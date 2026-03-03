@@ -1,0 +1,11 @@
+[package]
+name = "ant-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ant"
+path = "src/main.rs"
+
+[dependencies]
+ant-core = { path = "../ant-core" }

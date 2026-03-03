@@ -1,0 +1,3 @@
+[workspace]
+members = ["ant-core", "ant-cli"]
+resolver = "2"
