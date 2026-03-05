@@ -3,20 +3,24 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
+use crate::node::binary::NoopProgress;
 use crate::node::daemon::supervisor::Supervisor;
 use crate::node::events::NodeEvent;
 use crate::node::registry::NodeRegistry;
-use crate::node::types::{DaemonConfig, DaemonStatus};
+use crate::node::types::{
+    AddNodeOpts, AddNodeResult, DaemonConfig, DaemonStatus, RemoveNodeResult,
+};
 
 /// Shared application state for the daemon HTTP server.
 pub struct AppState {
@@ -80,6 +84,8 @@ fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/events", get(get_events))
+        .route("/api/v1/nodes", post(post_nodes))
+        .route("/api/v1/nodes/{id}", delete(delete_node))
         .route("/api/v1/openapi.json", get(get_openapi))
         .with_state(state)
 }
@@ -124,6 +130,57 @@ async fn get_events(
     Sse::new(stream)
 }
 
+/// POST /api/v1/nodes — Add one or more nodes to the registry.
+async fn post_nodes(
+    State(state): State<Arc<AppState>>,
+    Json(opts): Json<AddNodeOpts>,
+) -> std::result::Result<(StatusCode, Json<AddNodeResult>), (StatusCode, Json<serde_json::Value>)> {
+    let registry_path = state.config.registry_path.clone();
+    let progress = NoopProgress;
+
+    match crate::node::add_nodes(opts, &registry_path, &progress).await {
+        Ok(result) => {
+            // Update the in-memory registry to stay in sync
+            let mut registry = state.registry.write().await;
+            if let Ok(fresh) = NodeRegistry::load(&registry_path) {
+                *registry = fresh;
+            }
+            Ok((StatusCode::CREATED, Json(result)))
+        }
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
+/// DELETE /api/v1/nodes/:id — Remove a node from the registry.
+async fn delete_node(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u32>,
+) -> std::result::Result<Json<RemoveNodeResult>, (StatusCode, Json<serde_json::Value>)> {
+    let registry_path = state.config.registry_path.clone();
+
+    match crate::node::remove_node(id, &registry_path) {
+        Ok(result) => {
+            // Update the in-memory registry to stay in sync
+            let mut registry = state.registry.write().await;
+            if let Ok(fresh) = NodeRegistry::load(&registry_path) {
+                *registry = fresh;
+            }
+            Ok(Json(result))
+        }
+        Err(crate::error::Error::NodeNotFound(id)) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("Node not found: {id}") })),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
 async fn get_openapi() -> impl IntoResponse {
     // Minimal OpenAPI 3.1 spec - will be expanded with utoipa as endpoints grow
     let spec = serde_json::json!({
@@ -157,6 +214,58 @@ async fn get_openapi() -> impl IntoResponse {
                     "responses": {
                         "200": {
                             "description": "SSE event stream"
+                        }
+                    }
+                }
+            },
+            "/api/v1/nodes": {
+                "post": {
+                    "summary": "Add nodes",
+                    "description": "Add one or more nodes to the registry",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/AddNodeOpts" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Nodes added",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/AddNodeResult" }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Invalid request"
+                        }
+                    }
+                }
+            },
+            "/api/v1/nodes/{id}": {
+                "delete": {
+                    "summary": "Remove node",
+                    "description": "Remove a node from the registry",
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "integer" }
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "Node removed",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/RemoveNodeResult" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Node not found"
                         }
                     }
                 }

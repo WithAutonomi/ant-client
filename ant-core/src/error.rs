@@ -37,6 +37,18 @@ pub enum Error {
 
     #[error("Process spawn failed: {0}")]
     ProcessSpawn(String),
+
+    #[error("Port range length ({range_len}) does not match node count ({count})")]
+    PortRangeMismatch { range_len: u16, count: u16 },
+
+    #[error("Binary not found at path: {0}")]
+    BinaryNotFound(PathBuf),
+
+    #[error("Binary resolution failed: {0}")]
+    BinaryResolution(String),
+
+    #[error("Invalid rewards address: {0}")]
+    InvalidRewardsAddress(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

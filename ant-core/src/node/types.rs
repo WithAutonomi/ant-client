@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -78,8 +79,8 @@ pub struct NodeConfig {
     pub rewards_address: String,
     #[schema(value_type = String)]
     pub data_dir: PathBuf,
-    #[schema(value_type = String)]
-    pub log_dir: PathBuf,
+    #[schema(value_type = Option<String>)]
+    pub log_dir: Option<PathBuf>,
     pub node_port: Option<u16>,
     pub metrics_port: Option<u16>,
     pub network_id: Option<u32>,
@@ -118,19 +119,129 @@ pub struct DaemonStopResult {
     pub pid: u32,
 }
 
-/// Options for adding a new node to the registry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Source for the node binary.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(tag = "type", content = "value")]
+#[serde(rename_all = "snake_case")]
+pub enum BinarySource {
+    /// Download the latest release.
+    #[default]
+    Latest,
+    /// Download a specific version.
+    Version(String),
+    /// Download from a URL (zip/tar.gz archive).
+    Url(String),
+    /// Use an existing local binary.
+    #[schema(value_type = String)]
+    LocalPath(PathBuf),
+}
+
+impl fmt::Display for BinarySource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Latest => write!(f, "latest"),
+            Self::Version(v) => write!(f, "v{v}"),
+            Self::Url(u) => write!(f, "{u}"),
+            Self::LocalPath(p) => write!(f, "{}", p.display()),
+        }
+    }
+}
+
+/// A single port or a range of ports.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum PortRange {
+    Single(u16),
+    Range(u16, u16),
+}
+
+impl PortRange {
+    /// Returns the number of ports in this range.
+    pub fn len(&self) -> u16 {
+        match self {
+            Self::Single(_) => 1,
+            Self::Range(start, end) => end.saturating_sub(*start) + 1,
+        }
+    }
+
+    /// Whether this range is empty (should not happen in practice).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Get the port at the given index within the range.
+    pub fn port_at(&self, index: u16) -> Option<u16> {
+        match self {
+            Self::Single(p) if index == 0 => Some(*p),
+            Self::Range(start, end) => {
+                let port = start + index;
+                if port <= *end {
+                    Some(port)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Options for adding one or more nodes to the registry.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AddNodeOpts {
+    /// Number of nodes to add. Default: 1.
+    pub count: u16,
+    /// Required. Wallet address for node earnings.
     pub rewards_address: String,
-    pub data_dir: Option<PathBuf>,
-    pub log_dir: Option<PathBuf>,
-    pub node_port: Option<u16>,
-    pub metrics_port: Option<u16>,
-    pub network_id: Option<u32>,
-    pub binary_path: Option<PathBuf>,
-    pub version: Option<String>,
-    pub env_variables: HashMap<String, String>,
+    /// Port or port range for node(s).
+    pub node_port: Option<PortRange>,
+    /// Metrics port or range.
+    pub metrics_port: Option<PortRange>,
+    /// Custom data directory prefix.
+    #[schema(value_type = Option<String>)]
+    pub data_dir_path: Option<PathBuf>,
+    /// Custom log directory prefix.
+    #[schema(value_type = Option<String>)]
+    pub log_dir_path: Option<PathBuf>,
+    /// Network ID. Default: 1 (mainnet).
+    pub network_id: u8,
+    /// Source for the node binary.
+    pub binary_source: BinarySource,
+    /// Bootstrap peer(s).
     pub bootstrap_peers: Vec<String>,
+    /// Environment variables for the node.
+    pub env_variables: Vec<(String, String)>,
+}
+
+impl Default for AddNodeOpts {
+    fn default() -> Self {
+        Self {
+            count: 1,
+            rewards_address: String::new(),
+            node_port: None,
+            metrics_port: None,
+            data_dir_path: None,
+            log_dir_path: None,
+            network_id: 1,
+            binary_source: BinarySource::default(),
+            bootstrap_peers: Vec::new(),
+            env_variables: Vec::new(),
+        }
+    }
+}
+
+/// Result of adding nodes to the registry.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct AddNodeResult {
+    /// The nodes that were added.
+    pub nodes_added: Vec<NodeConfig>,
+}
+
+/// Result of removing a node from the registry.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RemoveNodeResult {
+    /// The node that was removed.
+    pub removed: NodeConfig,
 }
 
 #[cfg(test)]
@@ -169,5 +280,54 @@ mod tests {
     fn node_status_serializes_snake_case() {
         let json = serde_json::to_string(&NodeStatus::Running).unwrap();
         assert_eq!(json, "\"running\"");
+    }
+
+    #[test]
+    fn port_range_single_len() {
+        let pr = PortRange::Single(8080);
+        assert_eq!(pr.len(), 1);
+        assert!(!pr.is_empty());
+    }
+
+    #[test]
+    fn port_range_single_port_at() {
+        let pr = PortRange::Single(8080);
+        assert_eq!(pr.port_at(0), Some(8080));
+        assert_eq!(pr.port_at(1), None);
+    }
+
+    #[test]
+    fn port_range_range_len() {
+        let pr = PortRange::Range(12000, 12004);
+        assert_eq!(pr.len(), 5);
+    }
+
+    #[test]
+    fn port_range_range_port_at() {
+        let pr = PortRange::Range(12000, 12002);
+        assert_eq!(pr.port_at(0), Some(12000));
+        assert_eq!(pr.port_at(1), Some(12001));
+        assert_eq!(pr.port_at(2), Some(12002));
+        assert_eq!(pr.port_at(3), None);
+    }
+
+    #[test]
+    fn binary_source_serializes_with_tag() {
+        let src = BinarySource::Latest;
+        let json = serde_json::to_string(&src).unwrap();
+        assert!(json.contains("\"type\":\"latest\""));
+
+        let src = BinarySource::Version("1.0.0".to_string());
+        let json = serde_json::to_string(&src).unwrap();
+        assert!(json.contains("\"type\":\"version\""));
+        assert!(json.contains("1.0.0"));
+    }
+
+    #[test]
+    fn add_node_opts_default() {
+        let opts = AddNodeOpts::default();
+        assert_eq!(opts.count, 1);
+        assert_eq!(opts.network_id, 1);
+        assert!(matches!(opts.binary_source, BinarySource::Latest));
     }
 }

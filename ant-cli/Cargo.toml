@@ -11,5 +11,6 @@ path = "src/main.rs"
 ant-core = { path = "../ant-core" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

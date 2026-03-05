@@ -83,6 +83,56 @@ Output connection details for programmatic use. Always outputs JSON regardless o
 
 AI agents can use this to bootstrap their connection to the daemon.
 
+### `ant node add`
+
+Register one or more nodes in the node registry. Does **not** start them and does **not** require the daemon to be running.
+
+```
+$ ant node add --rewards-address 0xYourWalletAddress --path /path/to/antnode
+Added 1 node(s):
+  Node 1:
+    Data dir: ~/.local/share/ant/nodes/node-1
+    Log dir:  ~/.local/share/ant/nodes/node-1/logs
+    Port:     (none)
+    Binary:   /path/to/antnode
+    Version:  0.1.0
+```
+
+#### Adding multiple nodes with a port range
+
+```
+$ ant node add --rewards-address 0xYourWallet --count 3 --node-port 12000-12002 --path /path/to/antnode
+Added 3 node(s):
+  Node 1:
+    Data dir: ~/.local/share/ant/nodes/node-1
+    Port:     12000
+  Node 2:
+    Data dir: ~/.local/share/ant/nodes/node-2
+    Port:     12001
+  Node 3:
+    Data dir: ~/.local/share/ant/nodes/node-3
+    Port:     12002
+```
+
+#### Options
+
+| Flag | Description |
+|------|-------------|
+| `--rewards-address <ADDR>` | Required. Wallet address for node earnings |
+| `--count <N>` | Number of nodes to add (default: 1) |
+| `--node-port <PORT\|RANGE>` | Port or port range (e.g., `12000` or `12000-12004`) |
+| `--metrics-port <PORT\|RANGE>` | Metrics port or range |
+| `--data-dir-path <PATH>` | Custom data directory prefix |
+| `--log-dir-path <PATH>` | Custom log directory prefix |
+| `--network-id <ID>` | Network ID (default: 1 for mainnet) |
+| `--path <PATH>` | Path to a local node binary |
+| `--version <X.Y.Z>` | Download a specific version (not yet implemented) |
+| `--url <URL>` | Download binary from a URL (not yet implemented) |
+| `--bootstrap <IP:PORT>` | Bootstrap peer(s), comma-separated |
+| `--env <K=V>` | Environment variables, comma-separated |
+
+If the daemon is running, the command routes through its REST API. Otherwise, it operates directly on the registry file.
+
 ### Global Flags
 
 | Flag | Description |
@@ -97,6 +147,8 @@ When the daemon is running, it exposes these endpoints on `127.0.0.1:<port>`:
 |--------|------|-------------|
 | GET | `/api/v1/status` | Daemon health, uptime, node count summary |
 | GET | `/api/v1/events` | SSE stream of real-time node events |
+| POST | `/api/v1/nodes` | Add one or more nodes to the registry |
+| DELETE | `/api/v1/nodes/{id}` | Remove a node from the registry |
 | GET | `/api/v1/openapi.json` | OpenAPI 3.1 specification |
 
 ## Development

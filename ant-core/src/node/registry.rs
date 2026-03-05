@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -35,6 +37,24 @@ impl NodeRegistry {
         }
     }
 
+    /// Load the registry with an exclusive file lock.
+    ///
+    /// Returns the registry and the lock file handle. The lock is held until the
+    /// file handle is dropped, so callers should keep it alive for the duration of
+    /// their read-modify-write cycle.
+    pub fn load_locked(path: &Path) -> Result<(Self, File)> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let lock_path = path.with_extension("lock");
+        let lock_file = File::create(&lock_path)?;
+        lock_file.lock_exclusive()?;
+
+        let registry = Self::load(path)?;
+        Ok((registry, lock_file))
+    }
+
     /// Save the registry to disk.
     pub fn save(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
@@ -51,11 +71,17 @@ impl NodeRegistry {
     }
 
     /// Add a node and return its assigned ID.
-    pub fn add(&mut self, config: NodeConfig) -> u32 {
+    pub fn add(&mut self, mut config: NodeConfig) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
+        config.id = id;
         self.nodes.insert(id, config);
         id
+    }
+
+    /// Add multiple nodes at once and return their assigned IDs.
+    pub fn add_batch(&mut self, configs: Vec<NodeConfig>) -> Vec<u32> {
+        configs.into_iter().map(|config| self.add(config)).collect()
     }
 
     /// Remove a node by ID.
@@ -92,7 +118,7 @@ mod tests {
             id,
             rewards_address: "0xtest".to_string(),
             data_dir: PathBuf::from("/tmp/test"),
-            log_dir: PathBuf::from("/tmp/test/logs"),
+            log_dir: None,
             node_port: None,
             metrics_port: None,
             network_id: None,
@@ -118,7 +144,7 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().with_extension("json");
         let mut reg = NodeRegistry::load(&path).unwrap();
-        let id = reg.add(make_config(1));
+        let id = reg.add(make_config(0));
         assert_eq!(id, 1);
         assert_eq!(reg.get(id).unwrap().rewards_address, "0xtest");
     }
@@ -128,10 +154,51 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().with_extension("json");
         let mut reg = NodeRegistry::load(&path).unwrap();
-        reg.add(make_config(1));
+        reg.add(make_config(0));
         reg.save().unwrap();
 
         let reg2 = NodeRegistry::load(&path).unwrap();
         assert_eq!(reg2.len(), 1);
+    }
+
+    #[test]
+    fn add_batch_assigns_sequential_ids() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().with_extension("json");
+        let mut reg = NodeRegistry::load(&path).unwrap();
+        let configs = vec![make_config(0), make_config(0), make_config(0)];
+        let ids = reg.add_batch(configs);
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(reg.len(), 3);
+        assert_eq!(reg.next_id, 4);
+    }
+
+    #[test]
+    fn load_locked_creates_lock_file() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().with_extension("json");
+        let (reg, _lock) = NodeRegistry::load_locked(&path).unwrap();
+        assert!(reg.is_empty());
+        assert!(path.with_extension("lock").exists());
+    }
+
+    #[test]
+    fn remove_returns_config() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().with_extension("json");
+        let mut reg = NodeRegistry::load(&path).unwrap();
+        let id = reg.add(make_config(0));
+        let removed = reg.remove(id).unwrap();
+        assert_eq!(removed.rewards_address, "0xtest");
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn remove_missing_node_errors() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().with_extension("json");
+        let mut reg = NodeRegistry::load(&path).unwrap();
+        let result = reg.remove(999);
+        assert!(result.is_err());
     }
 }

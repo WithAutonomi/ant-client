@@ -11,6 +11,10 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Node { command } => match command {
+            commands::node::NodeCommand::Add(args) => {
+                args.execute(cli.json).await?;
+            }
+
             commands::node::NodeCommand::Daemon { command } => {
                 command.execute(cli.json).await?;
             }

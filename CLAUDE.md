@@ -63,9 +63,10 @@ ant-core/src/
 ├── config.rs                 # Platform-appropriate data/log directory paths
 └── node/
     ├── mod.rs
-    ├── types.rs              # DaemonConfig, DaemonStatus, NodeConfig, NodeInfo, etc.
+    ├── types.rs              # DaemonConfig, DaemonStatus, NodeConfig, NodeInfo, AddNodeOpts, etc.
     ├── events.rs             # NodeEvent enum, EventListener trait
-    ├── registry.rs           # Node registry (CRUD, JSON persistence)
+    ├── binary.rs             # Binary resolution (download/cache/validate), ProgressReporter trait
+    ├── registry.rs           # Node registry (CRUD, JSON persistence, file locking)
     ├── daemon/
     │   ├── mod.rs
     │   ├── server.rs         # HTTP server (axum), REST API handlers
@@ -81,6 +82,7 @@ ant-cli/src/
 └── commands/
     └── node/
         ├── mod.rs
+        ├── add.rs            # ant node add command
         └── daemon.rs         # daemon start/stop/status/info/run commands
 ```
 
@@ -103,6 +105,10 @@ cargo run --bin ant -- --help  # Run the CLI
 - **Platform paths**: Use `ant_core::config::data_dir()` and `ant_core::config::log_dir()` for platform-appropriate paths. Never hardcode paths.
 - **OpenAPI schema**: Types exposed in the REST API derive `utoipa::ToSchema`. Use `#[schema(value_type = String)]` for `PathBuf` fields.
 - **Tests**: Unit tests go in `#[cfg(test)] mod tests` inside the source file. Integration tests go in `ant-core/tests/`.
+- **Progress reporting**: Long-running operations (e.g., binary downloads) accept a `&dyn ProgressReporter` from `ant_core::node::binary`. CLI provides a terminal-printing implementation; use `NoopProgress` in tests and daemon API handlers.
+- **Registry file locking**: Use `NodeRegistry::load_locked()` for read-modify-write operations to prevent concurrent CLI invocations from corrupting the registry. The returned `File` handle holds the lock until dropped.
+- **Dual-path CLI commands**: Commands that modify the registry (like `ant node add`) check if the daemon is running. If so, they route through the REST API; otherwise, they operate directly on the registry file.
+- **Binary source resolution**: Node binary sources are represented by the `BinarySource` enum (Latest, Version, Url, LocalPath). Download variants are stubbed until release infrastructure is available.
 
 ## Linear Project
 
