@@ -452,4 +452,39 @@ mod tests {
         assert!(result.data_dirs_removed.is_empty());
         assert!(result.log_dirs_removed.is_empty());
     }
+
+    #[tokio::test]
+    async fn reset_then_add_starts_fresh_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = create_fake_binary(tmp.path());
+        let reg_path = test_registry_path(tmp.path());
+
+        // Add 2 nodes
+        let opts = AddNodeOpts {
+            count: 2,
+            rewards_address: "0xfirst_batch".to_string(),
+            data_dir_path: Some(tmp.path().join("data")),
+            log_dir_path: Some(tmp.path().join("logs")),
+            binary_source: BinarySource::LocalPath(binary.clone()),
+            ..Default::default()
+        };
+        add_nodes(opts, &reg_path, &NoopProgress).await.unwrap();
+
+        // Reset
+        reset(&reg_path).unwrap();
+
+        // Add again — IDs should restart from 1
+        let opts = AddNodeOpts {
+            count: 1,
+            rewards_address: "0xsecond_batch".to_string(),
+            data_dir_path: Some(tmp.path().join("data")),
+            log_dir_path: Some(tmp.path().join("logs")),
+            binary_source: BinarySource::LocalPath(binary),
+            ..Default::default()
+        };
+        let result = add_nodes(opts, &reg_path, &NoopProgress).await.unwrap();
+
+        assert_eq!(result.nodes_added[0].id, 1);
+        assert_eq!(result.nodes_added[0].rewards_address, "0xsecond_batch");
+    }
 }
