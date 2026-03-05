@@ -9,3 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 ant-core = { path = "../ant-core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

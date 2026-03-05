@@ -1,0 +1,204 @@
+use std::path::Path;
+use std::time::Duration;
+
+use crate::error::{Error, Result};
+use crate::node::process::detach;
+use crate::node::types::{
+    DaemonConfig, DaemonInfo, DaemonStartResult, DaemonStatus, DaemonStopResult,
+};
+
+/// Get the daemon's current status by querying its REST API.
+///
+/// If the daemon is not running, returns a `DaemonStatus` with `running: false`.
+pub async fn status(config: &DaemonConfig) -> Result<DaemonStatus> {
+    let port = match read_port_file(&config.port_file_path) {
+        Some(port) => port,
+        None => {
+            return Ok(DaemonStatus {
+                running: false,
+                pid: None,
+                port: None,
+                uptime_secs: None,
+                nodes_total: 0,
+                nodes_running: 0,
+                nodes_stopped: 0,
+                nodes_errored: 0,
+            });
+        }
+    };
+
+    let url = format!("http://127.0.0.1:{port}/api/v1/status");
+    match reqwest::get(&url).await {
+        Ok(resp) => resp
+            .json::<DaemonStatus>()
+            .await
+            .map_err(|e| Error::HttpRequest(e.to_string())),
+        Err(_) => Ok(DaemonStatus {
+            running: false,
+            pid: None,
+            port: Some(port),
+            uptime_secs: None,
+            nodes_total: 0,
+            nodes_running: 0,
+            nodes_stopped: 0,
+            nodes_errored: 0,
+        }),
+    }
+}
+
+/// Stop the running daemon.
+///
+/// Reads the PID from the PID file, sends SIGTERM (Unix) or TerminateProcess (Windows),
+/// and waits for the process to exit.
+pub async fn stop(config: &DaemonConfig) -> Result<DaemonStopResult> {
+    let pid = read_pid_file(&config.pid_file_path)?;
+
+    send_terminate(pid);
+
+    // Wait for process to exit
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !is_process_alive(pid) {
+            break;
+        }
+    }
+
+    // Clean up files if they still exist
+    let _ = std::fs::remove_file(&config.pid_file_path);
+    let _ = std::fs::remove_file(&config.port_file_path);
+
+    Ok(DaemonStopResult { pid })
+}
+
+/// Start the daemon as a detached background process.
+///
+/// If the daemon is already running, returns a result with `already_running: true`.
+/// Otherwise, spawns the daemon and polls for the port file to confirm startup.
+pub async fn start(config: &DaemonConfig) -> Result<DaemonStartResult> {
+    // Check if daemon is already running
+    if let Some(pid) = check_running(&config.pid_file_path) {
+        let port = read_port_file(&config.port_file_path);
+        return Ok(DaemonStartResult {
+            already_running: true,
+            pid,
+            port,
+        });
+    }
+
+    // Get the path to the current executable
+    let exe = std::env::current_exe()
+        .map_err(|e| Error::ProcessSpawn(format!("Failed to get current executable: {e}")))?;
+    let exe_str = exe
+        .to_str()
+        .ok_or_else(|| Error::ProcessSpawn("Executable path is not valid UTF-8".to_string()))?;
+
+    let pid = detach::spawn_detached(exe_str, &["node", "daemon", "run"])?;
+
+    // Wait briefly for the daemon to write its port file
+    let mut port = None;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(p) = read_port_file(&config.port_file_path) {
+            port = Some(p);
+            break;
+        }
+    }
+
+    Ok(DaemonStartResult {
+        already_running: false,
+        pid,
+        port,
+    })
+}
+
+/// Get daemon connection info for programmatic use.
+///
+/// Reads PID and port files and checks if the process is alive.
+pub fn info(config: &DaemonConfig) -> DaemonInfo {
+    let pid = std::fs::read_to_string(&config.pid_file_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+
+    let port = read_port_file(&config.port_file_path);
+
+    let running = pid.is_some_and(is_process_alive);
+
+    DaemonInfo {
+        running,
+        pid,
+        port,
+        api_base: port.map(|p| format!("http://127.0.0.1:{p}/api/v1")),
+    }
+}
+
+/// Run the daemon in the foreground (the actual daemon process entry point).
+///
+/// Starts the HTTP server, sets up signal handling, and blocks until shutdown.
+pub async fn run(config: DaemonConfig) -> Result<()> {
+    use crate::node::daemon::server;
+    use crate::node::registry::NodeRegistry;
+
+    let registry = NodeRegistry::load(&config.registry_path)?;
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    let shutdown_clone = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        shutdown_clone.cancel();
+    });
+
+    let _addr = server::start(config, registry, shutdown.clone()).await?;
+
+    shutdown.cancelled().await;
+    // Give the server a moment to clean up
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    Ok(())
+}
+
+fn read_port_file(path: &Path) -> Option<u16> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+}
+
+fn read_pid_file(path: &Path) -> Result<u32> {
+    let contents = std::fs::read_to_string(path).map_err(|_| Error::DaemonNotRunning)?;
+    contents
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| Error::DaemonNotRunning)
+}
+
+/// Check if a daemon is running. Returns the PID if so.
+fn check_running(pid_file: &Path) -> Option<u32> {
+    let pid = read_pid_file(pid_file).ok()?;
+    if is_process_alive(pid) {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn send_terminate(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+}
+
+#[cfg(windows)]
+fn send_terminate(_pid: u32) {
+    // TODO: Implement Windows process termination via TerminateProcess
+}
+
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn is_process_alive(_pid: u32) -> bool {
+    // TODO: Implement Windows process check
+    false
+}
