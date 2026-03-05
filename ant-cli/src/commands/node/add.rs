@@ -171,7 +171,7 @@ impl AddArgs {
 
         let client = reqwest::Client::new();
         let resp = client
-            .post(format!("{api_base}/api/v1/nodes"))
+            .post(format!("{api_base}/nodes"))
             .json(opts)
             .send()
             .await?;

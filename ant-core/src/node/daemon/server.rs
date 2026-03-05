@@ -19,13 +19,14 @@ use crate::node::daemon::supervisor::Supervisor;
 use crate::node::events::NodeEvent;
 use crate::node::registry::NodeRegistry;
 use crate::node::types::{
-    AddNodeOpts, AddNodeResult, DaemonConfig, DaemonStatus, RemoveNodeResult, ResetResult,
+    AddNodeOpts, AddNodeResult, DaemonConfig, DaemonStatus, NodeStarted, RemoveNodeResult,
+    ResetResult, StartNodeResult,
 };
 
 /// Shared application state for the daemon HTTP server.
 pub struct AppState {
     pub registry: RwLock<NodeRegistry>,
-    pub supervisor: RwLock<Supervisor>,
+    pub supervisor: Arc<RwLock<Supervisor>>,
     pub event_tx: broadcast::Sender<NodeEvent>,
     pub start_time: Instant,
     pub config: DaemonConfig,
@@ -43,7 +44,7 @@ pub async fn start(
 
     let state = Arc::new(AppState {
         registry: RwLock::new(registry),
-        supervisor: RwLock::new(Supervisor::new(event_tx.clone())),
+        supervisor: Arc::new(RwLock::new(Supervisor::new(event_tx.clone()))),
         event_tx,
         start_time: Instant::now(),
         config: config.clone(),
@@ -86,6 +87,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/events", get(get_events))
         .route("/api/v1/nodes", post(post_nodes))
         .route("/api/v1/nodes/{id}", delete(delete_node))
+        .route("/api/v1/nodes/{id}/start", post(post_start_node))
+        .route("/api/v1/nodes/start-all", post(post_start_all))
         .route("/api/v1/reset", post(post_reset))
         .route("/api/v1/openapi.json", get(get_openapi))
         .with_state(state)
@@ -180,6 +183,112 @@ async fn delete_node(
             Json(serde_json::json!({ "error": e.to_string() })),
         )),
     }
+}
+
+/// POST /api/v1/nodes/:id/start — Start a specific node.
+async fn post_start_node(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u32>,
+) -> std::result::Result<Json<NodeStarted>, (StatusCode, Json<serde_json::Value>)> {
+    let registry = state.registry.read().await;
+    let config = match registry.get(id) {
+        Ok(config) => config.clone(),
+        Err(_) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("Node not found: {id}") })),
+            ))
+        }
+    };
+    drop(registry);
+
+    let supervisor_ref = state.supervisor.clone();
+
+    {
+        let supervisor = state.supervisor.read().await;
+        if supervisor.is_running(id) {
+            let pid = supervisor.node_pid(id);
+            let uptime_secs = supervisor.node_uptime_secs(id);
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("Node {id} is already running"),
+                    "current_state": {
+                        "node_id": id,
+                        "status": "running",
+                        "pid": pid,
+                        "uptime_secs": uptime_secs,
+                    }
+                })),
+            ));
+        }
+    }
+
+    let mut supervisor = state.supervisor.write().await;
+    match supervisor.start_node(&config, supervisor_ref).await {
+        Ok(started) => Ok(Json(started)),
+        Err(crate::error::Error::NodeAlreadyRunning(id)) => {
+            let pid = supervisor.node_pid(id);
+            let uptime_secs = supervisor.node_uptime_secs(id);
+            Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("Node {id} is already running"),
+                    "current_state": {
+                        "node_id": id,
+                        "status": "running",
+                        "pid": pid,
+                        "uptime_secs": uptime_secs,
+                    }
+                })),
+            ))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
+/// POST /api/v1/nodes/start-all — Start all registered nodes.
+async fn post_start_all(State(state): State<Arc<AppState>>) -> Json<StartNodeResult> {
+    let registry = state.registry.read().await;
+    let configs: Vec<_> = registry.list().into_iter().cloned().collect();
+    drop(registry);
+
+    let mut started = Vec::new();
+    let mut failed = Vec::new();
+    let mut already_running = Vec::new();
+
+    let supervisor_ref = state.supervisor.clone();
+
+    for config in &configs {
+        let mut supervisor = state.supervisor.write().await;
+        if supervisor.is_running(config.id) {
+            already_running.push(config.id);
+            continue;
+        }
+
+        match supervisor.start_node(config, supervisor_ref.clone()).await {
+            Ok(result) => started.push(result),
+            Err(crate::error::Error::NodeAlreadyRunning(id)) => {
+                already_running.push(id);
+            }
+            Err(e) => {
+                failed.push(crate::node::types::NodeStartFailed {
+                    node_id: config.id,
+                    service_name: config.service_name.clone(),
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+
+    Json(StartNodeResult {
+        started,
+        failed,
+        already_running,
+    })
 }
 
 /// POST /api/v1/reset — Reset all node state.
@@ -303,6 +412,53 @@ async fn get_openapi() -> impl IntoResponse {
                         },
                         "404": {
                             "description": "Node not found"
+                        }
+                    }
+                }
+            },
+            "/api/v1/nodes/{id}/start": {
+                "post": {
+                    "summary": "Start a node",
+                    "description": "Start a specific node by ID. Returns 409 if already running with current_state.",
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "integer" }
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "Node started",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/NodeStarted" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Node not found"
+                        },
+                        "409": {
+                            "description": "Node already running (includes current_state)"
+                        },
+                        "500": {
+                            "description": "Failed to start node"
+                        }
+                    }
+                }
+            },
+            "/api/v1/nodes/start-all": {
+                "post": {
+                    "summary": "Start all nodes",
+                    "description": "Start all registered nodes. Returns per-node results.",
+                    "responses": {
+                        "200": {
+                            "description": "Start results",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/StartNodeResult" }
+                                }
+                            }
                         }
                     }
                 }

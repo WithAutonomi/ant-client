@@ -83,6 +83,7 @@ pub async fn add_nodes(
 
         let config = NodeConfig {
             id: placeholder_id,
+            service_name: String::new(), // assigned by registry.add()
             rewards_address: opts.rewards_address.clone(),
             data_dir,
             log_dir,
@@ -368,6 +369,7 @@ mod tests {
         let (mut registry, _lock) = NodeRegistry::load_locked(&reg_path).unwrap();
         registry.add(NodeConfig {
             id: 0,
+            service_name: String::new(),
             rewards_address: "0xtest".to_string(),
             data_dir: PathBuf::from("/tmp/test"),
             log_dir: None,

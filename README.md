@@ -133,6 +133,33 @@ Added 3 node(s):
 
 If the daemon is running, the command routes through its REST API. Otherwise, it operates directly on the registry file.
 
+### `ant node start`
+
+Start registered node(s). Requires the daemon to be running. With no arguments, starts all registered nodes. Use `--service-name` to start a specific node.
+
+```
+$ ant node start
+Started 3 node(s):
+  node1 (1) — PID 12345
+  node2 (2) — PID 12346
+  node3 (3) — PID 12347
+```
+
+#### Starting a specific node
+
+```
+$ ant node start --service-name node1
+Node node1 (1) started (PID 12345)
+```
+
+If the daemon is not running, the command will fail with an error asking you to start it first.
+
+#### Options
+
+| Flag | Description |
+|------|-------------|
+| `--service-name <NAME>` | Start a specific node by its service name (e.g., `node1`) |
+
 ### `ant node reset`
 
 Remove all node data directories, log directories, and clear the registry, returning the system to a clean state. All nodes must be stopped before running this command.
@@ -175,6 +202,8 @@ When the daemon is running, it exposes these endpoints on `127.0.0.1:<port>`:
 | GET | `/api/v1/events` | SSE stream of real-time node events |
 | POST | `/api/v1/nodes` | Add one or more nodes to the registry |
 | DELETE | `/api/v1/nodes/{id}` | Remove a node from the registry |
+| POST | `/api/v1/nodes/{id}/start` | Start a specific node |
+| POST | `/api/v1/nodes/start-all` | Start all registered nodes |
 | POST | `/api/v1/reset` | Reset all node state (fails if nodes running) |
 | GET | `/api/v1/openapi.json` | OpenAPI 3.1 specification |
 

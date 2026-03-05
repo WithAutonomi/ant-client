@@ -76,6 +76,7 @@ pub enum NodeStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct NodeConfig {
     pub id: u32,
+    pub service_name: String,
     pub rewards_address: String,
     #[schema(value_type = String)]
     pub data_dir: PathBuf,
@@ -262,6 +263,50 @@ pub struct ResetResult {
     /// Log directories that were removed.
     #[schema(value_type = Vec<String>)]
     pub log_dirs_removed: Vec<PathBuf>,
+}
+
+/// Options for starting one or more nodes.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct StartNodeOpts {
+    /// Which node(s) to start.
+    pub target: NodeTarget,
+}
+
+/// Which node(s) to target.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeTarget {
+    /// Start a specific node by service name.
+    ServiceName(String),
+    /// Start all registered nodes.
+    All,
+}
+
+/// Result of starting node(s).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct StartNodeResult {
+    /// Nodes that were successfully started.
+    pub started: Vec<NodeStarted>,
+    /// Nodes that failed to start.
+    pub failed: Vec<NodeStartFailed>,
+    /// Node IDs that were already running.
+    pub already_running: Vec<u32>,
+}
+
+/// A node that was successfully started.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NodeStarted {
+    pub node_id: u32,
+    pub service_name: String,
+    pub pid: u32,
+}
+
+/// A node that failed to start.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NodeStartFailed {
+    pub node_id: u32,
+    pub service_name: String,
+    pub error: String,
 }
 
 #[cfg(test)]

@@ -4,7 +4,8 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 use crate::node::process::detach;
 use crate::node::types::{
-    DaemonConfig, DaemonInfo, DaemonStartResult, DaemonStatus, DaemonStopResult,
+    DaemonConfig, DaemonInfo, DaemonStartResult, DaemonStatus, DaemonStopResult, NodeStarted,
+    StartNodeResult,
 };
 
 /// Get the daemon's current status by querying its REST API.
@@ -109,6 +110,48 @@ pub async fn start(config: &DaemonConfig) -> Result<DaemonStartResult> {
         pid,
         port,
     })
+}
+
+/// Start a specific node by ID via the daemon REST API.
+pub async fn start_node(config: &DaemonConfig, node_id: u32) -> Result<NodeStarted> {
+    let port = read_port_file(&config.port_file_path).ok_or(Error::DaemonNotRunning)?;
+
+    let url = format!("http://127.0.0.1:{port}/api/v1/nodes/{node_id}/start");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| Error::HttpRequest(e.to_string()))?;
+
+    if resp.status().is_success() {
+        resp.json::<NodeStarted>()
+            .await
+            .map_err(|e| Error::HttpRequest(e.to_string()))
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(Error::HttpRequest(body))
+    }
+}
+
+/// Start all registered nodes via the daemon REST API.
+pub async fn start_all_nodes(config: &DaemonConfig) -> Result<StartNodeResult> {
+    let port = read_port_file(&config.port_file_path).ok_or(Error::DaemonNotRunning)?;
+
+    let url = format!("http://127.0.0.1:{port}/api/v1/nodes/start-all");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| Error::HttpRequest(e.to_string()))?;
+
+    if resp.status().is_success() {
+        resp.json::<StartNodeResult>()
+            .await
+            .map_err(|e| Error::HttpRequest(e.to_string()))
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(Error::HttpRequest(body))
+    }
 }
 
 /// Get daemon connection info for programmatic use.

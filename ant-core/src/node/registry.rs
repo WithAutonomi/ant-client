@@ -75,6 +75,7 @@ impl NodeRegistry {
         let id = self.next_id;
         self.next_id += 1;
         config.id = id;
+        config.service_name = format!("node{id}");
         self.nodes.insert(id, config);
         id
     }
@@ -94,6 +95,11 @@ impl NodeRegistry {
         let mut nodes: Vec<_> = self.nodes.values().collect();
         nodes.sort_by_key(|n| n.id);
         nodes
+    }
+
+    /// Find a node by its service name.
+    pub fn find_by_service_name(&self, name: &str) -> Option<&NodeConfig> {
+        self.nodes.values().find(|n| n.service_name == name)
     }
 
     /// Number of registered nodes.
@@ -122,6 +128,7 @@ mod tests {
     fn make_config(id: u32) -> NodeConfig {
         NodeConfig {
             id,
+            service_name: String::new(),
             rewards_address: "0xtest".to_string(),
             data_dir: PathBuf::from("/tmp/test"),
             log_dir: None,

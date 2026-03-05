@@ -77,10 +77,7 @@ impl ResetArgs {
             .ok_or_else(|| anyhow::anyhow!("Daemon is running but API base URL not available"))?;
 
         let client = reqwest::Client::new();
-        let resp = client
-            .post(format!("{api_base}/api/v1/reset"))
-            .send()
-            .await?;
+        let resp = client.post(format!("{api_base}/reset")).send().await?;
 
         if resp.status().is_success() {
             Ok(resp.json().await?)
