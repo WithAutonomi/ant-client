@@ -335,6 +335,23 @@ pub struct NodeStopFailed {
     pub error: String,
 }
 
+/// Summary of a single node's status.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NodeStatusSummary {
+    pub node_id: u32,
+    pub name: String,
+    pub version: String,
+    pub status: NodeStatus,
+}
+
+/// Result of querying node status across all registered nodes.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NodeStatusResult {
+    pub nodes: Vec<NodeStatusSummary>,
+    pub total_running: u32,
+    pub total_stopped: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +459,51 @@ mod tests {
         assert_eq!(deserialized.stopped[0].node_id, 1);
         assert_eq!(deserialized.failed.len(), 1);
         assert_eq!(deserialized.already_stopped, vec![3]);
+    }
+
+    #[test]
+    fn node_status_result_serializes() {
+        let result = NodeStatusResult {
+            nodes: vec![
+                NodeStatusSummary {
+                    node_id: 1,
+                    name: "antnode-1".to_string(),
+                    version: "0.110.0".to_string(),
+                    status: NodeStatus::Running,
+                },
+                NodeStatusSummary {
+                    node_id: 2,
+                    name: "antnode-2".to_string(),
+                    version: "0.110.0".to_string(),
+                    status: NodeStatus::Stopped,
+                },
+            ],
+            total_running: 1,
+            total_stopped: 1,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: NodeStatusResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.nodes.len(), 2);
+        assert_eq!(deserialized.nodes[0].node_id, 1);
+        assert_eq!(deserialized.nodes[0].status, NodeStatus::Running);
+        assert_eq!(deserialized.nodes[1].status, NodeStatus::Stopped);
+        assert_eq!(deserialized.total_running, 1);
+        assert_eq!(deserialized.total_stopped, 1);
+    }
+
+    #[test]
+    fn node_status_summary_serializes() {
+        let summary = NodeStatusSummary {
+            node_id: 1,
+            name: "antnode-1".to_string(),
+            version: "0.110.0".to_string(),
+            status: NodeStatus::Running,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"node_id\":1"));
+        assert!(json.contains("\"name\":\"antnode-1\""));
+        assert!(json.contains("\"version\":\"0.110.0\""));
+        assert!(json.contains("\"status\":\"running\""));
     }
 
     #[test]

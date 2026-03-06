@@ -12,7 +12,10 @@ use crate::config;
 use crate::error::{Error, Result};
 use crate::node::binary::ProgressReporter;
 use crate::node::registry::NodeRegistry;
-use crate::node::types::{AddNodeOpts, AddNodeResult, NodeConfig, RemoveNodeResult, ResetResult};
+use crate::node::types::{
+    AddNodeOpts, AddNodeResult, NodeConfig, NodeStatus, NodeStatusResult, NodeStatusSummary,
+    RemoveNodeResult, ResetResult,
+};
 
 /// Add one or more nodes to the registry.
 ///
@@ -176,6 +179,29 @@ pub fn reset(registry_path: &Path) -> Result<ResetResult> {
         nodes_cleared,
         data_dirs_removed,
         log_dirs_removed,
+    })
+}
+
+/// Get the status of all registered nodes without the daemon.
+///
+/// Since the daemon is not running, all nodes are reported as `Stopped`.
+pub fn node_status_offline(registry_path: &Path) -> Result<NodeStatusResult> {
+    let registry = NodeRegistry::load(registry_path)?;
+    let nodes: Vec<NodeStatusSummary> = registry
+        .list()
+        .iter()
+        .map(|config| NodeStatusSummary {
+            node_id: config.id,
+            name: config.service_name.clone(),
+            version: config.version.clone(),
+            status: NodeStatus::Stopped,
+        })
+        .collect();
+    let total_stopped = nodes.len() as u32;
+    Ok(NodeStatusResult {
+        nodes,
+        total_running: 0,
+        total_stopped,
     })
 }
 
@@ -442,6 +468,64 @@ mod tests {
         let reg = NodeRegistry::load(&reg_path).unwrap();
         assert!(reg.is_empty());
         assert_eq!(reg.next_id, 1);
+    }
+
+    #[test]
+    fn node_status_offline_shows_all_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = test_registry_path(tmp.path());
+
+        // Add two nodes directly to the registry
+        let (mut registry, _lock) = NodeRegistry::load_locked(&reg_path).unwrap();
+        registry.add(NodeConfig {
+            id: 0,
+            service_name: String::new(),
+            rewards_address: "0xtest".to_string(),
+            data_dir: PathBuf::from("/tmp/test1"),
+            log_dir: None,
+            node_port: None,
+            metrics_port: None,
+            network_id: None,
+            binary_path: PathBuf::from("/usr/bin/antnode"),
+            version: "0.110.0".to_string(),
+            env_variables: HashMap::new(),
+            bootstrap_peers: vec![],
+        });
+        registry.add(NodeConfig {
+            id: 0,
+            service_name: String::new(),
+            rewards_address: "0xtest".to_string(),
+            data_dir: PathBuf::from("/tmp/test2"),
+            log_dir: None,
+            node_port: None,
+            metrics_port: None,
+            network_id: None,
+            binary_path: PathBuf::from("/usr/bin/antnode"),
+            version: "0.110.0".to_string(),
+            env_variables: HashMap::new(),
+            bootstrap_peers: vec![],
+        });
+        registry.save().unwrap();
+        drop(_lock);
+
+        let result = node_status_offline(&reg_path).unwrap();
+        assert_eq!(result.nodes.len(), 2);
+        assert_eq!(result.total_running, 0);
+        assert_eq!(result.total_stopped, 2);
+        for node in &result.nodes {
+            assert_eq!(node.status, NodeStatus::Stopped);
+        }
+    }
+
+    #[test]
+    fn node_status_offline_empty_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = test_registry_path(tmp.path());
+
+        let result = node_status_offline(&reg_path).unwrap();
+        assert!(result.nodes.is_empty());
+        assert_eq!(result.total_running, 0);
+        assert_eq!(result.total_stopped, 0);
     }
 
     #[test]

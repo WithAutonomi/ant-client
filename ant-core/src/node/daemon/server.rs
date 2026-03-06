@@ -19,8 +19,9 @@ use crate::node::daemon::supervisor::Supervisor;
 use crate::node::events::NodeEvent;
 use crate::node::registry::NodeRegistry;
 use crate::node::types::{
-    AddNodeOpts, AddNodeResult, DaemonConfig, DaemonStatus, NodeStarted, NodeStopped,
-    RemoveNodeResult, ResetResult, StartNodeResult, StopNodeResult,
+    AddNodeOpts, AddNodeResult, DaemonConfig, DaemonStatus, NodeStarted, NodeStatus,
+    NodeStatusResult, NodeStatusSummary, NodeStopped, RemoveNodeResult, ResetResult,
+    StartNodeResult, StopNodeResult,
 };
 
 /// Shared application state for the daemon HTTP server.
@@ -85,6 +86,7 @@ fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/events", get(get_events))
+        .route("/api/v1/nodes/status", get(get_nodes_status))
         .route("/api/v1/nodes", post(post_nodes))
         .route("/api/v1/nodes/{id}", delete(delete_node))
         .route("/api/v1/nodes/{id}/start", post(post_start_node))
@@ -134,6 +136,40 @@ async fn get_events(
     };
 
     Sse::new(stream)
+}
+
+/// GET /api/v1/nodes/status — Get status of all registered nodes.
+async fn get_nodes_status(State(state): State<Arc<AppState>>) -> Json<NodeStatusResult> {
+    let registry = state.registry.read().await;
+    let supervisor = state.supervisor.read().await;
+
+    let mut nodes = Vec::new();
+    let mut total_running = 0u32;
+    let mut total_stopped = 0u32;
+
+    for config in registry.list() {
+        let status = supervisor
+            .node_status(config.id)
+            .unwrap_or(NodeStatus::Stopped);
+
+        match status {
+            NodeStatus::Running | NodeStatus::Starting => total_running += 1,
+            _ => total_stopped += 1,
+        }
+
+        nodes.push(NodeStatusSummary {
+            node_id: config.id,
+            name: config.service_name.clone(),
+            version: config.version.clone(),
+            status,
+        });
+    }
+
+    Json(NodeStatusResult {
+        nodes,
+        total_running,
+        total_stopped,
+    })
 }
 
 /// POST /api/v1/nodes — Add one or more nodes to the registry.
