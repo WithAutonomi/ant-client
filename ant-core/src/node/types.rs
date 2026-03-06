@@ -309,6 +309,32 @@ pub struct NodeStartFailed {
     pub error: String,
 }
 
+/// Result of stopping node(s).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct StopNodeResult {
+    /// Nodes that were successfully stopped.
+    pub stopped: Vec<NodeStopped>,
+    /// Nodes that failed to stop.
+    pub failed: Vec<NodeStopFailed>,
+    /// Node IDs that were already stopped.
+    pub already_stopped: Vec<u32>,
+}
+
+/// A node that was successfully stopped.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NodeStopped {
+    pub node_id: u32,
+    pub service_name: String,
+}
+
+/// A node that failed to stop.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NodeStopFailed {
+    pub node_id: u32,
+    pub service_name: String,
+    pub error: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +420,38 @@ mod tests {
         assert_eq!(opts.count, 1);
         assert_eq!(opts.network_id, 1);
         assert!(matches!(opts.binary_source, BinarySource::Latest));
+    }
+
+    #[test]
+    fn stop_node_result_serializes() {
+        let result = StopNodeResult {
+            stopped: vec![NodeStopped {
+                node_id: 1,
+                service_name: "node1".to_string(),
+            }],
+            failed: vec![NodeStopFailed {
+                node_id: 2,
+                service_name: "node2".to_string(),
+                error: "process not found".to_string(),
+            }],
+            already_stopped: vec![3],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: StopNodeResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.stopped.len(), 1);
+        assert_eq!(deserialized.stopped[0].node_id, 1);
+        assert_eq!(deserialized.failed.len(), 1);
+        assert_eq!(deserialized.already_stopped, vec![3]);
+    }
+
+    #[test]
+    fn node_stopped_serializes() {
+        let stopped = NodeStopped {
+            node_id: 1,
+            service_name: "node1".to_string(),
+        };
+        let json = serde_json::to_string(&stopped).unwrap();
+        assert!(json.contains("\"node_id\":1"));
+        assert!(json.contains("\"service_name\":\"node1\""));
     }
 }

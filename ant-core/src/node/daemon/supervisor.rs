@@ -7,7 +7,9 @@ use tokio::sync::{broadcast, RwLock};
 use crate::error::{Error, Result};
 use crate::node::events::NodeEvent;
 use crate::node::process::spawn::spawn_node;
-use crate::node::types::{NodeConfig, NodeStarted, NodeStatus};
+use crate::node::types::{
+    NodeConfig, NodeStarted, NodeStatus, NodeStopFailed, NodeStopped, StopNodeResult,
+};
 
 /// Maximum restart attempts before marking a node as errored.
 const MAX_CRASHES_BEFORE_ERRORED: u32 = 5;
@@ -137,7 +139,11 @@ impl Supervisor {
         Ok(result)
     }
 
-    /// Stop a node by killing its process.
+    /// Stop a node by gracefully terminating its process.
+    ///
+    /// Sends SIGTERM (Unix) or kills (Windows), waits up to 10 seconds for exit,
+    /// then sends SIGKILL if needed. The monitor task detects the Stopping status
+    /// and exits cleanly without attempting a restart.
     pub async fn stop_node(&mut self, node_id: u32) -> Result<()> {
         let state = self
             .node_states
@@ -148,12 +154,17 @@ impl Supervisor {
             return Err(Error::NodeNotRunning(node_id));
         }
 
-        let _ = self.event_tx.send(NodeEvent::NodeStopping { node_id });
+        let pid = state.pid;
 
+        let _ = self.event_tx.send(NodeEvent::NodeStopping { node_id });
         state.status = NodeStatus::Stopping;
 
-        // The actual kill is handled by the monitor task detecting the status change,
-        // or we could kill it here. For now, mark as stopped.
+        if let Some(pid) = pid {
+            graceful_kill(pid).await;
+        }
+
+        // Update state after kill
+        let state = self.node_states.get_mut(&node_id).unwrap();
         state.status = NodeStatus::Stopped;
         state.pid = None;
         state.started_at = None;
@@ -161,6 +172,53 @@ impl Supervisor {
         let _ = self.event_tx.send(NodeEvent::NodeStopped { node_id });
 
         Ok(())
+    }
+
+    /// Stop all running nodes, returning an aggregate result.
+    pub async fn stop_all_nodes(&mut self, configs: &[(u32, String)]) -> StopNodeResult {
+        let mut stopped = Vec::new();
+        let mut failed = Vec::new();
+        let mut already_stopped = Vec::new();
+
+        for (node_id, service_name) in configs {
+            let node_id = *node_id;
+            match self.node_status(node_id) {
+                Ok(NodeStatus::Running) => {}
+                Ok(_) => {
+                    already_stopped.push(node_id);
+                    continue;
+                }
+                Err(_) => {
+                    already_stopped.push(node_id);
+                    continue;
+                }
+            }
+
+            match self.stop_node(node_id).await {
+                Ok(()) => {
+                    stopped.push(NodeStopped {
+                        node_id,
+                        service_name: service_name.clone(),
+                    });
+                }
+                Err(Error::NodeNotRunning(_)) => {
+                    already_stopped.push(node_id);
+                }
+                Err(e) => {
+                    failed.push(NodeStopFailed {
+                        node_id,
+                        service_name: service_name.clone(),
+                        error: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        StopNodeResult {
+            stopped,
+            failed,
+            already_stopped,
+        }
     }
 
     /// Get the status of a node.
@@ -387,6 +445,71 @@ async fn monitor_node(
     }
 }
 
+/// Timeout for graceful shutdown before force-killing.
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Send SIGTERM to a process, wait for it to exit, and SIGKILL if it doesn't.
+async fn graceful_kill(pid: u32) {
+    send_signal_term(pid);
+
+    // Poll for process exit
+    let start = Instant::now();
+    loop {
+        if !is_process_alive(pid) {
+            return;
+        }
+        if start.elapsed() >= GRACEFUL_SHUTDOWN_TIMEOUT {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Force kill if still alive
+    send_signal_kill(pid);
+
+    // Brief wait for force kill to take effect
+    for _ in 0..10 {
+        if !is_process_alive(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(unix)]
+fn send_signal_term(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+}
+
+#[cfg(unix)]
+fn send_signal_kill(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn send_signal_term(_pid: u32) {
+    unimplemented!("Windows process termination requires windows-sys dependency")
+}
+
+#[cfg(windows)]
+fn send_signal_kill(_pid: u32) {
+    unimplemented!("Windows process termination requires windows-sys dependency")
+}
+
+#[cfg(windows)]
+fn is_process_alive(_pid: u32) -> bool {
+    unimplemented!("Windows process check requires windows-sys dependency")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,5 +659,73 @@ mod tests {
         assert_eq!(running, 1);
         assert_eq!(stopped, 1);
         assert_eq!(errored, 1);
+    }
+
+    #[tokio::test]
+    async fn stop_node_not_found() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut sup = Supervisor::new(tx);
+
+        let result = sup.stop_node(999).await;
+        assert!(matches!(result, Err(Error::NodeNotFound(999))));
+    }
+
+    #[tokio::test]
+    async fn stop_node_not_running() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut sup = Supervisor::new(tx);
+
+        sup.node_states.insert(
+            1,
+            NodeRuntime {
+                status: NodeStatus::Stopped,
+                pid: None,
+                started_at: None,
+                restart_count: 0,
+                first_crash_at: None,
+            },
+        );
+
+        let result = sup.stop_node(1).await;
+        assert!(matches!(result, Err(Error::NodeNotRunning(1))));
+    }
+
+    #[tokio::test]
+    async fn stop_all_nodes_mixed_states() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut sup = Supervisor::new(tx);
+
+        // Node 1: running (but with a fake PID that won't exist)
+        sup.node_states.insert(
+            1,
+            NodeRuntime {
+                status: NodeStatus::Running,
+                pid: Some(999999),
+                started_at: Some(Instant::now()),
+                restart_count: 0,
+                first_crash_at: None,
+            },
+        );
+        // Node 2: already stopped
+        sup.node_states.insert(
+            2,
+            NodeRuntime {
+                status: NodeStatus::Stopped,
+                pid: None,
+                started_at: None,
+                restart_count: 0,
+                first_crash_at: None,
+            },
+        );
+
+        let configs = vec![(1, "node1".to_string()), (2, "node2".to_string())];
+
+        let result = sup.stop_all_nodes(&configs).await;
+
+        assert_eq!(result.stopped.len(), 1);
+        assert_eq!(result.stopped[0].node_id, 1);
+        assert_eq!(result.stopped[0].service_name, "node1");
+        assert_eq!(result.already_stopped, vec![2]);
+        assert!(result.failed.is_empty());
     }
 }

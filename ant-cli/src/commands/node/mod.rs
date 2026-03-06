@@ -2,6 +2,7 @@ pub mod add;
 pub mod daemon;
 pub mod reset;
 pub mod start;
+pub mod stop;
 
 use clap::Subcommand;
 
@@ -9,6 +10,7 @@ use crate::commands::node::add::AddArgs;
 use crate::commands::node::daemon::DaemonCommand;
 use crate::commands::node::reset::ResetArgs;
 use crate::commands::node::start::StartArgs;
+use crate::commands::node::stop::StopArgs;
 
 #[derive(Subcommand)]
 pub enum NodeCommand {
@@ -23,4 +25,6 @@ pub enum NodeCommand {
     Reset(ResetArgs),
     /// Start node(s). With no arguments starts all nodes; use --service-name for a specific node.
     Start(StartArgs),
+    /// Stop node(s). With no arguments stops all nodes; use --service-name for a specific node.
+    Stop(StopArgs),
 }

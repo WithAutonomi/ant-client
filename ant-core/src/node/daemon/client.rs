@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::node::process::detach;
 use crate::node::types::{
     DaemonConfig, DaemonInfo, DaemonStartResult, DaemonStatus, DaemonStopResult, NodeStarted,
-    StartNodeResult,
+    NodeStopped, StartNodeResult, StopNodeResult,
 };
 
 /// Get the daemon's current status by querying its REST API.
@@ -146,6 +146,48 @@ pub async fn start_all_nodes(config: &DaemonConfig) -> Result<StartNodeResult> {
 
     if resp.status().is_success() {
         resp.json::<StartNodeResult>()
+            .await
+            .map_err(|e| Error::HttpRequest(e.to_string()))
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(Error::HttpRequest(body))
+    }
+}
+
+/// Stop a specific node by ID via the daemon REST API.
+pub async fn stop_node(config: &DaemonConfig, node_id: u32) -> Result<NodeStopped> {
+    let port = read_port_file(&config.port_file_path).ok_or(Error::DaemonNotRunning)?;
+
+    let url = format!("http://127.0.0.1:{port}/api/v1/nodes/{node_id}/stop");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| Error::HttpRequest(e.to_string()))?;
+
+    if resp.status().is_success() {
+        resp.json::<NodeStopped>()
+            .await
+            .map_err(|e| Error::HttpRequest(e.to_string()))
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(Error::HttpRequest(body))
+    }
+}
+
+/// Stop all running nodes via the daemon REST API.
+pub async fn stop_all_nodes(config: &DaemonConfig) -> Result<StopNodeResult> {
+    let port = read_port_file(&config.port_file_path).ok_or(Error::DaemonNotRunning)?;
+
+    let url = format!("http://127.0.0.1:{port}/api/v1/nodes/stop-all");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| Error::HttpRequest(e.to_string()))?;
+
+    if resp.status().is_success() {
+        resp.json::<StopNodeResult>()
             .await
             .map_err(|e| Error::HttpRequest(e.to_string()))
     } else {

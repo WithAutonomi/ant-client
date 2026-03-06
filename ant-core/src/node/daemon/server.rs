@@ -19,8 +19,8 @@ use crate::node::daemon::supervisor::Supervisor;
 use crate::node::events::NodeEvent;
 use crate::node::registry::NodeRegistry;
 use crate::node::types::{
-    AddNodeOpts, AddNodeResult, DaemonConfig, DaemonStatus, NodeStarted, RemoveNodeResult,
-    ResetResult, StartNodeResult,
+    AddNodeOpts, AddNodeResult, DaemonConfig, DaemonStatus, NodeStarted, NodeStopped,
+    RemoveNodeResult, ResetResult, StartNodeResult, StopNodeResult,
 };
 
 /// Shared application state for the daemon HTTP server.
@@ -89,6 +89,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/nodes/{id}", delete(delete_node))
         .route("/api/v1/nodes/{id}/start", post(post_start_node))
         .route("/api/v1/nodes/start-all", post(post_start_all))
+        .route("/api/v1/nodes/{id}/stop", post(post_stop_node))
+        .route("/api/v1/nodes/stop-all", post(post_stop_all))
         .route("/api/v1/reset", post(post_reset))
         .route("/api/v1/openapi.json", get(get_openapi))
         .with_state(state)
@@ -291,6 +293,86 @@ async fn post_start_all(State(state): State<Arc<AppState>>) -> Json<StartNodeRes
     })
 }
 
+/// POST /api/v1/nodes/:id/stop — Stop a specific node.
+async fn post_stop_node(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u32>,
+) -> std::result::Result<Json<NodeStopped>, (StatusCode, Json<serde_json::Value>)> {
+    let registry = state.registry.read().await;
+    let config = match registry.get(id) {
+        Ok(config) => config.clone(),
+        Err(_) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("Node not found: {id}") })),
+            ))
+        }
+    };
+    drop(registry);
+
+    {
+        let supervisor = state.supervisor.read().await;
+        if !supervisor.is_running(id) {
+            let status = supervisor
+                .node_status(id)
+                .unwrap_or(crate::node::types::NodeStatus::Stopped);
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("Node {id} is not running"),
+                    "current_state": {
+                        "node_id": id,
+                        "status": status,
+                    }
+                })),
+            ));
+        }
+    }
+
+    let mut supervisor = state.supervisor.write().await;
+    match supervisor.stop_node(id).await {
+        Ok(()) => Ok(Json(NodeStopped {
+            node_id: id,
+            service_name: config.service_name,
+        })),
+        Err(crate::error::Error::NodeNotRunning(id)) => {
+            let status = supervisor
+                .node_status(id)
+                .unwrap_or(crate::node::types::NodeStatus::Stopped);
+            Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("Node {id} is not running"),
+                    "current_state": {
+                        "node_id": id,
+                        "status": status,
+                    }
+                })),
+            ))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
+/// POST /api/v1/nodes/stop-all — Stop all running nodes.
+async fn post_stop_all(State(state): State<Arc<AppState>>) -> Json<StopNodeResult> {
+    let registry = state.registry.read().await;
+    let configs: Vec<(u32, String)> = registry
+        .list()
+        .into_iter()
+        .map(|c| (c.id, c.service_name.clone()))
+        .collect();
+    drop(registry);
+
+    let mut supervisor = state.supervisor.write().await;
+    let result = supervisor.stop_all_nodes(&configs).await;
+
+    Json(result)
+}
+
 /// POST /api/v1/reset — Reset all node state.
 async fn post_reset(
     State(state): State<Arc<AppState>>,
@@ -457,6 +539,53 @@ async fn get_openapi() -> impl IntoResponse {
                             "content": {
                                 "application/json": {
                                     "schema": { "$ref": "#/components/schemas/StartNodeResult" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/nodes/{id}/stop": {
+                "post": {
+                    "summary": "Stop a node",
+                    "description": "Stop a specific node by ID. Returns 409 if already stopped with current_state.",
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "integer" }
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "Node stopped",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/NodeStopped" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Node not found"
+                        },
+                        "409": {
+                            "description": "Node not running (includes current_state)"
+                        },
+                        "500": {
+                            "description": "Failed to stop node"
+                        }
+                    }
+                }
+            },
+            "/api/v1/nodes/stop-all": {
+                "post": {
+                    "summary": "Stop all nodes",
+                    "description": "Stop all running nodes. Returns per-node results.",
+                    "responses": {
+                        "200": {
+                            "description": "Stop results",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/StopNodeResult" }
                                 }
                             }
                         }

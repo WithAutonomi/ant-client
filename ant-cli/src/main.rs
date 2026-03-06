@@ -26,6 +26,10 @@ async fn main() -> anyhow::Result<()> {
             commands::node::NodeCommand::Start(args) => {
                 args.execute(cli.json).await?;
             }
+
+            commands::node::NodeCommand::Stop(args) => {
+                args.execute(cli.json).await?;
+            }
         },
     }
 

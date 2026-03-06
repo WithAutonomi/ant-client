@@ -160,6 +160,33 @@ If the daemon is not running, the command will fail with an error asking you to 
 |------|-------------|
 | `--service-name <NAME>` | Start a specific node by its service name (e.g., `node1`) |
 
+### `ant node stop`
+
+Stop running node(s). Requires the daemon to be running. With no arguments, stops all running nodes. Use `--service-name` to stop a specific node.
+
+```
+$ ant node stop
+Stopped 3 node(s):
+  node1 (1)
+  node2 (2)
+  node3 (3)
+```
+
+#### Stopping a specific node
+
+```
+$ ant node stop --service-name node1
+Node node1 (1) stopped
+```
+
+If the daemon is not running, the command will fail with an error asking you to start it first.
+
+#### Options
+
+| Flag | Description |
+|------|-------------|
+| `--service-name <NAME>` | Stop a specific node by its service name (e.g., `node1`) |
+
 ### `ant node reset`
 
 Remove all node data directories, log directories, and clear the registry, returning the system to a clean state. All nodes must be stopped before running this command.
@@ -204,6 +231,8 @@ When the daemon is running, it exposes these endpoints on `127.0.0.1:<port>`:
 | DELETE | `/api/v1/nodes/{id}` | Remove a node from the registry |
 | POST | `/api/v1/nodes/{id}/start` | Start a specific node |
 | POST | `/api/v1/nodes/start-all` | Start all registered nodes |
+| POST | `/api/v1/nodes/{id}/stop` | Stop a specific node |
+| POST | `/api/v1/nodes/stop-all` | Stop all running nodes |
 | POST | `/api/v1/reset` | Reset all node state (fails if nodes running) |
 | GET | `/api/v1/openapi.json` | OpenAPI 3.1 specification |
 
