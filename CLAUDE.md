@@ -110,6 +110,10 @@ cargo run --bin ant -- --help  # Run the CLI
 - **Dual-path CLI commands**: Commands that modify the registry (like `ant node add`) check if the daemon is running. If so, they route through the REST API; otherwise, they operate directly on the registry file.
 - **Binary source resolution**: Node binary sources are represented by the `BinarySource` enum (Latest, Version, Url, LocalPath). Download variants are stubbed until release infrastructure is available.
 
+## E2E Test Skill
+
+The project includes an E2E test command at `.claude/commands/e2e-node-management-test.md` that tests all node management features against a real testnet (invoked via `/e2e-node-management-test`). When adding new `ant node` subcommands or changing existing node management behavior, update this command to cover the new or changed functionality.
+
 ## Linear Project
 
 This project tracks work under the "Unified CLI" project in Linear (team: v2.0).
