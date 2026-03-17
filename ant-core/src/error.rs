@@ -50,6 +50,9 @@ pub enum Error {
     #[error("Invalid rewards address: {0}")]
     InvalidRewardsAddress(String),
 
+    #[error("Failed to stop daemon: {0}")]
+    DaemonStopFailed(String),
+
     #[error(
         "Cannot reset while nodes are running ({0} node(s) still running). Stop all nodes first."
     )]

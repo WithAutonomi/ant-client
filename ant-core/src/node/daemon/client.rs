@@ -49,10 +49,30 @@ pub async fn status(config: &DaemonConfig) -> Result<DaemonStatus> {
 
 /// Stop the running daemon.
 ///
-/// Reads the PID from the PID file, sends SIGTERM (Unix) or TerminateProcess (Windows),
-/// and waits for the process to exit.
+/// Reads the PID from the PID file, validates the process is actually a daemon
+/// instance, sends SIGTERM (Unix) or Ctrl+C (Windows), and waits for the process
+/// to exit.
 pub async fn stop(config: &DaemonConfig) -> Result<DaemonStopResult> {
     let pid = read_pid_file(&config.pid_file_path)?;
+
+    // Validate the process is actually our daemon before killing it.
+    // After a crash, the PID may have been reused by an unrelated process.
+    if !is_process_alive(pid) {
+        // Process is already dead — just clean up stale files
+        let _ = std::fs::remove_file(&config.pid_file_path);
+        let _ = std::fs::remove_file(&config.port_file_path);
+        return Ok(DaemonStopResult { pid });
+    }
+
+    if !validate_daemon_process(pid) {
+        // PID is alive but isn't our daemon — clean up stale files without killing
+        let _ = std::fs::remove_file(&config.pid_file_path);
+        let _ = std::fs::remove_file(&config.port_file_path);
+        return Err(Error::DaemonStopFailed(format!(
+            "PID {pid} is alive but does not appear to be the ant daemon (possible PID reuse). \
+             Stale PID file removed."
+        )));
+    }
 
     send_terminate(pid);
 
@@ -258,6 +278,51 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     Ok(())
+}
+
+/// Validate that a PID belongs to an ant daemon process by checking its
+/// command line. This guards against PID reuse after a daemon crash.
+#[cfg(unix)]
+fn validate_daemon_process(pid: u32) -> bool {
+    let cmdline_path = format!("/proc/{pid}/cmdline");
+    match std::fs::read_to_string(&cmdline_path) {
+        Ok(cmdline) => {
+            // /proc/PID/cmdline uses null bytes as separators
+            let cmdline = cmdline.replace('\0', " ");
+            cmdline.contains("ant") && cmdline.contains("daemon")
+        }
+        Err(_) => {
+            // On non-Linux Unix (macOS), /proc doesn't exist. Fall back to
+            // trusting the PID file since there's no cheap way to inspect
+            // the command line without shelling out.
+            true
+        }
+    }
+}
+
+#[cfg(windows)]
+fn validate_daemon_process(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let success = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
+        CloseHandle(handle);
+
+        if success == 0 {
+            return false;
+        }
+        let name = String::from_utf16_lossy(&buf[..size as usize]);
+        name.contains("ant")
+    }
 }
 
 fn read_port_file(path: &Path) -> Option<u16> {
