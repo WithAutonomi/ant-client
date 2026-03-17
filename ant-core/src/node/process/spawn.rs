@@ -21,10 +21,16 @@ pub async fn spawn_node(
     let stdout_path = log_dir.join("stdout.log");
     let stderr_path = log_dir.join("stderr.log");
 
-    let stdout_file = std::fs::File::create(&stdout_path)
-        .map_err(|e| Error::ProcessSpawn(format!("Failed to create stdout log: {e}")))?;
-    let stderr_file = std::fs::File::create(&stderr_path)
-        .map_err(|e| Error::ProcessSpawn(format!("Failed to create stderr log: {e}")))?;
+    let stdout_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stdout_path)
+        .map_err(|e| Error::ProcessSpawn(format!("Failed to open stdout log: {e}")))?;
+    let stderr_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_path)
+        .map_err(|e| Error::ProcessSpawn(format!("Failed to open stderr log: {e}")))?;
 
     let mut cmd = Command::new(binary_path);
     cmd.args(args)
@@ -32,6 +38,8 @@ pub async fn spawn_node(
         .stdin(Stdio::null())
         .stdout(stdout_file)
         .stderr(stderr_file)
+        // Nodes intentionally survive daemon restarts. The daemon re-discovers
+        // running nodes on startup via the registry and PID checks.
         .kill_on_drop(false);
 
     #[cfg(windows)]

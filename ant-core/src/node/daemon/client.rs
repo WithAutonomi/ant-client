@@ -84,6 +84,13 @@ pub async fn stop(config: &DaemonConfig) -> Result<DaemonStopResult> {
         }
     }
 
+    // Verify the process actually died
+    if is_process_alive(pid) {
+        return Err(Error::DaemonStopFailed(format!(
+            "Daemon (PID {pid}) is still alive after 5 seconds"
+        )));
+    }
+
     // Clean up files if they still exist
     let _ = std::fs::remove_file(&config.pid_file_path);
     let _ = std::fs::remove_file(&config.port_file_path);

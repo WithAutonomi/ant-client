@@ -86,6 +86,13 @@ pub async fn start(
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
+    use tower_http::cors::{Any, CorsLayer};
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     Router::new()
         .route("/console", get(get_console))
         .route("/api/v1/status", get(get_status))
@@ -99,6 +106,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/nodes/stop-all", post(post_stop_all))
         .route("/api/v1/reset", post(post_reset))
         .route("/api/v1/openapi.json", get(get_openapi))
+        .layer(cors)
         .with_state(state)
 }
 

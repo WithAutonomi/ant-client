@@ -55,13 +55,18 @@ impl NodeRegistry {
         Ok((registry, lock_file))
     }
 
-    /// Save the registry to disk.
+    /// Save the registry to disk atomically.
+    ///
+    /// Writes to a temporary file first, then renames to the target path.
+    /// This prevents registry corruption if the process crashes mid-write.
     pub fn save(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let contents = serde_json::to_string_pretty(self)?;
-        std::fs::write(&self.path, contents)?;
+        let tmp_path = self.path.with_extension("tmp");
+        std::fs::write(&tmp_path, &contents)?;
+        std::fs::rename(&tmp_path, &self.path)?;
         Ok(())
     }
 
@@ -228,5 +233,18 @@ mod tests {
         reg.clear();
         assert!(reg.is_empty());
         assert_eq!(reg.next_id, 1);
+    }
+
+    #[test]
+    fn save_is_atomic_no_tmp_file_remains() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().with_extension("json");
+        let mut reg = NodeRegistry::load(&path).unwrap();
+        reg.add(make_config(0));
+        reg.save().unwrap();
+
+        // The temp file should not remain after a successful save
+        assert!(path.exists());
+        assert!(!path.with_extension("tmp").exists());
     }
 }
