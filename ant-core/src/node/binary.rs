@@ -229,6 +229,16 @@ fn extract_tar_gz(data: &[u8], install_dir: &Path) -> Result<PathBuf> {
             .path()
             .map_err(|e| Error::BinaryResolution(format!("invalid path in archive: {e}")))?;
 
+        // Reject paths with traversal components (e.g., "../../../etc/passwd")
+        for component in path.components() {
+            if matches!(component, std::path::Component::ParentDir) {
+                return Err(Error::BinaryResolution(format!(
+                    "path traversal detected in archive: {}",
+                    path.display()
+                )));
+            }
+        }
+
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -428,6 +438,43 @@ mod tests {
 
         let result = extract_tar_gz(&gz_data, tmp.path());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_tar_gz_rejects_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Build a tar archive with a path traversal entry using raw bytes.
+        // The tar crate's set_path() rejects ".." so we write the header manually.
+        let data = b"malicious content";
+        let mut header = tar::Header::new_gnu();
+        // Use a safe placeholder first, then overwrite the raw name bytes
+        header.set_path("placeholder").unwrap();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o755);
+
+        // Overwrite the name field (first 100 bytes) with a traversal path
+        let traversal = b"../../../etc/evil";
+        let raw = header.as_mut_bytes();
+        raw[..traversal.len()].copy_from_slice(traversal);
+        raw[traversal.len()] = 0;
+        header.set_cksum();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.append(&header, &data[..]).unwrap();
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar_data).unwrap();
+        let gz_data = encoder.finish().unwrap();
+
+        let result = extract_tar_gz(&gz_data, tmp.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("path traversal"),
+            "expected path traversal error, got: {err}"
+        );
     }
 
     #[tokio::test]
