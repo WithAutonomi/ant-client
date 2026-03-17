@@ -243,27 +243,25 @@ async fn post_start_node(
 
     let supervisor_ref = state.supervisor.clone();
 
-    {
-        let supervisor = state.supervisor.read().await;
-        if supervisor.is_running(id) {
-            let pid = supervisor.node_pid(id);
-            let uptime_secs = supervisor.node_uptime_secs(id);
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!("Node {id} is already running"),
-                    "current_state": {
-                        "node_id": id,
-                        "status": "running",
-                        "pid": pid,
-                        "uptime_secs": uptime_secs,
-                    }
-                })),
-            ));
-        }
+    // Acquire write lock once for atomic check-and-act (avoids TOCTOU race)
+    let mut supervisor = state.supervisor.write().await;
+    if supervisor.is_running(id) {
+        let pid = supervisor.node_pid(id);
+        let uptime_secs = supervisor.node_uptime_secs(id);
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("Node {id} is already running"),
+                "current_state": {
+                    "node_id": id,
+                    "status": "running",
+                    "pid": pid,
+                    "uptime_secs": uptime_secs,
+                }
+            })),
+        ));
     }
 
-    let mut supervisor = state.supervisor.write().await;
     match supervisor.start_node(&config, supervisor_ref).await {
         Ok(started) => Ok(Json(started)),
         Err(crate::error::Error::NodeAlreadyRunning(id)) => {
@@ -347,26 +345,24 @@ async fn post_stop_node(
     };
     drop(registry);
 
-    {
-        let supervisor = state.supervisor.read().await;
-        if !supervisor.is_running(id) {
-            let status = supervisor
-                .node_status(id)
-                .unwrap_or(crate::node::types::NodeStatus::Stopped);
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!("Node {id} is not running"),
-                    "current_state": {
-                        "node_id": id,
-                        "status": status,
-                    }
-                })),
-            ));
-        }
+    // Acquire write lock once for atomic check-and-act (avoids TOCTOU race)
+    let mut supervisor = state.supervisor.write().await;
+    if !supervisor.is_running(id) {
+        let status = supervisor
+            .node_status(id)
+            .unwrap_or(crate::node::types::NodeStatus::Stopped);
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("Node {id} is not running"),
+                "current_state": {
+                    "node_id": id,
+                    "status": status,
+                }
+            })),
+        ));
     }
 
-    let mut supervisor = state.supervisor.write().await;
     match supervisor.stop_node(id).await {
         Ok(()) => Ok(Json(NodeStopped {
             node_id: id,
