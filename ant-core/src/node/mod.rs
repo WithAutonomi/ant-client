@@ -32,12 +32,8 @@ pub async fn add_nodes(
     registry_path: &Path,
     progress: &dyn ProgressReporter,
 ) -> Result<AddNodeResult> {
-    // Validate rewards address is non-empty
-    if opts.rewards_address.trim().is_empty() {
-        return Err(Error::InvalidRewardsAddress(
-            "rewards address cannot be empty".to_string(),
-        ));
-    }
+    // Validate rewards address format (Ethereum-style: 0x followed by 40 hex chars)
+    validate_rewards_address(&opts.rewards_address)?;
 
     // Validate port ranges match count
     if let Some(ref port_range) = opts.node_port {
@@ -205,6 +201,36 @@ pub fn node_status_offline(registry_path: &Path) -> Result<NodeStatusResult> {
     })
 }
 
+/// Validate that a rewards address is a valid Ethereum-style address.
+///
+/// Must be `0x` followed by exactly 40 hexadecimal characters.
+fn validate_rewards_address(address: &str) -> Result<()> {
+    let address = address.trim();
+    if address.is_empty() {
+        return Err(Error::InvalidRewardsAddress(
+            "rewards address cannot be empty".to_string(),
+        ));
+    }
+    if !address.starts_with("0x") && !address.starts_with("0X") {
+        return Err(Error::InvalidRewardsAddress(format!(
+            "rewards address must start with '0x', got '{address}'"
+        )));
+    }
+    let hex_part = &address[2..];
+    if hex_part.len() != 40 {
+        return Err(Error::InvalidRewardsAddress(format!(
+            "rewards address must be 42 characters (0x + 40 hex), got {} characters",
+            address.len()
+        )));
+    }
+    if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::InvalidRewardsAddress(format!(
+            "rewards address contains non-hex characters: '{address}'"
+        )));
+    }
+    Ok(())
+}
+
 /// Determine the data directory for a node.
 fn node_data_dir(custom_prefix: &Option<PathBuf>, node_id: u32) -> PathBuf {
     match custom_prefix {
@@ -234,6 +260,9 @@ mod tests {
     use crate::node::binary::NoopProgress;
     use crate::node::types::{BinarySource, PortRange};
 
+    /// A valid Ethereum address for use in tests.
+    const TEST_ADDR: &str = "0x1234567890abcdef1234567890abcdef12345678";
+
     fn test_registry_path(dir: &std::path::Path) -> PathBuf {
         dir.join("node_registry.json")
     }
@@ -262,7 +291,7 @@ mod tests {
 
         let opts = AddNodeOpts {
             count: 1,
-            rewards_address: "0xabc123".to_string(),
+            rewards_address: TEST_ADDR.to_string(),
             data_dir_path: Some(tmp.path().join("data")),
             log_dir_path: Some(tmp.path().join("logs")),
             binary_source: BinarySource::LocalPath(binary),
@@ -271,7 +300,7 @@ mod tests {
 
         let result = add_nodes(opts, &reg_path, &NoopProgress).await.unwrap();
         assert_eq!(result.nodes_added.len(), 1);
-        assert_eq!(result.nodes_added[0].rewards_address, "0xabc123");
+        assert_eq!(result.nodes_added[0].rewards_address, TEST_ADDR);
         assert_eq!(result.nodes_added[0].id, 1);
         assert!(result.nodes_added[0].data_dir.exists());
         assert!(result.nodes_added[0].log_dir.as_ref().unwrap().exists());
@@ -289,7 +318,7 @@ mod tests {
 
         let opts = AddNodeOpts {
             count: 3,
-            rewards_address: "0xdef456".to_string(),
+            rewards_address: TEST_ADDR.to_string(),
             node_port: Some(PortRange::Range(12000, 12002)),
             data_dir_path: Some(tmp.path().join("data")),
             log_dir_path: Some(tmp.path().join("logs")),
@@ -315,7 +344,7 @@ mod tests {
 
         let opts = AddNodeOpts {
             count: 3,
-            rewards_address: "0xtest".to_string(),
+            rewards_address: TEST_ADDR.to_string(),
             node_port: Some(PortRange::Range(12000, 12001)), // 2 ports, 3 nodes
             binary_source: BinarySource::LocalPath(binary),
             ..Default::default()
@@ -348,6 +377,36 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn validate_rewards_address_rejects_missing_prefix() {
+        let result = validate_rewards_address("1234567890abcdef1234567890abcdef12345678");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_rewards_address_rejects_short_address() {
+        let result = validate_rewards_address("0xabc123");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_rewards_address_rejects_non_hex() {
+        let result = validate_rewards_address("0xGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_rewards_address_accepts_valid() {
+        let result = validate_rewards_address(TEST_ADDR);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_rewards_address_accepts_uppercase_hex() {
+        let result = validate_rewards_address("0xABCDEF1234567890ABCDEF1234567890ABCDEF12");
+        assert!(result.is_ok());
+    }
+
     #[tokio::test]
     async fn add_nodes_with_custom_data_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -357,7 +416,7 @@ mod tests {
 
         let opts = AddNodeOpts {
             count: 1,
-            rewards_address: "0xtest".to_string(),
+            rewards_address: TEST_ADDR.to_string(),
             data_dir_path: Some(custom_data.clone()),
             binary_source: BinarySource::LocalPath(binary),
             ..Default::default()
@@ -375,7 +434,7 @@ mod tests {
 
         let opts = AddNodeOpts {
             count: 1,
-            rewards_address: "0xtest".to_string(),
+            rewards_address: TEST_ADDR.to_string(),
             data_dir_path: Some(tmp.path().join("data")),
             // log_dir_path not set — defaults to None
             binary_source: BinarySource::LocalPath(binary),
@@ -436,7 +495,7 @@ mod tests {
         // Add 2 nodes
         let opts = AddNodeOpts {
             count: 2,
-            rewards_address: "0xreset_test".to_string(),
+            rewards_address: TEST_ADDR.to_string(),
             data_dir_path: Some(tmp.path().join("data")),
             log_dir_path: Some(tmp.path().join("logs")),
             binary_source: BinarySource::LocalPath(binary),
@@ -548,7 +607,7 @@ mod tests {
         // Add 2 nodes
         let opts = AddNodeOpts {
             count: 2,
-            rewards_address: "0xfirst_batch".to_string(),
+            rewards_address: TEST_ADDR.to_string(),
             data_dir_path: Some(tmp.path().join("data")),
             log_dir_path: Some(tmp.path().join("logs")),
             binary_source: BinarySource::LocalPath(binary.clone()),
@@ -562,7 +621,7 @@ mod tests {
         // Add again — IDs should restart from 1
         let opts = AddNodeOpts {
             count: 1,
-            rewards_address: "0xsecond_batch".to_string(),
+            rewards_address: TEST_ADDR.to_string(),
             data_dir_path: Some(tmp.path().join("data")),
             log_dir_path: Some(tmp.path().join("logs")),
             binary_source: BinarySource::LocalPath(binary),
@@ -571,6 +630,6 @@ mod tests {
         let result = add_nodes(opts, &reg_path, &NoopProgress).await.unwrap();
 
         assert_eq!(result.nodes_added[0].id, 1);
-        assert_eq!(result.nodes_added[0].rewards_address, "0xsecond_batch");
+        assert_eq!(result.nodes_added[0].rewards_address, TEST_ADDR);
     }
 }

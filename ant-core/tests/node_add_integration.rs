@@ -5,6 +5,8 @@ use ant_core::node::binary::NoopProgress;
 use ant_core::node::registry::NodeRegistry;
 use ant_core::node::types::{AddNodeOpts, BinarySource, PortRange};
 
+const TEST_ADDR: &str = "0x1234567890abcdef1234567890abcdef12345678";
+
 /// Create a fake binary that responds to --version
 fn create_fake_binary(dir: &std::path::Path) -> PathBuf {
     let binary_path = dir.join("fake-antnode");
@@ -29,7 +31,7 @@ async fn add_nodes_creates_registry_and_directories() {
 
     let opts = AddNodeOpts {
         count: 2,
-        rewards_address: "0xintegration_test".to_string(),
+        rewards_address: TEST_ADDR.to_string(),
         node_port: Some(PortRange::Range(12000, 12001)),
         metrics_port: Some(PortRange::Range(13000, 13001)),
         data_dir_path: Some(tmp.path().join("data")),
@@ -82,7 +84,7 @@ async fn add_then_remove_node() {
     // Add a node
     let opts = AddNodeOpts {
         count: 1,
-        rewards_address: "0xremove_test".to_string(),
+        rewards_address: TEST_ADDR.to_string(),
         data_dir_path: Some(tmp.path().join("data")),
         log_dir_path: Some(tmp.path().join("logs")),
         binary_source: BinarySource::LocalPath(binary),
@@ -96,7 +98,7 @@ async fn add_then_remove_node() {
 
     // Remove it
     let remove_result = ant_core::node::remove_node(node_id, &reg_path).unwrap();
-    assert_eq!(remove_result.removed.rewards_address, "0xremove_test");
+    assert_eq!(remove_result.removed.rewards_address, TEST_ADDR);
 
     // Verify registry is empty
     let reg = NodeRegistry::load(&reg_path).unwrap();
@@ -111,7 +113,7 @@ async fn add_nodes_with_env_variables() {
 
     let opts = AddNodeOpts {
         count: 1,
-        rewards_address: "0xenv_test".to_string(),
+        rewards_address: TEST_ADDR.to_string(),
         data_dir_path: Some(tmp.path().join("data")),
         log_dir_path: Some(tmp.path().join("logs")),
         binary_source: BinarySource::LocalPath(binary),
