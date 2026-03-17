@@ -64,12 +64,13 @@ Verify the JSON response contains `pid` (a number) and `already_running` is `fal
 ant node daemon status --json
 ```
 
-Verify: `running` is `true`, `pid` is present, `port` is present.
+Verify: `running` is `true`, `pid` is present, `port` is present and **non-zero** (the daemon binds
+to an OS-assigned port, so port must be a real port number, not 0).
 
 **Step 5.3 — Check daemon info:**
 
 ```
-ant node daemon info
+ant node daemon info --json
 ```
 
 Verify: `running` is `true`, `api_base` contains a URL like `http://127.0.0.1:<port>/api/v1`.
@@ -155,7 +156,7 @@ Using the `api_base` URL from Step 5.3, make the following requests with `curl`:
 curl -s <api_base>/status
 ```
 
-Verify: response is JSON with `nodes_total`, `nodes_running`, etc.
+Verify: response is JSON with `nodes_total`, `nodes_running`, etc. Also verify `port` is non-zero.
 
 **Step 7.2 — Nodes status endpoint:**
 
@@ -183,6 +184,14 @@ curl -s http://127.0.0.1:<port>/console
 ```
 
 Verify: response contains HTML (check for `<html` or `<!DOCTYPE`).
+
+**Step 7.5 — CORS headers:**
+
+```bash
+curl -s -I -X OPTIONS -H "Origin: http://example.com" -H "Access-Control-Request-Method: GET" <api_base>/status
+```
+
+Verify: response includes `access-control-allow-origin` header (case-insensitive check).
 
 ### Phase 8: Cleanup
 
@@ -247,6 +256,7 @@ Phase 7: REST API
   [PASS] 7.2 GET /nodes/status
   [PASS] 7.3 GET /openapi.json
   [PASS] 7.4 GET /console
+  [PASS] 7.5 CORS headers
 
 Phase 8: Cleanup
   [PASS] 8.1 Stop all nodes
