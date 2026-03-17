@@ -497,6 +497,28 @@ fn is_process_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn send_signal_term(pid: u32) {
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler, CTRL_C_EVENT,
+    };
+
+    unsafe {
+        // Detach from our own console so we don't kill ourselves
+        FreeConsole();
+
+        // Attach to the target process's console and send Ctrl+C
+        if AttachConsole(pid) != 0 {
+            // Disable our own handler so we don't terminate
+            SetConsoleCtrlHandler(None, 1);
+            GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
+            // Re-enable our handler and detach
+            SetConsoleCtrlHandler(None, 0);
+            FreeConsole();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn send_signal_kill(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
@@ -507,12 +529,6 @@ fn send_signal_term(pid: u32) {
             CloseHandle(handle);
         }
     }
-}
-
-#[cfg(windows)]
-fn send_signal_kill(pid: u32) {
-    // Windows has no SIGKILL equivalent; TerminateProcess is already forceful.
-    send_signal_term(pid);
 }
 
 #[cfg(windows)]
