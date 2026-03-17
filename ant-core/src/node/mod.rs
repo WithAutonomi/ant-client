@@ -88,7 +88,7 @@ pub async fn add_nodes(
             log_dir,
             node_port,
             metrics_port,
-            network_id: Some(opts.network_id as u32),
+            network_id: Some(opts.network_id),
             binary_path: PathBuf::new(), // placeholder, updated below
             version: version.clone(),
             env_variables: env_map.clone(),

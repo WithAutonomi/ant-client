@@ -36,7 +36,7 @@ pub struct AddArgs {
 
     /// Network ID (default: 1 for mainnet)
     #[arg(long, default_value = "1")]
-    pub network_id: u8,
+    pub network_id: u32,
 
     /// Path to a local node binary
     #[arg(long, conflicts_with_all = &["version", "url"])]

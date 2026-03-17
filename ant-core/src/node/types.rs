@@ -205,7 +205,7 @@ pub struct AddNodeOpts {
     #[schema(value_type = Option<String>)]
     pub log_dir_path: Option<PathBuf>,
     /// Network ID. Default: 1 (mainnet).
-    pub network_id: u8,
+    pub network_id: u32,
     /// Source for the node binary.
     pub binary_source: BinarySource,
     /// Bootstrap peer(s).
