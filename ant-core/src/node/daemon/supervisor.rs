@@ -526,17 +526,20 @@ fn send_signal_term(pid: u32) {
 
         // Attach to the target process's console and send Ctrl+C
         if AttachConsole(pid) != 0 {
-            // Permanently disable Ctrl+C handling in the daemon process.
-            // GenerateConsoleCtrlEvent is asynchronous — it dispatches to a
-            // separate handler thread that checks the ignore flag whenever it
-            // wakes up. Re-enabling the handler after sending the event creates
-            // an unwinnable race: the handler thread can wake up after the flag
-            // is cleared and terminate the daemon. Since the daemon is a
-            // background process that uses CancellationToken for shutdown, it
-            // never needs to respond to Ctrl+C.
+            // Disable Ctrl+C handling so GenerateConsoleCtrlEvent doesn't
+            // terminate us while we're attached to the node's console.
             SetConsoleCtrlHandler(None, 1);
             GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
+            // Detach from the node's console first — once detached, the
+            // async Ctrl+C event can only reach the node, not us.
             FreeConsole();
+            // Brief delay to let the event drain before re-enabling our
+            // handler. Without this, the handler thread can process the
+            // event between FreeConsole and SetConsoleCtrlHandler.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // Restore Ctrl+C handling so `daemon run` (foreground mode)
+            // can still be stopped via Ctrl+C / tokio::signal::ctrl_c().
+            SetConsoleCtrlHandler(None, 0);
         }
     }
 }
