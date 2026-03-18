@@ -424,7 +424,20 @@ async fn monitor_node(
         // Try to restart
         match spawn_node_from_config(&config).await {
             Ok(new_child) => {
-                let pid = new_child.id().unwrap_or(0);
+                let pid = match new_child.id() {
+                    Some(pid) => pid,
+                    None => {
+                        // Process exited before we could read its PID
+                        let _ = event_tx.send(NodeEvent::NodeErrored {
+                            node_id,
+                            message: "Restarted process exited before PID could be read"
+                                .to_string(),
+                        });
+                        let mut sup = supervisor.write().await;
+                        sup.update_state(node_id, NodeStatus::Errored, None);
+                        return;
+                    }
+                };
                 {
                     let mut sup = supervisor.write().await;
                     sup.update_state(node_id, NodeStatus::Running, Some(pid));
