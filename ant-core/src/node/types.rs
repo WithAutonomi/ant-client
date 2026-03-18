@@ -175,7 +175,7 @@ impl PortRange {
         match self {
             Self::Single(p) if index == 0 => Some(*p),
             Self::Range(start, end) => {
-                let port = start + index;
+                let port = start.checked_add(index)?;
                 if port <= *end {
                     Some(port)
                 } else {

@@ -292,11 +292,24 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 #[cfg(unix)]
 fn validate_daemon_process(pid: u32) -> bool {
     let cmdline_path = format!("/proc/{pid}/cmdline");
-    match std::fs::read_to_string(&cmdline_path) {
-        Ok(cmdline) => {
-            // /proc/PID/cmdline uses null bytes as separators
-            let cmdline = cmdline.replace('\0', " ");
-            cmdline.contains("ant") && cmdline.contains("daemon")
+    match std::fs::read(&cmdline_path) {
+        Ok(raw) => {
+            // /proc/PID/cmdline uses null bytes as separators.
+            // Check that the executable basename ends with "ant" and one
+            // of the arguments is "daemon". This avoids false positives
+            // from processes like "rant" or "phantom-daemon".
+            let args: Vec<String> = raw
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).to_string())
+                .collect();
+            let exe_matches = args
+                .first()
+                .and_then(|exe| std::path::Path::new(exe).file_name())
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "ant" || name == "ant.exe");
+            let has_daemon_arg = args.iter().any(|a| a == "daemon");
+            exe_matches && has_daemon_arg
         }
         Err(_) => {
             // On non-Linux Unix (macOS), /proc doesn't exist. Fall back to
@@ -327,8 +340,12 @@ fn validate_daemon_process(pid: u32) -> bool {
         if success == 0 {
             return false;
         }
-        let name = String::from_utf16_lossy(&buf[..size as usize]);
-        name.contains("ant")
+        let path = String::from_utf16_lossy(&buf[..size as usize]);
+        // Check the executable basename, not just substring
+        std::path::Path::new(&path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|name| name == "ant")
     }
 }
 
@@ -357,9 +374,16 @@ fn check_running(pid_file: &Path) -> Option<u32> {
 }
 
 #[cfg(unix)]
+fn pid_to_i32(pid: u32) -> Option<i32> {
+    i32::try_from(pid).ok().filter(|&p| p > 0)
+}
+
+#[cfg(unix)]
 fn send_terminate(pid: u32) {
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
+    if let Some(pid) = pid_to_i32(pid) {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
     }
 }
 
@@ -379,7 +403,10 @@ fn send_terminate(pid: u32) {
 
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
-    let ret = unsafe { libc::kill(pid as i32, 0) };
+    let Some(pid) = pid_to_i32(pid) else {
+        return false;
+    };
+    let ret = unsafe { libc::kill(pid, 0) };
     if ret == 0 {
         return true;
     }

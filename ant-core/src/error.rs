@@ -56,6 +56,9 @@ pub enum Error {
     #[error("Could not determine home directory (HOME/USERPROFILE not set)")]
     HomeDirNotFound,
 
+    #[error("Node count {count} exceeds maximum of {max} per call")]
+    InvalidNodeCount { count: u16, max: u16 },
+
     #[error(
         "Cannot reset while nodes are running ({0} node(s) still running). Stop all nodes first."
     )]

@@ -490,22 +490,34 @@ async fn graceful_kill(pid: u32) {
 }
 
 #[cfg(unix)]
+fn pid_to_i32(pid: u32) -> Option<i32> {
+    i32::try_from(pid).ok().filter(|&p| p > 0)
+}
+
+#[cfg(unix)]
 fn send_signal_term(pid: u32) {
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
+    if let Some(pid) = pid_to_i32(pid) {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
     }
 }
 
 #[cfg(unix)]
 fn send_signal_kill(pid: u32) {
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
+    if let Some(pid) = pid_to_i32(pid) {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
     }
 }
 
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
-    let ret = unsafe { libc::kill(pid as i32, 0) };
+    let Some(pid) = pid_to_i32(pid) else {
+        return false;
+    };
+    let ret = unsafe { libc::kill(pid, 0) };
     if ret == 0 {
         return true;
     }

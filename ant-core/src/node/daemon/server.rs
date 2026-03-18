@@ -218,6 +218,19 @@ async fn delete_node(
     State(state): State<Arc<AppState>>,
     Path(id): Path<u32>,
 ) -> std::result::Result<Json<RemoveNodeResult>, (StatusCode, Json<serde_json::Value>)> {
+    // Prevent removing a running node (would orphan the process)
+    let supervisor = state.supervisor.read().await;
+    if supervisor.is_running(id) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("Cannot remove node {id} while it is running. Stop it first."),
+                "current_state": { "node_id": id, "status": "running" }
+            })),
+        ));
+    }
+    drop(supervisor);
+
     let registry_path = state.config.registry_path.clone();
 
     match crate::node::remove_node(id, &registry_path) {
@@ -426,8 +439,9 @@ async fn post_stop_all(State(state): State<Arc<AppState>>) -> Json<StopNodeResul
 async fn post_reset(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<ResetResult>, (StatusCode, Json<serde_json::Value>)> {
-    // Check if any nodes are running via supervisor
-    let supervisor = state.supervisor.read().await;
+    // Hold write lock for atomic check-and-act (prevents nodes being started
+    // between the running check and the reset operation)
+    let supervisor = state.supervisor.write().await;
     let (running, _, _) = supervisor.node_counts();
     if running > 0 {
         return Err((

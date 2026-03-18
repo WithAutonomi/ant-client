@@ -32,8 +32,18 @@ pub async fn add_nodes(
     registry_path: &Path,
     progress: &dyn ProgressReporter,
 ) -> Result<AddNodeResult> {
-    // Validate rewards address format (Ethereum-style: 0x followed by 40 hex chars)
+    // Validate and normalize rewards address
     validate_rewards_address(&opts.rewards_address)?;
+    let rewards_address = opts.rewards_address.trim().to_string();
+
+    // Cap the number of nodes per call to prevent accidental resource exhaustion
+    const MAX_NODES_PER_CALL: u16 = 1000;
+    if opts.count > MAX_NODES_PER_CALL {
+        return Err(Error::InvalidNodeCount {
+            count: opts.count,
+            max: MAX_NODES_PER_CALL,
+        });
+    }
 
     // Validate port ranges match count
     if let Some(ref port_range) = opts.node_port {
@@ -83,7 +93,7 @@ pub async fn add_nodes(
         let config = NodeConfig {
             id: placeholder_id,
             service_name: String::new(), // assigned by registry.add()
-            rewards_address: opts.rewards_address.clone(),
+            rewards_address: rewards_address.clone(),
             data_dir,
             log_dir,
             node_port,
