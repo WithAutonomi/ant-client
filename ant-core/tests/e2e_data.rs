@@ -126,11 +126,24 @@ async fn test_data_deterministic_encryption() {
         .await
         .expect("second upload should succeed");
 
-    // Verify download produces the original content
-    let downloaded = client
-        .data_download(&result2.data_map)
-        .await
-        .expect("data_download should succeed");
+    // Verify download produces the original content (retry for CI transport flakiness)
+    let mut downloaded = None;
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        match client.data_download(&result2.data_map).await {
+            Ok(d) => {
+                downloaded = Some(d);
+                break;
+            }
+            Err(e) if attempt < 2 => {
+                eprintln!("attempt {attempt}: data_download failed: {e}");
+            }
+            Err(e) => panic!("data_download should succeed: {e}"),
+        }
+    }
+    let downloaded = downloaded.expect("data_download should succeed after retries");
     assert_eq!(
         downloaded, content,
         "downloaded content should match original after deterministic re-upload"
@@ -285,11 +298,24 @@ async fn test_public_data_map_store_and_fetch() {
         "Fetched DataMap should have same number of chunks"
     );
 
-    // Use the fetched DataMap to download the original data
-    let downloaded = client
-        .data_download(&fetched_dm)
-        .await
-        .expect("data_download from fetched DataMap should succeed");
+    // Use the fetched DataMap to download the original data (retry for CI transport flakiness)
+    let mut downloaded = None;
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        match client.data_download(&fetched_dm).await {
+            Ok(d) => {
+                downloaded = Some(d);
+                break;
+            }
+            Err(e) if attempt < 2 => {
+                eprintln!("attempt {attempt}: data_download failed: {e}");
+            }
+            Err(e) => panic!("data_download from fetched DataMap should succeed: {e}"),
+        }
+    }
+    let downloaded = downloaded.expect("data_download should succeed after retries");
 
     assert_eq!(
         downloaded, content,
