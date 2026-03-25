@@ -10,8 +10,18 @@ path = "src/main.rs"
 [dependencies]
 ant-core = { path = "../ant-core" }
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 colored = "3.1.1"
 reqwest = { version = "0.12", features = ["json"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+
+# Data operations CLI deps
+bytes = "1"
+color-eyre = "0.6"
+evmlib = "0.4.7"
+hex = "0.4"
+rmp-serde = "1"
+saorsa-node = { git = "https://github.com/saorsa-labs/saorsa-node", branch = "merkle_payments" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

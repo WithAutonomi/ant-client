@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
+use crate::commands::data::{ChunkAction, FileAction, WalletAction};
 use crate::commands::node::NodeCommand;
 
 #[derive(Parser)]
@@ -8,6 +11,30 @@ pub struct Cli {
     /// Output structured JSON instead of human-readable text
     #[arg(long, global = true)]
     pub json: bool,
+
+    /// Bootstrap peer addresses (for data operations).
+    #[arg(long, short)]
+    pub bootstrap: Vec<SocketAddr>,
+
+    /// Path to devnet manifest JSON (for data operations).
+    #[arg(long)]
+    pub devnet_manifest: Option<PathBuf>,
+
+    /// Allow loopback connections (required for devnet/local testing).
+    #[arg(long)]
+    pub allow_loopback: bool,
+
+    /// Timeout for network operations (seconds).
+    #[arg(long, default_value_t = 60)]
+    pub timeout_secs: u64,
+
+    /// Log level.
+    #[arg(long, default_value = "info")]
+    pub log_level: String,
+
+    /// EVM network for payment processing.
+    #[arg(long, default_value = "local")]
+    pub evm_network: String,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -19,5 +46,20 @@ pub enum Commands {
     Node {
         #[command(subcommand)]
         command: NodeCommand,
+    },
+    /// Wallet operations
+    Wallet {
+        #[command(subcommand)]
+        action: WalletAction,
+    },
+    /// File operations (multi-chunk upload/download with EVM payment)
+    File {
+        #[command(subcommand)]
+        action: FileAction,
+    },
+    /// Single-chunk operations (low-level put/get without file splitting)
+    Chunk {
+        #[command(subcommand)]
+        action: ChunkAction,
     },
 }

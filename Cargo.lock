@@ -831,11 +831,19 @@ version = "0.1.0"
 dependencies = [
  "ant-core",
  "anyhow",
+ "bytes",
  "clap",
+ "color-eyre",
  "colored",
+ "evmlib",
+ "hex",
  "reqwest 0.12.28",
+ "rmp-serde",
+ "saorsa-node",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
