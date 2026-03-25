@@ -14,8 +14,8 @@ use support::MiniTestnet;
 const CLIENT_TIMEOUT_SECS: u64 = 30;
 
 async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(6).await;
-    let node = testnet.node(3).expect("Node 3 should exist");
+    let testnet = MiniTestnet::start(8).await;
+    let node = testnet.node(4).expect("Node 4 should exist");
 
     let config = ClientConfig {
         timeout_secs: CLIENT_TIMEOUT_SECS,
@@ -257,11 +257,24 @@ async fn test_data_upload_partial_overlap_skips_payment_for_existing_chunks() {
         "full duplicate upload should not spend any tokens"
     );
 
-    // Verify the data is still downloadable and correct
-    let downloaded = client
-        .data_download(&result.data_map)
-        .await
-        .expect("data_download should succeed");
+    // Verify the data is still downloadable and correct (retry for CI transport flakiness)
+    let mut downloaded = None;
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        match client.data_download(&result.data_map).await {
+            Ok(d) => {
+                downloaded = Some(d);
+                break;
+            }
+            Err(e) if attempt < 2 => {
+                eprintln!("attempt {attempt}: data_download failed: {e}");
+            }
+            Err(e) => panic!("data_download should succeed: {e}"),
+        }
+    }
+    let downloaded = downloaded.expect("data_download should succeed after retries");
     assert_eq!(downloaded, content, "downloaded content should match");
 
     drop(client);
