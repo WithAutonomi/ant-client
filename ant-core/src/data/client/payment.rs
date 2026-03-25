@@ -24,7 +24,7 @@ impl Client {
     /// Pay for storage and return the serialized payment proof bytes.
     ///
     /// This orchestrates the full payment flow:
-    /// 1. Collect 5 quotes from closest peers
+    /// 1. Collect `CLOSE_GROUP_SIZE` quotes from closest peers
     /// 2. Build `SingleNodePayment` (median 3x, others 0)
     /// 3. Pay on-chain via the wallet
     /// 4. Serialize `PaymentProof` with transaction hashes
@@ -33,16 +33,15 @@ impl Client {
     ///
     /// Returns an error if the wallet is not set, quotes cannot be collected,
     /// on-chain payment fails, or serialization fails.
-    /// Returns `(proof_bytes, target_peer, peer_addrs)`. The `target_peer` is
-    /// the closest peer from quote collection — callers **must** send the PUT
-    /// to this peer to avoid a mismatch between the paid quotes and the
-    /// storage target. `peer_addrs` are the target's known network addresses.
+    /// Returns `(proof_bytes, quoted_peers)`. `quoted_peers` are the
+    /// `CLOSE_GROUP_SIZE` peers that provided quotes — callers should store
+    /// the chunk to at least `CLOSE_GROUP_MAJORITY` of these peers.
     pub async fn pay_for_storage(
         &self,
         address: &[u8; 32],
         data_size: u64,
         data_type: u32,
-    ) -> Result<(Vec<u8>, PeerId, Vec<MultiAddr>)> {
+    ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>)> {
         let wallet = self.require_wallet()?;
 
         debug!("Collecting quotes for address {}", hex::encode(address));
@@ -50,12 +49,11 @@ impl Client {
         // 1. Collect quotes from network
         let quotes_with_peers = self.get_store_quotes(address, data_size, data_type).await?;
 
-        // Pin the closest peer from the quote set as the PUT target.
-        // This peer was among the quoted set so the proof includes it.
-        let (target_peer, target_addrs) = quotes_with_peers
-            .first()
+        // Capture all quoted peers for replication by the caller.
+        let quoted_peers: Vec<(PeerId, Vec<MultiAddr>)> = quotes_with_peers
+            .iter()
             .map(|(peer_id, addrs, _, _)| (*peer_id, addrs.clone()))
-            .ok_or_else(|| Error::InsufficientPeers("no quotes collected".to_string()))?;
+            .collect();
 
         // 2. Fetch prices from the on-chain contract rather than using the
         // locally-computed estimates. The contract's getQuote() is the authoritative
@@ -119,7 +117,7 @@ impl Client {
         let proof_bytes = serialize_single_node_proof(&proof)
             .map_err(|e| Error::Serialization(format!("Failed to serialize payment proof: {e}")))?;
 
-        Ok((proof_bytes, target_peer, target_addrs))
+        Ok((proof_bytes, quoted_peers))
     }
 
     /// Approve the wallet to spend tokens on the payment vault contract.

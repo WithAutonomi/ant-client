@@ -145,10 +145,12 @@ async fn test_attack_replay_different_chunk() {
 
     // Legitimately store chunk A
     let content_a = Bytes::from("replay attack - legitimate chunk A");
-    let (proof_bytes_a, target_peer_a, target_addrs_a) = client
+    let (proof_bytes_a, peers_a) = client
         .pay_for_storage(&compute_address(&content_a), content_a.len() as u64, 0)
         .await
         .expect("payment for chunk A should succeed");
+    let (target_peer_a, target_addrs_a) =
+        peers_a.first().expect("should have quoted peers").clone();
 
     let addr_a = client
         .chunk_put_with_proof(

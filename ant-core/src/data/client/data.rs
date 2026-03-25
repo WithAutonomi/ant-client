@@ -151,11 +151,7 @@ impl Client {
                                 ))
                             })?;
                             let peers = self.close_group_peers(addr).await?;
-                            let (target, addrs) = peers.first().ok_or_else(|| {
-                                Error::InsufficientPeers("no peers for chunk".to_string())
-                            })?;
-                            self.chunk_put_with_proof(content, proof, target, addrs)
-                                .await
+                            self.chunk_put_to_close_group(content, proof, &peers).await
                         }
                     },
                 ))
