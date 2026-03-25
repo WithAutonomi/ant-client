@@ -9,10 +9,10 @@
 use crate::data::client::merkle::PaymentMode;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
+use ant_node::ant_protocol::DATA_TYPE_CHUNK;
+use ant_node::client::compute_address;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use saorsa_node::ant_protocol::DATA_TYPE_CHUNK;
-use saorsa_node::client::compute_address;
 use self_encryption::{decrypt, encrypt, DataMap, EncryptedChunk};
 use tracing::{debug, info, warn};
 
@@ -151,10 +151,11 @@ impl Client {
                                 ))
                             })?;
                             let peers = self.close_group_peers(addr).await?;
-                            let target = peers.first().ok_or_else(|| {
+                            let (target, addrs) = peers.first().ok_or_else(|| {
                                 Error::InsufficientPeers("no peers for chunk".to_string())
                             })?;
-                            self.chunk_put_with_proof(content, proof, target).await
+                            self.chunk_put_with_proof(content, proof, target, addrs)
+                                .await
                         }
                     },
                 ))

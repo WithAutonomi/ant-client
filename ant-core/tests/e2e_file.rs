@@ -105,7 +105,7 @@ async fn test_file_large_content() {
 async fn test_file_upload_nonexistent_path_fails() {
     let (client, testnet) = setup().await;
 
-    let nonexistent = PathBuf::from("/tmp/saorsa_test_nonexistent_file_12345.bin");
+    let nonexistent = PathBuf::from("/tmp/ant_test_nonexistent_file_12345.bin");
     let result = client.file_upload(&nonexistent).await;
     assert!(
         result.is_err(),

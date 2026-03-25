@@ -1,4 +1,4 @@
-//! Minimal test infrastructure for saorsa-client E2E tests.
+//! Minimal test infrastructure for ant-core E2E tests.
 //!
 //! Spawns a small local testnet with `AntProtocol` handlers and an Anvil
 //! EVM testnet for real on-chain payment verification.
@@ -16,19 +16,19 @@
 )]
 
 use ant_evm::RewardsAddress;
+use ant_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
+use ant_node::core::{
+    CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
+};
+use ant_node::payment::{
+    EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
+    QuotingMetricsTracker,
+};
+use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use evmlib::testnet::Testnet;
 use evmlib::wallet::Wallet;
 use evmlib::Network as EvmNetwork;
 use rand::Rng;
-use saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
-use saorsa_node::core::{
-    CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
-};
-use saorsa_node::payment::{
-    EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
-    QuotingMetricsTracker,
-};
-use saorsa_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -289,27 +289,29 @@ impl MiniTestnet {
                         let node = Arc::clone(&handler_node);
                         let topic_clone = topic.clone();
                         tokio::spawn(async move {
-                            let result = if topic_clone == saorsa_node::CHUNK_PROTOCOL_ID {
-                                protocol.handle_message(&data).await
-                            } else {
+                            if topic_clone != ant_node::CHUNK_PROTOCOL_ID {
                                 return;
-                            };
-                            match result {
-                                Ok(response_bytes) => {
+                            }
+                            match protocol.try_handle_request(&data).await {
+                                Ok(Some(response_bytes)) => {
                                     if let Err(e) = node
                                         .send_message(
                                             &source_peer,
                                             &topic_clone,
                                             response_bytes.to_vec(),
+                                            &[],
                                         )
                                         .await
                                     {
                                         eprintln!("ERROR: node {node_index} failed to send response to {source_peer}: {e}");
                                     }
                                 }
+                                Ok(None) => {
+                                    // Non-request message (e.g. response) — nothing to reply
+                                }
                                 Err(e) => {
                                     eprintln!(
-                                        "ERROR: node {node_index} handle_message failed: {e}"
+                                        "ERROR: node {node_index} try_handle_request failed: {e}"
                                     );
                                 }
                             }

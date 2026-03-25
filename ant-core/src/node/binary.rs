@@ -5,8 +5,8 @@ use futures_util::StreamExt;
 use crate::error::{Error, Result};
 use crate::node::types::BinarySource;
 
-const GITHUB_REPO: &str = "saorsa-labs/saorsa-node";
-pub const BINARY_NAME: &str = "saorsa-node";
+const GITHUB_REPO: &str = "WithAutonomi/ant-node";
+pub const BINARY_NAME: &str = "ant-node";
 
 /// Trait for reporting progress during long-running operations like binary downloads.
 pub trait ProgressReporter: Send + Sync {
@@ -323,7 +323,7 @@ async fn extract_version(binary_path: &Path) -> Result<String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Expect output like "saorsa-node 0.3.4" — extract the version part.
+    // Expect output like "ant-node 0.3.4" — extract the version part.
     let version = stdout
         .split_whitespace()
         .last()
@@ -365,7 +365,7 @@ fn platform_asset_name() -> Result<String> {
         "tar.gz"
     };
 
-    Ok(format!("saorsa-node-cli-{os}-{arch}.{ext}"))
+    Ok(format!("ant-node-cli-{os}-{arch}.{ext}"))
 }
 
 /// Returns the directory where downloaded binaries are cached.
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn platform_asset_name_has_correct_format() {
         let name = platform_asset_name().unwrap();
-        assert!(name.starts_with("saorsa-node-cli-"));
+        assert!(name.starts_with("ant-node-cli-"));
         assert!(
             name.ends_with(".tar.gz") || name.ends_with(".zip"),
             "unexpected extension: {name}"

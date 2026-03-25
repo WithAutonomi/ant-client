@@ -22,7 +22,7 @@ utoipa = { version = "5", features = ["axum_extras"] }
 zip = "2"
 tower-http = { version = "0.6.8", features = ["cors"] }
 
-# Data operations (from saorsa-client)
+# Data operations
 ant-evm = "0.1.19"
 evmlib = "0.4.7"
 xor_name = "5"
@@ -37,7 +37,7 @@ tracing = "0.1"
 bytes = "1"
 lru = "0.16"
 rand = "0.8"
-saorsa-node = { git = "https://github.com/saorsa-labs/saorsa-node", branch = "merkle_payments" }
+ant-node = "0.6"
 saorsa-pqc = "0.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

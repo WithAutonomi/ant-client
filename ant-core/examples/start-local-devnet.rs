@@ -1,7 +1,7 @@
 //! Start a local devnet with EVM payments.
 //!
-//! Launches a minimal Saorsa network (5 nodes) with an embedded Anvil
-//! blockchain, writes a manifest to `/tmp/saorsa-devnet-manifest.json`,
+//! Launches a minimal Autonomi network (5 nodes) with an embedded Anvil
+//! blockchain, writes a manifest to `/tmp/ant-devnet-manifest.json`,
 //! and waits for Ctrl+C.
 //!
 //! # Usage
@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let devnet = LocalDevnet::start_minimal().await?;
 
     // Write manifest so the CLI example can use it
-    let manifest_path = PathBuf::from("/tmp/saorsa-devnet-manifest.json");
+    let manifest_path = PathBuf::from("/tmp/ant-devnet-manifest.json");
     devnet.write_manifest(&manifest_path).await?;
 
     println!();

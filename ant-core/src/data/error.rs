@@ -65,8 +65,8 @@ pub enum Error {
     AlreadyStored,
 }
 
-impl From<saorsa_node::Error> for Error {
-    fn from(e: saorsa_node::Error) -> Self {
+impl From<ant_node::Error> for Error {
+    fn from(e: ant_node::Error) -> Self {
         Self::Network(e.to_string())
     }
 }

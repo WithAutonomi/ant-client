@@ -1,7 +1,7 @@
 //! Local self-encryption unit tests (no network required).
 //!
 //! These validate encryption correctness, `DataMap` integrity, and edge cases
-//! using only in-memory chunk stores. Ported from saorsa-node's
+//! using only in-memory chunk stores. Ported from ant-node's
 //! `src/client/self_encrypt.rs` tests.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

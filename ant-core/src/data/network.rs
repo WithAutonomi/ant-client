@@ -1,15 +1,15 @@
-//! Network layer wrapping saorsa-core's P2P node.
+//! Network layer wrapping ant-node's P2P node.
 //!
 //! Provides peer discovery, message sending, and DHT operations
 //! for the client library.
 
 use crate::data::error::{Error, Result};
-use saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
-use saorsa_node::core::{CoreNodeConfig, MultiAddr, NodeMode, P2PNode, PeerId};
+use ant_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
+use ant_node::core::{CoreNodeConfig, MultiAddr, NodeMode, P2PNode, PeerId};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// Network abstraction for the saorsa client.
+/// Network abstraction for the Autonomi client.
 ///
 /// Wraps a `P2PNode` providing high-level operations for
 /// peer discovery and message routing.
@@ -71,10 +71,18 @@ impl Network {
 
     /// Find the closest peers to a target address.
     ///
+    /// Returns each peer paired with its known network addresses, enabling
+    /// callers to pass addresses to `send_and_await_chunk_response` for
+    /// faster connection establishment.
+    ///
     /// # Errors
     ///
     /// Returns an error if the DHT lookup fails.
-    pub async fn find_closest_peers(&self, target: &[u8; 32], count: usize) -> Result<Vec<PeerId>> {
+    pub async fn find_closest_peers(
+        &self,
+        target: &[u8; 32],
+        count: usize,
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
         let local_peer_id = self.node.peer_id();
 
         // Request one extra to account for filtering out our own peer ID
@@ -89,7 +97,7 @@ impl Network {
             .into_iter()
             .filter(|n| n.peer_id != *local_peer_id)
             .take(count)
-            .map(|n| n.peer_id)
+            .map(|n| (n.peer_id, n.addresses))
             .collect())
     }
 

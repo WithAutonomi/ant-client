@@ -6,13 +6,13 @@
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_evm::{Amount, PaymentQuote};
-use futures::stream::{FuturesUnordered, StreamExt};
-use saorsa_node::ant_protocol::{
+use ant_node::ant_protocol::{
     ChunkMessage, ChunkMessageBody, ChunkQuoteRequest, ChunkQuoteResponse,
 };
-use saorsa_node::client::send_and_await_chunk_response;
-use saorsa_node::core::PeerId;
-use saorsa_node::payment::{calculate_price, single_node::REQUIRED_QUOTES};
+use ant_node::client::send_and_await_chunk_response;
+use ant_node::core::{MultiAddr, PeerId};
+use ant_node::payment::{calculate_price, single_node::REQUIRED_QUOTES};
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -31,7 +31,7 @@ impl Client {
         address: &[u8; 32],
         data_size: u64,
         data_type: u32,
-    ) -> Result<Vec<(PeerId, PaymentQuote, Amount)>> {
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
         let node = self.network().node();
 
         debug!(
@@ -54,7 +54,7 @@ impl Client {
         // Request quotes from all peers concurrently
         let mut quote_futures = FuturesUnordered::new();
 
-        for peer_id in &remote_peers {
+        for (peer_id, peer_addrs) in &remote_peers {
             let request_id = self.next_request_id();
             let request = ChunkQuoteRequest {
                 address: *address,
@@ -75,6 +75,7 @@ impl Client {
             };
 
             let peer_id_clone = *peer_id;
+            let addrs_clone = peer_addrs.clone();
             let node_clone = node.clone();
 
             let quote_future = async move {
@@ -84,6 +85,7 @@ impl Client {
                     message_bytes,
                     request_id,
                     timeout,
+                    &addrs_clone,
                     |body| match body {
                         ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
                             quote,
@@ -118,7 +120,7 @@ impl Client {
                 )
                 .await;
 
-                (peer_id_clone, result)
+                (peer_id_clone, addrs_clone, result)
             };
 
             quote_futures.push(quote_future);
@@ -129,10 +131,10 @@ impl Client {
         let mut already_stored_count = 0usize;
         let mut failures: Vec<String> = Vec::new();
 
-        while let Some((peer_id, quote_result)) = quote_futures.next().await {
+        while let Some((peer_id, addrs, quote_result)) = quote_futures.next().await {
             match quote_result {
                 Ok((quote, price)) => {
-                    quotes_with_peers.push((peer_id, quote, price));
+                    quotes_with_peers.push((peer_id, addrs, quote, price));
                     if quotes_with_peers.len() >= REQUIRED_QUOTES {
                         break;
                     }

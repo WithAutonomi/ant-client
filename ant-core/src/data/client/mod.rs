@@ -1,7 +1,7 @@
-//! Client operations for the saorsa network.
+//! Client operations for the Autonomi network.
 //!
 //! Provides high-level APIs for storing and retrieving data
-//! on the saorsa decentralized network.
+//! on the Autonomi decentralized network.
 
 pub mod cache;
 pub mod chunk;
@@ -14,14 +14,14 @@ pub mod quote;
 use crate::data::client::cache::ChunkCache;
 use crate::data::error::{Error, Result};
 use crate::data::network::Network;
+use ant_node::client::XorName;
+use ant_node::core::{MultiAddr, P2PNode, PeerId};
 use evmlib::wallet::Wallet;
-use saorsa_node::client::XorName;
-use saorsa_node::core::{P2PNode, PeerId};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::debug;
 
-/// Configuration for the saorsa client.
+/// Configuration for the Autonomi client.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     /// Timeout for network operations in seconds.
@@ -39,7 +39,7 @@ impl Default for ClientConfig {
     }
 }
 
-/// Client for the saorsa decentralized network.
+/// Client for the Autonomi decentralized network.
 ///
 /// Provides high-level APIs for storing and retrieving chunks
 /// and files on the network.
@@ -75,7 +75,7 @@ impl Client {
         config: ClientConfig,
     ) -> Result<Self> {
         debug!(
-            "Connecting to saorsa network with {} bootstrap peers",
+            "Connecting to Autonomi network with {} bootstrap peers",
             bootstrap_peers.len()
         );
         let network = Network::new(bootstrap_peers).await?;
@@ -127,7 +127,11 @@ impl Client {
     /// Return all peers in the close group for a target address.
     ///
     /// Queries the DHT for the closest peers by XOR distance.
-    pub(crate) async fn close_group_peers(&self, target: &XorName) -> Result<Vec<PeerId>> {
+    /// Returns each peer paired with its known network addresses.
+    pub(crate) async fn close_group_peers(
+        &self,
+        target: &XorName,
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
         let peers = self
             .network()
             .find_closest_peers(target, self.config().close_group_size)

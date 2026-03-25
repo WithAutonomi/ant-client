@@ -1,16 +1,16 @@
 //! Local devnet launcher for development and testing.
 //!
-//! Wraps `saorsa_node::devnet::Devnet` and `evmlib::testnet::Testnet` (Anvil)
+//! Wraps [`ant_node::devnet::Devnet`] and `evmlib::testnet::Testnet` (Anvil)
 //! to spin up a local network with EVM payments in a few lines of code.
 
 use crate::data::client::ClientConfig;
 use crate::data::error::{Error, Result};
 use crate::data::Client;
+use ant_node::core::MultiAddr;
+use ant_node::devnet::{Devnet, DevnetConfig, DevnetEvmInfo, DevnetManifest};
 use evmlib::testnet::Testnet;
 use evmlib::wallet::Wallet;
 use evmlib::Network as EvmNetwork;
-use saorsa_node::core::MultiAddr;
-use saorsa_node::devnet::{Devnet, DevnetConfig, DevnetEvmInfo, DevnetManifest};
 use std::path::Path;
 use std::time::SystemTime;
 use tracing::info;
