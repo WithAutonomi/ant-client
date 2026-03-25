@@ -1,6 +1,6 @@
 //! Batch chunk upload with wave-based pipelined EVM payments.
 //!
-//! Groups chunks into waves of [`PAYMENT_WAVE_SIZE`] and pays for each
+//! Groups chunks into waves of 64 and pays for each
 //! wave in a single EVM transaction. Stores from wave N are pipelined
 //! with quote collection for wave N+1 via `tokio::join!`.
 
@@ -204,10 +204,10 @@ impl Client {
 
     /// Upload chunks in waves with pipelined EVM payments.
     ///
-    /// Processes chunks in waves of [`PAYMENT_WAVE_SIZE`]. Within each wave:
+    /// Processes chunks in waves of `PAYMENT_WAVE_SIZE` (64). Within each wave:
     /// 1. **Prepare**: collect quotes for all chunks concurrently
     /// 2. **Pay**: single EVM transaction for the whole wave
-    /// 3. **Store**: concurrent [`Client::chunk_put_to_close_group`] calls
+    /// 3. **Store**: concurrent chunk replication to close group
     ///
     /// Stores from wave N overlap with quote collection for wave N+1
     /// via `tokio::join!`.
