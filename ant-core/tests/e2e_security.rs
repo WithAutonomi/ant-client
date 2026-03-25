@@ -18,16 +18,11 @@ use serial_test::serial;
 use std::sync::Arc;
 use support::MiniTestnet;
 
-const CLIENT_TIMEOUT_SECS: u64 = 30;
-
 async fn setup() -> (Client, MiniTestnet) {
     let testnet = MiniTestnet::start(6).await;
     let node = testnet.node(3).expect("Node 3 should exist");
-    let config = ClientConfig {
-        timeout_secs: CLIENT_TIMEOUT_SECS,
-        ..Default::default()
-    };
-    let client = Client::from_node(Arc::clone(&node), config).with_wallet(testnet.wallet().clone());
+    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
+        .with_wallet(testnet.wallet().clone());
     (client, testnet)
 }
 
@@ -145,10 +140,12 @@ async fn test_attack_replay_different_chunk() {
 
     // Legitimately store chunk A
     let content_a = Bytes::from("replay attack - legitimate chunk A");
-    let (proof_bytes_a, target_peer_a, target_addrs_a) = client
+    let (proof_bytes_a, peers_a) = client
         .pay_for_storage(&compute_address(&content_a), content_a.len() as u64, 0)
         .await
         .expect("payment for chunk A should succeed");
+    let (target_peer_a, target_addrs_a) =
+        peers_a.first().expect("should have quoted peers").clone();
 
     let addr_a = client
         .chunk_put_with_proof(
@@ -350,11 +347,7 @@ async fn test_attack_client_without_wallet() {
     let node = testnet.node(3).expect("Node 3 should exist");
 
     // Create client WITHOUT wallet
-    let config = ClientConfig {
-        timeout_secs: CLIENT_TIMEOUT_SECS,
-        ..Default::default()
-    };
-    let client = Client::from_node(Arc::clone(&node), config);
+    let client = Client::from_node(Arc::clone(&node), ClientConfig::default());
 
     let content = Bytes::from("no wallet attack test data");
     let result = client.chunk_put(content).await;

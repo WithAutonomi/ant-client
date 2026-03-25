@@ -923,9 +923,9 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b335e0d9258602b176fd94a3175d2b52094081b7cf246d01b0c6bb3ca781d7aa"
+checksum = "9161d53c72cfcc0dd8fee14bff64c0bad06642f074d52c5c91d9ee203acb4042"
 dependencies = [
  "aes-gcm-siv",
  "ant-evm",

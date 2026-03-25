@@ -13,16 +13,11 @@ use serial_test::serial;
 use std::sync::Arc;
 use support::MiniTestnet;
 
-const CLIENT_TIMEOUT_SECS: u64 = 30;
-
 async fn setup() -> (Client, MiniTestnet) {
     let testnet = MiniTestnet::start(6).await;
     let node = testnet.node(3).expect("Node 3 should exist");
-    let config = ClientConfig {
-        timeout_secs: CLIENT_TIMEOUT_SECS,
-        ..Default::default()
-    };
-    let client = Client::from_node(Arc::clone(&node), config).with_wallet(testnet.wallet().clone());
+    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
+        .with_wallet(testnet.wallet().clone());
     (client, testnet)
 }
 
@@ -119,12 +114,8 @@ async fn test_payment_required_enforcement() {
     let node = testnet.node(3).expect("Node 3 should exist");
 
     // Client with wallet for the paid test
-    let config = ClientConfig {
-        timeout_secs: CLIENT_TIMEOUT_SECS,
-        ..Default::default()
-    };
-    let client_with_wallet =
-        Client::from_node(Arc::clone(&node), config.clone()).with_wallet(testnet.wallet().clone());
+    let client_with_wallet = Client::from_node(Arc::clone(&node), ClientConfig::default())
+        .with_wallet(testnet.wallet().clone());
 
     // Try chunk_put_with_proof using garbage proof — should be rejected by the node
     let content = Bytes::from("payment enforcement test data");
@@ -307,11 +298,8 @@ async fn test_chunk_put_fails_with_insufficient_funds() {
     )
     .expect("create wallet from random key");
 
-    let config = ClientConfig {
-        timeout_secs: CLIENT_TIMEOUT_SECS,
-        ..Default::default()
-    };
-    let client = Client::from_node(Arc::clone(&node), config).with_wallet(empty_wallet);
+    let client =
+        Client::from_node(Arc::clone(&node), ClientConfig::default()).with_wallet(empty_wallet);
 
     let content = Bytes::from("insufficient funds test data");
     let result = client.chunk_put(content).await;
@@ -332,7 +320,7 @@ async fn test_chunk_put_fails_with_insufficient_funds() {
 async fn test_payment_flow_with_node_failure() {
     let mut testnet = MiniTestnet::start(6).await;
 
-    // With a 6-node testnet and REQUIRED_QUOTES = 5, we need exactly 5
+    // With a 6-node testnet and CLOSE_GROUP_SIZE = 5, we need exactly 5
     // remote peers. The client's own node is excluded from quote collection,
     // so killing even one node leaves only 4 remote peers — not enough.
     //
@@ -340,11 +328,8 @@ async fn test_payment_flow_with_node_failure() {
     // down a node, wait, then bring it back by verifying the remaining
     // network can still serve reads.
     let node = testnet.node(3).expect("Node 3 should exist");
-    let config = ClientConfig {
-        timeout_secs: CLIENT_TIMEOUT_SECS,
-        ..Default::default()
-    };
-    let client = Client::from_node(Arc::clone(&node), config).with_wallet(testnet.wallet().clone());
+    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
+        .with_wallet(testnet.wallet().clone());
 
     // Store a chunk BEFORE any failure
     let content = Bytes::from("resilience test: payment before node failure");

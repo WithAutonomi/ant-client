@@ -11,9 +11,11 @@ use ant_node::ant_protocol::{
 };
 use ant_node::client::{compute_address, send_and_await_chunk_response, DataChunk, XorName};
 use ant_node::core::{MultiAddr, PeerId};
+use ant_node::CLOSE_GROUP_MAJORITY;
 use bytes::Bytes;
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Data type identifier for chunks (used in quote requests).
 const CHUNK_DATA_TYPE: u32 = 0;
@@ -23,7 +25,8 @@ impl Client {
     ///
     /// Checks if the chunk already exists before paying. If it does,
     /// returns the address immediately without incurring on-chain costs.
-    /// Otherwise collects quotes, pays on-chain, then stores with proof.
+    /// Otherwise collects quotes, pays on-chain, then stores with proof
+    /// to `CLOSE_GROUP_MAJORITY` peers.
     ///
     /// # Errors
     ///
@@ -37,10 +40,7 @@ impl Client {
             .pay_for_storage(&address, data_size, CHUNK_DATA_TYPE)
             .await
         {
-            Ok((proof, target_peer, peer_addrs)) => {
-                self.chunk_put_with_proof(content, proof, &target_peer, &peer_addrs)
-                    .await
-            }
+            Ok((proof, peers)) => self.chunk_put_to_close_group(content, proof, &peers).await,
             Err(Error::AlreadyStored) => {
                 debug!(
                     "Chunk {} already stored on network, skipping payment",
@@ -52,11 +52,70 @@ impl Client {
         }
     }
 
+    /// Store a chunk to `CLOSE_GROUP_MAJORITY` peers from the quoted set.
+    ///
+    /// Sends the PUT concurrently to all `peers` and succeeds once
+    /// `CLOSE_GROUP_MAJORITY` confirm storage. Peers that already have
+    /// the chunk count towards the majority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fewer than `CLOSE_GROUP_MAJORITY` peers accept
+    /// the chunk.
+    pub(crate) async fn chunk_put_to_close_group(
+        &self,
+        content: Bytes,
+        proof: Vec<u8>,
+        peers: &[(PeerId, Vec<MultiAddr>)],
+    ) -> Result<XorName> {
+        let address = compute_address(&content);
+
+        let mut put_futures = FuturesUnordered::new();
+        for (peer_id, addrs) in peers {
+            let content = content.clone();
+            let proof = proof.clone();
+            let peer_id = *peer_id;
+            let addrs = addrs.clone();
+            put_futures.push(async move {
+                let result = self
+                    .chunk_put_with_proof(content, proof, &peer_id, &addrs)
+                    .await;
+                (peer_id, result)
+            });
+        }
+
+        let mut success_count = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+
+        while let Some((peer_id, result)) = put_futures.next().await {
+            match result {
+                Ok(_) => {
+                    success_count += 1;
+                    if success_count >= CLOSE_GROUP_MAJORITY {
+                        info!(
+                            "Chunk {} stored on {success_count} peers (majority reached)",
+                            hex::encode(address)
+                        );
+                        return Ok(address);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to store chunk on {peer_id}: {e}");
+                    failures.push(format!("{peer_id}: {e}"));
+                }
+            }
+        }
+
+        Err(Error::InsufficientPeers(format!(
+            "Stored on {success_count} peers, need {CLOSE_GROUP_MAJORITY}. Failures: [{}]",
+            failures.join("; ")
+        )))
+    }
+
     /// Store a chunk on the Autonomi network with a pre-built payment proof.
     ///
-    /// `target_peer` must be one of the peers that was quoted during payment —
-    /// sending the proof to a different peer will cause rejection because the
-    /// proof doesn't include that peer's rewards address.
+    /// Sends to a single peer. Callers that need replication across the
+    /// close group should use `chunk_put_to_close_group` instead.
     ///
     /// # Errors
     ///

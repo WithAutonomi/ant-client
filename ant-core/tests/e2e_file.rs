@@ -12,17 +12,12 @@ use std::sync::Arc;
 use support::MiniTestnet;
 use tempfile::{NamedTempFile, TempDir};
 
-const CLIENT_TIMEOUT_SECS: u64 = 30;
-
 async fn setup() -> (Client, MiniTestnet) {
     let testnet = MiniTestnet::start(6).await;
     let node = testnet.node(3).expect("Node 3 should exist");
 
-    let config = ClientConfig {
-        timeout_secs: CLIENT_TIMEOUT_SECS,
-        ..Default::default()
-    };
-    let client = Client::from_node(Arc::clone(&node), config).with_wallet(testnet.wallet().clone());
+    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
+        .with_wallet(testnet.wallet().clone());
 
     (client, testnet)
 }

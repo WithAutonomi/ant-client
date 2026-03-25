@@ -10,17 +10,12 @@ use serial_test::serial;
 use std::sync::Arc;
 use support::MiniTestnet;
 
-const CLIENT_TIMEOUT_SECS: u64 = 30;
-
 async fn setup() -> (Client, MiniTestnet) {
     let testnet = MiniTestnet::start(6).await;
     let node = testnet.node(3).expect("Node 3 should exist");
 
-    let config = ClientConfig {
-        timeout_secs: CLIENT_TIMEOUT_SECS,
-        ..Default::default()
-    };
-    let client = Client::from_node(Arc::clone(&node), config).with_wallet(testnet.wallet().clone());
+    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
+        .with_wallet(testnet.wallet().clone());
 
     (client, testnet)
 }
@@ -189,11 +184,7 @@ async fn test_chunk_get_is_always_free() {
     // Reads are free so the wallet absence should not matter.
     // Using the same node ensures the DHT routes to the same storing peer.
     let node = testnet.node(3).expect("Node 3 should exist");
-    let config = ClientConfig {
-        timeout_secs: CLIENT_TIMEOUT_SECS,
-        ..Default::default()
-    };
-    let no_wallet_client = Client::from_node(Arc::clone(&node), config);
+    let no_wallet_client = Client::from_node(Arc::clone(&node), ClientConfig::default());
 
     let retrieved = no_wallet_client
         .chunk_get(&address)
@@ -254,11 +245,7 @@ async fn test_chunk_put_no_wallet_fails() {
     let node = testnet.node(3).expect("Node 3 should exist");
 
     // Client WITHOUT wallet
-    let config = ClientConfig {
-        timeout_secs: CLIENT_TIMEOUT_SECS,
-        ..Default::default()
-    };
-    let client = Client::from_node(Arc::clone(&node), config);
+    let client = Client::from_node(Arc::clone(&node), ClientConfig::default());
 
     let content = Bytes::from("chunk_put without wallet test");
     let result = client.chunk_put(content).await;

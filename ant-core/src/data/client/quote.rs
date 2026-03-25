@@ -11,7 +11,8 @@ use ant_node::ant_protocol::{
 };
 use ant_node::client::send_and_await_chunk_response;
 use ant_node::core::{MultiAddr, PeerId};
-use ant_node::payment::{calculate_price, single_node::REQUIRED_QUOTES};
+use ant_node::payment::calculate_price;
+use ant_node::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -19,8 +20,11 @@ use tracing::{debug, info, warn};
 impl Client {
     /// Get storage quotes from the closest peers for a given address.
     ///
-    /// Queries the DHT for the closest peers and requests quotes from them.
-    /// Collects exactly `REQUIRED_QUOTES` (5) quotes.
+    /// Queries the DHT for the `CLOSE_GROUP_SIZE` closest peers and requests
+    /// quotes from each. Waits for all requests to complete or timeout.
+    ///
+    /// Returns `Error::AlreadyStored` early if `CLOSE_GROUP_MAJORITY` peers
+    /// report the chunk is already stored.
     ///
     /// # Errors
     ///
@@ -35,16 +39,17 @@ impl Client {
         let node = self.network().node();
 
         debug!(
-            "Requesting {REQUIRED_QUOTES} quotes for address {} (size: {data_size})",
+            "Requesting {CLOSE_GROUP_SIZE} quotes for address {} (size: {data_size})",
             hex::encode(address)
         );
 
-        // Use the same DHT-based peer discovery as chunk_get
-        let remote_peers = self.close_group_peers(address).await?;
+        // Query DHT and take only the CLOSE_GROUP_SIZE closest peers.
+        let mut remote_peers = self.close_group_peers(address).await?;
+        remote_peers.truncate(CLOSE_GROUP_SIZE);
 
-        if remote_peers.len() < REQUIRED_QUOTES {
+        if remote_peers.len() < CLOSE_GROUP_SIZE {
             return Err(Error::InsufficientPeers(format!(
-                "Found {} peers, need {REQUIRED_QUOTES}",
+                "Found {} peers, need {CLOSE_GROUP_SIZE}",
                 remote_peers.len()
             )));
         }
@@ -126,71 +131,47 @@ impl Client {
             quote_futures.push(quote_future);
         }
 
-        // Collect all quote responses (don't short-circuit on the first 5).
-        //
-        // The previous first-5-wins approach caused nodes behind NAT to be
-        // systematically excluded: cloud nodes always respond faster, so the
-        // NATed node's quote would arrive 6th and be dropped. By collecting
-        // all responses and then selecting the closest by XOR distance, every
-        // reachable node has a fair chance of being included.
-        let mut all_quotes = Vec::with_capacity(remote_peers.len());
+        // Wait for all quote requests to complete or timeout.
+        // Early-return if CLOSE_GROUP_MAJORITY peers report already stored.
+        let mut quotes = Vec::with_capacity(CLOSE_GROUP_SIZE);
         let mut already_stored_count = 0usize;
         let mut failures: Vec<String> = Vec::new();
-        let total_peers = remote_peers.len();
 
         while let Some((peer_id, addrs, quote_result)) = quote_futures.next().await {
             match quote_result {
                 Ok((quote, price)) => {
-                    all_quotes.push((peer_id, addrs, quote, price));
+                    quotes.push((peer_id, addrs, quote, price));
                 }
                 Err(Error::AlreadyStored) => {
                     already_stored_count += 1;
                     debug!("Peer {peer_id} reports chunk already stored");
+                    if already_stored_count >= CLOSE_GROUP_MAJORITY {
+                        info!(
+                            "Chunk {} already stored ({already_stored_count}/{CLOSE_GROUP_SIZE} peers confirm)",
+                            hex::encode(address)
+                        );
+                        return Err(Error::AlreadyStored);
+                    }
                 }
                 Err(e) => {
                     warn!("Failed to get quote from {peer_id}: {e}");
                     failures.push(format!("{peer_id}: {e}"));
                 }
             }
-
-            // Once every peer has responded (or failed), stop waiting.
-            let responded = all_quotes.len() + already_stored_count + failures.len();
-            if responded >= total_peers {
-                break;
-            }
         }
 
-        // Sort by XOR distance to the chunk address (closest first), then
-        // take the REQUIRED_QUOTES closest. This ensures deterministic,
-        // distance-based selection rather than speed-based racing.
-        all_quotes.sort_by_key(|(peer_id, _, _, _)| {
-            let peer_bytes = peer_id.as_bytes();
-            let mut distance = [0u8; 32];
-            for i in 0..32 {
-                distance[i] = peer_bytes[i] ^ address[i];
-            }
-            distance
-        });
-        let quotes_with_peers: Vec<_> = all_quotes.into_iter().take(REQUIRED_QUOTES).collect();
-
-        if quotes_with_peers.len() >= REQUIRED_QUOTES {
+        if quotes.len() >= CLOSE_GROUP_SIZE {
             info!(
                 "Collected {} quotes for address {}",
-                quotes_with_peers.len(),
+                quotes.len(),
                 hex::encode(address)
             );
-            return Ok(quotes_with_peers);
-        }
-
-        // Not enough quotes. If any peer reported already_stored, the chunk
-        // likely exists — signal the caller to skip payment.
-        if already_stored_count > 0 {
-            return Err(Error::AlreadyStored);
+            return Ok(quotes);
         }
 
         Err(Error::InsufficientPeers(format!(
-            "Got {} quotes, need {REQUIRED_QUOTES}. Failures: [{}]",
-            quotes_with_peers.len(),
+            "Got {} quotes, need {CLOSE_GROUP_SIZE}. Failures: [{}]",
+            quotes.len(),
             failures.join("; ")
         )))
     }

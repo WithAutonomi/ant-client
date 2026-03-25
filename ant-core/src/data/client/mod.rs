@@ -16,10 +16,14 @@ use crate::data::error::{Error, Result};
 use crate::data::network::Network;
 use ant_node::client::XorName;
 use ant_node::core::{MultiAddr, P2PNode, PeerId};
+use ant_node::CLOSE_GROUP_SIZE;
 use evmlib::wallet::Wallet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::debug;
+
+/// Default timeout for network operations in seconds.
+const CLIENT_TIMEOUT_SECS: u64 = 10;
 
 /// Configuration for the Autonomi client.
 #[derive(Debug, Clone)]
@@ -33,8 +37,8 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            timeout_secs: 30,
-            close_group_size: 8,
+            timeout_secs: CLIENT_TIMEOUT_SECS,
+            close_group_size: CLOSE_GROUP_SIZE,
         }
     }
 }

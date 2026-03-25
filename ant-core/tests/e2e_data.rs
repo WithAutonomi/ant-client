@@ -11,17 +11,12 @@ use serial_test::serial;
 use std::sync::Arc;
 use support::MiniTestnet;
 
-const CLIENT_TIMEOUT_SECS: u64 = 30;
-
 async fn setup() -> (Client, MiniTestnet) {
     let testnet = MiniTestnet::start(8).await;
     let node = testnet.node(4).expect("Node 4 should exist");
 
-    let config = ClientConfig {
-        timeout_secs: CLIENT_TIMEOUT_SECS,
-        ..Default::default()
-    };
-    let client = Client::from_node(Arc::clone(&node), config).with_wallet(testnet.wallet().clone());
+    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
+        .with_wallet(testnet.wallet().clone());
 
     (client, testnet)
 }
