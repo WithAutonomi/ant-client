@@ -332,7 +332,7 @@ async fn test_chunk_put_fails_with_insufficient_funds() {
 async fn test_payment_flow_with_node_failure() {
     let mut testnet = MiniTestnet::start(6).await;
 
-    // With a 6-node testnet and REQUIRED_QUOTES = 5, we need exactly 5
+    // With a 6-node testnet and CLOSE_GROUP_SIZE = 5, we need exactly 5
     // remote peers. The client's own node is excluded from quote collection,
     // so killing even one node leaves only 4 remote peers — not enough.
     //
