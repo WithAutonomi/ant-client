@@ -221,7 +221,8 @@ impl Client {
         }
 
         let total_chunks = chunks.len();
-        info!("Batch uploading {total_chunks} chunks in waves of {PAYMENT_WAVE_SIZE}");
+        let concurrency = self.config().chunk_concurrency;
+        info!("Batch uploading {total_chunks} chunks in waves of {PAYMENT_WAVE_SIZE} (concurrency: {concurrency})");
 
         let mut all_addresses = Vec::with_capacity(total_chunks);
         let mut seen_addresses: HashSet<XorName> = HashSet::new();
