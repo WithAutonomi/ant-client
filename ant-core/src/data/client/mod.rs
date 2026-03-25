@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 /// Default timeout for network operations in seconds.
-const CLIENT_TIMEOUT_SECS: u64 = 30;
+const CLIENT_TIMEOUT_SECS: u64 = 10;
 
 /// Configuration for the Autonomi client.
 #[derive(Debug, Clone)]
