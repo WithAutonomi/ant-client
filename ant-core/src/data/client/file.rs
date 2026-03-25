@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Result of a file upload: the `DataMap` needed to retrieve the file.
 #[derive(Debug, Clone)]
@@ -125,22 +125,13 @@ impl Client {
 
         let (mut chunk_rx, datamap_rx, handle) = spawn_file_encryption(path.to_path_buf())?;
 
-        // Collect chunks from encryption channel, then upload concurrently.
+        // Collect all chunks from encryption channel.
         let mut chunk_contents = Vec::new();
         while let Some(content) = chunk_rx.recv().await {
             chunk_contents.push(content);
         }
 
-        let mut chunks_stored = 0usize;
-        let mut upload_stream = futures::stream::iter(chunk_contents)
-            .map(|content| self.chunk_put(content))
-            .buffer_unordered(4);
-
-        while let Some(result) = futures::StreamExt::next(&mut upload_stream).await {
-            result?;
-            chunks_stored += 1;
-        }
-
+        // Await encryption completion to catch errors before paying for storage.
         handle
             .await
             .map_err(|e| Error::Encryption(format!("encryption task panicked: {e}")))?
@@ -149,6 +140,9 @@ impl Client {
         let data_map = datamap_rx
             .await
             .map_err(|_| Error::Encryption("no DataMap from encryption thread".to_string()))?;
+
+        let addresses = self.batch_upload_chunks(chunk_contents).await?;
+        let chunks_stored = addresses.len();
 
         info!(
             "File uploaded: {chunks_stored} chunks stored ({})",
@@ -184,11 +178,21 @@ impl Client {
 
         let (mut chunk_rx, datamap_rx, handle) = spawn_file_encryption(path.to_path_buf())?;
 
-        // Collect all chunks first (buffer-then-pay)
+        // Collect all chunks first (buffer-then-pay).
         let mut chunk_contents = Vec::new();
         while let Some(content) = chunk_rx.recv().await {
             chunk_contents.push(content);
         }
+
+        // Await encryption completion to catch errors before paying for storage.
+        handle
+            .await
+            .map_err(|e| Error::Encryption(format!("encryption task panicked: {e}")))?
+            .map_err(|e| Error::Encryption(format!("encryption failed: {e}")))?;
+
+        let data_map = datamap_rx
+            .await
+            .map_err(|_| Error::Encryption("no DataMap from encryption thread".to_string()))?;
 
         let chunk_count = chunk_contents.len();
 
@@ -209,28 +213,11 @@ impl Client {
             {
                 Ok(result) => result,
                 Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
-                    warn!("Merkle needs more peers ({msg}), falling back to per-chunk");
-                    let mut s_stored = 0usize;
-                    let mut s = stream::iter(chunk_contents)
-                        .map(|c| self.chunk_put(c))
-                        .buffer_unordered(4);
-                    while let Some(result) = futures::StreamExt::next(&mut s).await {
-                        result?;
-                        s_stored += 1;
-                    }
-
-                    // Need datamap from the encryption handle
-                    handle
-                        .await
-                        .map_err(|e| Error::Encryption(format!("encryption task panicked: {e}")))?
-                        .map_err(|e| Error::Encryption(format!("encryption failed: {e}")))?;
-                    let data_map = datamap_rx.await.map_err(|_| {
-                        Error::Encryption("no DataMap from encryption thread".to_string())
-                    })?;
-
+                    info!("Merkle needs more peers ({msg}), falling back to wave-batch");
+                    let addresses = self.batch_upload_chunks(chunk_contents).await?;
                     return Ok(FileUploadResult {
                         data_map,
-                        chunks_stored: s_stored,
+                        chunks_stored: addresses.len(),
                         payment_mode_used: PaymentMode::Single,
                     });
                 }
@@ -262,27 +249,10 @@ impl Client {
             }
             (stored, PaymentMode::Merkle)
         } else {
-            // Standard per-chunk payment path
-            let mut stored = 0usize;
-            let mut upload_stream = stream::iter(chunk_contents)
-                .map(|content| self.chunk_put(content))
-                .buffer_unordered(4);
-
-            while let Some(result) = futures::StreamExt::next(&mut upload_stream).await {
-                result?;
-                stored += 1;
-            }
-            (stored, PaymentMode::Single)
+            // Wave-based batch payment path (single EVM tx per wave).
+            let addresses = self.batch_upload_chunks(chunk_contents).await?;
+            (addresses.len(), PaymentMode::Single)
         };
-
-        handle
-            .await
-            .map_err(|e| Error::Encryption(format!("encryption task panicked: {e}")))?
-            .map_err(|e| Error::Encryption(format!("encryption failed: {e}")))?;
-
-        let data_map = datamap_rx
-            .await
-            .map_err(|_| Error::Encryption("no DataMap from encryption thread".to_string()))?;
 
         info!(
             "File uploaded with mode {mode:?}: {chunks_stored} chunks stored ({})",

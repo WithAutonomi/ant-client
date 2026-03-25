@@ -3,6 +3,7 @@
 //! Provides high-level APIs for storing and retrieving data
 //! on the Autonomi decentralized network.
 
+pub mod batch;
 pub mod cache;
 pub mod chunk;
 pub mod data;

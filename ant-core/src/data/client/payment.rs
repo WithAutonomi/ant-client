@@ -154,7 +154,7 @@ impl Client {
 }
 
 /// Convert an ant-node `PeerId` to an `EncodedPeerId` for payment proofs.
-fn peer_id_to_encoded(peer_id: &PeerId) -> Result<EncodedPeerId> {
+pub(crate) fn peer_id_to_encoded(peer_id: &PeerId) -> Result<EncodedPeerId> {
     hex_node_id_to_encoded_peer_id(&peer_id.to_hex())
         .map_err(|e| Error::Payment(format!("Failed to encode peer ID: {e}")))
 }
