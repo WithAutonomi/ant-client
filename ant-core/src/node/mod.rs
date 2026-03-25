@@ -1,5 +1,6 @@
 pub mod binary;
 pub mod daemon;
+pub mod devnet;
 pub mod events;
 pub mod process;
 pub mod registry;
