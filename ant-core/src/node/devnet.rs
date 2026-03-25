@@ -193,14 +193,18 @@ fn extract_custom_network_info(
     network: &EvmNetwork,
 ) -> Result<(String, String, String, Option<String>)> {
     match network {
-        EvmNetwork::Custom(custom) => Ok((
-            custom.rpc_url_http.to_string(),
-            format!("{:?}", custom.payment_token_address),
-            format!("{:?}", custom.data_payments_address),
-            custom
-                .merkle_payments_address
-                .map(|addr| format!("{addr:?}")),
-        )),
+        EvmNetwork::Custom(custom) => {
+            let token = custom.payment_token_address;
+            let payments = custom.data_payments_address;
+            Ok((
+                custom.rpc_url_http.to_string(),
+                format!("{token:?}"),
+                format!("{payments:?}"),
+                custom
+                    .merkle_payments_address
+                    .map(|addr| format!("{addr:?}")),
+            ))
+        }
         _ => Err(Error::Config(
             "Anvil testnet returned non-Custom network".to_string(),
         )),

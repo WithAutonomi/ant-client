@@ -13,9 +13,11 @@ use futures::stream;
 use futures::StreamExt;
 use saorsa_node::ant_protocol::DATA_TYPE_CHUNK;
 use saorsa_node::client::compute_address;
-use self_encryption::{stream_encrypt, DataMap};
+use self_encryption::{stream_encrypt, streaming_decrypt, DataMap};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
 /// Result of a file upload: the `DataMap` needed to retrieve the file.
@@ -312,10 +314,6 @@ impl Client {
     /// or the file cannot be written.
     #[allow(clippy::unused_async)] // Async for API consistency; blocking handled via block_in_place
     pub async fn file_download(&self, data_map: &DataMap, output: &Path) -> Result<u64> {
-        use self_encryption::streaming_decrypt;
-        use std::io::Write;
-        use tokio::runtime::Handle;
-
         debug!("Downloading file to {}", output.display());
 
         let handle = Handle::current();

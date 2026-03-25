@@ -83,7 +83,8 @@ async fn main() -> anyhow::Result<()> {
             action.execute(wallet).await?;
         }
         Commands::File { action } => {
-            let client = build_data_client(&data_ctx, true).await?;
+            let needs_wallet = matches!(action, commands::data::FileAction::Upload { .. });
+            let client = build_data_client(&data_ctx, needs_wallet).await?;
             action.execute(&client).await?;
         }
         Commands::Chunk { action } => {
@@ -113,7 +114,9 @@ async fn build_data_client(ctx: &DataCliContext, needs_wallet: bool) -> anyhow::
         anyhow::bail!("SECRET_KEY environment variable required for this operation");
     }
 
-    let (bootstrap, _manifest) = resolve_bootstrap(ctx)?;
+    // Parse manifest once and share it across bootstrap + EVM resolution.
+    let manifest = load_manifest(ctx)?;
+    let bootstrap = resolve_bootstrap_from(ctx, manifest.as_ref())?;
     let node = create_client_node(bootstrap, ctx.allow_loopback).await?;
 
     let config = ClientConfig {
@@ -124,7 +127,7 @@ async fn build_data_client(ctx: &DataCliContext, needs_wallet: bool) -> anyhow::
     let mut client = Client::from_node(node, config);
 
     if let Some(ref key) = private_key {
-        let (network, _) = resolve_evm_network_and_manifest(ctx)?;
+        let network = resolve_evm_network(&ctx.evm_network, manifest.as_ref())?;
         let wallet = create_wallet(key, network)?;
         info!("Wallet configured for EVM payments");
         client = client.with_wallet(wallet);
@@ -147,16 +150,20 @@ fn create_wallet(private_key: &str, network: EvmNetwork) -> anyhow::Result<Walle
         .map_err(|e| anyhow::anyhow!("Failed to create wallet: {e}"))
 }
 
+/// Load and parse the devnet manifest once (if configured).
+fn load_manifest(ctx: &DataCliContext) -> anyhow::Result<Option<DevnetManifest>> {
+    if let Some(ref manifest_path) = ctx.devnet_manifest {
+        let data = std::fs::read_to_string(manifest_path)?;
+        Ok(Some(serde_json::from_str(&data)?))
+    } else {
+        Ok(None)
+    }
+}
+
 fn resolve_evm_network_and_manifest(
     ctx: &DataCliContext,
 ) -> anyhow::Result<(EvmNetwork, Option<DevnetManifest>)> {
-    let manifest = if let Some(ref manifest_path) = ctx.devnet_manifest {
-        let data = std::fs::read_to_string(manifest_path)?;
-        Some(serde_json::from_str(&data)?)
-    } else {
-        None
-    };
-
+    let manifest = load_manifest(ctx)?;
     let network = resolve_evm_network(&ctx.evm_network, manifest.as_ref())?;
     Ok((network, manifest))
 }
@@ -186,7 +193,12 @@ fn resolve_evm_network(
                     let merkle_addr: Option<EvmAddress> = evm
                         .merkle_payments_address
                         .as_ref()
-                        .and_then(|s| s.parse().ok());
+                        .map(|s| {
+                            s.parse().map_err(|e| {
+                                anyhow::anyhow!("Invalid merkle payments address: {e}")
+                            })
+                        })
+                        .transpose()?;
                     return Ok(EvmNetwork::Custom(CustomNetwork {
                         rpc_url_http: rpc_url,
                         payment_token_address: token_addr,
@@ -205,22 +217,22 @@ fn resolve_evm_network(
     }
 }
 
-fn resolve_bootstrap(
+/// Resolve bootstrap peers from a pre-loaded manifest.
+fn resolve_bootstrap_from(
     ctx: &DataCliContext,
-) -> anyhow::Result<(Vec<SocketAddr>, Option<DevnetManifest>)> {
+    manifest: Option<&DevnetManifest>,
+) -> anyhow::Result<Vec<SocketAddr>> {
     if !ctx.bootstrap.is_empty() {
-        return Ok((ctx.bootstrap.clone(), None));
+        return Ok(ctx.bootstrap.clone());
     }
 
-    if let Some(ref manifest_path) = ctx.devnet_manifest {
-        let data = std::fs::read_to_string(manifest_path)?;
-        let manifest: DevnetManifest = serde_json::from_str(&data)?;
-        let bootstrap: Vec<SocketAddr> = manifest
+    if let Some(m) = manifest {
+        let bootstrap: Vec<SocketAddr> = m
             .bootstrap
             .iter()
             .filter_map(MultiAddr::socket_addr)
             .collect();
-        return Ok((bootstrap, Some(manifest)));
+        return Ok(bootstrap);
     }
 
     anyhow::bail!("No bootstrap peers provided. Use --bootstrap or --devnet-manifest.")
