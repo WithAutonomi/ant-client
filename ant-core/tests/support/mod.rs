@@ -3,7 +3,12 @@
 //! Spawns a small local testnet with `AntProtocol` handlers and an Anvil
 //! EVM testnet for real on-chain payment verification.
 
+// This module is compiled into every [[test]] binary separately.
+// Each binary uses a different subset of methods, so Rust flags
+// the unused ones as dead code. All items ARE used by at least
+// one test binary.
 #![allow(
+    dead_code,
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::cast_possible_truncation,
@@ -42,7 +47,6 @@ const TEST_MAX_RECORDS: usize = 1280;
 /// Initial records for quoting metrics.
 const TEST_INITIAL_RECORDS: usize = 1000;
 
-#[allow(dead_code)]
 pub struct TestNode {
     pub p2p_node: Option<Arc<P2PNode>>,
     pub protocol: Option<Arc<AntProtocol>>,
@@ -176,13 +180,11 @@ impl MiniTestnet {
     }
 
     /// Get a reference to the funded wallet for payment operations.
-    #[allow(dead_code)]
     pub fn wallet(&self) -> &Wallet {
         &self.wallet
     }
 
     /// Get the EVM network configuration (Anvil testnet).
-    #[allow(dead_code)]
     pub fn evm_network(&self) -> &EvmNetwork {
         &self.evm_network
     }
@@ -332,7 +334,6 @@ impl MiniTestnet {
     ///
     /// Aborts the handler task and drops the P2P node reference so the
     /// transport shuts down. The slot remains in the `nodes` vec (as `None`).
-    #[allow(dead_code)]
     pub fn shutdown_node(&mut self, index: usize) {
         if let Some(node) = self.nodes.get_mut(index) {
             if let Some(task) = node._handler_task.take() {
@@ -344,16 +345,43 @@ impl MiniTestnet {
     }
 
     /// Count how many nodes are still running (have a P2P node).
-    #[allow(dead_code)]
     pub fn running_node_count(&self) -> usize {
         self.nodes.iter().filter(|n| n.p2p_node.is_some()).count()
     }
 
     pub async fn teardown(self) {
+        // 1. Abort handler tasks first so they stop processing messages
         for node in &self.nodes {
             if let Some(ref task) = node._handler_task {
                 task.abort();
             }
         }
+
+        // 2. Gracefully shut down each P2P node — this sends DHT leave
+        //    messages, closes QUIC endpoints, and releases ports so the
+        //    OS can reclaim them before the next sequential test starts.
+        //    Without this, ports remain in TIME_WAIT and subsequent tests
+        //    encounter "Peer not found" / "Stream error" transport failures.
+        for node in &self.nodes {
+            if let Some(ref p2p_node) = node.p2p_node {
+                let _ = p2p_node.shutdown().await;
+            }
+        }
+    }
+
+    /// Tear down the testnet **without** calling `P2PNode::shutdown()`.
+    ///
+    /// This reproduces the old buggy teardown path for regression testing.
+    /// It aborts handler tasks and drops everything, but leaves QUIC endpoints
+    /// open and ports in TIME_WAIT. The `e2e_transport_teardown` test uses
+    /// this to prove that incomplete teardown causes transport failures.
+    pub async fn teardown_without_shutdown(self) {
+        for node in &self.nodes {
+            if let Some(ref task) = node._handler_task {
+                task.abort();
+            }
+        }
+        // Intentionally NOT calling p2p_node.shutdown() — this is the bug.
+        drop(self);
     }
 }

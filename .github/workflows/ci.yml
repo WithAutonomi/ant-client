@@ -56,7 +56,6 @@ jobs:
   test-e2e:
     name: E2E Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -75,7 +74,6 @@ jobs:
   test-merkle:
     name: Merkle E2E (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
     timeout-minutes: 20
     strategy:
       fail-fast: false
