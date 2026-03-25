@@ -5,8 +5,7 @@ use bytes::Bytes;
 use clap::Subcommand;
 use tracing::info;
 
-use ant_core::data::Client;
-use saorsa_node::ant_protocol::MAX_CHUNK_SIZE;
+use ant_core::data::{Client, MAX_CHUNK_SIZE};
 
 /// Chunk subcommands.
 #[derive(Subcommand, Debug)]

@@ -1,5 +1,5 @@
+use ant_core::data::Wallet;
 use clap::Subcommand;
-use evmlib::wallet::Wallet;
 
 /// Wallet subcommands.
 #[derive(Subcommand, Debug, Clone)]

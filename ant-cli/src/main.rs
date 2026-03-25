@@ -6,14 +6,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use evmlib::wallet::Wallet;
-use evmlib::Network as EvmNetwork;
-use saorsa_node::core::{CoreNodeConfig, MultiAddr, NodeMode, P2PNode};
-use saorsa_node::devnet::DevnetManifest;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use ant_core::data::{Client, ClientConfig};
+use ant_core::data::{
+    Client, ClientConfig, CoreNodeConfig, CustomNetwork, DevnetManifest, EvmAddress, EvmNetwork,
+    MultiAddr, NodeMode, P2PNode, Wallet, MAX_WIRE_MESSAGE_SIZE,
+};
 use cli::{Cli, Commands};
 
 #[tokio::main]
@@ -176,19 +175,19 @@ fn resolve_evm_network(
                         .rpc_url
                         .parse()
                         .map_err(|e| anyhow::anyhow!("Invalid RPC URL: {e}"))?;
-                    let token_addr: evmlib::common::Address = evm
+                    let token_addr: EvmAddress = evm
                         .payment_token_address
                         .parse()
                         .map_err(|e| anyhow::anyhow!("Invalid token address: {e}"))?;
-                    let payments_addr: evmlib::common::Address = evm
+                    let payments_addr: EvmAddress = evm
                         .data_payments_address
                         .parse()
                         .map_err(|e| anyhow::anyhow!("Invalid payments address: {e}"))?;
-                    let merkle_addr: Option<evmlib::common::Address> = evm
+                    let merkle_addr: Option<EvmAddress> = evm
                         .merkle_payments_address
                         .as_ref()
                         .and_then(|s| s.parse().ok());
-                    return Ok(EvmNetwork::Custom(evmlib::CustomNetwork {
+                    return Ok(EvmNetwork::Custom(CustomNetwork {
                         rpc_url_http: rpc_url,
                         payment_token_address: token_addr,
                         data_payments_address: payments_addr,
@@ -236,7 +235,7 @@ async fn create_client_node(
         .ipv6(false)
         .local(allow_loopback)
         .mode(NodeMode::Client)
-        .max_message_size(saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE)
+        .max_message_size(MAX_WIRE_MESSAGE_SIZE)
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to create core config: {e}"))?;
 
