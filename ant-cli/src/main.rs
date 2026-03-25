@@ -15,7 +15,14 @@ use ant_core::data::{
 };
 use cli::{Cli, Commands};
 
-#[tokio::main]
+/// Force at least 4 worker threads regardless of CPU count.
+///
+/// On small VMs (1-2 vCPU), the default `num_cpus` gives only 1-2 worker
+/// threads.  The NAT traversal poll() function does synchronous work
+/// (parking_lot locks, DashMap iteration) that blocks its worker thread.
+/// With only 1 worker, this freezes the entire runtime — timers stop,
+/// keepalives can't fire, and connections die silently.
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     let code = match run().await {
         Ok(()) => 0,
