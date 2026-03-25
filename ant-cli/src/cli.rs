@@ -28,6 +28,11 @@ pub struct Cli {
     #[arg(long, default_value_t = 60)]
     pub timeout_secs: u64,
 
+    /// Maximum number of chunks processed concurrently during uploads.
+    /// Defaults to half the available CPU threads.
+    #[arg(long)]
+    pub chunk_concurrency: Option<usize>,
+
     /// Log level.
     #[arg(long, default_value = "info")]
     pub log_level: String,

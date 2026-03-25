@@ -54,9 +54,9 @@ impl Client {
 
     /// Store a chunk to `CLOSE_GROUP_MAJORITY` peers from the quoted set.
     ///
-    /// Sends the PUT concurrently to all `peers` and succeeds once
-    /// `CLOSE_GROUP_MAJORITY` confirm storage. Peers that already have
-    /// the chunk count towards the majority.
+    /// Sends the PUT concurrently to the first `CLOSE_GROUP_MAJORITY`
+    /// peers and succeeds once all confirm storage. Peers that already
+    /// have the chunk count towards the majority.
     ///
     /// # Errors
     ///
@@ -70,8 +70,12 @@ impl Client {
     ) -> Result<XorName> {
         let address = compute_address(&content);
 
+        // Only send to CLOSE_GROUP_MAJORITY peers — no need to replicate
+        // beyond the minimum required for consensus.
+        let target_peers = &peers[..peers.len().min(CLOSE_GROUP_MAJORITY)];
+
         let mut put_futures = FuturesUnordered::new();
-        for (peer_id, addrs) in peers {
+        for (peer_id, addrs) in target_peers {
             let content = content.clone();
             let proof = proof.clone();
             let peer_id = *peer_id;

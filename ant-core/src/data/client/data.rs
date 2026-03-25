@@ -139,7 +139,7 @@ impl Client {
                         }
                     },
                 ))
-                .buffer_unordered(4);
+                .buffer_unordered(self.config().chunk_concurrency);
 
             while let Some(result) = upload_stream.next().await {
                 result?;

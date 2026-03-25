@@ -26,6 +26,19 @@ use tracing::debug;
 /// Default timeout for network operations in seconds.
 const CLIENT_TIMEOUT_SECS: u64 = 10;
 
+/// Assumed CPU thread count when `available_parallelism()` fails.
+const FALLBACK_THREAD_COUNT: usize = 4;
+
+/// Derive a sensible default chunk concurrency from available CPU parallelism.
+///
+/// Uses half the available threads (network I/O doesn't need 1:1 CPU mapping).
+fn default_chunk_concurrency() -> usize {
+    let threads = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(FALLBACK_THREAD_COUNT);
+    (threads / 2).max(1)
+}
+
 /// Configuration for the Autonomi client.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -33,6 +46,11 @@ pub struct ClientConfig {
     pub timeout_secs: u64,
     /// Number of closest peers to consider for routing.
     pub close_group_size: usize,
+    /// Maximum number of chunks processed concurrently during uploads.
+    ///
+    /// Controls parallelism for quote collection, chunk storage, and
+    /// merkle upload paths. Defaults to half the available CPU threads.
+    pub chunk_concurrency: usize,
 }
 
 impl Default for ClientConfig {
@@ -40,6 +58,7 @@ impl Default for ClientConfig {
         Self {
             timeout_secs: CLIENT_TIMEOUT_SECS,
             close_group_size: CLOSE_GROUP_SIZE,
+            chunk_concurrency: default_chunk_concurrency(),
         }
     }
 }

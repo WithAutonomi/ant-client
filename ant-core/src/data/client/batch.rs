@@ -314,7 +314,7 @@ impl Client {
             .map(|(content, address)| async move {
                 (address, self.prepare_chunk_payment(content).await)
             })
-            .buffer_unordered(chunk_count)
+            .buffer_unordered(self.config().chunk_concurrency)
             .collect()
             .await;
 
@@ -333,15 +333,15 @@ impl Client {
 
     /// Store a batch of paid chunks concurrently to their close groups.
     async fn store_paid_chunks(&self, paid_chunks: Vec<PaidChunk>) -> Result<Vec<XorName>> {
-        let store_futures: Vec<_> = paid_chunks
-            .into_iter()
+        let results: Vec<Result<XorName>> = stream::iter(paid_chunks)
             .map(|chunk| async move {
                 self.chunk_put_to_close_group(chunk.content, chunk.proof_bytes, &chunk.quoted_peers)
                     .await
             })
-            .collect();
+            .buffer_unordered(self.config().chunk_concurrency)
+            .collect()
+            .await;
 
-        let results = futures::future::join_all(store_futures).await;
         results.into_iter().collect()
     }
 }

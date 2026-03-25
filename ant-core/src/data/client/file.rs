@@ -241,7 +241,7 @@ impl Client {
                         }
                     },
                 ))
-                .buffer_unordered(4);
+                .buffer_unordered(self.config().chunk_concurrency);
 
             while let Some(result) = futures::StreamExt::next(&mut upload_stream).await {
                 result?;
