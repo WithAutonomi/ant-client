@@ -289,13 +289,11 @@ impl MiniTestnet {
                         let node = Arc::clone(&handler_node);
                         let topic_clone = topic.clone();
                         tokio::spawn(async move {
-                            let result = if topic_clone == ant_node::CHUNK_PROTOCOL_ID {
-                                protocol.handle_message(&data).await
-                            } else {
+                            if topic_clone != ant_node::CHUNK_PROTOCOL_ID {
                                 return;
-                            };
-                            match result {
-                                Ok(response_bytes) => {
+                            }
+                            match protocol.try_handle_request(&data).await {
+                                Ok(Some(response_bytes)) => {
                                     if let Err(e) = node
                                         .send_message(
                                             &source_peer,
@@ -308,9 +306,12 @@ impl MiniTestnet {
                                         eprintln!("ERROR: node {node_index} failed to send response to {source_peer}: {e}");
                                     }
                                 }
+                                Ok(None) => {
+                                    // Non-request message (e.g. response) — nothing to reply
+                                }
                                 Err(e) => {
                                     eprintln!(
-                                        "ERROR: node {node_index} handle_message failed: {e}"
+                                        "ERROR: node {node_index} try_handle_request failed: {e}"
                                     );
                                 }
                             }
