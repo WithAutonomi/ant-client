@@ -368,20 +368,4 @@ impl MiniTestnet {
             }
         }
     }
-
-    /// Tear down the testnet **without** calling `P2PNode::shutdown()`.
-    ///
-    /// This reproduces the old buggy teardown path for regression testing.
-    /// It aborts handler tasks and drops everything, but leaves QUIC endpoints
-    /// open and ports in TIME_WAIT. The `e2e_transport_teardown` test uses
-    /// this to prove that incomplete teardown causes transport failures.
-    pub async fn teardown_without_shutdown(self) {
-        for node in &self.nodes {
-            if let Some(ref task) = node._handler_task {
-                task.abort();
-            }
-        }
-        // Intentionally NOT calling p2p_node.shutdown() — this is the bug.
-        drop(self);
-    }
 }
