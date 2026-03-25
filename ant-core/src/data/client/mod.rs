@@ -16,6 +16,7 @@ use crate::data::error::{Error, Result};
 use crate::data::network::Network;
 use ant_node::client::XorName;
 use ant_node::core::{MultiAddr, P2PNode, PeerId};
+use ant_node::CLOSE_GROUP_SIZE;
 use evmlib::wallet::Wallet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -34,7 +35,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             timeout_secs: 30,
-            close_group_size: 8,
+            close_group_size: CLOSE_GROUP_SIZE,
         }
     }
 }
