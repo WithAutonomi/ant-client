@@ -38,6 +38,8 @@ bytes = "1"
 lru = "0.16"
 rand = "0.8"
 saorsa-node = { git = "https://github.com/saorsa-labs/saorsa-node", branch = "merkle_payments" }
+saorsa-pqc = "0.5"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -47,3 +49,43 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 tempfile = "3"
+serial_test = "3"
+anyhow = "1"
+alloy = { version = "1.6", features = ["node-bindings"] }
+tokio-test = "0.4"
+
+[[example]]
+name = "start-local-devnet"
+path = "examples/start-local-devnet.rs"
+
+[[test]]
+name = "e2e_chunk"
+path = "tests/e2e_chunk.rs"
+
+[[test]]
+name = "e2e_data"
+path = "tests/e2e_data.rs"
+
+[[test]]
+name = "e2e_file"
+path = "tests/e2e_file.rs"
+
+[[test]]
+name = "e2e_payment"
+path = "tests/e2e_payment.rs"
+
+[[test]]
+name = "e2e_security"
+path = "tests/e2e_security.rs"
+
+[[test]]
+name = "unit_self_encrypt"
+path = "tests/unit_self_encrypt.rs"
+
+[[test]]
+name = "merkle_unit"
+path = "tests/merkle_unit.rs"
+
+[[test]]
+name = "e2e_merkle"
+path = "tests/e2e_merkle.rs"
