@@ -15,7 +15,7 @@ use crate::data::client::cache::ChunkCache;
 use crate::data::error::{Error, Result};
 use crate::data::network::Network;
 use ant_node::client::XorName;
-use ant_node::core::{P2PNode, PeerId};
+use ant_node::core::{MultiAddr, P2PNode, PeerId};
 use evmlib::wallet::Wallet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -127,7 +127,11 @@ impl Client {
     /// Return all peers in the close group for a target address.
     ///
     /// Queries the DHT for the closest peers by XOR distance.
-    pub(crate) async fn close_group_peers(&self, target: &XorName) -> Result<Vec<PeerId>> {
+    /// Returns each peer paired with its known network addresses.
+    pub(crate) async fn close_group_peers(
+        &self,
+        target: &XorName,
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
         let peers = self
             .network()
             .find_closest_peers(target, self.config().close_group_size)

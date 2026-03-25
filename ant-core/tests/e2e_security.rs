@@ -49,7 +49,7 @@ async fn collect_and_pay(client: &Client, content: &Bytes) -> (PaymentProof, Vec
     // Build peer_quotes and payment
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes.len());
-    for (peer_id, quote, price) in quotes {
+    for (peer_id, _addrs, quote, price) in quotes {
         let encoded =
             hex_node_id_to_encoded_peer_id(&peer_id.to_hex()).expect("peer ID conversion");
         peer_quotes.push((encoded, quote.clone()));
@@ -98,7 +98,7 @@ async fn test_attack_forged_signature() {
     let tampered_bytes = rmp_serde::to_vec(&tampered_proof).expect("serialize tampered proof");
 
     let result = client
-        .chunk_put_with_proof(content, tampered_bytes, &target_peer)
+        .chunk_put_with_proof(content, tampered_bytes, &target_peer, &[])
         .await;
 
     assert!(
@@ -124,7 +124,7 @@ async fn test_attack_wrong_chunk_address() {
     // Try to store chunk B using A's proof
     let content_b = Bytes::from("chunk B - the interloper");
     let result = client
-        .chunk_put_with_proof(content_b, proof_bytes, &target_peer)
+        .chunk_put_with_proof(content_b, proof_bytes, &target_peer, &[])
         .await;
 
     assert!(
@@ -145,13 +145,18 @@ async fn test_attack_replay_different_chunk() {
 
     // Legitimately store chunk A
     let content_a = Bytes::from("replay attack - legitimate chunk A");
-    let (proof_bytes_a, target_peer_a) = client
+    let (proof_bytes_a, target_peer_a, target_addrs_a) = client
         .pay_for_storage(&compute_address(&content_a), content_a.len() as u64, 0)
         .await
         .expect("payment for chunk A should succeed");
 
     let addr_a = client
-        .chunk_put_with_proof(content_a, proof_bytes_a.clone(), &target_peer_a)
+        .chunk_put_with_proof(
+            content_a,
+            proof_bytes_a.clone(),
+            &target_peer_a,
+            &target_addrs_a,
+        )
         .await
         .expect("storing chunk A should succeed");
 
@@ -162,7 +167,7 @@ async fn test_attack_replay_different_chunk() {
     // Try to store chunk B using A's proof
     let content_b = Bytes::from("replay attack - sneaky chunk B");
     let result = client
-        .chunk_put_with_proof(content_b, proof_bytes_a, &target_peer_a)
+        .chunk_put_with_proof(content_b, proof_bytes_a, &target_peer_a, &target_addrs_a)
         .await;
 
     assert!(
@@ -193,7 +198,7 @@ async fn test_attack_zero_amount_payment() {
 
     let target_peer = quotes.first().expect("should have quotes").0;
     let mut peer_quotes = Vec::with_capacity(quotes.len());
-    for (peer_id, quote, _price) in quotes {
+    for (peer_id, _addrs, quote, _price) in quotes {
         let encoded =
             hex_node_id_to_encoded_peer_id(&peer_id.to_hex()).expect("peer ID conversion");
         peer_quotes.push((encoded, quote));
@@ -207,7 +212,7 @@ async fn test_attack_zero_amount_payment() {
     let fake_bytes = rmp_serde::to_vec(&fake_proof).expect("serialize fake proof");
 
     let result = client
-        .chunk_put_with_proof(content, fake_bytes, &target_peer)
+        .chunk_put_with_proof(content, fake_bytes, &target_peer, &[])
         .await;
 
     assert!(
@@ -238,7 +243,7 @@ async fn test_attack_fabricated_tx_hash() {
 
     let target_peer = quotes.first().expect("should have quotes").0;
     let mut peer_quotes = Vec::with_capacity(quotes.len());
-    for (peer_id, quote, _price) in quotes {
+    for (peer_id, _addrs, quote, _price) in quotes {
         let encoded =
             hex_node_id_to_encoded_peer_id(&peer_id.to_hex()).expect("peer ID conversion");
         peer_quotes.push((encoded, quote));
@@ -253,7 +258,7 @@ async fn test_attack_fabricated_tx_hash() {
     let fake_bytes = rmp_serde::to_vec(&fake_proof).expect("serialize fake proof");
 
     let result = client
-        .chunk_put_with_proof(content, fake_bytes, &target_peer)
+        .chunk_put_with_proof(content, fake_bytes, &target_peer, &[])
         .await;
 
     assert!(
@@ -277,13 +282,13 @@ async fn test_attack_double_spend_same_proof() {
 
     // Store chunk A successfully
     let addr1 = client
-        .chunk_put_with_proof(content.clone(), proof_bytes.clone(), &target_peer)
+        .chunk_put_with_proof(content.clone(), proof_bytes.clone(), &target_peer, &[])
         .await
         .expect("first PUT should succeed");
 
     // Try to store the SAME chunk with the SAME proof again
     let addr2 = client
-        .chunk_put_with_proof(content, proof_bytes, &target_peer)
+        .chunk_put_with_proof(content, proof_bytes, &target_peer, &[])
         .await
         .expect("second PUT (idempotent AlreadyExists) should succeed");
 
@@ -324,7 +329,7 @@ async fn test_attack_corrupted_public_key() {
     let tampered_bytes = rmp_serde::to_vec(&tampered_proof).expect("serialize tampered proof");
 
     let result = client
-        .chunk_put_with_proof(content, tampered_bytes, &target_peer)
+        .chunk_put_with_proof(content, tampered_bytes, &target_peer, &[])
         .await;
 
     assert!(

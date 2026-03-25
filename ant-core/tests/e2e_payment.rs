@@ -130,7 +130,7 @@ async fn test_payment_required_enforcement() {
     let content = Bytes::from("payment enforcement test data");
     let address = ant_core::data::compute_address(&content);
     let garbage_proof = vec![0xDE, 0xAD, 0xBE, 0xEF];
-    let target_peer = client_with_wallet
+    let (target_peer, target_addrs) = client_with_wallet
         .network()
         .find_closest_peers(&address, 1)
         .await
@@ -139,7 +139,7 @@ async fn test_payment_required_enforcement() {
         .next()
         .expect("should have at least one peer");
     let unpaid_result = client_with_wallet
-        .chunk_put_with_proof(content.clone(), garbage_proof, &target_peer)
+        .chunk_put_with_proof(content.clone(), garbage_proof, &target_peer, &target_addrs)
         .await;
 
     assert!(
@@ -271,7 +271,7 @@ async fn test_quote_collection() {
     );
 
     // All prices should be > 0
-    for (peer_id, _quote, price) in &quotes {
+    for (peer_id, _addrs, _quote, price) in &quotes {
         assert!(
             !price.is_zero(),
             "Quote price from peer {peer_id} should be > 0"
@@ -279,7 +279,7 @@ async fn test_quote_collection() {
     }
 
     // All peer IDs should be unique
-    let unique_peers: std::collections::HashSet<_> = quotes.iter().map(|(p, _, _)| *p).collect();
+    let unique_peers: std::collections::HashSet<_> = quotes.iter().map(|(p, _, _, _)| *p).collect();
     assert_eq!(
         unique_peers.len(),
         quotes.len(),

@@ -10,7 +10,7 @@ use ant_node::ant_protocol::{
     ChunkPutResponse,
 };
 use ant_node::client::{compute_address, send_and_await_chunk_response, DataChunk, XorName};
-use ant_node::core::PeerId;
+use ant_node::core::{MultiAddr, PeerId};
 use bytes::Bytes;
 use std::time::Duration;
 use tracing::{debug, info};
@@ -37,8 +37,8 @@ impl Client {
             .pay_for_storage(&address, data_size, CHUNK_DATA_TYPE)
             .await
         {
-            Ok((proof, target_peer)) => {
-                self.chunk_put_with_proof(content, proof, &target_peer)
+            Ok((proof, target_peer, peer_addrs)) => {
+                self.chunk_put_with_proof(content, proof, &target_peer, &peer_addrs)
                     .await
             }
             Err(Error::AlreadyStored) => {
@@ -66,6 +66,7 @@ impl Client {
         content: Bytes,
         proof: Vec<u8>,
         target_peer: &PeerId,
+        peer_addrs: &[MultiAddr],
     ) -> Result<XorName> {
         let address = compute_address(&content);
         let node = self.network().node();
@@ -90,7 +91,7 @@ impl Client {
             message_bytes,
             request_id,
             timeout,
-            &[],
+            peer_addrs,
             |body| match body {
                 ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address: addr }) => {
                     info!("Chunk stored at {}", hex::encode(addr));
@@ -149,8 +150,8 @@ impl Client {
         let peers = self.close_group_peers(address).await?;
         let addr_hex = hex::encode(address);
 
-        for peer in &peers {
-            match self.chunk_get_from_peer(address, peer).await {
+        for (peer, addrs) in &peers {
+            match self.chunk_get_from_peer(address, peer, addrs).await {
                 Ok(Some(chunk)) => {
                     self.chunk_cache().put(chunk.address, chunk.content.clone());
                     return Ok(Some(chunk));
@@ -174,6 +175,7 @@ impl Client {
         &self,
         address: &XorName,
         peer: &PeerId,
+        peer_addrs: &[MultiAddr],
     ) -> Result<Option<DataChunk>> {
         let node = self.network().node();
         let request_id = self.next_request_id();
@@ -196,7 +198,7 @@ impl Client {
             message_bytes,
             request_id,
             timeout,
-            &[],
+            peer_addrs,
             |body| match body {
                 ChunkMessageBody::GetResponse(ChunkGetResponse::Success {
                     address: addr,

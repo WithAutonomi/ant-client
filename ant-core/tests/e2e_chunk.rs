@@ -136,7 +136,7 @@ async fn test_chunk_put_with_insufficient_proof_rejected() {
 
     // Send a too-short proof (not even valid msgpack)
     let insufficient_proof = vec![0x00; 16];
-    let target_peer = client
+    let (target_peer, target_addrs) = client
         .network()
         .find_closest_peers(&address, 1)
         .await
@@ -145,7 +145,7 @@ async fn test_chunk_put_with_insufficient_proof_rejected() {
         .next()
         .expect("should have at least one peer");
     let result = client
-        .chunk_put_with_proof(content, insufficient_proof, &target_peer)
+        .chunk_put_with_proof(content, insufficient_proof, &target_peer, &target_addrs)
         .await;
 
     assert!(
@@ -218,7 +218,7 @@ async fn test_chunk_put_with_invalid_proof_rejected() {
     let address = compute_address(&content);
     let invalid_proof = vec![0xDE, 0xAD, 0xBE, 0xEF];
 
-    let target_peer = client
+    let (target_peer, target_addrs) = client
         .network()
         .find_closest_peers(&address, 1)
         .await
@@ -227,7 +227,7 @@ async fn test_chunk_put_with_invalid_proof_rejected() {
         .next()
         .expect("should have at least one peer");
     let result = client
-        .chunk_put_with_proof(content, invalid_proof, &target_peer)
+        .chunk_put_with_proof(content, invalid_proof, &target_peer, &target_addrs)
         .await;
 
     // The node should reject this — either a deserialization error or payment verification failure

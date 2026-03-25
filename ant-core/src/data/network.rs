@@ -71,10 +71,18 @@ impl Network {
 
     /// Find the closest peers to a target address.
     ///
+    /// Returns each peer paired with its known network addresses, enabling
+    /// callers to pass addresses to `send_and_await_chunk_response` for
+    /// faster connection establishment.
+    ///
     /// # Errors
     ///
     /// Returns an error if the DHT lookup fails.
-    pub async fn find_closest_peers(&self, target: &[u8; 32], count: usize) -> Result<Vec<PeerId>> {
+    pub async fn find_closest_peers(
+        &self,
+        target: &[u8; 32],
+        count: usize,
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
         let local_peer_id = self.node.peer_id();
 
         // Request one extra to account for filtering out our own peer ID
@@ -89,7 +97,7 @@ impl Network {
             .into_iter()
             .filter(|n| n.peer_id != *local_peer_id)
             .take(count)
-            .map(|n| n.peer_id)
+            .map(|n| (n.peer_id, n.addresses))
             .collect())
     }
 

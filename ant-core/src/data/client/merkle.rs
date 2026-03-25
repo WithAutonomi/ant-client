@@ -287,8 +287,8 @@ impl Client {
         if remote_peers.len() < CANDIDATES_PER_POOL {
             let connected = self.network().connected_peers().await;
             for peer in connected {
-                if !remote_peers.contains(&peer) {
-                    remote_peers.push(peer);
+                if !remote_peers.iter().any(|(id, _)| *id == peer) {
+                    remote_peers.push((peer, vec![]));
                 }
             }
         }
@@ -303,7 +303,7 @@ impl Client {
 
         let mut candidate_futures = FuturesUnordered::new();
 
-        for peer_id in &remote_peers {
+        for (peer_id, peer_addrs) in &remote_peers {
             let request_id = self.next_request_id();
             let request = MerkleCandidateQuoteRequest {
                 address: *address,
@@ -325,6 +325,7 @@ impl Client {
             };
 
             let peer_id_clone = *peer_id;
+            let addrs_clone = peer_addrs.clone();
             let node_clone = node.clone();
 
             let fut = async move {
@@ -334,7 +335,7 @@ impl Client {
                     message_bytes,
                     request_id,
                     timeout,
-                    &[],
+                    &addrs_clone,
                     |body| match body {
                         ChunkMessageBody::MerkleCandidateQuoteResponse(
                             MerkleCandidateQuoteResponse::Success { candidate_node },

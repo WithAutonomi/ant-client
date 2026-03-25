@@ -7,7 +7,7 @@ use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_evm::{EncodedPeerId, ProofOfPayment};
 use ant_node::client::hex_node_id_to_encoded_peer_id;
-use ant_node::core::PeerId;
+use ant_node::core::{MultiAddr, PeerId};
 use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use evmlib::wallet::Wallet;
 use std::sync::Arc;
@@ -33,15 +33,16 @@ impl Client {
     ///
     /// Returns an error if the wallet is not set, quotes cannot be collected,
     /// on-chain payment fails, or serialization fails.
-    /// Returns `(proof_bytes, target_peer)`. The `target_peer` is the closest
-    /// peer from quote collection — callers **must** send the PUT to this peer
-    /// to avoid a mismatch between the paid quotes and the storage target.
+    /// Returns `(proof_bytes, target_peer, peer_addrs)`. The `target_peer` is
+    /// the closest peer from quote collection — callers **must** send the PUT
+    /// to this peer to avoid a mismatch between the paid quotes and the
+    /// storage target. `peer_addrs` are the target's known network addresses.
     pub async fn pay_for_storage(
         &self,
         address: &[u8; 32],
         data_size: u64,
         data_type: u32,
-    ) -> Result<(Vec<u8>, PeerId)> {
+    ) -> Result<(Vec<u8>, PeerId, Vec<MultiAddr>)> {
         let wallet = self.require_wallet()?;
 
         debug!("Collecting quotes for address {}", hex::encode(address));
@@ -51,9 +52,9 @@ impl Client {
 
         // Pin the closest peer from the quote set as the PUT target.
         // This peer was among the quoted set so the proof includes it.
-        let target_peer = quotes_with_peers
+        let (target_peer, target_addrs) = quotes_with_peers
             .first()
-            .map(|(peer_id, _, _)| *peer_id)
+            .map(|(peer_id, addrs, _, _)| (*peer_id, addrs.clone()))
             .ok_or_else(|| Error::InsufficientPeers("no quotes collected".to_string()))?;
 
         // 2. Fetch prices from the on-chain contract rather than using the
@@ -62,7 +63,7 @@ impl Client {
         // using the same formula, so we must use matching prices.
         let metrics_batch: Vec<_> = quotes_with_peers
             .iter()
-            .map(|(_, quote, _)| quote.quoting_metrics.clone())
+            .map(|(_, _, quote, _)| quote.quoting_metrics.clone())
             .collect();
 
         let contract_prices =
@@ -84,7 +85,7 @@ impl Client {
         let mut peer_quotes = Vec::with_capacity(quotes_with_peers.len());
         let mut quotes_for_payment = Vec::with_capacity(quotes_with_peers.len());
 
-        for ((peer_id, quote, _local_price), contract_price) in
+        for ((peer_id, _addrs, quote, _local_price), contract_price) in
             quotes_with_peers.into_iter().zip(contract_prices)
         {
             let encoded = peer_id_to_encoded(&peer_id)?;
@@ -118,7 +119,7 @@ impl Client {
         let proof_bytes = serialize_single_node_proof(&proof)
             .map_err(|e| Error::Serialization(format!("Failed to serialize payment proof: {e}")))?;
 
-        Ok((proof_bytes, target_peer))
+        Ok((proof_bytes, target_peer, target_addrs))
     }
 
     /// Approve the wallet to spend tokens on the payment vault contract.
