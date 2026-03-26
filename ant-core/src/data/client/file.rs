@@ -38,6 +38,11 @@ pub struct FileUploadResult {
 /// Contains everything needed to construct the on-chain payment transaction
 /// externally (e.g. via WalletConnect in a desktop app) and then finalize
 /// the upload without a Rust-side wallet.
+///
+/// Note: This struct stays in Rust memory — only `payment_intent` is sent
+/// to the frontend. `PreparedChunk` contains non-serializable network types,
+/// so the full struct cannot derive `Serialize`.
+#[derive(Debug)]
 pub struct PreparedUpload {
     /// The data map for later retrieval.
     pub data_map: DataMap,
@@ -184,7 +189,10 @@ impl Client {
     /// Returns an error if the file cannot be read, encryption fails,
     /// or quote collection fails.
     pub async fn file_prepare_upload(&self, path: &Path) -> Result<PreparedUpload> {
-        debug!("Preparing file upload for external signing: {}", path.display());
+        debug!(
+            "Preparing file upload for external signing: {}",
+            path.display()
+        );
 
         let (mut chunk_rx, datamap_rx, handle) = spawn_file_encryption(path.to_path_buf())?;
 

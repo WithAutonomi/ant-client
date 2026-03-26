@@ -42,6 +42,8 @@ impl Client {
         data_size: u64,
         data_type: u32,
     ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>)> {
+        // Wallet is required for the on-chain payment step (step 5 below).
+        // Check early so we don't waste time collecting quotes for a misconfigured client.
         let wallet = self.require_wallet()?;
 
         debug!("Collecting quotes for address {}", hex::encode(address));
@@ -131,10 +133,10 @@ impl Client {
     /// Returns an error if the wallet is not set or the approval transaction fails.
     pub async fn approve_token_spend(&self) -> Result<()> {
         let wallet = self.require_wallet()?;
-        let network = wallet.network();
+        let evm_network = self.require_evm_network()?;
 
         // Approve data payments contract
-        let data_payments_address = network.data_payments_address();
+        let data_payments_address = evm_network.data_payments_address();
         wallet
             .approve_to_spend_tokens(*data_payments_address, evmlib::common::U256::MAX)
             .await
@@ -142,7 +144,7 @@ impl Client {
         info!("Token spend approved for data payments contract");
 
         // Approve merkle payments contract (if deployed)
-        if let Some(merkle_address) = network.merkle_payments_address() {
+        if let Some(merkle_address) = evm_network.merkle_payments_address() {
             wallet
                 .approve_to_spend_tokens(*merkle_address, evmlib::common::U256::MAX)
                 .await

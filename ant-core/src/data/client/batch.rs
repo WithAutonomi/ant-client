@@ -15,13 +15,14 @@ use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePay
 use bytes::Bytes;
 use evmlib::common::TxHash;
 use futures::stream::{self, StreamExt};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, info};
 
 /// Number of chunks per payment wave.
 const PAYMENT_WAVE_SIZE: usize = 64;
 
 /// Chunk quoted but not yet paid. Produced by [`Client::prepare_chunk_payment`].
+#[derive(Debug)]
 pub struct PreparedChunk {
     /// The chunk content bytes.
     pub content: Bytes,
@@ -36,6 +37,7 @@ pub struct PreparedChunk {
 }
 
 /// Chunk paid but not yet stored. Produced by [`Client::batch_pay`].
+#[derive(Debug)]
 pub struct PaidChunk {
     /// The chunk content bytes.
     pub content: Bytes,
@@ -51,7 +53,7 @@ pub struct PaidChunk {
 ///
 /// Contains the information needed to construct and submit the on-chain
 /// payment transaction without requiring a local wallet or private key.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PaymentIntent {
     /// Individual payment entries: (quote_hash, rewards_address, amount).
     pub payments: Vec<(QuoteHash, RewardsAddress, Amount)>,
@@ -84,19 +86,27 @@ impl PaymentIntent {
 /// Build [`PaidChunk`]s from prepared chunks and externally-provided transaction hashes.
 ///
 /// Shared by [`Client::batch_pay`] (wallet flow) and [`finalize_batch_payment`] (external signer).
+///
+/// Returns an error if any non-zero-amount quote hash is missing from `tx_hash_map`,
+/// since chunks uploaded without valid proofs would be rejected by the network.
 fn build_paid_chunks(
     prepared: Vec<PreparedChunk>,
-    tx_hash_map: &BTreeMap<QuoteHash, TxHash>,
+    tx_hash_map: &HashMap<QuoteHash, TxHash>,
 ) -> Result<Vec<PaidChunk>> {
     let mut paid_chunks = Vec::with_capacity(prepared.len());
     for chunk in prepared {
-        let tx_hashes: Vec<_> = chunk
-            .payment
-            .quotes
-            .iter()
-            .filter(|info| !info.amount.is_zero())
-            .filter_map(|info| tx_hash_map.get(&info.quote_hash).copied())
-            .collect();
+        let mut tx_hashes = Vec::new();
+        for info in &chunk.payment.quotes {
+            if !info.amount.is_zero() {
+                let tx_hash = tx_hash_map.get(&info.quote_hash).copied().ok_or_else(|| {
+                    Error::Payment(format!(
+                        "Missing tx hash for quote {} — external signer did not return a receipt for this payment",
+                        hex::encode(info.quote_hash)
+                    ))
+                })?;
+                tx_hashes.push(tx_hash);
+            }
+        }
 
         let proof = PaymentProof {
             proof_of_payment: ProofOfPayment {
@@ -105,9 +115,8 @@ fn build_paid_chunks(
             tx_hashes,
         };
 
-        let proof_bytes = serialize_single_node_proof(&proof).map_err(|e| {
-            Error::Serialization(format!("Failed to serialize payment proof: {e}"))
-        })?;
+        let proof_bytes = serialize_single_node_proof(&proof)
+            .map_err(|e| Error::Serialization(format!("Failed to serialize payment proof: {e}")))?;
 
         paid_chunks.push(PaidChunk {
             content: chunk.content,
@@ -127,8 +136,7 @@ pub fn finalize_batch_payment(
     prepared: Vec<PreparedChunk>,
     tx_hash_map: &HashMap<QuoteHash, TxHash>,
 ) -> Result<Vec<PaidChunk>> {
-    let btree: BTreeMap<QuoteHash, TxHash> = tx_hash_map.iter().map(|(k, v)| (*k, *v)).collect();
-    build_paid_chunks(prepared, &btree)
+    build_paid_chunks(prepared, tx_hash_map)
 }
 
 impl Client {
@@ -254,6 +262,7 @@ impl Client {
             tx_hash_map.len()
         );
 
+        let tx_hash_map: HashMap<QuoteHash, TxHash> = tx_hash_map.into_iter().collect();
         build_paid_chunks(prepared, &tx_hash_map)
     }
 
@@ -388,7 +397,10 @@ impl Client {
     }
 
     /// Store a batch of paid chunks concurrently to their close groups.
-    pub(crate) async fn store_paid_chunks(&self, paid_chunks: Vec<PaidChunk>) -> Result<Vec<XorName>> {
+    pub(crate) async fn store_paid_chunks(
+        &self,
+        paid_chunks: Vec<PaidChunk>,
+    ) -> Result<Vec<XorName>> {
         let results: Vec<Result<XorName>> = stream::iter(paid_chunks)
             .map(|chunk| async move {
                 self.chunk_put_to_close_group(chunk.content, chunk.proof_bytes, &chunk.quoted_peers)
@@ -439,9 +451,7 @@ mod tests {
     }
 
     /// Helper: build a PreparedChunk with specified payment amounts.
-    fn make_prepared_chunk(
-        amounts: [u64; CLOSE_GROUP_SIZE],
-    ) -> PreparedChunk {
+    fn make_prepared_chunk(amounts: [u64; CLOSE_GROUP_SIZE]) -> PreparedChunk {
         let quotes: [QuotePaymentInfo; CLOSE_GROUP_SIZE] =
             std::array::from_fn(|i| QuotePaymentInfo {
                 quote_hash: QuoteHash::from([i as u8 + 1; 32]),
@@ -522,16 +532,15 @@ mod tests {
     }
 
     #[test]
-    fn finalize_batch_payment_missing_tx_hash_still_succeeds() {
-        // If the tx_hash_map doesn't contain a quote hash, filter_map skips it.
-        // The proof just has fewer tx_hashes — this is not an error in the
-        // current implementation (matches batch_pay behavior).
+    fn finalize_batch_payment_missing_tx_hash_errors() {
+        // Missing tx hash for a non-zero-amount quote should error,
+        // since the chunk would be rejected by the network without a valid proof.
         let chunk = make_prepared_chunk([0, 0, 500, 0, 0]);
 
-        let paid = finalize_batch_payment(vec![chunk], &HashMap::new()).unwrap();
-        assert_eq!(paid.len(), 1);
-        // Proof still serializes, just with empty tx_hashes
-        assert!(!paid[0].proof_bytes.is_empty());
+        let result = finalize_batch_payment(vec![chunk], &HashMap::new());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Missing tx hash"), "got: {err}");
     }
 
     #[test]
