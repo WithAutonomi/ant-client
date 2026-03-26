@@ -14,7 +14,7 @@ use ant_node::client::compute_address;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use self_encryption::{decrypt, encrypt, DataMap, EncryptedChunk};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Result of an in-memory data upload: the `DataMap` needed to retrieve the data.
 #[derive(Debug, Clone)]
@@ -51,17 +51,8 @@ impl Client {
             .map(|chunk| chunk.content)
             .collect();
 
-        // Fail-fast: cancel remaining uploads on first error to avoid
-        // wasting gas on chunks that can't form a complete DataMap.
-        let mut chunks_stored = 0usize;
-        let mut upload_stream = stream::iter(chunk_contents)
-            .map(|content| self.chunk_put(content))
-            .buffer_unordered(4);
-
-        while let Some(result) = upload_stream.next().await {
-            result?;
-            chunks_stored += 1;
-        }
+        let addresses = self.batch_upload_chunks(chunk_contents).await?;
+        let chunks_stored = addresses.len();
 
         info!("Data uploaded: {chunks_stored} chunks stored ({content_len} bytes original)");
 
@@ -119,18 +110,11 @@ impl Client {
             {
                 Ok(result) => result,
                 Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
-                    warn!("Merkle needs more peers ({msg}), falling back to per-chunk");
-                    let mut chunks_stored = 0usize;
-                    let mut s = stream::iter(chunk_contents)
-                        .map(|c| self.chunk_put(c))
-                        .buffer_unordered(4);
-                    while let Some(result) = s.next().await {
-                        result?;
-                        chunks_stored += 1;
-                    }
+                    info!("Merkle needs more peers ({msg}), falling back to wave-batch");
+                    let addresses = self.batch_upload_chunks(chunk_contents).await?;
                     return Ok(DataUploadResult {
                         data_map,
-                        chunks_stored,
+                        chunks_stored: addresses.len(),
                         payment_mode_used: PaymentMode::Single,
                     });
                 }
@@ -155,7 +139,7 @@ impl Client {
                         }
                     },
                 ))
-                .buffer_unordered(4);
+                .buffer_unordered(self.config().chunk_concurrency);
 
             while let Some(result) = upload_stream.next().await {
                 result?;
@@ -169,21 +153,16 @@ impl Client {
                 payment_mode_used: PaymentMode::Merkle,
             })
         } else {
-            // Standard per-chunk payment path
-            let mut chunks_stored = 0usize;
-            let mut upload_stream = stream::iter(chunk_contents)
-                .map(|content| self.chunk_put(content))
-                .buffer_unordered(4);
+            // Wave-based batch payment path (single EVM tx per wave).
+            let addresses = self.batch_upload_chunks(chunk_contents).await?;
 
-            while let Some(result) = upload_stream.next().await {
-                result?;
-                chunks_stored += 1;
-            }
-
-            info!("Data uploaded: {chunks_stored} chunks stored ({content_len} bytes original)");
+            info!(
+                "Data uploaded: {} chunks stored ({content_len} bytes original)",
+                addresses.len()
+            );
             Ok(DataUploadResult {
                 data_map,
-                chunks_stored,
+                chunks_stored: addresses.len(),
                 payment_mode_used: PaymentMode::Single,
             })
         }

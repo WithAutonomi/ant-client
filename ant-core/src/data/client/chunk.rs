@@ -14,6 +14,7 @@ use ant_node::core::{MultiAddr, PeerId};
 use ant_node::CLOSE_GROUP_MAJORITY;
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
+use std::future::Future;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -54,9 +55,10 @@ impl Client {
 
     /// Store a chunk to `CLOSE_GROUP_MAJORITY` peers from the quoted set.
     ///
-    /// Sends the PUT concurrently to all `peers` and succeeds once
-    /// `CLOSE_GROUP_MAJORITY` confirm storage. Peers that already have
-    /// the chunk count towards the majority.
+    /// Initially sends the PUT concurrently to the first
+    /// `CLOSE_GROUP_MAJORITY` peers. If any fail, falls back to the
+    /// remaining peers in the quoted set until majority is reached or
+    /// all peers are exhausted.
     ///
     /// # Errors
     ///
@@ -70,22 +72,17 @@ impl Client {
     ) -> Result<XorName> {
         let address = compute_address(&content);
 
+        let initial_count = peers.len().min(CLOSE_GROUP_MAJORITY);
+        let (initial_peers, fallback_peers) = peers.split_at(initial_count);
+
         let mut put_futures = FuturesUnordered::new();
-        for (peer_id, addrs) in peers {
-            let content = content.clone();
-            let proof = proof.clone();
-            let peer_id = *peer_id;
-            let addrs = addrs.clone();
-            put_futures.push(async move {
-                let result = self
-                    .chunk_put_with_proof(content, proof, &peer_id, &addrs)
-                    .await;
-                (peer_id, result)
-            });
+        for (peer_id, addrs) in initial_peers {
+            put_futures.push(self.spawn_chunk_put(content.clone(), proof.clone(), peer_id, addrs));
         }
 
         let mut success_count = 0usize;
         let mut failures: Vec<String> = Vec::new();
+        let mut fallback_iter = fallback_peers.iter();
 
         while let Some((peer_id, result)) = put_futures.next().await {
             match result {
@@ -102,6 +99,19 @@ impl Client {
                 Err(e) => {
                     warn!("Failed to store chunk on {peer_id}: {e}");
                     failures.push(format!("{peer_id}: {e}"));
+
+                    if let Some((fb_peer, fb_addrs)) = fallback_iter.next() {
+                        debug!(
+                            "Falling back to peer {fb_peer} for chunk {}",
+                            hex::encode(address)
+                        );
+                        put_futures.push(self.spawn_chunk_put(
+                            content.clone(),
+                            proof.clone(),
+                            fb_peer,
+                            fb_addrs,
+                        ));
+                    }
                 }
             }
         }
@@ -110,6 +120,23 @@ impl Client {
             "Stored on {success_count} peers, need {CLOSE_GROUP_MAJORITY}. Failures: [{}]",
             failures.join("; ")
         )))
+    }
+
+    /// Spawn a chunk PUT future for a single peer.
+    fn spawn_chunk_put<'a>(
+        &'a self,
+        content: Bytes,
+        proof: Vec<u8>,
+        peer_id: &'a PeerId,
+        addrs: &'a [MultiAddr],
+    ) -> impl Future<Output = (PeerId, Result<XorName>)> + 'a {
+        let peer_id_owned = *peer_id;
+        async move {
+            let result = self
+                .chunk_put_with_proof(content, proof, &peer_id_owned, addrs)
+                .await;
+            (peer_id_owned, result)
+        }
     }
 
     /// Store a chunk on the Autonomi network with a pre-built payment proof.

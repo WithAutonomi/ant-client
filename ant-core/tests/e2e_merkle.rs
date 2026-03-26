@@ -39,6 +39,7 @@ async fn setup_merkle_testnet() -> (Client, MiniTestnet) {
     let config = ClientConfig {
         timeout_secs: CLIENT_TIMEOUT_SECS,
         close_group_size: 20,
+        ..Default::default()
     };
     let client = Client::from_node(Arc::clone(&node), config).with_wallet(testnet.wallet().clone());
 
