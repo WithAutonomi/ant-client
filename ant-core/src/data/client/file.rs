@@ -11,8 +11,6 @@ use crate::data::error::{Error, Result};
 use ant_node::ant_protocol::DATA_TYPE_CHUNK;
 use ant_node::client::compute_address;
 use bytes::Bytes;
-use futures::stream;
-use futures::StreamExt;
 use self_encryption::{stream_encrypt, streaming_decrypt, DataMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -224,29 +222,9 @@ impl Client {
                 Err(e) => return Err(e),
             };
 
-            let mut stored = 0usize;
-            let mut upload_stream =
-                stream::iter(chunk_contents.into_iter().zip(addresses.iter()).map(
-                    |(content, addr)| {
-                        let proof_bytes = batch_result.proofs.get(addr).cloned();
-                        async move {
-                            let proof = proof_bytes.ok_or_else(|| {
-                                Error::Payment(format!(
-                                    "Missing merkle proof for chunk {}",
-                                    hex::encode(addr)
-                                ))
-                            })?;
-                            let peers = self.close_group_peers(addr).await?;
-                            self.chunk_put_to_close_group(content, proof, &peers).await
-                        }
-                    },
-                ))
-                .buffer_unordered(self.config().chunk_concurrency);
-
-            while let Some(result) = futures::StreamExt::next(&mut upload_stream).await {
-                result?;
-                stored += 1;
-            }
+            let stored = self
+                .merkle_upload_chunks(chunk_contents, addresses, &batch_result)
+                .await?;
             (stored, PaymentMode::Merkle)
         } else {
             // Wave-based batch payment path (single EVM tx per wave).
@@ -354,5 +332,37 @@ impl Client {
                 Err(e)
             }
         }
+    }
+}
+
+/// Compile-time assertions that Client file method futures are Send.
+#[cfg(test)]
+mod send_assertions {
+    use super::*;
+
+    fn _assert_send<T: Send>(_: &T) {}
+
+    #[allow(dead_code, unreachable_code, clippy::diverging_sub_expression)]
+    async fn _file_upload_is_send(client: &Client) {
+        let fut = client.file_upload(Path::new("/dev/null"));
+        _assert_send(&fut);
+    }
+
+    #[allow(dead_code, unreachable_code, clippy::diverging_sub_expression)]
+    async fn _file_upload_with_mode_is_send(client: &Client) {
+        let fut = client.file_upload_with_mode(Path::new("/dev/null"), PaymentMode::Auto);
+        _assert_send(&fut);
+    }
+
+    #[allow(
+        dead_code,
+        unreachable_code,
+        unused_variables,
+        clippy::diverging_sub_expression
+    )]
+    async fn _file_download_is_send(client: &Client) {
+        let dm: DataMap = todo!();
+        let fut = client.file_download(&dm, Path::new("/dev/null"));
+        _assert_send(&fut);
     }
 }
