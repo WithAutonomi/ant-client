@@ -71,6 +71,7 @@ pub struct Client {
     config: ClientConfig,
     network: Network,
     wallet: Option<Arc<Wallet>>,
+    evm_network: Option<evmlib::Network>,
     chunk_cache: ChunkCache,
     next_request_id: AtomicU64,
 }
@@ -84,6 +85,7 @@ impl Client {
             config,
             network,
             wallet: None,
+            evm_network: None,
             chunk_cache: ChunkCache::default(),
             next_request_id: AtomicU64::new(1),
         }
@@ -107,16 +109,49 @@ impl Client {
             config,
             network,
             wallet: None,
+            evm_network: None,
             chunk_cache: ChunkCache::default(),
             next_request_id: AtomicU64::new(1),
         })
     }
 
     /// Set the wallet for payment operations.
+    ///
+    /// Also populates the EVM network from the wallet so that
+    /// price queries work without a separate `with_evm_network` call.
     #[must_use]
     pub fn with_wallet(mut self, wallet: Wallet) -> Self {
+        self.evm_network = Some(wallet.network().clone());
         self.wallet = Some(Arc::new(wallet));
         self
+    }
+
+    /// Set the EVM network for price queries without requiring a wallet.
+    ///
+    /// This enables operations like quote collection and cost estimation
+    /// for external-signer flows where the private key lives outside Rust.
+    #[must_use]
+    pub fn with_evm_network(mut self, network: evmlib::Network) -> Self {
+        self.evm_network = Some(network);
+        self
+    }
+
+    /// Get the EVM network, falling back to the wallet's network if available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if neither `with_evm_network` nor `with_wallet` was called.
+    pub(crate) fn require_evm_network(&self) -> Result<&evmlib::Network> {
+        if let Some(ref net) = self.evm_network {
+            return Ok(net);
+        }
+        if let Some(ref wallet) = self.wallet {
+            return Ok(wallet.network());
+        }
+        Err(Error::Payment(
+            "EVM network not configured — call with_evm_network() or with_wallet() first"
+                .to_string(),
+        ))
     }
 
     /// Get the client configuration.
