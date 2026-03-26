@@ -490,6 +490,27 @@ impl Client {
     }
 }
 
+/// Compile-time assertions that merkle method futures are Send.
+#[cfg(test)]
+mod send_assertions {
+    use super::*;
+    use crate::data::client::Client;
+
+    fn _assert_send<T: Send>(_: &T) {}
+
+    #[allow(
+        dead_code,
+        unreachable_code,
+        unused_variables,
+        clippy::diverging_sub_expression
+    )]
+    async fn _merkle_upload_chunks_is_send(client: &Client) {
+        let batch_result: MerkleBatchPaymentResult = todo!();
+        let fut = client.merkle_upload_chunks(Vec::new(), Vec::new(), &batch_result);
+        _assert_send(&fut);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
