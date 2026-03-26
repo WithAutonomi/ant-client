@@ -415,3 +415,136 @@ mod send_assertions {
         _assert_send(&fut);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use ant_evm::QuotingMetrics;
+    use ant_node::payment::single_node::QuotePaymentInfo;
+    use ant_node::CLOSE_GROUP_SIZE;
+
+    fn test_metrics() -> QuotingMetrics {
+        QuotingMetrics {
+            data_size: 0,
+            data_type: 0,
+            close_records_stored: 0,
+            records_per_type: vec![],
+            max_records: 0,
+            received_payment_count: 0,
+            live_time: 0,
+            network_density: None,
+            network_size: None,
+        }
+    }
+
+    /// Helper: build a PreparedChunk with specified payment amounts.
+    fn make_prepared_chunk(
+        amounts: [u64; CLOSE_GROUP_SIZE],
+    ) -> PreparedChunk {
+        let quotes: [QuotePaymentInfo; CLOSE_GROUP_SIZE] =
+            std::array::from_fn(|i| QuotePaymentInfo {
+                quote_hash: QuoteHash::from([i as u8 + 1; 32]),
+                rewards_address: RewardsAddress::new([i as u8 + 10; 20]),
+                amount: Amount::from(amounts[i]),
+                quoting_metrics: test_metrics(),
+            });
+
+        PreparedChunk {
+            content: Bytes::from(vec![0xAA; 32]),
+            address: [0u8; 32],
+            quoted_peers: Vec::new(),
+            payment: SingleNodePayment { quotes },
+            peer_quotes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn payment_intent_from_single_chunk() {
+        // Median (index 2) gets 3x price, others get 0 — matches SingleNodePayment layout
+        let chunk = make_prepared_chunk([0, 0, 300, 0, 0]);
+        let intent = PaymentIntent::from_prepared_chunks(&[chunk]);
+
+        assert_eq!(intent.payments.len(), 1, "only non-zero amounts");
+        assert_eq!(intent.total_amount, Amount::from(300));
+
+        let (hash, addr, amt) = &intent.payments[0];
+        assert_eq!(*hash, QuoteHash::from([3u8; 32])); // index 2 → byte 3
+        assert_eq!(*addr, RewardsAddress::new([12u8; 20])); // index 2 → byte 12
+        assert_eq!(*amt, Amount::from(300));
+    }
+
+    #[test]
+    fn payment_intent_from_multiple_chunks() {
+        let c1 = make_prepared_chunk([0, 0, 100, 0, 0]);
+        let c2 = make_prepared_chunk([0, 0, 250, 0, 0]);
+        let intent = PaymentIntent::from_prepared_chunks(&[c1, c2]);
+
+        assert_eq!(intent.payments.len(), 2);
+        assert_eq!(intent.total_amount, Amount::from(350));
+    }
+
+    #[test]
+    fn payment_intent_skips_all_zero_chunks() {
+        let chunk = make_prepared_chunk([0, 0, 0, 0, 0]);
+        let intent = PaymentIntent::from_prepared_chunks(&[chunk]);
+
+        assert!(intent.payments.is_empty());
+        assert_eq!(intent.total_amount, Amount::ZERO);
+    }
+
+    #[test]
+    fn payment_intent_empty_input() {
+        let intent = PaymentIntent::from_prepared_chunks(&[]);
+        assert!(intent.payments.is_empty());
+        assert_eq!(intent.total_amount, Amount::ZERO);
+    }
+
+    #[test]
+    fn finalize_batch_payment_builds_proofs() {
+        let chunk = make_prepared_chunk([0, 0, 500, 0, 0]);
+        let quote_hash = chunk.payment.quotes[2].quote_hash;
+
+        let mut tx_map = HashMap::new();
+        tx_map.insert(quote_hash, TxHash::from([0xBB; 32]));
+
+        let paid = finalize_batch_payment(vec![chunk], &tx_map).unwrap();
+
+        assert_eq!(paid.len(), 1);
+        assert!(!paid[0].proof_bytes.is_empty());
+        assert_eq!(paid[0].address, [0u8; 32]);
+    }
+
+    #[test]
+    fn finalize_batch_payment_empty_input() {
+        let paid = finalize_batch_payment(vec![], &HashMap::new()).unwrap();
+        assert!(paid.is_empty());
+    }
+
+    #[test]
+    fn finalize_batch_payment_missing_tx_hash_still_succeeds() {
+        // If the tx_hash_map doesn't contain a quote hash, filter_map skips it.
+        // The proof just has fewer tx_hashes — this is not an error in the
+        // current implementation (matches batch_pay behavior).
+        let chunk = make_prepared_chunk([0, 0, 500, 0, 0]);
+
+        let paid = finalize_batch_payment(vec![chunk], &HashMap::new()).unwrap();
+        assert_eq!(paid.len(), 1);
+        // Proof still serializes, just with empty tx_hashes
+        assert!(!paid[0].proof_bytes.is_empty());
+    }
+
+    #[test]
+    fn finalize_batch_payment_multiple_chunks() {
+        let c1 = make_prepared_chunk([0, 0, 100, 0, 0]);
+        let c2 = make_prepared_chunk([0, 0, 200, 0, 0]);
+        let q1 = c1.payment.quotes[2].quote_hash;
+        let mut tx_map = HashMap::new();
+        // Both chunks have the same quote_hash (same index/byte pattern)
+        // so one tx_hash covers both
+        tx_map.insert(q1, TxHash::from([0xCC; 32]));
+
+        let paid = finalize_batch_payment(vec![c1, c2], &tx_map).unwrap();
+        assert_eq!(paid.len(), 2);
+    }
+}
