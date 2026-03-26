@@ -62,19 +62,33 @@ All business logic. No UI code, no terminal output.
 ```
 ant-core/src/
 ├── lib.rs
-├── error.rs                  # Unified error type
-├── config.rs                 # Shared configuration types
-└── node/
-    ├── mod.rs
-    ├── types.rs              # NodeInfo, NodeStatus, AddNodeOpts, etc.
+├── config.rs                 # Platform-appropriate data/log directory paths
+├── error.rs                  # Unified error type (thiserror)
+├── data/                     # Data storage and retrieval
+│   ├── mod.rs                # Re-exports and module declarations
+│   ├── error.rs              # Data operation errors
+│   ├── network.rs            # P2P network wrapper (DHT, peer discovery)
+│   └── client/               # High-level client API
+│       ├── mod.rs            # Client, ClientConfig
+│       ├── chunk.rs          # chunk_put, chunk_get, chunk_exists
+│       ├── data.rs           # data_upload, data_download, data_map_store/fetch
+│       ├── file.rs           # file_upload, file_download (streaming)
+│       ├── payment.rs        # pay_for_storage, approve_token_spend
+│       ├── quote.rs          # get_store_quotes from network peers
+│       ├── merkle.rs         # Merkle batch payment (PaymentMode enum)
+│       └── cache.rs          # In-memory LRU chunk cache
+└── node/                     # Node management
+    ├── mod.rs                # add_nodes, remove_node, reset
+    ├── types.rs              # DaemonConfig, NodeConfig, AddNodeOpts, etc.
     ├── events.rs             # NodeEvent enum, EventListener trait
-    ├── progress.rs           # ProgressReporter trait
-    ├── registry.rs           # Node registry (CRUD, JSON persistence)
+    ├── binary.rs             # Binary resolution, ProgressReporter trait
+    ├── registry.rs           # Node registry (CRUD, JSON persistence, file locking)
+    ├── devnet.rs             # LocalDevnet (local network + Anvil EVM)
     ├── daemon/
     │   ├── mod.rs
+    │   ├── client.rs         # Daemon client API (start/stop/status via HTTP)
     │   ├── server.rs         # HTTP server (axum), REST API handlers
-    │   ├── supervisor.rs     # Process supervision loop
-    │   └── console.rs        # Static web UI serving
+    │   └── supervisor.rs     # Process supervision loop
     └── process/
         ├── mod.rs
         ├── spawn.rs          # Spawning node processes
@@ -90,18 +104,21 @@ Thin adapter layer. Parses arguments, calls `ant-core`, formats output.
 
 ```
 ant-cli/src/
-├── main.rs
+├── main.rs                   # Entry point, client/wallet/EVM initialization
 ├── cli.rs                    # Top-level clap definition
 └── commands/
+    ├── data/
+    │   ├── file.rs           # ant file upload/download
+    │   ├── chunk.rs          # ant chunk put/get
+    │   └── wallet.rs         # ant wallet address/balance
     └── node/
         ├── mod.rs
-        ├── add.rs            # Calls ant_core::node::registry directly
-        ├── start.rs          # Sends HTTP to daemon
-        ├── stop.rs           # Sends HTTP to daemon
-        ├── remove.rs         # Calls ant_core::node::registry directly
-        ├── list.rs           # Calls registry or daemon
-        ├── status.rs         # Sends HTTP to daemon
-        └── daemon.rs         # Launches/stops/queries daemon process
+        ├── add.rs            # ant node add
+        ├── daemon.rs         # ant node daemon start/stop/status/info/run
+        ├── start.rs          # ant node start
+        ├── stop.rs           # ant node stop
+        ├── status.rs         # ant node status
+        └── reset.rs          # ant node reset
 ```
 
 When the daemon is not running, the CLI calls `ant-core` directly for registry operations (`add`,
@@ -112,23 +129,82 @@ needing the CLI.
 ## Command Structure
 
 ```
-ant [--json]                          # Global flag: output structured JSON instead of human text
-ant node
-├── daemon start                      # Launch daemon (detached)
-├── daemon stop                       # Shut down daemon
-├── daemon status                     # Is daemon running, summary stats
-├── daemon info                       # Connection details (port, PID) for programmatic use
-├── add [options]                     # Register node(s) in the registry
-├── remove <id>                       # Remove node from registry
-├── start <id|all>                    # Tell daemon to spawn node process
-├── stop <id|all>                     # Tell daemon to stop node process
-├── list                              # Show all nodes and their status
-└── status <id>                       # Detailed status/metrics for one node
+ant [global flags]
+├── file
+│   ├── upload <PATH> [--public] [--merkle|--no-merkle]
+│   └── download [ADDRESS] [--datamap PATH] [-o PATH]
+├── chunk
+│   ├── put [FILE]
+│   └── get <ADDRESS> [-o PATH]
+├── wallet
+│   ├── address
+│   └── balance
+└── node
+    ├── daemon start
+    ├── daemon stop
+    ├── daemon status
+    ├── daemon info
+    ├── daemon run                        # Hidden; runs daemon in foreground
+    ├── add [options]
+    ├── start [--service-name NAME]
+    ├── stop [--service-name NAME]
+    ├── status
+    └── reset [--force]
 ```
 
 The `--json` global flag causes all commands to output structured JSON instead of human-readable
 text. This is essential for AI agents and scripts that consume the CLI directly rather than using
 the REST API.
+
+## Data Flow: Upload and Download
+
+### File Upload
+
+```
+┌─────────┐    read 8KB    ┌──────────────────┐    encrypted    ┌──────────┐
+│  Disk    │──────────────▶│  Self-Encryption  │──────chunks───▶│  Client  │
+│  (file)  │   streaming   │  (convergent enc) │                │          │
+└─────────┘                └──────────────────┘                └──────────┘
+                                    │                               │
+                                    ▼                               │ for each chunk:
+                              DataMap                               │ 1. get quotes
+                              (chunk addresses                      │ 2. pay (EVM tx)
+                               + encryption keys)                   │ 3. store on peer
+                                                                    ▼
+                                                           ┌────────────────┐
+                                                           │  P2P Network   │
+                                                           │  (XOR-routed)  │
+                                                           └────────────────┘
+```
+
+- Files are streamed in 8KB reads through `self_encryption::stream_encrypt`.
+- Each encrypted chunk is content-addressed (XOR hash of its bytes).
+- Payment is per-chunk or via a merkle batch (single EVM transaction for many chunks).
+- The `DataMap` is the key to reconstruct the file. Store it publicly (on-network) or keep it private (local file).
+
+### File Download
+
+```
+┌───────────┐   chunk addresses   ┌──────────┐   requests    ┌────────────────┐
+│  DataMap   │──────────────────▶│  Client  │─────────────▶│  P2P Network   │
+└───────────┘                    │          │◀─────────────│  (XOR-routed)  │
+                                 └──────────┘  encrypted   └────────────────┘
+                                      │        chunks
+                                      ▼
+                              ┌──────────────────┐
+                              │  Self-Decryption  │
+                              │  (streaming)      │
+                              └──────────────────┘
+                                      │
+                                      ▼
+                                 ┌─────────┐
+                                 │  Disk    │
+                                 │  (file)  │
+                                 └─────────┘
+```
+
+- Downloads are also streaming: chunks are fetched concurrently and decrypted in batches.
+- The file is written incrementally via a temp file, then atomically renamed.
 
 ## Node Registry
 
@@ -142,9 +218,10 @@ their configuration.
   "nodes": {
     "1": {
       "id": 1,
+      "service_name": "node1",
       "rewards_address": "0xabc123...",
-      "data_dir": "/home/user/.local/share/ant/nodes/1",
-      "log_dir": "/home/user/.local/share/ant/nodes/1/logs",
+      "data_dir": "/home/user/.local/share/ant/nodes/node-1",
+      "log_dir": "/home/user/.local/share/ant/nodes/node-1/logs",
       "node_port": null,
       "metrics_port": null,
       "network_id": 1,
@@ -179,17 +256,17 @@ AI agents and other HTTP clients need to find the daemon. Two mechanisms:
 
 ```
 GET    /api/v1/status                    Daemon health, uptime, node count summary
-GET    /api/v1/nodes                     List all nodes with status
-GET    /api/v1/nodes/:id                 Node detail including runtime metrics
-POST   /api/v1/nodes                     Add/register a new node (same as CLI `add`)
+GET    /api/v1/nodes/status              Node status summary (all nodes)
+POST   /api/v1/nodes                     Add/register nodes (same as CLI `add`)
 DELETE /api/v1/nodes/:id                 Remove a node from the registry
 POST   /api/v1/nodes/:id/start           Start a node
 POST   /api/v1/nodes/:id/stop            Stop a node
 POST   /api/v1/nodes/start-all           Start all registered nodes
 POST   /api/v1/nodes/stop-all            Stop all running nodes
+POST   /api/v1/reset                     Reset all node state (fails if nodes running)
 GET    /api/v1/events                    SSE stream of real-time node events
 GET    /api/v1/openapi.json              OpenAPI spec for API self-discovery
-GET    /                                 Web status console (static HTML)
+GET    /console                          Web status console (static HTML)
 ```
 
 ### Idempotency
@@ -233,8 +310,7 @@ All error responses use a consistent envelope:
 
 The daemon serves an OpenAPI 3.1 spec at `/api/v1/openapi.json`. This allows AI agents to
 self-discover available endpoints, parameter shapes, and response schemas without external
-documentation. The spec is generated from the axum route definitions using `utoipa` or a similar
-library.
+documentation. The spec is generated from the axum route definitions using `utoipa`.
 
 ## Process Management
 
@@ -310,4 +386,4 @@ event: node_crashed
 data: {"node_id": 2, "exit_code": 1}
 ```
 
-Clients that don't need real-time updates can poll `GET /api/v1/nodes` instead.
+Clients that don't need real-time updates can poll `GET /api/v1/nodes/status` instead.

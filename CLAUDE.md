@@ -61,29 +61,52 @@ ant-core/src/
 ├── lib.rs
 ├── error.rs                  # Unified error type (thiserror)
 ├── config.rs                 # Platform-appropriate data/log directory paths
-└── node/
-    ├── mod.rs
+├── data/                     # Data storage and retrieval
+│   ├── mod.rs                # Re-exports (Client, DataMap, Wallet, PaymentMode, etc.)
+│   ├── error.rs              # Data operation errors
+│   ├── network.rs            # P2P network wrapper (DHT, peer discovery)
+│   └── client/               # High-level client API
+│       ├── mod.rs            # Client, ClientConfig
+│       ├── chunk.rs          # chunk_put, chunk_get, chunk_exists
+│       ├── data.rs           # data_upload, data_download, data_map_store/fetch
+│       ├── file.rs           # file_upload, file_download (streaming self-encryption)
+│       ├── payment.rs        # pay_for_storage, approve_token_spend
+│       ├── quote.rs          # get_store_quotes from network peers
+│       ├── merkle.rs         # Merkle batch payment (PaymentMode enum)
+│       └── cache.rs          # In-memory LRU chunk cache
+└── node/                     # Node management
+    ├── mod.rs                # add_nodes, remove_node, reset
     ├── types.rs              # DaemonConfig, DaemonStatus, NodeConfig, NodeInfo, AddNodeOpts, etc.
     ├── events.rs             # NodeEvent enum, EventListener trait
     ├── binary.rs             # Binary resolution (download/cache/validate), ProgressReporter trait
     ├── registry.rs           # Node registry (CRUD, JSON persistence, file locking)
+    ├── devnet.rs             # LocalDevnet (local network + Anvil EVM blockchain)
     ├── daemon/
     │   ├── mod.rs
+    │   ├── client.rs         # Daemon client API (start/stop/status via HTTP)
     │   ├── server.rs         # HTTP server (axum), REST API handlers
-    │   └── supervisor.rs     # Process supervision
+    │   └── supervisor.rs     # Process supervision with backoff
     └── process/
         ├── mod.rs
         ├── spawn.rs          # Spawning node processes
         └── detach.rs         # Platform-specific session detachment
 
 ant-cli/src/
-├── main.rs
+├── main.rs                   # Entry point, client/wallet/EVM initialization
 ├── cli.rs                    # Top-level clap definition
 └── commands/
+    ├── data/
+    │   ├── file.rs           # ant file upload/download
+    │   ├── chunk.rs          # ant chunk put/get
+    │   └── wallet.rs         # ant wallet address/balance
     └── node/
         ├── mod.rs
         ├── add.rs            # ant node add command
-        └── daemon.rs         # daemon start/stop/status/info/run commands
+        ├── daemon.rs         # daemon start/stop/status/info/run commands
+        ├── start.rs          # ant node start
+        ├── stop.rs           # ant node stop
+        ├── status.rs         # ant node status
+        └── reset.rs          # ant node reset
 ```
 
 ## Common Commands
