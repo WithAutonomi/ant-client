@@ -64,8 +64,9 @@ impl Client {
             .map(|(_, _, quote, _)| quote.quoting_metrics.clone())
             .collect();
 
+        let evm_network = self.require_evm_network()?;
         let contract_prices =
-            evmlib::contract::payment_vault::get_market_price(wallet.network(), metrics_batch)
+            evmlib::contract::payment_vault::get_market_price(evm_network, metrics_batch)
                 .await
                 .map_err(|e| {
                     Error::Payment(format!("Failed to get market prices from contract: {e}"))
