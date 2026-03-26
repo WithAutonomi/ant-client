@@ -7,14 +7,15 @@
 use crate::data::client::payment::peer_id_to_encoded;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_evm::{EncodedPeerId, PaymentQuote, ProofOfPayment};
+use ant_evm::{Amount, EncodedPeerId, PaymentQuote, ProofOfPayment, QuoteHash, RewardsAddress};
 use ant_node::ant_protocol::DATA_TYPE_CHUNK;
 use ant_node::client::{compute_address, XorName};
 use ant_node::core::{MultiAddr, PeerId};
 use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use bytes::Bytes;
+use evmlib::common::TxHash;
 use futures::stream::{self, StreamExt};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{debug, info};
 
 /// Number of chunks per payment wave.
@@ -46,6 +47,90 @@ pub struct PaidChunk {
     pub proof_bytes: Vec<u8>,
 }
 
+/// Payment data for external signing.
+///
+/// Contains the information needed to construct and submit the on-chain
+/// payment transaction without requiring a local wallet or private key.
+#[derive(Debug, Clone)]
+pub struct PaymentIntent {
+    /// Individual payment entries: (quote_hash, rewards_address, amount).
+    pub payments: Vec<(QuoteHash, RewardsAddress, Amount)>,
+    /// Total amount across all payments.
+    pub total_amount: Amount,
+}
+
+impl PaymentIntent {
+    /// Build from a set of prepared chunks.
+    ///
+    /// Collects all non-zero payment entries and computes the total.
+    pub fn from_prepared_chunks(prepared: &[PreparedChunk]) -> Self {
+        let mut payments = Vec::new();
+        let mut total = Amount::ZERO;
+        for chunk in prepared {
+            for info in &chunk.payment.quotes {
+                if !info.amount.is_zero() {
+                    payments.push((info.quote_hash, info.rewards_address, info.amount));
+                    total += info.amount;
+                }
+            }
+        }
+        Self {
+            payments,
+            total_amount: total,
+        }
+    }
+}
+
+/// Build [`PaidChunk`]s from prepared chunks and externally-provided transaction hashes.
+///
+/// Shared by [`Client::batch_pay`] (wallet flow) and [`finalize_batch_payment`] (external signer).
+fn build_paid_chunks(
+    prepared: Vec<PreparedChunk>,
+    tx_hash_map: &BTreeMap<QuoteHash, TxHash>,
+) -> Result<Vec<PaidChunk>> {
+    let mut paid_chunks = Vec::with_capacity(prepared.len());
+    for chunk in prepared {
+        let tx_hashes: Vec<_> = chunk
+            .payment
+            .quotes
+            .iter()
+            .filter(|info| !info.amount.is_zero())
+            .filter_map(|info| tx_hash_map.get(&info.quote_hash).copied())
+            .collect();
+
+        let proof = PaymentProof {
+            proof_of_payment: ProofOfPayment {
+                peer_quotes: chunk.peer_quotes,
+            },
+            tx_hashes,
+        };
+
+        let proof_bytes = serialize_single_node_proof(&proof).map_err(|e| {
+            Error::Serialization(format!("Failed to serialize payment proof: {e}"))
+        })?;
+
+        paid_chunks.push(PaidChunk {
+            content: chunk.content,
+            address: chunk.address,
+            quoted_peers: chunk.quoted_peers,
+            proof_bytes,
+        });
+    }
+    Ok(paid_chunks)
+}
+
+/// Finalize a batch payment using externally-provided transaction hashes.
+///
+/// Takes prepared chunks and a map of `quote_hash -> tx_hash` from the
+/// external signer. Builds per-chunk `PaymentProof` bytes without needing a wallet.
+pub fn finalize_batch_payment(
+    prepared: Vec<PreparedChunk>,
+    tx_hash_map: &HashMap<QuoteHash, TxHash>,
+) -> Result<Vec<PaidChunk>> {
+    let btree: BTreeMap<QuoteHash, TxHash> = tx_hash_map.iter().map(|(k, v)| (*k, *v)).collect();
+    build_paid_chunks(prepared, &btree)
+}
+
 impl Client {
     /// Prepare a single chunk for batch payment.
     ///
@@ -73,7 +158,7 @@ impl Client {
             Err(e) => return Err(e),
         };
 
-        let wallet = self.require_wallet()?;
+        let evm_network = self.require_evm_network()?;
 
         // Capture all quoted peers for close-group replication.
         let quoted_peers: Vec<(PeerId, Vec<MultiAddr>)> = quotes_with_peers
@@ -88,7 +173,7 @@ impl Client {
             .collect();
 
         let contract_prices =
-            evmlib::contract::payment_vault::get_market_price(wallet.network(), metrics_batch)
+            evmlib::contract::payment_vault::get_market_price(evm_network, metrics_batch)
                 .await
                 .map_err(|e| {
                     Error::Payment(format!("Failed to get market prices from contract: {e}"))
@@ -169,37 +254,7 @@ impl Client {
             tx_hash_map.len()
         );
 
-        // Map tx hashes back to per-chunk PaymentProofs.
-        let mut paid_chunks = Vec::with_capacity(prepared.len());
-        for chunk in prepared {
-            let tx_hashes: Vec<_> = chunk
-                .payment
-                .quotes
-                .iter()
-                .filter(|info| !info.amount.is_zero())
-                .filter_map(|info| tx_hash_map.get(&info.quote_hash).copied())
-                .collect();
-
-            let proof = PaymentProof {
-                proof_of_payment: ProofOfPayment {
-                    peer_quotes: chunk.peer_quotes,
-                },
-                tx_hashes,
-            };
-
-            let proof_bytes = serialize_single_node_proof(&proof).map_err(|e| {
-                Error::Serialization(format!("Failed to serialize payment proof: {e}"))
-            })?;
-
-            paid_chunks.push(PaidChunk {
-                content: chunk.content,
-                address: chunk.address,
-                quoted_peers: chunk.quoted_peers,
-                proof_bytes,
-            });
-        }
-
-        Ok(paid_chunks)
+        build_paid_chunks(prepared, &tx_hash_map)
     }
 
     /// Upload chunks in waves with pipelined EVM payments.
