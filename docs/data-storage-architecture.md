@@ -191,7 +191,7 @@ let my_id = network.peer_id();
 use ant_core::data::LocalDevnet;
 
 // Start 5 Autonomi nodes + a local Anvil EVM blockchain
-let devnet = LocalDevnet::start_minimal().await?;
+let mut devnet = LocalDevnet::start_minimal().await?;
 
 // Get a funded client (wallet with test tokens, pre-approved)
 let client = devnet.create_funded_client().await?;
@@ -222,6 +222,7 @@ All data operations return `ant_core::data::Result<T>`, where `Error` covers:
 | `Network` | P2P network failure (connection, routing) |
 | `Storage` | Storage node rejected the operation |
 | `Payment` | EVM transaction failed or insufficient funds |
+| `Protocol` | Protocol-level error (bad messages, remote errors) |
 | `Timeout` | Peer didn't respond within the timeout |
 | `InsufficientPeers` | Not enough peers found for the operation |
 | `Encryption` | Self-encryption or decryption failure |
@@ -229,6 +230,9 @@ All data operations return `ant_core::data::Result<T>`, where `Error` covers:
 | `AlreadyStored` | Chunk already exists on the network (not an error in practice) |
 | `Io` | Local filesystem error |
 | `Serialization` | DataMap or protocol message serialization failure |
+| `Crypto` | Cryptographic operation failed |
+| `Config` | Configuration error |
+| `SignatureVerification` | BLS/ML-DSA signature verification failed |
 
 ## EVM Networks
 

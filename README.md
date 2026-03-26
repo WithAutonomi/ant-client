@@ -452,7 +452,7 @@ Autonomi supports two payment strategies:
 use ant_core::data::LocalDevnet;
 
 // Start a minimal devnet (5 nodes + Anvil EVM chain)
-let devnet = LocalDevnet::start_minimal().await?;
+let mut devnet = LocalDevnet::start_minimal().await?;
 
 // Create a client with a pre-funded wallet (ready to upload)
 let client = devnet.create_funded_client().await?;
