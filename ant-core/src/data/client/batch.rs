@@ -388,7 +388,7 @@ impl Client {
     }
 
     /// Store a batch of paid chunks concurrently to their close groups.
-    async fn store_paid_chunks(&self, paid_chunks: Vec<PaidChunk>) -> Result<Vec<XorName>> {
+    pub(crate) async fn store_paid_chunks(&self, paid_chunks: Vec<PaidChunk>) -> Result<Vec<XorName>> {
         let results: Vec<Result<XorName>> = stream::iter(paid_chunks)
             .map(|chunk| async move {
                 self.chunk_put_to_close_group(chunk.content, chunk.proof_bytes, &chunk.quoted_peers)

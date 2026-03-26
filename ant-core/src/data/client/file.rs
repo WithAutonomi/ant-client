@@ -5,13 +5,17 @@
 //! uploading each piece as it's produced.
 //! For in-memory data uploads, see the `data` module.
 
+use crate::data::client::batch::{finalize_batch_payment, PaymentIntent, PreparedChunk};
 use crate::data::client::merkle::PaymentMode;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
+use ant_evm::QuoteHash;
 use ant_node::ant_protocol::DATA_TYPE_CHUNK;
 use ant_node::client::compute_address;
 use bytes::Bytes;
+use evmlib::common::TxHash;
 use self_encryption::{stream_encrypt, streaming_decrypt, DataMap};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -27,6 +31,20 @@ pub struct FileUploadResult {
     pub chunks_stored: usize,
     /// Which payment mode was actually used (not just requested).
     pub payment_mode_used: PaymentMode,
+}
+
+/// Prepared upload ready for external payment.
+///
+/// Contains everything needed to construct the on-chain payment transaction
+/// externally (e.g. via WalletConnect in a desktop app) and then finalize
+/// the upload without a Rust-side wallet.
+pub struct PreparedUpload {
+    /// The data map for later retrieval.
+    pub data_map: DataMap,
+    /// Chunks ready for payment.
+    pub prepared_chunks: Vec<PreparedChunk>,
+    /// Payment intent for external signing.
+    pub payment_intent: PaymentIntent,
 }
 
 /// Return type for [`spawn_file_encryption`]: chunk receiver, `DataMap` oneshot, join handle.
@@ -149,6 +167,88 @@ impl Client {
 
         Ok(FileUploadResult {
             data_map,
+            chunks_stored,
+            payment_mode_used: PaymentMode::Single,
+        })
+    }
+
+    /// Phase 1 of external-signer upload: encrypt file and prepare chunks.
+    ///
+    /// Requires an EVM network (for contract price queries) but NOT a wallet.
+    /// Returns a [`PreparedUpload`] containing the data map, prepared chunks,
+    /// and a [`PaymentIntent`] that the external signer uses to construct
+    /// and submit the on-chain payment transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, encryption fails,
+    /// or quote collection fails.
+    pub async fn file_prepare_upload(&self, path: &Path) -> Result<PreparedUpload> {
+        debug!("Preparing file upload for external signing: {}", path.display());
+
+        let (mut chunk_rx, datamap_rx, handle) = spawn_file_encryption(path.to_path_buf())?;
+
+        // Collect all chunks from encryption channel.
+        let mut chunk_contents = Vec::new();
+        while let Some(content) = chunk_rx.recv().await {
+            chunk_contents.push(content);
+        }
+
+        // Await encryption completion to catch errors before collecting quotes.
+        handle
+            .await
+            .map_err(|e| Error::Encryption(format!("encryption task panicked: {e}")))?
+            .map_err(|e| Error::Encryption(format!("encryption failed: {e}")))?;
+
+        let data_map = datamap_rx
+            .await
+            .map_err(|_| Error::Encryption("no DataMap from encryption thread".to_string()))?;
+
+        // Prepare each chunk (collect quotes, fetch contract prices).
+        let mut prepared_chunks = Vec::with_capacity(chunk_contents.len());
+        for content in chunk_contents {
+            if let Some(prepared) = self.prepare_chunk_payment(content).await? {
+                prepared_chunks.push(prepared);
+            }
+        }
+
+        let payment_intent = PaymentIntent::from_prepared_chunks(&prepared_chunks);
+
+        info!(
+            "File prepared for external signing: {} chunks, total {} atto ({})",
+            prepared_chunks.len(),
+            payment_intent.total_amount,
+            path.display()
+        );
+
+        Ok(PreparedUpload {
+            data_map,
+            prepared_chunks,
+            payment_intent,
+        })
+    }
+
+    /// Phase 2 of external-signer upload: finalize with externally-signed tx hashes.
+    ///
+    /// Takes a [`PreparedUpload`] from [`Client::file_prepare_upload`] and a map
+    /// of `quote_hash -> tx_hash` provided by the external signer after on-chain
+    /// payment. Builds payment proofs and stores chunks on the network.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if proof construction fails or any chunk cannot be stored.
+    pub async fn finalize_upload(
+        &self,
+        prepared: PreparedUpload,
+        tx_hash_map: &HashMap<QuoteHash, TxHash>,
+    ) -> Result<FileUploadResult> {
+        let paid_chunks = finalize_batch_payment(prepared.prepared_chunks, tx_hash_map)?;
+        let chunks_stored = self.store_paid_chunks(paid_chunks).await?.len();
+
+        info!("External-signer upload finalized: {chunks_stored} chunks stored");
+
+        Ok(FileUploadResult {
+            data_map: prepared.data_map,
             chunks_stored,
             payment_mode_used: PaymentMode::Single,
         })
