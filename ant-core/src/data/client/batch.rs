@@ -7,20 +7,22 @@
 use crate::data::client::payment::peer_id_to_encoded;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_evm::{EncodedPeerId, PaymentQuote, ProofOfPayment};
+use ant_evm::{Amount, EncodedPeerId, PaymentQuote, ProofOfPayment, QuoteHash, RewardsAddress};
 use ant_node::ant_protocol::DATA_TYPE_CHUNK;
 use ant_node::client::{compute_address, XorName};
 use ant_node::core::{MultiAddr, PeerId};
 use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use bytes::Bytes;
+use evmlib::common::TxHash;
 use futures::stream::{self, StreamExt};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, info};
 
 /// Number of chunks per payment wave.
 const PAYMENT_WAVE_SIZE: usize = 64;
 
 /// Chunk quoted but not yet paid. Produced by [`Client::prepare_chunk_payment`].
+#[derive(Debug)]
 pub struct PreparedChunk {
     /// The chunk content bytes.
     pub content: Bytes,
@@ -35,6 +37,7 @@ pub struct PreparedChunk {
 }
 
 /// Chunk paid but not yet stored. Produced by [`Client::batch_pay`].
+#[derive(Debug)]
 pub struct PaidChunk {
     /// The chunk content bytes.
     pub content: Bytes,
@@ -44,6 +47,96 @@ pub struct PaidChunk {
     pub quoted_peers: Vec<(PeerId, Vec<MultiAddr>)>,
     /// Serialized [`PaymentProof`] bytes.
     pub proof_bytes: Vec<u8>,
+}
+
+/// Payment data for external signing.
+///
+/// Contains the information needed to construct and submit the on-chain
+/// payment transaction without requiring a local wallet or private key.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PaymentIntent {
+    /// Individual payment entries: (quote_hash, rewards_address, amount).
+    pub payments: Vec<(QuoteHash, RewardsAddress, Amount)>,
+    /// Total amount across all payments.
+    pub total_amount: Amount,
+}
+
+impl PaymentIntent {
+    /// Build from a set of prepared chunks.
+    ///
+    /// Collects all non-zero payment entries and computes the total.
+    pub fn from_prepared_chunks(prepared: &[PreparedChunk]) -> Self {
+        let mut payments = Vec::new();
+        let mut total = Amount::ZERO;
+        for chunk in prepared {
+            for info in &chunk.payment.quotes {
+                if !info.amount.is_zero() {
+                    payments.push((info.quote_hash, info.rewards_address, info.amount));
+                    total += info.amount;
+                }
+            }
+        }
+        Self {
+            payments,
+            total_amount: total,
+        }
+    }
+}
+
+/// Build [`PaidChunk`]s from prepared chunks and externally-provided transaction hashes.
+///
+/// Shared by [`Client::batch_pay`] (wallet flow) and [`finalize_batch_payment`] (external signer).
+///
+/// Returns an error if any non-zero-amount quote hash is missing from `tx_hash_map`,
+/// since chunks uploaded without valid proofs would be rejected by the network.
+fn build_paid_chunks(
+    prepared: Vec<PreparedChunk>,
+    tx_hash_map: &HashMap<QuoteHash, TxHash>,
+) -> Result<Vec<PaidChunk>> {
+    let mut paid_chunks = Vec::with_capacity(prepared.len());
+    for chunk in prepared {
+        let mut tx_hashes = Vec::new();
+        for info in &chunk.payment.quotes {
+            if !info.amount.is_zero() {
+                let tx_hash = tx_hash_map.get(&info.quote_hash).copied().ok_or_else(|| {
+                    Error::Payment(format!(
+                        "Missing tx hash for quote {} — external signer did not return a receipt for this payment",
+                        hex::encode(info.quote_hash)
+                    ))
+                })?;
+                tx_hashes.push(tx_hash);
+            }
+        }
+
+        let proof = PaymentProof {
+            proof_of_payment: ProofOfPayment {
+                peer_quotes: chunk.peer_quotes,
+            },
+            tx_hashes,
+        };
+
+        let proof_bytes = serialize_single_node_proof(&proof)
+            .map_err(|e| Error::Serialization(format!("Failed to serialize payment proof: {e}")))?;
+
+        paid_chunks.push(PaidChunk {
+            content: chunk.content,
+            address: chunk.address,
+            quoted_peers: chunk.quoted_peers,
+            proof_bytes,
+        });
+    }
+    Ok(paid_chunks)
+}
+
+/// Finalize a batch payment using externally-provided transaction hashes.
+///
+/// Takes prepared chunks and a map of `quote_hash -> tx_hash` from the
+/// external signer. Builds per-chunk `PaymentProof` bytes without needing a wallet.
+pub fn finalize_batch_payment(
+    prepared: Vec<PreparedChunk>,
+    tx_hash_map: &HashMap<QuoteHash, TxHash>,
+) -> Result<Vec<PaidChunk>> {
+    build_paid_chunks(prepared, tx_hash_map)
 }
 
 impl Client {
@@ -73,7 +166,7 @@ impl Client {
             Err(e) => return Err(e),
         };
 
-        let wallet = self.require_wallet()?;
+        let evm_network = self.require_evm_network()?;
 
         // Capture all quoted peers for close-group replication.
         let quoted_peers: Vec<(PeerId, Vec<MultiAddr>)> = quotes_with_peers
@@ -88,7 +181,7 @@ impl Client {
             .collect();
 
         let contract_prices =
-            evmlib::contract::payment_vault::get_market_price(wallet.network(), metrics_batch)
+            evmlib::contract::payment_vault::get_market_price(evm_network, metrics_batch)
                 .await
                 .map_err(|e| {
                     Error::Payment(format!("Failed to get market prices from contract: {e}"))
@@ -169,37 +262,8 @@ impl Client {
             tx_hash_map.len()
         );
 
-        // Map tx hashes back to per-chunk PaymentProofs.
-        let mut paid_chunks = Vec::with_capacity(prepared.len());
-        for chunk in prepared {
-            let tx_hashes: Vec<_> = chunk
-                .payment
-                .quotes
-                .iter()
-                .filter(|info| !info.amount.is_zero())
-                .filter_map(|info| tx_hash_map.get(&info.quote_hash).copied())
-                .collect();
-
-            let proof = PaymentProof {
-                proof_of_payment: ProofOfPayment {
-                    peer_quotes: chunk.peer_quotes,
-                },
-                tx_hashes,
-            };
-
-            let proof_bytes = serialize_single_node_proof(&proof).map_err(|e| {
-                Error::Serialization(format!("Failed to serialize payment proof: {e}"))
-            })?;
-
-            paid_chunks.push(PaidChunk {
-                content: chunk.content,
-                address: chunk.address,
-                quoted_peers: chunk.quoted_peers,
-                proof_bytes,
-            });
-        }
-
-        Ok(paid_chunks)
+        let tx_hash_map: HashMap<QuoteHash, TxHash> = tx_hash_map.into_iter().collect();
+        build_paid_chunks(prepared, &tx_hash_map)
     }
 
     /// Upload chunks in waves with pipelined EVM payments.
@@ -333,7 +397,10 @@ impl Client {
     }
 
     /// Store a batch of paid chunks concurrently to their close groups.
-    async fn store_paid_chunks(&self, paid_chunks: Vec<PaidChunk>) -> Result<Vec<XorName>> {
+    pub(crate) async fn store_paid_chunks(
+        &self,
+        paid_chunks: Vec<PaidChunk>,
+    ) -> Result<Vec<XorName>> {
         let results: Vec<Result<XorName>> = stream::iter(paid_chunks)
             .map(|chunk| async move {
                 self.chunk_put_to_close_group(chunk.content, chunk.proof_bytes, &chunk.quoted_peers)
@@ -358,5 +425,135 @@ mod send_assertions {
     async fn _batch_upload_is_send(client: &Client) {
         let fut = client.batch_upload_chunks(Vec::new());
         _assert_send(&fut);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use ant_evm::QuotingMetrics;
+    use ant_node::payment::single_node::QuotePaymentInfo;
+    use ant_node::CLOSE_GROUP_SIZE;
+
+    fn test_metrics() -> QuotingMetrics {
+        QuotingMetrics {
+            data_size: 0,
+            data_type: 0,
+            close_records_stored: 0,
+            records_per_type: vec![],
+            max_records: 0,
+            received_payment_count: 0,
+            live_time: 0,
+            network_density: None,
+            network_size: None,
+        }
+    }
+
+    /// Helper: build a PreparedChunk with specified payment amounts.
+    fn make_prepared_chunk(amounts: [u64; CLOSE_GROUP_SIZE]) -> PreparedChunk {
+        let quotes: [QuotePaymentInfo; CLOSE_GROUP_SIZE] =
+            std::array::from_fn(|i| QuotePaymentInfo {
+                quote_hash: QuoteHash::from([i as u8 + 1; 32]),
+                rewards_address: RewardsAddress::new([i as u8 + 10; 20]),
+                amount: Amount::from(amounts[i]),
+                quoting_metrics: test_metrics(),
+            });
+
+        PreparedChunk {
+            content: Bytes::from(vec![0xAA; 32]),
+            address: [0u8; 32],
+            quoted_peers: Vec::new(),
+            payment: SingleNodePayment { quotes },
+            peer_quotes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn payment_intent_from_single_chunk() {
+        // Median (index 2) gets 3x price, others get 0 — matches SingleNodePayment layout
+        let chunk = make_prepared_chunk([0, 0, 300, 0, 0]);
+        let intent = PaymentIntent::from_prepared_chunks(&[chunk]);
+
+        assert_eq!(intent.payments.len(), 1, "only non-zero amounts");
+        assert_eq!(intent.total_amount, Amount::from(300));
+
+        let (hash, addr, amt) = &intent.payments[0];
+        assert_eq!(*hash, QuoteHash::from([3u8; 32])); // index 2 → byte 3
+        assert_eq!(*addr, RewardsAddress::new([12u8; 20])); // index 2 → byte 12
+        assert_eq!(*amt, Amount::from(300));
+    }
+
+    #[test]
+    fn payment_intent_from_multiple_chunks() {
+        let c1 = make_prepared_chunk([0, 0, 100, 0, 0]);
+        let c2 = make_prepared_chunk([0, 0, 250, 0, 0]);
+        let intent = PaymentIntent::from_prepared_chunks(&[c1, c2]);
+
+        assert_eq!(intent.payments.len(), 2);
+        assert_eq!(intent.total_amount, Amount::from(350));
+    }
+
+    #[test]
+    fn payment_intent_skips_all_zero_chunks() {
+        let chunk = make_prepared_chunk([0, 0, 0, 0, 0]);
+        let intent = PaymentIntent::from_prepared_chunks(&[chunk]);
+
+        assert!(intent.payments.is_empty());
+        assert_eq!(intent.total_amount, Amount::ZERO);
+    }
+
+    #[test]
+    fn payment_intent_empty_input() {
+        let intent = PaymentIntent::from_prepared_chunks(&[]);
+        assert!(intent.payments.is_empty());
+        assert_eq!(intent.total_amount, Amount::ZERO);
+    }
+
+    #[test]
+    fn finalize_batch_payment_builds_proofs() {
+        let chunk = make_prepared_chunk([0, 0, 500, 0, 0]);
+        let quote_hash = chunk.payment.quotes[2].quote_hash;
+
+        let mut tx_map = HashMap::new();
+        tx_map.insert(quote_hash, TxHash::from([0xBB; 32]));
+
+        let paid = finalize_batch_payment(vec![chunk], &tx_map).unwrap();
+
+        assert_eq!(paid.len(), 1);
+        assert!(!paid[0].proof_bytes.is_empty());
+        assert_eq!(paid[0].address, [0u8; 32]);
+    }
+
+    #[test]
+    fn finalize_batch_payment_empty_input() {
+        let paid = finalize_batch_payment(vec![], &HashMap::new()).unwrap();
+        assert!(paid.is_empty());
+    }
+
+    #[test]
+    fn finalize_batch_payment_missing_tx_hash_errors() {
+        // Missing tx hash for a non-zero-amount quote should error,
+        // since the chunk would be rejected by the network without a valid proof.
+        let chunk = make_prepared_chunk([0, 0, 500, 0, 0]);
+
+        let result = finalize_batch_payment(vec![chunk], &HashMap::new());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Missing tx hash"), "got: {err}");
+    }
+
+    #[test]
+    fn finalize_batch_payment_multiple_chunks() {
+        let c1 = make_prepared_chunk([0, 0, 100, 0, 0]);
+        let c2 = make_prepared_chunk([0, 0, 200, 0, 0]);
+        let q1 = c1.payment.quotes[2].quote_hash;
+        let mut tx_map = HashMap::new();
+        // Both chunks have the same quote_hash (same index/byte pattern)
+        // so one tx_hash covers both
+        tx_map.insert(q1, TxHash::from([0xCC; 32]));
+
+        let paid = finalize_batch_payment(vec![c1, c2], &tx_map).unwrap();
+        assert_eq!(paid.len(), 2);
     }
 }

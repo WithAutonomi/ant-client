@@ -19,8 +19,9 @@ pub use crate::node::devnet::LocalDevnet;
 pub use ant_node::client::{compute_address, DataChunk, XorName};
 
 // Re-export client data types
+pub use client::batch::{finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk};
 pub use client::data::DataUploadResult;
-pub use client::file::FileUploadResult;
+pub use client::file::{FileUploadResult, PreparedUpload};
 pub use client::merkle::{MerkleBatchPaymentResult, PaymentMode, DEFAULT_MERKLE_THRESHOLD};
 
 // Re-export self-encryption types
