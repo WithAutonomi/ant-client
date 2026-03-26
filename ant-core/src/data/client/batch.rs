@@ -346,3 +346,17 @@ impl Client {
         results.into_iter().collect()
     }
 }
+
+/// Compile-time assertions that batch method futures are Send.
+#[cfg(test)]
+mod send_assertions {
+    use super::*;
+
+    fn _assert_send<T: Send>(_: &T) {}
+
+    #[allow(dead_code)]
+    async fn _batch_upload_is_send(client: &Client) {
+        let fut = client.batch_upload_chunks(Vec::new());
+        _assert_send(&fut);
+    }
+}

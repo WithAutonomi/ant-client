@@ -121,30 +121,9 @@ impl Client {
                 Err(e) => return Err(e),
             };
 
-            // Upload each chunk with its merkle proof
-            let mut chunks_stored = 0usize;
-            let mut upload_stream =
-                stream::iter(chunk_contents.into_iter().zip(addresses.iter()).map(
-                    |(content, addr)| {
-                        let proof_bytes = batch_result.proofs.get(addr).cloned();
-                        async move {
-                            let proof = proof_bytes.ok_or_else(|| {
-                                Error::Payment(format!(
-                                    "Missing merkle proof for chunk {}",
-                                    hex::encode(addr)
-                                ))
-                            })?;
-                            let peers = self.close_group_peers(addr).await?;
-                            self.chunk_put_to_close_group(content, proof, &peers).await
-                        }
-                    },
-                ))
-                .buffer_unordered(self.config().chunk_concurrency);
-
-            while let Some(result) = upload_stream.next().await {
-                result?;
-                chunks_stored += 1;
-            }
+            let chunks_stored = self
+                .merkle_upload_chunks(chunk_contents, addresses, &batch_result)
+                .await?;
 
             info!("Data uploaded via merkle: {chunks_stored} chunks stored ({content_len} bytes)");
             Ok(DataUploadResult {
@@ -211,8 +190,8 @@ impl Client {
     /// Download and decrypt data from the network using its `DataMap`.
     ///
     /// Retrieves all chunks referenced by the data map, then decrypts
-    /// and reassembles the original content. Uses `buffered(4)` to
-    /// fetch chunks concurrently while preserving order.
+    /// and reassembles the original content. Fetches chunks concurrently
+    /// (bounded by `chunk_concurrency`) while preserving order.
     ///
     /// # Errors
     ///
@@ -221,22 +200,23 @@ impl Client {
         let chunk_infos = data_map.infos();
         debug!("Downloading data ({} chunks)", chunk_infos.len());
 
-        let encrypted_chunks: Vec<EncryptedChunk> = stream::iter(chunk_infos.iter())
-            .map(|info| {
-                let address = info.dst_hash.0;
-                async move {
-                    let chunk = self.chunk_get(&address).await?.ok_or_else(|| {
-                        Error::InvalidData(format!(
-                            "Missing chunk {} required for data reconstruction",
-                            hex::encode(address)
-                        ))
-                    })?;
-                    Ok::<_, Error>(EncryptedChunk {
-                        content: chunk.content,
-                    })
-                }
+        // Extract owned addresses to avoid HRTB lifetime issue with
+        // stream::iter over references combined with async closures.
+        let addresses: Vec<[u8; 32]> = chunk_infos.iter().map(|info| info.dst_hash.0).collect();
+
+        let encrypted_chunks: Vec<EncryptedChunk> = stream::iter(addresses)
+            .map(|address| async move {
+                let chunk = self.chunk_get(&address).await?.ok_or_else(|| {
+                    Error::InvalidData(format!(
+                        "Missing chunk {} required for data reconstruction",
+                        hex::encode(address)
+                    ))
+                })?;
+                Ok::<_, Error>(EncryptedChunk {
+                    content: chunk.content,
+                })
             })
-            .buffered(4)
+            .buffered(self.config().chunk_concurrency)
             .try_collect()
             .await?;
 
@@ -251,5 +231,43 @@ impl Client {
         info!("Data downloaded and decrypted ({} bytes)", content.len());
 
         Ok(content)
+    }
+}
+
+/// Compile-time assertions that Client method futures are Send.
+///
+/// These methods are called from axum handlers and tokio::spawn contexts
+/// that require Send + 'static. The async closures inside stream
+/// combinators must not capture references with concrete lifetimes
+/// (HRTB issue). If any of these checks fail, the stream closures
+/// need restructuring to use owned values instead of references.
+#[cfg(test)]
+mod send_assertions {
+    use super::*;
+
+    fn _assert_send<T: Send>(_: &T) {}
+
+    #[allow(
+        dead_code,
+        unreachable_code,
+        unused_variables,
+        clippy::diverging_sub_expression
+    )]
+    async fn _data_download_is_send(client: &Client) {
+        let dm: DataMap = todo!();
+        let fut = client.data_download(&dm);
+        _assert_send(&fut);
+    }
+
+    #[allow(dead_code, unreachable_code, clippy::diverging_sub_expression)]
+    async fn _data_upload_is_send(client: &Client) {
+        let fut = client.data_upload(Bytes::new());
+        _assert_send(&fut);
+    }
+
+    #[allow(dead_code, unreachable_code, clippy::diverging_sub_expression)]
+    async fn _data_upload_with_mode_is_send(client: &Client) {
+        let fut = client.data_upload_with_mode(Bytes::new(), PaymentMode::Auto);
+        _assert_send(&fut);
     }
 }

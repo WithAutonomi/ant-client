@@ -16,8 +16,9 @@ use ant_node::ant_protocol::{
 use ant_node::client::send_and_await_chunk_response;
 use ant_node::payment::quote::verify_merkle_candidate_signature;
 use ant_node::payment::serialize_merkle_proof;
+use bytes::Bytes;
 use evmlib::merkle_batch_payment::PoolCommitment;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -445,6 +446,68 @@ impl Client {
         candidates
             .try_into()
             .map_err(|_| Error::Payment("Failed to convert candidates to fixed array".to_string()))
+    }
+
+    /// Upload chunks using pre-computed merkle proofs from a batch payment.
+    ///
+    /// Each chunk is matched to its proof from `batch_result.proofs`,
+    /// then stored to its close group concurrently. Returns the number
+    /// of chunks successfully stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any chunk is missing its proof or storage fails.
+    pub(crate) async fn merkle_upload_chunks(
+        &self,
+        chunk_contents: Vec<Bytes>,
+        addresses: Vec<[u8; 32]>,
+        batch_result: &MerkleBatchPaymentResult,
+    ) -> Result<usize> {
+        let mut stored = 0usize;
+        let mut upload_stream = stream::iter(chunk_contents.into_iter().zip(addresses).map(
+            |(content, addr)| {
+                let proof_bytes = batch_result.proofs.get(&addr).cloned();
+                async move {
+                    let proof = proof_bytes.ok_or_else(|| {
+                        Error::Payment(format!(
+                            "Missing merkle proof for chunk {}",
+                            hex::encode(addr)
+                        ))
+                    })?;
+                    let peers = self.close_group_peers(&addr).await?;
+                    self.chunk_put_to_close_group(content, proof, &peers).await
+                }
+            },
+        ))
+        .buffer_unordered(self.config().chunk_concurrency);
+
+        while let Some(result) = upload_stream.next().await {
+            result?;
+            stored += 1;
+        }
+
+        Ok(stored)
+    }
+}
+
+/// Compile-time assertions that merkle method futures are Send.
+#[cfg(test)]
+mod send_assertions {
+    use super::*;
+    use crate::data::client::Client;
+
+    fn _assert_send<T: Send>(_: &T) {}
+
+    #[allow(
+        dead_code,
+        unreachable_code,
+        unused_variables,
+        clippy::diverging_sub_expression
+    )]
+    async fn _merkle_upload_chunks_is_send(client: &Client) {
+        let batch_result: MerkleBatchPaymentResult = todo!();
+        let fut = client.merkle_upload_chunks(Vec::new(), Vec::new(), &batch_result);
+        _assert_send(&fut);
     }
 }
 
