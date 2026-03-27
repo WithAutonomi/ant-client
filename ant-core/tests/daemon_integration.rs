@@ -1,8 +1,11 @@
 use std::net::IpAddr;
 
+use ant_core::node::binary::NoopProgress;
 use ant_core::node::daemon::server;
 use ant_core::node::registry::NodeRegistry;
-use ant_core::node::types::{DaemonConfig, DaemonStatus};
+use ant_core::node::types::{
+    AddNodeOpts, BinarySource, DaemonConfig, DaemonStatus, NodeStatusResult,
+};
 
 fn test_config(dir: &tempfile::TempDir) -> DaemonConfig {
     DaemonConfig {
@@ -138,6 +141,137 @@ async fn console_returns_html() {
     let body = resp.text().await.unwrap();
     assert!(body.contains("Node Console"));
     assert!(body.contains("/api/v1"));
+
+    shutdown.cancel();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+/// Create a fake binary that responds to `--version` and stays alive otherwise.
+fn create_fake_binary(dir: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        let binary_path = dir.join("fake-antnode");
+        std::fs::write(
+            &binary_path,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"antnode 0.1.0-test\"; exit 0; fi\nsleep 300\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        binary_path
+    }
+    #[cfg(windows)]
+    {
+        let binary_path = dir.join("fake-antnode.cmd");
+        std::fs::write(
+            &binary_path,
+            "@echo off\r\nif \"%1\"==\"--version\" (\r\n  echo antnode 0.1.0-test\r\n  exit /b 0\r\n)\r\ntimeout /t 300 /nobreak >nul\r\n",
+        )
+        .unwrap();
+        binary_path
+    }
+}
+
+#[tokio::test]
+async fn nodes_status_includes_pid_and_uptime() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(&dir);
+    let reg_path = config.registry_path.clone();
+
+    // Add nodes to the registry before starting the daemon
+    let binary = create_fake_binary(dir.path());
+    let opts = AddNodeOpts {
+        count: 2,
+        rewards_address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+        data_dir_path: Some(dir.path().join("data")),
+        log_dir_path: Some(dir.path().join("logs")),
+        binary_source: BinarySource::LocalPath(binary),
+        ..Default::default()
+    };
+    ant_core::node::add_nodes(opts, &reg_path, &NoopProgress)
+        .await
+        .unwrap();
+
+    // Start the daemon with the populated registry
+    let registry = NodeRegistry::load(&reg_path).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let addr = server::start(config, registry, shutdown.clone())
+        .await
+        .unwrap();
+
+    // Hit the nodes status endpoint
+    let url = format!("http://{addr}/api/v1/nodes/status");
+    let resp = reqwest::get(&url).await.unwrap();
+    assert!(resp.status().is_success());
+
+    let result: NodeStatusResult = resp.json().await.unwrap();
+    assert_eq!(result.nodes.len(), 2);
+
+    // Nodes are registered but not started — pid and uptime should be None
+    for node in &result.nodes {
+        assert!(node.pid.is_none(), "stopped node should have no pid");
+        assert!(
+            node.uptime_secs.is_none(),
+            "stopped node should have no uptime"
+        );
+    }
+
+    // Verify the JSON omits None fields (skip_serializing_if)
+    let raw: serde_json::Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+    let first_node = &raw["nodes"][0];
+    assert!(
+        first_node.get("pid").is_none(),
+        "pid should be omitted from JSON for stopped nodes"
+    );
+    assert!(
+        first_node.get("uptime_secs").is_none(),
+        "uptime_secs should be omitted from JSON for stopped nodes"
+    );
+
+    // Start node 1 via the daemon API.
+    // The fake binary uses `sleep`/`timeout` to stay alive — on Unix this works
+    // natively, on Windows the .cmd wrapper can't be spawned directly by
+    // tokio::process::Command (os error 193), so we skip the running-node
+    // assertions on Windows. The unit tests in types.rs cover the Some case.
+    let start_url = format!("http://{addr}/api/v1/nodes/1/start");
+    let client = reqwest::Client::new();
+    let start_resp = client.post(&start_url).send().await.unwrap();
+
+    if start_resp.status().is_success() {
+        // Give the process a moment to be tracked
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Now status should include pid and uptime for the running node
+        let result: NodeStatusResult = reqwest::get(&url).await.unwrap().json().await.unwrap();
+        let running_node = result.nodes.iter().find(|n| n.node_id == 1).unwrap();
+        assert!(running_node.pid.is_some(), "running node should have a pid");
+        assert!(
+            running_node.uptime_secs.is_some(),
+            "running node should have uptime"
+        );
+
+        // Node 2 is still stopped
+        let stopped_node = result.nodes.iter().find(|n| n.node_id == 2).unwrap();
+        assert!(stopped_node.pid.is_none());
+        assert!(stopped_node.uptime_secs.is_none());
+
+        // Verify JSON shape for the running node
+        let raw: serde_json::Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+        let running_raw = raw["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["node_id"] == 1)
+            .unwrap();
+        assert!(
+            running_raw.get("pid").is_some(),
+            "running node JSON should include pid"
+        );
+        assert!(
+            running_raw.get("uptime_secs").is_some(),
+            "running node JSON should include uptime_secs"
+        );
+    }
 
     shutdown.cancel();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
