@@ -342,6 +342,12 @@ pub struct NodeStatusSummary {
     pub name: String,
     pub version: String,
     pub status: NodeStatus,
+    /// Process ID (only set when the node is running).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Seconds since the node process started (only set when running).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime_secs: Option<u64>,
 }
 
 /// Result of querying node status across all registered nodes.
@@ -470,12 +476,16 @@ mod tests {
                     name: "antnode-1".to_string(),
                     version: "0.110.0".to_string(),
                     status: NodeStatus::Running,
+                    pid: Some(1234),
+                    uptime_secs: Some(60),
                 },
                 NodeStatusSummary {
                     node_id: 2,
                     name: "antnode-2".to_string(),
                     version: "0.110.0".to_string(),
                     status: NodeStatus::Stopped,
+                    pid: None,
+                    uptime_secs: None,
                 },
             ],
             total_running: 1,
@@ -498,12 +508,29 @@ mod tests {
             name: "antnode-1".to_string(),
             version: "0.110.0".to_string(),
             status: NodeStatus::Running,
+            pid: Some(5678),
+            uptime_secs: Some(120),
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"node_id\":1"));
         assert!(json.contains("\"name\":\"antnode-1\""));
         assert!(json.contains("\"version\":\"0.110.0\""));
         assert!(json.contains("\"status\":\"running\""));
+        assert!(json.contains("\"pid\":5678"));
+        assert!(json.contains("\"uptime_secs\":120"));
+
+        // None fields should be omitted
+        let stopped = NodeStatusSummary {
+            node_id: 2,
+            name: "antnode-2".to_string(),
+            version: "0.110.0".to_string(),
+            status: NodeStatus::Stopped,
+            pid: None,
+            uptime_secs: None,
+        };
+        let json_stopped = serde_json::to_string(&stopped).unwrap();
+        assert!(!json_stopped.contains("pid"));
+        assert!(!json_stopped.contains("uptime_secs"));
     }
 
     #[test]
