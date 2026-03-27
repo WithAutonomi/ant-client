@@ -202,6 +202,8 @@ pub fn node_status_offline(registry_path: &Path) -> Result<NodeStatusResult> {
             name: config.service_name.clone(),
             version: config.version.clone(),
             status: NodeStatus::Stopped,
+            pid: None,
+            uptime_secs: None,
         })
         .collect();
     let total_stopped = nodes.len() as u32;

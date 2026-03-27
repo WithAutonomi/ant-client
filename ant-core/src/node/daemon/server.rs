@@ -174,11 +174,16 @@ async fn get_nodes_status(State(state): State<Arc<AppState>>) -> Json<NodeStatus
             _ => total_stopped += 1,
         }
 
+        let pid = supervisor.node_pid(config.id);
+        let uptime_secs = supervisor.node_uptime_secs(config.id);
+
         nodes.push(NodeStatusSummary {
             node_id: config.id,
             name: config.service_name.clone(),
             version: config.version.clone(),
             status,
+            pid,
+            uptime_secs,
         });
     }
 
