@@ -1,0 +1,323 @@
+name: ant release
+
+on:
+  push:
+    tags:
+      - "ant-cli-v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: build
+        run: cargo build --release --target ${{ matrix.target }} --bin ant
+
+      - name: determine version
+        id: version
+        shell: bash
+        run: |
+          version=$(grep '^version' ant-cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=${version}" >> $GITHUB_OUTPUT
+
+      - name: package (unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          staging="ant-${{ steps.version.outputs.version }}-${{ matrix.target }}"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/ant" "$staging/"
+          cp "resources/bootstrap_peers.toml" "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
+          echo "ASSET=$staging.tar.gz" >> $GITHUB_ENV
+
+      - name: package (windows)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          staging="ant-${{ steps.version.outputs.version }}-${{ matrix.target }}"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/ant.exe" "$staging/"
+          cp "resources/bootstrap_peers.toml" "$staging/"
+          7z a "$staging.zip" "$staging"
+          echo "ASSET=$staging.zip" >> $GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ant-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  sign-windows:
+    name: sign windows binary
+    runs-on: windows-latest
+    needs: [build]
+    env:
+      SM_HOST: ${{ secrets.SM_HOST }}
+      SM_API_KEY: ${{ secrets.SM_API_KEY }}
+      SM_CLIENT_CERT_PASSWORD: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+      SM_KEYPAIR_ALIAS: ${{ secrets.SM_KEYPAIR_ALIAS }}
+      SM_LOG_LEVEL: trace
+      SM_LOG_FILE: ${{ github.workspace }}\smctl-signing.log
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ant-x86_64-pc-windows-msvc
+          path: artifacts/
+
+      - name: extract binary for signing
+        shell: bash
+        run: |
+          cd artifacts
+          7z x *.zip
+          # Find and copy the exe to a known location
+          find . -name "ant.exe" -exec cp {} ant.exe \;
+
+      - name: create client certificate file
+        id: prepare_cert
+        shell: pwsh
+        run: |
+          $raw = @'
+          ${{ secrets.SM_CLIENT_CERT_B64 }}
+          '@
+
+          $clean = ($raw -replace '\s','')
+
+          if ([string]::IsNullOrWhiteSpace($clean)) {
+            Write-Error "SM_CLIENT_CERT_B64 is empty after normalization."
+            exit 1
+          }
+
+          try {
+            $certBytes = [Convert]::FromBase64String($clean)
+          } catch {
+            Write-Error "SM_CLIENT_CERT_B64 is not valid Base64."
+            exit 1
+          }
+
+          $certPath = Join-Path $env:RUNNER_TEMP "Certificate.p12"
+          [System.IO.File]::WriteAllBytes($certPath, $certBytes)
+
+          "SM_CLIENT_CERT_FILE=$certPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "sm_client_cert_b64=$clean" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: setup DigiCert SSM tools
+        uses: digicert/ssm-code-signing@v1.2.1
+        with:
+          sm_host: ${{ secrets.SM_HOST }}
+          sm_api_key: ${{ secrets.SM_API_KEY }}
+          sm_client_cert_b64: ${{ steps.prepare_cert.outputs.sm_client_cert_b64 }}
+          sm_client_cert_password: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+
+      - name: verify smctl installation
+        shell: pwsh
+        run: |
+          smctl -v
+          smctl healthcheck
+
+      - name: sign ant.exe
+        shell: pwsh
+        run: |
+          $file = "artifacts\ant.exe"
+          $result = & smctl sign --keypair-alias "$env:SM_KEYPAIR_ALIAS" --input "$file" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Signing failed: $result"
+            exit 1
+          }
+          Write-Host "Successfully signed ant.exe"
+
+      - name: verify signature
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "artifacts\ant.exe"
+          Write-Host "Status: $($sig.Status)"
+          Write-Host "Signer: $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne "Valid") {
+            Write-Error "Signature validation failed"
+            exit 1
+          }
+
+      - name: repackage signed archive
+        shell: bash
+        run: |
+          version=$(grep '^version' ant-cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          staging="ant-${version}-x86_64-pc-windows-msvc"
+          rm -rf "$staging"
+          mkdir "$staging"
+          cp artifacts/ant.exe "$staging/"
+          cp resources/bootstrap_peers.toml "$staging/"
+          7z a "$staging.zip" "$staging"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ant-x86_64-pc-windows-msvc-signed
+          path: ant-*-x86_64-pc-windows-msvc.zip
+
+      - name: upload signing logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signing-logs
+          path: ${{ github.workspace }}\smctl-signing.log
+          if-no-files-found: ignore
+
+  publish-crate:
+    name: publish ant-core to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: publish ant-core
+        working-directory: ant-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+
+  release:
+    name: create github release
+    runs-on: ubuntu-latest
+    needs: [build, sign-windows, publish-crate]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: determine version and prerelease
+        id: meta
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#ant-cli-v}"
+          echo "tag=${tag}" >> $GITHUB_OUTPUT
+          echo "version=${version}" >> $GITHUB_OUTPUT
+          if [[ "$version" == *"-rc."* ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ant-x86_64-unknown-linux-musl
+          path: assets/
+      - uses: actions/download-artifact@v4
+        with:
+          name: ant-aarch64-unknown-linux-musl
+          path: assets/
+      - uses: actions/download-artifact@v4
+        with:
+          name: ant-x86_64-apple-darwin
+          path: assets/
+      - uses: actions/download-artifact@v4
+        with:
+          name: ant-aarch64-apple-darwin
+          path: assets/
+      - uses: actions/download-artifact@v4
+        with:
+          name: ant-x86_64-pc-windows-msvc-signed
+          path: assets/
+
+      - name: extract changelog entry
+        id: changelog
+        shell: bash
+        run: |
+          # Extract the latest changelog section (between first two ## headers)
+          changelog=$(awk '/^## \[/{if(found) exit; found=1; next} found' CHANGELOG.md)
+          # Write to file for the release body
+          echo "$changelog" > /tmp/changelog_entry.md
+
+      - name: generate release body
+        shell: bash
+        run: |
+          version="${{ steps.meta.outputs.version }}"
+          cat > /tmp/release_body.md << 'HEADER'
+          ## Installation
+
+          ### Linux / macOS (quick-start)
+
+          ```bash
+          curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh | bash
+          ```
+
+          ### Manual download
+
+          Download the archive for your platform from the assets below, extract it, and place the `ant` binary on your `PATH`. Copy `bootstrap_peers.toml` to the appropriate config directory:
+
+          | Platform | Config path |
+          |----------|-------------|
+          | Linux | `~/.config/ant/bootstrap_peers.toml` |
+          | macOS | `~/Library/Application Support/ant/bootstrap_peers.toml` |
+          | Windows | `%APPDATA%\ant\bootstrap_peers.toml` |
+
+          ### Windows (winget)
+
+          ```powershell
+          winget install Autonomi.ant
+          ```
+
+          HEADER
+
+          echo "## Detailed Changes" >> /tmp/release_body.md
+          echo "" >> /tmp/release_body.md
+          cat /tmp/changelog_entry.md >> /tmp/release_body.md
+
+      - name: create github release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          prerelease_flag=""
+          if [[ "${{ steps.meta.outputs.prerelease }}" == "true" ]]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --title "ant ${{ steps.meta.outputs.version }}" \
+            --notes-file /tmp/release_body.md \
+            $prerelease_flag \
+            assets/*

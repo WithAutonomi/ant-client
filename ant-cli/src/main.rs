@@ -240,6 +240,8 @@ fn resolve_evm_network(
 }
 
 /// Resolve bootstrap peers from a pre-loaded manifest.
+///
+/// Priority: CLI `--bootstrap` > devnet manifest > `bootstrap_peers.toml` config file.
 fn resolve_bootstrap_from(
     ctx: &DataCliContext,
     manifest: Option<&DevnetManifest>,
@@ -257,7 +259,17 @@ fn resolve_bootstrap_from(
         return Ok(bootstrap);
     }
 
-    anyhow::bail!("No bootstrap peers provided. Use --bootstrap or --devnet-manifest.")
+    if let Some(peers) = ant_core::config::load_bootstrap_peers()
+        .map_err(|e| anyhow::anyhow!("Failed to load bootstrap config: {e}"))?
+    {
+        info!("Loaded {} bootstrap peer(s) from config file", peers.len());
+        return Ok(peers);
+    }
+
+    anyhow::bail!(
+        "No bootstrap peers provided. Use --bootstrap, --devnet-manifest, \
+         or install bootstrap_peers.toml to your config directory."
+    )
 }
 
 async fn create_client_node(

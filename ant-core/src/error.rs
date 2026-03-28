@@ -56,6 +56,9 @@ pub enum Error {
     #[error("Could not determine home directory (HOME/USERPROFILE not set)")]
     HomeDirNotFound,
 
+    #[error("Failed to parse bootstrap_peers.toml: {0}")]
+    BootstrapConfigParse(String),
+
     #[error("Node count {count} exceeds maximum of {max} per call")]
     InvalidNodeCount { count: u16, max: u16 },
 

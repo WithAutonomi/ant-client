@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.singleton.1.6.0.schema.json
+# Winget manifest for Autonomi ant CLI.
+#
+# This file is a template. The release workflow substitutes the version and URL.
+# To submit to winget-pkgs, use `wingetcreate update` or submit a PR to
+# https://github.com/microsoft/winget-pkgs.
+
+PackageIdentifier: Autonomi.ant
+PackageVersion: "${VERSION}"
+PackageName: Autonomi ant
+Publisher: Autonomi
+License: GPL-3.0
+ShortDescription: The Autonomi CLI for interacting with the Autonomi network.
+PackageUrl: https://github.com/WithAutonomi/ant-client
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    InstallerUrl: https://github.com/WithAutonomi/ant-client/releases/download/ant-cli-v${VERSION}/ant-${VERSION}-x86_64-pc-windows-msvc.zip
+    InstallerSha256: "${SHA256}"
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: ant-${VERSION}-x86_64-pc-windows-msvc\ant.exe
+        PortableCommandAlias: ant
+ManifestType: singleton
+ManifestVersion: 1.6.0
