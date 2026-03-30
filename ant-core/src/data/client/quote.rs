@@ -252,14 +252,29 @@ impl Client {
 
         // Validate close-group quorum: each responding peer should recognize
         // most of the other queried peers in its own close-group view.
-        Self::validate_close_group_quorum(&quotes, &close_group_views)?;
+        let quorum_indices = Self::validate_close_group_quorum(&quotes, &close_group_views)?;
+
+        // Reorder quotes so quorum members come first. These peers mutually
+        // recognize each other and are most likely to accept payment proofs,
+        // so chunk_put_to_close_group should target them as the initial set.
+        let quorum_set: HashSet<usize> = quorum_indices.iter().copied().collect();
+        let (quorum, non_quorum): (Vec<_>, Vec<_>) = quotes
+            .into_iter()
+            .enumerate()
+            .partition(|(i, _)| quorum_set.contains(i));
+        let reordered: Vec<_> = quorum
+            .into_iter()
+            .chain(non_quorum)
+            .map(|(_, q)| q)
+            .collect();
 
         info!(
-            "Collected {} quotes for address {} (close-group quorum verified)",
-            quotes.len(),
-            hex::encode(address)
+            "Collected {} quotes for address {} (close-group quorum verified, {} quorum members prioritized)",
+            reordered.len(),
+            hex::encode(address),
+            quorum_indices.len(),
         );
-        Ok(quotes)
+        Ok(reordered)
     }
 
     /// Validate close-group quorum by finding the largest subset of queried
@@ -271,12 +286,12 @@ impl Client {
     /// verification.
     ///
     /// Fails if no mutually-recognizing subset of size `CLOSE_GROUP_MAJORITY`
-    /// exists. Larger subsets are better — they increase the likelihood of
-    /// durable storage and replication.
+    /// exists. Returns the indices of the quorum members on success so
+    /// callers can prioritize those peers for uploads.
     fn validate_close_group_quorum(
         quotes: &[(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)],
         close_group_views: &[(PeerId, Vec<[u8; 32]>)],
-    ) -> Result<()> {
+    ) -> Result<Vec<usize>> {
         let peer_ids: Vec<[u8; 32]> = quotes
             .iter()
             .map(|(peer_id, _, _, _)| *peer_id.as_bytes())
@@ -291,27 +306,32 @@ impl Client {
         // Check subsets from largest to smallest (CLOSE_GROUP_SIZE down to
         // CLOSE_GROUP_MAJORITY). For CLOSE_GROUP_SIZE=5 this is at most
         // C(5,5) + C(5,4) + C(5,3) = 1 + 5 + 10 = 16 checks.
-        let clique_size = Self::find_largest_mutual_subset(&peer_ids, &views);
+        let quorum_indices = Self::find_largest_mutual_subset(&peer_ids, &views);
 
-        if clique_size >= CLOSE_GROUP_MAJORITY {
+        if quorum_indices.len() >= CLOSE_GROUP_MAJORITY {
             info!(
-                "Close-group quorum passed: {clique_size}/{} peers mutually recognize each other",
+                "Close-group quorum passed: {}/{} peers mutually recognize each other",
+                quorum_indices.len(),
                 peer_ids.len()
             );
-            Ok(())
+            Ok(quorum_indices)
         } else {
             Err(Error::CloseGroupQuorumFailure(format!(
-                "Largest mutually-recognizing subset is {clique_size} peers (need {CLOSE_GROUP_MAJORITY})"
+                "Largest mutually-recognizing subset is {} peers (need {CLOSE_GROUP_MAJORITY})",
+                quorum_indices.len()
             )))
         }
     }
 
-    /// Find the size of the largest subset of `peer_ids` where every peer
-    /// in the subset appears in every other peer's close-group view.
+    /// Find the largest subset of `peer_ids` where every peer in the subset
+    /// appears in every other peer's close-group view.
+    ///
+    /// Returns the indices of the members in the largest mutual subset,
+    /// or an empty vec if no subset of size `CLOSE_GROUP_MAJORITY` exists.
     fn find_largest_mutual_subset(
         peer_ids: &[[u8; 32]],
         views: &[([u8; 32], HashSet<[u8; 32]>)],
-    ) -> usize {
+    ) -> Vec<usize> {
         let n = peer_ids.len();
 
         // Try subset sizes from largest to smallest.
@@ -320,7 +340,7 @@ impl Client {
             let mut indices: Vec<usize> = (0..size).collect();
             loop {
                 if Self::is_mutual_subset(peer_ids, views, &indices) {
-                    return size;
+                    return indices;
                 }
                 if !Self::next_combination(&mut indices, n) {
                     break;
@@ -328,7 +348,7 @@ impl Client {
             }
         }
 
-        0
+        vec![]
     }
 
     /// Check whether the peers at the given indices mutually recognize each other.
@@ -503,7 +523,9 @@ mod tests {
             (peers[4], &[peers[0], peers[1], peers[2], peers[3]]),
         ]);
 
-        assert_eq!(Client::find_largest_mutual_subset(&peers, &views), 5);
+        let result = Client::find_largest_mutual_subset(&peers, &views);
+        assert_eq!(result.len(), 5);
+        assert_eq!(result, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
@@ -518,7 +540,9 @@ mod tests {
             (peers[4], &[]),
         ]);
 
-        assert_eq!(Client::find_largest_mutual_subset(&peers, &views), 3);
+        let result = Client::find_largest_mutual_subset(&peers, &views);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result, vec![0, 1, 2]);
     }
 
     #[test]
@@ -534,7 +558,7 @@ mod tests {
         ]);
 
         // Largest mutual subset is 2, below CLOSE_GROUP_MAJORITY (3)
-        assert_eq!(Client::find_largest_mutual_subset(&peers, &views), 0);
+        assert!(Client::find_largest_mutual_subset(&peers, &views).is_empty());
     }
 
     #[test]
@@ -548,7 +572,7 @@ mod tests {
             (peers[4], &[]),
         ]);
 
-        assert_eq!(Client::find_largest_mutual_subset(&peers, &views), 0);
+        assert!(Client::find_largest_mutual_subset(&peers, &views).is_empty());
     }
 
     #[test]
@@ -563,7 +587,9 @@ mod tests {
             (peers[4], &[]),
         ]);
 
-        assert_eq!(Client::find_largest_mutual_subset(&peers, &views), 4);
+        let result = Client::find_largest_mutual_subset(&peers, &views);
+        assert_eq!(result.len(), 4);
+        assert_eq!(result, vec![0, 1, 2, 3]);
     }
 
     #[test]
@@ -578,8 +604,12 @@ mod tests {
             (peers[4], &[peers[0], peers[1], peers[2], peers[3]]),
         ]);
 
-        // {0,1,2,3,4} fails (3 doesn't see 0), but {1,2,3,4} works
-        assert_eq!(Client::find_largest_mutual_subset(&peers, &views), 4);
+        // {0,1,2,3,4} fails (3 doesn't see 0). Both {0,1,2,4} and {1,2,3,4}
+        // are valid 4-peer cliques; the algorithm returns the first found in
+        // lexicographic order.
+        let result = Client::find_largest_mutual_subset(&peers, &views);
+        assert_eq!(result.len(), 4);
+        assert_eq!(result, vec![0, 1, 2, 4]);
     }
 
     // ─── validate_close_group_quorum (integration) ─────────────────────
@@ -649,7 +679,8 @@ mod tests {
             .collect();
 
         let (quotes, views) = make_quotes_and_views(&peer_ids, &neighbor_map);
-        assert!(Client::validate_close_group_quorum(&quotes, &views).is_ok());
+        let indices = Client::validate_close_group_quorum(&quotes, &views).unwrap();
+        assert_eq!(indices.len(), CLOSE_GROUP_SIZE);
     }
 
     #[test]
@@ -693,6 +724,9 @@ mod tests {
             .collect();
 
         let (quotes, views) = make_quotes_and_views(&peer_ids, &neighbor_map);
-        assert!(Client::validate_close_group_quorum(&quotes, &views).is_ok());
+        let indices = Client::validate_close_group_quorum(&quotes, &views).unwrap();
+        assert_eq!(indices.len(), CLOSE_GROUP_MAJORITY);
+        // Only the first 3 peers (indices 0,1,2) form the quorum
+        assert_eq!(indices, vec![0, 1, 2]);
     }
 }
