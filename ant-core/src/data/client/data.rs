@@ -6,6 +6,8 @@
 //! For file-based streaming uploads that avoid loading the entire
 //! file into memory, see the `file` module.
 
+use crate::data::client::batch::PaymentIntent;
+use crate::data::client::file::PreparedUpload;
 use crate::data::client::merkle::PaymentMode;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
@@ -147,6 +149,56 @@ impl Client {
         }
     }
 
+    /// Phase 1 of external-signer data upload: encrypt and collect quotes.
+    ///
+    /// Encrypts in-memory data via self-encryption, then collects storage
+    /// quotes for each chunk without making any on-chain payment. Returns
+    /// a [`PreparedUpload`] containing the data map and a [`PaymentIntent`]
+    /// with the payment details for external signing.
+    ///
+    /// After the caller signs and submits the payment transaction, call
+    /// [`Client::finalize_upload`] with the tx hashes to complete storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encryption fails or quote collection fails.
+    pub async fn data_prepare_upload(&self, content: Bytes) -> Result<PreparedUpload> {
+        let content_len = content.len();
+        debug!("Preparing data upload for external signing ({content_len} bytes)");
+
+        let (data_map, encrypted_chunks) = encrypt(content)
+            .map_err(|e| Error::Encryption(format!("Failed to encrypt data: {e}")))?;
+
+        let chunk_count = encrypted_chunks.len();
+        info!("Data encrypted into {chunk_count} chunks");
+
+        let chunk_contents: Vec<Bytes> = encrypted_chunks
+            .into_iter()
+            .map(|chunk| chunk.content)
+            .collect();
+
+        let mut prepared_chunks = Vec::with_capacity(chunk_contents.len());
+        for content in chunk_contents {
+            if let Some(prepared) = self.prepare_chunk_payment(content).await? {
+                prepared_chunks.push(prepared);
+            }
+        }
+
+        let payment_intent = PaymentIntent::from_prepared_chunks(&prepared_chunks);
+
+        info!(
+            "Data prepared for external signing: {} chunks, total {} atto ({content_len} bytes)",
+            prepared_chunks.len(),
+            payment_intent.total_amount,
+        );
+
+        Ok(PreparedUpload {
+            data_map,
+            prepared_chunks,
+            payment_intent,
+        })
+    }
+
     /// Store a `DataMap` on the network as a public chunk.
     ///
     /// The serialized `DataMap` is stored as a regular content-addressed chunk.
@@ -268,6 +320,12 @@ mod send_assertions {
     #[allow(dead_code, unreachable_code, clippy::diverging_sub_expression)]
     async fn _data_upload_with_mode_is_send(client: &Client) {
         let fut = client.data_upload_with_mode(Bytes::new(), PaymentMode::Auto);
+        _assert_send(&fut);
+    }
+
+    #[allow(dead_code, unreachable_code, clippy::diverging_sub_expression)]
+    async fn _data_prepare_upload_is_send(client: &Client) {
+        let fut = client.data_prepare_upload(Bytes::new());
         _assert_send(&fut);
     }
 }
