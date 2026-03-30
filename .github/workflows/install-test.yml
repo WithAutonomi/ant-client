@@ -65,69 +65,33 @@ jobs:
           echo "Bootstrap config installed at $config_file"
           cat "$config_file"
 
-  test-winget-manifest:
-    name: validate winget manifest
+  test-install-script-windows:
+    name: test install.ps1 (Windows)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: install wingetcreate
+      - name: run install script
+        shell: pwsh
+        env:
+          ANT_VERSION: ${{ inputs.version }}
+          INSTALL_DIR: ${{ runner.temp }}\ant\bin
+        run: . .\install.ps1
+
+      - name: verify binary
         shell: pwsh
         run: |
-          winget install wingetcreate --accept-source-agreements --accept-package-agreements
-        continue-on-error: true
+          $env:Path = "${{ runner.temp }}\ant\bin;$env:Path"
+          ant --help
+          Write-Host "Binary runs successfully"
 
-      - name: generate and validate manifest
+      - name: verify bootstrap config
         shell: pwsh
         run: |
-          $version = "${{ inputs.version }}"
-          $url = "https://github.com/WithAutonomi/ant-client/releases/download/ant-cli-v${version}/ant-${version}-x86_64-pc-windows-msvc.zip"
-
-          # Download and hash
-          $tempFile = [System.IO.Path]::GetTempFileName()
-          try {
-            Invoke-WebRequest -Uri $url -OutFile $tempFile
-            $hash = (Get-FileHash -Path $tempFile -Algorithm SHA256).Hash
-            Write-Host "SHA256: $hash"
-          } finally {
-            Remove-Item $tempFile -ErrorAction SilentlyContinue
-          }
-
-          # Substitute template
-          $template = Get-Content "resources\winget\Autonomi.ant.yaml" -Raw
-          $manifest = $template `
-            -replace '\$\{VERSION\}', $version `
-            -replace '\$\{SHA256\}', $hash
-          $manifest | Set-Content "winget\Autonomi.ant.installer.yaml" -Encoding UTF8
-
-          Write-Host "Generated manifest:"
-          Get-Content "winget\Autonomi.ant.installer.yaml"
-
-      - name: test download and extract
-        shell: pwsh
-        run: |
-          $version = "${{ inputs.version }}"
-          $url = "https://github.com/WithAutonomi/ant-client/releases/download/ant-cli-v${version}/ant-${version}-x86_64-pc-windows-msvc.zip"
-          $tempDir = Join-Path $env:RUNNER_TEMP "ant-test"
-          New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
-
-          Invoke-WebRequest -Uri $url -OutFile "$tempDir\ant.zip"
-          Expand-Archive "$tempDir\ant.zip" -DestinationPath $tempDir
-
-          $antExe = Get-ChildItem -Path $tempDir -Recurse -Filter "ant.exe" | Select-Object -First 1
-          if (-not $antExe) {
-            Write-Error "ant.exe not found in archive"
+          $configFile = Join-Path $env:APPDATA "ant\bootstrap_peers.toml"
+          if (-not (Test-Path $configFile)) {
+            Write-Error "bootstrap_peers.toml not found at $configFile"
             exit 1
           }
-
-          & $antExe.FullName --help
-          Write-Host "Windows binary runs successfully"
-
-          # Check bootstrap config is in archive
-          $config = Get-ChildItem -Path $tempDir -Recurse -Filter "bootstrap_peers.toml" | Select-Object -First 1
-          if (-not $config) {
-            Write-Error "bootstrap_peers.toml not found in archive"
-            exit 1
-          }
-          Write-Host "Bootstrap config found in archive"
-          Get-Content $config.FullName
+          Write-Host "Bootstrap config installed at $configFile"
+          Get-Content $configFile

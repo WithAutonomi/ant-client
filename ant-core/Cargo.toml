@@ -44,6 +44,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Vendored OpenSSL ensures openssl-sys links statically for musl targets.
+# Without this, the musl CI builds fail because the runners lack musl-compatible
+# OpenSSL dev libraries. Not needed on Windows (uses schannel via native-tls).
+openssl = { version = "0.10", features = ["vendored"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }

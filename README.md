@@ -13,8 +13,16 @@ Data on Autonomi is **content-addressed**. Files are split into encrypted chunks
 
 ## Installation
 
+### Linux / macOS
+
 ```bash
-cargo install --path ant-cli
+curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh | bash
+```
+
+### Windows
+
+```powershell
+irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex
 ```
 
 ## Quick Start
