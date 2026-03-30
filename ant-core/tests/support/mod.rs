@@ -272,7 +272,7 @@ impl MiniTestnet {
             storage,
             payment_verifier,
             Arc::new(quote_generator),
-            None,
+            Some(Arc::clone(&node)),
         ));
 
         // Start message handler loop
