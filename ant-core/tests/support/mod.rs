@@ -246,6 +246,7 @@ impl MiniTestnet {
             },
             cache_capacity: 1000,
             local_rewards_address: rewards_address,
+            local_peer_id: *identity.peer_id().as_bytes(),
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
         let metrics_tracker = QuotingMetricsTracker::new(TEST_MAX_RECORDS);
@@ -271,6 +272,7 @@ impl MiniTestnet {
             storage,
             payment_verifier,
             Arc::new(quote_generator),
+            None,
         ));
 
         // Start message handler loop

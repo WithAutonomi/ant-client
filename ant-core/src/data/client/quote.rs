@@ -14,6 +14,7 @@ use ant_node::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
 use evmlib::common::Amount;
 use evmlib::PaymentQuote;
 use futures::stream::{FuturesUnordered, StreamExt};
+use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -117,6 +118,7 @@ impl Client {
                         ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
                             quote,
                             already_stored,
+                            close_group,
                         }) => {
                             if already_stored {
                                 debug!("Peer {peer_id_clone} already has chunk");
@@ -126,7 +128,7 @@ impl Client {
                                 Ok(payment_quote) => {
                                     let price = payment_quote.price;
                                     debug!("Received quote from {peer_id_clone}: price = {price}");
-                                    Some(Ok((payment_quote, price)))
+                                    Some(Ok((payment_quote, price, close_group)))
                                 }
                                 Err(e) => Some(Err(Error::Serialization(format!(
                                     "Failed to deserialize quote from {peer_id_clone}: {e}"
@@ -156,6 +158,8 @@ impl Client {
         // Collect all responses with an overall timeout to prevent indefinite stalls.
         // Over-query means we have 2x peers, so we can tolerate failures.
         let mut quotes = Vec::with_capacity(over_query_count);
+        let mut close_group_views: Vec<(PeerId, Vec<[u8; 32]>)> =
+            Vec::with_capacity(over_query_count);
         let mut already_stored_peers: Vec<(PeerId, [u8; 32])> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
 
@@ -163,7 +167,8 @@ impl Client {
             tokio::time::timeout(overall_timeout, async {
                 while let Some((peer_id, addrs, quote_result)) = quote_futures.next().await {
                     match quote_result {
-                        Ok((quote, price)) => {
+                        Ok((quote, price, close_group)) => {
+                            close_group_views.push((peer_id, close_group));
                             quotes.push((peer_id, addrs, quote, price));
                         }
                         Err(Error::AlreadyStored) => {
@@ -221,29 +226,159 @@ impl Client {
             }
         }
 
-        if quotes.len() >= CLOSE_GROUP_SIZE {
-            let total_responses = quotes.len() + failures.len() + already_stored_peers.len();
-
-            // Sort by XOR distance to target, keep the closest CLOSE_GROUP_SIZE.
-            quotes.sort_by(|a, b| {
-                let dist_a = xor_distance(&a.0, address);
-                let dist_b = xor_distance(&b.0, address);
-                dist_a.cmp(&dist_b)
-            });
-            quotes.truncate(CLOSE_GROUP_SIZE);
-
-            info!(
-                "Collected {} quotes for address {} (from {total_responses} responses)",
+        if quotes.len() < CLOSE_GROUP_SIZE {
+            return Err(Error::InsufficientPeers(format!(
+                "Got {} quotes, need {CLOSE_GROUP_SIZE}. Failures: [{}]",
                 quotes.len(),
-                hex::encode(address),
-            );
-            return Ok(quotes);
+                failures.join("; ")
+            )));
         }
 
-        Err(Error::InsufficientPeers(format!(
-            "Got {} quotes, need {CLOSE_GROUP_SIZE}. Failures: [{}]",
+        // Sort by XOR distance to target, keep the closest CLOSE_GROUP_SIZE.
+        // We over-queried, so trim to the true close group before validation.
+        quotes.sort_by(|a, b| {
+            let dist_a = xor_distance(&a.0, address);
+            let dist_b = xor_distance(&b.0, address);
+            dist_a.cmp(&dist_b)
+        });
+        quotes.truncate(CLOSE_GROUP_SIZE);
+
+        // Also trim close_group_views to match the kept quotes.
+        let kept_peers: HashSet<[u8; 32]> = quotes
+            .iter()
+            .map(|(pid, _, _, _)| *pid.as_bytes())
+            .collect();
+        close_group_views.retain(|(pid, _)| kept_peers.contains(pid.as_bytes()));
+
+        // Validate close-group quorum: each responding peer should recognize
+        // most of the other queried peers in its own close-group view.
+        Self::validate_close_group_quorum(&quotes, &close_group_views)?;
+
+        info!(
+            "Collected {} quotes for address {} (close-group quorum verified)",
             quotes.len(),
-            failures.join("; ")
-        )))
+            hex::encode(address)
+        );
+        Ok(quotes)
+    }
+
+    /// Validate close-group quorum by finding the largest subset of queried
+    /// peers that mutually recognize each other.
+    ///
+    /// "Mutual recognition" means: for every pair (P, Q) in the subset,
+    /// Q appears in P's close-group view. This matches the server-side
+    /// `CLOSE_GROUP_MAJORITY` threshold that nodes enforce during payment
+    /// verification.
+    ///
+    /// Fails if no mutually-recognizing subset of size `CLOSE_GROUP_MAJORITY`
+    /// exists. Larger subsets are better — they increase the likelihood of
+    /// durable storage and replication.
+    fn validate_close_group_quorum(
+        quotes: &[(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)],
+        close_group_views: &[(PeerId, Vec<[u8; 32]>)],
+    ) -> Result<()> {
+        let peer_ids: Vec<[u8; 32]> = quotes
+            .iter()
+            .map(|(peer_id, _, _, _)| *peer_id.as_bytes())
+            .collect();
+
+        // Build a lookup: peer_bytes → set of peers it recognizes
+        let views: Vec<([u8; 32], HashSet<[u8; 32]>)> = close_group_views
+            .iter()
+            .map(|(peer_id, view)| (*peer_id.as_bytes(), view.iter().copied().collect()))
+            .collect();
+
+        // Check subsets from largest to smallest (CLOSE_GROUP_SIZE down to
+        // CLOSE_GROUP_MAJORITY). For CLOSE_GROUP_SIZE=5 this is at most
+        // C(5,5) + C(5,4) + C(5,3) = 1 + 5 + 10 = 16 checks.
+        let clique_size = Self::find_largest_mutual_subset(&peer_ids, &views);
+
+        if clique_size >= CLOSE_GROUP_MAJORITY {
+            info!(
+                "Close-group quorum passed: {clique_size}/{} peers mutually recognize each other",
+                peer_ids.len()
+            );
+            Ok(())
+        } else {
+            Err(Error::CloseGroupQuorumFailure(format!(
+                "Largest mutually-recognizing subset is {clique_size} peers (need {CLOSE_GROUP_MAJORITY})"
+            )))
+        }
+    }
+
+    /// Find the size of the largest subset of `peer_ids` where every peer
+    /// in the subset appears in every other peer's close-group view.
+    fn find_largest_mutual_subset(
+        peer_ids: &[[u8; 32]],
+        views: &[([u8; 32], HashSet<[u8; 32]>)],
+    ) -> usize {
+        let n = peer_ids.len();
+
+        // Try subset sizes from largest to smallest.
+        for size in (CLOSE_GROUP_MAJORITY..=n).rev() {
+            // Iterate all index combinations of the given size.
+            let mut indices: Vec<usize> = (0..size).collect();
+            loop {
+                if Self::is_mutual_subset(peer_ids, views, &indices) {
+                    return size;
+                }
+                if !Self::next_combination(&mut indices, n) {
+                    break;
+                }
+            }
+        }
+
+        0
+    }
+
+    /// Check whether the peers at the given indices mutually recognize each other.
+    fn is_mutual_subset(
+        peer_ids: &[[u8; 32]],
+        views: &[([u8; 32], HashSet<[u8; 32]>)],
+        indices: &[usize],
+    ) -> bool {
+        for &i in indices {
+            // Find this peer's view
+            let peer_bytes = peer_ids[i];
+            let view = views
+                .iter()
+                .find(|(id, _)| *id == peer_bytes)
+                .map(|(_, v)| v);
+
+            let Some(view) = view else {
+                return false;
+            };
+
+            // Every OTHER peer in the subset must appear in this peer's view
+            for &j in indices {
+                if i == j {
+                    continue;
+                }
+                if !view.contains(&peer_ids[j]) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Advance an index combination to the next one in lexicographic order.
+    /// Returns false when all combinations have been exhausted.
+    fn next_combination(indices: &mut [usize], n: usize) -> bool {
+        let k = indices.len();
+        // Find the rightmost index that can be incremented
+        let mut i = k;
+        while i > 0 {
+            i -= 1;
+            if indices[i] < n - k + i {
+                indices[i] += 1;
+                // Reset all subsequent indices
+                for j in (i + 1)..k {
+                    indices[j] = indices[j - 1] + 1;
+                }
+                return true;
+            }
+        }
+        false
     }
 }

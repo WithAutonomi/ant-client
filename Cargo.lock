@@ -901,8 +901,9 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.10.0"
-source = "git+https://github.com/WithAutonomi/ant-node?rev=44358c1b4e35cc9aff5841a746bb2b1fcb6dcbee#44358c1b4e35cc9aff5841a746bb2b1fcb6dcbee"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bc2ac7c262accf6b4ab73448816662c921303c4a81932379b90edfdee3e4a5d"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -921,7 +922,6 @@ dependencies = [
  "lru",
  "objc2",
  "objc2-foundation",
- "page_size",
  "parking_lot",
  "postcard",
  "rand 0.8.5",
@@ -2417,9 +2417,9 @@ dependencies = [
 
 [[package]]
 name = "evmlib"
-version = "0.8.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1338c23c9ce1b4e54ff5cc65e53ce859095f121bfc742e474e1e1f2e03748000"
+checksum = "d608fcd0976beee509fef7fa391735571cb2fffd715ddca174322180300b6615"
 dependencies = [
  "alloy",
  "ant-merkle",
