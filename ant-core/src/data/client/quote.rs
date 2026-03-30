@@ -382,3 +382,317 @@ impl Client {
         false
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use ant_evm::{Amount, PaymentQuote, QuotingMetrics, RewardsAddress};
+    use ant_node::core::{MultiAddr, PeerId};
+    use ant_node::CLOSE_GROUP_SIZE;
+    use std::collections::HashSet;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::SystemTime;
+
+    /// Create a deterministic peer ID from an index byte.
+    fn peer(id: u8) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        bytes[0] = id;
+        bytes
+    }
+
+    /// Build a views array where each peer's view contains the given neighbors.
+    fn make_views(entries: &[([u8; 32], &[[u8; 32]])]) -> Vec<([u8; 32], HashSet<[u8; 32]>)> {
+        entries
+            .iter()
+            .map(|(id, neighbors)| (*id, neighbors.iter().copied().collect()))
+            .collect()
+    }
+
+    // ─── next_combination ──────────────────────────────────────────────
+
+    #[test]
+    fn next_combination_enumerates_all_c_5_3() {
+        let n = 5;
+        let k = 3;
+        let mut indices: Vec<usize> = (0..k).collect();
+        let mut count = 1; // first combination is [0,1,2]
+        while Client::next_combination(&mut indices, n) {
+            count += 1;
+        }
+        // C(5,3) = 10
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn next_combination_enumerates_all_c_5_5() {
+        let n = 5;
+        let k = 5;
+        let mut indices: Vec<usize> = (0..k).collect();
+        let mut count = 1;
+        while Client::next_combination(&mut indices, n) {
+            count += 1;
+        }
+        // C(5,5) = 1
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn next_combination_single_element() {
+        let n = 5;
+        let k = 1;
+        let mut indices: Vec<usize> = (0..k).collect();
+        let mut count = 1;
+        while Client::next_combination(&mut indices, n) {
+            count += 1;
+        }
+        // C(5,1) = 5
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn next_combination_empty_returns_false() {
+        let mut indices: Vec<usize> = vec![];
+        assert!(!Client::next_combination(&mut indices, 5));
+    }
+
+    // ─── is_mutual_subset ──────────────────────────────────────────────
+
+    #[test]
+    fn is_mutual_subset_two_peers_recognize_each_other() {
+        let a = peer(1);
+        let b = peer(2);
+        let peer_ids = vec![a, b];
+        let views = make_views(&[(a, &[b]), (b, &[a])]);
+
+        assert!(Client::is_mutual_subset(&peer_ids, &views, &[0, 1]));
+    }
+
+    #[test]
+    fn is_mutual_subset_asymmetric_fails() {
+        let a = peer(1);
+        let b = peer(2);
+        let peer_ids = vec![a, b];
+        // A sees B, but B does NOT see A
+        let views = make_views(&[(a, &[b]), (b, &[])]);
+
+        assert!(!Client::is_mutual_subset(&peer_ids, &views, &[0, 1]));
+    }
+
+    #[test]
+    fn is_mutual_subset_missing_view_returns_false() {
+        let a = peer(1);
+        let b = peer(2);
+        let peer_ids = vec![a, b];
+        // Only A has a view entry; B is missing entirely
+        let views = make_views(&[(a, &[b])]);
+
+        assert!(!Client::is_mutual_subset(&peer_ids, &views, &[0, 1]));
+    }
+
+    // ─── find_largest_mutual_subset ────────────────────────────────────
+
+    #[test]
+    fn all_five_peers_mutually_recognize() {
+        let peers: Vec<[u8; 32]> = (1..=5).map(peer).collect();
+        let views = make_views(&[
+            (peers[0], &[peers[1], peers[2], peers[3], peers[4]]),
+            (peers[1], &[peers[0], peers[2], peers[3], peers[4]]),
+            (peers[2], &[peers[0], peers[1], peers[3], peers[4]]),
+            (peers[3], &[peers[0], peers[1], peers[2], peers[4]]),
+            (peers[4], &[peers[0], peers[1], peers[2], peers[3]]),
+        ]);
+
+        assert_eq!(Client::find_largest_mutual_subset(&peers, &views), 5);
+    }
+
+    #[test]
+    fn three_of_five_mutually_recognize() {
+        let peers: Vec<[u8; 32]> = (1..=5).map(peer).collect();
+        // Peers 0,1,2 see each other; peers 3,4 have empty views
+        let views = make_views(&[
+            (peers[0], &[peers[1], peers[2]]),
+            (peers[1], &[peers[0], peers[2]]),
+            (peers[2], &[peers[0], peers[1]]),
+            (peers[3], &[]),
+            (peers[4], &[]),
+        ]);
+
+        assert_eq!(Client::find_largest_mutual_subset(&peers, &views), 3);
+    }
+
+    #[test]
+    fn two_of_five_below_majority() {
+        let peers: Vec<[u8; 32]> = (1..=5).map(peer).collect();
+        // Only peers 0 and 1 see each other
+        let views = make_views(&[
+            (peers[0], &[peers[1]]),
+            (peers[1], &[peers[0]]),
+            (peers[2], &[]),
+            (peers[3], &[]),
+            (peers[4], &[]),
+        ]);
+
+        // Largest mutual subset is 2, below CLOSE_GROUP_MAJORITY (3)
+        assert_eq!(Client::find_largest_mutual_subset(&peers, &views), 0);
+    }
+
+    #[test]
+    fn empty_views_returns_zero() {
+        let peers: Vec<[u8; 32]> = (1..=5).map(peer).collect();
+        let views = make_views(&[
+            (peers[0], &[]),
+            (peers[1], &[]),
+            (peers[2], &[]),
+            (peers[3], &[]),
+            (peers[4], &[]),
+        ]);
+
+        assert_eq!(Client::find_largest_mutual_subset(&peers, &views), 0);
+    }
+
+    #[test]
+    fn four_of_five_one_rogue_peer() {
+        let peers: Vec<[u8; 32]> = (1..=5).map(peer).collect();
+        // Peer 4 doesn't recognize anyone, but the other 4 form a clique
+        let views = make_views(&[
+            (peers[0], &[peers[1], peers[2], peers[3]]),
+            (peers[1], &[peers[0], peers[2], peers[3]]),
+            (peers[2], &[peers[0], peers[1], peers[3]]),
+            (peers[3], &[peers[0], peers[1], peers[2]]),
+            (peers[4], &[]),
+        ]);
+
+        assert_eq!(Client::find_largest_mutual_subset(&peers, &views), 4);
+    }
+
+    #[test]
+    fn asymmetric_recognition_reduces_clique() {
+        let peers: Vec<[u8; 32]> = (1..=5).map(peer).collect();
+        // All see each other except: peer 3 does NOT see peer 0
+        let views = make_views(&[
+            (peers[0], &[peers[1], peers[2], peers[3], peers[4]]),
+            (peers[1], &[peers[0], peers[2], peers[3], peers[4]]),
+            (peers[2], &[peers[0], peers[1], peers[3], peers[4]]),
+            (peers[3], &[peers[1], peers[2], peers[4]]), // missing peers[0]
+            (peers[4], &[peers[0], peers[1], peers[2], peers[3]]),
+        ]);
+
+        // {0,1,2,3,4} fails (3 doesn't see 0), but {1,2,3,4} works
+        assert_eq!(Client::find_largest_mutual_subset(&peers, &views), 4);
+    }
+
+    // ─── validate_close_group_quorum (integration) ─────────────────────
+
+    fn make_test_quote() -> PaymentQuote {
+        PaymentQuote {
+            content: xor_name::XorName([0u8; 32]),
+            timestamp: SystemTime::now(),
+            quoting_metrics: QuotingMetrics {
+                data_size: 0,
+                data_type: 0,
+                close_records_stored: 0,
+                records_per_type: vec![],
+                max_records: 0,
+                received_payment_count: 0,
+                live_time: 0,
+                network_density: None,
+                network_size: None,
+            },
+            pub_key: vec![],
+            signature: vec![],
+            rewards_address: RewardsAddress::new([0u8; 20]),
+        }
+    }
+
+    fn make_dummy_addr() -> Vec<MultiAddr> {
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12345);
+        vec![MultiAddr::quic(addr)]
+    }
+
+    type Quotes = Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>;
+    type CloseGroupViews = Vec<(PeerId, Vec<[u8; 32]>)>;
+
+    fn make_quotes_and_views(
+        peer_ids: &[PeerId],
+        neighbor_map: &[Vec<[u8; 32]>],
+    ) -> (Quotes, CloseGroupViews) {
+        let quotes: Quotes = peer_ids
+            .iter()
+            .map(|pid| (*pid, make_dummy_addr(), make_test_quote(), Amount::ZERO))
+            .collect();
+
+        let views: CloseGroupViews = peer_ids
+            .iter()
+            .zip(neighbor_map.iter())
+            .map(|(pid, neighbors)| (*pid, neighbors.clone()))
+            .collect();
+
+        (quotes, views)
+    }
+
+    #[test]
+    fn validate_quorum_all_mutual_passes() {
+        let peer_ids: Vec<PeerId> = (1..=CLOSE_GROUP_SIZE)
+            .map(|i| PeerId::from_bytes(peer(i as u8)))
+            .collect();
+
+        let neighbor_map: Vec<Vec<[u8; 32]>> = peer_ids
+            .iter()
+            .map(|me| {
+                peer_ids
+                    .iter()
+                    .filter(|p| p != &me)
+                    .map(|p| *p.as_bytes())
+                    .collect()
+            })
+            .collect();
+
+        let (quotes, views) = make_quotes_and_views(&peer_ids, &neighbor_map);
+        assert!(Client::validate_close_group_quorum(&quotes, &views).is_ok());
+    }
+
+    #[test]
+    fn validate_quorum_empty_views_fails() {
+        let peer_ids: Vec<PeerId> = (1..=CLOSE_GROUP_SIZE)
+            .map(|i| PeerId::from_bytes(peer(i as u8)))
+            .collect();
+
+        let neighbor_map: Vec<Vec<[u8; 32]>> = vec![vec![]; CLOSE_GROUP_SIZE];
+
+        let (quotes, views) = make_quotes_and_views(&peer_ids, &neighbor_map);
+        let result = Client::validate_close_group_quorum(&quotes, &views);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::CloseGroupQuorumFailure(_)
+        ));
+    }
+
+    #[test]
+    fn validate_quorum_exactly_majority_passes() {
+        let peer_ids: Vec<PeerId> = (1..=CLOSE_GROUP_SIZE)
+            .map(|i| PeerId::from_bytes(peer(i as u8)))
+            .collect();
+
+        // Only first CLOSE_GROUP_MAJORITY peers see each other
+        let majority = &peer_ids[..CLOSE_GROUP_MAJORITY];
+        let neighbor_map: Vec<Vec<[u8; 32]>> = peer_ids
+            .iter()
+            .map(|me| {
+                if majority.contains(me) {
+                    majority
+                        .iter()
+                        .filter(|p| p != &me)
+                        .map(|p| *p.as_bytes())
+                        .collect()
+                } else {
+                    vec![]
+                }
+            })
+            .collect();
+
+        let (quotes, views) = make_quotes_and_views(&peer_ids, &neighbor_map);
+        assert!(Client::validate_close_group_quorum(&quotes, &views).is_ok());
+    }
+}
