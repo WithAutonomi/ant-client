@@ -63,6 +63,12 @@ pub enum Error {
     /// Data already exists on the network — no payment needed.
     #[error("already stored on network")]
     AlreadyStored,
+
+    /// Close group quorum check failed — the queried peers do not mutually
+    /// recognize each other as close group members, so payment would not
+    /// result in durable storage.
+    #[error("close group quorum failure: {0}")]
+    CloseGroupQuorumFailure(String),
 }
 
 impl From<ant_node::Error> for Error {

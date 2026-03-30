@@ -925,8 +925,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9161d53c72cfcc0dd8fee14bff64c0bad06642f074d52c5c91d9ee203acb4042"
+source = "git+https://github.com/WithAutonomi/ant-node.git?branch=feat%2Fclose-group-quorum-validation#019bddbf54a75ea0bfe324d3960b633aa6b282d8"
 dependencies = [
  "aes-gcm-siv",
  "ant-evm",
