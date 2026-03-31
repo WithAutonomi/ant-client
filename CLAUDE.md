@@ -135,7 +135,7 @@ cargo run --bin ant -- --help  # Run the CLI
 
 ## E2E Test Skill
 
-The project includes an E2E test command at `.claude/commands/e2e-node-management-test.md` that tests all node management features against a real testnet (invoked via `/e2e-node-management-test`). When adding new `ant node` subcommands or changing existing node management behavior, update this command to cover the new or changed functionality.
+The project includes an E2E test skill at `.claude/skills/e2e-node-management-test/SKILL.md` that tests all node management features against a real testnet (invoked via `/e2e-node-management-test`). When adding new `ant node` subcommands or changing existing node management behavior, update this command to cover the new or changed functionality.
 
 ## Linear Project
 
