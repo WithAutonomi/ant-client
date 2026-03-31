@@ -1,3 +1,9 @@
+---
+name: e2e-node-management-test
+description: Run a comprehensive end-to-end test of all node management features against a real testnet. Builds the binary and exercises every implemented command and API endpoint.
+allowed-tools: Bash, Read, Glob, Grep, AskUserQuestion
+---
+
 # End-to-End Node Management Test
 
 This command runs a comprehensive end-to-end test of all node management features against a real

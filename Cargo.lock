@@ -899,9 +899,9 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4856d03e8885a161c5fcb4227ad387c5ba43193a874f5b57c066bab48b0bdd9"
+checksum = "3bc2ac7c262accf6b4ab73448816662c921303c4a81932379b90edfdee3e4a5d"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -3041,9 +3041,9 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hyper"
-version = "1.8.1"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ab2d4f250c3d7b1c9fcdff1cece94ea4e2dfbec68614f7b87cb205f24ca9d11"
+checksum = "6299f016b246a94207e63da54dbe807655bf9e00044f73ded42c3ac5305fbcca"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3056,7 +3056,6 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "pin-utils",
  "smallvec",
  "tokio",
  "want",
@@ -4983,9 +4982,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.20.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39c045892301eb0f4fe3961760cbeb3592cf3d8b936a70b1a11d3f7043cdb82f"
+checksum = "19de0950a0c9c9a3f97681c539e513c52c909866caddef5d825fe2dcbd1b0173"
 dependencies = [
  "anyhow",
  "async-trait",
