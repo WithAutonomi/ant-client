@@ -104,7 +104,8 @@ Verify the JSON response has a `started` array with 3 entries and an empty `fail
 ant node status --json
 ```
 
-Verify: `nodes` array has 3 entries and all are `running`.
+Verify: `nodes` array has 3 entries and all are `running`. For each running node, verify that `pid`
+is present and is a number, and `uptime_secs` is present and is a number.
 
 **Step 6.4 — Stop a single node:**
 
@@ -120,7 +121,10 @@ Verify the JSON response shows `node_id` and `service_name` of `node1`.
 ant node status --json
 ```
 
-Verify: one node is `stopped`, two nodes are `running`.
+Verify: one node is `stopped`, two nodes are `running`. For the stopped node (`node1`), verify that
+`pid` and `uptime_secs` are **not present** in the JSON (they are omitted via `skip_serializing_if`
+when a node is stopped). For the two running nodes, verify that `pid` and `uptime_secs` are present
+and are numbers.
 
 **Step 6.6 — Start the stopped node:**
 
@@ -164,7 +168,8 @@ Verify: response is JSON with `nodes_total`, `nodes_running`, etc. Also verify `
 curl -s <api_base>/nodes/status
 ```
 
-Verify: response is JSON with node entries.
+Verify: response is JSON with node entries. Each running node should have `pid` (number) and
+`uptime_secs` (number) fields present in the response.
 
 **Step 7.3 — OpenAPI spec:**
 
