@@ -8,12 +8,11 @@
 mod support;
 
 use ant_core::data::{compute_address, Client, ClientConfig};
-use ant_evm::ProofOfPayment;
-use ant_node::client::hex_node_id_to_encoded_peer_id;
 use ant_node::core::PeerId;
 use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use bytes::Bytes;
 use evmlib::common::TxHash;
+use evmlib::{EncodedPeerId, ProofOfPayment};
 use serial_test::serial;
 use std::sync::Arc;
 use support::MiniTestnet;
@@ -45,8 +44,7 @@ async fn collect_and_pay(client: &Client, content: &Bytes) -> (PaymentProof, Vec
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes.len());
     for (peer_id, _addrs, quote, price) in quotes {
-        let encoded =
-            hex_node_id_to_encoded_peer_id(&peer_id.to_hex()).expect("peer ID conversion");
+        let encoded = EncodedPeerId::new(*peer_id.as_bytes());
         peer_quotes.push((encoded, quote.clone()));
         quotes_for_payment.push((quote, price));
     }
@@ -196,8 +194,7 @@ async fn test_attack_zero_amount_payment() {
     let target_peer = quotes.first().expect("should have quotes").0;
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     for (peer_id, _addrs, quote, _price) in quotes {
-        let encoded =
-            hex_node_id_to_encoded_peer_id(&peer_id.to_hex()).expect("peer ID conversion");
+        let encoded = EncodedPeerId::new(*peer_id.as_bytes());
         peer_quotes.push((encoded, quote));
     }
 
@@ -241,8 +238,7 @@ async fn test_attack_fabricated_tx_hash() {
     let target_peer = quotes.first().expect("should have quotes").0;
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     for (peer_id, _addrs, quote, _price) in quotes {
-        let encoded =
-            hex_node_id_to_encoded_peer_id(&peer_id.to_hex()).expect("peer ID conversion");
+        let encoded = EncodedPeerId::new(*peer_id.as_bytes());
         peer_quotes.push((encoded, quote));
     }
 

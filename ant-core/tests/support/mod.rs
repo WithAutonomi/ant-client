@@ -15,7 +15,6 @@
     clippy::used_underscore_binding
 )]
 
-use ant_evm::RewardsAddress;
 use ant_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
 use ant_node::core::{
     CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
@@ -28,6 +27,7 @@ use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use evmlib::testnet::Testnet;
 use evmlib::wallet::Wallet;
 use evmlib::Network as EvmNetwork;
+use evmlib::RewardsAddress;
 use rand::Rng;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -68,11 +68,13 @@ impl MiniTestnet {
     /// Use 6 for standard tests, 35+ for merkle tests (need 16 peers per pool).
     pub async fn start(node_count: usize) -> Self {
         // Start Anvil EVM testnet FIRST
-        let testnet = Testnet::new().await;
+        let testnet = Testnet::new().await.expect("start Anvil testnet");
         let evm_network = testnet.to_network();
 
         // Create funded wallet from the same Anvil instance
-        let private_key = testnet.default_wallet_private_key();
+        let private_key = testnet
+            .default_wallet_private_key()
+            .expect("get wallet key");
         let wallet = Wallet::new_from_private_key(evm_network.clone(), &private_key)
             .expect("create funded wallet");
 

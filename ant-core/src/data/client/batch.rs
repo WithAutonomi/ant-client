@@ -7,15 +7,15 @@
 use crate::data::client::payment::peer_id_to_encoded;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_evm::{Amount, EncodedPeerId, PaymentQuote, ProofOfPayment, QuoteHash, RewardsAddress};
 use ant_node::ant_protocol::DATA_TYPE_CHUNK;
 use ant_node::client::{compute_address, XorName};
 use ant_node::core::{MultiAddr, PeerId};
 use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use bytes::Bytes;
-use evmlib::common::TxHash;
+use evmlib::common::{Amount, QuoteHash, TxHash};
 use evmlib::contract::payment_vault::get_market_price;
 use evmlib::wallet::PayForQuotesError;
+use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use futures::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, info};
@@ -435,9 +435,9 @@ mod send_assertions {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use ant_evm::QuotingMetrics;
     use ant_node::payment::single_node::QuotePaymentInfo;
     use ant_node::CLOSE_GROUP_SIZE;
+    use evmlib::quoting_metrics::QuotingMetrics;
 
     fn test_metrics() -> QuotingMetrics {
         QuotingMetrics {

@@ -40,9 +40,13 @@ impl LocalDevnet {
     /// Returns an error if the devnet fails to start or stabilize.
     pub async fn start(mut config: DevnetConfig) -> Result<Self> {
         info!("Starting local Anvil blockchain...");
-        let testnet = Testnet::new().await;
+        let testnet = Testnet::new()
+            .await
+            .map_err(|e| Error::Config(format!("failed to start Anvil testnet: {e}")))?;
         let network = testnet.to_network();
-        let wallet_key = testnet.default_wallet_private_key();
+        let wallet_key = testnet
+            .default_wallet_private_key()
+            .map_err(|e| Error::Config(format!("failed to get wallet key: {e}")))?;
 
         let (rpc_url, token_addr, payments_addr, merkle_addr) =
             extract_custom_network_info(&network)?;
