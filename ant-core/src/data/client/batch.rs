@@ -14,6 +14,8 @@ use ant_node::core::{MultiAddr, PeerId};
 use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use bytes::Bytes;
 use evmlib::common::TxHash;
+use evmlib::contract::payment_vault::get_market_price;
+use evmlib::wallet::PayForQuotesError;
 use futures::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, info};
@@ -180,12 +182,11 @@ impl Client {
             .map(|(_, _, quote, _)| quote.quoting_metrics.clone())
             .collect();
 
-        let contract_prices =
-            evmlib::contract::payment_vault::get_market_price(evm_network, metrics_batch)
-                .await
-                .map_err(|e| {
-                    Error::Payment(format!("Failed to get market prices from contract: {e}"))
-                })?;
+        let contract_prices = get_market_price(evm_network, metrics_batch)
+            .await
+            .map_err(|e| {
+                Error::Payment(format!("Failed to get market prices from contract: {e}"))
+            })?;
 
         if contract_prices.len() != quotes_with_peers.len() {
             return Err(Error::Payment(format!(
@@ -251,11 +252,13 @@ impl Client {
             all_payments.len()
         );
 
-        let (tx_hash_map, _gas_info) = wallet.pay_for_quotes(all_payments).await.map_err(
-            |evmlib::wallet::PayForQuotesError(err, _)| {
-                Error::Payment(format!("Batch payment failed: {err}"))
-            },
-        )?;
+        let (tx_hash_map, _gas_info) =
+            wallet
+                .pay_for_quotes(all_payments)
+                .await
+                .map_err(|PayForQuotesError(err, _)| {
+                    Error::Payment(format!("Batch payment failed: {err}"))
+                })?;
 
         info!(
             "Batch payment succeeded: {} transactions",

@@ -55,10 +55,13 @@ struct ChunkSpill {
 
 impl ChunkSpill {
     /// Create a new spill directory under the system temp dir.
+    ///
+    /// Uses `create_dir` (not `create_dir_all`) so creation fails if the
+    /// directory already exists, preventing silent reuse of a stale spill.
     fn new() -> Result<Self> {
         let unique: u64 = rand::random();
         let dir = std::env::temp_dir().join(format!(".ant_spill_{}_{unique}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir(&dir)?;
         Ok(Self {
             dir,
             addresses: Vec::new(),
