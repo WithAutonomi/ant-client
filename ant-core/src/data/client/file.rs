@@ -234,9 +234,10 @@ fn spawn_file_encryption(path: PathBuf) -> Result<EncryptionChannels> {
                     Some(Bytes::from(buffer))
                 }
                 Err(e) => {
-                    if let Ok(mut guard) = read_error_clone.lock() {
-                        *guard = Some(e);
-                    }
+                    let mut guard = read_error_clone
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *guard = Some(e);
                     None
                 }
             }
@@ -250,7 +251,10 @@ fn spawn_file_encryption(path: PathBuf) -> Result<EncryptionChannels> {
             // stream_encrypt sees None (EOF) when a read fails, so it stops
             // producing chunks. We must detect this before sending the
             // partial results to avoid uploading a truncated DataMap.
-            if let Ok(guard) = read_error.lock() {
+            {
+                let guard = read_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(ref e) = *guard {
                     return Err(Error::Io(std::io::Error::new(e.kind(), e.to_string())));
                 }
@@ -264,7 +268,10 @@ fn spawn_file_encryption(path: PathBuf) -> Result<EncryptionChannels> {
         }
 
         // Final check: read error after last chunk (stream saw EOF).
-        if let Ok(guard) = read_error.lock() {
+        {
+            let guard = read_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(ref e) = *guard {
                 return Err(Error::Io(std::io::Error::new(e.kind(), e.to_string())));
             }
@@ -431,6 +438,12 @@ impl Client {
         );
 
         // Phase 2: Decide payment mode and upload in waves from disk.
+        //
+        // Note on merkle proof memory: MerkleBatchPaymentResult.proofs holds all
+        // proofs simultaneously (~86 KB each due to ML-DSA-65 signatures in the
+        // candidate pool). For a 100 GB file (~25k chunks), this is ~2 GB. This
+        // is acceptable because merkle payments save significant gas costs — the
+        // gas savings far outweigh the proof memory overhead.
         let (chunks_stored, actual_mode) = if self.should_use_merkle(chunk_count, mode) {
             // Merkle batch payment path — needs all addresses upfront for tree.
             info!("Using merkle batch payment for {chunk_count} file chunks");
