@@ -120,32 +120,56 @@ fn get_current_rss_linux() -> Option<u64> {
     Some(resident_pages * page_size as u64)
 }
 
+/// Fixed PRNG seed for deterministic, incompressible test data.
+///
+/// Using a seeded PRNG (not a repeating pattern) ensures encrypted chunks
+/// are full-size (~4 MB each), exercising the worst-case wave buffer.
+/// A repeating 256-byte pattern would compress to tiny chunks, making
+/// the memory test pass trivially without stressing the wave buffer.
+const TEST_SEED: u64 = 0xDEAD_BEEF_CAFE_BABE;
+
+/// Simple xorshift64 PRNG — deterministic, fast, incompressible output.
+struct Xorshift64(u64);
+
+impl Xorshift64 {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u8(&mut self) -> u8 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 & 0xFF) as u8
+    }
+}
+
 /// Create a deterministic test file of the given size.
 ///
-/// Uses a repeating 256-byte pattern so content is verifiable after
-/// round-trip without keeping the original in memory.
+/// Uses a seeded PRNG to produce incompressible content so encrypted chunks
+/// are full-size (~4 MB each), properly exercising the wave buffer. The same
+/// seed is used in `verify_file_content` for verification.
 fn create_test_file(dir: &TempDir, size: u64) -> std::path::PathBuf {
     let path = dir.path().join("huge_test_file.bin");
     let mut file = std::fs::File::create(&path).expect("create test file");
 
-    let pattern: Vec<u8> = (0u8..=255).collect();
+    let mut rng = Xorshift64::new(TEST_SEED);
     let mut remaining = size;
 
     // Write in 1 MB chunks to avoid holding the whole file in memory
     let write_buf_size: usize = 1024 * 1024;
-    let mut buf = Vec::with_capacity(write_buf_size);
+    let mut buf = vec![0u8; write_buf_size];
     while remaining > 0 {
-        buf.clear();
         let to_write = remaining.min(write_buf_size as u64) as usize;
-        for i in 0..to_write {
-            buf.push(pattern[i % pattern.len()]);
+        for byte in buf.iter_mut().take(to_write) {
+            *byte = rng.next_u8();
         }
-        file.write_all(&buf).expect("write chunk to test file");
+        file.write_all(&buf[..to_write])
+            .expect("write chunk to test file");
         remaining -= to_write as u64;
     }
     file.flush().expect("flush test file");
     drop(file);
-    // Drop the write buffer before asserting
     drop(buf);
 
     let meta = std::fs::metadata(&path).expect("stat test file");
@@ -154,9 +178,10 @@ fn create_test_file(dir: &TempDir, size: u64) -> std::path::PathBuf {
     path
 }
 
-/// Verify downloaded file matches the expected repeating pattern.
+/// Verify downloaded file matches the expected PRNG sequence.
 ///
-/// Reads in chunks to avoid loading the entire file into memory.
+/// Regenerates the same PRNG stream and compares byte-by-byte,
+/// reading in 1 MB chunks to avoid loading the file into memory.
 fn verify_file_content(path: &std::path::Path, expected_size: u64) {
     let meta = std::fs::metadata(path).expect("stat downloaded file");
     assert_eq!(
@@ -165,7 +190,7 @@ fn verify_file_content(path: &std::path::Path, expected_size: u64) {
         "downloaded file size should match original"
     );
 
-    let pattern: Vec<u8> = (0u8..=255).collect();
+    let mut rng = Xorshift64::new(TEST_SEED);
     let file = std::fs::File::open(path).expect("open downloaded file");
     let mut reader = std::io::BufReader::new(file);
     let mut offset = 0u64;
@@ -176,16 +201,15 @@ fn verify_file_content(path: &std::path::Path, expected_size: u64) {
         if n == 0 {
             break;
         }
-        for (i, &byte) in buf[..n].iter().enumerate() {
-            let global_pos = (offset + i as u64) as usize;
-            let expected = pattern[global_pos % pattern.len()];
+        for &byte in &buf[..n] {
+            let expected = rng.next_u8();
             if byte != expected {
                 panic!(
-                    "content mismatch at byte {global_pos}: got {byte:#04x}, expected {expected:#04x}"
+                    "content mismatch at byte {offset}: got {byte:#04x}, expected {expected:#04x}"
                 );
             }
+            offset += 1;
         }
-        offset += n as u64;
     }
     assert_eq!(offset, expected_size, "total bytes read mismatch");
 }
@@ -264,6 +288,12 @@ async fn test_huge_file_upload_download_1gb() {
             after / (1024 * 1024)
         );
     } else {
+        // On macOS/Linux, RSS measurement must succeed — a silent skip would
+        // let the bounded-memory claim go unverified in CI.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        panic!("RSS measurement failed on a supported platform — cannot verify bounded memory");
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         eprintln!("WARNING: Could not measure current RSS on this platform, skipping memory check");
     }
 
@@ -358,10 +388,10 @@ async fn test_huge_file_upload_download_4gb() {
         result.chunks_stored, result.payment_mode_used
     );
 
-    // 4 GB at ~4 MB chunks → ~1024 chunks
+    // 4 GB at MAX_CHUNK_SIZE (4,190,208 bytes) → ~1026 chunks minimum
     assert!(
-        result.chunks_stored >= 800,
-        "4 GB file should produce at least 800 chunks, got {}",
+        result.chunks_stored >= 1000,
+        "4 GB file should produce at least 1000 chunks, got {}",
         result.chunks_stored
     );
 
@@ -387,6 +417,12 @@ async fn test_huge_file_upload_download_4gb() {
             after / (1024 * 1024)
         );
     } else {
+        // On macOS/Linux, RSS measurement must succeed — a silent skip would
+        // let the bounded-memory claim go unverified in CI.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        panic!("RSS measurement failed on a supported platform — cannot verify bounded memory");
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         eprintln!("WARNING: Could not measure current RSS on this platform, skipping memory check");
     }
 
