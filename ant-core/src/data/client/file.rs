@@ -680,14 +680,24 @@ impl Client {
         })();
 
         match write_result {
-            Ok(bytes_written) => {
-                std::fs::rename(&tmp_path, output)?;
-                info!(
-                    "File downloaded: {bytes_written} bytes written to {}",
-                    output.display()
-                );
-                Ok(bytes_written)
-            }
+            Ok(bytes_written) => match std::fs::rename(&tmp_path, output) {
+                Ok(()) => {
+                    info!(
+                        "File downloaded: {bytes_written} bytes written to {}",
+                        output.display()
+                    );
+                    Ok(bytes_written)
+                }
+                Err(rename_err) => {
+                    if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
+                        warn!(
+                            "Failed to remove temp download file {}: {cleanup_err}",
+                            tmp_path.display()
+                        );
+                    }
+                    Err(rename_err.into())
+                }
+            },
             Err(e) => {
                 if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
                     warn!(
