@@ -3,10 +3,15 @@
 //! Upload files directly from disk without loading them entirely into memory.
 //! Uses `stream_encrypt` to process files in 8KB chunks, encrypting and
 //! uploading each piece as it's produced.
+//!
+//! Encrypted chunks are spilled to a temporary directory during encryption
+//! so that peak memory usage is bounded to one wave (~256 MB for 64 × 4 MB
+//! chunks) regardless of file size.
+//!
 //! For in-memory data uploads, see the `data` module.
 
 use crate::data::client::batch::{finalize_batch_payment, PaymentIntent, PreparedChunk};
-use crate::data::client::merkle::PaymentMode;
+use crate::data::client::merkle::{MerkleBatchPaymentResult, PaymentMode};
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_evm::QuoteHash;
@@ -14,13 +19,158 @@ use ant_node::ant_protocol::DATA_TYPE_CHUNK;
 use ant_node::client::compute_address;
 use bytes::Bytes;
 use evmlib::common::TxHash;
+use futures::stream::{self, StreamExt};
 use self_encryption::{stream_encrypt, streaming_decrypt, DataMap};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+use xor_name::XorName;
+
+/// Number of chunks per upload wave (matches batch.rs PAYMENT_WAVE_SIZE).
+const UPLOAD_WAVE_SIZE: usize = 64;
+
+/// Extra headroom percentage for disk space check.
+///
+/// Encrypted chunks are slightly larger than the source data due to padding
+/// and self-encryption overhead. We require file_size + 10% free space in
+/// the temp directory to account for this.
+const DISK_SPACE_HEADROOM_PERCENT: u64 = 10;
+
+/// Temporary on-disk buffer for encrypted chunks.
+///
+/// During file encryption, chunks are written to a temp directory so that
+/// only their 32-byte addresses stay in memory. At upload time chunks are
+/// read back one wave at a time, keeping peak RAM at ~`UPLOAD_WAVE_SIZE × 4 MB`.
+struct ChunkSpill {
+    /// Temp directory holding spilled chunk files (named by hex address).
+    dir: PathBuf,
+    /// Ordered list of chunk addresses (preserves encryption order).
+    addresses: Vec<[u8; 32]>,
+    /// Running total of chunk byte sizes (for average-size calculation).
+    total_bytes: u64,
+}
+
+impl ChunkSpill {
+    /// Create a new spill directory under the system temp dir.
+    fn new() -> Result<Self> {
+        let unique: u64 = rand::random();
+        let dir = std::env::temp_dir().join(format!(".ant_spill_{}_{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self {
+            dir,
+            addresses: Vec::new(),
+            total_bytes: 0,
+        })
+    }
+
+    /// Write one encrypted chunk to disk and record its address.
+    fn push(&mut self, content: &[u8]) -> Result<()> {
+        let address = compute_address(content);
+        let path = self.dir.join(hex::encode(address));
+        std::fs::write(&path, content)?;
+        self.total_bytes += content.len() as u64;
+        self.addresses.push(address);
+        Ok(())
+    }
+
+    /// Number of chunks stored.
+    fn len(&self) -> usize {
+        self.addresses.len()
+    }
+
+    /// Total bytes of all spilled chunks.
+    fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Average chunk size in bytes (for quoting metrics).
+    fn avg_chunk_size(&self) -> u64 {
+        if self.addresses.is_empty() {
+            return 0;
+        }
+        self.total_bytes / self.addresses.len() as u64
+    }
+
+    /// Read a single chunk back from disk by address.
+    fn read_chunk(&self, address: &[u8; 32]) -> Result<Bytes> {
+        let path = self.dir.join(hex::encode(address));
+        let data = std::fs::read(&path).map_err(|e| {
+            Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("reading spilled chunk {}: {e}", hex::encode(address)),
+            ))
+        })?;
+        Ok(Bytes::from(data))
+    }
+
+    /// Iterate over address slices in wave-sized groups.
+    fn waves(&self) -> std::slice::Chunks<'_, [u8; 32]> {
+        self.addresses.chunks(UPLOAD_WAVE_SIZE)
+    }
+
+    /// Read a wave of chunks from disk.
+    fn read_wave(&self, wave_addrs: &[[u8; 32]]) -> Result<Vec<(Bytes, [u8; 32])>> {
+        let mut out = Vec::with_capacity(wave_addrs.len());
+        for addr in wave_addrs {
+            let content = self.read_chunk(addr)?;
+            out.push((content, *addr));
+        }
+        Ok(out)
+    }
+
+    /// Clean up the spill directory.
+    fn cleanup(&self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            warn!(
+                "Failed to clean up chunk spill dir {}: {e}",
+                self.dir.display()
+            );
+        }
+    }
+}
+
+impl Drop for ChunkSpill {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Check that the temp directory has enough free space for the spilled chunks.
+///
+/// `file_size` is the source file's byte count. We require
+/// `file_size + 10%` free space in the temp dir to account for
+/// self-encryption overhead.
+fn check_disk_space_for_spill(file_size: u64) -> Result<()> {
+    let tmp = std::env::temp_dir();
+    let available = fs2::available_space(&tmp).map_err(|e| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to query disk space on {}: {e}", tmp.display()),
+        ))
+    })?;
+
+    // Use integer arithmetic to avoid f64 precision loss on large file sizes.
+    let headroom = file_size / DISK_SPACE_HEADROOM_PERCENT;
+    let required = file_size.saturating_add(headroom);
+
+    if available < required {
+        let avail_mb = available / (1024 * 1024);
+        let req_mb = required / (1024 * 1024);
+        return Err(Error::InsufficientDiskSpace(format!(
+            "need ~{req_mb} MB in temp dir ({}) but only {avail_mb} MB available",
+            tmp.display()
+        )));
+    }
+
+    debug!(
+        "Disk space check passed: {available} bytes available, {required} bytes required (temp: {})",
+        tmp.display()
+    );
+    Ok(())
+}
 
 /// Result of a file upload: the `DataMap` needed to retrieve the file.
 #[derive(Debug, Clone)]
@@ -123,7 +273,9 @@ fn spawn_file_encryption(path: PathBuf) -> Result<EncryptionChannels> {
         let datamap = stream
             .into_datamap()
             .ok_or_else(|| Error::Encryption("no DataMap after encryption".to_string()))?;
-        let _ = datamap_tx.send(datamap);
+        if datamap_tx.send(datamap).is_err() {
+            warn!("DataMap receiver dropped — upload may have been cancelled");
+        }
         Ok(())
     });
 
@@ -133,48 +285,16 @@ fn spawn_file_encryption(path: PathBuf) -> Result<EncryptionChannels> {
 impl Client {
     /// Upload a file to the network using streaming self-encryption.
     ///
-    /// The file is read in 8KB chunks, encrypted via `stream_encrypt`,
-    /// and each encrypted chunk is uploaded as it's produced. The file
-    /// is never fully loaded into memory.
+    /// Automatically selects merkle batch payment for files that produce
+    /// 64+ chunks (saves gas). Encrypted chunks are spilled to a temp
+    /// directory so peak memory stays at ~256 MB regardless of file size.
     ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be read, encryption fails,
     /// or any chunk cannot be stored.
     pub async fn file_upload(&self, path: &Path) -> Result<FileUploadResult> {
-        debug!("Streaming file upload: {}", path.display());
-
-        let (mut chunk_rx, datamap_rx, handle) = spawn_file_encryption(path.to_path_buf())?;
-
-        // Collect all chunks from encryption channel.
-        let mut chunk_contents = Vec::new();
-        while let Some(content) = chunk_rx.recv().await {
-            chunk_contents.push(content);
-        }
-
-        // Await encryption completion to catch errors before paying for storage.
-        handle
-            .await
-            .map_err(|e| Error::Encryption(format!("encryption task panicked: {e}")))?
-            .map_err(|e| Error::Encryption(format!("encryption failed: {e}")))?;
-
-        let data_map = datamap_rx
-            .await
-            .map_err(|_| Error::Encryption("no DataMap from encryption thread".to_string()))?;
-
-        let addresses = self.batch_upload_chunks(chunk_contents).await?;
-        let chunks_stored = addresses.len();
-
-        info!(
-            "File uploaded: {chunks_stored} chunks stored ({})",
-            path.display()
-        );
-
-        Ok(FileUploadResult {
-            data_map,
-            chunks_stored,
-            payment_mode_used: PaymentMode::Single,
-        })
+        self.file_upload_with_mode(path, PaymentMode::Auto).await
     }
 
     /// Phase 1 of external-signer upload: encrypt file and prepare chunks.
@@ -184,39 +304,49 @@ impl Client {
     /// and a [`PaymentIntent`] that the external signer uses to construct
     /// and submit the on-chain payment transaction.
     ///
+    /// **Memory note:** Encryption uses disk spilling for bounded memory, but
+    /// the returned [`PreparedUpload`] holds all chunk content in memory (each
+    /// [`PreparedChunk`] contains a `Bytes` with the full chunk data). This is
+    /// inherent to the two-phase external-signer protocol — the chunks must
+    /// stay in memory until [`Client::finalize_upload`] stores them. For very
+    /// large files, prefer [`Client::file_upload`] which streams directly.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read, encryption fails,
-    /// or quote collection fails.
+    /// Returns an error if there is insufficient disk space, the file cannot
+    /// be read, encryption fails, or quote collection fails.
     pub async fn file_prepare_upload(&self, path: &Path) -> Result<PreparedUpload> {
         debug!(
             "Preparing file upload for external signing: {}",
             path.display()
         );
 
-        let (mut chunk_rx, datamap_rx, handle) = spawn_file_encryption(path.to_path_buf())?;
+        let file_size = std::fs::metadata(path)?.len();
+        check_disk_space_for_spill(file_size)?;
 
-        // Collect all chunks from encryption channel.
-        let mut chunk_contents = Vec::new();
-        while let Some(content) = chunk_rx.recv().await {
-            chunk_contents.push(content);
-        }
+        let (spill, data_map) = self.encrypt_file_to_spill(path).await?;
 
-        // Await encryption completion to catch errors before collecting quotes.
-        handle
-            .await
-            .map_err(|e| Error::Encryption(format!("encryption task panicked: {e}")))?
-            .map_err(|e| Error::Encryption(format!("encryption failed: {e}")))?;
+        info!(
+            "Encrypted {} into {} chunks for external signing (spilled to disk)",
+            path.display(),
+            spill.len()
+        );
 
-        let data_map = datamap_rx
-            .await
-            .map_err(|_| Error::Encryption("no DataMap from encryption thread".to_string()))?;
-
-        // Prepare each chunk (collect quotes, fetch contract prices).
-        let mut prepared_chunks = Vec::with_capacity(chunk_contents.len());
-        for content in chunk_contents {
+        // Read each chunk from disk and collect quotes. Note: all PreparedChunks
+        // accumulate in memory because the external-signer protocol requires them
+        // for finalize_upload. This is NOT memory-bounded for large files.
+        let mut prepared_chunks = Vec::with_capacity(spill.len());
+        for (i, addr) in spill.addresses.iter().enumerate() {
+            let content = spill.read_chunk(addr)?;
             if let Some(prepared) = self.prepare_chunk_payment(content).await? {
                 prepared_chunks.push(prepared);
+            }
+            if (i + 1) % 100 == 0 {
+                info!(
+                    "Prepared {}/{} chunks for external signing",
+                    i + 1,
+                    spill.len()
+                );
             }
         }
 
@@ -264,13 +394,17 @@ impl Client {
 
     /// Upload a file with a specific payment mode.
     ///
-    /// Uses buffer-then-pay strategy: encrypts file, collects all chunks,
-    /// then pays via merkle batch or per-chunk depending on mode and count.
+    /// Before encryption, checks that the temp directory has enough free
+    /// disk space for the spilled chunks (~1.1× source file size).
+    ///
+    /// Encrypted chunks are spilled to a temp directory during encryption
+    /// so that only their 32-byte addresses stay in memory. At upload time,
+    /// chunks are read back one wave at a time (~64 × 4 MB ≈ 256 MB peak).
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read, encryption fails,
-    /// or any chunk cannot be stored.
+    /// Returns an error if there is insufficient disk space, the file cannot
+    /// be read, encryption fails, or any chunk cannot be stored.
     #[allow(clippy::too_many_lines)]
     pub async fn file_upload_with_mode(
         &self,
@@ -282,15 +416,85 @@ impl Client {
             path.display()
         );
 
+        // Pre-flight: verify enough temp disk space for the chunk spill.
+        let file_size = std::fs::metadata(path)?.len();
+        check_disk_space_for_spill(file_size)?;
+
+        // Phase 1: Encrypt file and spill chunks to temp directory.
+        // Only 32-byte addresses stay in memory — chunk data lives on disk.
+        let (spill, data_map) = self.encrypt_file_to_spill(path).await?;
+
+        let chunk_count = spill.len();
+        info!(
+            "Encrypted {} into {chunk_count} chunks (spilled to disk)",
+            path.display()
+        );
+
+        // Phase 2: Decide payment mode and upload in waves from disk.
+        let (chunks_stored, actual_mode) = if self.should_use_merkle(chunk_count, mode) {
+            // Merkle batch payment path — needs all addresses upfront for tree.
+            info!("Using merkle batch payment for {chunk_count} file chunks");
+
+            let batch_result = match self
+                .pay_for_merkle_batch(&spill.addresses, DATA_TYPE_CHUNK, spill.avg_chunk_size())
+                .await
+            {
+                Ok(result) => result,
+                Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
+                    info!("Merkle needs more peers ({msg}), falling back to wave-batch");
+                    let stored = self.upload_waves_single(&spill).await?;
+                    return Ok(FileUploadResult {
+                        data_map,
+                        chunks_stored: stored,
+                        payment_mode_used: PaymentMode::Single,
+                    });
+                }
+                Err(e) => return Err(e),
+            };
+
+            let stored = self.upload_waves_merkle(&spill, &batch_result).await?;
+            (stored, PaymentMode::Merkle)
+        } else {
+            // Wave-based per-chunk payment path.
+            let stored = self.upload_waves_single(&spill).await?;
+            (stored, PaymentMode::Single)
+        };
+
+        info!(
+            "File uploaded with {actual_mode:?}: {chunks_stored} chunks stored ({})",
+            path.display()
+        );
+
+        Ok(FileUploadResult {
+            data_map,
+            chunks_stored,
+            payment_mode_used: actual_mode,
+        })
+    }
+
+    /// Encrypt a file and spill chunks to a temp directory.
+    ///
+    /// Logs progress every 100 chunks so users get feedback during
+    /// multi-GB encryptions.
+    ///
+    /// Returns the spill buffer (addresses on disk) and the `DataMap`.
+    async fn encrypt_file_to_spill(&self, path: &Path) -> Result<(ChunkSpill, DataMap)> {
         let (mut chunk_rx, datamap_rx, handle) = spawn_file_encryption(path.to_path_buf())?;
 
-        // Collect all chunks first (buffer-then-pay).
-        let mut chunk_contents = Vec::new();
+        let mut spill = ChunkSpill::new()?;
         while let Some(content) = chunk_rx.recv().await {
-            chunk_contents.push(content);
+            spill.push(&content)?;
+            if spill.len() % 100 == 0 {
+                let mb = spill.total_bytes() / (1024 * 1024);
+                info!(
+                    "Encryption progress: {} chunks spilled ({mb} MB) — {}",
+                    spill.len(),
+                    path.display()
+                );
+            }
         }
 
-        // Await encryption completion to catch errors before paying for storage.
+        // Await encryption completion to catch errors before paying.
         handle
             .await
             .map_err(|e| Error::Encryption(format!("encryption task panicked: {e}")))?
@@ -300,56 +504,82 @@ impl Client {
             .await
             .map_err(|_| Error::Encryption("no DataMap from encryption thread".to_string()))?;
 
-        let chunk_count = chunk_contents.len();
+        Ok((spill, data_map))
+    }
 
-        let (chunks_stored, actual_mode) = if self.should_use_merkle(chunk_count, mode) {
-            // Merkle batch payment path
-            info!("Using merkle batch payment for {chunk_count} file chunks");
+    /// Upload chunks from a spill using wave-based per-chunk (single) payments.
+    ///
+    /// Reads one wave at a time from disk, prepares quotes, pays, and stores.
+    /// Peak memory: ~`UPLOAD_WAVE_SIZE × MAX_CHUNK_SIZE` (~256 MB).
+    async fn upload_waves_single(&self, spill: &ChunkSpill) -> Result<usize> {
+        let mut total_stored = 0usize;
+        let total_chunks = spill.len();
+        let waves: Vec<&[[u8; 32]]> = spill.waves().collect();
+        let wave_count = waves.len();
 
-            let addresses: Vec<[u8; 32]> =
-                chunk_contents.iter().map(|c| compute_address(c)).collect();
+        for (wave_idx, wave_addrs) in waves.into_iter().enumerate() {
+            let wave_num = wave_idx + 1;
+            let wave_data: Vec<Bytes> = wave_addrs
+                .iter()
+                .map(|addr| spill.read_chunk(addr))
+                .collect::<Result<Vec<_>>>()?;
 
-            let avg_size =
-                chunk_contents.iter().map(bytes::Bytes::len).sum::<usize>() / chunk_count.max(1);
-            let avg_size_u64 = u64::try_from(avg_size).unwrap_or(0);
+            info!(
+                "Wave {wave_num}/{wave_count}: uploading {} chunks (single payment) — {total_stored}/{total_chunks} stored so far",
+                wave_data.len()
+            );
+            let addresses = self.batch_upload_chunks(wave_data).await?;
+            total_stored += addresses.len();
+        }
 
-            let batch_result = match self
-                .pay_for_merkle_batch(&addresses, DATA_TYPE_CHUNK, avg_size_u64)
-                .await
-            {
-                Ok(result) => result,
-                Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
-                    info!("Merkle needs more peers ({msg}), falling back to wave-batch");
-                    let addresses = self.batch_upload_chunks(chunk_contents).await?;
-                    return Ok(FileUploadResult {
-                        data_map,
-                        chunks_stored: addresses.len(),
-                        payment_mode_used: PaymentMode::Single,
-                    });
+        Ok(total_stored)
+    }
+
+    /// Upload chunks from a spill using pre-computed merkle proofs.
+    ///
+    /// Reads one wave at a time from disk, pairs each chunk with its proof,
+    /// and uploads concurrently. Peak memory: ~`UPLOAD_WAVE_SIZE × MAX_CHUNK_SIZE`.
+    async fn upload_waves_merkle(
+        &self,
+        spill: &ChunkSpill,
+        batch_result: &MerkleBatchPaymentResult,
+    ) -> Result<usize> {
+        let mut total_stored = 0usize;
+        let total_chunks = spill.len();
+        let waves: Vec<&[[u8; 32]]> = spill.waves().collect();
+        let wave_count = waves.len();
+
+        for (wave_idx, wave_addrs) in waves.into_iter().enumerate() {
+            let wave_num = wave_idx + 1;
+            let wave = spill.read_wave(wave_addrs)?;
+
+            info!(
+                "Wave {wave_num}/{wave_count}: uploading {} chunks (merkle) — {total_stored}/{total_chunks} stored so far",
+                wave.len()
+            );
+
+            let mut upload_stream = stream::iter(wave.into_iter().map(|(content, addr)| {
+                let proof_bytes = batch_result.proofs.get(&addr).cloned();
+                async move {
+                    let proof = proof_bytes.ok_or_else(|| {
+                        Error::Payment(format!(
+                            "Missing merkle proof for chunk {}",
+                            hex::encode(addr)
+                        ))
+                    })?;
+                    let peers = self.close_group_peers(&addr).await?;
+                    self.chunk_put_to_close_group(content, proof, &peers).await
                 }
-                Err(e) => return Err(e),
-            };
+            }))
+            .buffer_unordered(self.config().chunk_concurrency);
 
-            let stored = self
-                .merkle_upload_chunks(chunk_contents, addresses, &batch_result)
-                .await?;
-            (stored, PaymentMode::Merkle)
-        } else {
-            // Wave-based batch payment path (single EVM tx per wave).
-            let addresses = self.batch_upload_chunks(chunk_contents).await?;
-            (addresses.len(), PaymentMode::Single)
-        };
+            while let Some(result) = upload_stream.next().await {
+                result?;
+                total_stored += 1;
+            }
+        }
 
-        info!(
-            "File uploaded with mode {mode:?}: {chunks_stored} chunks stored ({})",
-            path.display()
-        );
-
-        Ok(FileUploadResult {
-            data_map,
-            chunks_stored,
-            payment_mode_used: actual_mode,
-        })
+        Ok(total_stored)
     }
 
     /// Download and decrypt a file from the network, writing it to disk.
@@ -361,6 +591,13 @@ impl Client {
     ///
     /// Returns the number of bytes written.
     ///
+    /// # Panics
+    ///
+    /// Requires a multi-threaded Tokio runtime (`flavor = "multi_thread"`).
+    /// Will panic if called from a `current_thread` runtime because
+    /// `streaming_decrypt` takes a synchronous callback that must bridge
+    /// back to async via `block_in_place`.
+    ///
     /// # Errors
     ///
     /// Returns an error if any chunk cannot be retrieved, decryption fails,
@@ -371,8 +608,8 @@ impl Client {
 
         let handle = Handle::current();
 
-        let stream = streaming_decrypt(data_map, |batch: &[(usize, xor_name::XorName)]| {
-            let batch_owned: Vec<(usize, xor_name::XorName)> = batch.to_vec();
+        let stream = streaming_decrypt(data_map, |batch: &[(usize, XorName)]| {
+            let batch_owned: Vec<(usize, XorName)> = batch.to_vec();
 
             tokio::task::block_in_place(|| {
                 handle.block_on(async {
@@ -436,10 +673,76 @@ impl Client {
                 Ok(bytes_written)
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp_path);
+                if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
+                    warn!(
+                        "Failed to remove temp download file {}: {cleanup_err}",
+                        tmp_path.display()
+                    );
+                }
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_space_check_passes_for_small_file() {
+        // A 1 KB file should always pass the disk space check
+        check_disk_space_for_spill(1024).unwrap();
+    }
+
+    #[test]
+    fn disk_space_check_fails_for_absurd_size() {
+        // Requesting space for a 1 exabyte file should fail on any real system
+        let result = check_disk_space_for_spill(u64::MAX / 2);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, Error::InsufficientDiskSpace(_)),
+            "expected InsufficientDiskSpace, got: {err}"
+        );
+    }
+
+    #[test]
+    fn chunk_spill_round_trip() {
+        let mut spill = ChunkSpill::new().unwrap();
+        let data1 = vec![0xAA; 1024];
+        let data2 = vec![0xBB; 2048];
+
+        spill.push(&data1).unwrap();
+        spill.push(&data2).unwrap();
+
+        assert_eq!(spill.len(), 2);
+        assert_eq!(spill.total_bytes(), 1024 + 2048);
+        assert_eq!(spill.avg_chunk_size(), (1024 + 2048) / 2);
+
+        // Read back and verify
+        let chunk1 = spill.read_chunk(spill.addresses.first().unwrap()).unwrap();
+        assert_eq!(&chunk1[..], &data1[..]);
+
+        let chunk2 = spill.read_chunk(spill.addresses.get(1).unwrap()).unwrap();
+        assert_eq!(&chunk2[..], &data2[..]);
+
+        // Verify waves with 1-chunk wave size
+        let waves: Vec<_> = spill.addresses.chunks(1).collect();
+        assert_eq!(waves.len(), 2);
+    }
+
+    #[test]
+    fn chunk_spill_cleanup_on_drop() {
+        let dir;
+        {
+            let spill = ChunkSpill::new().unwrap();
+            dir = spill.dir.clone();
+            assert!(dir.exists());
+        }
+        // After drop, the directory should be cleaned up
+        assert!(!dir.exists(), "spill dir should be removed on drop");
     }
 }
 

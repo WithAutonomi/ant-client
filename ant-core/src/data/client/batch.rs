@@ -237,8 +237,8 @@ impl Client {
         let wallet = self.require_wallet()?;
 
         // Flatten all quote payments from all chunks into a single batch.
-        let mut all_payments =
-            Vec::with_capacity(prepared.len() * prepared[0].payment.quotes.len());
+        let total_quotes: usize = prepared.iter().map(|c| c.payment.quotes.len()).sum();
+        let mut all_payments = Vec::with_capacity(total_quotes);
         for chunk in &prepared {
             for info in &chunk.payment.quotes {
                 all_payments.push((info.quote_hash, info.rewards_address, info.amount));
