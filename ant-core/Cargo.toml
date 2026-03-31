@@ -24,7 +24,8 @@ zip = "2"
 tower-http = { version = "0.6.8", features = ["cors"] }
 
 # Data operations
-evmlib = { path = "/Users/anselme/Documents/maidsafe/saorsa/evmlib" }
+# TODO: update to crates.io version once evmlib with merged ant-evm types is released
+evmlib = { git = "https://github.com/WithAutonomi/evmlib.git", branch = "feat/merge-ant-evm" }
 xor_name = "5"
 self_encryption = "0.35.0"
 futures = "0.3"
@@ -35,7 +36,8 @@ tracing = "0.1"
 bytes = "1"
 lru = "0.16"
 rand = "0.8"
-ant-node = { path = "/tmp/ant-node-evmlib-merge" }
+# TODO: update to crates.io version once ant-node with evmlib merge is released
+ant-node = { git = "https://github.com/WithAutonomi/ant-node.git", branch = "merge-evmlib" }
 saorsa-pqc = "0.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
