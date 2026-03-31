@@ -6,10 +6,6 @@
 
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_evm::merkle_payments::{
-    MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
-    MidpointProof, CANDIDATES_PER_POOL, MAX_LEAVES,
-};
 use ant_node::ant_protocol::{
     ChunkMessage, ChunkMessageBody, MerkleCandidateQuoteRequest, MerkleCandidateQuoteResponse,
 };
@@ -18,6 +14,10 @@ use ant_node::payment::quote::verify_merkle_candidate_signature;
 use ant_node::payment::serialize_merkle_proof;
 use bytes::Bytes;
 use evmlib::merkle_batch_payment::PoolCommitment;
+use evmlib::merkle_payments::{
+    MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
+    MidpointProof, CANDIDATES_PER_POOL, MAX_LEAVES,
+};
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -515,7 +515,7 @@ mod send_assertions {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use ant_evm::merkle_payments::{MerkleTree, CANDIDATES_PER_POOL};
+    use evmlib::merkle_payments::{MerkleTree, CANDIDATES_PER_POOL};
 
     // =========================================================================
     // should_use_merkle (free function, no Client needed)
@@ -632,10 +632,10 @@ mod tests {
 
     #[test]
     fn test_merkle_proof_serialize_deserialize_roundtrip() {
-        use ant_evm::merkle_payments::MerklePaymentCandidateNode;
-        use ant_evm::QuotingMetrics;
-        use ant_evm::RewardsAddress;
         use ant_node::payment::{deserialize_merkle_proof, serialize_merkle_proof};
+        use evmlib::merkle_payments::MerklePaymentCandidateNode;
+        use evmlib::quoting_metrics::QuotingMetrics;
+        use evmlib::RewardsAddress;
 
         let addrs = make_test_addresses(4);
         let xornames: Vec<XorName> = addrs.iter().map(|a| XorName(*a)).collect();
@@ -702,7 +702,7 @@ mod tests {
         // Simulates what collect_validated_candidates checks
         let candidate = MerklePaymentCandidateNode {
             pub_key: vec![0u8; 32],
-            quoting_metrics: ant_evm::QuotingMetrics {
+            quoting_metrics: evmlib::quoting_metrics::QuotingMetrics {
                 data_size: 0,
                 data_type: 0,
                 close_records_stored: 0,
@@ -713,7 +713,7 @@ mod tests {
                 network_density: None,
                 network_size: None,
             },
-            reward_address: ant_evm::RewardsAddress::new([0u8; 20]),
+            reward_address: evmlib::RewardsAddress::new([0u8; 20]),
             merkle_payment_timestamp: 1000,
             signature: vec![0u8; 64],
         };
@@ -726,7 +726,7 @@ mod tests {
     fn test_candidate_wrong_data_type_rejected() {
         let candidate = MerklePaymentCandidateNode {
             pub_key: vec![0u8; 32],
-            quoting_metrics: ant_evm::QuotingMetrics {
+            quoting_metrics: evmlib::quoting_metrics::QuotingMetrics {
                 data_size: 0,
                 data_type: 1, // scratchpad
                 close_records_stored: 0,
@@ -737,7 +737,7 @@ mod tests {
                 network_density: None,
                 network_size: None,
             },
-            reward_address: ant_evm::RewardsAddress::new([0u8; 20]),
+            reward_address: evmlib::RewardsAddress::new([0u8; 20]),
             merkle_payment_timestamp: 1000,
             signature: vec![0u8; 64],
         };

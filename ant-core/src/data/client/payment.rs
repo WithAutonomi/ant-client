@@ -5,11 +5,10 @@
 
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_evm::{EncodedPeerId, ProofOfPayment};
-use ant_node::client::hex_node_id_to_encoded_peer_id;
 use ant_node::core::{MultiAddr, PeerId};
 use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use evmlib::wallet::Wallet;
+use evmlib::{EncodedPeerId, ProofOfPayment};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -158,6 +157,5 @@ impl Client {
 
 /// Convert an ant-node `PeerId` to an `EncodedPeerId` for payment proofs.
 pub(crate) fn peer_id_to_encoded(peer_id: &PeerId) -> Result<EncodedPeerId> {
-    hex_node_id_to_encoded_peer_id(&peer_id.to_hex())
-        .map_err(|e| Error::Payment(format!("Failed to encode peer ID: {e}")))
+    Ok(EncodedPeerId::new(*peer_id.as_bytes()))
 }

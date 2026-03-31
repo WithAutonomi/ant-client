@@ -14,10 +14,10 @@ use crate::data::client::batch::{finalize_batch_payment, PaymentIntent, Prepared
 use crate::data::client::merkle::{MerkleBatchPaymentResult, PaymentMode};
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_evm::QuoteHash;
 use ant_node::ant_protocol::DATA_TYPE_CHUNK;
 use ant_node::client::compute_address;
 use bytes::Bytes;
+use evmlib::common::QuoteHash;
 use evmlib::common::TxHash;
 use futures::stream::{self, StreamExt};
 use self_encryption::{stream_encrypt, streaming_decrypt, DataMap};

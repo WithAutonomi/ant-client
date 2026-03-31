@@ -7,7 +7,6 @@
 use crate::data::client::payment::peer_id_to_encoded;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_evm::{Amount, EncodedPeerId, PaymentQuote, ProofOfPayment, QuoteHash, RewardsAddress};
 use ant_node::ant_protocol::DATA_TYPE_CHUNK;
 use ant_node::client::{compute_address, XorName};
 use ant_node::core::{MultiAddr, PeerId};
@@ -435,9 +434,9 @@ mod send_assertions {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use ant_evm::QuotingMetrics;
     use ant_node::payment::single_node::QuotePaymentInfo;
     use ant_node::CLOSE_GROUP_SIZE;
+    use evmlib::quoting_metrics::QuotingMetrics;
 
     fn test_metrics() -> QuotingMetrics {
         QuotingMetrics {
