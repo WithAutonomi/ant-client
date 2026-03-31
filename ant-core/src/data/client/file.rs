@@ -21,7 +21,7 @@ use bytes::Bytes;
 use evmlib::common::TxHash;
 use futures::stream::{self, StreamExt};
 use self_encryption::{stream_encrypt, streaming_decrypt, DataMap};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -47,9 +47,11 @@ const DISK_SPACE_HEADROOM_PERCENT: u64 = 10;
 struct ChunkSpill {
     /// Temp directory holding spilled chunk files (named by hex address).
     dir: PathBuf,
-    /// Ordered list of chunk addresses (preserves encryption order).
+    /// Deduplicated list of chunk addresses.
     addresses: Vec<[u8; 32]>,
-    /// Running total of chunk byte sizes (for average-size calculation).
+    /// Tracks seen addresses for deduplication.
+    seen: HashSet<[u8; 32]>,
+    /// Running total of unique chunk byte sizes (for average-size calculation).
     total_bytes: u64,
 }
 
@@ -65,13 +67,21 @@ impl ChunkSpill {
         Ok(Self {
             dir,
             addresses: Vec::new(),
+            seen: HashSet::new(),
             total_bytes: 0,
         })
     }
 
     /// Write one encrypted chunk to disk and record its address.
+    ///
+    /// Deduplicates by content address: if the same chunk was already
+    /// spilled, the write and accounting are skipped. This prevents
+    /// double-uploads and inflated quoting metrics.
     fn push(&mut self, content: &[u8]) -> Result<()> {
         let address = compute_address(content);
+        if !self.seen.insert(address) {
+            return Ok(());
+        }
         let path = self.dir.join(hex::encode(address));
         std::fs::write(&path, content)?;
         self.total_bytes += content.len() as u64;
@@ -769,6 +779,29 @@ mod tests {
         }
         // After drop, the directory should be cleaned up
         assert!(!dir.exists(), "spill dir should be removed on drop");
+    }
+
+    #[test]
+    fn chunk_spill_deduplicates_identical_content() {
+        let mut spill = ChunkSpill::new().unwrap();
+        let data = vec![0xCC; 512];
+
+        spill.push(&data).unwrap();
+        spill.push(&data).unwrap(); // same content, should be skipped
+        spill.push(&data).unwrap(); // again
+
+        assert_eq!(spill.len(), 1, "duplicate chunks should be deduplicated");
+        assert_eq!(
+            spill.total_bytes(),
+            512,
+            "total_bytes should count unique only"
+        );
+
+        // Different content should still be added
+        let data2 = vec![0xDD; 256];
+        spill.push(&data2).unwrap();
+        assert_eq!(spill.len(), 2);
+        assert_eq!(spill.total_bytes(), 512 + 256);
     }
 }
 
