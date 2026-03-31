@@ -862,11 +862,12 @@ dependencies = [
  "hex",
  "libc",
  "lru",
+ "openssl",
  "postcard",
  "rand 0.8.5",
  "reqwest 0.12.28",
  "rmp-serde",
- "saorsa-pqc 0.5.0",
+ "saorsa-pqc 0.5.1",
  "self_encryption",
  "serde",
  "serde_json",
@@ -898,8 +899,9 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.7.0"
-source = "git+https://github.com/WithAutonomi/ant-node.git?branch=merge-evmlib#bf31c5df875efa768df472991766bbf7415effdd"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4856d03e8885a161c5fcb4227ad387c5ba43193a874f5b57c066bab48b0bdd9"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -924,7 +926,7 @@ dependencies = [
  "reqwest 0.13.2",
  "rmp-serde",
  "saorsa-core",
- "saorsa-pqc 0.5.0",
+ "saorsa-pqc 0.5.1",
  "self-replace",
  "self_encryption",
  "semver 1.0.27",
@@ -2413,8 +2415,9 @@ dependencies = [
 
 [[package]]
 name = "evmlib"
-version = "0.4.9"
-source = "git+https://github.com/WithAutonomi/evmlib.git?branch=feat%2Fmerge-ant-evm#976696e2f0f858ed9bd804f573f0799a170ffa3b"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d608fcd0976beee509fef7fa391735571cb2fffd715ddca174322180300b6615"
 dependencies = [
  "alloy",
  "ant-merkle",
@@ -3906,6 +3909,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "openssl-src"
+version = "300.5.5+3.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f1787d533e03597a7934fd0a765f0d28e94ecc5fb7789f8053b1e699a56f709"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "openssl-sys"
 version = "0.9.112"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3913,6 +3925,7 @@ checksum = "57d55af3b3e226502be1526dfdba67ab0e9c96fc293004e79576b2b9edb0dbdb"
 dependencies = [
  "cc",
  "libc",
+ "openssl-src",
  "pkg-config",
  "vcpkg",
 ]
@@ -4986,7 +4999,7 @@ dependencies = [
  "parking_lot",
  "postcard",
  "rand 0.8.5",
- "saorsa-pqc 0.5.0",
+ "saorsa-pqc 0.5.1",
  "saorsa-transport",
  "serde",
  "serde_json",
@@ -5044,9 +5057,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-pqc"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "846eb36cf54149d079fd824aa0aaeaa708dd612ef54eaaf65583c82f90b19f95"
+checksum = "a2ed2e429e5673763625ca5285bcbf15270fa16918cb5e63fc95ababacbb1a4c"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -5054,8 +5067,6 @@ dependencies = [
  "blake3",
  "bytes",
  "chacha20poly1305",
- "curve25519-dalek",
- "ed25519-dalek",
  "fips203",
  "fips204",
  "fips205",
@@ -5081,7 +5092,6 @@ dependencies = [
  "tokio",
  "tracing",
  "wide",
- "x25519-dalek",
  "zeroize",
 ]
 
