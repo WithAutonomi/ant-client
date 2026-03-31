@@ -63,6 +63,10 @@ pub enum Error {
     /// Data already exists on the network — no payment needed.
     #[error("already stored on network")]
     AlreadyStored,
+
+    /// Not enough disk space for the operation.
+    #[error("insufficient disk space: {0}")]
+    InsufficientDiskSpace(String),
 }
 
 impl From<ant_node::Error> for Error {
@@ -156,6 +160,15 @@ mod tests {
     fn test_display_encryption() {
         let err = Error::Encryption("decrypt failed".to_string());
         assert_eq!(err.to_string(), "encryption error: decrypt failed");
+    }
+
+    #[test]
+    fn test_display_insufficient_disk_space() {
+        let err = Error::InsufficientDiskSpace("need 100 MB but only 10 MB available".to_string());
+        assert_eq!(
+            err.to_string(),
+            "insufficient disk space: need 100 MB but only 10 MB available"
+        );
     }
 
     #[test]
