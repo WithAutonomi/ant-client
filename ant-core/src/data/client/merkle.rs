@@ -179,7 +179,7 @@ impl Client {
         info!("Generating merkle proofs for {chunk_count} chunks");
         let mut proofs = HashMap::with_capacity(chunk_count);
 
-        for (i, xorname) in xornames.iter().enumerate() {
+        for (i, (xorname, address)) in xornames.iter().zip(addresses.iter()).enumerate() {
             let address_proof = tree.generate_address_proof(i, *xorname).map_err(|e| {
                 Error::Payment(format!(
                     "Failed to generate address proof for chunk {i}: {e}"
@@ -193,7 +193,7 @@ impl Client {
                 Error::Serialization(format!("Failed to serialize merkle proof: {e}"))
             })?;
 
-            proofs.insert(addresses[i], tagged_bytes);
+            proofs.insert(*address, tagged_bytes);
         }
 
         info!("Merkle batch payment complete: {chunk_count} proofs generated");
@@ -376,8 +376,13 @@ impl Client {
             candidate_futures.push(fut);
         }
 
-        self.collect_validated_candidates(&mut candidate_futures, merkle_payment_timestamp)
-            .await
+        self.collect_validated_candidates(
+            &mut candidate_futures,
+            merkle_payment_timestamp,
+            data_type,
+            data_size,
+        )
+        .await
     }
 
     /// Collect and validate merkle candidate responses until we have enough.
@@ -392,6 +397,8 @@ impl Client {
             >,
         >,
         merkle_payment_timestamp: u64,
+        expected_data_type: u32,
+        expected_data_size: u64,
     ) -> Result<[MerklePaymentCandidateNode; CANDIDATES_PER_POOL]> {
         let mut candidates = Vec::with_capacity(CANDIDATES_PER_POOL);
         let mut failures: Vec<String> = Vec::new();
@@ -407,6 +414,27 @@ impl Client {
                     if candidate.merkle_payment_timestamp != merkle_payment_timestamp {
                         warn!("Timestamp mismatch from merkle candidate {peer_id}");
                         failures.push(format!("{peer_id}: timestamp mismatch"));
+                        continue;
+                    }
+                    if candidate.quoting_metrics.data_type != expected_data_type {
+                        warn!(
+                            "Data type mismatch from {peer_id}: expected {expected_data_type}, got {}",
+                            candidate.quoting_metrics.data_type
+                        );
+                        failures.push(format!("{peer_id}: wrong data_type"));
+                        continue;
+                    }
+                    // Consistency check: nodes must echo the client-provided data_size.
+                    // This catches nodes that tamper with the value to manipulate pricing.
+                    // Note: usize -> u64 cast is always widening (safe on all targets).
+                    #[allow(clippy::cast_possible_truncation)]
+                    let candidate_data_size = candidate.quoting_metrics.data_size as u64;
+                    if candidate_data_size != expected_data_size {
+                        warn!(
+                            "Data size mismatch from {peer_id}: expected {expected_data_size}, got {}",
+                            candidate.quoting_metrics.data_size
+                        );
+                        failures.push(format!("{peer_id}: wrong data_size"));
                         continue;
                     }
                     candidates.push(candidate);
