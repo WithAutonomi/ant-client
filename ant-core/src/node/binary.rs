@@ -180,10 +180,10 @@ async fn download_and_extract(
 
     // Extract based on file extension
     let binary_path = if url.ends_with(".zip") {
-        extract_zip(&bytes, install_dir)?
+        extract_zip(&bytes, install_dir, BINARY_NAME)?
     } else {
         // Assume .tar.gz
-        extract_tar_gz(&bytes, install_dir)?
+        extract_tar_gz(&bytes, install_dir, BINARY_NAME)?
     };
 
     // Determine the actual version from the binary
@@ -211,8 +211,11 @@ async fn download_and_extract(
     Ok((cached_path, actual_version))
 }
 
-/// Extract a .tar.gz archive and return the path to the node binary.
-fn extract_tar_gz(data: &[u8], install_dir: &Path) -> Result<PathBuf> {
+/// Extract a .tar.gz archive and return the path to a named binary.
+///
+/// Searches the archive for an entry whose file name matches `binary_name`
+/// and writes it to `install_dir/<binary_name>`.
+pub fn extract_tar_gz(data: &[u8], install_dir: &Path, binary_name: &str) -> Result<PathBuf> {
     let decoder = flate2::read::GzDecoder::new(data);
     let mut archive = tar::Archive::new(decoder);
 
@@ -244,8 +247,8 @@ fn extract_tar_gz(data: &[u8], install_dir: &Path) -> Result<PathBuf> {
             .and_then(|n| n.to_str())
             .unwrap_or_default();
 
-        if file_name == BINARY_NAME {
-            let dest = install_dir.join(BINARY_NAME);
+        if file_name == binary_name {
+            let dest = install_dir.join(binary_name);
             let mut file = std::fs::File::create(&dest)?;
             std::io::copy(&mut entry, &mut file)?;
 
@@ -261,11 +264,14 @@ fn extract_tar_gz(data: &[u8], install_dir: &Path) -> Result<PathBuf> {
     }
 
     binary_path
-        .ok_or_else(|| Error::BinaryResolution(format!("'{BINARY_NAME}' not found in archive")))
+        .ok_or_else(|| Error::BinaryResolution(format!("'{binary_name}' not found in archive")))
 }
 
-/// Extract a .zip archive and return the path to the node binary.
-fn extract_zip(data: &[u8], install_dir: &Path) -> Result<PathBuf> {
+/// Extract a .zip archive and return the path to a named binary.
+///
+/// Searches the archive for an entry whose file name matches `binary_name`
+/// (or `binary_name.exe` on Windows) and writes it to `install_dir/`.
+pub fn extract_zip(data: &[u8], install_dir: &Path, binary_name: &str) -> Result<PathBuf> {
     let cursor = std::io::Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| Error::BinaryResolution(format!("failed to open zip archive: {e}")))?;
@@ -282,7 +288,7 @@ fn extract_zip(data: &[u8], install_dir: &Path) -> Result<PathBuf> {
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
             .unwrap_or_default();
 
-        if file_name == BINARY_NAME || file_name == format!("{BINARY_NAME}.exe") {
+        if file_name == binary_name || file_name == format!("{binary_name}.exe") {
             let dest = install_dir.join(&file_name);
             let mut out = std::fs::File::create(&dest)?;
             std::io::copy(&mut file, &mut out)?;
@@ -298,7 +304,7 @@ fn extract_zip(data: &[u8], install_dir: &Path) -> Result<PathBuf> {
     }
 
     binary_path
-        .ok_or_else(|| Error::BinaryResolution(format!("'{BINARY_NAME}' not found in archive")))
+        .ok_or_else(|| Error::BinaryResolution(format!("'{binary_name}' not found in archive")))
 }
 
 /// Extract the version string from a node binary by running `<binary> --version`.
@@ -419,7 +425,7 @@ mod tests {
         std::io::Write::write_all(&mut encoder, &tar_data).unwrap();
         let gz_data = encoder.finish().unwrap();
 
-        let result = extract_tar_gz(&gz_data, tmp.path());
+        let result = extract_tar_gz(&gz_data, tmp.path(), BINARY_NAME);
         assert!(result.is_ok());
         let path = result.unwrap();
         assert!(path.exists());
@@ -436,7 +442,7 @@ mod tests {
         std::io::Write::write_all(&mut encoder, &tar_data).unwrap();
         let gz_data = encoder.finish().unwrap();
 
-        let result = extract_tar_gz(&gz_data, tmp.path());
+        let result = extract_tar_gz(&gz_data, tmp.path(), BINARY_NAME);
         assert!(result.is_err());
     }
 
@@ -468,7 +474,7 @@ mod tests {
         std::io::Write::write_all(&mut encoder, &tar_data).unwrap();
         let gz_data = encoder.finish().unwrap();
 
-        let result = extract_tar_gz(&gz_data, tmp.path());
+        let result = extract_tar_gz(&gz_data, tmp.path(), BINARY_NAME);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(

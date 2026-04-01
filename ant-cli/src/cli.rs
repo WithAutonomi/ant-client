@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use crate::commands::data::{ChunkAction, FileAction, WalletAction};
 use crate::commands::node::NodeCommand;
+use crate::commands::update::UpdateArgs;
 
 #[derive(Parser)]
 #[command(name = "ant", about = "Autonomi network client")]
@@ -67,4 +68,6 @@ pub enum Commands {
         #[command(subcommand)]
         action: ChunkAction,
     },
+    /// Update the ant binary to the latest version
+    Update(UpdateArgs),
 }
