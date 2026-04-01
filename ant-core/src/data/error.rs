@@ -67,6 +67,23 @@ pub enum Error {
     /// Not enough disk space for the operation.
     #[error("insufficient disk space: {0}")]
     InsufficientDiskSpace(String),
+
+    /// Upload partially succeeded -- some chunks stored, some failed after retries.
+    ///
+    /// The `stored` addresses can be used for progress tracking and resume.
+    #[error("partial upload: {stored_count} stored, {failed_count} failed: {reason}")]
+    PartialUpload {
+        /// Addresses of successfully stored chunks.
+        stored: Vec<[u8; 32]>,
+        /// Number of successfully stored chunks.
+        stored_count: usize,
+        /// Addresses and error messages of chunks that failed after retries.
+        failed: Vec<([u8; 32], String)>,
+        /// Number of failed chunks.
+        failed_count: usize,
+        /// Root cause description.
+        reason: String,
+    },
 }
 
 impl From<ant_node::Error> for Error {

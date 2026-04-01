@@ -401,7 +401,18 @@ impl Client {
         tx_hash_map: &HashMap<QuoteHash, TxHash>,
     ) -> Result<FileUploadResult> {
         let paid_chunks = finalize_batch_payment(prepared.prepared_chunks, tx_hash_map)?;
-        let chunks_stored = self.store_paid_chunks(paid_chunks).await?.len();
+        let wave_result = self.store_paid_chunks(paid_chunks).await;
+        if !wave_result.failed.is_empty() {
+            let failed_count = wave_result.failed.len();
+            return Err(Error::PartialUpload {
+                stored: wave_result.stored.clone(),
+                stored_count: wave_result.stored.len(),
+                failed: wave_result.failed,
+                failed_count,
+                reason: "finalize_upload: chunk storage failed after retries".into(),
+            });
+        }
+        let chunks_stored = wave_result.stored.len();
 
         info!("External-signer upload finalized: {chunks_stored} chunks stored");
 
