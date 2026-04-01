@@ -13,7 +13,7 @@
 mod support;
 
 use ant_core::data::client::merkle::PaymentMode;
-use ant_core::data::{Client, ClientConfig};
+use ant_core::data::{compute_address, Client, ClientConfig};
 use serial_test::serial;
 use std::io::Write;
 use std::sync::Arc;
@@ -21,6 +21,9 @@ use support::MiniTestnet;
 use tempfile::{NamedTempFile, TempDir};
 
 const CLIENT_TIMEOUT_SECS: u64 = 120;
+
+/// Chunk size for merkle security tests (small, fast to hash).
+const TEST_CHUNK_SIZE: usize = 1024;
 
 /// Create a 35-node testnet suitable for merkle payments.
 async fn setup_merkle_testnet() -> (Client, MiniTestnet) {
@@ -138,6 +141,139 @@ async fn test_merkle_data_upload_download() {
     assert_eq!(downloaded.as_ref(), data.as_slice());
 
     eprintln!("Merkle data upload/download round-trip verified.");
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+// ─── Merkle Payment Security Tests ─────────────────────────────────────────
+//
+// Verify that nodes reject tampered merkle proofs. Unlike single-node payments
+// where the client controls the amount, merkle payment amounts are determined
+// by the smart contract. The cheating vectors for merkle are:
+// - Using a proof from one chunk to store a different chunk (address mismatch)
+// - Using a proof from a payment that didn't happen on-chain
+
+/// Use a valid merkle proof from chunk A to try storing chunk B.
+///
+/// The merkle proof contains an address-binding commitment: the proof's
+/// `address` field and sibling hashes bind it to a specific leaf in the tree.
+/// Nodes must verify this binding rejects mismatched chunks.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_attack_merkle_proof_for_wrong_chunk() {
+    let (client, testnet) = setup_merkle_testnet().await;
+
+    // Create 4 small chunks for a minimal merkle tree
+    let chunks: Vec<bytes::Bytes> = (0..4u8)
+        .map(|i| bytes::Bytes::from(vec![i; TEST_CHUNK_SIZE]))
+        .collect();
+    let addresses: Vec<[u8; 32]> = chunks.iter().map(|c| compute_address(c)).collect();
+
+    eprintln!("Paying for 4 chunks via merkle batch...");
+
+    // Pay for these chunks via merkle batch payment
+    let batch_result = client
+        .pay_for_merkle_batch(&addresses, 0, TEST_CHUNK_SIZE as u64)
+        .await
+        .expect("merkle batch payment should succeed");
+
+    assert_eq!(
+        batch_result.proofs.len(),
+        4,
+        "should have proofs for all 4 chunks"
+    );
+
+    // Get the proof for chunk 0
+    let proof_for_chunk_0 = batch_result
+        .proofs
+        .get(&addresses[0])
+        .expect("should have proof for chunk 0")
+        .clone();
+
+    // Create a completely different chunk NOT in the merkle tree
+    let evil_content = bytes::Bytes::from("this content was NOT in the merkle tree");
+    let evil_address = compute_address(&evil_content);
+    assert_ne!(
+        evil_address, addresses[0],
+        "evil chunk must have a different address"
+    );
+
+    // Find a peer close to the evil chunk's address to PUT to
+    let peers = client
+        .network()
+        .find_closest_peers(&evil_address, 1)
+        .await
+        .expect("should find peers");
+    let (target_peer, target_addrs) = &peers[0];
+
+    eprintln!("Attempting PUT of wrong chunk with merkle proof for chunk 0...");
+
+    // Try to store the evil chunk using chunk 0's merkle proof
+    let result = client
+        .chunk_put_with_proof(evil_content, proof_for_chunk_0, target_peer, target_addrs)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "PUT with merkle proof for a different chunk should be rejected (address mismatch)"
+    );
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// Use a proof from chunk A to try storing chunk B where both are in the tree.
+///
+/// Even when both chunks have valid merkle proofs from the same batch, the
+/// proofs are NOT interchangeable — each proof binds to its specific leaf
+/// via the address and sibling hash path.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_attack_merkle_proof_swap_within_batch() {
+    let (client, testnet) = setup_merkle_testnet().await;
+
+    let chunks: Vec<bytes::Bytes> = (0..4u8)
+        .map(|i| bytes::Bytes::from(vec![i; TEST_CHUNK_SIZE]))
+        .collect();
+    let addresses: Vec<[u8; 32]> = chunks.iter().map(|c| compute_address(c)).collect();
+
+    eprintln!("Paying for 4 chunks via merkle batch...");
+
+    let batch_result = client
+        .pay_for_merkle_batch(&addresses, 0, TEST_CHUNK_SIZE as u64)
+        .await
+        .expect("merkle batch payment should succeed");
+
+    // Take chunk 0's proof and try to store chunk 1 with it
+    let proof_for_chunk_0 = batch_result
+        .proofs
+        .get(&addresses[0])
+        .expect("should have proof for chunk 0")
+        .clone();
+
+    let peers = client
+        .network()
+        .find_closest_peers(&addresses[1], 1)
+        .await
+        .expect("should find peers");
+    let (target_peer, target_addrs) = &peers[0];
+
+    eprintln!("Attempting to store chunk 1 using chunk 0's merkle proof...");
+
+    let result = client
+        .chunk_put_with_proof(
+            chunks[1].clone(),
+            proof_for_chunk_0,
+            target_peer,
+            target_addrs,
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Swapping merkle proofs between chunks in the same batch should be rejected"
+    );
 
     drop(client);
     testnet.teardown().await;

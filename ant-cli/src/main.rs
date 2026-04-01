@@ -215,24 +215,14 @@ fn resolve_evm_network(
                         .payment_token_address
                         .parse()
                         .map_err(|e| anyhow::anyhow!("Invalid token address: {e}"))?;
-                    let payments_addr: EvmAddress = evm
-                        .data_payments_address
+                    let vault_addr: EvmAddress = evm
+                        .payment_vault_address
                         .parse()
-                        .map_err(|e| anyhow::anyhow!("Invalid payments address: {e}"))?;
-                    let merkle_addr: Option<EvmAddress> = evm
-                        .merkle_payments_address
-                        .as_ref()
-                        .map(|s| {
-                            s.parse().map_err(|e| {
-                                anyhow::anyhow!("Invalid merkle payments address: {e}")
-                            })
-                        })
-                        .transpose()?;
+                        .map_err(|e| anyhow::anyhow!("Invalid payment vault address: {e}"))?;
                     return Ok(EvmNetwork::Custom(CustomNetwork {
                         rpc_url_http: rpc_url,
                         payment_token_address: token_addr,
-                        data_payments_address: payments_addr,
-                        merkle_payments_address: merkle_addr,
+                        payment_vault_address: vault_addr,
                     }));
                 }
             }

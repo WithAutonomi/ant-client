@@ -153,20 +153,12 @@ impl MiniTestnet {
             sleep(Duration::from_millis(500)).await;
         }
 
-        // Approve token spend for data payments contract
-        let data_payments_address = evm_network.data_payments_address();
+        // Approve token spend for the unified payment vault contract
+        let vault_address = evm_network.payment_vault_address();
         wallet
-            .approve_to_spend_tokens(*data_payments_address, evmlib::common::U256::MAX)
+            .approve_to_spend_tokens(*vault_address, evmlib::common::U256::MAX)
             .await
-            .expect("approve data payment token spend");
-
-        // Approve token spend for merkle payments contract (if deployed)
-        if let Some(merkle_address) = evm_network.merkle_payments_address() {
-            wallet
-                .approve_to_spend_tokens(*merkle_address, evmlib::common::U256::MAX)
-                .await
-                .expect("approve merkle payment token spend");
-        }
+            .expect("approve payment vault token spend");
 
         Self {
             nodes,

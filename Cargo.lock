@@ -900,8 +900,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bc2ac7c262accf6b4ab73448816662c921303c4a81932379b90edfdee3e4a5d"
+source = "git+https://github.com/WithAutonomi/ant-node.git?branch=feat%2Fadapt-evmlib-payment-vault#08bb16f5e240d0c963c36afebd1e1b6c43368d81"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -2416,8 +2415,7 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d608fcd0976beee509fef7fa391735571cb2fffd715ddca174322180300b6615"
+source = "git+https://github.com/WithAutonomi/evmlib.git?branch=refactor%2Funify-payment-vault-v2#f4cdd45ea76a98ced0a416794c92b9b4bc2da224"
 dependencies = [
  "alloy",
  "ant-merkle",
