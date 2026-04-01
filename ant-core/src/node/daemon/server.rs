@@ -7,7 +7,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse};
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
@@ -19,7 +19,7 @@ use crate::node::daemon::supervisor::Supervisor;
 use crate::node::events::NodeEvent;
 use crate::node::registry::NodeRegistry;
 use crate::node::types::{
-    AddNodeOpts, AddNodeResult, DaemonConfig, DaemonStatus, NodeStarted, NodeStatus,
+    AddNodeOpts, AddNodeResult, DaemonConfig, DaemonStatus, NodeInfo, NodeStarted, NodeStatus,
     NodeStatusResult, NodeStatusSummary, NodeStopped, RemoveNodeResult, ResetResult,
     StartNodeResult, StopNodeResult,
 };
@@ -104,7 +104,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/events", get(get_events))
         .route("/api/v1/nodes/status", get(get_nodes_status))
         .route("/api/v1/nodes", post(post_nodes))
-        .route("/api/v1/nodes/{id}", delete(delete_node))
+        .route(
+            "/api/v1/nodes/{id}",
+            get(get_node_detail).delete(delete_node),
+        )
         .route("/api/v1/nodes/{id}/start", post(post_start_node))
         .route("/api/v1/nodes/start-all", post(post_start_all))
         .route("/api/v1/nodes/{id}/stop", post(post_stop_node))
@@ -192,6 +195,35 @@ async fn get_nodes_status(State(state): State<Arc<AppState>>) -> Json<NodeStatus
         total_running,
         total_stopped,
     })
+}
+
+/// GET /api/v1/nodes/:id — Get full detail for a single node.
+async fn get_node_detail(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u32>,
+) -> std::result::Result<Json<NodeInfo>, (StatusCode, Json<serde_json::Value>)> {
+    let registry = state.registry.read().await;
+    let config = match registry.get(id) {
+        Ok(config) => config.clone(),
+        Err(_) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("Node not found: {id}") })),
+            ))
+        }
+    };
+
+    let supervisor = state.supervisor.read().await;
+    let status = supervisor.node_status(id).unwrap_or(NodeStatus::Stopped);
+    let pid = supervisor.node_pid(id);
+    let uptime_secs = supervisor.node_uptime_secs(id);
+
+    Ok(Json(NodeInfo {
+        config,
+        status,
+        pid,
+        uptime_secs,
+    }))
 }
 
 /// POST /api/v1/nodes — Add one or more nodes to the registry.
