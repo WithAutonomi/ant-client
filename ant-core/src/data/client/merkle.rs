@@ -211,13 +211,36 @@ impl Client {
         data_type: u32,
         data_size: u64,
     ) -> Result<MerkleBatchPaymentResult> {
+        let sub_batches: Vec<&[[u8; 32]]> = addresses.chunks(MAX_LEAVES).collect();
+        let total_sub_batches = sub_batches.len();
         let mut all_proofs = HashMap::with_capacity(addresses.len());
 
-        for chunk in addresses.chunks(MAX_LEAVES) {
-            let sub_result = self
+        for (i, chunk) in sub_batches.into_iter().enumerate() {
+            match self
                 .pay_for_merkle_single_batch(chunk, data_type, data_size)
-                .await?;
-            all_proofs.extend(sub_result.proofs);
+                .await
+            {
+                Ok(sub_result) => {
+                    all_proofs.extend(sub_result.proofs);
+                }
+                Err(e) => {
+                    if all_proofs.is_empty() {
+                        // First sub-batch failed, nothing paid yet -- propagate directly.
+                        return Err(e);
+                    }
+                    // Return partial result so caller can still store already-paid chunks.
+                    warn!(
+                        "Merkle sub-batch {}/{total_sub_batches} failed: {e}. \
+                         Returning {} proofs from prior sub-batches",
+                        i + 1,
+                        all_proofs.len()
+                    );
+                    return Ok(MerkleBatchPaymentResult {
+                        chunk_count: all_proofs.len(),
+                        proofs: all_proofs,
+                    });
+                }
+            }
         }
 
         Ok(MerkleBatchPaymentResult {
