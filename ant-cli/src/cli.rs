@@ -6,8 +6,24 @@ use crate::commands::data::{ChunkAction, FileAction, WalletAction};
 use crate::commands::node::NodeCommand;
 use crate::commands::update::UpdateArgs;
 
+fn long_version() -> &'static str {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        "\n",
+        "Autonomi network client: file operations and node management for the Autonomi decentralised network\n",
+        "\n",
+        "Repository: https://github.com/WithAutonomi/ant-client\n",
+        "License:    MIT or Apache-2.0",
+    )
+}
+
 #[derive(Parser)]
-#[command(name = "ant", about = "Autonomi network client")]
+#[command(
+    name = "ant",
+    version,
+    long_version = long_version(),
+    about = "Autonomi network client"
+)]
 pub struct Cli {
     /// Output structured JSON instead of human-readable text
     #[arg(long, global = true)]
