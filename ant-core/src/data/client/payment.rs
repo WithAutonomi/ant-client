@@ -24,7 +24,7 @@ impl Client {
     ///
     /// This orchestrates the full payment flow:
     /// 1. Collect `CLOSE_GROUP_SIZE` quotes from closest peers
-    /// 2. Build `SingleNodePayment` (median 3x, others 0)
+    /// 2. Build `SingleNodePayment` using node-reported prices (median 3x, others 0)
     /// 3. Pay on-chain via the wallet
     /// 4. Serialize `PaymentProof` with transaction hashes
     ///
@@ -41,7 +41,7 @@ impl Client {
         data_size: u64,
         data_type: u32,
     ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>)> {
-        // Wallet is required for the on-chain payment step (step 5 below).
+        // Wallet is required for the on-chain payment step (step 4 below).
         // Check early so we don't waste time collecting quotes for a misconfigured client.
         let wallet = self.require_wallet()?;
 
@@ -56,50 +56,24 @@ impl Client {
             .map(|(peer_id, addrs, _, _)| (*peer_id, addrs.clone()))
             .collect();
 
-        // 2. Fetch prices from the on-chain contract rather than using the
-        // locally-computed estimates. The contract's getQuote() is the authoritative
-        // price source — the verifyPayment() call recomputes prices from QuotingMetrics
-        // using the same formula, so we must use matching prices.
-        let metrics_batch: Vec<_> = quotes_with_peers
-            .iter()
-            .map(|(_, _, quote, _)| quote.quoting_metrics.clone())
-            .collect();
-
-        let evm_network = self.require_evm_network()?;
-        let contract_prices =
-            evmlib::contract::payment_vault::get_market_price(evm_network, metrics_batch)
-                .await
-                .map_err(|e| {
-                    Error::Payment(format!("Failed to get market prices from contract: {e}"))
-                })?;
-
-        if contract_prices.len() != quotes_with_peers.len() {
-            return Err(Error::Payment(format!(
-                "Contract returned {} prices for {} quotes",
-                contract_prices.len(),
-                quotes_with_peers.len()
-            )));
-        }
-
-        // 3. Build peer_quotes for ProofOfPayment + quotes for SingleNodePayment
+        // 2. Build peer_quotes for ProofOfPayment + quotes for SingleNodePayment.
+        // Use node-reported prices directly — no contract price fetch needed.
         let mut peer_quotes = Vec::with_capacity(quotes_with_peers.len());
         let mut quotes_for_payment = Vec::with_capacity(quotes_with_peers.len());
 
-        for ((peer_id, _addrs, quote, _local_price), contract_price) in
-            quotes_with_peers.into_iter().zip(contract_prices)
-        {
+        for (peer_id, _addrs, quote, price) in quotes_with_peers {
             let encoded = peer_id_to_encoded(&peer_id)?;
             peer_quotes.push((encoded, quote.clone()));
-            quotes_for_payment.push((quote, contract_price));
+            quotes_for_payment.push((quote, price));
         }
 
-        // 4. Create SingleNodePayment (sorts by price, selects median)
+        // 3. Create SingleNodePayment (sorts by price, selects median)
         let payment = SingleNodePayment::from_quotes(quotes_for_payment)
             .map_err(|e| Error::Payment(format!("Failed to create payment: {e}")))?;
 
         info!("Payment total: {} atto", payment.total_amount());
 
-        // 5. Pay on-chain
+        // 4. Pay on-chain
         let tx_hashes = payment
             .pay(wallet)
             .await
@@ -110,7 +84,7 @@ impl Client {
             tx_hashes.len()
         );
 
-        // 6. Build and serialize proof with version tag
+        // 5. Build and serialize proof with version tag
         let proof = PaymentProof {
             proof_of_payment: ProofOfPayment { peer_quotes },
             tx_hashes,
@@ -134,22 +108,12 @@ impl Client {
         let wallet = self.require_wallet()?;
         let evm_network = self.require_evm_network()?;
 
-        // Approve data payments contract
-        let data_payments_address = evm_network.data_payments_address();
+        let vault_address = evm_network.payment_vault_address();
         wallet
-            .approve_to_spend_tokens(*data_payments_address, evmlib::common::U256::MAX)
+            .approve_to_spend_tokens(*vault_address, evmlib::common::U256::MAX)
             .await
             .map_err(|e| Error::Payment(format!("Token approval failed: {e}")))?;
-        info!("Token spend approved for data payments contract");
-
-        // Approve merkle payments contract (if deployed)
-        if let Some(merkle_address) = evm_network.merkle_payments_address() {
-            wallet
-                .approve_to_spend_tokens(*merkle_address, evmlib::common::U256::MAX)
-                .await
-                .map_err(|e| Error::Payment(format!("Merkle token approval failed: {e}")))?;
-            info!("Token spend approved for merkle payments contract");
-        }
+        info!("Token spend approved for payment vault contract");
 
         Ok(())
     }

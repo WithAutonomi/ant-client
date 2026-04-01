@@ -13,7 +13,6 @@ use ant_node::core::{MultiAddr, PeerId};
 use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use bytes::Bytes;
 use evmlib::common::{Amount, QuoteHash, TxHash};
-use evmlib::contract::payment_vault::get_market_price;
 use evmlib::wallet::PayForQuotesError;
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use futures::stream::{self, StreamExt};
@@ -144,7 +143,7 @@ pub fn finalize_batch_payment(
 impl Client {
     /// Prepare a single chunk for batch payment.
     ///
-    /// Collects quotes and fetches contract prices without making any
+    /// Collects quotes and uses node-reported prices without making any
     /// on-chain transaction. Returns `Ok(None)` if the chunk is already
     /// stored on the network.
     ///
@@ -168,44 +167,21 @@ impl Client {
             Err(e) => return Err(e),
         };
 
-        let evm_network = self.require_evm_network()?;
-
         // Capture all quoted peers for close-group replication.
         let quoted_peers: Vec<(PeerId, Vec<MultiAddr>)> = quotes_with_peers
             .iter()
             .map(|(peer_id, addrs, _, _)| (*peer_id, addrs.clone()))
             .collect();
 
-        // Fetch authoritative prices from the on-chain contract.
-        let metrics_batch: Vec<_> = quotes_with_peers
-            .iter()
-            .map(|(_, _, quote, _)| quote.quoting_metrics.clone())
-            .collect();
-
-        let contract_prices = get_market_price(evm_network, metrics_batch)
-            .await
-            .map_err(|e| {
-                Error::Payment(format!("Failed to get market prices from contract: {e}"))
-            })?;
-
-        if contract_prices.len() != quotes_with_peers.len() {
-            return Err(Error::Payment(format!(
-                "Contract returned {} prices for {} quotes",
-                contract_prices.len(),
-                quotes_with_peers.len()
-            )));
-        }
-
         // Build peer_quotes for ProofOfPayment + quotes for SingleNodePayment.
+        // Use node-reported prices directly — no contract price fetch needed.
         let mut peer_quotes = Vec::with_capacity(quotes_with_peers.len());
         let mut quotes_for_payment = Vec::with_capacity(quotes_with_peers.len());
 
-        for ((peer_id, _addrs, quote, _local_price), contract_price) in
-            quotes_with_peers.into_iter().zip(contract_prices)
-        {
+        for (peer_id, _addrs, quote, price) in quotes_with_peers {
             let encoded = peer_id_to_encoded(&peer_id)?;
             peer_quotes.push((encoded, quote.clone()));
-            quotes_for_payment.push((quote, contract_price));
+            quotes_for_payment.push((quote, price));
         }
 
         let payment = SingleNodePayment::from_quotes(quotes_for_payment)
@@ -437,21 +413,6 @@ mod tests {
     use super::*;
     use ant_node::payment::single_node::QuotePaymentInfo;
     use ant_node::CLOSE_GROUP_SIZE;
-    use evmlib::quoting_metrics::QuotingMetrics;
-
-    fn test_metrics() -> QuotingMetrics {
-        QuotingMetrics {
-            data_size: 0,
-            data_type: 0,
-            close_records_stored: 0,
-            records_per_type: vec![],
-            max_records: 0,
-            received_payment_count: 0,
-            live_time: 0,
-            network_density: None,
-            network_size: None,
-        }
-    }
 
     /// Helper: build a PreparedChunk with specified payment amounts.
     fn make_prepared_chunk(amounts: [u64; CLOSE_GROUP_SIZE]) -> PreparedChunk {
@@ -460,7 +421,6 @@ mod tests {
                 quote_hash: QuoteHash::from([i as u8 + 1; 32]),
                 rewards_address: RewardsAddress::new([i as u8 + 10; 20]),
                 amount: Amount::from(amounts[i]),
-                quoting_metrics: test_metrics(),
             });
 
         PreparedChunk {

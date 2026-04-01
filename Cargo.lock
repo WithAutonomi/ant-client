@@ -902,6 +902,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.9.0"
+source = "git+https://github.com/WithAutonomi/ant-node.git?branch=feat%2Fadapt-evmlib-payment-vault#08bb16f5e240d0c963c36afebd1e1b6c43368d81"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -2416,8 +2417,7 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d608fcd0976beee509fef7fa391735571cb2fffd715ddca174322180300b6615"
+source = "git+https://github.com/WithAutonomi/evmlib.git?branch=refactor%2Funify-payment-vault-v2#f4cdd45ea76a98ced0a416794c92b9b4bc2da224"
 dependencies = [
  "alloy",
  "ant-merkle",
@@ -4983,6 +4983,8 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19de0950a0c9c9a3f97681c539e513c52c909866caddef5d825fe2dcbd1b0173"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5095,6 +5097,8 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbe38ad2be12e4be34e203e79a33eab1664c23a4b65a1ff4b08973ae9af01f01"
 dependencies = [
  "anyhow",
  "async-trait",
