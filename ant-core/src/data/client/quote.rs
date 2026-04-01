@@ -17,11 +17,26 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+/// Compute XOR distance between a peer's ID bytes and a target address.
+///
+/// Uses the first 32 bytes of the peer ID (or fewer if shorter) XORed with
+/// the target address. Returns a byte array suitable for lexicographic comparison.
+fn xor_distance(peer_id: &PeerId, target: &[u8; 32]) -> [u8; 32] {
+    let peer_bytes = peer_id.as_bytes();
+    let mut distance = [0u8; 32];
+    for (i, d) in distance.iter_mut().enumerate() {
+        let pb = peer_bytes.get(i).copied().unwrap_or(0);
+        *d = pb ^ target[i];
+    }
+    distance
+}
+
 impl Client {
     /// Get storage quotes from the closest peers for a given address.
     ///
-    /// Queries the DHT for the `CLOSE_GROUP_SIZE` closest peers and requests
-    /// quotes from each. Waits for all requests to complete or timeout.
+    /// Queries 2x `CLOSE_GROUP_SIZE` peers from the DHT for fault tolerance,
+    /// requests quotes from all of them concurrently, and returns the
+    /// `CLOSE_GROUP_SIZE` closest successful responders sorted by XOR distance.
     ///
     /// Returns `Error::AlreadyStored` early if `CLOSE_GROUP_MAJORITY` peers
     /// report the chunk is already stored.
@@ -38,14 +53,17 @@ impl Client {
     ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
         let node = self.network().node();
 
+        // Over-query for fault tolerance: ask 2x peers, keep closest successful ones.
+        let over_query_count = CLOSE_GROUP_SIZE * 2;
         debug!(
-            "Requesting {CLOSE_GROUP_SIZE} quotes for address {} (size: {data_size})",
+            "Requesting quotes from up to {over_query_count} peers for address {} (size: {data_size})",
             hex::encode(address)
         );
 
-        // Query DHT and take only the CLOSE_GROUP_SIZE closest peers.
-        let mut remote_peers = self.close_group_peers(address).await?;
-        remote_peers.truncate(CLOSE_GROUP_SIZE);
+        let remote_peers = self
+            .network()
+            .find_closest_peers(address, over_query_count)
+            .await?;
 
         if remote_peers.len() < CLOSE_GROUP_SIZE {
             return Err(Error::InsufficientPeers(format!(
@@ -135,10 +153,10 @@ impl Client {
             quote_futures.push(quote_future);
         }
 
-        // Wait for all quote requests to complete, with an overall timeout
-        // to prevent indefinite stalls when connection establishment hangs.
-        let mut quotes = Vec::with_capacity(CLOSE_GROUP_SIZE);
-        let mut already_stored_count = 0usize;
+        // Collect all responses with an overall timeout to prevent indefinite stalls.
+        // Over-query means we have 2x peers, so we can tolerate failures.
+        let mut quotes = Vec::with_capacity(over_query_count);
+        let mut already_stored_peers: Vec<(PeerId, [u8; 32])> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
 
         let collect_result: std::result::Result<std::result::Result<(), Error>, _> =
@@ -149,15 +167,9 @@ impl Client {
                             quotes.push((peer_id, addrs, quote, price));
                         }
                         Err(Error::AlreadyStored) => {
-                            already_stored_count += 1;
                             debug!("Peer {peer_id} reports chunk already stored");
-                            if already_stored_count >= CLOSE_GROUP_MAJORITY {
-                                info!(
-                                    "Chunk {} already stored ({already_stored_count}/{CLOSE_GROUP_SIZE} peers confirm)",
-                                    hex::encode(address)
-                                );
-                                return Err(Error::AlreadyStored);
-                            }
+                            let dist = xor_distance(&peer_id, address);
+                            already_stored_peers.push((peer_id, dist));
                         }
                         Err(e) => {
                             warn!("Failed to get quote from {peer_id}: {e}");
@@ -172,26 +184,58 @@ impl Client {
         match collect_result {
             Err(_elapsed) => {
                 warn!(
-                    "Quote collection timed out after {:?} for address {}",
-                    overall_timeout,
+                    "Quote collection timed out after {overall_timeout:?} for address {}",
                     hex::encode(address)
                 );
-                return Err(Error::Timeout(format!(
-                    "Quote collection timed out after {:?}. Got {} quotes, need {CLOSE_GROUP_SIZE}. Failures: [{}]",
-                    overall_timeout,
-                    quotes.len(),
-                    failures.join("; ")
-                )));
+                // Fall through to check if we have enough quotes despite timeout.
+                // The timeout fires when slow peers haven't responded yet, but we
+                // may already have enough successful quotes from fast peers.
             }
-            Ok(Err(e)) => return Err(e), // AlreadyStored early return
-            Ok(Ok(())) => {}             // All futures completed normally
+            Ok(Err(e)) => return Err(e),
+            Ok(Ok(())) => {}
+        }
+
+        // Check already-stored: only count votes from the closest CLOSE_GROUP_SIZE peers.
+        if !already_stored_peers.is_empty() {
+            let mut all_peers_by_distance: Vec<(bool, [u8; 32])> = Vec::new();
+            for (peer_id, _, _, _) in &quotes {
+                all_peers_by_distance.push((false, xor_distance(peer_id, address)));
+            }
+            for (_, dist) in &already_stored_peers {
+                all_peers_by_distance.push((true, *dist));
+            }
+            all_peers_by_distance.sort_by(|a, b| a.1.cmp(&b.1));
+
+            let close_group_stored = all_peers_by_distance
+                .iter()
+                .take(CLOSE_GROUP_SIZE)
+                .filter(|(is_stored, _)| *is_stored)
+                .count();
+
+            if close_group_stored >= CLOSE_GROUP_MAJORITY {
+                info!(
+                    "Chunk {} already stored ({close_group_stored}/{CLOSE_GROUP_SIZE} close-group peers confirm)",
+                    hex::encode(address)
+                );
+                return Err(Error::AlreadyStored);
+            }
         }
 
         if quotes.len() >= CLOSE_GROUP_SIZE {
+            let total_responses = quotes.len() + failures.len() + already_stored_peers.len();
+
+            // Sort by XOR distance to target, keep the closest CLOSE_GROUP_SIZE.
+            quotes.sort_by(|a, b| {
+                let dist_a = xor_distance(&a.0, address);
+                let dist_b = xor_distance(&b.0, address);
+                dist_a.cmp(&dist_b)
+            });
+            quotes.truncate(CLOSE_GROUP_SIZE);
+
             info!(
-                "Collected {} quotes for address {}",
+                "Collected {} quotes for address {} (from {total_responses} responses)",
                 quotes.len(),
-                hex::encode(address)
+                hex::encode(address),
             );
             return Ok(quotes);
         }
