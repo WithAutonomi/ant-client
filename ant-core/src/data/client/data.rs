@@ -6,7 +6,7 @@
 //! For file-based streaming uploads that avoid loading the entire
 //! file into memory, see the `file` module.
 
-use crate::data::client::batch::PaymentIntent;
+use crate::data::client::batch::{PaymentIntent, PreparedChunk};
 use crate::data::client::file::PreparedUpload;
 use crate::data::client::merkle::PaymentMode;
 use crate::data::client::Client;
@@ -177,9 +177,16 @@ impl Client {
             .map(|chunk| chunk.content)
             .collect();
 
-        let mut prepared_chunks = Vec::with_capacity(chunk_contents.len());
-        for content in chunk_contents {
-            if let Some(prepared) = self.prepare_chunk_payment(content).await? {
+        let concurrency = self.config().chunk_concurrency;
+        let results: Vec<Result<Option<PreparedChunk>>> = futures::stream::iter(chunk_contents)
+            .map(|content| async move { self.prepare_chunk_payment(content).await })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+        let mut prepared_chunks = Vec::with_capacity(results.len());
+        for result in results {
+            if let Some(prepared) = result? {
                 prepared_chunks.push(prepared);
             }
         }
@@ -196,6 +203,7 @@ impl Client {
             data_map,
             prepared_chunks,
             payment_intent,
+            payment_mode: PaymentMode::Single,
         })
     }
 

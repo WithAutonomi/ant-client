@@ -213,6 +213,8 @@ pub struct PreparedUpload {
     pub prepared_chunks: Vec<PreparedChunk>,
     /// Payment intent for external signing.
     pub payment_intent: PaymentIntent,
+    /// The payment mode used for this upload.
+    pub payment_mode: PaymentMode,
 }
 
 /// Return type for [`spawn_file_encryption`]: chunk receiver, `DataMap` oneshot, join handle.
@@ -352,21 +354,26 @@ impl Client {
             spill.len()
         );
 
-        // Read each chunk from disk and collect quotes. Note: all PreparedChunks
-        // accumulate in memory because the external-signer protocol requires them
-        // for finalize_upload. This is NOT memory-bounded for large files.
+        // Read each chunk from disk and collect quotes concurrently.
+        // Note: all PreparedChunks accumulate in memory because the external-signer
+        // protocol requires them for finalize_upload. NOT memory-bounded for large files.
+        let chunk_data: Vec<Bytes> = spill
+            .addresses
+            .iter()
+            .map(|addr| spill.read_chunk(addr))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let concurrency = self.config().chunk_concurrency;
+        let results: Vec<Result<Option<PreparedChunk>>> = stream::iter(chunk_data)
+            .map(|content| async move { self.prepare_chunk_payment(content).await })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
         let mut prepared_chunks = Vec::with_capacity(spill.len());
-        for (i, addr) in spill.addresses.iter().enumerate() {
-            let content = spill.read_chunk(addr)?;
-            if let Some(prepared) = self.prepare_chunk_payment(content).await? {
+        for result in results {
+            if let Some(prepared) = result? {
                 prepared_chunks.push(prepared);
-            }
-            if (i + 1) % 100 == 0 {
-                info!(
-                    "Prepared {}/{} chunks for external signing",
-                    i + 1,
-                    spill.len()
-                );
             }
         }
 
@@ -383,6 +390,7 @@ impl Client {
             data_map,
             prepared_chunks,
             payment_intent,
+            payment_mode: PaymentMode::Single,
         })
     }
 
@@ -419,7 +427,7 @@ impl Client {
         Ok(FileUploadResult {
             data_map: prepared.data_map,
             chunks_stored,
-            payment_mode_used: PaymentMode::Single,
+            payment_mode_used: prepared.payment_mode,
         })
     }
 
