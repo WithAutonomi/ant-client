@@ -900,7 +900,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.9.0"
-source = "git+https://github.com/WithAutonomi/ant-node.git?branch=feat%2Fadapt-evmlib-payment-vault#08bb16f5e240d0c963c36afebd1e1b6c43368d81"
+source = "git+https://github.com/WithAutonomi/ant-node.git?branch=feat%2Fadapt-evmlib-payment-vault#f283b9ac333b1a4a9251a3ece57c9302b24078f9"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -2415,7 +2415,7 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.5.0"
-source = "git+https://github.com/WithAutonomi/evmlib.git?branch=refactor%2Funify-payment-vault-v2#f4cdd45ea76a98ced0a416794c92b9b4bc2da224"
+source = "git+https://github.com/WithAutonomi/evmlib.git?branch=refactor%2Funify-payment-vault-v2#56148ce8751bf0a1f33817573d6501ab6c4e91d3"
 dependencies = [
  "alloy",
  "ant-merkle",
