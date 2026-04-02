@@ -102,9 +102,9 @@ async fn measure_upload_cost(
 
     // Estimate tx count based on mode and chunk count
     let tx_estimate = match mode {
-        PaymentMode::Single => format!("~{}", (result.chunks_stored + 255) / 256),
+        PaymentMode::Single => format!("~{}", result.chunks_stored.div_ceil(256)),
         PaymentMode::Merkle => {
-            let sub_batches = (result.chunks_stored + 255) / 256;
+            let sub_batches = result.chunks_stored.div_ceil(256);
             format!("{sub_batches}")
         }
         PaymentMode::Auto => format!("{:?}", result.payment_mode_used),
@@ -193,16 +193,20 @@ async fn test_upload_cost_comparison() {
 
     let work_dir = TempDir::new().expect("create work dir");
 
-    // Sizes chosen for speed while covering key scenarios:
-    // 10 MB  -> ~3 chunks  (tiny, below merkle threshold)
-    // 50 MB  -> ~13 chunks (small, below 64-chunk wave)
-    // 200 MB -> ~54 chunks (near wave boundary)
-    // 500 MB -> ~128 chunks (multi-wave, multi-batch merkle boundary)
+    // Sizes covering single-wave through multi-batch merkle scenarios.
+    // 10 MB   -> ~3 chunks   (tiny, below merkle threshold)
+    // 50 MB   -> ~13 chunks  (small, below 64-chunk wave)
+    // 200 MB  -> ~54 chunks  (near wave boundary)
+    // 500 MB  -> ~128 chunks (multi-wave, near merkle 256-leaf limit)
+    // 2 GB    -> ~512 chunks (multi-batch merkle: 2 sub-batches)
+    // 4 GB    -> ~1024 chunks (multi-batch merkle: 4 sub-batches)
     let sizes: Vec<(u64, &str)> = vec![
         (10, "10mb.bin"),
         (50, "50mb.bin"),
         (200, "200mb.bin"),
         (500, "500mb.bin"),
+        (2048, "2gb.bin"),
+        (4096, "4gb.bin"),
     ];
 
     let mut results = Vec::new();
@@ -226,8 +230,7 @@ async fn test_upload_cost_comparison() {
         );
         eprintln!("  Uploading (Single)...");
         let single_result =
-            measure_upload_cost(&client, wallet, &single_path, PaymentMode::Single, *size_mb)
-                .await;
+            measure_upload_cost(&client, wallet, &single_path, PaymentMode::Single, *size_mb).await;
         eprintln!(
             "    {} chunks, ANT: {}, Gas: {}",
             single_result.chunks,
@@ -246,8 +249,7 @@ async fn test_upload_cost_comparison() {
         );
         eprintln!("  Uploading (Merkle)...");
         let merkle_result =
-            measure_upload_cost(&client, wallet, &merkle_path, PaymentMode::Merkle, *size_mb)
-                .await;
+            measure_upload_cost(&client, wallet, &merkle_path, PaymentMode::Merkle, *size_mb).await;
         eprintln!(
             "    {} chunks, ANT: {}, Gas: {}",
             merkle_result.chunks,
