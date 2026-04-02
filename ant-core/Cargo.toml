@@ -24,7 +24,7 @@ zip = "2"
 tower-http = { version = "0.6.8", features = ["cors"] }
 
 # Data operations
-evmlib = { git = "https://github.com/WithAutonomi/evmlib.git", branch = "refactor/unify-payment-vault-v2" }
+evmlib = "0.7"
 xor_name = "5"
 self_encryption = "0.35.0"
 futures = "0.3"
