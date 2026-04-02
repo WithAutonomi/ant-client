@@ -45,12 +45,20 @@ const DISK_SPACE_HEADROOM_PERCENT: u64 = 10;
 /// only their 32-byte addresses stay in memory. At upload time chunks are
 /// read back one wave at a time, keeping peak RAM at ~`UPLOAD_WAVE_SIZE × 4 MB`.
 /// Maximum age (in seconds) for orphaned spill directories.
-/// Directories older than this are cleaned up on the next `ChunkSpill::new()` call.
+/// Dirs older than this are cleaned up if they have no active lockfile.
 const SPILL_MAX_AGE_SECS: u64 = 24 * 60 * 60; // 24 hours
+
+/// Prefix for spill directory names to distinguish from user files.
+const SPILL_DIR_PREFIX: &str = "spill_";
+
+/// Lockfile name inside each spill dir to signal active use.
+const SPILL_LOCK_NAME: &str = ".lock";
 
 struct ChunkSpill {
     /// Directory holding spilled chunk files (named by hex address).
     dir: PathBuf,
+    /// Lockfile held for the lifetime of this spill (prevents stale cleanup).
+    _lock: std::fs::File,
     /// Deduplicated list of chunk addresses.
     addresses: Vec<[u8; 32]>,
     /// Tracks seen addresses for deduplication.
@@ -62,7 +70,8 @@ struct ChunkSpill {
 impl ChunkSpill {
     /// Return the parent directory for all spill dirs: `<data_dir>/spill/`.
     fn spill_root() -> Result<PathBuf> {
-        let root = crate::config::data_dir()
+        use crate::config;
+        let root = config::data_dir()
             .map_err(|e| Error::Config(format!("cannot determine data dir for spill: {e}")))?
             .join("spill");
         Ok(root)
@@ -70,9 +79,9 @@ impl ChunkSpill {
 
     /// Create a new spill directory under `<data_dir>/spill/`.
     ///
-    /// Directory name encodes a Unix timestamp and random suffix so orphans
-    /// can be identified and cleaned up by age. Also cleans up any stale
-    /// spill dirs older than `SPILL_MAX_AGE_SECS`.
+    /// Directory name is `spill_<timestamp>_<random>` so orphans can be
+    /// identified by prefix and cleaned up by age. A lockfile inside the
+    /// dir prevents concurrent cleanup from deleting an active spill.
     fn new() -> Result<Self> {
         let root = Self::spill_root()?;
         std::fs::create_dir_all(&root)?;
@@ -85,26 +94,56 @@ impl ChunkSpill {
             .unwrap_or_default()
             .as_secs();
         let unique: u64 = rand::random();
-        let dir = root.join(format!("{now}_{unique}"));
+        let dir = root.join(format!("{SPILL_DIR_PREFIX}{now}_{unique}"));
         std::fs::create_dir(&dir)?;
+
+        // Create and hold a lockfile for the lifetime of this spill.
+        // cleanup_stale() will skip dirs with locked files.
+        let lock_path = dir.join(SPILL_LOCK_NAME);
+        let lock_file = std::fs::File::create(&lock_path).map_err(|e| {
+            Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to create spill lockfile: {e}"),
+            ))
+        })?;
+        use fs2::FileExt;
+        lock_file.try_lock_exclusive().map_err(|e| {
+            Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to lock spill lockfile: {e}"),
+            ))
+        })?;
+
         Ok(Self {
             dir,
+            _lock: lock_file,
             addresses: Vec::new(),
             seen: HashSet::new(),
             total_bytes: 0,
         })
     }
 
-    /// Remove spill directories older than `SPILL_MAX_AGE_SECS`.
+    /// Clean up stale spill directories. Best-effort, errors are logged.
     ///
-    /// Each spill dir is named `<unix_timestamp>_<random>`. We parse the
-    /// timestamp prefix and remove dirs that are too old. Errors are logged
-    /// and swallowed -- cleanup is best-effort.
+    /// Only removes directories that:
+    /// 1. Start with `SPILL_DIR_PREFIX` (ignores unrelated files)
+    /// 2. Are actual directories (not symlinks -- prevents symlink attacks)
+    /// 3. Have a timestamp older than `SPILL_MAX_AGE_SECS`
+    /// 4. Do NOT have an active lockfile (prevents deleting in-progress uploads)
+    ///
+    /// Safe to call concurrently from multiple processes.
     fn cleanup_stale(root: &Path) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        if now == 0 {
+            // Clock is broken (before Unix epoch). Skip cleanup to avoid
+            // misidentifying dirs as stale.
+            warn!("System clock before Unix epoch, skipping spill cleanup");
+            return;
+        }
 
         let entries = match std::fs::read_dir(root) {
             Ok(entries) => entries,
@@ -115,19 +154,59 @@ impl ChunkSpill {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
 
-            // Parse timestamp from dir name: "<timestamp>_<random>"
-            let timestamp: u64 = match name_str.split('_').next().and_then(|s| s.parse().ok()) {
-                Some(ts) => ts,
-                None => continue, // Not our format, skip
+            // Only process dirs with our prefix.
+            let suffix = match name_str.strip_prefix(SPILL_DIR_PREFIX) {
+                Some(s) => s,
+                None => continue,
             };
 
-            if now.saturating_sub(timestamp) > SPILL_MAX_AGE_SECS {
-                let path = entry.path();
-                info!("Cleaning up stale spill dir: {}", path.display());
-                if let Err(e) = std::fs::remove_dir_all(&path) {
-                    warn!("Failed to clean up stale spill dir {}: {e}", path.display());
-                }
+            // Parse timestamp: "spill_<timestamp>_<random>"
+            let timestamp: u64 = match suffix.split('_').next().and_then(|s| s.parse().ok()) {
+                Some(ts) => ts,
+                None => continue,
+            };
+
+            if now.saturating_sub(timestamp) <= SPILL_MAX_AGE_SECS {
+                continue;
             }
+
+            // Safety: only delete actual directories, not symlinks.
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let path = entry.path();
+
+            // Check lockfile: if locked, the dir is in active use -- skip it.
+            let lock_path = path.join(SPILL_LOCK_NAME);
+            if let Ok(lock_file) = std::fs::File::open(&lock_path) {
+                use fs2::FileExt;
+                if lock_file.try_lock_exclusive().is_err() {
+                    // Lock held by another process -- dir is active.
+                    debug!("Skipping active spill dir: {}", path.display());
+                    continue;
+                }
+                // We acquired the lock, so no one else holds it.
+                // Drop it before deleting.
+                drop(lock_file);
+            }
+
+            info!("Cleaning up stale spill dir: {}", path.display());
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                warn!("Failed to clean up stale spill dir {}: {e}", path.display());
+            }
+        }
+    }
+
+    /// Run stale spill cleanup. Call at client startup or periodically.
+    #[allow(dead_code)]
+    pub(crate) fn run_cleanup() {
+        if let Ok(root) = Self::spill_root() {
+            Self::cleanup_stale(&root);
         }
     }
 
