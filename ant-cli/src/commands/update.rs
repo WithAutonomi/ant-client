@@ -43,9 +43,7 @@ impl UpdateArgs {
         let mut check = update::check_for_update(current_version).await?;
 
         if !check.update_available && self.force {
-            // Force mode: rebuild the download URL even if versions match.
-            check.update_available = true;
-            check.download_url = Some(update::build_download_url(&check.latest_version)?);
+            check.force()?;
         }
 
         if !check.update_available {
