@@ -900,7 +900,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.9.0"
-source = "git+https://github.com/WithAutonomi/ant-node.git?branch=feat%2Fadapt-evmlib-payment-vault#26d1fe6d3ccb1e917c4259d4f46ec51f02b11df9"
+source = "git+https://github.com/WithAutonomi/ant-node.git?branch=feat%2Fadapt-evmlib-payment-vault#1ca840ced9f97c9f1a54474319a9995d8b0d26c9"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
