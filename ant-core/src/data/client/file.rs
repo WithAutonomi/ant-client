@@ -44,8 +44,12 @@ const DISK_SPACE_HEADROOM_PERCENT: u64 = 10;
 /// During file encryption, chunks are written to a temp directory so that
 /// only their 32-byte addresses stay in memory. At upload time chunks are
 /// read back one wave at a time, keeping peak RAM at ~`UPLOAD_WAVE_SIZE × 4 MB`.
+/// Maximum age (in seconds) for orphaned spill directories.
+/// Directories older than this are cleaned up on the next `ChunkSpill::new()` call.
+const SPILL_MAX_AGE_SECS: u64 = 24 * 60 * 60; // 24 hours
+
 struct ChunkSpill {
-    /// Temp directory holding spilled chunk files (named by hex address).
+    /// Directory holding spilled chunk files (named by hex address).
     dir: PathBuf,
     /// Deduplicated list of chunk addresses.
     addresses: Vec<[u8; 32]>,
@@ -56,13 +60,32 @@ struct ChunkSpill {
 }
 
 impl ChunkSpill {
-    /// Create a new spill directory under the system temp dir.
+    /// Return the parent directory for all spill dirs: `<data_dir>/spill/`.
+    fn spill_root() -> Result<PathBuf> {
+        let root = crate::config::data_dir()
+            .map_err(|e| Error::Config(format!("cannot determine data dir for spill: {e}")))?
+            .join("spill");
+        Ok(root)
+    }
+
+    /// Create a new spill directory under `<data_dir>/spill/`.
     ///
-    /// Uses `create_dir` (not `create_dir_all`) so creation fails if the
-    /// directory already exists, preventing silent reuse of a stale spill.
+    /// Directory name encodes a Unix timestamp and random suffix so orphans
+    /// can be identified and cleaned up by age. Also cleans up any stale
+    /// spill dirs older than `SPILL_MAX_AGE_SECS`.
     fn new() -> Result<Self> {
+        let root = Self::spill_root()?;
+        std::fs::create_dir_all(&root)?;
+
+        // Clean up stale spill dirs from previous crashed runs.
+        Self::cleanup_stale(&root);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let unique: u64 = rand::random();
-        let dir = std::env::temp_dir().join(format!(".ant_spill_{}_{unique}", std::process::id()));
+        let dir = root.join(format!("{now}_{unique}"));
         std::fs::create_dir(&dir)?;
         Ok(Self {
             dir,
@@ -70,6 +93,42 @@ impl ChunkSpill {
             seen: HashSet::new(),
             total_bytes: 0,
         })
+    }
+
+    /// Remove spill directories older than `SPILL_MAX_AGE_SECS`.
+    ///
+    /// Each spill dir is named `<unix_timestamp>_<random>`. We parse the
+    /// timestamp prefix and remove dirs that are too old. Errors are logged
+    /// and swallowed -- cleanup is best-effort.
+    fn cleanup_stale(root: &Path) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            // Parse timestamp from dir name: "<timestamp>_<random>"
+            let timestamp: u64 = match name_str.split('_').next().and_then(|s| s.parse().ok()) {
+                Some(ts) => ts,
+                None => continue, // Not our format, skip
+            };
+
+            if now.saturating_sub(timestamp) > SPILL_MAX_AGE_SECS {
+                let path = entry.path();
+                info!("Cleaning up stale spill dir: {}", path.display());
+                if let Err(e) = std::fs::remove_dir_all(&path) {
+                    warn!("Failed to clean up stale spill dir {}: {e}", path.display());
+                }
+            }
+        }
     }
 
     /// Write one encrypted chunk to disk and record its address.
@@ -151,17 +210,23 @@ impl Drop for ChunkSpill {
     }
 }
 
-/// Check that the temp directory has enough free space for the spilled chunks.
+/// Check that the spill directory has enough free space for the spilled chunks.
 ///
 /// `file_size` is the source file's byte count. We require
-/// `file_size + 10%` free space in the temp dir to account for
-/// self-encryption overhead.
+/// `file_size + 10%` free space to account for self-encryption overhead.
 fn check_disk_space_for_spill(file_size: u64) -> Result<()> {
-    let tmp = std::env::temp_dir();
-    let available = fs2::available_space(&tmp).map_err(|e| {
+    let spill_root = ChunkSpill::spill_root()?;
+
+    // Ensure the root exists so fs2 can query it.
+    std::fs::create_dir_all(&spill_root)?;
+
+    let available = fs2::available_space(&spill_root).map_err(|e| {
         Error::Io(std::io::Error::new(
             e.kind(),
-            format!("failed to query disk space on {}: {e}", tmp.display()),
+            format!(
+                "failed to query disk space on {}: {e}",
+                spill_root.display()
+            ),
         ))
     })?;
 
@@ -173,14 +238,14 @@ fn check_disk_space_for_spill(file_size: u64) -> Result<()> {
         let avail_mb = available / (1024 * 1024);
         let req_mb = required / (1024 * 1024);
         return Err(Error::InsufficientDiskSpace(format!(
-            "need ~{req_mb} MB in temp dir ({}) but only {avail_mb} MB available",
-            tmp.display()
+            "need ~{req_mb} MB in spill dir ({}) but only {avail_mb} MB available",
+            spill_root.display()
         )));
     }
 
     debug!(
-        "Disk space check passed: {available} bytes available, {required} bytes required (temp: {})",
-        tmp.display()
+        "Disk space check passed: {available} bytes available, {required} bytes required (spill: {})",
+        spill_root.display()
     );
     Ok(())
 }
