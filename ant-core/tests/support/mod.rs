@@ -44,8 +44,6 @@ const STABILIZATION_TIMEOUT_SECS: u64 = 180;
 const TEST_REWARDS_ADDRESS: [u8; 20] = [0x01; 20];
 /// Max records for quoting metrics.
 const TEST_MAX_RECORDS: usize = 1280;
-/// Initial records for quoting metrics.
-const TEST_INITIAL_RECORDS: usize = 1000;
 
 pub struct TestNode {
     pub p2p_node: Option<Arc<P2PNode>>,
@@ -217,8 +215,8 @@ impl MiniTestnet {
         let storage_config = LmdbStorageConfig {
             root_dir: data_dir.to_path_buf(),
             verify_on_read: true,
-            max_chunks: 0,
             max_map_size: 0,
+            disk_reserve: 0,
         };
         let storage = Arc::new(
             LmdbStorage::new(storage_config)
@@ -242,7 +240,7 @@ impl MiniTestnet {
             local_rewards_address: rewards_address,
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
-        let metrics_tracker = QuotingMetricsTracker::new(TEST_MAX_RECORDS, TEST_INITIAL_RECORDS);
+        let metrics_tracker = QuotingMetricsTracker::new(TEST_MAX_RECORDS);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing so quotes are properly signed and verifiable
