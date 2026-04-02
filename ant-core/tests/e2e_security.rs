@@ -12,7 +12,7 @@ use ant_node::core::PeerId;
 use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use bytes::Bytes;
 use evmlib::common::{Amount, TxHash};
-use evmlib::{EncodedPeerId, ProofOfPayment};
+use evmlib::{EncodedPeerId, ProofOfPayment, RewardsAddress};
 use serial_test::serial;
 use std::sync::Arc;
 use support::MiniTestnet;
@@ -382,7 +382,12 @@ async fn test_attack_underpayment_single_node() {
         .await
         .expect("quote collection should succeed");
 
-    let target_peer = quotes.first().expect("should have quotes").0;
+    // Save (PeerId, RewardsAddress) mapping before consuming quotes — needed
+    // to target the median peer after from_quotes() sorts internally.
+    let peer_by_rewards: Vec<(PeerId, RewardsAddress)> = quotes
+        .iter()
+        .map(|(pid, _, q, _)| (*pid, q.rewards_address))
+        .collect();
 
     // 2. Build SingleNodePayment normally (sorts by price, median gets 3×)
     let mut peer_quotes = Vec::with_capacity(quotes.len());
@@ -396,8 +401,16 @@ async fn test_attack_underpayment_single_node() {
     let mut payment = SingleNodePayment::from_quotes(quotes_for_payment)
         .expect("payment creation should succeed");
 
-    // Median is at index 2 (CLOSE_GROUP_SIZE=5, sorted by price)
+    // Median is at index 2 (CLOSE_GROUP_SIZE=5, sorted by price).
+    // Target the median peer specifically — it's the only one that receives
+    // payment, so only it will detect the amount mismatch in verifyPayment().
     let original_amount = payment.quotes[2].amount;
+    let median_rewards = payment.quotes[2].rewards_address;
+    let target_peer = peer_by_rewards
+        .iter()
+        .find(|(_, addr)| *addr == median_rewards)
+        .expect("median rewards address must match a quoted peer")
+        .0;
     assert!(
         !original_amount.is_zero(),
         "Median quote (index 2) should have non-zero payment amount"
@@ -460,7 +473,10 @@ async fn test_attack_underpayment_half_price() {
         .await
         .expect("quote collection should succeed");
 
-    let target_peer = quotes.first().expect("should have quotes").0;
+    let peer_by_rewards: Vec<(PeerId, RewardsAddress)> = quotes
+        .iter()
+        .map(|(pid, _, q, _)| (*pid, q.rewards_address))
+        .collect();
 
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes.len());
@@ -473,8 +489,15 @@ async fn test_attack_underpayment_half_price() {
     let mut payment = SingleNodePayment::from_quotes(quotes_for_payment)
         .expect("payment creation should succeed");
 
-    // Halve the median payment (3× → ~1.5×)
+    // Halve the median payment (3× → ~1.5×).
+    // Target the median peer — only it verifies the amount it received.
     let original_amount = payment.quotes[2].amount;
+    let median_rewards = payment.quotes[2].rewards_address;
+    let target_peer = peer_by_rewards
+        .iter()
+        .find(|(_, addr)| *addr == median_rewards)
+        .expect("median rewards address must match a quoted peer")
+        .0;
     let half_amount = original_amount / Amount::from(2u64);
     assert!(
         !half_amount.is_zero(),
