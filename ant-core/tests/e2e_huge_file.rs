@@ -448,6 +448,96 @@ async fn test_huge_file_upload_download_4gb() {
     testnet.teardown().await;
 }
 
+/// Upload and download an 8 GB file, proving memory stays bounded.
+///
+/// 8 GB → ~2048 chunks → ~32 waves of 64 chunks each.
+/// Memory usage should be comparable to the 1 GB and 4 GB tests.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_huge_file_upload_download_8gb() {
+    let file_size: u64 = 8 * 1024 * 1024 * 1024;
+
+    let (client, testnet) = setup_large().await;
+    let work_dir = TempDir::new().expect("create work dir");
+
+    eprintln!("Creating 8 GB test file...");
+    let input_path = create_test_file(&work_dir, file_size);
+    eprintln!("Test file created at {}", input_path.display());
+
+    tokio::task::yield_now().await;
+
+    let rss_before = get_current_rss_bytes();
+    if let Some(rss) = rss_before {
+        eprintln!("RSS baseline before upload: {} MB", rss / (1024 * 1024));
+    }
+
+    eprintln!("Uploading 8 GB file...");
+    let result = client
+        .file_upload(input_path.as_path())
+        .await
+        .expect("8 GB file upload should succeed");
+
+    let rss_after_upload = get_current_rss_bytes();
+
+    eprintln!(
+        "Upload complete: {} chunks stored, mode: {:?}",
+        result.chunks_stored, result.payment_mode_used
+    );
+
+    // 8 GB at MAX_CHUNK_SIZE (4,190,208 bytes) → ~2053 chunks minimum
+    assert!(
+        result.chunks_stored >= 2000,
+        "8 GB file should produce at least 2000 chunks, got {}",
+        result.chunks_stored
+    );
+
+    if let (Some(before), Some(after)) = (rss_before, rss_after_upload) {
+        let increase = after.saturating_sub(before);
+        let increase_mb = increase / (1024 * 1024);
+        let max_mb = MAX_RSS_INCREASE_BYTES / (1024 * 1024);
+        eprintln!(
+            "Current RSS before: {} MB, after: {} MB, increase: {increase_mb} MB (limit: {max_mb} MB)",
+            before / (1024 * 1024),
+            after / (1024 * 1024)
+        );
+        assert!(
+            increase < MAX_RSS_INCREASE_BYTES,
+            "RSS increased by {increase_mb} MB for an 8 GB file — \
+             this exceeds the {max_mb} MB limit. \
+             Before: {} MB, After: {} MB",
+            before / (1024 * 1024),
+            after / (1024 * 1024)
+        );
+    } else {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        panic!("RSS measurement failed on a supported platform — cannot verify bounded memory");
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        eprintln!("WARNING: Could not measure current RSS on this platform, skipping memory check");
+    }
+
+    // Download and verify
+    let output_path = work_dir.path().join("downloaded_8gb.bin");
+    eprintln!("Downloading 8 GB file...");
+    let bytes_written = client
+        .file_download(&result.data_map, &output_path)
+        .await
+        .expect("8 GB file download should succeed");
+
+    assert_eq!(
+        bytes_written, file_size,
+        "bytes_written should equal original file size"
+    );
+    eprintln!("Download complete: {bytes_written} bytes written");
+
+    eprintln!("Verifying file content...");
+    verify_file_content(&output_path, file_size);
+    eprintln!("Content verification passed — all 8 GB match");
+
+    drop(client);
+    testnet.teardown().await;
+}
+
 /// Test that a moderately large file (64 MB) round-trips correctly.
 ///
 /// This test verifies data integrity on a medium file. Memory bounding
