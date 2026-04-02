@@ -421,6 +421,7 @@ mod tests {
                 quote_hash: QuoteHash::from([i as u8 + 1; 32]),
                 rewards_address: RewardsAddress::new([i as u8 + 10; 20]),
                 amount: Amount::from(amounts[i]),
+                price: Amount::from(amounts[i]),
             });
 
         PreparedChunk {
