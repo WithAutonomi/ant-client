@@ -34,11 +34,11 @@ impl Xorshift64 {
     }
 }
 
-fn create_test_file(dir: &Path, size: u64, name: &str) -> PathBuf {
+fn create_test_file(dir: &Path, size: u64, name: &str, seed: u64) -> PathBuf {
     let path = dir.join(name);
     let mut file = std::fs::File::create(&path).expect("create test file");
 
-    let mut rng = Xorshift64::new(0xDEAD_BEEF_CAFE_BABE);
+    let mut rng = Xorshift64::new(seed);
     let mut remaining = size;
     let write_buf_size: usize = 1024 * 1024;
     let mut buf = vec![0u8; write_buf_size];
@@ -182,7 +182,8 @@ fn print_table(results: &[CostResult]) {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_upload_cost_comparison() {
-    let testnet = MiniTestnet::start(6).await;
+    // Need 20+ nodes for merkle payment pools (CANDIDATES_PER_POOL = 16)
+    let testnet = MiniTestnet::start(20).await;
     let node = testnet.node(3).expect("Node 3 should exist");
     let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
         .with_wallet(testnet.wallet().clone());
@@ -200,16 +201,24 @@ async fn test_upload_cost_comparison() {
 
     for (size_mb, filename) in &sizes {
         let file_size = *size_mb * 1024 * 1024;
-        eprintln!("Creating {size_mb} MB test file...");
-        let path = create_test_file(work_dir.path(), file_size, filename);
-        eprintln!("  Created: {}", path.display());
-
         let wallet = testnet.wallet();
 
+        // Create separate files for single and merkle to avoid AlreadyStored
+        let single_name = format!("single_{filename}");
+        let merkle_name = format!("merkle_{filename}");
+
         // Single payment mode
+        eprintln!("Creating {size_mb} MB test file for Single mode...");
+        let single_path = create_test_file(
+            work_dir.path(),
+            file_size,
+            &single_name,
+            0xDEAD_BEEF_0000_0000 + *size_mb,
+        );
         eprintln!("  Uploading with Single payment mode...");
         let single_result =
-            measure_upload_cost(&client, wallet, &path, PaymentMode::Single, *size_mb).await;
+            measure_upload_cost(&client, wallet, &single_path, PaymentMode::Single, *size_mb)
+                .await;
         eprintln!(
             "    {} chunks, ANT: {}, Gas: {}",
             single_result.chunks,
@@ -218,10 +227,18 @@ async fn test_upload_cost_comparison() {
         );
         results.push(single_result);
 
-        // Merkle payment mode (only if >= 2 chunks)
+        // Merkle payment mode
+        eprintln!("Creating {size_mb} MB test file for Merkle mode...");
+        let merkle_path = create_test_file(
+            work_dir.path(),
+            file_size,
+            &merkle_name,
+            0xCAFE_BABE_0000_0000 + *size_mb,
+        );
         eprintln!("  Uploading with Merkle payment mode...");
         let merkle_result =
-            measure_upload_cost(&client, wallet, &path, PaymentMode::Merkle, *size_mb).await;
+            measure_upload_cost(&client, wallet, &merkle_path, PaymentMode::Merkle, *size_mb)
+                .await;
         eprintln!(
             "    {} chunks, ANT: {}, Gas: {}",
             merkle_result.chunks,
