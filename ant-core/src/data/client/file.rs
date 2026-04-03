@@ -19,6 +19,7 @@ use ant_node::client::compute_address;
 use bytes::Bytes;
 use evmlib::common::QuoteHash;
 use evmlib::common::TxHash;
+use fs2::FileExt;
 use futures::stream::{self, StreamExt};
 use self_encryption::{stream_encrypt, streaming_decrypt, DataMap};
 use std::collections::{HashMap, HashSet};
@@ -44,9 +45,21 @@ const DISK_SPACE_HEADROOM_PERCENT: u64 = 10;
 /// During file encryption, chunks are written to a temp directory so that
 /// only their 32-byte addresses stay in memory. At upload time chunks are
 /// read back one wave at a time, keeping peak RAM at ~`UPLOAD_WAVE_SIZE × 4 MB`.
+/// Maximum age (in seconds) for orphaned spill directories.
+/// Dirs older than this are cleaned up if they have no active lockfile.
+const SPILL_MAX_AGE_SECS: u64 = 24 * 60 * 60; // 24 hours
+
+/// Prefix for spill directory names to distinguish from user files.
+const SPILL_DIR_PREFIX: &str = "spill_";
+
+/// Lockfile name inside each spill dir to signal active use.
+const SPILL_LOCK_NAME: &str = ".lock";
+
 struct ChunkSpill {
-    /// Temp directory holding spilled chunk files (named by hex address).
+    /// Directory holding spilled chunk files (named by hex address).
     dir: PathBuf,
+    /// Lockfile held for the lifetime of this spill (prevents stale cleanup).
+    _lock: std::fs::File,
     /// Deduplicated list of chunk addresses.
     addresses: Vec<[u8; 32]>,
     /// Tracks seen addresses for deduplication.
@@ -56,20 +69,145 @@ struct ChunkSpill {
 }
 
 impl ChunkSpill {
-    /// Create a new spill directory under the system temp dir.
+    /// Return the parent directory for all spill dirs: `<data_dir>/spill/`.
+    fn spill_root() -> Result<PathBuf> {
+        use crate::config;
+        let root = config::data_dir()
+            .map_err(|e| Error::Config(format!("cannot determine data dir for spill: {e}")))?
+            .join("spill");
+        Ok(root)
+    }
+
+    /// Create a new spill directory under `<data_dir>/spill/`.
     ///
-    /// Uses `create_dir` (not `create_dir_all`) so creation fails if the
-    /// directory already exists, preventing silent reuse of a stale spill.
+    /// Directory name is `spill_<timestamp>_<random>` so orphans can be
+    /// identified by prefix and cleaned up by age. A lockfile inside the
+    /// dir prevents concurrent cleanup from deleting an active spill.
     fn new() -> Result<Self> {
+        let root = Self::spill_root()?;
+        std::fs::create_dir_all(&root)?;
+
+        // Clean up stale spill dirs from previous crashed runs.
+        Self::cleanup_stale(&root);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let unique: u64 = rand::random();
-        let dir = std::env::temp_dir().join(format!(".ant_spill_{}_{unique}", std::process::id()));
+        let dir = root.join(format!("{SPILL_DIR_PREFIX}{now}_{unique}"));
         std::fs::create_dir(&dir)?;
+
+        // Create and hold a lockfile for the lifetime of this spill.
+        // cleanup_stale() will skip dirs with locked files.
+        let lock_path = dir.join(SPILL_LOCK_NAME);
+        let lock_file = std::fs::File::create(&lock_path).map_err(|e| {
+            Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to create spill lockfile: {e}"),
+            ))
+        })?;
+        lock_file.try_lock_exclusive().map_err(|e| {
+            Error::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to lock spill lockfile: {e}"),
+            ))
+        })?;
+
         Ok(Self {
             dir,
+            _lock: lock_file,
             addresses: Vec::new(),
             seen: HashSet::new(),
             total_bytes: 0,
         })
+    }
+
+    /// Clean up stale spill directories. Best-effort, errors are logged.
+    ///
+    /// Only removes directories that:
+    /// 1. Start with `SPILL_DIR_PREFIX` (ignores unrelated files)
+    /// 2. Are actual directories (not symlinks -- prevents symlink attacks)
+    /// 3. Have a timestamp older than `SPILL_MAX_AGE_SECS`
+    /// 4. Do NOT have an active lockfile (prevents deleting in-progress uploads)
+    ///
+    /// Safe to call concurrently from multiple processes.
+    fn cleanup_stale(root: &Path) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if now == 0 {
+            // Clock is broken (before Unix epoch). Skip cleanup to avoid
+            // misidentifying dirs as stale.
+            warn!("System clock before Unix epoch, skipping spill cleanup");
+            return;
+        }
+
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            // Only process dirs with our prefix.
+            let suffix = match name_str.strip_prefix(SPILL_DIR_PREFIX) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Parse timestamp: "spill_<timestamp>_<random>"
+            let timestamp: u64 = match suffix.split('_').next().and_then(|s| s.parse().ok()) {
+                Some(ts) => ts,
+                None => continue,
+            };
+
+            if now.saturating_sub(timestamp) <= SPILL_MAX_AGE_SECS {
+                continue;
+            }
+
+            // Safety: only delete actual directories, not symlinks.
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let path = entry.path();
+
+            // Check lockfile: if locked, the dir is in active use -- skip it.
+            let lock_path = path.join(SPILL_LOCK_NAME);
+            if let Ok(lock_file) = std::fs::File::open(&lock_path) {
+                use fs2::FileExt;
+                if lock_file.try_lock_exclusive().is_err() {
+                    // Lock held by another process -- dir is active.
+                    debug!("Skipping active spill dir: {}", path.display());
+                    continue;
+                }
+                // We acquired the lock, so no one else holds it.
+                // Drop it before deleting.
+                drop(lock_file);
+            }
+
+            info!("Cleaning up stale spill dir: {}", path.display());
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                warn!("Failed to clean up stale spill dir {}: {e}", path.display());
+            }
+        }
+    }
+
+    /// Run stale spill cleanup. Call at client startup or periodically.
+    #[allow(dead_code)]
+    pub(crate) fn run_cleanup() {
+        if let Ok(root) = Self::spill_root() {
+            Self::cleanup_stale(&root);
+        }
     }
 
     /// Write one encrypted chunk to disk and record its address.
@@ -151,17 +289,23 @@ impl Drop for ChunkSpill {
     }
 }
 
-/// Check that the temp directory has enough free space for the spilled chunks.
+/// Check that the spill directory has enough free space for the spilled chunks.
 ///
 /// `file_size` is the source file's byte count. We require
-/// `file_size + 10%` free space in the temp dir to account for
-/// self-encryption overhead.
+/// `file_size + 10%` free space to account for self-encryption overhead.
 fn check_disk_space_for_spill(file_size: u64) -> Result<()> {
-    let tmp = std::env::temp_dir();
-    let available = fs2::available_space(&tmp).map_err(|e| {
+    let spill_root = ChunkSpill::spill_root()?;
+
+    // Ensure the root exists so fs2 can query it.
+    std::fs::create_dir_all(&spill_root)?;
+
+    let available = fs2::available_space(&spill_root).map_err(|e| {
         Error::Io(std::io::Error::new(
             e.kind(),
-            format!("failed to query disk space on {}: {e}", tmp.display()),
+            format!(
+                "failed to query disk space on {}: {e}",
+                spill_root.display()
+            ),
         ))
     })?;
 
@@ -173,14 +317,14 @@ fn check_disk_space_for_spill(file_size: u64) -> Result<()> {
         let avail_mb = available / (1024 * 1024);
         let req_mb = required / (1024 * 1024);
         return Err(Error::InsufficientDiskSpace(format!(
-            "need ~{req_mb} MB in temp dir ({}) but only {avail_mb} MB available",
-            tmp.display()
+            "need ~{req_mb} MB in spill dir ({}) but only {avail_mb} MB available",
+            spill_root.display()
         )));
     }
 
     debug!(
-        "Disk space check passed: {available} bytes available, {required} bytes required (temp: {})",
-        tmp.display()
+        "Disk space check passed: {available} bytes available, {required} bytes required (spill: {})",
+        spill_root.display()
     );
     Ok(())
 }
@@ -213,6 +357,8 @@ pub struct PreparedUpload {
     pub prepared_chunks: Vec<PreparedChunk>,
     /// Payment intent for external signing.
     pub payment_intent: PaymentIntent,
+    /// The payment mode used for this upload.
+    pub payment_mode: PaymentMode,
 }
 
 /// Return type for [`spawn_file_encryption`]: chunk receiver, `DataMap` oneshot, join handle.
@@ -352,21 +498,26 @@ impl Client {
             spill.len()
         );
 
-        // Read each chunk from disk and collect quotes. Note: all PreparedChunks
-        // accumulate in memory because the external-signer protocol requires them
-        // for finalize_upload. This is NOT memory-bounded for large files.
+        // Read each chunk from disk and collect quotes concurrently.
+        // Note: all PreparedChunks accumulate in memory because the external-signer
+        // protocol requires them for finalize_upload. NOT memory-bounded for large files.
+        let chunk_data: Vec<Bytes> = spill
+            .addresses
+            .iter()
+            .map(|addr| spill.read_chunk(addr))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let concurrency = self.config().chunk_concurrency;
+        let results: Vec<Result<Option<PreparedChunk>>> = stream::iter(chunk_data)
+            .map(|content| async move { self.prepare_chunk_payment(content).await })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
         let mut prepared_chunks = Vec::with_capacity(spill.len());
-        for (i, addr) in spill.addresses.iter().enumerate() {
-            let content = spill.read_chunk(addr)?;
-            if let Some(prepared) = self.prepare_chunk_payment(content).await? {
+        for result in results {
+            if let Some(prepared) = result? {
                 prepared_chunks.push(prepared);
-            }
-            if (i + 1) % 100 == 0 {
-                info!(
-                    "Prepared {}/{} chunks for external signing",
-                    i + 1,
-                    spill.len()
-                );
             }
         }
 
@@ -383,6 +534,7 @@ impl Client {
             data_map,
             prepared_chunks,
             payment_intent,
+            payment_mode: PaymentMode::Single,
         })
     }
 
@@ -401,14 +553,25 @@ impl Client {
         tx_hash_map: &HashMap<QuoteHash, TxHash>,
     ) -> Result<FileUploadResult> {
         let paid_chunks = finalize_batch_payment(prepared.prepared_chunks, tx_hash_map)?;
-        let chunks_stored = self.store_paid_chunks(paid_chunks).await?.len();
+        let wave_result = self.store_paid_chunks(paid_chunks).await;
+        if !wave_result.failed.is_empty() {
+            let failed_count = wave_result.failed.len();
+            return Err(Error::PartialUpload {
+                stored: wave_result.stored.clone(),
+                stored_count: wave_result.stored.len(),
+                failed: wave_result.failed,
+                failed_count,
+                reason: "finalize_upload: chunk storage failed after retries".into(),
+            });
+        }
+        let chunks_stored = wave_result.stored.len();
 
         info!("External-signer upload finalized: {chunks_stored} chunks stored");
 
         Ok(FileUploadResult {
             data_map: prepared.data_map,
             chunks_stored,
-            payment_mode_used: PaymentMode::Single,
+            payment_mode_used: prepared.payment_mode,
         })
     }
 

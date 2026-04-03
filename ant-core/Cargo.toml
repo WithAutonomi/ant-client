@@ -97,3 +97,7 @@ path = "tests/e2e_merkle.rs"
 [[test]]
 name = "e2e_huge_file"
 path = "tests/e2e_huge_file.rs"
+
+[[test]]
+name = "e2e_upload_costs"
+path = "tests/e2e_upload_costs.rs"
