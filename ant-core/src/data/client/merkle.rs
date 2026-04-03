@@ -791,6 +791,119 @@ mod tests {
     }
 
     // =========================================================================
+    // finalize_merkle_batch (external signer)
+    // =========================================================================
+
+    fn make_dummy_candidate_nodes(
+        timestamp: u64,
+    ) -> [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] {
+        std::array::from_fn(|i| MerklePaymentCandidateNode {
+            pub_key: vec![i as u8; 32],
+            quoting_metrics: ant_evm::QuotingMetrics {
+                data_size: 1024,
+                data_type: 0,
+                close_records_stored: 0,
+                records_per_type: vec![],
+                max_records: 100,
+                received_payment_count: 0,
+                live_time: 0,
+                network_density: None,
+                network_size: None,
+            },
+            reward_address: ant_evm::RewardsAddress::new([i as u8; 20]),
+            merkle_payment_timestamp: timestamp,
+            signature: vec![i as u8; 64],
+        })
+    }
+
+    fn make_prepared_merkle_batch(count: usize) -> PreparedMerkleBatch {
+        let addrs = make_test_addresses(count);
+        let xornames: Vec<XorName> = addrs.iter().map(|a| XorName(*a)).collect();
+        let tree = MerkleTree::from_xornames(xornames).unwrap();
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let midpoints = tree.reward_candidates(timestamp).unwrap();
+
+        let candidate_pools: Vec<MerklePaymentCandidatePool> = midpoints
+            .into_iter()
+            .map(|mp| MerklePaymentCandidatePool {
+                midpoint_proof: mp,
+                candidate_nodes: make_dummy_candidate_nodes(timestamp),
+            })
+            .collect();
+
+        let pool_commitments = candidate_pools
+            .iter()
+            .map(MerklePaymentCandidatePool::to_commitment)
+            .collect();
+
+        PreparedMerkleBatch {
+            depth: tree.depth(),
+            pool_commitments,
+            merkle_payment_timestamp: timestamp,
+            candidate_pools,
+            tree,
+            addresses: addrs,
+        }
+    }
+
+    #[test]
+    fn test_finalize_merkle_batch_with_valid_winner() {
+        let prepared = make_prepared_merkle_batch(4);
+        let winner_hash = prepared.candidate_pools[0].hash();
+
+        let result = finalize_merkle_batch(prepared, winner_hash);
+        assert!(
+            result.is_ok(),
+            "should succeed with valid winner: {result:?}"
+        );
+
+        let batch = result.unwrap();
+        assert_eq!(batch.chunk_count, 4);
+        assert_eq!(batch.proofs.len(), 4);
+
+        // Every proof should be non-empty
+        for proof_bytes in batch.proofs.values() {
+            assert!(!proof_bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_finalize_merkle_batch_with_invalid_winner() {
+        let prepared = make_prepared_merkle_batch(4);
+        let bad_hash = [0xFF; 32];
+
+        let result = finalize_merkle_batch(prepared, bad_hash);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found in candidate pools"), "got: {err}");
+    }
+
+    #[test]
+    fn test_finalize_merkle_batch_proofs_are_deserializable() {
+        use ant_node::payment::deserialize_merkle_proof;
+
+        let prepared = make_prepared_merkle_batch(8);
+        let winner_hash = prepared.candidate_pools[0].hash();
+
+        let batch = finalize_merkle_batch(prepared, winner_hash).unwrap();
+
+        for (addr, proof_bytes) in &batch.proofs {
+            let proof = deserialize_merkle_proof(proof_bytes);
+            assert!(
+                proof.is_ok(),
+                "proof for {} should deserialize: {:?}",
+                hex::encode(addr),
+                proof.err()
+            );
+        }
+    }
+
+    // =========================================================================
     // Batch splitting edge cases
     // =========================================================================
 
