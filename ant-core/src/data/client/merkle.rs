@@ -603,7 +603,9 @@ mod send_assertions {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use evmlib::common::Amount;
     use evmlib::merkle_payments::{MerkleTree, CANDIDATES_PER_POOL};
+    use evmlib::RewardsAddress;
 
     // =========================================================================
     // should_use_merkle (free function, no Client needed)
@@ -799,18 +801,8 @@ mod tests {
     ) -> [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] {
         std::array::from_fn(|i| MerklePaymentCandidateNode {
             pub_key: vec![i as u8; 32],
-            quoting_metrics: ant_evm::QuotingMetrics {
-                data_size: 1024,
-                data_type: 0,
-                close_records_stored: 0,
-                records_per_type: vec![],
-                max_records: 100,
-                received_payment_count: 0,
-                live_time: 0,
-                network_density: None,
-                network_size: None,
-            },
-            reward_address: ant_evm::RewardsAddress::new([i as u8; 20]),
+            price: Amount::from(1024u64),
+            reward_address: RewardsAddress::new([i as u8; 20]),
             merkle_payment_timestamp: timestamp,
             signature: vec![i as u8; 64],
         })
