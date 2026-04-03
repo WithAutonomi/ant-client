@@ -7,7 +7,7 @@
 //! file into memory, see the `file` module.
 
 use crate::data::client::batch::{PaymentIntent, PreparedChunk};
-use crate::data::client::file::PreparedUpload;
+use crate::data::client::file::{ExternalPaymentInfo, PreparedUpload};
 use crate::data::client::merkle::PaymentMode;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
@@ -201,9 +201,10 @@ impl Client {
 
         Ok(PreparedUpload {
             data_map,
-            prepared_chunks,
-            payment_intent,
-            payment_mode: PaymentMode::Single,
+            payment_info: ExternalPaymentInfo::WaveBatch {
+                prepared_chunks,
+                payment_intent,
+            },
         })
     }
 
