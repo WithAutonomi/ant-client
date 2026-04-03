@@ -435,23 +435,23 @@ mod tests {
 
     #[test]
     fn payment_intent_from_single_chunk() {
-        // Median (index 2) gets 3x price, others get 0 — matches SingleNodePayment layout
-        let chunk = make_prepared_chunk([0, 0, 300, 0, 0]);
+        // Median (index 3) gets 3x price, others get 0 — matches SingleNodePayment layout
+        let chunk = make_prepared_chunk([0, 0, 0, 300, 0, 0, 0]);
         let intent = PaymentIntent::from_prepared_chunks(&[chunk]);
 
         assert_eq!(intent.payments.len(), 1, "only non-zero amounts");
         assert_eq!(intent.total_amount, Amount::from(300));
 
         let (hash, addr, amt) = &intent.payments[0];
-        assert_eq!(*hash, QuoteHash::from([3u8; 32])); // index 2 → byte 3
-        assert_eq!(*addr, RewardsAddress::new([12u8; 20])); // index 2 → byte 12
+        assert_eq!(*hash, QuoteHash::from([4u8; 32])); // index 3 → byte 4
+        assert_eq!(*addr, RewardsAddress::new([13u8; 20])); // index 3 → byte 13
         assert_eq!(*amt, Amount::from(300));
     }
 
     #[test]
     fn payment_intent_from_multiple_chunks() {
-        let c1 = make_prepared_chunk([0, 0, 100, 0, 0]);
-        let c2 = make_prepared_chunk([0, 0, 250, 0, 0]);
+        let c1 = make_prepared_chunk([0, 0, 0, 100, 0, 0, 0]);
+        let c2 = make_prepared_chunk([0, 0, 0, 250, 0, 0, 0]);
         let intent = PaymentIntent::from_prepared_chunks(&[c1, c2]);
 
         assert_eq!(intent.payments.len(), 2);
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn payment_intent_skips_all_zero_chunks() {
-        let chunk = make_prepared_chunk([0, 0, 0, 0, 0]);
+        let chunk = make_prepared_chunk([0, 0, 0, 0, 0, 0, 0]);
         let intent = PaymentIntent::from_prepared_chunks(&[chunk]);
 
         assert!(intent.payments.is_empty());
@@ -476,8 +476,8 @@ mod tests {
 
     #[test]
     fn finalize_batch_payment_builds_proofs() {
-        let chunk = make_prepared_chunk([0, 0, 500, 0, 0]);
-        let quote_hash = chunk.payment.quotes[2].quote_hash;
+        let chunk = make_prepared_chunk([0, 0, 0, 500, 0, 0, 0]);
+        let quote_hash = chunk.payment.quotes[3].quote_hash;
 
         let mut tx_map = HashMap::new();
         tx_map.insert(quote_hash, TxHash::from([0xBB; 32]));
@@ -499,7 +499,7 @@ mod tests {
     fn finalize_batch_payment_missing_tx_hash_errors() {
         // Missing tx hash for a non-zero-amount quote should error,
         // since the chunk would be rejected by the network without a valid proof.
-        let chunk = make_prepared_chunk([0, 0, 500, 0, 0]);
+        let chunk = make_prepared_chunk([0, 0, 0, 500, 0, 0, 0]);
 
         let result = finalize_batch_payment(vec![chunk], &HashMap::new());
         assert!(result.is_err());
@@ -509,9 +509,9 @@ mod tests {
 
     #[test]
     fn finalize_batch_payment_multiple_chunks() {
-        let c1 = make_prepared_chunk([0, 0, 100, 0, 0]);
-        let c2 = make_prepared_chunk([0, 0, 200, 0, 0]);
-        let q1 = c1.payment.quotes[2].quote_hash;
+        let c1 = make_prepared_chunk([0, 0, 0, 100, 0, 0, 0]);
+        let c2 = make_prepared_chunk([0, 0, 0, 200, 0, 0, 0]);
+        let q1 = c1.payment.quotes[3].quote_hash;
         let mut tx_map = HashMap::new();
         // Both chunks have the same quote_hash (same index/byte pattern)
         // so one tx_hash covers both
