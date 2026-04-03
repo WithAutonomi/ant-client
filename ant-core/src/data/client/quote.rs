@@ -10,7 +10,6 @@ use ant_node::ant_protocol::{
 };
 use ant_node::client::send_and_await_chunk_response;
 use ant_node::core::{MultiAddr, PeerId};
-use ant_node::payment::calculate_price;
 use ant_node::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
 use evmlib::common::Amount;
 use evmlib::PaymentQuote;
@@ -107,7 +106,7 @@ impl Client {
                             }
                             match rmp_serde::from_slice::<PaymentQuote>(&quote) {
                                 Ok(payment_quote) => {
-                                    let price = calculate_price(&payment_quote.quoting_metrics);
+                                    let price = payment_quote.price;
                                     debug!("Received quote from {peer_id_clone}: price = {price}");
                                     Some(Ok((payment_quote, price)))
                                 }

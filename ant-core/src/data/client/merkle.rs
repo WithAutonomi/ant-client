@@ -376,12 +376,8 @@ impl Client {
             candidate_futures.push(fut);
         }
 
-        self.collect_validated_candidates(
-            &mut candidate_futures,
-            merkle_payment_timestamp,
-            data_type,
-        )
-        .await
+        self.collect_validated_candidates(&mut candidate_futures, merkle_payment_timestamp)
+            .await
     }
 
     /// Collect and validate merkle candidate responses until we have enough.
@@ -396,7 +392,6 @@ impl Client {
             >,
         >,
         merkle_payment_timestamp: u64,
-        expected_data_type: u32,
     ) -> Result<[MerklePaymentCandidateNode; CANDIDATES_PER_POOL]> {
         let mut candidates = Vec::with_capacity(CANDIDATES_PER_POOL);
         let mut failures: Vec<String> = Vec::new();
@@ -412,14 +407,6 @@ impl Client {
                     if candidate.merkle_payment_timestamp != merkle_payment_timestamp {
                         warn!("Timestamp mismatch from merkle candidate {peer_id}");
                         failures.push(format!("{peer_id}: timestamp mismatch"));
-                        continue;
-                    }
-                    if candidate.quoting_metrics.data_type != expected_data_type {
-                        warn!(
-                            "Data type mismatch from {peer_id}: expected {expected_data_type}, got {}",
-                            candidate.quoting_metrics.data_type
-                        );
-                        failures.push(format!("{peer_id}: wrong data_type"));
                         continue;
                     }
                     candidates.push(candidate);
@@ -633,8 +620,8 @@ mod tests {
     #[test]
     fn test_merkle_proof_serialize_deserialize_roundtrip() {
         use ant_node::payment::{deserialize_merkle_proof, serialize_merkle_proof};
+        use evmlib::common::Amount;
         use evmlib::merkle_payments::MerklePaymentCandidateNode;
-        use evmlib::quoting_metrics::QuotingMetrics;
         use evmlib::RewardsAddress;
 
         let addrs = make_test_addresses(4);
@@ -654,17 +641,7 @@ mod tests {
         let candidate_nodes: [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] =
             std::array::from_fn(|i| MerklePaymentCandidateNode {
                 pub_key: vec![i as u8; 32],
-                quoting_metrics: QuotingMetrics {
-                    data_size: 1024,
-                    data_type: 0,
-                    close_records_stored: 0,
-                    records_per_type: vec![],
-                    max_records: 100,
-                    received_payment_count: 0,
-                    live_time: 0,
-                    network_density: None,
-                    network_size: None,
-                },
+                price: Amount::from(1024u64),
                 reward_address: RewardsAddress::new([i as u8; 20]),
                 merkle_payment_timestamp: timestamp,
                 signature: vec![i as u8; 64],
@@ -702,17 +679,7 @@ mod tests {
         // Simulates what collect_validated_candidates checks
         let candidate = MerklePaymentCandidateNode {
             pub_key: vec![0u8; 32],
-            quoting_metrics: evmlib::quoting_metrics::QuotingMetrics {
-                data_size: 0,
-                data_type: 0,
-                close_records_stored: 0,
-                records_per_type: vec![],
-                max_records: 0,
-                received_payment_count: 0,
-                live_time: 0,
-                network_density: None,
-                network_size: None,
-            },
+            price: evmlib::common::Amount::ZERO,
             reward_address: evmlib::RewardsAddress::new([0u8; 20]),
             merkle_payment_timestamp: 1000,
             signature: vec![0u8; 64],
@@ -720,30 +687,6 @@ mod tests {
 
         // Timestamp check: 1000 != 2000
         assert_ne!(candidate.merkle_payment_timestamp, 2000);
-    }
-
-    #[test]
-    fn test_candidate_wrong_data_type_rejected() {
-        let candidate = MerklePaymentCandidateNode {
-            pub_key: vec![0u8; 32],
-            quoting_metrics: evmlib::quoting_metrics::QuotingMetrics {
-                data_size: 0,
-                data_type: 1, // scratchpad
-                close_records_stored: 0,
-                records_per_type: vec![],
-                max_records: 0,
-                received_payment_count: 0,
-                live_time: 0,
-                network_density: None,
-                network_size: None,
-            },
-            reward_address: evmlib::RewardsAddress::new([0u8; 20]),
-            merkle_payment_timestamp: 1000,
-            signature: vec![0u8; 64],
-        };
-
-        // data_type check: 1 (scratchpad) != 0 (chunk)
-        assert_ne!(candidate.quoting_metrics.data_type, 0);
     }
 
     // =========================================================================

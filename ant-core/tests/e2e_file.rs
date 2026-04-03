@@ -9,11 +9,11 @@ use serial_test::serial;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use support::MiniTestnet;
+use support::{MiniTestnet, DEFAULT_NODE_COUNT};
 use tempfile::{NamedTempFile, TempDir};
 
 async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(6).await;
+    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(3).expect("Node 3 should exist");
 
     let client = Client::from_node(Arc::clone(&node), ClientConfig::default())

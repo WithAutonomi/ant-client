@@ -13,7 +13,6 @@ use ant_node::core::{MultiAddr, PeerId};
 use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use bytes::Bytes;
 use evmlib::common::{Amount, QuoteHash, TxHash};
-use evmlib::contract::payment_vault::get_market_price;
 use evmlib::wallet::PayForQuotesError;
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use futures::stream::{self, StreamExt};
@@ -144,7 +143,7 @@ pub fn finalize_batch_payment(
 impl Client {
     /// Prepare a single chunk for batch payment.
     ///
-    /// Collects quotes and fetches contract prices without making any
+    /// Collects quotes and uses node-reported prices without making any
     /// on-chain transaction. Returns `Ok(None)` if the chunk is already
     /// stored on the network.
     ///
@@ -168,44 +167,21 @@ impl Client {
             Err(e) => return Err(e),
         };
 
-        let evm_network = self.require_evm_network()?;
-
         // Capture all quoted peers for close-group replication.
         let quoted_peers: Vec<(PeerId, Vec<MultiAddr>)> = quotes_with_peers
             .iter()
             .map(|(peer_id, addrs, _, _)| (*peer_id, addrs.clone()))
             .collect();
 
-        // Fetch authoritative prices from the on-chain contract.
-        let metrics_batch: Vec<_> = quotes_with_peers
-            .iter()
-            .map(|(_, _, quote, _)| quote.quoting_metrics.clone())
-            .collect();
-
-        let contract_prices = get_market_price(evm_network, metrics_batch)
-            .await
-            .map_err(|e| {
-                Error::Payment(format!("Failed to get market prices from contract: {e}"))
-            })?;
-
-        if contract_prices.len() != quotes_with_peers.len() {
-            return Err(Error::Payment(format!(
-                "Contract returned {} prices for {} quotes",
-                contract_prices.len(),
-                quotes_with_peers.len()
-            )));
-        }
-
         // Build peer_quotes for ProofOfPayment + quotes for SingleNodePayment.
+        // Use node-reported prices directly — no contract price fetch needed.
         let mut peer_quotes = Vec::with_capacity(quotes_with_peers.len());
         let mut quotes_for_payment = Vec::with_capacity(quotes_with_peers.len());
 
-        for ((peer_id, _addrs, quote, _local_price), contract_price) in
-            quotes_with_peers.into_iter().zip(contract_prices)
-        {
+        for (peer_id, _addrs, quote, price) in quotes_with_peers {
             let encoded = peer_id_to_encoded(&peer_id)?;
             peer_quotes.push((encoded, quote.clone()));
-            quotes_for_payment.push((quote, contract_price));
+            quotes_for_payment.push((quote, price));
         }
 
         let payment = SingleNodePayment::from_quotes(quotes_for_payment)
@@ -437,31 +413,23 @@ mod tests {
     use super::*;
     use ant_node::payment::single_node::QuotePaymentInfo;
     use ant_node::CLOSE_GROUP_SIZE;
-    use evmlib::quoting_metrics::QuotingMetrics;
 
-    fn test_metrics() -> QuotingMetrics {
-        QuotingMetrics {
-            data_size: 0,
-            data_type: 0,
-            close_records_stored: 0,
-            records_per_type: vec![],
-            max_records: 0,
-            received_payment_count: 0,
-            live_time: 0,
-            network_density: None,
-            network_size: None,
-        }
-    }
+    /// Median index in the quotes array.
+    const MEDIAN_INDEX: usize = CLOSE_GROUP_SIZE / 2;
 
-    /// Helper: build a PreparedChunk with specified payment amounts.
-    fn make_prepared_chunk(amounts: [u64; CLOSE_GROUP_SIZE]) -> PreparedChunk {
-        let quotes: [QuotePaymentInfo; CLOSE_GROUP_SIZE] =
-            std::array::from_fn(|i| QuotePaymentInfo {
+    /// Helper: build a `PreparedChunk` with `median_amount` at the median
+    /// quote index and zero for all other quotes. Adapts automatically to
+    /// `CLOSE_GROUP_SIZE` changes.
+    fn make_prepared_chunk(median_amount: u64) -> PreparedChunk {
+        let quotes: [QuotePaymentInfo; CLOSE_GROUP_SIZE] = std::array::from_fn(|i| {
+            let amount = if i == MEDIAN_INDEX { median_amount } else { 0 };
+            QuotePaymentInfo {
                 quote_hash: QuoteHash::from([i as u8 + 1; 32]),
                 rewards_address: RewardsAddress::new([i as u8 + 10; 20]),
-                amount: Amount::from(amounts[i]),
-                quoting_metrics: test_metrics(),
-            });
+                amount: Amount::from(amount),
+                price: Amount::from(amount),
+            }
+        });
 
         PreparedChunk {
             content: Bytes::from(vec![0xAA; 32]),
@@ -474,23 +442,22 @@ mod tests {
 
     #[test]
     fn payment_intent_from_single_chunk() {
-        // Median (index 2) gets 3x price, others get 0 — matches SingleNodePayment layout
-        let chunk = make_prepared_chunk([0, 0, 300, 0, 0]);
+        let chunk = make_prepared_chunk(300);
         let intent = PaymentIntent::from_prepared_chunks(&[chunk]);
 
         assert_eq!(intent.payments.len(), 1, "only non-zero amounts");
         assert_eq!(intent.total_amount, Amount::from(300));
 
         let (hash, addr, amt) = &intent.payments[0];
-        assert_eq!(*hash, QuoteHash::from([3u8; 32])); // index 2 → byte 3
-        assert_eq!(*addr, RewardsAddress::new([12u8; 20])); // index 2 → byte 12
+        assert_eq!(*hash, QuoteHash::from([MEDIAN_INDEX as u8 + 1; 32]));
+        assert_eq!(*addr, RewardsAddress::new([MEDIAN_INDEX as u8 + 10; 20]));
         assert_eq!(*amt, Amount::from(300));
     }
 
     #[test]
     fn payment_intent_from_multiple_chunks() {
-        let c1 = make_prepared_chunk([0, 0, 100, 0, 0]);
-        let c2 = make_prepared_chunk([0, 0, 250, 0, 0]);
+        let c1 = make_prepared_chunk(100);
+        let c2 = make_prepared_chunk(250);
         let intent = PaymentIntent::from_prepared_chunks(&[c1, c2]);
 
         assert_eq!(intent.payments.len(), 2);
@@ -499,7 +466,7 @@ mod tests {
 
     #[test]
     fn payment_intent_skips_all_zero_chunks() {
-        let chunk = make_prepared_chunk([0, 0, 0, 0, 0]);
+        let chunk = make_prepared_chunk(0);
         let intent = PaymentIntent::from_prepared_chunks(&[chunk]);
 
         assert!(intent.payments.is_empty());
@@ -515,8 +482,8 @@ mod tests {
 
     #[test]
     fn finalize_batch_payment_builds_proofs() {
-        let chunk = make_prepared_chunk([0, 0, 500, 0, 0]);
-        let quote_hash = chunk.payment.quotes[2].quote_hash;
+        let chunk = make_prepared_chunk(500);
+        let quote_hash = chunk.payment.quotes[MEDIAN_INDEX].quote_hash;
 
         let mut tx_map = HashMap::new();
         tx_map.insert(quote_hash, TxHash::from([0xBB; 32]));
@@ -538,7 +505,7 @@ mod tests {
     fn finalize_batch_payment_missing_tx_hash_errors() {
         // Missing tx hash for a non-zero-amount quote should error,
         // since the chunk would be rejected by the network without a valid proof.
-        let chunk = make_prepared_chunk([0, 0, 500, 0, 0]);
+        let chunk = make_prepared_chunk(500);
 
         let result = finalize_batch_payment(vec![chunk], &HashMap::new());
         assert!(result.is_err());
@@ -548,9 +515,9 @@ mod tests {
 
     #[test]
     fn finalize_batch_payment_multiple_chunks() {
-        let c1 = make_prepared_chunk([0, 0, 100, 0, 0]);
-        let c2 = make_prepared_chunk([0, 0, 200, 0, 0]);
-        let q1 = c1.payment.quotes[2].quote_hash;
+        let c1 = make_prepared_chunk(100);
+        let c2 = make_prepared_chunk(200);
+        let q1 = c1.payment.quotes[MEDIAN_INDEX].quote_hash;
         let mut tx_map = HashMap::new();
         // Both chunks have the same quote_hash (same index/byte pattern)
         // so one tx_hash covers both

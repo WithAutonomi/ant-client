@@ -9,10 +9,10 @@ use bytes::Bytes;
 use self_encryption::encrypt;
 use serial_test::serial;
 use std::sync::Arc;
-use support::MiniTestnet;
+use support::{MiniTestnet, DEFAULT_NODE_COUNT};
 
 async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(8).await;
+    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(4).expect("Node 4 should exist");
 
     let client = Client::from_node(Arc::clone(&node), ClientConfig::default())

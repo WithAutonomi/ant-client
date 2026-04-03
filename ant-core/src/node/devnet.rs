@@ -48,8 +48,7 @@ impl LocalDevnet {
             .default_wallet_private_key()
             .map_err(|e| Error::Config(format!("failed to get wallet key: {e}")))?;
 
-        let (rpc_url, token_addr, payments_addr, merkle_addr) =
-            extract_custom_network_info(&network)?;
+        let (rpc_url, token_addr, vault_addr) = extract_custom_network_info(&network)?;
 
         config.evm_network = Some(network.clone());
 
@@ -70,8 +69,7 @@ impl LocalDevnet {
             rpc_url,
             wallet_private_key: wallet_key.clone(),
             payment_token_address: token_addr,
-            data_payments_address: payments_addr,
-            merkle_payments_address: merkle_addr,
+            payment_vault_address: vault_addr,
         };
 
         let manifest = DevnetManifest {
@@ -192,21 +190,16 @@ impl LocalDevnet {
     }
 }
 
-/// Extract RPC URL, token address, payments address, and merkle address from a Custom network.
-fn extract_custom_network_info(
-    network: &EvmNetwork,
-) -> Result<(String, String, String, Option<String>)> {
+/// Extract RPC URL, token address, and payment vault address from a Custom network.
+fn extract_custom_network_info(network: &EvmNetwork) -> Result<(String, String, String)> {
     match network {
         EvmNetwork::Custom(custom) => {
             let token = custom.payment_token_address;
-            let payments = custom.data_payments_address;
+            let vault = custom.payment_vault_address;
             Ok((
                 custom.rpc_url_http.to_string(),
                 format!("{token:?}"),
-                format!("{payments:?}"),
-                custom
-                    .merkle_payments_address
-                    .map(|addr| format!("{addr:?}")),
+                format!("{vault:?}"),
             ))
         }
         _ => Err(Error::Config(

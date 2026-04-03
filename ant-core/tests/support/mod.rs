@@ -24,6 +24,7 @@ use ant_node::payment::{
     QuotingMetricsTracker,
 };
 use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
+use ant_node::CLOSE_GROUP_SIZE;
 use evmlib::testnet::Testnet;
 use evmlib::wallet::Wallet;
 use evmlib::Network as EvmNetwork;
@@ -40,12 +41,17 @@ const BOOTSTRAP_COUNT: usize = 2;
 const SPAWN_DELAY_MS: u64 = 200;
 const STABILIZATION_TIMEOUT_SECS: u64 = 180;
 
+/// Default node count for standard E2E tests. Must exceed `CLOSE_GROUP_SIZE`
+/// so that quote collection can find enough peers.
+pub const DEFAULT_NODE_COUNT: usize = CLOSE_GROUP_SIZE + 1;
+
+/// Index of the median quote in a `SingleNodePayment` quotes array.
+pub const MEDIAN_QUOTE_INDEX: usize = CLOSE_GROUP_SIZE / 2;
+
 /// Test rewards address (20 bytes, all 0x01).
 const TEST_REWARDS_ADDRESS: [u8; 20] = [0x01; 20];
 /// Max records for quoting metrics.
 const TEST_MAX_RECORDS: usize = 1280;
-/// Initial records for quoting metrics.
-const TEST_INITIAL_RECORDS: usize = 1000;
 
 pub struct TestNode {
     pub p2p_node: Option<Arc<P2PNode>>,
@@ -65,7 +71,7 @@ pub struct MiniTestnet {
 impl MiniTestnet {
     /// Start a testnet with the given number of nodes.
     ///
-    /// Use 6 for standard tests, 35+ for merkle tests (need 16 peers per pool).
+    /// Use `DEFAULT_NODE_COUNT` for standard tests, 35+ for merkle tests (need 16 peers per pool).
     pub async fn start(node_count: usize) -> Self {
         // Start Anvil EVM testnet FIRST
         let testnet = Testnet::new().await.expect("start Anvil testnet");
@@ -153,20 +159,12 @@ impl MiniTestnet {
             sleep(Duration::from_millis(500)).await;
         }
 
-        // Approve token spend for data payments contract
-        let data_payments_address = evm_network.data_payments_address();
+        // Approve token spend for the unified payment vault contract
+        let vault_address = evm_network.payment_vault_address();
         wallet
-            .approve_to_spend_tokens(*data_payments_address, evmlib::common::U256::MAX)
+            .approve_to_spend_tokens(*vault_address, evmlib::common::U256::MAX)
             .await
-            .expect("approve data payment token spend");
-
-        // Approve token spend for merkle payments contract (if deployed)
-        if let Some(merkle_address) = evm_network.merkle_payments_address() {
-            wallet
-                .approve_to_spend_tokens(*merkle_address, evmlib::common::U256::MAX)
-                .await
-                .expect("approve merkle payment token spend");
-        }
+            .expect("approve payment vault token spend");
 
         Self {
             nodes,
@@ -225,8 +223,8 @@ impl MiniTestnet {
         let storage_config = LmdbStorageConfig {
             root_dir: data_dir.to_path_buf(),
             verify_on_read: true,
-            max_chunks: 0,
             max_map_size: 0,
+            disk_reserve: 0,
         };
         let storage = Arc::new(
             LmdbStorage::new(storage_config)
@@ -250,7 +248,7 @@ impl MiniTestnet {
             local_rewards_address: rewards_address,
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
-        let metrics_tracker = QuotingMetricsTracker::new(TEST_MAX_RECORDS, TEST_INITIAL_RECORDS);
+        let metrics_tracker = QuotingMetricsTracker::new(TEST_MAX_RECORDS);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing so quotes are properly signed and verifiable

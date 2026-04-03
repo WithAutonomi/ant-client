@@ -118,7 +118,7 @@ impl Client {
     /// Set the wallet for payment operations.
     ///
     /// Also populates the EVM network from the wallet so that
-    /// price queries work without a separate `with_evm_network` call.
+    /// token approvals work without a separate `with_evm_network` call.
     #[must_use]
     pub fn with_wallet(mut self, wallet: Wallet) -> Self {
         self.evm_network = Some(wallet.network().clone());
@@ -126,9 +126,9 @@ impl Client {
         self
     }
 
-    /// Set the EVM network for price queries without requiring a wallet.
+    /// Set the EVM network without requiring a wallet.
     ///
-    /// This enables operations like quote collection and cost estimation
+    /// This enables token approval and contract interactions
     /// for external-signer flows where the private key lives outside Rust.
     #[must_use]
     pub fn with_evm_network(mut self, network: evmlib::Network) -> Self {

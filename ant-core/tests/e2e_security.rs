@@ -11,14 +11,14 @@ use ant_core::data::{compute_address, Client, ClientConfig};
 use ant_node::core::PeerId;
 use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use bytes::Bytes;
-use evmlib::common::TxHash;
-use evmlib::{EncodedPeerId, ProofOfPayment};
+use evmlib::common::{Amount, TxHash};
+use evmlib::{EncodedPeerId, ProofOfPayment, RewardsAddress};
 use serial_test::serial;
 use std::sync::Arc;
-use support::MiniTestnet;
+use support::{MiniTestnet, DEFAULT_NODE_COUNT, MEDIAN_QUOTE_INDEX};
 
 async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(6).await;
+    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(3).expect("Node 3 should exist");
     let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
         .with_wallet(testnet.wallet().clone());
@@ -339,7 +339,7 @@ async fn test_attack_corrupted_public_key() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_attack_client_without_wallet() {
-    let testnet = MiniTestnet::start(6).await;
+    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(3).expect("Node 3 should exist");
 
     // Create client WITHOUT wallet
@@ -354,6 +354,175 @@ async fn test_attack_client_without_wallet() {
     assert!(
         err_lower.contains("wallet"),
         "Error should mention wallet, got: {err_msg}"
+    );
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+// ─── Test 9: Underpayment — Single Node ─────────────────────────────────────
+//
+// Collects real quotes, builds a valid SingleNodePayment, then tampers with
+// the median quote's amount (reducing it to 1 atto). Pays on-chain with the
+// reduced amount. The node's on-chain verifyPayment check should detect that
+// the paid amount is far below the expected 3× median price and reject the PUT.
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_attack_underpayment_single_node() {
+    let (client, testnet) = setup().await;
+
+    let content = Bytes::from("underpayment attack: client pays too little");
+    let address = compute_address(&content);
+    let data_size = content.len() as u64;
+
+    // 1. Collect real quotes from close group
+    let quotes = client
+        .get_store_quotes(&address, data_size, 0)
+        .await
+        .expect("quote collection should succeed");
+
+    // Save (PeerId, RewardsAddress) mapping before consuming quotes — needed
+    // to target the median peer after from_quotes() sorts internally.
+    let peer_by_rewards: Vec<(PeerId, RewardsAddress)> = quotes
+        .iter()
+        .map(|(pid, _, q, _)| (*pid, q.rewards_address))
+        .collect();
+
+    // 2. Build SingleNodePayment normally (sorts by price, median gets 3×)
+    let mut peer_quotes = Vec::with_capacity(quotes.len());
+    let mut quotes_for_payment = Vec::with_capacity(quotes.len());
+    for (peer_id, _addrs, quote, price) in quotes {
+        let encoded = EncodedPeerId::new(*peer_id.as_bytes());
+        peer_quotes.push((encoded, quote.clone()));
+        quotes_for_payment.push((quote, price));
+    }
+
+    let mut payment = SingleNodePayment::from_quotes(quotes_for_payment)
+        .expect("payment creation should succeed");
+
+    // Target the median peer specifically — it's the only one that receives
+    // payment, so only it will detect the amount mismatch in verifyPayment().
+    let original_amount = payment.quotes[MEDIAN_QUOTE_INDEX].amount;
+    let median_rewards = payment.quotes[MEDIAN_QUOTE_INDEX].rewards_address;
+    let target_peer = peer_by_rewards
+        .iter()
+        .find(|(_, addr)| *addr == median_rewards)
+        .expect("median rewards address must match a quoted peer")
+        .0;
+    assert!(
+        !original_amount.is_zero(),
+        "Median quote should have non-zero payment amount"
+    );
+
+    // 3. Tamper: reduce median payment to 1 atto (should be 3× median price)
+    payment.quotes[MEDIAN_QUOTE_INDEX].amount = Amount::from(1u64);
+
+    // 4. Pay on-chain with the reduced amount — the contract records whatever
+    //    amount is sent, it only validates amounts in verifyPayment()
+    let wallet = client.wallet().expect("wallet should be set");
+    let tx_hashes = payment
+        .pay(wallet)
+        .await
+        .expect("on-chain payment should succeed (contract accepts any amount in payForQuotes)");
+
+    assert!(
+        !tx_hashes.is_empty(),
+        "Should have at least one tx hash for the 1-atto payment"
+    );
+
+    // 5. Build proof with real ML-DSA-65 signed quotes but underpaid tx
+    let proof = PaymentProof {
+        proof_of_payment: ProofOfPayment { peer_quotes },
+        tx_hashes,
+    };
+    let proof_bytes = serialize_single_node_proof(&proof).expect("serialize proof");
+
+    // 6. PUT should be REJECTED — node's verifyPayment detects 1 atto < 3× expected
+    let result = client
+        .chunk_put_with_proof(content, proof_bytes, &target_peer, &[])
+        .await;
+
+    assert!(
+        result.is_err(),
+        "PUT with underpayment (1 atto instead of {original_amount}) should be rejected"
+    );
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+// ─── Test 10: Underpayment — Pay Half the Required Amount ───────────────────
+//
+// Verifies the boundary more closely: pays roughly half the expected 3× median
+// price. The contract should still reject this because the amount is below the
+// 3× threshold, even though it's not trivially small like 1 atto.
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_attack_underpayment_half_price() {
+    let (client, testnet) = setup().await;
+
+    let content = Bytes::from("half-price underpayment attack test data");
+    let address = compute_address(&content);
+    let data_size = content.len() as u64;
+
+    let quotes = client
+        .get_store_quotes(&address, data_size, 0)
+        .await
+        .expect("quote collection should succeed");
+
+    let peer_by_rewards: Vec<(PeerId, RewardsAddress)> = quotes
+        .iter()
+        .map(|(pid, _, q, _)| (*pid, q.rewards_address))
+        .collect();
+
+    let mut peer_quotes = Vec::with_capacity(quotes.len());
+    let mut quotes_for_payment = Vec::with_capacity(quotes.len());
+    for (peer_id, _addrs, quote, price) in quotes {
+        let encoded = EncodedPeerId::new(*peer_id.as_bytes());
+        peer_quotes.push((encoded, quote.clone()));
+        quotes_for_payment.push((quote, price));
+    }
+
+    let mut payment = SingleNodePayment::from_quotes(quotes_for_payment)
+        .expect("payment creation should succeed");
+
+    // Halve the median payment (3× → ~1.5×).
+    // Target the median peer — only it verifies the amount it received.
+    let original_amount = payment.quotes[MEDIAN_QUOTE_INDEX].amount;
+    let median_rewards = payment.quotes[MEDIAN_QUOTE_INDEX].rewards_address;
+    let target_peer = peer_by_rewards
+        .iter()
+        .find(|(_, addr)| *addr == median_rewards)
+        .expect("median rewards address must match a quoted peer")
+        .0;
+    let half_amount = original_amount / Amount::from(2u64);
+    assert!(
+        !half_amount.is_zero(),
+        "Half of original amount should still be non-zero"
+    );
+    payment.quotes[MEDIAN_QUOTE_INDEX].amount = half_amount;
+
+    let wallet = client.wallet().expect("wallet should be set");
+    let tx_hashes = payment
+        .pay(wallet)
+        .await
+        .expect("on-chain payment should succeed");
+
+    let proof = PaymentProof {
+        proof_of_payment: ProofOfPayment { peer_quotes },
+        tx_hashes,
+    };
+    let proof_bytes = serialize_single_node_proof(&proof).expect("serialize proof");
+
+    let result = client
+        .chunk_put_with_proof(content, proof_bytes, &target_peer, &[])
+        .await;
+
+    assert!(
+        result.is_err(),
+        "PUT with half-price payment ({half_amount} instead of {original_amount}) should be rejected"
     );
 
     drop(client);

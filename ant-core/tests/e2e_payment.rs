@@ -11,10 +11,10 @@ use ant_core::data::{compute_address, Client, ClientConfig};
 use bytes::Bytes;
 use serial_test::serial;
 use std::sync::Arc;
-use support::MiniTestnet;
+use support::{MiniTestnet, DEFAULT_NODE_COUNT};
 
 async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(6).await;
+    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(3).expect("Node 3 should exist");
     let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
         .with_wallet(testnet.wallet().clone());
@@ -110,7 +110,7 @@ async fn test_concurrent_paid_uploads() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_payment_required_enforcement() {
-    let testnet = MiniTestnet::start(6).await;
+    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(3).expect("Node 3 should exist");
 
     // Client with wallet for the paid test
@@ -286,7 +286,7 @@ async fn test_quote_collection() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_chunk_put_fails_with_insufficient_funds() {
-    let testnet = MiniTestnet::start(6).await;
+    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(3).expect("Node 3 should exist");
 
     // Create a wallet with zero balance by using a random private key
@@ -318,11 +318,11 @@ async fn test_chunk_put_fails_with_insufficient_funds() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_payment_flow_with_node_failure() {
-    let mut testnet = MiniTestnet::start(6).await;
+    let mut testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
 
-    // With a 6-node testnet and CLOSE_GROUP_SIZE = 5, we need exactly 5
-    // remote peers. The client's own node is excluded from quote collection,
-    // so killing even one node leaves only 4 remote peers — not enough.
+    // We need CLOSE_GROUP_SIZE remote peers for quote collection. The
+    // client's own node is excluded, so with DEFAULT_NODE_COUNT nodes
+    // killing one leaves only CLOSE_GROUP_SIZE - 1 remote peers — not enough.
     //
     // Instead, verify the payment flow survives a brief disruption: shut
     // down a node, wait, then bring it back by verifying the remaining
@@ -341,7 +341,11 @@ async fn test_payment_flow_with_node_failure() {
     // Shut down node 5
     testnet.shutdown_node(5);
     let remaining = testnet.running_node_count();
-    assert_eq!(remaining, 5, "Should have 5 nodes after shutting down 1");
+    assert_eq!(
+        remaining,
+        DEFAULT_NODE_COUNT - 1,
+        "Should have one fewer node after shutting down 1"
+    );
 
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
