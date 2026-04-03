@@ -19,6 +19,7 @@ use ant_node::client::compute_address;
 use bytes::Bytes;
 use evmlib::common::QuoteHash;
 use evmlib::common::TxHash;
+use fs2::FileExt;
 use futures::stream::{self, StreamExt};
 use self_encryption::{stream_encrypt, streaming_decrypt, DataMap};
 use std::collections::{HashMap, HashSet};
@@ -106,7 +107,6 @@ impl ChunkSpill {
                 format!("failed to create spill lockfile: {e}"),
             ))
         })?;
-        use fs2::FileExt;
         lock_file.try_lock_exclusive().map_err(|e| {
             Error::Io(std::io::Error::new(
                 e.kind(),
