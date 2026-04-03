@@ -15,10 +15,10 @@ use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, ProofOfPayment, RewardsAddress};
 use serial_test::serial;
 use std::sync::Arc;
-use support::MiniTestnet;
+use support::{MiniTestnet, DEFAULT_NODE_COUNT, MEDIAN_QUOTE_INDEX};
 
 async fn setup() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(6).await;
+    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(3).expect("Node 3 should exist");
     let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
         .with_wallet(testnet.wallet().clone());
@@ -339,7 +339,7 @@ async fn test_attack_corrupted_public_key() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_attack_client_without_wallet() {
-    let testnet = MiniTestnet::start(6).await;
+    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(3).expect("Node 3 should exist");
 
     // Create client WITHOUT wallet
@@ -401,11 +401,10 @@ async fn test_attack_underpayment_single_node() {
     let mut payment = SingleNodePayment::from_quotes(quotes_for_payment)
         .expect("payment creation should succeed");
 
-    // Median is at index 2 (CLOSE_GROUP_SIZE=5, sorted by price).
     // Target the median peer specifically — it's the only one that receives
     // payment, so only it will detect the amount mismatch in verifyPayment().
-    let original_amount = payment.quotes[2].amount;
-    let median_rewards = payment.quotes[2].rewards_address;
+    let original_amount = payment.quotes[MEDIAN_QUOTE_INDEX].amount;
+    let median_rewards = payment.quotes[MEDIAN_QUOTE_INDEX].rewards_address;
     let target_peer = peer_by_rewards
         .iter()
         .find(|(_, addr)| *addr == median_rewards)
@@ -413,11 +412,11 @@ async fn test_attack_underpayment_single_node() {
         .0;
     assert!(
         !original_amount.is_zero(),
-        "Median quote (index 2) should have non-zero payment amount"
+        "Median quote should have non-zero payment amount"
     );
 
     // 3. Tamper: reduce median payment to 1 atto (should be 3× median price)
-    payment.quotes[2].amount = Amount::from(1u64);
+    payment.quotes[MEDIAN_QUOTE_INDEX].amount = Amount::from(1u64);
 
     // 4. Pay on-chain with the reduced amount — the contract records whatever
     //    amount is sent, it only validates amounts in verifyPayment()
@@ -491,8 +490,8 @@ async fn test_attack_underpayment_half_price() {
 
     // Halve the median payment (3× → ~1.5×).
     // Target the median peer — only it verifies the amount it received.
-    let original_amount = payment.quotes[2].amount;
-    let median_rewards = payment.quotes[2].rewards_address;
+    let original_amount = payment.quotes[MEDIAN_QUOTE_INDEX].amount;
+    let median_rewards = payment.quotes[MEDIAN_QUOTE_INDEX].rewards_address;
     let target_peer = peer_by_rewards
         .iter()
         .find(|(_, addr)| *addr == median_rewards)
@@ -503,7 +502,7 @@ async fn test_attack_underpayment_half_price() {
         !half_amount.is_zero(),
         "Half of original amount should still be non-zero"
     );
-    payment.quotes[2].amount = half_amount;
+    payment.quotes[MEDIAN_QUOTE_INDEX].amount = half_amount;
 
     let wallet = client.wallet().expect("wallet should be set");
     let tx_hashes = payment

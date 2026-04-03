@@ -11,7 +11,7 @@ use ant_core::data::{Client, ClientConfig};
 use serial_test::serial;
 use std::io::Write;
 use std::sync::Arc;
-use support::MiniTestnet;
+use support::{MiniTestnet, DEFAULT_NODE_COUNT};
 use tempfile::TempDir;
 
 /// Size of the 1 GB test file.
@@ -26,7 +26,7 @@ const FILE_SIZE_1GB: u64 = 1024 * 1024 * 1024;
 const MAX_RSS_INCREASE_BYTES: u64 = 512 * 1024 * 1024;
 
 async fn setup_large() -> (Client, MiniTestnet) {
-    let testnet = MiniTestnet::start(6).await;
+    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(3).expect("Node 3 should exist");
 
     let client = Client::from_node(Arc::clone(&node), ClientConfig::default())

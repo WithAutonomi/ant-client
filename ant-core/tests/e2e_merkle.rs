@@ -279,7 +279,7 @@ async fn test_attack_merkle_proof_swap_within_batch() {
     testnet.teardown().await;
 }
 
-// Single-node coexistence is tested in e2e_file.rs (6-node testnet).
+// Single-node coexistence is tested in e2e_file.rs (DEFAULT_NODE_COUNT testnet).
 // The 35-node testnet's DHT can have sparse XOR regions where single-node
 // quotes can't find 5 peers for a random chunk address, making that test
 // unreliable here. Merkle tests are the focus of this file.

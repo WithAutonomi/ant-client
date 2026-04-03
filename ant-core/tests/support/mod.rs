@@ -24,6 +24,7 @@ use ant_node::payment::{
     QuotingMetricsTracker,
 };
 use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
+use ant_node::CLOSE_GROUP_SIZE;
 use evmlib::testnet::Testnet;
 use evmlib::wallet::Wallet;
 use evmlib::Network as EvmNetwork;
@@ -39,6 +40,13 @@ const TEST_PORT_RANGE_MAX: u16 = 60_000;
 const BOOTSTRAP_COUNT: usize = 2;
 const SPAWN_DELAY_MS: u64 = 200;
 const STABILIZATION_TIMEOUT_SECS: u64 = 180;
+
+/// Default node count for standard E2E tests. Must exceed `CLOSE_GROUP_SIZE`
+/// so that quote collection can find enough peers.
+pub const DEFAULT_NODE_COUNT: usize = CLOSE_GROUP_SIZE + 1;
+
+/// Index of the median quote in a `SingleNodePayment` quotes array.
+pub const MEDIAN_QUOTE_INDEX: usize = CLOSE_GROUP_SIZE / 2;
 
 /// Test rewards address (20 bytes, all 0x01).
 const TEST_REWARDS_ADDRESS: [u8; 20] = [0x01; 20];
@@ -63,7 +71,7 @@ pub struct MiniTestnet {
 impl MiniTestnet {
     /// Start a testnet with the given number of nodes.
     ///
-    /// Use 6 for standard tests, 35+ for merkle tests (need 16 peers per pool).
+    /// Use `DEFAULT_NODE_COUNT` for standard tests, 35+ for merkle tests (need 16 peers per pool).
     pub async fn start(node_count: usize) -> Self {
         // Start Anvil EVM testnet FIRST
         let testnet = Testnet::new().await.expect("start Anvil testnet");
