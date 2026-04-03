@@ -48,6 +48,37 @@ pub struct MerkleBatchPaymentResult {
     pub chunk_count: usize,
 }
 
+/// Prepared merkle batch ready for external payment.
+///
+/// Contains everything needed to submit the on-chain merkle payment
+/// and then finalize proof generation without a wallet.
+pub struct PreparedMerkleBatch {
+    /// Merkle tree depth (needed for the on-chain call).
+    pub depth: u8,
+    /// Pool commitments for the on-chain call.
+    pub pool_commitments: Vec<PoolCommitment>,
+    /// Timestamp used for the merkle payment.
+    pub merkle_payment_timestamp: u64,
+    /// Internal: candidate pools (needed for proof generation after payment).
+    candidate_pools: Vec<MerklePaymentCandidatePool>,
+    /// Internal: the merkle tree (needed for proof generation).
+    tree: MerkleTree,
+    /// Internal: chunk addresses in order.
+    addresses: Vec<[u8; 32]>,
+}
+
+impl std::fmt::Debug for PreparedMerkleBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedMerkleBatch")
+            .field("depth", &self.depth)
+            .field("pool_commitments", &self.pool_commitments.len())
+            .field("merkle_payment_timestamp", &self.merkle_payment_timestamp)
+            .field("candidate_pools", &self.candidate_pools.len())
+            .field("addresses", &self.addresses.len())
+            .finish()
+    }
+}
+
 /// Determine whether to use merkle payments for a given batch size.
 /// Free function — no Client needed.
 #[must_use]
@@ -101,21 +132,24 @@ impl Client {
             .await
     }
 
-    /// Pay for a single batch (up to `MAX_LEAVES` chunks).
-    async fn pay_for_merkle_single_batch(
+    /// Phase 1 of external-signer merkle payment: prepare batch without paying.
+    ///
+    /// Builds the merkle tree, collects candidate pools from the network,
+    /// and returns the data needed for the on-chain payment call.
+    /// Requires `EvmNetwork` but NOT a wallet.
+    pub async fn prepare_merkle_batch_external(
         &self,
         addresses: &[[u8; 32]],
         data_type: u32,
         data_size: u64,
-    ) -> Result<MerkleBatchPaymentResult> {
+    ) -> Result<PreparedMerkleBatch> {
         let chunk_count = addresses.len();
-        let wallet = self.require_wallet()?;
         let xornames: Vec<XorName> = addresses.iter().map(|a| XorName(*a)).collect();
 
         info!("Building merkle tree for {chunk_count} chunks");
 
         // 1. Build merkle tree
-        let tree = MerkleTree::from_xornames(xornames.clone())
+        let tree = MerkleTree::from_xornames(xornames)
             .map_err(|e| Error::Payment(format!("Failed to build merkle tree: {e}")))?;
 
         let depth = tree.depth();
@@ -152,10 +186,38 @@ impl Client {
             .map(MerklePaymentCandidatePool::to_commitment)
             .collect();
 
-        // 5. Pay on-chain (single transaction)
-        info!("Submitting merkle batch payment on-chain (depth={depth})");
+        Ok(PreparedMerkleBatch {
+            depth,
+            pool_commitments,
+            merkle_payment_timestamp,
+            candidate_pools,
+            tree,
+            addresses: addresses.to_vec(),
+        })
+    }
+
+    /// Pay for a single batch (up to `MAX_LEAVES` chunks).
+    async fn pay_for_merkle_single_batch(
+        &self,
+        addresses: &[[u8; 32]],
+        data_type: u32,
+        data_size: u64,
+    ) -> Result<MerkleBatchPaymentResult> {
+        let wallet = self.require_wallet()?;
+        let prepared = self
+            .prepare_merkle_batch_external(addresses, data_type, data_size)
+            .await?;
+
+        info!(
+            "Submitting merkle batch payment on-chain (depth={})",
+            prepared.depth
+        );
         let (winner_pool_hash, _amount, _gas_info) = wallet
-            .pay_for_merkle_tree(depth, pool_commitments, merkle_payment_timestamp)
+            .pay_for_merkle_tree(
+                prepared.depth,
+                prepared.pool_commitments.clone(),
+                prepared.merkle_payment_timestamp,
+            )
             .await
             .map_err(|e| Error::Payment(format!("Merkle batch payment failed: {e}")))?;
 
@@ -164,44 +226,7 @@ impl Client {
             hex::encode(winner_pool_hash)
         );
 
-        // 6. Find the winner pool
-        let winner_pool = candidate_pools
-            .iter()
-            .find(|pool| pool.hash() == winner_pool_hash)
-            .ok_or_else(|| {
-                Error::Payment(format!(
-                    "Winner pool {} not found in candidate pools",
-                    hex::encode(winner_pool_hash)
-                ))
-            })?;
-
-        // 7. Generate proofs for each chunk
-        info!("Generating merkle proofs for {chunk_count} chunks");
-        let mut proofs = HashMap::with_capacity(chunk_count);
-
-        for (i, (xorname, address)) in xornames.iter().zip(addresses.iter()).enumerate() {
-            let address_proof = tree.generate_address_proof(i, *xorname).map_err(|e| {
-                Error::Payment(format!(
-                    "Failed to generate address proof for chunk {i}: {e}"
-                ))
-            })?;
-
-            let merkle_proof =
-                MerklePaymentProof::new(*xorname, address_proof, winner_pool.clone());
-
-            let tagged_bytes = serialize_merkle_proof(&merkle_proof).map_err(|e| {
-                Error::Serialization(format!("Failed to serialize merkle proof: {e}"))
-            })?;
-
-            proofs.insert(*address, tagged_bytes);
-        }
-
-        info!("Merkle batch payment complete: {chunk_count} proofs generated");
-
-        Ok(MerkleBatchPaymentResult {
-            proofs,
-            chunk_count,
-        })
+        finalize_merkle_batch(prepared, winner_pool_hash)
     }
 
     /// Handle batches larger than `MAX_LEAVES` by splitting into sub-batches.
@@ -500,6 +525,59 @@ impl Client {
     }
 }
 
+/// Phase 2 of external-signer merkle payment: generate proofs from winner.
+///
+/// Takes the prepared batch and the winner pool hash returned by the
+/// on-chain payment transaction. Generates per-chunk merkle proofs.
+pub fn finalize_merkle_batch(
+    prepared: PreparedMerkleBatch,
+    winner_pool_hash: [u8; 32],
+) -> Result<MerkleBatchPaymentResult> {
+    let chunk_count = prepared.addresses.len();
+    let xornames: Vec<XorName> = prepared.addresses.iter().map(|a| XorName(*a)).collect();
+
+    // Find the winner pool
+    let winner_pool = prepared
+        .candidate_pools
+        .iter()
+        .find(|pool| pool.hash() == winner_pool_hash)
+        .ok_or_else(|| {
+            Error::Payment(format!(
+                "Winner pool {} not found in candidate pools",
+                hex::encode(winner_pool_hash)
+            ))
+        })?;
+
+    // Generate proofs for each chunk
+    info!("Generating merkle proofs for {chunk_count} chunks");
+    let mut proofs = HashMap::with_capacity(chunk_count);
+
+    for (i, xorname) in xornames.iter().enumerate() {
+        let address_proof = prepared
+            .tree
+            .generate_address_proof(i, *xorname)
+            .map_err(|e| {
+                Error::Payment(format!(
+                    "Failed to generate address proof for chunk {i}: {e}"
+                ))
+            })?;
+
+        let merkle_proof = MerklePaymentProof::new(*xorname, address_proof, winner_pool.clone());
+
+        let tagged_bytes = serialize_merkle_proof(&merkle_proof)
+            .map_err(|e| Error::Serialization(format!("Failed to serialize merkle proof: {e}")))?;
+
+        proofs.insert(prepared.addresses[i], tagged_bytes);
+    }
+
+    info!("Merkle batch payment complete: {chunk_count} proofs generated");
+
+    Ok(MerkleBatchPaymentResult {
+        proofs,
+        chunk_count,
+    })
+}
+
 /// Compile-time assertions that merkle method futures are Send.
 #[cfg(test)]
 mod send_assertions {
@@ -525,7 +603,9 @@ mod send_assertions {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use evmlib::common::Amount;
     use evmlib::merkle_payments::{MerkleTree, CANDIDATES_PER_POOL};
+    use evmlib::RewardsAddress;
 
     // =========================================================================
     // should_use_merkle (free function, no Client needed)
@@ -710,6 +790,109 @@ mod tests {
 
         // Timestamp check: 1000 != 2000
         assert_ne!(candidate.merkle_payment_timestamp, 2000);
+    }
+
+    // =========================================================================
+    // finalize_merkle_batch (external signer)
+    // =========================================================================
+
+    fn make_dummy_candidate_nodes(
+        timestamp: u64,
+    ) -> [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] {
+        std::array::from_fn(|i| MerklePaymentCandidateNode {
+            pub_key: vec![i as u8; 32],
+            price: Amount::from(1024u64),
+            reward_address: RewardsAddress::new([i as u8; 20]),
+            merkle_payment_timestamp: timestamp,
+            signature: vec![i as u8; 64],
+        })
+    }
+
+    fn make_prepared_merkle_batch(count: usize) -> PreparedMerkleBatch {
+        let addrs = make_test_addresses(count);
+        let xornames: Vec<XorName> = addrs.iter().map(|a| XorName(*a)).collect();
+        let tree = MerkleTree::from_xornames(xornames).unwrap();
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let midpoints = tree.reward_candidates(timestamp).unwrap();
+
+        let candidate_pools: Vec<MerklePaymentCandidatePool> = midpoints
+            .into_iter()
+            .map(|mp| MerklePaymentCandidatePool {
+                midpoint_proof: mp,
+                candidate_nodes: make_dummy_candidate_nodes(timestamp),
+            })
+            .collect();
+
+        let pool_commitments = candidate_pools
+            .iter()
+            .map(MerklePaymentCandidatePool::to_commitment)
+            .collect();
+
+        PreparedMerkleBatch {
+            depth: tree.depth(),
+            pool_commitments,
+            merkle_payment_timestamp: timestamp,
+            candidate_pools,
+            tree,
+            addresses: addrs,
+        }
+    }
+
+    #[test]
+    fn test_finalize_merkle_batch_with_valid_winner() {
+        let prepared = make_prepared_merkle_batch(4);
+        let winner_hash = prepared.candidate_pools[0].hash();
+
+        let result = finalize_merkle_batch(prepared, winner_hash);
+        assert!(
+            result.is_ok(),
+            "should succeed with valid winner: {result:?}"
+        );
+
+        let batch = result.unwrap();
+        assert_eq!(batch.chunk_count, 4);
+        assert_eq!(batch.proofs.len(), 4);
+
+        // Every proof should be non-empty
+        for proof_bytes in batch.proofs.values() {
+            assert!(!proof_bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_finalize_merkle_batch_with_invalid_winner() {
+        let prepared = make_prepared_merkle_batch(4);
+        let bad_hash = [0xFF; 32];
+
+        let result = finalize_merkle_batch(prepared, bad_hash);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found in candidate pools"), "got: {err}");
+    }
+
+    #[test]
+    fn test_finalize_merkle_batch_proofs_are_deserializable() {
+        use ant_node::payment::deserialize_merkle_proof;
+
+        let prepared = make_prepared_merkle_batch(8);
+        let winner_hash = prepared.candidate_pools[0].hash();
+
+        let batch = finalize_merkle_batch(prepared, winner_hash).unwrap();
+
+        for (addr, proof_bytes) in &batch.proofs {
+            let proof = deserialize_merkle_proof(proof_bytes);
+            assert!(
+                proof.is_ok(),
+                "proof for {} should deserialize: {:?}",
+                hex::encode(addr),
+                proof.err()
+            );
+        }
     }
 
     // =========================================================================
