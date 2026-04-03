@@ -56,6 +56,9 @@ pub enum Error {
     #[error("Could not determine home directory (HOME/USERPROFILE not set)")]
     HomeDirNotFound,
 
+    #[error("Update failed: {0}")]
+    UpdateFailed(String),
+
     #[error("Failed to parse bootstrap_peers.toml: {0}")]
     BootstrapConfigParse(String),
 

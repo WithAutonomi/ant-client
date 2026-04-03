@@ -1,8 +1,9 @@
 use std::net::IpAddr;
 
+use ant_core::node::binary::NoopProgress;
 use ant_core::node::daemon::server;
 use ant_core::node::registry::NodeRegistry;
-use ant_core::node::types::{DaemonConfig, DaemonStatus};
+use ant_core::node::types::{AddNodeOpts, BinarySource, DaemonConfig, DaemonStatus, NodeInfo};
 
 fn test_config(dir: &tempfile::TempDir) -> DaemonConfig {
     DaemonConfig {
@@ -138,6 +139,95 @@ async fn console_returns_html() {
     let body = resp.text().await.unwrap();
     assert!(body.contains("Node Console"));
     assert!(body.contains("/api/v1"));
+
+    shutdown.cancel();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+/// Create a fake binary that responds to `--version`.
+fn create_fake_binary(dir: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        let binary_path = dir.join("fake-antnode");
+        std::fs::write(&binary_path, "#!/bin/sh\necho \"antnode 0.1.0-test\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        binary_path
+    }
+    #[cfg(windows)]
+    {
+        let binary_path = dir.join("fake-antnode.cmd");
+        std::fs::write(&binary_path, "@echo off\r\necho antnode 0.1.0-test\r\n").unwrap();
+        binary_path
+    }
+}
+
+#[tokio::test]
+async fn get_node_detail_returns_full_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(&dir);
+    let reg_path = config.registry_path.clone();
+
+    // Add a node to the registry
+    let binary = create_fake_binary(dir.path());
+    let opts = AddNodeOpts {
+        count: 1,
+        rewards_address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+        data_dir_path: Some(dir.path().join("data")),
+        log_dir_path: Some(dir.path().join("logs")),
+        binary_source: BinarySource::LocalPath(binary),
+        ..Default::default()
+    };
+    ant_core::node::add_nodes(opts, &reg_path, &NoopProgress)
+        .await
+        .unwrap();
+
+    // Start the daemon
+    let registry = NodeRegistry::load(&reg_path).unwrap();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let addr = server::start(config, registry, shutdown.clone())
+        .await
+        .unwrap();
+
+    // GET /api/v1/nodes/1 — should return full config + runtime state
+    let url = format!("http://{addr}/api/v1/nodes/1");
+    let resp = reqwest::get(&url).await.unwrap();
+    assert!(resp.status().is_success());
+
+    let detail: NodeInfo = resp.json().await.unwrap();
+    assert_eq!(detail.config.id, 1);
+    assert_eq!(detail.config.service_name, "node1");
+    assert_eq!(
+        detail.config.rewards_address,
+        "0x1234567890abcdef1234567890abcdef12345678"
+    );
+    assert!(detail.config.data_dir.exists());
+    assert_eq!(detail.status, ant_core::node::types::NodeStatus::Stopped);
+    assert!(detail.pid.is_none());
+    assert!(detail.uptime_secs.is_none());
+
+    // Verify JSON includes flattened config fields (serde flatten)
+    let raw: serde_json::Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+    assert!(raw.get("id").is_some(), "should have flattened id");
+    assert!(
+        raw.get("service_name").is_some(),
+        "should have flattened service_name"
+    );
+    assert!(
+        raw.get("data_dir").is_some(),
+        "should have flattened data_dir"
+    );
+    assert!(
+        raw.get("rewards_address").is_some(),
+        "should have flattened rewards_address"
+    );
+    assert!(raw.get("status").is_some());
+
+    // GET /api/v1/nodes/999 — should 404
+    let resp_404 = reqwest::get(format!("http://{addr}/api/v1/nodes/999"))
+        .await
+        .unwrap();
+    assert_eq!(resp_404.status(), 404);
 
     shutdown.cancel();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;

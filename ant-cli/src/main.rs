@@ -117,6 +117,9 @@ async fn run() -> anyhow::Result<()> {
             let client = build_data_client(&data_ctx, needs_wallet).await?;
             action.execute(&client).await?;
         }
+        Commands::Update(args) => {
+            args.execute(json).await?;
+        }
     }
 
     Ok(())
