@@ -118,7 +118,6 @@ impl Client {
                         ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
                             quote,
                             already_stored,
-                            close_group,
                         }) => {
                             if already_stored {
                                 debug!("Peer {peer_id_clone} already has chunk");
@@ -126,6 +125,7 @@ impl Client {
                             }
                             match rmp_serde::from_slice::<PaymentQuote>(&quote) {
                                 Ok(payment_quote) => {
+                                    let close_group = payment_quote.close_group.clone();
                                     let price = payment_quote.price;
                                     debug!("Received quote from {peer_id_clone}: price = {price}");
                                     Some(Ok((payment_quote, price, close_group)))
@@ -407,9 +407,10 @@ impl Client {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use ant_evm::{Amount, PaymentQuote, QuotingMetrics, RewardsAddress};
     use ant_node::core::{MultiAddr, PeerId};
     use ant_node::CLOSE_GROUP_SIZE;
+    use evmlib::common::Amount;
+    use evmlib::{PaymentQuote, RewardsAddress};
     use std::collections::HashSet;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::time::SystemTime;
@@ -618,20 +619,11 @@ mod tests {
         PaymentQuote {
             content: xor_name::XorName([0u8; 32]),
             timestamp: SystemTime::now(),
-            quoting_metrics: QuotingMetrics {
-                data_size: 0,
-                data_type: 0,
-                close_records_stored: 0,
-                records_per_type: vec![],
-                max_records: 0,
-                received_payment_count: 0,
-                live_time: 0,
-                network_density: None,
-                network_size: None,
-            },
+            price: Amount::ZERO,
+            rewards_address: RewardsAddress::new([0u8; 20]),
+            close_group: vec![],
             pub_key: vec![],
             signature: vec![],
-            rewards_address: RewardsAddress::new([0u8; 20]),
         }
     }
 

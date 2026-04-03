@@ -27,7 +27,7 @@ zip = "2"
 tower-http = { version = "0.6.8", features = ["cors"] }
 
 # Data operations
-evmlib = "0.8"
+evmlib = { git = "https://github.com/WithAutonomi/evmlib", rev = "a3be57fcb3bd4982bc93ad0b58116255d509db28" }
 xor_name = "5"
 self_encryption = "0.35.0"
 futures = "0.3"
@@ -38,7 +38,7 @@ tracing = "0.1"
 bytes = "1"
 lru = "0.16"
 rand = "0.8"
-ant-node = { git = "https://github.com/WithAutonomi/ant-node", rev = "44358c1b4e35cc9aff5841a746bb2b1fcb6dcbee" }
+ant-node = { git = "https://github.com/WithAutonomi/ant-node", rev = "ba5fe8500c5726cbafa43b3df83c7d77ca0d1827" }
 saorsa-pqc = "0.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -101,3 +101,7 @@ path = "tests/e2e_huge_file.rs"
 [[test]]
 name = "e2e_upload_costs"
 path = "tests/e2e_upload_costs.rs"
+
+[[test]]
+name = "e2e_close_group_quorum"
+path = "tests/e2e_close_group_quorum.rs"
