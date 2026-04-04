@@ -870,7 +870,7 @@ dependencies = [
  "saorsa-pqc 0.5.1",
  "self-replace",
  "self_encryption",
- "semver 1.0.27",
+ "semver 1.0.28",
  "serde",
  "serde_json",
  "serial_test",
@@ -901,8 +901,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.10.0-rc.1"
-source = "git+https://github.com/WithAutonomi/ant-node?rev=6dfc7178a940fc842ab3c6542265d9750a08b060#6dfc7178a940fc842ab3c6542265d9750a08b060"
+version = "0.10.0-rc.2"
+source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.4.1#007549668a8f31da069e4048a747143ee1c678da"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -931,7 +931,7 @@ dependencies = [
  "saorsa-pqc 0.5.1",
  "self-replace",
  "self_encryption",
- "semver 1.0.27",
+ "semver 1.0.28",
  "serde",
  "serde_json",
  "sha2",
@@ -2457,9 +2457,9 @@ dependencies = [
 
 [[package]]
 name = "fastrand"
-version = "2.3.0"
+version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
+checksum = "a043dc74da1e37d6afe657061213aa6f425f855399a11d3463c6ecccc4dfda1f"
 
 [[package]]
 name = "fastrlp"
@@ -4820,7 +4820,7 @@ version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
- "semver 1.0.27",
+ "semver 1.0.28",
 ]
 
 [[package]]
@@ -4986,8 +4986,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad51589091bdbfbf8c42b5db37428a1cad0febd0af616ef3fe3a0f38dc921b24"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=rc-2026.4.1#dcfc79ec66e33704cc88937d7555ba93a9762be1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5100,8 +5099,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e33412e61b0cb630410981a629f967a858b1663be8f71b75eadb66c9588ef26"
+source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=rc-2026.4.1#24bec697562a972bfac01a2b730a3694e5fc5fd7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5312,9 +5310,9 @@ dependencies = [
 
 [[package]]
 name = "semver"
-version = "1.0.27"
+version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "semver-parser"
@@ -6539,7 +6537,7 @@ dependencies = [
  "bitflags",
  "hashbrown 0.15.5",
  "indexmap 2.13.1",
- "semver 1.0.27",
+ "semver 1.0.28",
 ]
 
 [[package]]
@@ -7146,7 +7144,7 @@ dependencies = [
  "id-arena",
  "indexmap 2.13.1",
  "log",
- "semver 1.0.27",
+ "semver 1.0.28",
  "serde",
  "serde_derive",
  "serde_json",
