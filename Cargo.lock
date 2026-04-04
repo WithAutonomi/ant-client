@@ -901,8 +901,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.10.0-rc.3"
-source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.4.1#51c0e11903175c9e041e2b86a2fa409db1d6a217"
+version = "0.10.0-rc.4"
+source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.4.1#006cff20125f37e79f77dbb1f57375a3720b9b08"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -4986,7 +4986,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.22.0"
-source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=rc-2026.4.1#0a6b17820706f3f57213a0f4f5a0747840af81f3"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=rc-2026.4.1#0d01b71a21dff4a92656a971f5e7dbf2c968227d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5099,7 +5099,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.31.0"
-source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=rc-2026.4.1#e29f32464c308b1d61a8481b16f7970f4a583688"
+source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=rc-2026.4.1#da74da9c8a80788b6639ce092abadbe7cc3e6b18"
 dependencies = [
  "anyhow",
  "async-trait",
