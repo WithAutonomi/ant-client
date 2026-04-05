@@ -1,6 +1,6 @@
 [package]
 name = "ant-cli"
-version = "0.1.2-rc.6"
+version = "0.1.2-rc.7"
 edition = "2021"
 
 [[bin]]
