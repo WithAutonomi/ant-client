@@ -57,10 +57,15 @@ serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
 tokio-test = "0.4"
+dirs = "5"
 
 [[example]]
 name = "start-local-devnet"
 path = "examples/start-local-devnet.rs"
+
+[[example]]
+name = "start-devnet-sepolia"
+path = "examples/start-devnet-sepolia.rs"
 
 [[test]]
 name = "e2e_chunk"
