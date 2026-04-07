@@ -901,8 +901,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.10.0-rc.15"
-source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.4.1#2bd3537783200959cc2b832ac4ef2c98f65e312e"
+version = "0.10.0-rc.16"
+source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.4.1#790d5a4efe09577c332518b4548fc3e278101c88"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -3956,9 +3956,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "openssl-src"
-version = "300.5.5+3.5.5"
+version = "300.6.0+3.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f1787d533e03597a7934fd0a765f0d28e94ecc5fb7789f8053b1e699a56f709"
+checksum = "a8e8cbfd3a4a8c8f089147fd7aaa33cf8c7450c4d09f8f80698a0cf093abeff4"
 dependencies = [
  "cc",
 ]
@@ -5047,7 +5047,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.22.0"
-source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=rc-2026.4.1#34258e70dfabe785c8aff9631243f4521e095915"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=rc-2026.4.1#e92150dae8b464f99a46bcaf18bb71828b01400e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5160,7 +5160,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.31.0"
-source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=rc-2026.4.1#52ef49364ea71520787fb9edb2a2df476bc3c281"
+source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=rc-2026.4.1#6e85dd904d33071c82c8629b504ceeffd5af8655"
 dependencies = [
  "anyhow",
  "async-trait",
