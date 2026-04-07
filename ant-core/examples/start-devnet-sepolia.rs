@@ -51,8 +51,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Token: {token_addr}");
         println!("Vault: {vault_addr}");
 
-        let mut config = DevnetConfig::default(); // 25 nodes
-        config.evm_network = Some(evm_network);
+        let config = DevnetConfig {
+            evm_network: Some(evm_network),
+            ..DevnetConfig::default()
+        };
 
         println!("Starting {} nodes...", config.node_count);
 
@@ -65,8 +67,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter_map(|ma| {
                 let s = ma.to_string();
                 let parts: Vec<&str> = s.split('/').collect();
-                let ip = parts.iter().position(|&p| p == "ip4").and_then(|i| parts.get(i + 1))?;
-                let port = parts.iter().position(|&p| p == "udp").and_then(|i| parts.get(i + 1))?;
+                let ip = parts
+                    .iter()
+                    .position(|&p| p == "ip4")
+                    .and_then(|i| parts.get(i + 1))?;
+                let port = parts
+                    .iter()
+                    .position(|&p| p == "udp")
+                    .and_then(|i| parts.get(i + 1))?;
                 Some(format!("{ip}:{port}"))
             })
             .collect();
