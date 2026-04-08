@@ -62,6 +62,10 @@ tokio-test = "0.4"
 name = "start-local-devnet"
 path = "examples/start-local-devnet.rs"
 
+[[example]]
+name = "start-devnet-sepolia"
+path = "examples/start-devnet-sepolia.rs"
+
 [[test]]
 name = "e2e_chunk"
 path = "tests/e2e_chunk.rs"

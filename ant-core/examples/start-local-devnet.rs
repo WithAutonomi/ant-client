@@ -1,20 +1,28 @@
-//! Start a local devnet with EVM payments.
+//! Start a local devnet with 25 nodes and EVM payments.
 //!
-//! Launches a minimal Autonomi network (5 nodes) with an embedded Anvil
-//! blockchain, writes a manifest to `/tmp/ant-devnet-manifest.json`,
-//! and waits for Ctrl+C.
+//! Launches an Autonomi network with an embedded Anvil blockchain,
+//! writes a manifest to the shared ant data directory, and waits for Ctrl+C.
+//!
+//! Any consumer that checks `ant_core::config::data_dir()` for
+//! `devnet-manifest.json` (ant-gui, ant-cli, ant-tui) will auto-detect
+//! devnet mode on startup.
 //!
 //! # Usage
 //!
 //! ```bash
-//! cargo run --example start-local-devnet
+//! cargo run --release --example start-local-devnet
 //! ```
 
 use ant_core::data::LocalDevnet;
-use std::path::PathBuf;
+use ant_node::devnet::DevnetConfig;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn manifest_path() -> std::path::PathBuf {
+    let data_dir = ant_core::config::data_dir().expect("Could not determine data directory");
+    std::fs::create_dir_all(&data_dir).ok();
+    data_dir.join("devnet-manifest.json")
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -23,36 +31,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Start a minimal local devnet with EVM payments
-    let devnet = LocalDevnet::start_minimal().await?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?;
 
-    // Write manifest so the CLI example can use it
-    let manifest_path = PathBuf::from("/tmp/ant-devnet-manifest.json");
-    devnet.write_manifest(&manifest_path).await?;
+    runtime.block_on(async {
+        let config = DevnetConfig::default();
+        println!("Starting local Anvil devnet with {} nodes...", config.node_count);
 
-    println!();
-    println!("=== Devnet is running! ===");
-    println!();
-    println!("Bootstrap peers: {:?}", devnet.bootstrap_addrs());
-    println!("Wallet key:      {}", devnet.wallet_private_key());
-    println!("Manifest:        {}", manifest_path.display());
-    println!();
-    println!("# Upload a file:");
-    println!(
-        "cargo run --example cli -- --devnet-manifest {} upload --file <YOUR_FILE>",
-        manifest_path.display()
-    );
-    println!();
-    println!("# Download it back:");
-    println!(
-        "cargo run --example cli -- --devnet-manifest {} download --datamap <HEX> --output <OUTPUT_PATH>",
-        manifest_path.display()
-    );
-    println!();
-    println!("Press Ctrl+C to stop.");
+        let devnet = LocalDevnet::start(config).await?;
 
-    tokio::signal::ctrl_c().await?;
-    println!("Shutting down...");
+        let path = manifest_path();
+        devnet.write_manifest(&path).await?;
 
-    Ok(())
+        println!();
+        println!("=== Local Devnet is running! ===");
+        println!();
+        println!("Nodes:           {}", devnet.manifest().node_count);
+        println!("Bootstrap peers: {:?}", devnet.bootstrap_addrs());
+        println!("Wallet key:      {}", devnet.wallet_private_key());
+        println!("Manifest:        {}", path.display());
+        println!();
+        println!("Press Ctrl+C to stop.");
+
+        tokio::signal::ctrl_c().await?;
+        println!("Shutting down...");
+
+        if path.exists() {
+            std::fs::remove_file(&path).ok();
+        }
+
+        Ok(())
+    })
 }
