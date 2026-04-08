@@ -1,3 +1,23 @@
 [workspace]
 members = ["ant-core", "ant-cli"]
 resolver = "2"
+
+# NAT traversal fixes: patch saorsa-core and saorsa-transport to branches
+# with proven fixes (tested via Mac upload to NAT testnet, 3/3 success).
+#
+# saorsa-core fix/clock-skew-tolerance:
+#   - MAX_FUTURE_SECS: 30 -> 300 (tolerate real-world clock drift)
+#
+# saorsa-transport round4-combined (8 fixes):
+#   - send_ack_timeout 500ms -> 5s
+#   - accept loop dedup keeps newer connection
+#   - scope-aware reachability model
+#   - relay fallback rotation + session reuse + cleanup
+#   - quality-aware coordinator selection
+#
+# Once these branches are merged into rc-2026.4.1, remove this patch section.
+[patch."https://github.com/saorsa-labs/saorsa-core.git"]
+saorsa-core = { git = "https://github.com/grumbach/saorsa-core.git", branch = "fix/clock-skew-tolerance" }
+
+[patch."https://github.com/saorsa-labs/saorsa-transport.git"]
+saorsa-transport = { git = "https://github.com/grumbach/saorsa-transport.git", branch = "round4-combined" }
