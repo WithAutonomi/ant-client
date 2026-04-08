@@ -38,7 +38,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     runtime.block_on(async {
         let config = DevnetConfig::default();
-        println!("Starting local Anvil devnet with {} nodes...", config.node_count);
+        println!(
+            "Starting local Anvil devnet with {} nodes...",
+            config.node_count
+        );
 
         let devnet = LocalDevnet::start(config).await?;
 
