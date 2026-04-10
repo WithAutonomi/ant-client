@@ -126,10 +126,10 @@ async fn handle_file_upload(
                 chunks: result.chunks_stored,
                 size: file_size,
                 storage_cost_atto: result.storage_cost_atto.clone(),
-                gas_cost_wei: result.gas_cost_wei,
+                gas_cost_wei: result.gas_cost_wei.to_string(),
                 elapsed_secs: elapsed.as_secs_f64(),
             };
-            println!("{}", serde_json::to_string(&out).unwrap_or_default());
+            println!("{}", serde_json::to_string(&out)?);
         } else {
             eprintln!(" done");
             eprintln!();
@@ -164,10 +164,10 @@ async fn handle_file_upload(
                 chunks: result.chunks_stored,
                 size: file_size,
                 storage_cost_atto: result.storage_cost_atto.clone(),
-                gas_cost_wei: result.gas_cost_wei,
+                gas_cost_wei: result.gas_cost_wei.to_string(),
                 elapsed_secs: elapsed.as_secs_f64(),
             };
-            println!("{}", serde_json::to_string(&out).unwrap_or_default());
+            println!("{}", serde_json::to_string(&out)?);
         } else {
             eprintln!();
             println!("Upload complete!");
@@ -235,7 +235,7 @@ async fn handle_file_download(
             size: file_size,
             elapsed_secs: elapsed.as_secs_f64(),
         };
-        println!("{}", serde_json::to_string(&out).unwrap_or_default());
+        println!("{}", serde_json::to_string(&out)?);
     } else {
         println!("Download complete!");
         println!("  File: {}", output_path.display());
@@ -256,7 +256,7 @@ struct UploadResult {
     chunks: usize,
     size: u64,
     storage_cost_atto: String,
-    gas_cost_wei: u128,
+    gas_cost_wei: String,
     elapsed_secs: f64,
 }
 
