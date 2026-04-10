@@ -5159,6 +5159,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.31.0"
+source = "git+https://github.com/jacderida/saorsa-transport.git?branch=round4-combined#9a8ffa256ce0f07b4d5b22d97b0010ac1be8ad1d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7506,3 +7507,7 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "saorsa-transport"
+version = "0.31.0"
