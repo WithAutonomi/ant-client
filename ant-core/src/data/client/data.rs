@@ -53,7 +53,8 @@ impl Client {
             .map(|chunk| chunk.content)
             .collect();
 
-        let addresses = self.batch_upload_chunks(chunk_contents).await?;
+        let (addresses, _storage_cost, _gas_cost) =
+            self.batch_upload_chunks(chunk_contents).await?;
         let chunks_stored = addresses.len();
 
         info!("Data uploaded: {chunks_stored} chunks stored ({content_len} bytes original)");
@@ -113,7 +114,7 @@ impl Client {
                 Ok(result) => result,
                 Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
                     info!("Merkle needs more peers ({msg}), falling back to wave-batch");
-                    let addresses = self.batch_upload_chunks(chunk_contents).await?;
+                    let (addresses, _sc, _gc) = self.batch_upload_chunks(chunk_contents).await?;
                     return Ok(DataUploadResult {
                         data_map,
                         chunks_stored: addresses.len(),
@@ -135,7 +136,7 @@ impl Client {
             })
         } else {
             // Wave-based batch payment path (single EVM tx per wave).
-            let addresses = self.batch_upload_chunks(chunk_contents).await?;
+            let (addresses, _sc, _gc) = self.batch_upload_chunks(chunk_contents).await?;
 
             info!(
                 "Data uploaded: {} chunks stored ({content_len} bytes original)",

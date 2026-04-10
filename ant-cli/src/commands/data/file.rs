@@ -113,6 +113,8 @@ async fn handle_file_upload(
 
         let hex_addr = hex::encode(dm_address);
 
+        let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei);
+
         if json_output {
             let out = UploadResult {
                 address: Some(hex_addr.clone()),
@@ -120,6 +122,8 @@ async fn handle_file_upload(
                 mode: "public".into(),
                 chunks: result.chunks_stored,
                 size: file_size,
+                storage_cost_atto: result.storage_cost_atto.clone(),
+                gas_cost_wei: result.gas_cost_wei,
                 elapsed_secs: elapsed.as_secs_f64(),
             };
             println!("{}", serde_json::to_string(&out).unwrap_or_default());
@@ -130,6 +134,7 @@ async fn handle_file_upload(
             println!("  Address: {hex_addr}");
             println!("  Chunks:  {}", result.chunks_stored);
             println!("  Size:    {}", format_size(file_size));
+            println!("  Cost:    {cost_display}");
             println!("  Time:    {:.1}s", elapsed.as_secs_f64());
             println!();
             println!("Anyone can download this file with:");
@@ -146,6 +151,8 @@ async fn handle_file_upload(
         let datamap_bytes = serialize_datamap(&result.data_map)?;
         std::fs::write(&datamap_path, &datamap_bytes)?;
 
+        let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei);
+
         if json_output {
             let out = UploadResult {
                 address: None,
@@ -153,6 +160,8 @@ async fn handle_file_upload(
                 mode: "private".into(),
                 chunks: result.chunks_stored,
                 size: file_size,
+                storage_cost_atto: result.storage_cost_atto.clone(),
+                gas_cost_wei: result.gas_cost_wei,
                 elapsed_secs: elapsed.as_secs_f64(),
             };
             println!("{}", serde_json::to_string(&out).unwrap_or_default());
@@ -162,6 +171,7 @@ async fn handle_file_upload(
             println!("  Datamap: {}", datamap_path.display());
             println!("  Chunks:  {}", result.chunks_stored);
             println!("  Size:    {}", format_size(file_size));
+            println!("  Cost:    {cost_display}");
             println!("  Time:    {:.1}s", elapsed.as_secs_f64());
             println!();
             println!("Download this file with:");
@@ -242,6 +252,8 @@ struct UploadResult {
     mode: String,
     chunks: usize,
     size: u64,
+    storage_cost_atto: String,
+    gas_cost_wei: u128,
     elapsed_secs: f64,
 }
 
@@ -270,4 +282,46 @@ fn serialize_datamap(data_map: &DataMap) -> anyhow::Result<Vec<u8>> {
 
 fn deserialize_datamap(bytes: &[u8]) -> anyhow::Result<DataMap> {
     rmp_serde::from_slice(bytes).map_err(|e| anyhow::anyhow!("DataMap deserialization failed: {e}"))
+}
+
+/// Format storage cost for human display.
+///
+/// - >= 1e18 atto: show as "X.XX ANT"
+/// - >= 1e9 atto: show as "X nano"
+/// - otherwise: show as "X atto"
+fn format_storage_cost(atto_str: &str) -> String {
+    let atto: u128 = atto_str.parse().unwrap_or(0);
+    if atto == 0 {
+        return "0".to_string();
+    }
+    if atto >= 1_000_000_000_000_000_000 {
+        let whole = atto / 1_000_000_000_000_000_000;
+        let frac = (atto % 1_000_000_000_000_000_000) / 10_000_000_000_000_000; // 2 decimal places
+        format!("{whole}.{frac:02} ANT")
+    } else if atto >= 1_000_000_000 {
+        let nano = atto / 1_000_000_000;
+        format!("{nano} nano")
+    } else {
+        format!("{atto} atto")
+    }
+}
+
+/// Format gas cost as ETH.
+fn format_gas_cost(wei: u128) -> String {
+    if wei == 0 {
+        return "0 ETH".to_string();
+    }
+    let eth = wei as f64 / 1e18;
+    if eth >= 0.01 {
+        format!("{eth:.4} ETH")
+    } else {
+        format!("{eth:.6} ETH")
+    }
+}
+
+/// Combined cost display: "150 nano (gas: 0.000100 ETH)"
+fn format_cost(storage_cost_atto: &str, gas_cost_wei: u128) -> String {
+    let storage = format_storage_cost(storage_cost_atto);
+    let gas = format_gas_cost(gas_cost_wei);
+    format!("{storage} (gas: {gas})")
 }

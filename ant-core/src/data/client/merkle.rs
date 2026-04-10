@@ -13,6 +13,7 @@ use ant_node::client::send_and_await_chunk_response;
 use ant_node::payment::quote::verify_merkle_candidate_signature;
 use ant_node::payment::serialize_merkle_proof;
 use bytes::Bytes;
+use evmlib::common::Amount;
 use evmlib::merkle_batch_payment::PoolCommitment;
 use evmlib::merkle_payments::{
     MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
@@ -46,6 +47,10 @@ pub struct MerkleBatchPaymentResult {
     pub proofs: HashMap<[u8; 32], Vec<u8>>,
     /// Number of chunks in the batch.
     pub chunk_count: usize,
+    /// Total storage cost in atto (token smallest unit).
+    pub storage_cost_atto: String,
+    /// Total gas cost in wei.
+    pub gas_cost_wei: u128,
 }
 
 /// Prepared merkle batch ready for external payment.
@@ -212,7 +217,7 @@ impl Client {
             "Submitting merkle batch payment on-chain (depth={})",
             prepared.depth
         );
-        let (winner_pool_hash, _amount, _gas_info) = wallet
+        let (winner_pool_hash, amount, gas_info) = wallet
             .pay_for_merkle_tree(
                 prepared.depth,
                 prepared.pool_commitments.clone(),
@@ -226,7 +231,10 @@ impl Client {
             hex::encode(winner_pool_hash)
         );
 
-        finalize_merkle_batch(prepared, winner_pool_hash)
+        let mut result = finalize_merkle_batch(prepared, winner_pool_hash)?;
+        result.storage_cost_atto = amount.to_string();
+        result.gas_cost_wei = gas_info.gas_cost_wei;
+        Ok(result)
     }
 
     /// Handle batches larger than `MAX_LEAVES` by splitting into sub-batches.
@@ -239,6 +247,8 @@ impl Client {
         let sub_batches: Vec<&[[u8; 32]]> = addresses.chunks(MAX_LEAVES).collect();
         let total_sub_batches = sub_batches.len();
         let mut all_proofs = HashMap::with_capacity(addresses.len());
+        let mut total_storage = Amount::ZERO;
+        let mut total_gas: u128 = 0;
 
         for (i, chunk) in sub_batches.into_iter().enumerate() {
             match self
@@ -246,6 +256,10 @@ impl Client {
                 .await
             {
                 Ok(sub_result) => {
+                    if let Ok(cost) = sub_result.storage_cost_atto.parse::<Amount>() {
+                        total_storage += cost;
+                    }
+                    total_gas = total_gas.saturating_add(sub_result.gas_cost_wei);
                     all_proofs.extend(sub_result.proofs);
                 }
                 Err(e) => {
@@ -263,6 +277,8 @@ impl Client {
                     return Ok(MerkleBatchPaymentResult {
                         chunk_count: all_proofs.len(),
                         proofs: all_proofs,
+                        storage_cost_atto: total_storage.to_string(),
+                        gas_cost_wei: total_gas,
                     });
                 }
             }
@@ -271,6 +287,8 @@ impl Client {
         Ok(MerkleBatchPaymentResult {
             chunk_count: addresses.len(),
             proofs: all_proofs,
+            storage_cost_atto: total_storage.to_string(),
+            gas_cost_wei: total_gas,
         })
     }
 
@@ -575,6 +593,8 @@ pub fn finalize_merkle_batch(
     Ok(MerkleBatchPaymentResult {
         proofs,
         chunk_count,
+        storage_cost_atto: "0".to_string(),
+        gas_cost_wei: 0,
     })
 }
 
