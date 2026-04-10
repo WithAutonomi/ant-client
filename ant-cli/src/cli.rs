@@ -30,7 +30,8 @@ pub struct Cli {
     pub json: bool,
 
     /// Bootstrap peer addresses (for data operations).
-    #[arg(long, short)]
+    /// Comma-separated or repeated: -b 1.2.3.4:10000,5.6.7.8:10000
+    #[arg(long, short, value_delimiter = ',')]
     pub bootstrap: Vec<SocketAddr>,
 
     /// Path to devnet manifest JSON (for data operations).

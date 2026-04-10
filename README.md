@@ -78,7 +78,7 @@ ant chunk get abc123def456... --bootstrap ...
 | Flag | Description |
 |------|-------------|
 | `--json` | Output structured JSON instead of human-readable text |
-| `-b, --bootstrap <IP:PORT>` | Bootstrap peer addresses, repeatable (e.g. `-b 1.2.3.4:10000 -b 5.6.7.8:10000`) |
+| `-b, --bootstrap <IP:PORT>` | Bootstrap peer addresses, comma-separated or repeated (`-b 1.2.3.4:10000,5.6.7.8:10000`) |
 | `--devnet-manifest <PATH>` | Path to devnet manifest JSON file |
 | `--allow-loopback` | Allow loopback connections (required for local devnet) |
 | `--timeout-secs <N>` | Network operation timeout in seconds (default: 60) |
