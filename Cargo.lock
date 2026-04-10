@@ -837,6 +837,7 @@ dependencies = [
  "hex",
  "reqwest 0.12.28",
  "rmp-serde",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -5047,7 +5048,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.22.0"
-source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=rc-2026.4.1#81a29f7e55f5d36a85d9303125a3784fbcd4eac9"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=rc-2026.4.1#e92150dae8b464f99a46bcaf18bb71828b01400e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5160,7 +5161,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.31.0"
-source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=rc-2026.4.1#496721bee0e5b535d5aec07513ec3ced29d20644"
+source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=rc-2026.4.1#6e85dd904d33071c82c8629b504ceeffd5af8655"
 dependencies = [
  "anyhow",
  "async-trait",

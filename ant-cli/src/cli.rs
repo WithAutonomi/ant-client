@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -50,9 +50,10 @@ pub struct Cli {
     #[arg(long)]
     pub chunk_concurrency: Option<usize>,
 
-    /// Log level.
-    #[arg(long, default_value = "info")]
-    pub log_level: String,
+    /// Increase verbosity. By default no logs are emitted (privacy by design).
+    /// -v: info + warnings, -vv: debug, -vvv: trace.
+    #[arg(short, long, action = ArgAction::Count)]
+    pub verbose: u8,
 
     /// EVM network for payment processing.
     #[arg(long, default_value = "local")]

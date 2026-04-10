@@ -16,6 +16,7 @@ colored = "3.1.1"
 hex = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
