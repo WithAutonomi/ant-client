@@ -55,8 +55,8 @@ pub struct Cli {
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
 
-    /// EVM network for payment processing.
-    #[arg(long, default_value = "local")]
+    /// EVM network for payment processing (arbitrum-one, arbitrum-sepolia, local).
+    #[arg(long, default_value = "arbitrum-one")]
     pub evm_network: String,
 
     #[command(subcommand)]
