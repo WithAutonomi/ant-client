@@ -216,12 +216,20 @@ impl Client {
     ///
     /// Returns an error if the wallet is not configured or the on-chain
     /// payment fails.
-    pub async fn batch_pay(&self, prepared: Vec<PreparedChunk>) -> Result<Vec<PaidChunk>> {
+    /// Returns `(paid_chunks, storage_cost_atto, gas_cost_wei)`.
+    pub async fn batch_pay(
+        &self,
+        prepared: Vec<PreparedChunk>,
+    ) -> Result<(Vec<PaidChunk>, String, u128)> {
         if prepared.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), "0".to_string(), 0));
         }
 
         let wallet = self.require_wallet()?;
+
+        // Compute total storage cost from the prepared chunks before paying.
+        let intent = PaymentIntent::from_prepared_chunks(&prepared);
+        let storage_cost_atto = intent.total_amount.to_string();
 
         // Flatten all quote payments from all chunks into a single batch.
         let total_quotes: usize = prepared.iter().map(|c| c.payment.quotes.len()).sum();
@@ -238,7 +246,7 @@ impl Client {
             all_payments.len()
         );
 
-        let (tx_hash_map, _gas_info) =
+        let (tx_hash_map, gas_info) =
             wallet
                 .pay_for_quotes(all_payments)
                 .await
@@ -252,7 +260,8 @@ impl Client {
         );
 
         let tx_hash_map: HashMap<QuoteHash, TxHash> = tx_hash_map.into_iter().collect();
-        build_paid_chunks(prepared, &tx_hash_map)
+        let paid_chunks = build_paid_chunks(prepared, &tx_hash_map)?;
+        Ok((paid_chunks, storage_cost_atto, gas_info.gas_cost_wei))
     }
 
     /// Upload chunks in waves with pipelined EVM payments.
@@ -268,9 +277,13 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if any payment or store operation fails.
-    pub async fn batch_upload_chunks(&self, chunks: Vec<Bytes>) -> Result<Vec<XorName>> {
+    /// Returns `(addresses, total_storage_cost_atto, total_gas_cost_wei)`.
+    pub async fn batch_upload_chunks(
+        &self,
+        chunks: Vec<Bytes>,
+    ) -> Result<(Vec<XorName>, String, u128)> {
         if chunks.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), "0".to_string(), 0));
         }
 
         let total_chunks = chunks.len();
@@ -280,6 +293,10 @@ impl Client {
 
         let mut all_addresses = Vec::with_capacity(total_chunks);
         let mut seen_addresses: HashSet<XorName> = HashSet::new();
+
+        // Accumulate costs across waves.
+        let mut total_storage = Amount::ZERO;
+        let mut total_gas: u128 = 0;
 
         // Deduplicate chunks by content address.
         let mut unique_chunks = Vec::with_capacity(total_chunks);
@@ -350,7 +367,12 @@ impl Client {
                 "Wave {wave_num}/{wave_count}: paying for {} chunks",
                 prepared_chunks.len()
             );
-            let paid_chunks = self.batch_pay(prepared_chunks).await?;
+            let (paid_chunks, wave_storage, wave_gas) = self.batch_pay(prepared_chunks).await?;
+            // Parse wave storage cost and accumulate.
+            if let Ok(cost) = wave_storage.parse::<Amount>() {
+                total_storage += cost;
+            }
+            total_gas = total_gas.saturating_add(wave_gas);
             pending_store = Some(paid_chunks);
         }
 
@@ -372,7 +394,7 @@ impl Client {
         }
 
         info!("Batch upload complete: {} addresses", all_addresses.len());
-        Ok(all_addresses)
+        Ok((all_addresses, total_storage.to_string(), total_gas))
     }
 
     /// Prepare a wave of chunks by collecting quotes concurrently.

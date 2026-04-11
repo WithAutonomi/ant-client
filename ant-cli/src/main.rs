@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use clap::Parser;
 use tracing::info;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use ant_core::data::{
     Client, ClientConfig, CoreNodeConfig, CustomNetwork, DevnetManifest, EvmAddress, EvmNetwork,
@@ -27,10 +26,13 @@ async fn main() {
     let code = match run().await {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("Error: {e:?}");
+            eprintln!("Error: {e:#}");
             1
         }
     };
+
+    // Flush stdout before force-exit to ensure all output (especially JSON) is written.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 
     // Force-exit to avoid hanging on tokio runtime shutdown.
     // Open QUIC connections and pending background tasks (DHT, keep-alive)
@@ -42,11 +44,17 @@ async fn main() {
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing for data commands (node commands handle their own output)
+    // Privacy by design: no logs unless the user explicitly opts in with -v.
+    // A decentralized network client must not emit metadata by default.
     let needs_tracing = !matches!(cli.command, Commands::Node { .. });
-    if needs_tracing {
-        let filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
+    if needs_tracing && cli.verbose > 0 {
+        use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+        let filter = match cli.verbose {
+            1 => EnvFilter::new("info"),
+            2 => EnvFilter::new("debug"),
+            _ => EnvFilter::new("trace"),
+        };
         tracing_subscriber::registry()
             .with(fmt::layer().with_writer(std::io::stderr))
             .with(filter)
@@ -61,7 +69,7 @@ async fn run() -> anyhow::Result<()> {
         devnet_manifest,
         allow_loopback,
         timeout_secs,
-        log_level: _,
+        verbose: _,
         evm_network,
         quote_concurrency,
         store_concurrency,
@@ -111,12 +119,12 @@ async fn run() -> anyhow::Result<()> {
         }
         Commands::File { action } => {
             let needs_wallet = matches!(action, commands::data::FileAction::Upload { .. });
-            let client = build_data_client(&data_ctx, needs_wallet).await?;
-            action.execute(&client).await?;
+            let client = build_data_client(&data_ctx, needs_wallet, json).await?;
+            action.execute(&client, json).await?;
         }
         Commands::Chunk { action } => {
             let needs_wallet = matches!(action, commands::data::ChunkAction::Put { .. });
-            let client = build_data_client(&data_ctx, needs_wallet).await?;
+            let client = build_data_client(&data_ctx, needs_wallet, json).await?;
             action.execute(&client).await?;
         }
         Commands::Update(args) => {
@@ -139,7 +147,11 @@ struct DataCliContext {
 }
 
 /// Build a data client with wallet if SECRET_KEY is set.
-async fn build_data_client(ctx: &DataCliContext, needs_wallet: bool) -> anyhow::Result<Client> {
+async fn build_data_client(
+    ctx: &DataCliContext,
+    needs_wallet: bool,
+    quiet: bool,
+) -> anyhow::Result<Client> {
     let private_key = std::env::var("SECRET_KEY").ok();
 
     if needs_wallet && private_key.is_none() {
@@ -149,7 +161,14 @@ async fn build_data_client(ctx: &DataCliContext, needs_wallet: bool) -> anyhow::
     // Parse manifest once and share it across bootstrap + EVM resolution.
     let manifest = load_manifest(ctx)?;
     let bootstrap = resolve_bootstrap_from(ctx, manifest.as_ref())?;
+
+    if !quiet {
+        eprint!("Connecting to network...");
+    }
     let node = create_client_node(bootstrap, ctx.allow_loopback).await?;
+    if !quiet {
+        eprintln!(" done");
+    }
 
     let mut config = ClientConfig {
         timeout_secs: ctx.timeout_secs,
@@ -167,12 +186,18 @@ async fn build_data_client(ctx: &DataCliContext, needs_wallet: bool) -> anyhow::
     if let Some(ref key) = private_key {
         let network = resolve_evm_network(&ctx.evm_network, manifest.as_ref())?;
         let wallet = create_wallet(key, network)?;
+        if !quiet {
+            eprint!("Approving token spend...");
+        }
         info!("Wallet configured for EVM payments");
         client = client.with_wallet(wallet);
         client
             .approve_token_spend()
             .await
             .map_err(|e| anyhow::anyhow!("Token approval failed: {e}"))?;
+        if !quiet {
+            eprintln!(" done");
+        }
     }
 
     Ok(client)

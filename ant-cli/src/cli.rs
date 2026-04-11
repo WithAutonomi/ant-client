@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -30,7 +30,8 @@ pub struct Cli {
     pub json: bool,
 
     /// Bootstrap peer addresses (for data operations).
-    #[arg(long, short)]
+    /// Comma-separated or repeated: -b 1.2.3.4:10000,5.6.7.8:10000
+    #[arg(long, short, value_delimiter = ',')]
     pub bootstrap: Vec<SocketAddr>,
 
     /// Path to devnet manifest JSON (for data operations).
@@ -56,12 +57,13 @@ pub struct Cli {
     #[arg(long, alias = "chunk-concurrency")]
     pub store_concurrency: Option<usize>,
 
-    /// Log level.
-    #[arg(long, default_value = "info")]
-    pub log_level: String,
+    /// Increase verbosity. By default no logs are emitted (privacy by design).
+    /// -v: info + warnings, -vv: debug, -vvv: trace.
+    #[arg(short, long, action = ArgAction::Count)]
+    pub verbose: u8,
 
-    /// EVM network for payment processing.
-    #[arg(long, default_value = "local")]
+    /// EVM network for payment processing (arbitrum-one, arbitrum-sepolia, local).
+    #[arg(long, default_value = "arbitrum-one")]
     pub evm_network: String,
 
     #[command(subcommand)]

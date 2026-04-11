@@ -341,6 +341,10 @@ pub struct FileUploadResult {
     pub chunks_stored: usize,
     /// Which payment mode was actually used (not just requested).
     pub payment_mode_used: PaymentMode,
+    /// Total storage cost paid in token units (atto). "0" if all chunks already existed.
+    pub storage_cost_atto: String,
+    /// Total gas cost in wei. 0 if no on-chain transactions were made.
+    pub gas_cost_wei: u128,
 }
 
 /// Payment information for external signing — either wave-batch or merkle.
@@ -633,6 +637,8 @@ impl Client {
                     data_map: prepared.data_map,
                     chunks_stored,
                     payment_mode_used: PaymentMode::Single,
+                    storage_cost_atto: "0".into(),
+                    gas_cost_wei: 0,
                 })
             }
             ExternalPaymentInfo::Merkle { .. } => Err(Error::Payment(
@@ -676,6 +682,8 @@ impl Client {
                     data_map: prepared.data_map,
                     chunks_stored,
                     payment_mode_used: PaymentMode::Merkle,
+                    storage_cost_atto: "0".into(),
+                    gas_cost_wei: 0,
                 })
             }
             ExternalPaymentInfo::WaveBatch { .. } => Err(Error::Payment(
@@ -731,34 +739,37 @@ impl Client {
         // candidate pool). For a 100 GB file (~25k chunks), this is ~2 GB. This
         // is acceptable because merkle payments save significant gas costs — the
         // gas savings far outweigh the proof memory overhead.
-        let (chunks_stored, actual_mode) = if self.should_use_merkle(chunk_count, mode) {
-            // Merkle batch payment path — needs all addresses upfront for tree.
-            info!("Using merkle batch payment for {chunk_count} file chunks");
+        let (chunks_stored, actual_mode, storage_cost_atto, gas_cost_wei) =
+            if self.should_use_merkle(chunk_count, mode) {
+                // Merkle batch payment path — needs all addresses upfront for tree.
+                info!("Using merkle batch payment for {chunk_count} file chunks");
 
-            let batch_result = match self
-                .pay_for_merkle_batch(&spill.addresses, DATA_TYPE_CHUNK, spill.avg_chunk_size())
-                .await
-            {
-                Ok(result) => result,
-                Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
-                    info!("Merkle needs more peers ({msg}), falling back to wave-batch");
-                    let stored = self.upload_waves_single(&spill).await?;
-                    return Ok(FileUploadResult {
-                        data_map,
-                        chunks_stored: stored,
-                        payment_mode_used: PaymentMode::Single,
-                    });
-                }
-                Err(e) => return Err(e),
+                let batch_result = match self
+                    .pay_for_merkle_batch(&spill.addresses, DATA_TYPE_CHUNK, spill.avg_chunk_size())
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
+                        info!("Merkle needs more peers ({msg}), falling back to wave-batch");
+                        let (stored, sc, gc) = self.upload_waves_single(&spill).await?;
+                        return Ok(FileUploadResult {
+                            data_map,
+                            chunks_stored: stored,
+                            payment_mode_used: PaymentMode::Single,
+                            storage_cost_atto: sc,
+                            gas_cost_wei: gc,
+                        });
+                    }
+                    Err(e) => return Err(e),
+                };
+
+                let (stored, sc, gc) = self.upload_waves_merkle(&spill, &batch_result).await?;
+                (stored, PaymentMode::Merkle, sc, gc)
+            } else {
+                // Wave-based per-chunk payment path.
+                let (stored, sc, gc) = self.upload_waves_single(&spill).await?;
+                (stored, PaymentMode::Single, sc, gc)
             };
-
-            let stored = self.upload_waves_merkle(&spill, &batch_result).await?;
-            (stored, PaymentMode::Merkle)
-        } else {
-            // Wave-based per-chunk payment path.
-            let stored = self.upload_waves_single(&spill).await?;
-            (stored, PaymentMode::Single)
-        };
 
         info!(
             "File uploaded with {actual_mode:?}: {chunks_stored} chunks stored ({})",
@@ -769,6 +780,8 @@ impl Client {
             data_map,
             chunks_stored,
             payment_mode_used: actual_mode,
+            storage_cost_atto,
+            gas_cost_wei,
         })
     }
 
@@ -811,8 +824,12 @@ impl Client {
     ///
     /// Reads one wave at a time from disk, prepares quotes, pays, and stores.
     /// Peak memory: ~`UPLOAD_WAVE_SIZE × MAX_CHUNK_SIZE` (~256 MB).
-    async fn upload_waves_single(&self, spill: &ChunkSpill) -> Result<usize> {
+    ///
+    /// Returns `(chunks_stored, storage_cost_atto, gas_cost_wei)`.
+    async fn upload_waves_single(&self, spill: &ChunkSpill) -> Result<(usize, String, u128)> {
         let mut total_stored = 0usize;
+        let mut total_storage = evmlib::common::Amount::ZERO;
+        let mut total_gas: u128 = 0;
         let total_chunks = spill.len();
         let waves: Vec<&[[u8; 32]]> = spill.waves().collect();
         let wave_count = waves.len();
@@ -828,22 +845,29 @@ impl Client {
                 "Wave {wave_num}/{wave_count}: uploading {} chunks (single payment) — {total_stored}/{total_chunks} stored so far",
                 wave_data.len()
             );
-            let addresses = self.batch_upload_chunks(wave_data).await?;
+            let (addresses, wave_storage, wave_gas) = self.batch_upload_chunks(wave_data).await?;
             total_stored += addresses.len();
+            if let Ok(cost) = wave_storage.parse::<evmlib::common::Amount>() {
+                total_storage += cost;
+            }
+            total_gas = total_gas.saturating_add(wave_gas);
         }
 
-        Ok(total_stored)
+        Ok((total_stored, total_storage.to_string(), total_gas))
     }
 
     /// Upload chunks from a spill using pre-computed merkle proofs.
     ///
     /// Reads one wave at a time from disk, pairs each chunk with its proof,
     /// and uploads concurrently. Peak memory: ~`UPLOAD_WAVE_SIZE × MAX_CHUNK_SIZE`.
+    ///
+    /// Returns `(chunks_stored, storage_cost_atto, gas_cost_wei)`.
+    /// Costs come from the `batch_result` which was populated during payment.
     async fn upload_waves_merkle(
         &self,
         spill: &ChunkSpill,
         batch_result: &MerkleBatchPaymentResult,
-    ) -> Result<usize> {
+    ) -> Result<(usize, String, u128)> {
         let mut total_stored = 0usize;
         let total_chunks = spill.len();
         let waves: Vec<&[[u8; 32]]> = spill.waves().collect();
@@ -879,7 +903,11 @@ impl Client {
             }
         }
 
-        Ok(total_stored)
+        Ok((
+            total_stored,
+            batch_result.storage_cost_atto.clone(),
+            batch_result.gas_cost_wei,
+        ))
     }
 
     /// Download and decrypt a file from the network, writing it to disk.
