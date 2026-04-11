@@ -274,8 +274,9 @@ impl Client {
         }
 
         let total_chunks = chunks.len();
-        let concurrency = self.config().chunk_concurrency;
-        info!("Batch uploading {total_chunks} chunks in waves of {PAYMENT_WAVE_SIZE} (concurrency: {concurrency})");
+        let quote_concurrency = self.config().quote_concurrency;
+        let store_concurrency = self.config().store_concurrency;
+        info!("Batch uploading {total_chunks} chunks in waves of {PAYMENT_WAVE_SIZE} (quote_concurrency: {quote_concurrency}, store_concurrency: {store_concurrency})");
 
         let mut all_addresses = Vec::with_capacity(total_chunks);
         let mut seen_addresses: HashSet<XorName> = HashSet::new();
@@ -391,7 +392,7 @@ impl Client {
             .map(|(content, address)| async move {
                 (address, self.prepare_chunk_payment(content).await)
             })
-            .buffer_unordered(self.config().chunk_concurrency)
+            .buffer_unordered(self.config().quote_concurrency)
             .collect()
             .await;
 
@@ -444,7 +445,7 @@ impl Client {
                         (chunk_clone, result)
                     }
                 })
-                .buffer_unordered(self.config().chunk_concurrency)
+                .buffer_unordered(self.config().store_concurrency)
                 .collect()
                 .await;
 

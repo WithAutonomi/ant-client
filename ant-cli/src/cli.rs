@@ -45,10 +45,16 @@ pub struct Cli {
     #[arg(long, default_value_t = 60)]
     pub timeout_secs: u64,
 
-    /// Maximum number of chunks processed concurrently during uploads.
-    /// Defaults to half the available CPU threads.
+    /// Maximum number of chunks quoted or downloaded concurrently.
+    /// Defaults to 32. Safe to set high — quoting is pure network I/O.
     #[arg(long)]
-    pub chunk_concurrency: Option<usize>,
+    pub quote_concurrency: Option<usize>,
+
+    /// Maximum number of chunks stored concurrently during uploads.
+    /// Defaults to half the available CPU threads. Lower values are
+    /// more reliable when storing to NAT-restricted nodes.
+    #[arg(long, alias = "chunk-concurrency")]
+    pub store_concurrency: Option<usize>,
 
     /// Log level.
     #[arg(long, default_value = "info")]

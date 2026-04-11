@@ -557,10 +557,10 @@ impl Client {
             }
         } else {
             // Wave-batch path: collect quotes per chunk concurrently.
-            let concurrency = self.config().chunk_concurrency;
+            let quote_concurrency = self.config().quote_concurrency;
             let results: Vec<Result<Option<PreparedChunk>>> = stream::iter(chunk_data)
                 .map(|content| async move { self.prepare_chunk_payment(content).await })
-                .buffer_unordered(concurrency)
+                .buffer_unordered(quote_concurrency)
                 .collect()
                 .await;
 
@@ -871,7 +871,7 @@ impl Client {
                     self.chunk_put_to_close_group(content, proof, &peers).await
                 }
             }))
-            .buffer_unordered(self.config().chunk_concurrency);
+            .buffer_unordered(self.config().store_concurrency);
 
             while let Some(result) = upload_stream.next().await {
                 result?;

@@ -63,7 +63,8 @@ async fn run() -> anyhow::Result<()> {
         timeout_secs,
         log_level: _,
         evm_network,
-        chunk_concurrency,
+        quote_concurrency,
+        store_concurrency,
     } = cli;
 
     // Shared context for data commands that need EVM / bootstrap info.
@@ -73,7 +74,8 @@ async fn run() -> anyhow::Result<()> {
         allow_loopback,
         timeout_secs,
         evm_network,
-        chunk_concurrency,
+        quote_concurrency,
+        store_concurrency,
     };
 
     match command {
@@ -132,7 +134,8 @@ struct DataCliContext {
     allow_loopback: bool,
     timeout_secs: u64,
     evm_network: String,
-    chunk_concurrency: Option<usize>,
+    quote_concurrency: Option<usize>,
+    store_concurrency: Option<usize>,
 }
 
 /// Build a data client with wallet if SECRET_KEY is set.
@@ -152,8 +155,11 @@ async fn build_data_client(ctx: &DataCliContext, needs_wallet: bool) -> anyhow::
         timeout_secs: ctx.timeout_secs,
         ..Default::default()
     };
-    if let Some(concurrency) = ctx.chunk_concurrency {
-        config.chunk_concurrency = concurrency;
+    if let Some(concurrency) = ctx.quote_concurrency {
+        config.quote_concurrency = concurrency;
+    }
+    if let Some(concurrency) = ctx.store_concurrency {
+        config.store_concurrency = concurrency;
     }
 
     let mut client = Client::from_node(node, config);
