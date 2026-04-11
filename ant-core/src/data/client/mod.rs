@@ -26,18 +26,15 @@ use tracing::debug;
 /// Default timeout for network operations in seconds.
 const CLIENT_TIMEOUT_SECS: u64 = 10;
 
-/// Assumed CPU thread count when `available_parallelism()` fails.
-const FALLBACK_THREAD_COUNT: usize = 4;
+/// Default quote concurrency: high because quoting is pure network I/O
+/// (DHT lookups + small request/response messages) with no CPU-bound work.
+const DEFAULT_QUOTE_CONCURRENCY: usize = 32;
 
-/// Derive a sensible default chunk concurrency from available CPU parallelism.
-///
-/// Uses half the available threads (network I/O doesn't need 1:1 CPU mapping).
-fn default_chunk_concurrency() -> usize {
-    let threads = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(FALLBACK_THREAD_COUNT);
-    (threads / 2).max(1)
-}
+/// Default store concurrency: moderate because each chunk PUT sends ~4MB
+/// to 7 close-group peers. At 16 concurrent stores, ~450MB of outbound
+/// traffic can be in flight, which is reasonable for most connections
+/// including residential uploads.
+const DEFAULT_STORE_CONCURRENCY: usize = 16;
 
 /// Configuration for the Autonomi client.
 #[derive(Debug, Clone)]
@@ -46,11 +43,19 @@ pub struct ClientConfig {
     pub timeout_secs: u64,
     /// Number of closest peers to consider for routing.
     pub close_group_size: usize,
-    /// Maximum number of chunks processed concurrently during uploads.
+    /// Maximum number of chunks quoted or downloaded concurrently.
     ///
-    /// Controls parallelism for quote collection, chunk storage, and
-    /// merkle upload paths. Defaults to half the available CPU threads.
-    pub chunk_concurrency: usize,
+    /// Controls parallelism for quote collection and chunk retrieval.
+    /// These are pure network I/O operations (DHT lookups, small messages)
+    /// with negligible CPU cost, so a high default is safe.
+    pub quote_concurrency: usize,
+    /// Maximum number of chunks stored concurrently during uploads.
+    ///
+    /// Controls parallelism for chunk PUT operations. Lower than quote
+    /// concurrency because storing to NAT nodes requires hole-punch
+    /// connection establishment, which is stateful and time-sensitive.
+    /// Defaults to half the available CPU threads.
+    pub store_concurrency: usize,
 }
 
 impl Default for ClientConfig {
@@ -58,7 +63,8 @@ impl Default for ClientConfig {
         Self {
             timeout_secs: CLIENT_TIMEOUT_SECS,
             close_group_size: CLOSE_GROUP_SIZE,
-            chunk_concurrency: default_chunk_concurrency(),
+            quote_concurrency: DEFAULT_QUOTE_CONCURRENCY,
+            store_concurrency: DEFAULT_STORE_CONCURRENCY,
         }
     }
 }

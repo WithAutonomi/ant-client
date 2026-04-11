@@ -26,7 +26,7 @@ impl Network {
     pub async fn new(bootstrap_peers: &[SocketAddr]) -> Result<Self> {
         let mut core_config = CoreNodeConfig::builder()
             .port(0)
-            .ipv6(false)
+            .ipv6(true)
             .local(true)
             .mode(NodeMode::Client)
             .max_message_size(MAX_WIRE_MESSAGE_SIZE)
