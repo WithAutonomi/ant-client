@@ -105,7 +105,10 @@ impl Network {
             .into_iter()
             .filter(|n| n.peer_id != *local_peer_id)
             .take(count)
-            .map(|n| (n.peer_id, n.addresses))
+            .map(|n| {
+                let addrs = n.addresses_by_priority();
+                (n.peer_id, addrs)
+            })
             .collect())
     }
 
