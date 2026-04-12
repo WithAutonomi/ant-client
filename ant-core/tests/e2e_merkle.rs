@@ -20,7 +20,8 @@ use std::sync::Arc;
 use support::MiniTestnet;
 use tempfile::{NamedTempFile, TempDir};
 
-const CLIENT_TIMEOUT_SECS: u64 = 120;
+const CLIENT_QUOTE_TIMEOUT_SECS: u64 = 120;
+const CLIENT_STORE_TIMEOUT_SECS: u64 = 120;
 
 /// Chunk size for merkle security tests (small, fast to hash).
 const TEST_CHUNK_SIZE: usize = 1024;
@@ -40,7 +41,8 @@ async fn setup_merkle_testnet() -> (Client, MiniTestnet) {
     eprintln!("Client node routing table: {routing_size} entries, {connected} connected");
 
     let config = ClientConfig {
-        timeout_secs: CLIENT_TIMEOUT_SECS,
+        quote_timeout_secs: CLIENT_QUOTE_TIMEOUT_SECS,
+        store_timeout_secs: CLIENT_STORE_TIMEOUT_SECS,
         close_group_size: 20,
         ..Default::default()
     };

@@ -339,7 +339,7 @@ impl Client {
         merkle_payment_timestamp: u64,
     ) -> Result<[MerklePaymentCandidateNode; CANDIDATES_PER_POOL]> {
         let node = self.network().node();
-        let timeout = Duration::from_secs(self.config().timeout_secs);
+        let timeout = Duration::from_secs(self.config().quote_timeout_secs);
 
         // Query extra peers to handle validation failures (bad sigs, wrong type, etc.)
         let query_count = CANDIDATES_PER_POOL * 2;

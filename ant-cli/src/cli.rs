@@ -42,9 +42,16 @@ pub struct Cli {
     #[arg(long)]
     pub allow_loopback: bool,
 
-    /// Timeout for network operations (seconds).
+    /// Timeout for lightweight network operations such as quotes and DHT
+    /// lookups (seconds).
+    #[arg(long, default_value_t = 10)]
+    pub quote_timeout_secs: u64,
+
+    /// Timeout for chunk store/retrieve operations (seconds).
+    /// Chunk PUTs transfer multi-MB payloads, so this should be longer than
+    /// the quote timeout.
     #[arg(long, default_value_t = 60)]
-    pub timeout_secs: u64,
+    pub store_timeout_secs: u64,
 
     /// Maximum number of chunks quoted or downloaded concurrently.
     /// Defaults to 32. Safe to set high — quoting is pure network I/O.
