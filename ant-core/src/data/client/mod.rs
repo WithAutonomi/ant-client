@@ -39,10 +39,10 @@ const DEFAULT_STORE_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_QUOTE_CONCURRENCY: usize = 32;
 
 /// Default store concurrency: moderate because each chunk PUT sends ~4MB
-/// to 7 close-group peers. At 16 concurrent stores, ~450MB of outbound
-/// traffic can be in flight, which is reasonable for most connections
-/// including residential uploads.
-const DEFAULT_STORE_CONCURRENCY: usize = 16;
+/// to 7 close-group peers. At 8 concurrent stores, ~225MB of outbound
+/// traffic can be in flight. Users on fast connections can increase this
+/// with --store-concurrency; users on slow connections can decrease it.
+const DEFAULT_STORE_CONCURRENCY: usize = 8;
 
 /// Configuration for the Autonomi client.
 #[derive(Debug, Clone)]
