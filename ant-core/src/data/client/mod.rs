@@ -23,24 +23,37 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::debug;
 
-/// Default timeout for network operations in seconds.
-const CLIENT_TIMEOUT_SECS: u64 = 10;
+/// Default timeout for lightweight network operations (quotes, DHT lookups) in seconds.
+const DEFAULT_QUOTE_TIMEOUT_SECS: u64 = 10;
+
+/// Default timeout for chunk store operations in seconds.
+///
+/// Chunk PUTs transfer multi-MB payloads to multiple peers. On residential
+/// connections with limited upload bandwidth, the default quote timeout (10 s)
+/// is far too short — a 4 MB chunk at 1 Mbps takes ~32 s just for the data
+/// transfer, before accounting for QUIC slow-start and NAT traversal overhead.
+const DEFAULT_STORE_TIMEOUT_SECS: u64 = 10;
 
 /// Default quote concurrency: high because quoting is pure network I/O
 /// (DHT lookups + small request/response messages) with no CPU-bound work.
 const DEFAULT_QUOTE_CONCURRENCY: usize = 32;
 
 /// Default store concurrency: moderate because each chunk PUT sends ~4MB
-/// to 7 close-group peers. At 16 concurrent stores, ~450MB of outbound
-/// traffic can be in flight, which is reasonable for most connections
-/// including residential uploads.
-const DEFAULT_STORE_CONCURRENCY: usize = 16;
+/// to 7 close-group peers. At 8 concurrent stores, ~225MB of outbound
+/// traffic can be in flight. Users on fast connections can increase this
+/// with --store-concurrency; users on slow connections can decrease it.
+const DEFAULT_STORE_CONCURRENCY: usize = 8;
 
 /// Configuration for the Autonomi client.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// Timeout for network operations in seconds.
-    pub timeout_secs: u64,
+    /// Timeout for lightweight network operations (quotes, DHT lookups) in seconds.
+    pub quote_timeout_secs: u64,
+    /// Timeout for chunk store (PUT) operations in seconds.
+    ///
+    /// This should be significantly longer than `quote_timeout_secs` because
+    /// each chunk PUT transfers ~4 MB to multiple peers.
+    pub store_timeout_secs: u64,
     /// Number of closest peers to consider for routing.
     pub close_group_size: usize,
     /// Maximum number of chunks quoted or downloaded concurrently.
@@ -61,7 +74,8 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            timeout_secs: CLIENT_TIMEOUT_SECS,
+            quote_timeout_secs: DEFAULT_QUOTE_TIMEOUT_SECS,
+            store_timeout_secs: DEFAULT_STORE_TIMEOUT_SECS,
             close_group_size: CLOSE_GROUP_SIZE,
             quote_concurrency: DEFAULT_QUOTE_CONCURRENCY,
             store_concurrency: DEFAULT_STORE_CONCURRENCY,
@@ -164,6 +178,11 @@ impl Client {
     #[must_use]
     pub fn config(&self) -> &ClientConfig {
         &self.config
+    }
+
+    /// Get a mutable reference to the client configuration.
+    pub fn config_mut(&mut self) -> &mut ClientConfig {
+        &mut self.config
     }
 
     /// Get a reference to the network layer.

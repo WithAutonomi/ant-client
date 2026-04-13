@@ -167,9 +167,9 @@ impl Client {
             .encode()
             .map_err(|e| Error::Protocol(format!("Failed to encode PUT request: {e}")))?;
 
-        let timeout = Duration::from_secs(self.config().timeout_secs);
+        let timeout = Duration::from_secs(self.config().store_timeout_secs);
         let addr_hex = hex::encode(address);
-        let timeout_secs = self.config().timeout_secs;
+        let timeout_secs = self.config().store_timeout_secs;
 
         send_and_await_chunk_response(
             node,
@@ -274,9 +274,9 @@ impl Client {
             .encode()
             .map_err(|e| Error::Protocol(format!("Failed to encode GET request: {e}")))?;
 
-        let timeout = Duration::from_secs(self.config().timeout_secs);
+        let timeout = Duration::from_secs(self.config().store_timeout_secs);
         let addr_hex = hex::encode(address);
-        let timeout_secs = self.config().timeout_secs;
+        let timeout_secs = self.config().store_timeout_secs;
 
         send_and_await_chunk_response(
             node,

@@ -27,6 +27,12 @@ pub enum FileAction {
         /// Disable merkle batch payment, always use per-chunk payments.
         #[arg(long, conflicts_with = "merkle")]
         no_merkle: bool,
+        /// Override the store timeout (seconds). Applies only to this upload.
+        #[arg(long)]
+        store_timeout: Option<u64>,
+        /// Override the store concurrency. Applies only to this upload.
+        #[arg(long)]
+        store_concurrency: Option<usize>,
     },
     /// Download a file from the network.
     Download {
@@ -42,6 +48,18 @@ pub enum FileAction {
 }
 
 impl FileAction {
+    /// Return per-upload client config overrides, if any.
+    pub fn upload_overrides(&self) -> (Option<u64>, Option<usize>) {
+        match self {
+            FileAction::Upload {
+                store_timeout,
+                store_concurrency,
+                ..
+            } => (*store_timeout, *store_concurrency),
+            _ => (None, None),
+        }
+    }
+
     pub async fn execute(self, client: &Client, json: bool) -> anyhow::Result<()> {
         match self {
             FileAction::Upload {
@@ -49,6 +67,8 @@ impl FileAction {
                 public,
                 merkle,
                 no_merkle,
+                store_timeout: _,
+                store_concurrency: _,
             } => {
                 let mode = if merkle {
                     PaymentMode::Merkle

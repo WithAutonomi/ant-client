@@ -68,7 +68,8 @@ async fn run() -> anyhow::Result<()> {
         bootstrap,
         devnet_manifest,
         allow_loopback,
-        timeout_secs,
+        quote_timeout_secs,
+        store_timeout_secs,
         verbose: _,
         evm_network,
         quote_concurrency,
@@ -80,7 +81,8 @@ async fn run() -> anyhow::Result<()> {
         bootstrap,
         devnet_manifest,
         allow_loopback,
-        timeout_secs,
+        quote_timeout_secs,
+        store_timeout_secs,
         evm_network,
         quote_concurrency,
         store_concurrency,
@@ -119,7 +121,16 @@ async fn run() -> anyhow::Result<()> {
         }
         Commands::File { action } => {
             let needs_wallet = matches!(action, commands::data::FileAction::Upload { .. });
-            let client = build_data_client(&data_ctx, needs_wallet, json).await?;
+            // Extract per-upload overrides before building the client.
+            let (store_timeout_override, store_concurrency_override) =
+                action.upload_overrides();
+            let mut client = build_data_client(&data_ctx, needs_wallet, json).await?;
+            if let Some(t) = store_timeout_override {
+                client.config_mut().store_timeout_secs = t;
+            }
+            if let Some(c) = store_concurrency_override {
+                client.config_mut().store_concurrency = c;
+            }
             action.execute(&client, json).await?;
         }
         Commands::Chunk { action } => {
@@ -140,7 +151,8 @@ struct DataCliContext {
     bootstrap: Vec<SocketAddr>,
     devnet_manifest: Option<PathBuf>,
     allow_loopback: bool,
-    timeout_secs: u64,
+    quote_timeout_secs: u64,
+    store_timeout_secs: u64,
     evm_network: String,
     quote_concurrency: Option<usize>,
     store_concurrency: Option<usize>,
@@ -171,7 +183,8 @@ async fn build_data_client(
     }
 
     let mut config = ClientConfig {
-        timeout_secs: ctx.timeout_secs,
+        quote_timeout_secs: ctx.quote_timeout_secs,
+        store_timeout_secs: ctx.store_timeout_secs,
         ..Default::default()
     };
     if let Some(concurrency) = ctx.quote_concurrency {
