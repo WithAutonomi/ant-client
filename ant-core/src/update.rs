@@ -225,11 +225,12 @@ pub async fn perform_update(
     progress.report_complete("Signature verified");
 
     progress.report_started("Extracting archive...");
-    let binary_path = if download_url.ends_with(".zip") {
+    let extracted = if download_url.ends_with(".zip") {
         extract_zip(&archive_bytes, tmp_dir.path(), CLI_BINARY_NAME)?
     } else {
         extract_tar_gz(&archive_bytes, tmp_dir.path(), CLI_BINARY_NAME)?
     };
+    let binary_path = extracted.binary_path;
 
     // Verify the extracted binary reports the expected version.
     let actual_version = extract_version(&binary_path).await;

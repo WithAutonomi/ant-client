@@ -122,8 +122,7 @@ async fn run() -> anyhow::Result<()> {
         Commands::File { action } => {
             let needs_wallet = matches!(action, commands::data::FileAction::Upload { .. });
             // Extract per-upload overrides before building the client.
-            let (store_timeout_override, store_concurrency_override) =
-                action.upload_overrides();
+            let (store_timeout_override, store_concurrency_override) = action.upload_overrides();
             let mut client = build_data_client(&data_ctx, needs_wallet, json).await?;
             if let Some(t) = store_timeout_override {
                 client.config_mut().store_timeout_secs = t;
