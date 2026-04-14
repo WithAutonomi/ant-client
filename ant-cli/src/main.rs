@@ -221,7 +221,10 @@ async fn build_data_client(
 
     let mut client = Client::from_node(node, config);
 
-    if let Some(ref key) = private_key {
+    if needs_wallet {
+        let key = private_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SECRET_KEY environment variable required"))?;
         let network = resolve_evm_network(&ctx.evm_network, manifest.as_ref())?;
         let wallet = create_wallet(key, network)?;
         info!("Wallet configured for EVM payments");
