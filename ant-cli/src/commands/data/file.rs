@@ -183,7 +183,7 @@ async fn handle_file_upload(
             println!("  Time:    {:.1}s", elapsed.as_secs_f64());
             println!();
             println!("Anyone can download this file with:");
-            println!("  ant file download {hex_addr}");
+            println!("  ant file download {hex_addr} -o <FILE>");
         }
 
         info!(
@@ -219,7 +219,10 @@ async fn handle_file_upload(
             println!("  Time:    {:.1}s", elapsed.as_secs_f64());
             println!();
             println!("Download this file with:");
-            println!("  ant file download --datamap {}", datamap_path.display());
+            println!(
+                "  ant file download --datamap {} -o <FILE>",
+                datamap_path.display()
+            );
         }
 
         info!(

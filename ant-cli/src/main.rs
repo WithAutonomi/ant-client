@@ -179,7 +179,14 @@ async fn build_data_client(
         create_client_node(bootstrap, ctx.allow_loopback).await?
     } else {
         let spinner = new_spinner("Connecting to autonomi network...");
-        let node = create_client_node_raw(bootstrap, ctx.allow_loopback).await?;
+
+        let node = match create_client_node_raw(bootstrap, ctx.allow_loopback).await {
+            Ok(n) => n,
+            Err(e) => {
+                spinner.finish_and_clear();
+                return Err(e);
+            }
+        };
 
         // Poll peer count during node.start() to show real-time discovery
         let spinner_clone = spinner.clone();
@@ -196,13 +203,13 @@ async fn build_data_client(
             }
         });
 
-        node.start()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to start P2P node: {e}"))?;
-
+        let start_result = node.start().await;
         poll_handle.abort();
-        let peers = node.connected_peers().await.len();
         spinner.finish_and_clear();
+
+        start_result.map_err(|e| anyhow::anyhow!("Failed to start P2P node: {e}"))?;
+
+        let peers = node.connected_peers().await.len();
         eprintln!("Connected to autonomi network (found {peers} peers)");
         node
     };
