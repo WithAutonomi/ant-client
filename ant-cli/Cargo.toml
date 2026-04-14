@@ -14,6 +14,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 colored = "3.1.1"
 hex = "0.4"
+indicatif = "0.17"
 reqwest = { version = "0.12", features = ["json"] }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
