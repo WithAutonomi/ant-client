@@ -47,8 +47,6 @@ pub enum UploadEvent {
         total_waves: usize,
         chunks_in_wave: usize,
     },
-    /// Payment submitted for a wave.
-    PayingForChunks { wave: usize, total_waves: usize },
     /// A chunk has been stored on the network.
     ChunkStored { stored: usize, total: usize },
     /// A wave has completed.

@@ -248,8 +248,13 @@ async fn build_data_client(
 }
 
 /// Create a styled spinner for long-running operations.
+/// Hidden when stderr is not a terminal (piped output).
 fn new_spinner(msg: &str) -> ProgressBar {
-    let pb = ProgressBar::new_spinner();
+    let pb = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        ProgressBar::new_spinner()
+    } else {
+        ProgressBar::hidden()
+    };
     pb.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
             .expect("valid template")

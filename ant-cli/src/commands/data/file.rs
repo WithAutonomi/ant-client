@@ -255,7 +255,11 @@ async fn drive_upload_progress(
                 // Finish the encryption spinner and create a new progress bar
                 pb.finish_and_clear();
                 eprintln!("Encrypted into {total_chunks} chunks");
-                pb = ProgressBar::new(total_chunks as u64);
+                pb = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                    ProgressBar::new(total_chunks as u64)
+                } else {
+                    ProgressBar::hidden()
+                };
                 pb.set_style(bar_style.clone());
                 pb.set_message(format!("Uploading {filename}"));
                 pb.enable_steady_tick(Duration::from_millis(80));
@@ -267,11 +271,6 @@ async fn drive_upload_progress(
             } => {
                 pb.set_message(format!(
                     "Uploading {filename} (wave {wave}/{total_waves}, quoting {chunks_in_wave} chunks)"
-                ));
-            }
-            UploadEvent::PayingForChunks { wave, total_waves } => {
-                pb.set_message(format!(
-                    "Uploading {filename} (wave {wave}/{total_waves}, paying)"
                 ));
             }
             UploadEvent::ChunkStored { stored, total: _ } => {
@@ -339,7 +338,11 @@ async fn handle_file_download(
         .progress_chars("━╸━")
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
 
-        let pb = ProgressBar::new(total_chunks as u64);
+        let pb = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            ProgressBar::new(total_chunks as u64)
+        } else {
+            ProgressBar::hidden()
+        };
         pb.set_style(bar_style);
         pb.enable_steady_tick(Duration::from_millis(80));
 
@@ -410,7 +413,11 @@ struct DownloadJsonResult {
 }
 
 fn new_spinner(msg: &str) -> ProgressBar {
-    let pb = ProgressBar::new_spinner();
+    let pb = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        ProgressBar::new_spinner()
+    } else {
+        ProgressBar::hidden()
+    };
     pb.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
             .expect("valid template")
