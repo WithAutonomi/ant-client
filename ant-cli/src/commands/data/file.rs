@@ -330,29 +330,13 @@ async fn handle_file_download(
         deserialize_datamap(&datamap_bytes)?
     };
 
-    let total_chunks = data_map.infos().len();
-
     if json_output {
         client
             .file_download(&data_map, &output_path)
             .await
             .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
     } else {
-        // Progress bar for chunk download
-        let bar_style = ProgressStyle::with_template(
-            "{spinner:.cyan} Downloading\n  [{bar:40.cyan/dim}] {pos}/{len} chunks",
-        )
-        .expect("valid template")
-        .progress_chars("━╸━")
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
-
-        let pb = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-            ProgressBar::new(total_chunks as u64)
-        } else {
-            ProgressBar::hidden()
-        };
-        pb.set_style(bar_style);
-        pb.enable_steady_tick(Duration::from_millis(80));
+        let pb = new_spinner("Downloading (0 chunks fetched)...");
 
         let (tx, mut rx) = mpsc::channel(64);
 
@@ -362,7 +346,7 @@ async fn handle_file_download(
             while let Some(event) = rx.recv().await {
                 match event {
                     DownloadEvent::ChunksFetched { fetched, total: _ } => {
-                        pb_clone.set_position(fetched as u64);
+                        pb_clone.set_message(format!("Downloading ({fetched} chunks fetched)..."));
                     }
                 }
             }
