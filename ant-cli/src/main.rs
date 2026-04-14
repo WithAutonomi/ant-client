@@ -4,8 +4,10 @@ mod commands;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use tracing::info;
 
 use ant_core::data::{
@@ -122,8 +124,7 @@ async fn run() -> anyhow::Result<()> {
         Commands::File { action } => {
             let needs_wallet = matches!(action, commands::data::FileAction::Upload { .. });
             // Extract per-upload overrides before building the client.
-            let (store_timeout_override, store_concurrency_override) =
-                action.upload_overrides();
+            let (store_timeout_override, store_concurrency_override) = action.upload_overrides();
             let mut client = build_data_client(&data_ctx, needs_wallet, json).await?;
             if let Some(t) = store_timeout_override {
                 client.config_mut().store_timeout_secs = t;
@@ -170,17 +171,24 @@ async fn build_data_client(
         anyhow::bail!("SECRET_KEY environment variable required for this operation");
     }
 
-    // Parse manifest once and share it across bootstrap + EVM resolution.
     let manifest = load_manifest(ctx)?;
     let bootstrap = resolve_bootstrap_from(ctx, manifest.as_ref())?;
 
-    if !quiet {
-        eprint!("Connecting to network...");
-    }
-    let node = create_client_node(bootstrap, ctx.allow_loopback).await?;
-    if !quiet {
-        eprintln!(" done");
-    }
+    // Connection phase with animated spinner showing peer discovery
+    let node = if quiet {
+        create_client_node(bootstrap, ctx.allow_loopback).await?
+    } else {
+        let spinner = new_spinner("Connecting to autonomi network...");
+        let node = create_client_node(bootstrap.clone(), ctx.allow_loopback).await?;
+
+        // Brief poll to show peer count
+        let peers = node.connected_peers().await;
+        spinner.finish_with_message(format!(
+            "Connected to autonomi network (found {} peers)",
+            peers.len()
+        ));
+        node
+    };
 
     let mut config = ClientConfig {
         quote_timeout_secs: ctx.quote_timeout_secs,
@@ -199,21 +207,38 @@ async fn build_data_client(
     if let Some(ref key) = private_key {
         let network = resolve_evm_network(&ctx.evm_network, manifest.as_ref())?;
         let wallet = create_wallet(key, network)?;
-        if !quiet {
-            eprint!("Approving token spend...");
-        }
         info!("Wallet configured for EVM payments");
         client = client.with_wallet(wallet);
-        client
-            .approve_token_spend()
-            .await
-            .map_err(|e| anyhow::anyhow!("Token approval failed: {e}"))?;
+
         if !quiet {
-            eprintln!(" done");
+            let spinner = new_spinner("Approving token spend...");
+            client
+                .approve_token_spend()
+                .await
+                .map_err(|e| anyhow::anyhow!("Token approval failed: {e}"))?;
+            spinner.finish_with_message("Token spend approved");
+        } else {
+            client
+                .approve_token_spend()
+                .await
+                .map_err(|e| anyhow::anyhow!("Token approval failed: {e}"))?;
         }
     }
 
     Ok(client)
+}
+
+/// Create a styled spinner for long-running operations.
+fn new_spinner(msg: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .expect("valid template")
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.set_message(msg.to_string());
+    pb.enable_steady_tick(Duration::from_millis(80));
+    pb
 }
 
 fn require_secret_key() -> anyhow::Result<String> {

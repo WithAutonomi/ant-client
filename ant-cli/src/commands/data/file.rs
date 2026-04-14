@@ -1,11 +1,13 @@
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Subcommand;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
+use tokio::sync::mpsc;
 use tracing::info;
 
-use ant_core::data::{Client, DataMap, PaymentMode};
+use ant_core::data::{Client, DataMap, DownloadEvent, PaymentMode, UploadEvent};
 
 use super::chunk::parse_address;
 
@@ -104,42 +106,60 @@ async fn handle_file_upload(
     }
     let start = Instant::now();
 
-    if !json_output {
-        eprintln!(
-            "Uploading {} ({})...",
-            path.display(),
-            format_size(file_size)
-        );
-    }
-
     info!(
         "Uploading file: {} ({file_size} bytes, payment mode: {mode:?})",
         path.display()
     );
 
-    let result = client
-        .file_upload_with_mode(path, mode)
-        .await
-        .map_err(|e| anyhow::anyhow!("File upload failed: {e}"))?;
+    let result = if json_output {
+        // No progress bars in JSON mode
+        client
+            .file_upload_with_mode(path, mode)
+            .await
+            .map_err(|e| anyhow::anyhow!("File upload failed: {e}"))?
+    } else {
+        // Set up progress channel and drive progress bars
+        let (tx, rx) = mpsc::channel(64);
+        let pb_handle = tokio::spawn(drive_upload_progress(
+            rx,
+            path.display().to_string(),
+            file_size,
+        ));
+
+        let result = client
+            .file_upload_with_progress(path, mode, Some(tx))
+            .await
+            .map_err(|e| anyhow::anyhow!("File upload failed: {e}"))?;
+
+        // Wait for progress display to finish
+        let _ = pb_handle.await;
+        result
+    };
 
     let elapsed = start.elapsed();
 
     if public {
-        // Store the DataMap as a chunk on the network
-        if !json_output {
-            eprint!("Storing public data map...");
-        }
+        let spinner = if !json_output {
+            let s = new_spinner("Storing public data map...");
+            Some(s)
+        } else {
+            None
+        };
+
         let dm_address = client
             .data_map_store(&result.data_map)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to store public DataMap: {e}"))?;
 
-        let hex_addr = hex::encode(dm_address);
+        if let Some(s) = spinner {
+            s.finish_and_clear();
+        }
 
+        let hex_addr = hex::encode(dm_address);
         let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei);
 
         if json_output {
-            let out = UploadResult {
+            let out = UploadJsonResult {
                 address: Some(hex_addr.clone()),
                 datamap: None,
                 mode: "public".into(),
@@ -151,8 +171,7 @@ async fn handle_file_upload(
             };
             println!("{}", serde_json::to_string(&out)?);
         } else {
-            eprintln!(" done");
-            eprintln!();
+            println!();
             println!("Upload complete!");
             println!("  Address: {hex_addr}");
             println!("  Chunks:  {}", result.chunks_stored);
@@ -169,7 +188,6 @@ async fn handle_file_upload(
             result.chunks_stored
         );
     } else {
-        // Save DataMap to disk (private)
         let datamap_path = path.with_extension("datamap");
         let datamap_bytes = serialize_datamap(&result.data_map)?;
         std::fs::write(&datamap_path, &datamap_bytes)?;
@@ -177,7 +195,7 @@ async fn handle_file_upload(
         let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei);
 
         if json_output {
-            let out = UploadResult {
+            let out = UploadJsonResult {
                 address: None,
                 datamap: Some(datamap_path.display().to_string()),
                 mode: "private".into(),
@@ -189,7 +207,7 @@ async fn handle_file_upload(
             };
             println!("{}", serde_json::to_string(&out)?);
         } else {
-            eprintln!();
+            println!();
             println!("Upload complete!");
             println!("  Datamap: {}", datamap_path.display());
             println!("  Chunks:  {}", result.chunks_stored);
@@ -211,6 +229,92 @@ async fn handle_file_upload(
     Ok(())
 }
 
+/// Drive upload progress bars from the event channel.
+async fn drive_upload_progress(
+    mut rx: mpsc::Receiver<UploadEvent>,
+    filename: String,
+    file_size: u64,
+) {
+    let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
+        .expect("valid template")
+        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
+
+    let bar_style = ProgressStyle::with_template(
+        "{spinner:.cyan} {msg}\n  [{bar:40.cyan/dim}] {pos}/{len} chunks",
+    )
+    .expect("valid template")
+    .progress_chars("━╸━")
+    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
+
+    // Start with encryption spinner
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(spinner_style.clone());
+    pb.set_message(format!(
+        "Encrypting {filename} ({})...",
+        format_size(file_size)
+    ));
+    pb.enable_steady_tick(Duration::from_millis(80));
+
+    let mut phase = UploadPhase::Encrypting;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            UploadEvent::Encrypting { chunks_done } => {
+                pb.set_message(format!("Encrypting {filename} ({chunks_done} chunks)..."));
+            }
+            UploadEvent::Encrypted { total_chunks } => {
+                pb.finish_with_message(format!("Encrypted into {total_chunks} chunks"));
+                // Switch to upload progress bar
+                phase = UploadPhase::Uploading;
+                pb.set_style(bar_style.clone());
+                pb.set_length(total_chunks as u64);
+                pb.set_position(0);
+                pb.set_message(format!("Uploading {filename}"));
+                pb.enable_steady_tick(Duration::from_millis(80));
+            }
+            UploadEvent::QuotingChunks {
+                wave,
+                total_waves,
+                chunks_in_wave,
+            } => {
+                if phase == UploadPhase::Uploading {
+                    pb.set_message(format!(
+                        "Uploading {filename} (wave {wave}/{total_waves}, quoting {chunks_in_wave} chunks)"
+                    ));
+                }
+            }
+            UploadEvent::PayingForChunks { wave, total_waves } => {
+                pb.set_message(format!(
+                    "Uploading {filename} (wave {wave}/{total_waves}, paying)"
+                ));
+            }
+            UploadEvent::ChunkStored { stored, total: _ } => {
+                pb.set_position(stored as u64);
+                pb.set_message(format!("Uploading {filename}"));
+            }
+            UploadEvent::WaveComplete {
+                wave,
+                total_waves,
+                stored_so_far,
+                total: _,
+            } => {
+                pb.set_position(stored_so_far as u64);
+                if wave < total_waves {
+                    pb.set_message(format!("Uploading {filename}"));
+                }
+            }
+        }
+    }
+
+    pb.finish_and_clear();
+}
+
+#[derive(Debug, PartialEq)]
+enum UploadPhase {
+    Encrypting,
+    Uploading,
+}
+
 async fn handle_file_download(
     client: &Client,
     address: Option<&str>,
@@ -223,34 +327,77 @@ async fn handle_file_download(
 
     let data_map = if let Some(addr_hex) = address {
         if !json_output {
-            eprintln!("Downloading from network...");
+            let spinner = new_spinner("Fetching data map...");
+            info!("Downloading public file from address {addr_hex}");
+            let dm = client
+                .data_map_fetch(&parse_address(addr_hex)?)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?;
+            spinner.finish_and_clear();
+            dm
+        } else {
+            info!("Downloading public file from address {addr_hex}");
+            client
+                .data_map_fetch(&parse_address(addr_hex)?)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
         }
-        info!("Downloading public file from address {addr_hex}");
-        client
-            .data_map_fetch(&parse_address(addr_hex)?)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
     } else {
         let dm_path = datamap_path
             .ok_or_else(|| anyhow::anyhow!("--datamap required for private download"))?;
-        if !json_output {
-            eprintln!("Downloading from network...");
-        }
         info!("Downloading file using datamap: {}", dm_path.display());
         let datamap_bytes = std::fs::read(dm_path)?;
         deserialize_datamap(&datamap_bytes)?
     };
 
-    client
-        .file_download(&data_map, &output_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+    let total_chunks = data_map.infos().len();
+
+    if json_output {
+        client
+            .file_download(&data_map, &output_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+    } else {
+        // Progress bar for chunk download
+        let bar_style = ProgressStyle::with_template(
+            "{spinner:.cyan} Downloading\n  [{bar:40.cyan/dim}] {pos}/{len} chunks",
+        )
+        .expect("valid template")
+        .progress_chars("━╸━")
+        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
+
+        let pb = ProgressBar::new(total_chunks as u64);
+        pb.set_style(bar_style);
+        pb.enable_steady_tick(Duration::from_millis(80));
+
+        let (tx, mut rx) = mpsc::channel(64);
+
+        // Spawn progress bar updater
+        let pb_clone = pb.clone();
+        let progress_handle = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    DownloadEvent::ChunksFetched { fetched, total: _ } => {
+                        pb_clone.set_position(fetched as u64);
+                    }
+                }
+            }
+            pb_clone.finish_and_clear();
+        });
+
+        client
+            .file_download_with_progress(&data_map, &output_path, Some(tx))
+            .await
+            .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+
+        let _ = progress_handle.await;
+    }
 
     let file_size = std::fs::metadata(&output_path)?.len();
     let elapsed = start.elapsed();
 
     if json_output {
-        let out = DownloadResult {
+        let out = DownloadJsonResult {
             file: output_path.display().to_string(),
             size: file_size,
             elapsed_secs: elapsed.as_secs_f64(),
@@ -267,7 +414,7 @@ async fn handle_file_download(
 }
 
 #[derive(Serialize)]
-struct UploadResult {
+struct UploadJsonResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -281,10 +428,22 @@ struct UploadResult {
 }
 
 #[derive(Serialize)]
-struct DownloadResult {
+struct DownloadJsonResult {
     file: String,
     size: u64,
     elapsed_secs: f64,
+}
+
+fn new_spinner(msg: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .expect("valid template")
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.set_message(msg.to_string());
+    pb.enable_steady_tick(Duration::from_millis(80));
+    pb
 }
 
 fn format_size(bytes: u64) -> String {
