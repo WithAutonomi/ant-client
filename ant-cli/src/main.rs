@@ -174,19 +174,36 @@ async fn build_data_client(
     let manifest = load_manifest(ctx)?;
     let bootstrap = resolve_bootstrap_from(ctx, manifest.as_ref())?;
 
-    // Connection phase with animated spinner showing peer discovery
+    // Connection phase with animated spinner showing peer discovery in real-time
     let node = if quiet {
         create_client_node(bootstrap, ctx.allow_loopback).await?
     } else {
         let spinner = new_spinner("Connecting to autonomi network...");
-        let node = create_client_node(bootstrap.clone(), ctx.allow_loopback).await?;
+        let node = create_client_node_raw(bootstrap, ctx.allow_loopback).await?;
 
-        // Brief poll to show peer count
-        let peers = node.connected_peers().await;
-        spinner.finish_with_message(format!(
-            "Connected to autonomi network (found {} peers)",
-            peers.len()
-        ));
+        // Poll peer count during node.start() to show real-time discovery
+        let spinner_clone = spinner.clone();
+        let node_clone = node.clone();
+        let poll_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let count = node_clone.connected_peers().await.len();
+                if count > 0 {
+                    spinner_clone.set_message(format!(
+                        "Connecting to autonomi network... (found {count} peers)"
+                    ));
+                }
+            }
+        });
+
+        node.start()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to start P2P node: {e}"))?;
+
+        poll_handle.abort();
+        let peers = node.connected_peers().await.len();
+        spinner.finish_and_clear();
+        eprintln!("Connected to autonomi network (found {peers} peers)");
         node
     };
 
@@ -344,6 +361,18 @@ async fn create_client_node(
     bootstrap: Vec<SocketAddr>,
     allow_loopback: bool,
 ) -> anyhow::Result<Arc<P2PNode>> {
+    let node = create_client_node_raw(bootstrap, allow_loopback).await?;
+    node.start()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to start P2P node: {e}"))?;
+    Ok(node)
+}
+
+/// Create a P2P node without starting it (for spinner polling during start).
+async fn create_client_node_raw(
+    bootstrap: Vec<SocketAddr>,
+    allow_loopback: bool,
+) -> anyhow::Result<Arc<P2PNode>> {
     let mut core_config = CoreNodeConfig::builder()
         .port(0)
         .ipv6(false)
@@ -361,9 +390,6 @@ async fn create_client_node(
     let node = P2PNode::new(core_config)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create P2P node: {e}"))?;
-    node.start()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to start P2P node: {e}"))?;
 
     Ok(Arc::new(node))
 }
