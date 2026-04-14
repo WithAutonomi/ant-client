@@ -362,8 +362,13 @@ async fn handle_file_download(
 
             while let Some(event) = rx.recv().await {
                 match event {
-                    DownloadEvent::ResolvingDataMap => {
-                        pb.set_message("Resolving data map...");
+                    DownloadEvent::ResolvingDataMap {
+                        total_map_chunks: _,
+                    } => {
+                        pb.set_message("Resolving data map...".to_string());
+                    }
+                    DownloadEvent::MapChunkFetched { fetched } => {
+                        pb.set_message(format!("Resolving data map... ({fetched} chunks)"));
                     }
                     DownloadEvent::DataMapResolved { total_chunks } => {
                         pb.finish_and_clear();

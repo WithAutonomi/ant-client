@@ -62,8 +62,10 @@ pub enum UploadEvent {
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
     /// Resolving hierarchical DataMap to discover real chunk count.
-    ResolvingDataMap,
-    /// DataMap resolved — total chunk count now known.
+    ResolvingDataMap { total_map_chunks: usize },
+    /// A DataMap chunk has been fetched during resolution.
+    MapChunkFetched { fetched: usize },
+    /// DataMap resolved — total data chunk count now known.
     DataMapResolved { total_chunks: usize },
     /// Data chunks are being fetched from the network.
     ChunksFetched { fetched: usize, total: usize },
@@ -1063,13 +1065,23 @@ impl Client {
         // Phase 1: Resolve hierarchical DataMap to root level.
         // This fetches child DataMap chunks (typically 3) to discover the real chunk count.
         let root_map = if data_map.is_child() {
+            let dm_chunks = data_map.len();
             if let Some(ref tx) = progress {
-                let _ = tx.try_send(DownloadEvent::ResolvingDataMap);
+                let _ = tx.try_send(DownloadEvent::ResolvingDataMap {
+                    total_map_chunks: dm_chunks,
+                });
             }
 
+            let resolve_progress = progress.clone();
+            let resolve_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
             let resolved = tokio::task::block_in_place(|| {
+                let counter_ref = resolve_counter.clone();
+                let progress_ref = resolve_progress.clone();
                 let fetch = |batch: &[(usize, XorName)]| {
                     let batch_owned: Vec<(usize, XorName)> = batch.to_vec();
+                    let counter = counter_ref.clone();
+                    let prog = progress_ref.clone();
                     handle.block_on(async {
                         let mut futs = futures::stream::FuturesUnordered::new();
                         for (idx, hash) in batch_owned {
@@ -1096,6 +1108,11 @@ impl Client {
                                     ))
                                 })?;
                             results.push((idx, chunk.content));
+                            let fetched =
+                                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if let Some(ref tx) = prog {
+                                let _ = tx.try_send(DownloadEvent::MapChunkFetched { fetched });
+                            }
                         }
                         Ok(results)
                     })
