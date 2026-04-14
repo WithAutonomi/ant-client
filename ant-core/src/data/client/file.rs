@@ -24,7 +24,7 @@ use evmlib::common::QuoteHash;
 use evmlib::common::TxHash;
 use fs2::FileExt;
 use futures::stream::{self, StreamExt};
-use self_encryption::{stream_encrypt, streaming_decrypt, DataMap};
+use self_encryption::{get_root_data_map_parallel, stream_encrypt, streaming_decrypt, DataMap};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -61,7 +61,11 @@ pub enum UploadEvent {
 /// Progress events emitted during file download for UI feedback.
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
-    /// Chunks are being fetched from the network.
+    /// Resolving hierarchical DataMap to discover real chunk count.
+    ResolvingDataMap,
+    /// DataMap resolved — total chunk count now known.
+    DataMapResolved { total_chunks: usize },
+    /// Data chunks are being fetched from the network.
     ChunksFetched { fetched: usize, total: usize },
 }
 
@@ -1039,6 +1043,12 @@ impl Client {
     /// Download and decrypt a file with progress events.
     ///
     /// Same as [`Client::file_download`] but sends [`DownloadEvent`]s for UI feedback.
+    ///
+    /// Progress reporting:
+    /// 1. Resolves hierarchical DataMaps to the root level first (reports as
+    ///    `ChunksFetched` with `total: 0` during resolution)
+    /// 2. Once the root DataMap is known, sends `total_chunks` with accurate count
+    /// 3. Fetches data chunks with accurate `fetched/total` progress
     #[allow(clippy::unused_async)]
     pub async fn file_download_with_progress(
         &self,
@@ -1048,13 +1058,73 @@ impl Client {
     ) -> Result<u64> {
         debug!("Downloading file to {}", output.display());
 
-        let total_chunks = data_map.infos().len();
+        let handle = Handle::current();
+
+        // Phase 1: Resolve hierarchical DataMap to root level.
+        // This fetches child DataMap chunks (typically 3) to discover the real chunk count.
+        let root_map = if data_map.is_child() {
+            if let Some(ref tx) = progress {
+                let _ = tx.try_send(DownloadEvent::ResolvingDataMap);
+            }
+
+            let resolved = tokio::task::block_in_place(|| {
+                let fetch = |batch: &[(usize, XorName)]| {
+                    let batch_owned: Vec<(usize, XorName)> = batch.to_vec();
+                    handle.block_on(async {
+                        let mut futs = futures::stream::FuturesUnordered::new();
+                        for (idx, hash) in batch_owned {
+                            let addr = hash.0;
+                            futs.push(async move {
+                                let result = self.chunk_get(&addr).await;
+                                (idx, hash, result)
+                            });
+                        }
+                        let mut results = Vec::with_capacity(futs.len());
+                        while let Some((idx, hash, result)) =
+                            futures::StreamExt::next(&mut futs).await
+                        {
+                            let chunk = result
+                                .map_err(|e| {
+                                    self_encryption::Error::Generic(format!(
+                                        "DataMap resolution failed: {e}"
+                                    ))
+                                })?
+                                .ok_or_else(|| {
+                                    self_encryption::Error::Generic(format!(
+                                        "DataMap chunk not found: {}",
+                                        hex::encode(hash.0)
+                                    ))
+                                })?;
+                            results.push((idx, chunk.content));
+                        }
+                        Ok(results)
+                    })
+                };
+                get_root_data_map_parallel(data_map.clone(), &fetch)
+            })
+            .map_err(|e| Error::Encryption(format!("DataMap resolution failed: {e}")))?;
+
+            info!(
+                "Resolved hierarchical DataMap: {} data chunks",
+                resolved.len()
+            );
+            resolved
+        } else {
+            data_map.clone()
+        };
+
+        // Phase 2: Now we know the real chunk count.
+        let total_chunks = root_map.len();
+        if let Some(ref tx) = progress {
+            let _ = tx.try_send(DownloadEvent::DataMapResolved { total_chunks });
+        }
+
+        // Phase 3: Fetch and decrypt data chunks with accurate progress.
         let fetched_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fetched_for_closure = fetched_counter.clone();
         let progress_for_closure = progress.clone();
-        let handle = Handle::current();
 
-        let stream = streaming_decrypt(data_map, |batch: &[(usize, XorName)]| {
+        let stream = streaming_decrypt(&root_map, |batch: &[(usize, XorName)]| {
             let batch_owned: Vec<(usize, XorName)> = batch.to_vec();
             let fetched_ref = fetched_for_closure.clone();
             let progress_ref = progress_for_closure.clone();

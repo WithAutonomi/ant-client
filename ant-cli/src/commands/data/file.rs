@@ -336,21 +336,52 @@ async fn handle_file_download(
             .await
             .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
     } else {
-        let pb = new_spinner("Downloading (0 chunks fetched)...");
-
         let (tx, mut rx) = mpsc::channel(64);
 
-        // Spawn progress bar updater
-        let pb_clone = pb.clone();
+        let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
         let progress_handle = tokio::spawn(async move {
+            let mut pb = if is_tty {
+                ProgressBar::new_spinner()
+            } else {
+                ProgressBar::hidden()
+            };
+            pb.set_style(
+                ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                    .expect("valid template")
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            );
+            pb.set_message("Resolving data map...");
+            pb.enable_steady_tick(Duration::from_millis(80));
+
+            let bar_style = ProgressStyle::with_template(
+                "{spinner:.cyan} Downloading\n  [{bar:40.cyan/dim}] {pos}/{len} chunks",
+            )
+            .expect("valid template")
+            .progress_chars("━╸━")
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
+
             while let Some(event) = rx.recv().await {
                 match event {
+                    DownloadEvent::ResolvingDataMap => {
+                        pb.set_message("Resolving data map...");
+                    }
+                    DownloadEvent::DataMapResolved { total_chunks } => {
+                        pb.finish_and_clear();
+                        pb = if is_tty {
+                            ProgressBar::new(total_chunks as u64)
+                        } else {
+                            ProgressBar::hidden()
+                        };
+                        pb.set_style(bar_style.clone());
+                        pb.set_message("Downloading");
+                        pb.enable_steady_tick(Duration::from_millis(80));
+                    }
                     DownloadEvent::ChunksFetched { fetched, total: _ } => {
-                        pb_clone.set_message(format!("Downloading ({fetched} chunks fetched)..."));
+                        pb.set_position(fetched as u64);
                     }
                 }
             }
-            pb_clone.finish_and_clear();
+            pb.finish_and_clear();
         });
 
         let download_result = client
