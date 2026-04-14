@@ -212,11 +212,10 @@ async fn build_data_client(
 
         if !quiet {
             let spinner = new_spinner("Approving token spend...");
-            client
-                .approve_token_spend()
-                .await
-                .map_err(|e| anyhow::anyhow!("Token approval failed: {e}"))?;
-            spinner.finish_with_message("Token spend approved");
+            let approval = client.approve_token_spend().await;
+            spinner.finish_and_clear();
+            approval.map_err(|e| anyhow::anyhow!("Token approval failed: {e}"))?;
+            eprintln!("Token spend approved");
         } else {
             client
                 .approve_token_spend()

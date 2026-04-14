@@ -126,14 +126,12 @@ async fn handle_file_upload(
             file_size,
         ));
 
-        let result = client
-            .file_upload_with_progress(path, mode, Some(tx))
-            .await
-            .map_err(|e| anyhow::anyhow!("File upload failed: {e}"))?;
+        let upload_result = client.file_upload_with_progress(path, mode, Some(tx)).await;
 
-        // Wait for progress display to finish
+        // Wait for progress display to finish (sender dropped → receiver exits)
         let _ = pb_handle.await;
-        result
+
+        upload_result.map_err(|e| anyhow::anyhow!("File upload failed: {e}"))?
     };
 
     let elapsed = start.elapsed();
@@ -146,14 +144,14 @@ async fn handle_file_upload(
             None
         };
 
-        let dm_address = client
-            .data_map_store(&result.data_map)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to store public DataMap: {e}"))?;
+        let dm_result = client.data_map_store(&result.data_map).await;
 
         if let Some(s) = spinner {
             s.finish_and_clear();
         }
+
+        let dm_address =
+            dm_result.map_err(|e| anyhow::anyhow!("Failed to store public DataMap: {e}"))?;
 
         let hex_addr = hex::encode(dm_address);
         let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei);
@@ -235,10 +233,6 @@ async fn drive_upload_progress(
     filename: String,
     file_size: u64,
 ) {
-    let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
-        .expect("valid template")
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
-
     let bar_style = ProgressStyle::with_template(
         "{spinner:.cyan} {msg}\n  [{bar:40.cyan/dim}] {pos}/{len} chunks",
     )
@@ -247,15 +241,10 @@ async fn drive_upload_progress(
     .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
 
     // Start with encryption spinner
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(spinner_style.clone());
-    pb.set_message(format!(
+    let mut pb = new_spinner(&format!(
         "Encrypting {filename} ({})...",
         format_size(file_size)
     ));
-    pb.enable_steady_tick(Duration::from_millis(80));
-
-    let mut phase = UploadPhase::Encrypting;
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -263,12 +252,11 @@ async fn drive_upload_progress(
                 pb.set_message(format!("Encrypting {filename} ({chunks_done} chunks)..."));
             }
             UploadEvent::Encrypted { total_chunks } => {
-                pb.finish_with_message(format!("Encrypted into {total_chunks} chunks"));
-                // Switch to upload progress bar
-                phase = UploadPhase::Uploading;
+                // Finish the encryption spinner and create a new progress bar
+                pb.finish_and_clear();
+                eprintln!("Encrypted into {total_chunks} chunks");
+                pb = ProgressBar::new(total_chunks as u64);
                 pb.set_style(bar_style.clone());
-                pb.set_length(total_chunks as u64);
-                pb.set_position(0);
                 pb.set_message(format!("Uploading {filename}"));
                 pb.enable_steady_tick(Duration::from_millis(80));
             }
@@ -277,11 +265,9 @@ async fn drive_upload_progress(
                 total_waves,
                 chunks_in_wave,
             } => {
-                if phase == UploadPhase::Uploading {
-                    pb.set_message(format!(
-                        "Uploading {filename} (wave {wave}/{total_waves}, quoting {chunks_in_wave} chunks)"
-                    ));
-                }
+                pb.set_message(format!(
+                    "Uploading {filename} (wave {wave}/{total_waves}, quoting {chunks_in_wave} chunks)"
+                ));
             }
             UploadEvent::PayingForChunks { wave, total_waves } => {
                 pb.set_message(format!(
@@ -293,26 +279,16 @@ async fn drive_upload_progress(
                 pb.set_message(format!("Uploading {filename}"));
             }
             UploadEvent::WaveComplete {
-                wave,
-                total_waves,
                 stored_so_far,
                 total: _,
+                ..
             } => {
                 pb.set_position(stored_so_far as u64);
-                if wave < total_waves {
-                    pb.set_message(format!("Uploading {filename}"));
-                }
             }
         }
     }
 
     pb.finish_and_clear();
-}
-
-#[derive(Debug, PartialEq)]
-enum UploadPhase {
-    Encrypting,
-    Uploading,
 }
 
 async fn handle_file_download(
@@ -329,12 +305,9 @@ async fn handle_file_download(
         if !json_output {
             let spinner = new_spinner("Fetching data map...");
             info!("Downloading public file from address {addr_hex}");
-            let dm = client
-                .data_map_fetch(&parse_address(addr_hex)?)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?;
+            let result = client.data_map_fetch(&parse_address(addr_hex)?).await;
             spinner.finish_and_clear();
-            dm
+            result.map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
         } else {
             info!("Downloading public file from address {addr_hex}");
             client
@@ -385,12 +358,14 @@ async fn handle_file_download(
             pb_clone.finish_and_clear();
         });
 
-        client
+        let download_result = client
             .file_download_with_progress(&data_map, &output_path, Some(tx))
-            .await
-            .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+            .await;
 
+        // Wait for progress bar cleanup (sender dropped → receiver exits)
         let _ = progress_handle.await;
+
+        download_result.map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
     }
 
     let file_size = std::fs::metadata(&output_path)?.len();

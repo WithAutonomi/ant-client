@@ -853,7 +853,9 @@ impl Client {
             spill.push(&content)?;
             let chunks_done = spill.len();
             if let Some(tx) = progress {
-                let _ = tx.send(UploadEvent::Encrypting { chunks_done }).await;
+                if chunks_done % 10 == 0 {
+                    let _ = tx.send(UploadEvent::Encrypting { chunks_done }).await;
+                }
             }
             if chunks_done % 100 == 0 {
                 let mb = spill.total_bytes() / (1024 * 1024);
@@ -962,14 +964,6 @@ impl Client {
                 "Wave {wave_num}/{wave_count}: uploading {} chunks (merkle) — {total_stored}/{total_chunks} stored so far",
                 wave.len()
             );
-            if let Some(tx) = progress {
-                let _ = tx
-                    .send(UploadEvent::ChunkStored {
-                        stored: total_stored,
-                        total: total_chunks,
-                    })
-                    .await;
-            }
 
             let mut upload_stream = stream::iter(wave.into_iter().map(|(content, addr)| {
                 let proof_bytes = batch_result.proofs.get(&addr).cloned();
