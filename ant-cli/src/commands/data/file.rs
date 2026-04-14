@@ -37,15 +37,20 @@ pub enum FileAction {
         store_concurrency: Option<usize>,
     },
     /// Download a file from the network.
+    ///
+    /// Public:  `ant file download ADDRESS -o output.pdf`
+    /// Private: `ant file download --datamap photo.datamap -o photo.jpg`
     Download {
         /// Hex-encoded address (public data map address).
+        /// Required unless --datamap is provided.
+        #[arg(required_unless_present = "datamap")]
         address: Option<String>,
         /// Path to a local data map file (for private downloads).
         #[arg(long)]
         datamap: Option<PathBuf>,
-        /// Output file path (defaults to `downloaded_file`).
-        #[arg(long, short)]
-        output: Option<PathBuf>,
+        /// Output file path (required).
+        #[arg(short, long)]
+        output: PathBuf,
     },
 }
 
@@ -294,10 +299,10 @@ async fn handle_file_download(
     client: &Client,
     address: Option<&str>,
     datamap_path: Option<&Path>,
-    output: Option<PathBuf>,
+    output: PathBuf,
     json_output: bool,
 ) -> anyhow::Result<()> {
-    let output_path = output.unwrap_or_else(|| PathBuf::from("downloaded_file"));
+    let output_path = output;
     let start = Instant::now();
 
     let data_map = if let Some(addr_hex) = address {
