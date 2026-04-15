@@ -69,6 +69,15 @@ pub struct ClientConfig {
     /// connection establishment, which is stateful and time-sensitive.
     /// Defaults to half the available CPU threads.
     pub store_concurrency: usize,
+    /// Allow loopback (`127.0.0.1`) connections in the saorsa-transport
+    /// layer. Set to `true` only for devnet / local testing. Production
+    /// peers on the public Autonomi network reject the QUIC handshake
+    /// variant produced when this is `true`, so the default is `false`.
+    ///
+    /// This mirrors the `--allow-loopback` flag in `ant-cli`, which already
+    /// defaults to `false` and threads through to the same
+    /// `CoreNodeConfig::builder().local(...)` call.
+    pub allow_loopback: bool,
 }
 
 impl Default for ClientConfig {
@@ -79,6 +88,7 @@ impl Default for ClientConfig {
             close_group_size: CLOSE_GROUP_SIZE,
             quote_concurrency: DEFAULT_QUOTE_CONCURRENCY,
             store_concurrency: DEFAULT_STORE_CONCURRENCY,
+            allow_loopback: false,
         }
     }
 }
@@ -113,6 +123,10 @@ impl Client {
 
     /// Create a client connected to bootstrap peers.
     ///
+    /// Threads `config.allow_loopback` through to `Network::new`, which
+    /// controls the saorsa-transport `local` flag on the underlying
+    /// `CoreNodeConfig`. See `ClientConfig::allow_loopback` for details.
+    ///
     /// # Errors
     ///
     /// Returns an error if the P2P node cannot be created or bootstrapping fails.
@@ -121,10 +135,11 @@ impl Client {
         config: ClientConfig,
     ) -> Result<Self> {
         debug!(
-            "Connecting to Autonomi network with {} bootstrap peers",
-            bootstrap_peers.len()
+            "Connecting to Autonomi network with {} bootstrap peers (allow_loopback={})",
+            bootstrap_peers.len(),
+            config.allow_loopback,
         );
-        let network = Network::new(bootstrap_peers).await?;
+        let network = Network::new(bootstrap_peers, config.allow_loopback).await?;
         Ok(Self {
             config,
             network,
