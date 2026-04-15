@@ -22,7 +22,7 @@ pub use ant_node::client::{compute_address, DataChunk, XorName};
 pub use client::batch::{finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk};
 pub use client::data::DataUploadResult;
 pub use client::file::{
-    DownloadEvent, ExternalPaymentInfo, FileUploadResult, PreparedUpload, UploadEvent,
+    DownloadEvent, ExternalPaymentInfo, FileUploadResult, PreparedUpload, UploadEvent, Visibility,
 };
 pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,

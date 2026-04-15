@@ -57,6 +57,7 @@ serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
 tokio-test = "0.4"
+rmp-serde = "1"
 
 [[example]]
 name = "start-local-devnet"
