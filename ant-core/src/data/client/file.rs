@@ -413,6 +413,23 @@ fn check_disk_space_for_spill(file_size: u64) -> Result<()> {
     Ok(())
 }
 
+/// Whether the data map is published to the network for address-based retrieval.
+///
+/// A private upload stores only the data chunks and returns the `DataMap` to
+/// the caller — only someone holding that `DataMap` can reconstruct the file.
+/// A public upload additionally stores the serialized `DataMap` as a chunk on
+/// the network, yielding a single chunk address that anyone can use to
+/// retrieve the `DataMap` (via [`Client::data_map_fetch`]) and then the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Visibility {
+    /// Keep the data map local; only the holder can retrieve the file.
+    #[default]
+    Private,
+    /// Publish the data map as a network chunk so anyone with the returned
+    /// address can retrieve and decrypt the file.
+    Public,
+}
+
 /// Estimated cost of uploading a file, returned by
 /// [`Client::estimate_upload_cost`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -431,6 +448,7 @@ pub struct UploadCostEstimate {
     pub payment_mode: PaymentMode,
 }
 
+
 /// Result of a file upload: the `DataMap` needed to retrieve the file.
 #[derive(Debug, Clone)]
 pub struct FileUploadResult {
@@ -444,6 +462,10 @@ pub struct FileUploadResult {
     pub storage_cost_atto: String,
     /// Total gas cost in wei. 0 if no on-chain transactions were made.
     pub gas_cost_wei: u128,
+    /// Chunk address of the serialized `DataMap`, set only for [`Visibility::Public`]
+    /// uploads. Share this address so others can retrieve the file without the
+    /// local `DataMap` (via [`Client::data_map_fetch`] then [`Client::file_download`]).
+    pub data_map_address: Option<[u8; 32]>,
 }
 
 /// Payment information for external signing — either wave-batch or merkle.
@@ -482,6 +504,12 @@ pub struct PreparedUpload {
     pub data_map: DataMap,
     /// Payment information — either wave-batch or merkle depending on chunk count.
     pub payment_info: ExternalPaymentInfo,
+    /// Chunk address of the serialized `DataMap` when this upload was prepared
+    /// with [`Visibility::Public`]. The address is `Some` whenever the data
+    /// map chunk has been bundled into `payment_info` for payment; it is
+    /// carried through to [`FileUploadResult::data_map_address`] after
+    /// finalization.
+    pub data_map_address: Option<[u8; 32]>,
 }
 
 /// Return type for [`spawn_file_encryption`]: chunk receiver, `DataMap` oneshot, join handle.
@@ -771,10 +799,26 @@ impl Client {
 
     /// Phase 1 of external-signer upload: encrypt file and prepare chunks.
     ///
+    /// Equivalent to [`Client::file_prepare_upload_with_visibility`] with
+    /// [`Visibility::Private`] — see that method for details.
+    pub async fn file_prepare_upload(&self, path: &Path) -> Result<PreparedUpload> {
+        self.file_prepare_upload_with_visibility(path, Visibility::Private)
+            .await
+    }
+
+    /// Phase 1 of external-signer upload with explicit [`Visibility`] control.
+    ///
     /// Requires an EVM network (for contract price queries) but NOT a wallet.
     /// Returns a [`PreparedUpload`] containing the data map, prepared chunks,
     /// and a [`PaymentIntent`] that the external signer uses to construct
     /// and submit the on-chain payment transaction.
+    ///
+    /// When `visibility` is [`Visibility::Public`], the serialized `DataMap`
+    /// is bundled into the payment batch as an additional chunk and its
+    /// address is recorded on the returned [`PreparedUpload`]. After
+    /// [`Client::finalize_upload`] (or `_merkle`) succeeds, that address is
+    /// surfaced via [`FileUploadResult::data_map_address`] so the uploader
+    /// can share a single address from which anyone can retrieve the file.
     ///
     /// **Memory note:** Encryption uses disk spilling for bounded memory, but
     /// the returned [`PreparedUpload`] holds all chunk content in memory (each
@@ -787,9 +831,13 @@ impl Client {
     ///
     /// Returns an error if there is insufficient disk space, the file cannot
     /// be read, encryption fails, or quote collection fails.
-    pub async fn file_prepare_upload(&self, path: &Path) -> Result<PreparedUpload> {
+    pub async fn file_prepare_upload_with_visibility(
+        &self,
+        path: &Path,
+        visibility: Visibility,
+    ) -> Result<PreparedUpload> {
         debug!(
-            "Preparing file upload for external signing: {}",
+            "Preparing file upload for external signing (visibility={visibility:?}): {}",
             path.display()
         );
 
@@ -807,11 +855,34 @@ impl Client {
         // Read each chunk from disk and collect quotes concurrently.
         // Note: all PreparedChunks accumulate in memory because the external-signer
         // protocol requires them for finalize_upload. NOT memory-bounded for large files.
-        let chunk_data: Vec<Bytes> = spill
+        let mut chunk_data: Vec<Bytes> = spill
             .addresses
             .iter()
             .map(|addr| spill.read_chunk(addr))
             .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // For public uploads, bundle the serialized DataMap as an extra chunk
+        // in the same payment batch. This lets the external signer pay for
+        // the data chunks and the DataMap chunk in one flow, and lets the
+        // finalize step return the DataMap's chunk address as the shareable
+        // retrieval address.
+        let data_map_address = match visibility {
+            Visibility::Private => None,
+            Visibility::Public => {
+                let serialized = rmp_serde::to_vec(&data_map).map_err(|e| {
+                    Error::Serialization(format!("Failed to serialize DataMap: {e}"))
+                })?;
+                let bytes = Bytes::from(serialized);
+                let address = compute_address(&bytes);
+                info!(
+                    "Public upload: bundling DataMap chunk ({} bytes) at address {}",
+                    bytes.len(),
+                    hex::encode(address)
+                );
+                chunk_data.push(bytes);
+                Some(address)
+            }
+        };
 
         let chunk_count = chunk_data.len();
 
@@ -875,6 +946,7 @@ impl Client {
         Ok(PreparedUpload {
             data_map,
             payment_info,
+            data_map_address,
         })
     }
 
@@ -894,6 +966,7 @@ impl Client {
         prepared: PreparedUpload,
         tx_hash_map: &HashMap<QuoteHash, TxHash>,
     ) -> Result<FileUploadResult> {
+        let data_map_address = prepared.data_map_address;
         match prepared.payment_info {
             ExternalPaymentInfo::WaveBatch {
                 prepared_chunks,
@@ -921,6 +994,7 @@ impl Client {
                     payment_mode_used: PaymentMode::Single,
                     storage_cost_atto: "0".into(),
                     gas_cost_wei: 0,
+                    data_map_address,
                 })
             }
             ExternalPaymentInfo::Merkle { .. } => Err(Error::Payment(
@@ -947,6 +1021,7 @@ impl Client {
         prepared: PreparedUpload,
         winner_pool_hash: [u8; 32],
     ) -> Result<FileUploadResult> {
+        let data_map_address = prepared.data_map_address;
         match prepared.payment_info {
             ExternalPaymentInfo::Merkle {
                 prepared_batch,
@@ -966,6 +1041,7 @@ impl Client {
                     payment_mode_used: PaymentMode::Merkle,
                     storage_cost_atto: "0".into(),
                     gas_cost_wei: 0,
+                    data_map_address,
                 })
             }
             ExternalPaymentInfo::WaveBatch { .. } => Err(Error::Payment(
@@ -1055,6 +1131,7 @@ impl Client {
                             payment_mode_used: PaymentMode::Single,
                             storage_cost_atto: sc,
                             gas_cost_wei: gc,
+                            data_map_address: None,
                         });
                     }
                     Err(e) => return Err(e),
@@ -1080,6 +1157,7 @@ impl Client {
             payment_mode_used: actual_mode,
             storage_cost_atto,
             gas_cost_wei,
+            data_map_address: None,
         })
     }
 

@@ -206,6 +206,7 @@ impl Client {
                 prepared_chunks,
                 payment_intent,
             },
+            data_map_address: None,
         })
     }
 

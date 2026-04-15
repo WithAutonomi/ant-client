@@ -4,7 +4,7 @@
 
 mod support;
 
-use ant_core::data::Client;
+use ant_core::data::{compute_address, Client, ExternalPaymentInfo, Visibility};
 use serial_test::serial;
 use std::io::Write;
 use std::path::PathBuf;
@@ -139,6 +139,80 @@ async fn test_file_download_bytes_written() {
         data.len() as u64,
         "bytes_written should equal original file size"
     );
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// External-signer prepare must bundle the serialized DataMap as one extra
+/// paid chunk when `Visibility::Public` is requested, and must record the
+/// resulting chunk address on the `PreparedUpload`. Private prepare must
+/// leave that address unset.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_file_prepare_upload_visibility() {
+    let (client, testnet) = setup().await;
+
+    let data = vec![0x37u8; 4096];
+    let mut input_file = NamedTempFile::new().expect("create temp file");
+    input_file.write_all(&data).expect("write temp file");
+    input_file.flush().expect("flush temp file");
+
+    let private = client
+        .file_prepare_upload_with_visibility(input_file.path(), Visibility::Private)
+        .await
+        .expect("private prepare should succeed");
+
+    assert!(
+        private.data_map_address.is_none(),
+        "private uploads must not publish a DataMap address"
+    );
+
+    let public = client
+        .file_prepare_upload_with_visibility(input_file.path(), Visibility::Public)
+        .await
+        .expect("public prepare should succeed");
+
+    let public_addr = public
+        .data_map_address
+        .expect("public prepare must record the DataMap chunk address");
+
+    // The recorded address must match a fresh hash of the serialized DataMap,
+    // proving the address refers to exactly the chunk that was added to the
+    // payment batch (and that `data_map_fetch` on this address will later
+    // yield the same DataMap we're holding).
+    let expected_bytes = rmp_serde::to_vec(&public.data_map).expect("serialize DataMap");
+    let expected_addr = compute_address(&expected_bytes);
+    assert_eq!(
+        public_addr, expected_addr,
+        "data_map_address must equal compute_address(rmp_serde::to_vec(&data_map))"
+    );
+
+    // A small file produces a wave-batch payment (well under the merkle
+    // threshold), and the datamap chunk must appear in that batch.
+    match (&private.payment_info, &public.payment_info) {
+        (
+            ExternalPaymentInfo::WaveBatch {
+                prepared_chunks: priv_chunks,
+                ..
+            },
+            ExternalPaymentInfo::WaveBatch {
+                prepared_chunks: pub_chunks,
+                ..
+            },
+        ) => {
+            assert_eq!(
+                pub_chunks.len(),
+                priv_chunks.len() + 1,
+                "public prepare must add exactly one chunk (the serialized DataMap) to the batch"
+            );
+            assert!(
+                pub_chunks.iter().any(|c| c.address == public_addr),
+                "the extra chunk must be the DataMap chunk at the recorded address"
+            );
+        }
+        other => panic!("expected wave-batch for a 4KB file, got {other:?}"),
+    }
 
     drop(client);
     testnet.teardown().await;

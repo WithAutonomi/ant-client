@@ -57,6 +57,7 @@ serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
 tokio-test = "0.4"
+rmp-serde = "1"
 # Direct access to BootstrapManager used by the cold-start-from-disk test,
 # which populates a cache via `add_peer_trusted` (bypasses Sybil rate limits)
 # and then verifies reload after save. Version tracks ant-node's transitive
