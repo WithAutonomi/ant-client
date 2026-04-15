@@ -20,14 +20,22 @@ pub struct Network {
 impl Network {
     /// Create a new network connection with the given bootstrap peers.
     ///
+    /// `allow_loopback` controls the saorsa-transport `local` flag on the
+    /// underlying `CoreNodeConfig`. Set it to `true` only for devnet / local
+    /// testing. Public Autonomi network peers reject the QUIC handshake
+    /// variant produced when `local = true`, so production callers must pass
+    /// `false` (this is what `ant-cli` does by default — see
+    /// `ant-cli/src/main.rs::create_client_node_raw`, which builds the same
+    /// `CoreNodeConfig` directly with `.local(allow_loopback)`).
+    ///
     /// # Errors
     ///
     /// Returns an error if the P2P node cannot be created or bootstrapping fails.
-    pub async fn new(bootstrap_peers: &[SocketAddr]) -> Result<Self> {
+    pub async fn new(bootstrap_peers: &[SocketAddr], allow_loopback: bool) -> Result<Self> {
         let mut core_config = CoreNodeConfig::builder()
             .port(0)
             .ipv6(true)
-            .local(true)
+            .local(allow_loopback)
             .mode(NodeMode::Client)
             .max_message_size(MAX_WIRE_MESSAGE_SIZE)
             .build()
