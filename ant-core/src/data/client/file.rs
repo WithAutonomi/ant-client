@@ -24,14 +24,52 @@ use evmlib::common::QuoteHash;
 use evmlib::common::TxHash;
 use fs2::FileExt;
 use futures::stream::{self, StreamExt};
-use self_encryption::{stream_encrypt, streaming_decrypt, DataMap};
+use self_encryption::{get_root_data_map_parallel, stream_encrypt, streaming_decrypt, DataMap};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use xor_name::XorName;
+
+/// Progress events emitted during file upload for UI feedback.
+#[derive(Debug, Clone)]
+pub enum UploadEvent {
+    /// A chunk has been encrypted and spilled to disk.
+    Encrypting { chunks_done: usize },
+    /// File encryption complete.
+    Encrypted { total_chunks: usize },
+    /// Starting quote collection for a wave.
+    QuotingChunks {
+        wave: usize,
+        total_waves: usize,
+        chunks_in_wave: usize,
+    },
+    /// A chunk has been stored on the network.
+    ChunkStored { stored: usize, total: usize },
+    /// A wave has completed.
+    WaveComplete {
+        wave: usize,
+        total_waves: usize,
+        stored_so_far: usize,
+        total: usize,
+    },
+}
+
+/// Progress events emitted during file download for UI feedback.
+#[derive(Debug, Clone)]
+pub enum DownloadEvent {
+    /// Resolving hierarchical DataMap to discover real chunk count.
+    ResolvingDataMap { total_map_chunks: usize },
+    /// A DataMap chunk has been fetched during resolution.
+    MapChunkFetched { fetched: usize },
+    /// DataMap resolved — total data chunk count now known.
+    DataMapResolved { total_chunks: usize },
+    /// Data chunks are being fetched from the network.
+    ChunksFetched { fetched: usize, total: usize },
+}
 
 /// Number of chunks per upload wave (matches batch.rs PAYMENT_WAVE_SIZE).
 const UPLOAD_WAVE_SIZE: usize = 64;
@@ -341,6 +379,10 @@ pub struct FileUploadResult {
     pub chunks_stored: usize,
     /// Which payment mode was actually used (not just requested).
     pub payment_mode_used: PaymentMode,
+    /// Total storage cost paid in token units (atto). "0" if all chunks already existed.
+    pub storage_cost_atto: String,
+    /// Total gas cost in wei. 0 if no on-chain transactions were made.
+    pub gas_cost_wei: u128,
 }
 
 /// Payment information for external signing — either wave-batch or merkle.
@@ -510,7 +552,7 @@ impl Client {
         let file_size = std::fs::metadata(path)?.len();
         check_disk_space_for_spill(file_size)?;
 
-        let (spill, data_map) = self.encrypt_file_to_spill(path).await?;
+        let (spill, data_map) = self.encrypt_file_to_spill(path, None).await?;
 
         info!(
             "Encrypted {} into {} chunks for external signing (spilled to disk)",
@@ -557,10 +599,10 @@ impl Client {
             }
         } else {
             // Wave-batch path: collect quotes per chunk concurrently.
-            let concurrency = self.config().chunk_concurrency;
+            let quote_concurrency = self.config().quote_concurrency;
             let results: Vec<Result<Option<PreparedChunk>>> = stream::iter(chunk_data)
                 .map(|content| async move { self.prepare_chunk_payment(content).await })
-                .buffer_unordered(concurrency)
+                .buffer_unordered(quote_concurrency)
                 .collect()
                 .await;
 
@@ -633,6 +675,8 @@ impl Client {
                     data_map: prepared.data_map,
                     chunks_stored,
                     payment_mode_used: PaymentMode::Single,
+                    storage_cost_atto: "0".into(),
+                    gas_cost_wei: 0,
                 })
             }
             ExternalPaymentInfo::Merkle { .. } => Err(Error::Payment(
@@ -676,6 +720,8 @@ impl Client {
                     data_map: prepared.data_map,
                     chunks_stored,
                     payment_mode_used: PaymentMode::Merkle,
+                    storage_cost_atto: "0".into(),
+                    gas_cost_wei: 0,
                 })
             }
             ExternalPaymentInfo::WaveBatch { .. } => Err(Error::Payment(
@@ -705,6 +751,20 @@ impl Client {
         path: &Path,
         mode: PaymentMode,
     ) -> Result<FileUploadResult> {
+        self.file_upload_with_progress(path, mode, None).await
+    }
+
+    /// Upload a file with progress events sent to the given channel.
+    ///
+    /// Same as [`Client::file_upload_with_mode`] but sends [`UploadEvent`]s to the
+    /// provided channel for UI progress feedback.
+    #[allow(clippy::too_many_lines)]
+    pub async fn file_upload_with_progress(
+        &self,
+        path: &Path,
+        mode: PaymentMode,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
         debug!(
             "Streaming file upload with mode {mode:?}: {}",
             path.display()
@@ -716,49 +776,54 @@ impl Client {
 
         // Phase 1: Encrypt file and spill chunks to temp directory.
         // Only 32-byte addresses stay in memory — chunk data lives on disk.
-        let (spill, data_map) = self.encrypt_file_to_spill(path).await?;
+        let (spill, data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
 
         let chunk_count = spill.len();
         info!(
             "Encrypted {} into {chunk_count} chunks (spilled to disk)",
             path.display()
         );
+        if let Some(ref tx) = progress {
+            let _ = tx
+                .send(UploadEvent::Encrypted {
+                    total_chunks: chunk_count,
+                })
+                .await;
+        }
 
         // Phase 2: Decide payment mode and upload in waves from disk.
-        //
-        // Note on merkle proof memory: MerkleBatchPaymentResult.proofs holds all
-        // proofs simultaneously (~86 KB each due to ML-DSA-65 signatures in the
-        // candidate pool). For a 100 GB file (~25k chunks), this is ~2 GB. This
-        // is acceptable because merkle payments save significant gas costs — the
-        // gas savings far outweigh the proof memory overhead.
-        let (chunks_stored, actual_mode) = if self.should_use_merkle(chunk_count, mode) {
-            // Merkle batch payment path — needs all addresses upfront for tree.
-            info!("Using merkle batch payment for {chunk_count} file chunks");
+        let (chunks_stored, actual_mode, storage_cost_atto, gas_cost_wei) =
+            if self.should_use_merkle(chunk_count, mode) {
+                info!("Using merkle batch payment for {chunk_count} file chunks");
 
-            let batch_result = match self
-                .pay_for_merkle_batch(&spill.addresses, DATA_TYPE_CHUNK, spill.avg_chunk_size())
-                .await
-            {
-                Ok(result) => result,
-                Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
-                    info!("Merkle needs more peers ({msg}), falling back to wave-batch");
-                    let stored = self.upload_waves_single(&spill).await?;
-                    return Ok(FileUploadResult {
-                        data_map,
-                        chunks_stored: stored,
-                        payment_mode_used: PaymentMode::Single,
-                    });
-                }
-                Err(e) => return Err(e),
+                let batch_result = match self
+                    .pay_for_merkle_batch(&spill.addresses, DATA_TYPE_CHUNK, spill.avg_chunk_size())
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
+                        info!("Merkle needs more peers ({msg}), falling back to wave-batch");
+                        let (stored, sc, gc) =
+                            self.upload_waves_single(&spill, progress.as_ref()).await?;
+                        return Ok(FileUploadResult {
+                            data_map,
+                            chunks_stored: stored,
+                            payment_mode_used: PaymentMode::Single,
+                            storage_cost_atto: sc,
+                            gas_cost_wei: gc,
+                        });
+                    }
+                    Err(e) => return Err(e),
+                };
+
+                let (stored, sc, gc) = self
+                    .upload_waves_merkle(&spill, &batch_result, progress.as_ref())
+                    .await?;
+                (stored, PaymentMode::Merkle, sc, gc)
+            } else {
+                let (stored, sc, gc) = self.upload_waves_single(&spill, progress.as_ref()).await?;
+                (stored, PaymentMode::Single, sc, gc)
             };
-
-            let stored = self.upload_waves_merkle(&spill, &batch_result).await?;
-            (stored, PaymentMode::Merkle)
-        } else {
-            // Wave-based per-chunk payment path.
-            let stored = self.upload_waves_single(&spill).await?;
-            (stored, PaymentMode::Single)
-        };
 
         info!(
             "File uploaded with {actual_mode:?}: {chunks_stored} chunks stored ({})",
@@ -769,6 +834,8 @@ impl Client {
             data_map,
             chunks_stored,
             payment_mode_used: actual_mode,
+            storage_cost_atto,
+            gas_cost_wei,
         })
     }
 
@@ -778,17 +845,26 @@ impl Client {
     /// multi-GB encryptions.
     ///
     /// Returns the spill buffer (addresses on disk) and the `DataMap`.
-    async fn encrypt_file_to_spill(&self, path: &Path) -> Result<(ChunkSpill, DataMap)> {
+    async fn encrypt_file_to_spill(
+        &self,
+        path: &Path,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+    ) -> Result<(ChunkSpill, DataMap)> {
         let (mut chunk_rx, datamap_rx, handle) = spawn_file_encryption(path.to_path_buf())?;
 
         let mut spill = ChunkSpill::new()?;
         while let Some(content) = chunk_rx.recv().await {
             spill.push(&content)?;
-            if spill.len() % 100 == 0 {
+            let chunks_done = spill.len();
+            if let Some(tx) = progress {
+                if chunks_done % 10 == 0 {
+                    let _ = tx.send(UploadEvent::Encrypting { chunks_done }).await;
+                }
+            }
+            if chunks_done % 100 == 0 {
                 let mb = spill.total_bytes() / (1024 * 1024);
                 info!(
-                    "Encryption progress: {} chunks spilled ({mb} MB) — {}",
-                    spill.len(),
+                    "Encryption progress: {chunks_done} chunks spilled ({mb} MB) — {}",
                     path.display()
                 );
             }
@@ -811,8 +887,16 @@ impl Client {
     ///
     /// Reads one wave at a time from disk, prepares quotes, pays, and stores.
     /// Peak memory: ~`UPLOAD_WAVE_SIZE × MAX_CHUNK_SIZE` (~256 MB).
-    async fn upload_waves_single(&self, spill: &ChunkSpill) -> Result<usize> {
+    ///
+    /// Returns `(chunks_stored, storage_cost_atto, gas_cost_wei)`.
+    async fn upload_waves_single(
+        &self,
+        spill: &ChunkSpill,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+    ) -> Result<(usize, String, u128)> {
         let mut total_stored = 0usize;
+        let mut total_storage = evmlib::common::Amount::ZERO;
+        let mut total_gas: u128 = 0;
         let total_chunks = spill.len();
         let waves: Vec<&[[u8; 32]]> = spill.waves().collect();
         let wave_count = waves.len();
@@ -828,22 +912,49 @@ impl Client {
                 "Wave {wave_num}/{wave_count}: uploading {} chunks (single payment) — {total_stored}/{total_chunks} stored so far",
                 wave_data.len()
             );
-            let addresses = self.batch_upload_chunks(wave_data).await?;
+            if let Some(tx) = progress {
+                let _ = tx
+                    .send(UploadEvent::QuotingChunks {
+                        wave: wave_num,
+                        total_waves: wave_count,
+                        chunks_in_wave: wave_data.len(),
+                    })
+                    .await;
+            }
+            let (addresses, wave_storage, wave_gas) = self.batch_upload_chunks(wave_data).await?;
             total_stored += addresses.len();
+            if let Ok(cost) = wave_storage.parse::<evmlib::common::Amount>() {
+                total_storage += cost;
+            }
+            total_gas = total_gas.saturating_add(wave_gas);
+            if let Some(tx) = progress {
+                let _ = tx
+                    .send(UploadEvent::WaveComplete {
+                        wave: wave_num,
+                        total_waves: wave_count,
+                        stored_so_far: total_stored,
+                        total: total_chunks,
+                    })
+                    .await;
+            }
         }
 
-        Ok(total_stored)
+        Ok((total_stored, total_storage.to_string(), total_gas))
     }
 
     /// Upload chunks from a spill using pre-computed merkle proofs.
     ///
     /// Reads one wave at a time from disk, pairs each chunk with its proof,
     /// and uploads concurrently. Peak memory: ~`UPLOAD_WAVE_SIZE × MAX_CHUNK_SIZE`.
+    ///
+    /// Returns `(chunks_stored, storage_cost_atto, gas_cost_wei)`.
+    /// Costs come from the `batch_result` which was populated during payment.
     async fn upload_waves_merkle(
         &self,
         spill: &ChunkSpill,
         batch_result: &MerkleBatchPaymentResult,
-    ) -> Result<usize> {
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+    ) -> Result<(usize, String, u128)> {
         let mut total_stored = 0usize;
         let total_chunks = spill.len();
         let waves: Vec<&[[u8; 32]]> = spill.waves().collect();
@@ -871,15 +982,38 @@ impl Client {
                     self.chunk_put_to_close_group(content, proof, &peers).await
                 }
             }))
-            .buffer_unordered(self.config().chunk_concurrency);
+            .buffer_unordered(self.config().store_concurrency);
 
             while let Some(result) = upload_stream.next().await {
                 result?;
                 total_stored += 1;
+                if let Some(tx) = progress {
+                    let _ = tx
+                        .send(UploadEvent::ChunkStored {
+                            stored: total_stored,
+                            total: total_chunks,
+                        })
+                        .await;
+                }
+            }
+
+            if let Some(tx) = progress {
+                let _ = tx
+                    .send(UploadEvent::WaveComplete {
+                        wave: wave_num,
+                        total_waves: wave_count,
+                        stored_so_far: total_stored,
+                        total: total_chunks,
+                    })
+                    .await;
             }
         }
 
-        Ok(total_stored)
+        Ok((
+            total_stored,
+            batch_result.storage_cost_atto.clone(),
+            batch_result.gas_cost_wei,
+        ))
     }
 
     /// Download and decrypt a file from the network, writing it to disk.
@@ -902,14 +1036,115 @@ impl Client {
     ///
     /// Returns an error if any chunk cannot be retrieved, decryption fails,
     /// or the file cannot be written.
-    #[allow(clippy::unused_async)] // Async for API consistency; blocking handled via block_in_place
+    #[allow(clippy::unused_async)]
     pub async fn file_download(&self, data_map: &DataMap, output: &Path) -> Result<u64> {
+        self.file_download_with_progress(data_map, output, None)
+            .await
+    }
+
+    /// Download and decrypt a file with progress events.
+    ///
+    /// Same as [`Client::file_download`] but sends [`DownloadEvent`]s for UI feedback.
+    ///
+    /// Progress reporting:
+    /// 1. Resolves hierarchical DataMaps to the root level first (reports as
+    ///    `ChunksFetched` with `total: 0` during resolution)
+    /// 2. Once the root DataMap is known, sends `total_chunks` with accurate count
+    /// 3. Fetches data chunks with accurate `fetched/total` progress
+    #[allow(clippy::unused_async)]
+    pub async fn file_download_with_progress(
+        &self,
+        data_map: &DataMap,
+        output: &Path,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
+    ) -> Result<u64> {
         debug!("Downloading file to {}", output.display());
 
         let handle = Handle::current();
 
-        let stream = streaming_decrypt(data_map, |batch: &[(usize, XorName)]| {
+        // Phase 1: Resolve hierarchical DataMap to root level.
+        // This fetches child DataMap chunks (typically 3) to discover the real chunk count.
+        let root_map = if data_map.is_child() {
+            let dm_chunks = data_map.len();
+            if let Some(ref tx) = progress {
+                let _ = tx.try_send(DownloadEvent::ResolvingDataMap {
+                    total_map_chunks: dm_chunks,
+                });
+            }
+
+            let resolve_progress = progress.clone();
+            let resolve_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            let resolved = tokio::task::block_in_place(|| {
+                let counter_ref = resolve_counter.clone();
+                let progress_ref = resolve_progress.clone();
+                let fetch = |batch: &[(usize, XorName)]| {
+                    let batch_owned: Vec<(usize, XorName)> = batch.to_vec();
+                    let counter = counter_ref.clone();
+                    let prog = progress_ref.clone();
+                    handle.block_on(async {
+                        let mut futs = futures::stream::FuturesUnordered::new();
+                        for (idx, hash) in batch_owned {
+                            let addr = hash.0;
+                            futs.push(async move {
+                                let result = self.chunk_get(&addr).await;
+                                (idx, hash, result)
+                            });
+                        }
+                        let mut results = Vec::with_capacity(futs.len());
+                        while let Some((idx, hash, result)) =
+                            futures::StreamExt::next(&mut futs).await
+                        {
+                            let chunk = result
+                                .map_err(|e| {
+                                    self_encryption::Error::Generic(format!(
+                                        "DataMap resolution failed: {e}"
+                                    ))
+                                })?
+                                .ok_or_else(|| {
+                                    self_encryption::Error::Generic(format!(
+                                        "DataMap chunk not found: {}",
+                                        hex::encode(hash.0)
+                                    ))
+                                })?;
+                            results.push((idx, chunk.content));
+                            let fetched =
+                                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if let Some(ref tx) = prog {
+                                let _ = tx.try_send(DownloadEvent::MapChunkFetched { fetched });
+                            }
+                        }
+                        Ok(results)
+                    })
+                };
+                get_root_data_map_parallel(data_map.clone(), &fetch)
+            })
+            .map_err(|e| Error::Encryption(format!("DataMap resolution failed: {e}")))?;
+
+            info!(
+                "Resolved hierarchical DataMap: {} data chunks",
+                resolved.len()
+            );
+            resolved
+        } else {
+            data_map.clone()
+        };
+
+        // Phase 2: Now we know the real chunk count.
+        let total_chunks = root_map.len();
+        if let Some(ref tx) = progress {
+            let _ = tx.try_send(DownloadEvent::DataMapResolved { total_chunks });
+        }
+
+        // Phase 3: Fetch and decrypt data chunks with accurate progress.
+        let fetched_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetched_for_closure = fetched_counter.clone();
+        let progress_for_closure = progress.clone();
+
+        let stream = streaming_decrypt(&root_map, |batch: &[(usize, XorName)]| {
             let batch_owned: Vec<(usize, XorName)> = batch.to_vec();
+            let fetched_ref = fetched_for_closure.clone();
+            let progress_ref = progress_for_closure.clone();
 
             tokio::task::block_in_place(|| {
                 handle.block_on(async {
@@ -938,6 +1173,14 @@ impl Client {
                                 ))
                             })?;
                         results.push((idx, chunk.content));
+                        let fetched =
+                            fetched_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if let Some(ref tx) = progress_ref {
+                            let _ = tx.try_send(DownloadEvent::ChunksFetched {
+                                fetched,
+                                total: total_chunks,
+                            });
+                        }
                     }
                     Ok(results)
                 })

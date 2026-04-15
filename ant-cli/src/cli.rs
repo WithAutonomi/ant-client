@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -30,7 +30,8 @@ pub struct Cli {
     pub json: bool,
 
     /// Bootstrap peer addresses (for data operations).
-    #[arg(long, short)]
+    /// Comma-separated or repeated: -b 1.2.3.4:10000,5.6.7.8:10000
+    #[arg(long, short, value_delimiter = ',')]
     pub bootstrap: Vec<SocketAddr>,
 
     /// Path to devnet manifest JSON (for data operations).
@@ -41,21 +42,35 @@ pub struct Cli {
     #[arg(long)]
     pub allow_loopback: bool,
 
-    /// Timeout for network operations (seconds).
+    /// Timeout for lightweight network operations such as quotes and DHT
+    /// lookups (seconds).
+    #[arg(long, default_value_t = 10)]
+    pub quote_timeout_secs: u64,
+
+    /// Timeout for chunk store/retrieve operations (seconds).
+    /// Chunk PUTs transfer multi-MB payloads, so this should be longer than
+    /// the quote timeout.
     #[arg(long, default_value_t = 60)]
-    pub timeout_secs: u64,
+    pub store_timeout_secs: u64,
 
-    /// Maximum number of chunks processed concurrently during uploads.
-    /// Defaults to half the available CPU threads.
+    /// Maximum number of chunks quoted or downloaded concurrently.
+    /// Defaults to 32. Safe to set high — quoting is pure network I/O.
     #[arg(long)]
-    pub chunk_concurrency: Option<usize>,
+    pub quote_concurrency: Option<usize>,
 
-    /// Log level.
-    #[arg(long, default_value = "info")]
-    pub log_level: String,
+    /// Maximum number of chunks stored concurrently during uploads.
+    /// Defaults to half the available CPU threads. Lower values are
+    /// more reliable when storing to NAT-restricted nodes.
+    #[arg(long, alias = "chunk-concurrency")]
+    pub store_concurrency: Option<usize>,
 
-    /// EVM network for payment processing.
-    #[arg(long, default_value = "local")]
+    /// Increase verbosity. By default no logs are emitted (privacy by design).
+    /// -v: info + warnings, -vv: debug, -vvv: trace.
+    #[arg(short, long, action = ArgAction::Count)]
+    pub verbose: u8,
+
+    /// EVM network for payment processing (arbitrum-one, arbitrum-sepolia, local).
+    #[arg(long, default_value = "arbitrum-one")]
     pub evm_network: String,
 
     #[command(subcommand)]

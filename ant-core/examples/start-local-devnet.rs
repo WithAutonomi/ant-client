@@ -23,8 +23,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Start a minimal local devnet with EVM payments
-    let devnet = LocalDevnet::start_minimal().await?;
+    // Start a small local devnet (10 nodes) with EVM payments
+    let devnet = LocalDevnet::start_small().await?;
 
     // Write manifest so the CLI example can use it
     let manifest_path = PathBuf::from("/tmp/ant-devnet-manifest.json");

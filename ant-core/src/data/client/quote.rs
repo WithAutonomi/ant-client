@@ -72,7 +72,7 @@ impl Client {
             )));
         }
 
-        let per_peer_timeout = Duration::from_secs(self.config().timeout_secs);
+        let per_peer_timeout = Duration::from_secs(self.config().quote_timeout_secs);
         // Overall timeout for collecting all quotes. Must accommodate
         // connect_with_fallback cascade (direct 5s + hole-punch 15s×3 + relay 30s ≈ 80s)
         // plus the per-peer quote timeout. 120s is generous.

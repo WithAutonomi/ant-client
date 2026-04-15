@@ -4,10 +4,11 @@ mod commands;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use tracing::info;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use ant_core::data::{
     Client, ClientConfig, CoreNodeConfig, CustomNetwork, DevnetManifest, EvmAddress, EvmNetwork,
@@ -27,10 +28,13 @@ async fn main() {
     let code = match run().await {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("Error: {e:?}");
+            eprintln!("Error: {e:#}");
             1
         }
     };
+
+    // Flush stdout before force-exit to ensure all output (especially JSON) is written.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 
     // Force-exit to avoid hanging on tokio runtime shutdown.
     // Open QUIC connections and pending background tasks (DHT, keep-alive)
@@ -42,11 +46,17 @@ async fn main() {
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing for data commands (node commands handle their own output)
+    // Privacy by design: no logs unless the user explicitly opts in with -v.
+    // A decentralized network client must not emit metadata by default.
     let needs_tracing = !matches!(cli.command, Commands::Node { .. });
-    if needs_tracing {
-        let filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
+    if needs_tracing && cli.verbose > 0 {
+        use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+        let filter = match cli.verbose {
+            1 => EnvFilter::new("info"),
+            2 => EnvFilter::new("debug"),
+            _ => EnvFilter::new("trace"),
+        };
         tracing_subscriber::registry()
             .with(fmt::layer().with_writer(std::io::stderr))
             .with(filter)
@@ -60,10 +70,12 @@ async fn run() -> anyhow::Result<()> {
         bootstrap,
         devnet_manifest,
         allow_loopback,
-        timeout_secs,
-        log_level: _,
+        quote_timeout_secs,
+        store_timeout_secs,
+        verbose: _,
         evm_network,
-        chunk_concurrency,
+        quote_concurrency,
+        store_concurrency,
     } = cli;
 
     // Shared context for data commands that need EVM / bootstrap info.
@@ -71,9 +83,11 @@ async fn run() -> anyhow::Result<()> {
         bootstrap,
         devnet_manifest,
         allow_loopback,
-        timeout_secs,
+        quote_timeout_secs,
+        store_timeout_secs,
         evm_network,
-        chunk_concurrency,
+        quote_concurrency,
+        store_concurrency,
     };
 
     match command {
@@ -109,12 +123,20 @@ async fn run() -> anyhow::Result<()> {
         }
         Commands::File { action } => {
             let needs_wallet = matches!(action, commands::data::FileAction::Upload { .. });
-            let client = build_data_client(&data_ctx, needs_wallet).await?;
-            action.execute(&client).await?;
+            // Extract per-upload overrides before building the client.
+            let (store_timeout_override, store_concurrency_override) = action.upload_overrides();
+            let mut client = build_data_client(&data_ctx, needs_wallet, json).await?;
+            if let Some(t) = store_timeout_override {
+                client.config_mut().store_timeout_secs = t;
+            }
+            if let Some(c) = store_concurrency_override {
+                client.config_mut().store_concurrency = c;
+            }
+            action.execute(&client, json).await?;
         }
         Commands::Chunk { action } => {
             let needs_wallet = matches!(action, commands::data::ChunkAction::Put { .. });
-            let client = build_data_client(&data_ctx, needs_wallet).await?;
+            let client = build_data_client(&data_ctx, needs_wallet, json).await?;
             action.execute(&client).await?;
         }
         Commands::Update(args) => {
@@ -130,46 +152,124 @@ struct DataCliContext {
     bootstrap: Vec<SocketAddr>,
     devnet_manifest: Option<PathBuf>,
     allow_loopback: bool,
-    timeout_secs: u64,
+    quote_timeout_secs: u64,
+    store_timeout_secs: u64,
     evm_network: String,
-    chunk_concurrency: Option<usize>,
+    quote_concurrency: Option<usize>,
+    store_concurrency: Option<usize>,
 }
 
 /// Build a data client with wallet if SECRET_KEY is set.
-async fn build_data_client(ctx: &DataCliContext, needs_wallet: bool) -> anyhow::Result<Client> {
+async fn build_data_client(
+    ctx: &DataCliContext,
+    needs_wallet: bool,
+    quiet: bool,
+) -> anyhow::Result<Client> {
     let private_key = std::env::var("SECRET_KEY").ok();
 
     if needs_wallet && private_key.is_none() {
         anyhow::bail!("SECRET_KEY environment variable required for this operation");
     }
 
-    // Parse manifest once and share it across bootstrap + EVM resolution.
     let manifest = load_manifest(ctx)?;
     let bootstrap = resolve_bootstrap_from(ctx, manifest.as_ref())?;
-    let node = create_client_node(bootstrap, ctx.allow_loopback).await?;
+
+    // Connection phase with animated spinner showing peer discovery in real-time
+    let node = if quiet {
+        create_client_node(bootstrap, ctx.allow_loopback).await?
+    } else {
+        let spinner = new_spinner("Connecting to autonomi network...");
+
+        let node = match create_client_node_raw(bootstrap, ctx.allow_loopback).await {
+            Ok(n) => n,
+            Err(e) => {
+                spinner.finish_and_clear();
+                return Err(e);
+            }
+        };
+
+        // Poll peer count during node.start() to show real-time discovery
+        let spinner_clone = spinner.clone();
+        let node_clone = node.clone();
+        let poll_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let count = node_clone.connected_peers().await.len();
+                if count > 0 {
+                    spinner_clone.set_message(format!(
+                        "Connecting to autonomi network... (found {count} peers)"
+                    ));
+                }
+            }
+        });
+
+        let start_result = node.start().await;
+        poll_handle.abort();
+        spinner.finish_and_clear();
+
+        start_result.map_err(|e| anyhow::anyhow!("Failed to start P2P node: {e}"))?;
+
+        let peers = node.connected_peers().await.len();
+        eprintln!("Connected to autonomi network (found {peers} peers)");
+        node
+    };
 
     let mut config = ClientConfig {
-        timeout_secs: ctx.timeout_secs,
+        quote_timeout_secs: ctx.quote_timeout_secs,
+        store_timeout_secs: ctx.store_timeout_secs,
         ..Default::default()
     };
-    if let Some(concurrency) = ctx.chunk_concurrency {
-        config.chunk_concurrency = concurrency;
+    if let Some(concurrency) = ctx.quote_concurrency {
+        config.quote_concurrency = concurrency;
+    }
+    if let Some(concurrency) = ctx.store_concurrency {
+        config.store_concurrency = concurrency;
     }
 
     let mut client = Client::from_node(node, config);
 
-    if let Some(ref key) = private_key {
+    if needs_wallet {
+        let key = private_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SECRET_KEY environment variable required"))?;
         let network = resolve_evm_network(&ctx.evm_network, manifest.as_ref())?;
         let wallet = create_wallet(key, network)?;
         info!("Wallet configured for EVM payments");
         client = client.with_wallet(wallet);
-        client
-            .approve_token_spend()
-            .await
-            .map_err(|e| anyhow::anyhow!("Token approval failed: {e}"))?;
+
+        if !quiet {
+            let spinner = new_spinner("Approving token spend...");
+            let approval = client.approve_token_spend().await;
+            spinner.finish_and_clear();
+            approval.map_err(|e| anyhow::anyhow!("Token approval failed: {e}"))?;
+            eprintln!("Token spend approved");
+        } else {
+            client
+                .approve_token_spend()
+                .await
+                .map_err(|e| anyhow::anyhow!("Token approval failed: {e}"))?;
+        }
     }
 
     Ok(client)
+}
+
+/// Create a styled spinner for long-running operations.
+/// Hidden when stderr is not a terminal (piped output).
+fn new_spinner(msg: &str) -> ProgressBar {
+    let pb = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        ProgressBar::new_spinner()
+    } else {
+        ProgressBar::hidden()
+    };
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .expect("valid template")
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.set_message(msg.to_string());
+    pb.enable_steady_tick(Duration::from_millis(80));
+    pb
 }
 
 fn require_secret_key() -> anyhow::Result<String> {
@@ -276,6 +376,18 @@ async fn create_client_node(
     bootstrap: Vec<SocketAddr>,
     allow_loopback: bool,
 ) -> anyhow::Result<Arc<P2PNode>> {
+    let node = create_client_node_raw(bootstrap, allow_loopback).await?;
+    node.start()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to start P2P node: {e}"))?;
+    Ok(node)
+}
+
+/// Create a P2P node without starting it (for spinner polling during start).
+async fn create_client_node_raw(
+    bootstrap: Vec<SocketAddr>,
+    allow_loopback: bool,
+) -> anyhow::Result<Arc<P2PNode>> {
     let mut core_config = CoreNodeConfig::builder()
         .port(0)
         .ipv6(false)
@@ -293,9 +405,6 @@ async fn create_client_node(
     let node = P2PNode::new(core_config)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create P2P node: {e}"))?;
-    node.start()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to start P2P node: {e}"))?;
 
     Ok(Arc::new(node))
 }

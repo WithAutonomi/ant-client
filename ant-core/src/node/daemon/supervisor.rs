@@ -329,6 +329,7 @@ pub fn build_node_args(config: &NodeConfig) -> Vec<String> {
     ];
 
     if let Some(ref log_dir) = config.log_dir {
+        args.push("--enable-logging".to_string());
         args.push("--log-dir".to_string());
         args.push(log_dir.display().to_string());
     }
@@ -616,6 +617,7 @@ mod tests {
         assert!(args.contains(&"0xabc123".to_string()));
         assert!(args.contains(&"--root-dir".to_string()));
         assert!(args.contains(&"/data/node-1".to_string()));
+        assert!(args.contains(&"--enable-logging".to_string()));
         assert!(args.contains(&"--log-dir".to_string()));
         assert!(args.contains(&"/logs/node-1".to_string()));
         assert!(args.contains(&"--port".to_string()));
@@ -648,6 +650,7 @@ mod tests {
 
         assert!(args.contains(&"--rewards-address".to_string()));
         assert!(args.contains(&"--root-dir".to_string()));
+        assert!(!args.contains(&"--enable-logging".to_string()));
         assert!(!args.contains(&"--log-dir".to_string()));
         assert!(!args.contains(&"--port".to_string()));
         assert!(!args.contains(&"--metrics-port".to_string()));

@@ -23,42 +23,62 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::debug;
 
-/// Default timeout for network operations in seconds.
-const CLIENT_TIMEOUT_SECS: u64 = 10;
+/// Default timeout for lightweight network operations (quotes, DHT lookups) in seconds.
+const DEFAULT_QUOTE_TIMEOUT_SECS: u64 = 10;
 
-/// Assumed CPU thread count when `available_parallelism()` fails.
-const FALLBACK_THREAD_COUNT: usize = 4;
-
-/// Derive a sensible default chunk concurrency from available CPU parallelism.
+/// Default timeout for chunk store operations in seconds.
 ///
-/// Uses half the available threads (network I/O doesn't need 1:1 CPU mapping).
-fn default_chunk_concurrency() -> usize {
-    let threads = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(FALLBACK_THREAD_COUNT);
-    (threads / 2).max(1)
-}
+/// Chunk PUTs transfer multi-MB payloads to multiple peers. On residential
+/// connections with limited upload bandwidth, the default quote timeout (10 s)
+/// is far too short — a 4 MB chunk at 1 Mbps takes ~32 s just for the data
+/// transfer, before accounting for QUIC slow-start and NAT traversal overhead.
+const DEFAULT_STORE_TIMEOUT_SECS: u64 = 10;
+
+/// Default quote concurrency: high because quoting is pure network I/O
+/// (DHT lookups + small request/response messages) with no CPU-bound work.
+const DEFAULT_QUOTE_CONCURRENCY: usize = 32;
+
+/// Default store concurrency: moderate because each chunk PUT sends ~4MB
+/// to 7 close-group peers. At 8 concurrent stores, ~225MB of outbound
+/// traffic can be in flight. Users on fast connections can increase this
+/// with --store-concurrency; users on slow connections can decrease it.
+const DEFAULT_STORE_CONCURRENCY: usize = 8;
 
 /// Configuration for the Autonomi client.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// Timeout for network operations in seconds.
-    pub timeout_secs: u64,
+    /// Timeout for lightweight network operations (quotes, DHT lookups) in seconds.
+    pub quote_timeout_secs: u64,
+    /// Timeout for chunk store (PUT) operations in seconds.
+    ///
+    /// This should be significantly longer than `quote_timeout_secs` because
+    /// each chunk PUT transfers ~4 MB to multiple peers.
+    pub store_timeout_secs: u64,
     /// Number of closest peers to consider for routing.
     pub close_group_size: usize,
-    /// Maximum number of chunks processed concurrently during uploads.
+    /// Maximum number of chunks quoted or downloaded concurrently.
     ///
-    /// Controls parallelism for quote collection, chunk storage, and
-    /// merkle upload paths. Defaults to half the available CPU threads.
-    pub chunk_concurrency: usize,
+    /// Controls parallelism for quote collection and chunk retrieval.
+    /// These are pure network I/O operations (DHT lookups, small messages)
+    /// with negligible CPU cost, so a high default is safe.
+    pub quote_concurrency: usize,
+    /// Maximum number of chunks stored concurrently during uploads.
+    ///
+    /// Controls parallelism for chunk PUT operations. Lower than quote
+    /// concurrency because storing to NAT nodes requires hole-punch
+    /// connection establishment, which is stateful and time-sensitive.
+    /// Defaults to half the available CPU threads.
+    pub store_concurrency: usize,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            timeout_secs: CLIENT_TIMEOUT_SECS,
+            quote_timeout_secs: DEFAULT_QUOTE_TIMEOUT_SECS,
+            store_timeout_secs: DEFAULT_STORE_TIMEOUT_SECS,
             close_group_size: CLOSE_GROUP_SIZE,
-            chunk_concurrency: default_chunk_concurrency(),
+            quote_concurrency: DEFAULT_QUOTE_CONCURRENCY,
+            store_concurrency: DEFAULT_STORE_CONCURRENCY,
         }
     }
 }
@@ -158,6 +178,11 @@ impl Client {
     #[must_use]
     pub fn config(&self) -> &ClientConfig {
         &self.config
+    }
+
+    /// Get a mutable reference to the client configuration.
+    pub fn config_mut(&mut self) -> &mut ClientConfig {
+        &mut self.config
     }
 
     /// Get a reference to the network layer.
