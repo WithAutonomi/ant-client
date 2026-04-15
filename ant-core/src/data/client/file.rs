@@ -47,6 +47,9 @@ pub enum UploadEvent {
         total_waves: usize,
         chunks_in_wave: usize,
     },
+    /// A chunk has been quoted (peer discovery + price received).
+    /// This is the slow phase — each quote involves network round-trips.
+    ChunkQuoted { quoted: usize, total: usize },
     /// A chunk has been stored on the network.
     ChunkStored { stored: usize, total: usize },
     /// A wave has completed.
@@ -921,7 +924,9 @@ impl Client {
                     })
                     .await;
             }
-            let (addresses, wave_storage, wave_gas) = self.batch_upload_chunks(wave_data).await?;
+            let (addresses, wave_storage, wave_gas) = self
+                .batch_upload_chunks_with_events(wave_data, progress, total_stored, total_chunks)
+                .await?;
             total_stored += addresses.len();
             if let Ok(cost) = wave_storage.parse::<evmlib::common::Amount>() {
                 total_storage += cost;

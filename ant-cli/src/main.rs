@@ -165,7 +165,9 @@ async fn build_data_client(
     needs_wallet: bool,
     quiet: bool,
 ) -> anyhow::Result<Client> {
-    let private_key = std::env::var("SECRET_KEY").ok();
+    let private_key = std::env::var("SECRET_KEY")
+        .ok()
+        .map(|k| k.strip_prefix("0x").unwrap_or(&k).to_string());
 
     if needs_wallet && private_key.is_none() {
         anyhow::bail!("SECRET_KEY environment variable required for this operation");
