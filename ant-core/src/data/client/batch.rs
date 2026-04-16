@@ -4,6 +4,7 @@
 //! wave in a single EVM transaction. Stores from wave N are pipelined
 //! with quote collection for wave N+1 via `tokio::join!`.
 
+use crate::data::client::file::UploadEvent;
 use crate::data::client::payment::peer_id_to_encoded;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
@@ -18,6 +19,7 @@ use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use futures::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Number of chunks per payment wave.
@@ -282,6 +284,23 @@ impl Client {
         &self,
         chunks: Vec<Bytes>,
     ) -> Result<(Vec<XorName>, String, u128)> {
+        self.batch_upload_chunks_with_events(chunks, None, 0, 0)
+            .await
+    }
+
+    /// Same as [`Client::batch_upload_chunks`] but sends [`UploadEvent::ChunkStored`]
+    /// events as each chunk is stored, enabling per-chunk progress bars.
+    ///
+    /// `stored_offset` is the number of chunks already stored in previous waves
+    /// (so events report cumulative progress). `file_total` is the total chunk
+    /// count across ALL waves (for the `total` field in events).
+    pub async fn batch_upload_chunks_with_events(
+        &self,
+        chunks: Vec<Bytes>,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+        stored_offset: usize,
+        file_total: usize,
+    ) -> Result<(Vec<XorName>, String, u128)> {
         if chunks.is_empty() {
             return Ok((Vec::new(), "0".to_string(), 0));
         }
@@ -307,6 +326,12 @@ impl Client {
             } else {
                 debug!("Skipping duplicate chunk {}", hex::encode(address));
                 all_addresses.push(address);
+                if let Some(tx) = progress {
+                    let _ = tx.try_send(UploadEvent::ChunkStored {
+                        stored: stored_offset + all_addresses.len(),
+                        total: file_total,
+                    });
+                }
             }
         }
 
@@ -323,21 +348,37 @@ impl Client {
         );
 
         let mut pending_store: Option<Vec<PaidChunk>> = None;
+        let mut total_quoted: usize = 0;
 
         for (wave_idx, wave_chunks) in waves.into_iter().enumerate() {
             let wave_num = wave_idx + 1;
+            let wave_size = wave_chunks.len();
 
             // Pipeline: store previous wave while preparing this one.
             let (prepare_result, store_result) = match pending_store.take() {
                 Some(paid_chunks) => {
+                    let store_offset = stored_offset + all_addresses.len();
+                    let quoted_offset = stored_offset + total_quoted;
                     let (prep, stored) = tokio::join!(
-                        self.prepare_wave(wave_chunks),
-                        self.store_paid_chunks(paid_chunks)
+                        self.prepare_wave(wave_chunks, progress, quoted_offset, file_total),
+                        self.store_paid_chunks_with_events(
+                            paid_chunks,
+                            progress,
+                            store_offset,
+                            file_total
+                        )
                     );
                     (prep, Some(stored))
                 }
-                None => (self.prepare_wave(wave_chunks).await, None),
+                None => {
+                    let quoted_offset = stored_offset + total_quoted;
+                    let result = self
+                        .prepare_wave(wave_chunks, progress, quoted_offset, file_total)
+                        .await;
+                    (result, None)
+                }
             };
+            total_quoted += wave_size;
 
             // Track partial progress from previous wave.
             if let Some(wave_result) = store_result {
@@ -356,7 +397,15 @@ impl Client {
             }
 
             let (prepared_chunks, already_stored) = prepare_result?;
-            all_addresses.extend(already_stored);
+            all_addresses.extend(&already_stored);
+            if let Some(tx) = progress {
+                for _ in &already_stored {
+                    let _ = tx.try_send(UploadEvent::ChunkStored {
+                        stored: stored_offset + all_addresses.len(),
+                        total: file_total,
+                    });
+                }
+            }
 
             if prepared_chunks.is_empty() {
                 info!("Wave {wave_num}/{wave_count}: all chunks already stored");
@@ -368,7 +417,6 @@ impl Client {
                 prepared_chunks.len()
             );
             let (paid_chunks, wave_storage, wave_gas) = self.batch_pay(prepared_chunks).await?;
-            // Parse wave storage cost and accumulate.
             if let Ok(cost) = wave_storage.parse::<Amount>() {
                 total_storage += cost;
             }
@@ -378,7 +426,10 @@ impl Client {
 
         // Store the last wave.
         if let Some(paid_chunks) = pending_store {
-            let wave_result = self.store_paid_chunks(paid_chunks).await;
+            let store_offset = stored_offset + all_addresses.len();
+            let wave_result = self
+                .store_paid_chunks_with_events(paid_chunks, progress, store_offset, file_total)
+                .await;
             all_addresses.extend(&wave_result.stored);
             if !wave_result.failed.is_empty() {
                 let failed_count = wave_result.failed.len();
@@ -399,8 +450,15 @@ impl Client {
 
     /// Prepare a wave of chunks by collecting quotes concurrently.
     ///
+    /// Fires [`UploadEvent::ChunkQuoted`] as each chunk's quote completes.
     /// Returns `(prepared_chunks, already_stored_addresses)`.
-    async fn prepare_wave(&self, chunks: Vec<Bytes>) -> Result<(Vec<PreparedChunk>, Vec<XorName>)> {
+    async fn prepare_wave(
+        &self,
+        chunks: Vec<Bytes>,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+        quoted_offset: usize,
+        file_total: usize,
+    ) -> Result<(Vec<PreparedChunk>, Vec<XorName>)> {
         let chunk_count = chunks.len();
         let chunks_with_addr: Vec<(Bytes, XorName)> = chunks
             .into_iter()
@@ -410,21 +468,27 @@ impl Client {
             })
             .collect();
 
-        let results: Vec<(XorName, Result<Option<PreparedChunk>>)> = stream::iter(chunks_with_addr)
+        let mut quote_stream = stream::iter(chunks_with_addr)
             .map(|(content, address)| async move {
                 (address, self.prepare_chunk_payment(content).await)
             })
-            .buffer_unordered(self.config().quote_concurrency)
-            .collect()
-            .await;
+            .buffer_unordered(self.config().quote_concurrency);
 
         let mut prepared = Vec::with_capacity(chunk_count);
         let mut already_stored = Vec::new();
+        let mut quoted_count = 0usize;
 
-        for (address, result) in results {
+        while let Some((address, result)) = quote_stream.next().await {
             match result? {
                 Some(chunk) => prepared.push(chunk),
                 None => already_stored.push(address),
+            }
+            quoted_count += 1;
+            if let Some(tx) = progress {
+                let _ = tx.try_send(UploadEvent::ChunkQuoted {
+                    quoted: quoted_offset + quoted_count,
+                    total: file_total,
+                });
             }
         }
 
@@ -437,6 +501,23 @@ impl Client {
     /// Returns a [`WaveResult`] with both successes and failures so callers can
     /// track partial progress instead of losing information about stored chunks.
     pub(crate) async fn store_paid_chunks(&self, paid_chunks: Vec<PaidChunk>) -> WaveResult {
+        self.store_paid_chunks_with_events(paid_chunks, None, 0, 0)
+            .await
+    }
+
+    /// Same as [`Client::store_paid_chunks`] but sends [`UploadEvent::ChunkStored`]
+    /// as each chunk is successfully stored.
+    ///
+    /// `stored_before` is the count of chunks already stored in previous waves,
+    /// so the event reports an accurate cumulative total. `total_chunks` is the
+    /// total across all waves.
+    pub(crate) async fn store_paid_chunks_with_events(
+        &self,
+        paid_chunks: Vec<PaidChunk>,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+        stored_before: usize,
+        total_chunks: usize,
+    ) -> WaveResult {
         const MAX_RETRIES: u32 = 3;
         const BASE_DELAY_MS: u64 = 500;
 
@@ -453,7 +534,7 @@ impl Client {
                 );
             }
 
-            let results: Vec<(PaidChunk, Result<XorName>)> = stream::iter(to_retry)
+            let mut upload_stream = stream::iter(to_retry)
                 .map(|chunk| {
                     let chunk_clone = chunk.clone();
                     async move {
@@ -467,14 +548,20 @@ impl Client {
                         (chunk_clone, result)
                     }
                 })
-                .buffer_unordered(self.config().store_concurrency)
-                .collect()
-                .await;
+                .buffer_unordered(self.config().store_concurrency);
 
             let mut failed_this_round = Vec::new();
-            for (chunk, result) in results {
+            while let Some((chunk, result)) = upload_stream.next().await {
                 match result {
-                    Ok(name) => stored.push(name),
+                    Ok(name) => {
+                        stored.push(name);
+                        if let Some(tx) = progress {
+                            let _ = tx.try_send(UploadEvent::ChunkStored {
+                                stored: stored_before + stored.len(),
+                                total: total_chunks,
+                            });
+                        }
+                    }
                     Err(e) => failed_this_round.push((chunk, e.to_string())),
                 }
             }

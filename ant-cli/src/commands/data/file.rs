@@ -143,30 +143,27 @@ async fn handle_file_upload(
 
     if public {
         let spinner = if !json_output {
-            let s = new_spinner("Storing public data map...");
-            Some(s)
+            Some(new_spinner("Storing public data map..."))
         } else {
             None
         };
-
         let dm_result = client.data_map_store(&result.data_map).await;
-
-        if let Some(s) = spinner {
+        if let Some(s) = &spinner {
             s.finish_and_clear();
         }
-
         let dm_address =
             dm_result.map_err(|e| anyhow::anyhow!("Failed to store public DataMap: {e}"))?;
 
         let hex_addr = hex::encode(dm_address);
         let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei);
+        let total_chunks = result.chunks_stored + 1; // +1 for the public data map chunk
 
         if json_output {
             let out = UploadJsonResult {
                 address: Some(hex_addr.clone()),
                 datamap: None,
                 mode: "public".into(),
-                chunks: result.chunks_stored,
+                chunks: total_chunks,
                 size: file_size,
                 storage_cost_atto: result.storage_cost_atto.clone(),
                 gas_cost_wei: result.gas_cost_wei.to_string(),
@@ -177,7 +174,10 @@ async fn handle_file_upload(
             println!();
             println!("Upload complete!");
             println!("  Address: {hex_addr}");
-            println!("  Chunks:  {}", result.chunks_stored);
+            println!(
+                "  Chunks:  {total_chunks} ({} + 1 data map)",
+                result.chunks_stored
+            );
             println!("  Size:    {}", format_size(file_size));
             println!("  Cost:    {cost_display}");
             println!("  Time:    {:.1}s", elapsed.as_secs_f64());
@@ -248,6 +248,8 @@ async fn drive_upload_progress(
     .progress_chars("━╸━")
     .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
 
+    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+
     // Start with encryption spinner
     let mut pb = new_spinner(&format!(
         "Encrypting {filename} ({})...",
@@ -260,10 +262,9 @@ async fn drive_upload_progress(
                 pb.set_message(format!("Encrypting {filename} ({chunks_done} chunks)..."));
             }
             UploadEvent::Encrypted { total_chunks } => {
-                // Finish the encryption spinner and create a new progress bar
                 pb.finish_and_clear();
                 eprintln!("Encrypted into {total_chunks} chunks");
-                pb = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                pb = if is_tty {
                     ProgressBar::new(total_chunks as u64)
                 } else {
                     ProgressBar::hidden()
@@ -272,18 +273,15 @@ async fn drive_upload_progress(
                 pb.set_message(format!("Uploading {filename}"));
                 pb.enable_steady_tick(Duration::from_millis(80));
             }
-            UploadEvent::QuotingChunks {
-                wave,
-                total_waves,
-                chunks_in_wave,
-            } => {
-                pb.set_message(format!(
-                    "Uploading {filename} (wave {wave}/{total_waves}, quoting {chunks_in_wave} chunks)"
-                ));
+            UploadEvent::QuotingChunks { .. } => {}
+            UploadEvent::ChunkQuoted { quoted, total: _ } => {
+                // Never go backwards — quoting may overlap with storage
+                let pos = std::cmp::max(pb.position(), quoted as u64);
+                pb.set_position(pos);
             }
             UploadEvent::ChunkStored { stored, total: _ } => {
-                pb.set_position(stored as u64);
-                pb.set_message(format!("Uploading {filename}"));
+                let pos = std::cmp::max(pb.position(), stored as u64);
+                pb.set_position(pos);
             }
             UploadEvent::WaveComplete {
                 stored_so_far,
