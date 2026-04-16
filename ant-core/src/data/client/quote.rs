@@ -204,7 +204,7 @@ impl Client {
             for (_, dist) in &already_stored_peers {
                 all_peers_by_distance.push((true, *dist));
             }
-            all_peers_by_distance.sort_by(|a, b| a.1.cmp(&b.1));
+            all_peers_by_distance.sort_by_key(|a| a.1);
 
             let close_group_stored = all_peers_by_distance
                 .iter()

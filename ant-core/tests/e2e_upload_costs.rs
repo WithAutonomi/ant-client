@@ -274,11 +274,10 @@ async fn test_upload_cost_comparison() {
                     single.file_size_mb,
                     format_wei(single.gas_cost_wei),
                     format_wei(merkle.gas_cost_wei),
-                    if merkle.gas_cost_wei > 0 {
-                        single.gas_cost_wei / merkle.gas_cost_wei
-                    } else {
-                        0
-                    }
+                    single
+                        .gas_cost_wei
+                        .checked_div(merkle.gas_cost_wei)
+                        .unwrap_or(0)
                 );
             }
         }
