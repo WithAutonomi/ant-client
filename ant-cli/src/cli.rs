@@ -6,24 +6,13 @@ use crate::commands::data::{ChunkAction, FileAction, WalletAction};
 use crate::commands::node::NodeCommand;
 use crate::commands::update::UpdateArgs;
 
-fn long_version() -> &'static str {
-    concat!(
-        env!("CARGO_PKG_VERSION"),
-        "\n",
-        "Autonomi network client: file operations and node management for the Autonomi decentralised network\n",
-        "\n",
-        "Repository: https://github.com/WithAutonomi/ant-client\n",
-        "License:    MIT or Apache-2.0",
-    )
-}
-
 #[derive(Parser)]
-#[command(
-    name = "ant",
-    version,
-    long_version = long_version(),
-    about = "Autonomi network client"
-)]
+// NOTE: when reintroducing a multi-line `--version` (e.g. via `long_version`),
+// the version number MUST stay on line 1. The self-update parser in 0.1.2–0.1.4
+// reads only the last whitespace-separated token of the entire output, so any
+// trailing line (like `License: MIT or Apache-2.0`) breaks upgrades for users
+// on those versions.
+#[command(name = "ant", version, about = "Autonomi network client")]
 pub struct Cli {
     /// Output structured JSON instead of human-readable text
     #[arg(long, global = true)]
