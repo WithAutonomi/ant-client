@@ -151,7 +151,7 @@ impl Client {
         let chunk_count = addresses.len();
         let xornames: Vec<XorName> = addresses.iter().map(|a| XorName(*a)).collect();
 
-        info!("Building merkle tree for {chunk_count} chunks");
+        debug!("Building merkle tree for {chunk_count} chunks");
 
         // 1. Build merkle tree
         let tree = MerkleTree::from_xornames(xornames)
@@ -163,14 +163,14 @@ impl Client {
             .map_err(|e| Error::Payment(format!("System time error: {e}")))?
             .as_secs();
 
-        info!("Merkle tree: depth={depth}, leaves={chunk_count}, ts={merkle_payment_timestamp}");
+        debug!("Merkle tree: depth={depth}, leaves={chunk_count}, ts={merkle_payment_timestamp}");
 
         // 2. Get reward candidates (midpoint proofs)
         let midpoint_proofs = tree
             .reward_candidates(merkle_payment_timestamp)
             .map_err(|e| Error::Payment(format!("Failed to generate reward candidates: {e}")))?;
 
-        info!(
+        debug!(
             "Collecting candidate pools from {} midpoints (concurrent)",
             midpoint_proofs.len()
         );

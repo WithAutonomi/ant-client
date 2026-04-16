@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::future::Future;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Data type identifier for chunks (used in quote requests).
 const CHUNK_DATA_TYPE: u32 = 0;
@@ -89,7 +89,7 @@ impl Client {
                 Ok(_) => {
                     success_count += 1;
                     if success_count >= CLOSE_GROUP_MAJORITY {
-                        info!(
+                        debug!(
                             "Chunk {} stored on {success_count} peers (majority reached)",
                             hex::encode(address)
                         );
@@ -180,13 +180,13 @@ impl Client {
             peer_addrs,
             |body| match body {
                 ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address: addr }) => {
-                    info!("Chunk stored at {}", hex::encode(addr));
+                    debug!("Chunk stored at {}", hex::encode(addr));
                     Some(Ok(addr))
                 }
                 ChunkMessageBody::PutResponse(ChunkPutResponse::AlreadyExists {
                     address: addr,
                 }) => {
-                    info!("Chunk already exists at {}", hex::encode(addr));
+                    debug!("Chunk already exists at {}", hex::encode(addr));
                     Some(Ok(addr))
                 }
                 ChunkMessageBody::PutResponse(ChunkPutResponse::PaymentRequired { message }) => {

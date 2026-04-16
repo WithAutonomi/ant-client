@@ -860,7 +860,7 @@ impl Client {
             spill.push(&content)?;
             let chunks_done = spill.len();
             if let Some(tx) = progress {
-                if chunks_done % 10 == 0 {
+                if chunks_done.is_multiple_of(10) {
                     let _ = tx.send(UploadEvent::Encrypting { chunks_done }).await;
                 }
             }
@@ -912,7 +912,7 @@ impl Client {
                 .collect::<Result<Vec<_>>>()?;
 
             info!(
-                "Wave {wave_num}/{wave_count}: uploading {} chunks (single payment) — {total_stored}/{total_chunks} stored so far",
+                "Wave {wave_num}/{wave_count}: quoting {} chunks — {total_stored}/{total_chunks} stored so far",
                 wave_data.len()
             );
             if let Some(tx) = progress {
@@ -970,7 +970,7 @@ impl Client {
             let wave = spill.read_wave(wave_addrs)?;
 
             info!(
-                "Wave {wave_num}/{wave_count}: uploading {} chunks (merkle) — {total_stored}/{total_chunks} stored so far",
+                "Wave {wave_num}/{wave_count}: storing {} chunks (merkle) — {total_stored}/{total_chunks} stored so far",
                 wave.len()
             );
 
@@ -992,6 +992,7 @@ impl Client {
             while let Some(result) = upload_stream.next().await {
                 result?;
                 total_stored += 1;
+                info!("Stored {total_stored}/{total_chunks}");
                 if let Some(tx) = progress {
                     let _ = tx
                         .send(UploadEvent::ChunkStored {
@@ -1180,6 +1181,7 @@ impl Client {
                         results.push((idx, chunk.content));
                         let fetched =
                             fetched_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        info!("Downloaded {fetched}/{total_chunks}");
                         if let Some(ref tx) = progress_ref {
                             let _ = tx.try_send(DownloadEvent::ChunksFetched {
                                 fetched,
