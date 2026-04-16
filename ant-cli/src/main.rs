@@ -53,8 +53,8 @@ async fn run() -> anyhow::Result<()> {
         use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
         let filter = match cli.verbose {
-            1 => EnvFilter::new("info"),
-            2 => EnvFilter::new("debug"),
+            1 => EnvFilter::new("ant_core=info,ant_cli=info"),
+            2 => EnvFilter::new("ant_core=debug,ant_cli=debug"),
             _ => EnvFilter::new("trace"),
         };
         tracing_subscriber::registry()
@@ -72,7 +72,7 @@ async fn run() -> anyhow::Result<()> {
         allow_loopback,
         quote_timeout_secs,
         store_timeout_secs,
-        verbose: _,
+        verbose,
         evm_network,
         quote_concurrency,
         store_concurrency,
@@ -132,7 +132,7 @@ async fn run() -> anyhow::Result<()> {
             if let Some(c) = store_concurrency_override {
                 client.config_mut().store_concurrency = c;
             }
-            action.execute(&client, json).await?;
+            action.execute(&client, json, verbose).await?;
         }
         Commands::Chunk { action } => {
             let needs_wallet = matches!(action, commands::data::ChunkAction::Put { .. });

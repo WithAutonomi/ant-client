@@ -242,7 +242,7 @@ impl Client {
             }
         }
 
-        info!(
+        debug!(
             "Batch payment for {} chunks ({} quote entries)",
             prepared.len(),
             all_payments.len()
@@ -308,7 +308,7 @@ impl Client {
         let total_chunks = chunks.len();
         let quote_concurrency = self.config().quote_concurrency;
         let store_concurrency = self.config().store_concurrency;
-        info!("Batch uploading {total_chunks} chunks in waves of {PAYMENT_WAVE_SIZE} (quote_concurrency: {quote_concurrency}, store_concurrency: {store_concurrency})");
+        debug!("Batch uploading {total_chunks} chunks in waves of {PAYMENT_WAVE_SIZE} (quote_concurrency: {quote_concurrency}, store_concurrency: {store_concurrency})");
 
         let mut all_addresses = Vec::with_capacity(total_chunks);
         let mut seen_addresses: HashSet<XorName> = HashSet::new();
@@ -342,7 +342,7 @@ impl Client {
             .collect();
         let wave_count = waves.len();
 
-        info!(
+        debug!(
             "{total_chunks} chunks -> {} unique -> {wave_count} waves",
             seen_addresses.len()
         );
@@ -444,7 +444,7 @@ impl Client {
             }
         }
 
-        info!("Batch upload complete: {} addresses", all_addresses.len());
+        debug!("Batch upload complete: {} addresses", all_addresses.len());
         Ok((all_addresses, total_storage.to_string(), total_gas))
     }
 
@@ -479,14 +479,23 @@ impl Client {
         let mut quoted_count = 0usize;
 
         while let Some((address, result)) = quote_stream.next().await {
+            let chunk_already_stored = result.as_ref().is_ok_and(|r| r.is_none());
             match result? {
                 Some(chunk) => prepared.push(chunk),
                 None => already_stored.push(address),
             }
             quoted_count += 1;
+            let progress_num = quoted_offset + quoted_count;
+            if file_total > 0 {
+                if chunk_already_stored {
+                    info!("Verified {progress_num}/{file_total} (already stored)");
+                } else {
+                    info!("Quoted {progress_num}/{file_total}");
+                }
+            }
             if let Some(tx) = progress {
                 let _ = tx.try_send(UploadEvent::ChunkQuoted {
-                    quoted: quoted_offset + quoted_count,
+                    quoted: progress_num,
                     total: file_total,
                 });
             }
@@ -555,9 +564,13 @@ impl Client {
                 match result {
                     Ok(name) => {
                         stored.push(name);
+                        let stored_num = stored_before + stored.len();
+                        if total_chunks > 0 {
+                            info!("Stored {stored_num}/{total_chunks}");
+                        }
                         if let Some(tx) = progress {
                             let _ = tx.try_send(UploadEvent::ChunkStored {
-                                stored: stored_before + stored.len(),
+                                stored: stored_num,
                                 total: total_chunks,
                             });
                         }

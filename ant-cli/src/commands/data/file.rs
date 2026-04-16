@@ -67,7 +67,7 @@ impl FileAction {
         }
     }
 
-    pub async fn execute(self, client: &Client, json: bool) -> anyhow::Result<()> {
+    pub async fn execute(self, client: &Client, json: bool, verbose: u8) -> anyhow::Result<()> {
         match self {
             FileAction::Upload {
                 path,
@@ -84,15 +84,22 @@ impl FileAction {
                 } else {
                     PaymentMode::Auto
                 };
-                handle_file_upload(client, &path, public, mode, json).await
+                handle_file_upload(client, &path, public, mode, json, verbose).await
             }
             FileAction::Download {
                 address,
                 datamap,
                 output,
             } => {
-                handle_file_download(client, address.as_deref(), datamap.as_deref(), output, json)
-                    .await
+                handle_file_download(
+                    client,
+                    address.as_deref(),
+                    datamap.as_deref(),
+                    output,
+                    json,
+                    verbose,
+                )
+                .await
             }
         }
     }
@@ -104,6 +111,7 @@ async fn handle_file_upload(
     public: bool,
     mode: PaymentMode,
     json_output: bool,
+    verbose: u8,
 ) -> anyhow::Result<()> {
     let file_size = std::fs::metadata(path)?.len();
     if file_size < 3 {
@@ -129,6 +137,7 @@ async fn handle_file_upload(
             rx,
             path.display().to_string(),
             file_size,
+            verbose,
         ));
 
         let upload_result = client.file_upload_with_progress(path, mode, Some(tx)).await;
@@ -142,7 +151,7 @@ async fn handle_file_upload(
     let elapsed = start.elapsed();
 
     if public {
-        let spinner = if !json_output {
+        let spinner = if !json_output && verbose == 0 {
             Some(new_spinner("Storing public data map..."))
         } else {
             None
@@ -235,11 +244,14 @@ async fn handle_file_upload(
     Ok(())
 }
 
-/// Drive upload progress bars from the event channel.
+/// Drive upload progress from the event channel.
+/// When `verbose > 0`, progress bars are hidden to avoid garbling the
+/// per-chunk `info!` lines that tracing emits to stderr.
 async fn drive_upload_progress(
     mut rx: mpsc::Receiver<UploadEvent>,
     filename: String,
     file_size: u64,
+    verbose: u8,
 ) {
     let bar_style = ProgressStyle::with_template(
         "{spinner:.cyan} {msg}\n  [{bar:40.cyan/dim}] {pos}/{len} chunks",
@@ -248,13 +260,16 @@ async fn drive_upload_progress(
     .progress_chars("━╸━")
     .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
 
-    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let show_bars = verbose == 0 && std::io::IsTerminal::is_terminal(&std::io::stderr());
 
-    // Start with encryption spinner
-    let mut pb = new_spinner(&format!(
-        "Encrypting {filename} ({})...",
-        format_size(file_size)
-    ));
+    let mut pb = if show_bars {
+        new_spinner(&format!(
+            "Encrypting {filename} ({})...",
+            format_size(file_size)
+        ))
+    } else {
+        ProgressBar::hidden()
+    };
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -264,18 +279,15 @@ async fn drive_upload_progress(
             UploadEvent::Encrypted { total_chunks } => {
                 pb.finish_and_clear();
                 eprintln!("Encrypted into {total_chunks} chunks");
-                pb = if is_tty {
-                    ProgressBar::new(total_chunks as u64)
-                } else {
-                    ProgressBar::hidden()
-                };
-                pb.set_style(bar_style.clone());
-                pb.set_message(format!("Uploading {filename}"));
-                pb.enable_steady_tick(Duration::from_millis(80));
+                if show_bars {
+                    pb = ProgressBar::new(total_chunks as u64);
+                    pb.set_style(bar_style.clone());
+                    pb.set_message(format!("Uploading {filename}"));
+                    pb.enable_steady_tick(Duration::from_millis(80));
+                }
             }
             UploadEvent::QuotingChunks { .. } => {}
             UploadEvent::ChunkQuoted { quoted, total: _ } => {
-                // Never go backwards — quoting may overlap with storage
                 let pos = std::cmp::max(pb.position(), quoted as u64);
                 pb.set_position(pos);
             }
@@ -302,19 +314,19 @@ async fn handle_file_download(
     datamap_path: Option<&Path>,
     output: PathBuf,
     json_output: bool,
+    verbose: u8,
 ) -> anyhow::Result<()> {
     let output_path = output;
     let start = Instant::now();
 
     let data_map = if let Some(addr_hex) = address {
-        if !json_output {
+        info!("Downloading public file from address {addr_hex}");
+        if !json_output && verbose == 0 {
             let spinner = new_spinner("Fetching data map...");
-            info!("Downloading public file from address {addr_hex}");
             let result = client.data_map_fetch(&parse_address(addr_hex)?).await;
             spinner.finish_and_clear();
             result.map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
         } else {
-            info!("Downloading public file from address {addr_hex}");
             client
                 .data_map_fetch(&parse_address(addr_hex)?)
                 .await
@@ -336,20 +348,21 @@ async fn handle_file_download(
     } else {
         let (tx, mut rx) = mpsc::channel(64);
 
-        let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let show_bars = verbose == 0 && std::io::IsTerminal::is_terminal(&std::io::stderr());
         let progress_handle = tokio::spawn(async move {
-            let mut pb = if is_tty {
-                ProgressBar::new_spinner()
+            let mut pb = if show_bars {
+                let s = ProgressBar::new_spinner();
+                s.set_style(
+                    ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                        .expect("valid template")
+                        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+                );
+                s.set_message("Resolving data map...");
+                s.enable_steady_tick(Duration::from_millis(80));
+                s
             } else {
                 ProgressBar::hidden()
             };
-            pb.set_style(
-                ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                    .expect("valid template")
-                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-            );
-            pb.set_message("Resolving data map...");
-            pb.enable_steady_tick(Duration::from_millis(80));
 
             let bar_style = ProgressStyle::with_template(
                 "{spinner:.cyan} Downloading\n  [{bar:40.cyan/dim}] {pos}/{len} chunks",
@@ -370,7 +383,7 @@ async fn handle_file_download(
                     }
                     DownloadEvent::DataMapResolved { total_chunks } => {
                         pb.finish_and_clear();
-                        pb = if is_tty {
+                        pb = if show_bars {
                             ProgressBar::new(total_chunks as u64)
                         } else {
                             ProgressBar::hidden()

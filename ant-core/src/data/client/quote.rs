@@ -15,7 +15,7 @@ use evmlib::common::Amount;
 use evmlib::PaymentQuote;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Compute XOR distance between a peer's ID bytes and a target address.
 ///
@@ -213,7 +213,7 @@ impl Client {
                 .count();
 
             if close_group_stored >= CLOSE_GROUP_MAJORITY {
-                info!(
+                debug!(
                     "Chunk {} already stored ({close_group_stored}/{CLOSE_GROUP_SIZE} close-group peers confirm)",
                     hex::encode(address)
                 );
@@ -232,7 +232,7 @@ impl Client {
             });
             quotes.truncate(CLOSE_GROUP_SIZE);
 
-            info!(
+            debug!(
                 "Collected {} quotes for address {} (from {total_responses} responses)",
                 quotes.len(),
                 hex::encode(address),
