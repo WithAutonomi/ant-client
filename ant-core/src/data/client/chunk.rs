@@ -5,13 +5,12 @@
 
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_node::ant_protocol::{
-    ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
-    ChunkPutResponse,
+use ant_protocol::transport::{MultiAddr, PeerId};
+use ant_protocol::{
+    compute_address, send_and_await_chunk_response, ChunkGetRequest, ChunkGetResponse,
+    ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, DataChunk, XorName,
+    CLOSE_GROUP_MAJORITY,
 };
-use ant_node::client::{compute_address, send_and_await_chunk_response, DataChunk, XorName};
-use ant_node::core::{MultiAddr, PeerId};
-use ant_node::CLOSE_GROUP_MAJORITY;
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::future::Future;

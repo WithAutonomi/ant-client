@@ -1,5 +1,10 @@
 pub mod binary;
 pub mod daemon;
+/// In-process devnet wrapper around `ant_node::devnet::Devnet`.
+///
+/// Only available with the `devnet` feature, which also pulls in the
+/// `ant-node` runtime dependency.
+#[cfg(feature = "devnet")]
 pub mod devnet;
 pub mod events;
 pub mod process;

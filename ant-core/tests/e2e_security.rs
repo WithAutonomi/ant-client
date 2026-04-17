@@ -8,11 +8,10 @@
 mod support;
 
 use ant_core::data::{compute_address, Client, ClientConfig};
-use ant_node::core::PeerId;
-use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
+use ant_protocol::evm::{Amount, EncodedPeerId, ProofOfPayment, RewardsAddress, TxHash};
+use ant_protocol::transport::PeerId;
+use ant_protocol::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
 use bytes::Bytes;
-use evmlib::common::{Amount, TxHash};
-use evmlib::{EncodedPeerId, ProofOfPayment, RewardsAddress};
 use serial_test::serial;
 use std::sync::Arc;
 use support::{MiniTestnet, DEFAULT_NODE_COUNT, MEDIAN_QUOTE_INDEX};

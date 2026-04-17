@@ -1,11 +1,12 @@
-//! Network layer wrapping ant-node's P2P node.
+//! Network layer wrapping the saorsa-core `P2PNode` (re-exported via
+//! `ant_protocol::transport`).
 //!
 //! Provides peer discovery, message sending, and DHT operations
 //! for the client library.
 
 use crate::data::error::{Error, Result};
-use ant_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
-use ant_node::core::{CoreNodeConfig, MultiAddr, NodeMode, P2PNode, PeerId};
+use ant_protocol::transport::{CoreNodeConfig, MultiAddr, NodeMode, P2PNode, PeerId};
+use ant_protocol::MAX_WIRE_MESSAGE_SIZE;
 use std::net::SocketAddr;
 use std::sync::Arc;
 

@@ -86,11 +86,10 @@ pub enum Error {
     },
 }
 
-impl From<ant_node::Error> for Error {
-    fn from(e: ant_node::Error) -> Self {
-        Self::Network(e.to_string())
-    }
-}
+// The `From<ant_node::Error>` conversion used before 0.2.0 lived here
+// because ant-core depended on ant-node at runtime. ant-node is now
+// optional (behind the `devnet` feature); the `LocalDevnet` wrapper
+// maps node errors inline via `map_err`. See `src/node/devnet.rs`.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

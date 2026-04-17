@@ -1,16 +1,18 @@
 //! Local devnet launcher for development and testing.
 //!
-//! Wraps [`ant_node::devnet::Devnet`] and `evmlib::testnet::Testnet` (Anvil)
-//! to spin up a local network with EVM payments in a few lines of code.
+//! Wraps `ant_node::devnet::Devnet` and the Anvil testnet re-exported as
+//! `ant_protocol::evm::testnet::Testnet` to spin up a local network with
+//! EVM payments in a few lines of code.
+//!
+//! Available only when `ant-core` is built with `features = ["devnet"]`.
 
 use crate::data::client::ClientConfig;
 use crate::data::error::{Error, Result};
 use crate::data::Client;
-use ant_node::core::MultiAddr;
 use ant_node::devnet::{Devnet, DevnetConfig, DevnetEvmInfo, DevnetManifest};
-use evmlib::testnet::Testnet;
-use evmlib::wallet::Wallet;
-use evmlib::Network as EvmNetwork;
+use ant_protocol::evm::testnet::Testnet;
+use ant_protocol::evm::{Network as EvmNetwork, Wallet};
+use ant_protocol::transport::MultiAddr;
 use std::path::Path;
 use std::time::SystemTime;
 use tracing::info;

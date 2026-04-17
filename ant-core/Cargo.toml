@@ -1,6 +1,6 @@
 [package]
 name = "ant-core"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -27,7 +27,12 @@ zip = "2"
 tower-http = { version = "0.6.8", features = ["cors"] }
 
 # Data operations
-evmlib = "0.8"
+# Wire protocol crate: gives us `ant_protocol::{chunk, payment, …}` plus
+# re-exports of `evmlib`, `saorsa-core` (transport), and `saorsa-pqc`
+# under `ant_protocol::{evm, transport, pqc}`. This is the ONE pin for
+# those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
+# deps here or the version can skew between ant-client and ant-node.
+ant-protocol = "2"
 xor_name = "5"
 self_encryption = "0.35.0"
 futures = "0.3"
@@ -38,8 +43,10 @@ tracing = "0.1"
 bytes = "1"
 lru = "0.16"
 rand = "0.8"
-ant-node = "0.10.0"
-saorsa-pqc = "0.5"
+# ant-node is optional. It is only linked for the `LocalDevnet` wrapper
+# that spawns a local in-process network for development and testing.
+# Enable with `--features devnet`.
+ant-node = { version = "0.11", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -52,7 +59,20 @@ openssl = { version = "0.10", features = ["vendored"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
 
+[features]
+# No features enabled by default — consumers that want to spawn a local
+# devnet opt in with `features = ["devnet"]`.
+default = []
+# Enable `LocalDevnet` (ant-core/src/node/devnet.rs) which wraps
+# `ant_node::devnet::Devnet` and an Anvil EVM testnet.
+devnet = ["dep:ant-node"]
+
 [dev-dependencies]
+# Test infrastructure in tests/support/mod.rs spawns real ant-nodes
+# in-process to exercise the wire protocol end-to-end. ant-node is a
+# dev-dep here (separate from the optional runtime dep above) so tests
+# always compile even without the `devnet` feature.
+ant-node = "0.11"
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
@@ -61,6 +81,10 @@ tokio-test = "0.4"
 [[example]]
 name = "start-local-devnet"
 path = "examples/start-local-devnet.rs"
+# `LocalDevnet` (and therefore this example) is gated behind `devnet`.
+# Running under default features would produce a confusing "LocalDevnet
+# not found" error, so require the feature explicitly.
+required-features = ["devnet"]
 
 [[test]]
 name = "e2e_chunk"

@@ -1,3 +1,10 @@
 [workspace]
 members = ["ant-core", "ant-cli"]
 resolver = "2"
+
+# While ant-protocol 2.0.0 and ant-node 0.11.0 are unpublished, resolve
+# both through git pins against their open PR branches. Remove this
+# block when both crates are on crates.io.
+[patch.crates-io]
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "597dbdb1b680a43d80a082d77076ff2080444079" }
+ant-node = { git = "https://github.com/WithAutonomi/ant-node", branch = "anselme/extract-ant-protocol" }
