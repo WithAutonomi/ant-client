@@ -9,6 +9,7 @@ use std::time::Duration;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::info;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use ant_core::data::{
     Client, ClientConfig, CoreNodeConfig, CustomNetwork, DevnetManifest, EvmAddress, EvmNetwork,
@@ -46,21 +47,24 @@ async fn main() {
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Privacy by design: no logs unless the user explicitly opts in with -v.
-    // A decentralized network client must not emit metadata by default.
+    // Privacy by design: no logs unless the user explicitly opts in with -v
+    // or by setting RUST_LOG. A decentralized network client must not emit
+    // metadata by default.
     let needs_tracing = !matches!(cli.command, Commands::Node { .. });
-    if needs_tracing && cli.verbose > 0 {
-        use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-
-        let filter = match cli.verbose {
-            1 => EnvFilter::new("ant_core=info,ant_cli=info"),
-            2 => EnvFilter::new("ant_core=debug,ant_cli=debug"),
-            _ => EnvFilter::new("trace"),
+    if needs_tracing {
+        let filter = match (EnvFilter::try_from_default_env().ok(), cli.verbose) {
+            (Some(f), _) => Some(f),
+            (None, 0) => None,
+            (None, 1) => Some(EnvFilter::new("ant_core=info,ant_cli=info")),
+            (None, 2) => Some(EnvFilter::new("ant_core=debug,ant_cli=debug")),
+            (None, _) => Some(EnvFilter::new("trace")),
         };
-        tracing_subscriber::registry()
-            .with(fmt::layer().with_writer(std::io::stderr))
-            .with(filter)
-            .init();
+        if let Some(filter) = filter {
+            tracing_subscriber::registry()
+                .with(fmt::layer().with_writer(std::io::stderr))
+                .with(filter)
+                .init();
+        }
     }
 
     // Separate the command from the rest of the CLI args to avoid partial-move issues.
