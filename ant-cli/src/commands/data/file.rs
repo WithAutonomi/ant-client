@@ -127,7 +127,7 @@ impl FileAction {
                 } else {
                     PaymentMode::Auto
                 };
-                handle_file_cost(client, &path, mode, json).await
+                handle_file_cost(client, &path, mode, json, verbose).await
             }
         }
     }
@@ -463,21 +463,29 @@ async fn handle_file_cost(
     path: &Path,
     mode: PaymentMode,
     json_output: bool,
+    verbose: u8,
 ) -> anyhow::Result<()> {
-    let spinner = if !json_output {
-        Some(new_spinner("Encrypting file to estimate cost..."))
+    let file_size = std::fs::metadata(path)?.len();
+
+    let estimate = if json_output {
+        client
+            .estimate_upload_cost(path, mode, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Cost estimation failed: {e}"))?
     } else {
-        None
+        let (tx, rx) = mpsc::channel(64);
+        let pb_handle = tokio::spawn(drive_upload_progress(
+            rx,
+            path.display().to_string(),
+            file_size,
+            verbose,
+        ));
+
+        let result = client.estimate_upload_cost(path, mode, Some(tx)).await;
+        let _ = pb_handle.await;
+
+        result.map_err(|e| anyhow::anyhow!("Cost estimation failed: {e}"))?
     };
-
-    let estimate = client
-        .estimate_upload_cost(path, mode, None)
-        .await
-        .map_err(|e| anyhow::anyhow!("Cost estimation failed: {e}"))?;
-
-    if let Some(s) = &spinner {
-        s.finish_and_clear();
-    }
 
     if json_output {
         println!("{}", serde_json::to_string(&estimate)?);

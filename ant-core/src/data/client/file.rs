@@ -555,8 +555,10 @@ impl Client {
     /// The estimate is fast (~2-5s) and does not require a wallet. Spilled
     /// chunks are cleaned up automatically when the function returns.
     ///
-    /// Gas cost is a rough heuristic (150k gas per transaction at 1 gwei),
-    /// not a live gas price query. Actual gas varies by network conditions.
+    /// Gas cost is a rough heuristic (not a live gas price query) priced at
+    /// ~1 gwei. Single-mode gas scales with the total number of quote entries
+    /// paid in `pay_for_quotes`; merkle-mode gas scales with the number of
+    /// sub-batches. Actual gas varies by network conditions.
     ///
     /// # Errors
     ///
@@ -602,34 +604,25 @@ impl Client {
             .first()
             .ok_or_else(|| Error::InvalidData("Encryption produced zero chunks".into()))?;
         let first_chunk = spill.read_chunk(first_addr)?;
-        let first_address = compute_address(&first_chunk);
         let data_size = u64::try_from(first_chunk.len())
             .map_err(|e| Error::InvalidData(format!("chunk size too large: {e}")))?;
 
-        // If the first chunk is already stored, we still proceed with
-        // the estimate using a zero price for that chunk. We cannot
-        // reliably detect whether ALL chunks are stored from a single
-        // sample, so we always return a cost estimate.
+        // If the first chunk is already stored we cannot obtain a
+        // representative quote from a single sample — returning a "free"
+        // estimate would be misleading for a file where the other chunks
+        // still need paying for. Surface a typed error so the caller can
+        // retry (e.g. with a different file) rather than trust a zero cost.
         let quotes = match self
-            .get_store_quotes(&first_address, data_size, DATA_TYPE_CHUNK)
+            .get_store_quotes(first_addr, data_size, DATA_TYPE_CHUNK)
             .await
         {
             Ok(q) => q,
             Err(Error::AlreadyStored) => {
-                // First chunk exists but we don't know about the rest.
-                // Return zero storage cost as a best-effort estimate.
-                let uses_merkle = should_use_merkle(chunk_count, mode);
-                return Ok(UploadCostEstimate {
-                    file_size,
-                    chunk_count,
-                    storage_cost_atto: "0".into(),
-                    estimated_gas_cost_wei: "0".into(),
-                    payment_mode: if uses_merkle {
-                        PaymentMode::Merkle
-                    } else {
-                        PaymentMode::Single
-                    },
-                });
+                return Err(Error::InvalidData(
+                    "first chunk is already stored on the network; cannot \
+                     sample a representative price for a reliable estimate"
+                        .into(),
+                ));
             }
             Err(e) => return Err(e),
         };
@@ -644,18 +637,33 @@ impl Client {
             .unwrap_or(Amount::ZERO);
         let per_chunk_cost = median_price * Amount::from(3u64);
 
-        let total_storage = per_chunk_cost * Amount::from(chunk_count as u64);
+        let chunk_count_u64 = u64::try_from(chunk_count)
+            .map_err(|e| Error::InvalidData(format!("chunk count too large: {e}")))?;
+        let total_storage = per_chunk_cost * Amount::from(chunk_count_u64);
 
         // Estimate gas cost based on payment mode and chunk count.
-        // This is a rough heuristic: ~150k gas per EVM transaction at ~1 gwei.
-        // Actual gas prices vary by network. Treat this as an order-of-magnitude guide.
+        // Rough heuristic at ~1 gwei; treat as an order-of-magnitude guide.
+        // - Single mode: `batch_pay` flattens every chunk's close-group quotes
+        //   into one `pay_for_quotes` call, so gas scales with the number of
+        //   quote entries in the wave (chunks × recipients/chunk), not the
+        //   number of waves. A multi-recipient tx of that shape on Arbitrum
+        //   runs ~75k base + ~25k per entry — use that per-wave rather than a
+        //   flat 150k, which was off by 5–10x for full waves.
+        // - Merkle mode: one on-chain tx per sub-batch, but the tx verifies a
+        //   tree and posts a pool commitment, so budget ~500k per sub-batch.
         let uses_merkle = should_use_merkle(chunk_count, mode);
+        let quotes_per_chunk = u128::try_from(quotes.len().max(1))
+            .map_err(|e| Error::InvalidData(format!("quote count too large: {e}")))?;
         let estimated_gas: u128 = if uses_merkle {
-            let batches = chunk_count.div_ceil(MAX_LEAVES);
-            (batches as u128) * 150_000 * 1_000_000_000
+            let batches = chunk_count.div_ceil(MAX_LEAVES) as u128;
+            batches * 500_000 * 1_000_000_000
         } else {
-            let waves = chunk_count.div_ceil(UPLOAD_WAVE_SIZE);
-            (waves as u128) * 150_000 * 1_000_000_000
+            // Sum over waves, accounting for a possibly-partial last wave.
+            let total_entries = (chunk_count as u128) * quotes_per_chunk;
+            let waves = chunk_count.div_ceil(UPLOAD_WAVE_SIZE) as u128;
+            let base_gas = waves * 75_000;
+            let entry_gas = total_entries * 25_000;
+            (base_gas + entry_gas) * 1_000_000_000
         };
 
         info!(
