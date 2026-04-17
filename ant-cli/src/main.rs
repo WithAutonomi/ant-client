@@ -70,6 +70,7 @@ async fn run() -> anyhow::Result<()> {
         bootstrap,
         devnet_manifest,
         allow_loopback,
+        ipv4_only,
         quote_timeout_secs,
         store_timeout_secs,
         verbose,
@@ -83,6 +84,7 @@ async fn run() -> anyhow::Result<()> {
         bootstrap,
         devnet_manifest,
         allow_loopback,
+        ipv4_only,
         quote_timeout_secs,
         store_timeout_secs,
         evm_network,
@@ -152,6 +154,7 @@ struct DataCliContext {
     bootstrap: Vec<SocketAddr>,
     devnet_manifest: Option<PathBuf>,
     allow_loopback: bool,
+    ipv4_only: bool,
     quote_timeout_secs: u64,
     store_timeout_secs: u64,
     evm_network: String,
@@ -178,11 +181,12 @@ async fn build_data_client(
 
     // Connection phase with animated spinner showing peer discovery in real-time
     let node = if quiet {
-        create_client_node(bootstrap, ctx.allow_loopback).await?
+        create_client_node(bootstrap, ctx.allow_loopback, ctx.ipv4_only).await?
     } else {
         let spinner = new_spinner("Connecting to autonomi network...");
 
-        let node = match create_client_node_raw(bootstrap, ctx.allow_loopback).await {
+        let node = match create_client_node_raw(bootstrap, ctx.allow_loopback, ctx.ipv4_only).await
+        {
             Ok(n) => n,
             Err(e) => {
                 spinner.finish_and_clear();
@@ -377,8 +381,9 @@ fn resolve_bootstrap_from(
 async fn create_client_node(
     bootstrap: Vec<SocketAddr>,
     allow_loopback: bool,
+    ipv4_only: bool,
 ) -> anyhow::Result<Arc<P2PNode>> {
-    let node = create_client_node_raw(bootstrap, allow_loopback).await?;
+    let node = create_client_node_raw(bootstrap, allow_loopback, ipv4_only).await?;
     node.start()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start P2P node: {e}"))?;
@@ -389,10 +394,11 @@ async fn create_client_node(
 async fn create_client_node_raw(
     bootstrap: Vec<SocketAddr>,
     allow_loopback: bool,
+    ipv4_only: bool,
 ) -> anyhow::Result<Arc<P2PNode>> {
     let mut core_config = CoreNodeConfig::builder()
         .port(0)
-        .ipv6(false)
+        .ipv6(!ipv4_only)
         .local(allow_loopback)
         .mode(NodeMode::Client)
         .max_message_size(MAX_WIRE_MESSAGE_SIZE)

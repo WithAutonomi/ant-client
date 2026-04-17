@@ -25,8 +25,9 @@ impl Network {
     /// testing. Public Autonomi network peers reject the QUIC handshake
     /// variant produced when `local = true`, so production callers must pass
     /// `false` (this is what `ant-cli` does by default — see
-    /// `ant-cli/src/main.rs::create_client_node_raw`, which builds the same
-    /// `CoreNodeConfig` directly with `.local(allow_loopback)`).
+    /// `ant-cli/src/main.rs::create_client_node_raw`, which builds an
+    /// equivalent `CoreNodeConfig` directly and additionally exposes an
+    /// `--ipv4-only` flag that flips `ipv6` to `false`).
     ///
     /// # Errors
     ///

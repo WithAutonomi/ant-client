@@ -31,6 +31,12 @@ pub struct Cli {
     #[arg(long)]
     pub allow_loopback: bool,
 
+    /// Force IPv4-only mode (disable dual-stack).
+    /// Use on hosts without working IPv6 to avoid advertising
+    /// unreachable addresses to the DHT.
+    #[arg(long)]
+    pub ipv4_only: bool,
+
     /// Timeout for lightweight network operations such as quotes and DHT
     /// lookups (seconds).
     #[arg(long, default_value_t = 10)]
