@@ -20,8 +20,8 @@ use crate::data::error::{Error, Result};
 use ant_node::ant_protocol::DATA_TYPE_CHUNK;
 use ant_node::client::compute_address;
 use bytes::Bytes;
-use evmlib::common::QuoteHash;
-use evmlib::common::TxHash;
+use evmlib::common::{Amount, QuoteHash, TxHash};
+use evmlib::merkle_payments::MAX_LEAVES;
 use fs2::FileExt;
 use futures::stream::{self, StreamExt};
 use self_encryption::{get_root_data_map_parallel, stream_encrypt, streaming_decrypt, DataMap};
@@ -373,6 +373,24 @@ fn check_disk_space_for_spill(file_size: u64) -> Result<()> {
     Ok(())
 }
 
+/// Estimated cost of uploading a file, returned by
+/// [`Client::estimate_upload_cost`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UploadCostEstimate {
+    /// Original file size in bytes.
+    pub file_size: u64,
+    /// Number of chunks the file would be split into (data chunks only,
+    /// does not include the DataMap chunk added during public uploads).
+    pub chunk_count: usize,
+    /// Estimated total storage cost in atto (token smallest unit).
+    pub storage_cost_atto: String,
+    /// Estimated gas cost in wei as a string. This is a rough heuristic
+    /// based on chunk count and payment mode, NOT a live gas price query.
+    pub estimated_gas_cost_wei: String,
+    /// Payment mode that would be used.
+    pub payment_mode: PaymentMode,
+}
+
 /// Result of a file upload: the `DataMap` needed to retrieve the file.
 #[derive(Debug, Clone)]
 pub struct FileUploadResult {
@@ -526,6 +544,135 @@ impl Client {
     /// or any chunk cannot be stored.
     pub async fn file_upload(&self, path: &Path) -> Result<FileUploadResult> {
         self.file_upload_with_mode(path, PaymentMode::Auto).await
+    }
+
+    /// Estimate the cost of uploading a file without actually uploading.
+    ///
+    /// Encrypts the file to determine chunk count and sizes, then requests
+    /// a single quote from the network for a representative chunk. The
+    /// per-chunk price is extrapolated to the total chunk count.
+    ///
+    /// The estimate is fast (~2-5s) and does not require a wallet. Spilled
+    /// chunks are cleaned up automatically when the function returns.
+    ///
+    /// Gas cost is a rough heuristic (150k gas per transaction at 1 gwei),
+    /// not a live gas price query. Actual gas varies by network conditions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, encryption fails,
+    /// or the network cannot provide a quote.
+    pub async fn estimate_upload_cost(
+        &self,
+        path: &Path,
+        mode: PaymentMode,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<UploadCostEstimate> {
+        let file_size = std::fs::metadata(path).map_err(Error::Io)?.len();
+
+        if file_size < 3 {
+            return Err(Error::InvalidData(
+                "File too small: self-encryption requires at least 3 bytes".into(),
+            ));
+        }
+
+        check_disk_space_for_spill(file_size)?;
+
+        info!(
+            "Estimating upload cost for {} ({file_size} bytes)",
+            path.display()
+        );
+
+        let (spill, _data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
+        let chunk_count = spill.len();
+
+        if let Some(ref tx) = progress {
+            let _ = tx
+                .send(UploadEvent::Encrypted {
+                    total_chunks: chunk_count,
+                })
+                .await;
+        }
+
+        info!("Encrypted into {chunk_count} chunks, requesting quote");
+
+        // Read the first chunk to get a representative quote from the network.
+        let first_addr = spill
+            .addresses
+            .first()
+            .ok_or_else(|| Error::InvalidData("Encryption produced zero chunks".into()))?;
+        let first_chunk = spill.read_chunk(first_addr)?;
+        let first_address = compute_address(&first_chunk);
+        let data_size = u64::try_from(first_chunk.len())
+            .map_err(|e| Error::InvalidData(format!("chunk size too large: {e}")))?;
+
+        // If the first chunk is already stored, we still proceed with
+        // the estimate using a zero price for that chunk. We cannot
+        // reliably detect whether ALL chunks are stored from a single
+        // sample, so we always return a cost estimate.
+        let quotes = match self
+            .get_store_quotes(&first_address, data_size, DATA_TYPE_CHUNK)
+            .await
+        {
+            Ok(q) => q,
+            Err(Error::AlreadyStored) => {
+                // First chunk exists but we don't know about the rest.
+                // Return zero storage cost as a best-effort estimate.
+                let uses_merkle = should_use_merkle(chunk_count, mode);
+                return Ok(UploadCostEstimate {
+                    file_size,
+                    chunk_count,
+                    storage_cost_atto: "0".into(),
+                    estimated_gas_cost_wei: "0".into(),
+                    payment_mode: if uses_merkle {
+                        PaymentMode::Merkle
+                    } else {
+                        PaymentMode::Single
+                    },
+                });
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Use the median price × 3 (matches SingleNodePayment::from_quotes
+        // which pays 3x the median to incentivize reliable storage).
+        let mut prices: Vec<Amount> = quotes.iter().map(|(_, _, _, price)| *price).collect();
+        prices.sort();
+        let median_price = prices
+            .get(prices.len() / 2)
+            .copied()
+            .unwrap_or(Amount::ZERO);
+        let per_chunk_cost = median_price * Amount::from(3u64);
+
+        let total_storage = per_chunk_cost * Amount::from(chunk_count as u64);
+
+        // Estimate gas cost based on payment mode and chunk count.
+        // This is a rough heuristic: ~150k gas per EVM transaction at ~1 gwei.
+        // Actual gas prices vary by network. Treat this as an order-of-magnitude guide.
+        let uses_merkle = should_use_merkle(chunk_count, mode);
+        let estimated_gas: u128 = if uses_merkle {
+            let batches = chunk_count.div_ceil(MAX_LEAVES);
+            (batches as u128) * 150_000 * 1_000_000_000
+        } else {
+            let waves = chunk_count.div_ceil(UPLOAD_WAVE_SIZE);
+            (waves as u128) * 150_000 * 1_000_000_000
+        };
+
+        info!(
+            "Estimate: {chunk_count} chunks, storage={total_storage} atto, gas~={estimated_gas} wei"
+        );
+
+        Ok(UploadCostEstimate {
+            file_size,
+            chunk_count,
+            storage_cost_atto: total_storage.to_string(),
+            estimated_gas_cost_wei: estimated_gas.to_string(),
+            payment_mode: if uses_merkle {
+                PaymentMode::Merkle
+            } else {
+                PaymentMode::Single
+            },
+        })
     }
 
     /// Phase 1 of external-signer upload: encrypt file and prepare chunks.

@@ -52,6 +52,20 @@ pub enum FileAction {
         #[arg(short, long)]
         output: PathBuf,
     },
+    /// Estimate the cost of uploading a file without uploading.
+    ///
+    /// Encrypts the file locally to determine chunk count, then queries
+    /// the network for a price quote. No payment or wallet required.
+    Cost {
+        /// Path to the file to estimate.
+        path: PathBuf,
+        /// Force merkle batch payment mode for the estimate.
+        #[arg(long, conflicts_with = "no_merkle")]
+        merkle: bool,
+        /// Force single payment mode for the estimate.
+        #[arg(long, conflicts_with = "merkle")]
+        no_merkle: bool,
+    },
 }
 
 impl FileAction {
@@ -100,6 +114,20 @@ impl FileAction {
                     verbose,
                 )
                 .await
+            }
+            FileAction::Cost {
+                path,
+                merkle,
+                no_merkle,
+            } => {
+                let mode = if merkle {
+                    PaymentMode::Merkle
+                } else if no_merkle {
+                    PaymentMode::Single
+                } else {
+                    PaymentMode::Auto
+                };
+                handle_file_cost(client, &path, mode, json).await
             }
         }
     }
@@ -425,6 +453,43 @@ async fn handle_file_download(
         println!("  File: {}", output_path.display());
         println!("  Size: {}", format_size(file_size));
         println!("  Time: {:.1}s", elapsed.as_secs_f64());
+    }
+
+    Ok(())
+}
+
+async fn handle_file_cost(
+    client: &Client,
+    path: &Path,
+    mode: PaymentMode,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let spinner = if !json_output {
+        Some(new_spinner("Encrypting file to estimate cost..."))
+    } else {
+        None
+    };
+
+    let estimate = client
+        .estimate_upload_cost(path, mode, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("Cost estimation failed: {e}"))?;
+
+    if let Some(s) = &spinner {
+        s.finish_and_clear();
+    }
+
+    if json_output {
+        println!("{}", serde_json::to_string(&estimate)?);
+    } else {
+        let gas_wei: u128 = estimate.estimated_gas_cost_wei.parse().unwrap_or(0);
+        let cost_display = format_cost(&estimate.storage_cost_atto, gas_wei);
+
+        println!();
+        println!("Estimated upload cost for {}", path.display());
+        println!("  Size:    {}", format_size(estimate.file_size));
+        println!("  Chunks:  {}", estimate.chunk_count);
+        println!("  Cost:    {cost_display}");
     }
 
     Ok(())

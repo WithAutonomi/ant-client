@@ -69,7 +69,7 @@ jobs:
         with:
           version: nightly
       - name: Run E2E tests (serial)
-        run: cargo test -p ant-core --test e2e_chunk --test e2e_data --test e2e_file --test e2e_payment --test e2e_security -- --test-threads=1
+        run: cargo test -p ant-core --test e2e_chunk --test e2e_data --test e2e_file --test e2e_payment --test e2e_security --test e2e_cost_estimate -- --test-threads=1
 
   test-merkle:
     name: Merkle E2E (${{ matrix.os }})
