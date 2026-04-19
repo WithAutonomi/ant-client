@@ -72,17 +72,25 @@ impl Client {
     ) -> Result<XorName> {
         let address = compute_address(&content);
 
-        let initial_count = peers.len().min(CLOSE_GROUP_MAJORITY);
-        let (initial_peers, fallback_peers) = peers.split_at(initial_count);
-
+        // chunk-put-parallel-dial: fire all close-group peers immediately rather
+        // than firing a CLOSE_GROUP_MAJORITY-sized batch and waiting for each
+        // failure before queuing the next candidate. With bimodal identity-
+        // exchange timing (fast success vs. full-timeout failure), serialised
+        // fallback makes the whole PUT latency-bounded by the slowest failing
+        // peer in the initial batch; firing everyone in parallel lets the
+        // earliest MAJORITY responders finish the PUT and cancels the rest.
         let mut put_futures = FuturesUnordered::new();
-        for (peer_id, addrs) in initial_peers {
+        for (peer_id, addrs) in peers {
             put_futures.push(self.spawn_chunk_put(content.clone(), proof.clone(), peer_id, addrs));
         }
+        debug!(
+            "chunk-put-parallel-dial: dispatched {} peers concurrently for chunk {}",
+            peers.len(),
+            hex::encode(address)
+        );
 
         let mut success_count = 0usize;
         let mut failures: Vec<String> = Vec::new();
-        let mut fallback_iter = fallback_peers.iter();
 
         while let Some((peer_id, result)) = put_futures.next().await {
             match result {
@@ -99,19 +107,6 @@ impl Client {
                 Err(e) => {
                     warn!("Failed to store chunk on {peer_id}: {e}");
                     failures.push(format!("{peer_id}: {e}"));
-
-                    if let Some((fb_peer, fb_addrs)) = fallback_iter.next() {
-                        debug!(
-                            "Falling back to peer {fb_peer} for chunk {}",
-                            hex::encode(address)
-                        );
-                        put_futures.push(self.spawn_chunk_put(
-                            content.clone(),
-                            proof.clone(),
-                            fb_peer,
-                            fb_addrs,
-                        ));
-                    }
                 }
             }
         }

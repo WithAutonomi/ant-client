@@ -904,7 +904,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.10.1"
-source = "git+https://github.com/WithAutonomi/ant-node.git?branch=debug%2Fidentity-exchange-probe#b0dbf81d9fd87bc92e102308855fd2cc76f9a21a"
+source = "git+https://github.com/WithAutonomi/ant-node.git?branch=debug%2Fidentity-exchange-probe#672156380c8836252f9a7afcf1ff46170b8642e4"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -1793,7 +1793,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2270,7 +2270,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2457,7 +2457,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3810,7 +3810,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4498,7 +4498,7 @@ dependencies = [
  "libc",
  "socket2 0.6.3",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4970,7 +4970,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5037,7 +5037,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5114,7 +5114,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.23.1"
-source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=debug%2Fidentity-exchange-probe#b38d8c58796735f8f06653e97ed930c4ede4e704"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=debug%2Fidentity-exchange-probe#70ef2086e83451da3a7f84512f9c9f75b8ffa8b3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5934,7 +5934,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6753,7 +6753,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
