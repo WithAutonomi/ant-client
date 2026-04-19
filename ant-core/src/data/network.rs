@@ -5,7 +5,7 @@
 
 use crate::data::error::{Error, Result};
 use ant_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
-use ant_node::core::{CoreNodeConfig, MultiAddr, NodeMode, P2PNode, PeerId};
+use ant_node::core::{CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode, PeerId};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -40,6 +40,12 @@ impl Network {
             .max_message_size(MAX_WIRE_MESSAGE_SIZE)
             .build()
             .map_err(|e| Error::Network(format!("Failed to create core config: {e}")))?;
+
+        // Clients never enforce IP-diversity limits: they don't host data and
+        // their routing table exists only to find peers, not to be defended
+        // against Sybil clustering. Strict per-IP / per-subnet caps would
+        // silently drop legitimate testnet peers that share an IP or /24.
+        core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
         core_config.bootstrap_peers = bootstrap_peers
             .iter()

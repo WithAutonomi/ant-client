@@ -34,7 +34,7 @@ pub use self_encryption::DataMap;
 
 // Re-export networking types needed by CLI for P2P node creation
 pub use ant_node::ant_protocol::{MAX_CHUNK_SIZE, MAX_WIRE_MESSAGE_SIZE};
-pub use ant_node::core::{CoreNodeConfig, MultiAddr, NodeMode, P2PNode};
+pub use ant_node::core::{CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode};
 pub use ant_node::devnet::DevnetManifest;
 
 // Re-export EVM types needed by CLI for wallet and network setup

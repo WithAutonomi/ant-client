@@ -13,7 +13,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 use ant_core::data::{
     Client, ClientConfig, CoreNodeConfig, CustomNetwork, DevnetManifest, EvmAddress, EvmNetwork,
-    MultiAddr, NodeMode, P2PNode, Wallet, MAX_WIRE_MESSAGE_SIZE,
+    IPDiversityConfig, MultiAddr, NodeMode, P2PNode, Wallet, MAX_WIRE_MESSAGE_SIZE,
 };
 use cli::{Cli, Commands};
 
@@ -402,6 +402,12 @@ async fn create_client_node_raw(
         .max_message_size(MAX_WIRE_MESSAGE_SIZE)
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to create core config: {e}"))?;
+
+    // Clients never enforce IP-diversity limits: they don't host data and
+    // their routing table exists only to find peers, not to be defended
+    // against Sybil clustering. Strict per-IP / per-subnet caps would
+    // silently drop legitimate testnet peers that share an IP or /24.
+    core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
     core_config.bootstrap_peers = bootstrap
         .iter()
