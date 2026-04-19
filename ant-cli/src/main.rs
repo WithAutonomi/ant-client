@@ -53,8 +53,12 @@ async fn run() -> anyhow::Result<()> {
         use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
         let filter = match cli.verbose {
-            1 => EnvFilter::new("ant_core=info,ant_cli=info,saorsa_core=info"),
-            2 => EnvFilter::new("ant_core=debug,ant_cli=debug,saorsa_core=debug"),
+            1 => EnvFilter::new(
+                "ant_core=info,ant_cli=info,saorsa_core=info,saorsa_transport=info",
+            ),
+            2 => EnvFilter::new(
+                "ant_core=debug,ant_cli=debug,saorsa_core=debug,saorsa_transport=info",
+            ),
             _ => EnvFilter::new("trace"),
         };
         tracing_subscriber::registry()
