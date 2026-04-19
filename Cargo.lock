@@ -904,7 +904,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.10.1"
-source = "git+https://github.com/WithAutonomi/ant-node.git?branch=debug%2Fidentity-exchange-probe#297d2c3fbea9737414d09331b5bd4b7164b89e76"
+source = "git+https://github.com/WithAutonomi/ant-node.git?branch=debug%2Fidentity-exchange-probe#55445f9d7b47c06c4007de1bbbd1ce389641f1e3"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -5114,7 +5114,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.23.1"
-source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=debug%2Fidentity-exchange-probe#ef0c1ce7a0b2955c8186b068093a18beacf95e30"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=debug%2Fidentity-exchange-probe#fd15690760eb83e20f9bdf756abb1688b586cdfb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5228,7 +5228,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.32.0"
-source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=debug%2Fidentity-exchange-probe#6b376ff4d4935f9074d368e22a18cf77ba04cbe7"
+source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=debug%2Fidentity-exchange-probe#594c3860096ba93508a2979621d383a0225af5aa"
 dependencies = [
  "anyhow",
  "async-trait",
