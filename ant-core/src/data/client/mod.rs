@@ -244,3 +244,35 @@ impl Client {
         Ok(peers)
     }
 }
+
+/// Feed a peer contact outcome into the `BootstrapManager` cache so future
+/// cold-starts can rank peers by observed latency and success rate.
+///
+/// On success, upserts the peer (subject to saorsa-core Sybil checks:
+/// rate limiting + IP diversity) and records the RTT. On failure, only
+/// updates the quality score of peers already in the cache — we never
+/// insert peers we couldn't reach.
+///
+/// Errors from both upstream calls are swallowed: peer-cache bookkeeping
+/// must never abort a user operation.
+pub(crate) async fn record_peer_outcome(
+    node: &Arc<P2PNode>,
+    peer_id: PeerId,
+    addrs: &[MultiAddr],
+    success: bool,
+    rtt_ms: Option<u64>,
+) {
+    if success {
+        let before = node.cached_peer_count().await;
+        let _ = node.add_discovered_peer(peer_id, addrs.to_vec()).await;
+        let after = node.cached_peer_count().await;
+        if after > before {
+            debug!("Bootstrap cache grew: {before} -> {after} peers");
+        }
+    }
+    if let Some(primary) = addrs.iter().find(|a| a.socket_addr().is_some()) {
+        let _ = node
+            .update_peer_metrics(primary, success, rtt_ms, None)
+            .await;
+    }
+}

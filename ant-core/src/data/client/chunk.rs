@@ -3,7 +3,7 @@
 //! Chunks are immutable, content-addressed data blocks where the address
 //! is the BLAKE3 hash of the content.
 
-use crate::data::client::Client;
+use crate::data::client::{record_peer_outcome, Client};
 use crate::data::error::{Error, Result};
 use ant_node::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
@@ -15,7 +15,7 @@ use ant_node::CLOSE_GROUP_MAJORITY;
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 /// Data type identifier for chunks (used in quote requests).
@@ -171,7 +171,8 @@ impl Client {
         let addr_hex = hex::encode(address);
         let timeout_secs = self.config().store_timeout_secs;
 
-        send_and_await_chunk_response(
+        let start = Instant::now();
+        let result = send_and_await_chunk_response(
             node,
             target_peer,
             message_bytes,
@@ -204,7 +205,14 @@ impl Client {
                 ))
             },
         )
-        .await
+        .await;
+
+        let reachable = !matches!(&result, Err(Error::Network(_) | Error::Timeout(_)));
+        let rtt_ms =
+            reachable.then(|| u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
+        record_peer_outcome(node, *target_peer, peer_addrs, reachable, rtt_ms).await;
+
+        result
     }
 
     /// Retrieve a chunk from the Autonomi network.
@@ -278,7 +286,8 @@ impl Client {
         let addr_hex = hex::encode(address);
         let timeout_secs = self.config().store_timeout_secs;
 
-        send_and_await_chunk_response(
+        let start = Instant::now();
+        let result = send_and_await_chunk_response(
             node,
             peer,
             message_bytes,
@@ -325,7 +334,14 @@ impl Client {
                 ))
             },
         )
-        .await
+        .await;
+
+        let reachable = !matches!(&result, Err(Error::Network(_) | Error::Timeout(_)));
+        let rtt_ms =
+            reachable.then(|| u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
+        record_peer_outcome(node, *peer, peer_addrs, reachable, rtt_ms).await;
+
+        result
     }
 
     /// Check if a chunk exists on the network.

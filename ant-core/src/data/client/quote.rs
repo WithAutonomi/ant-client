@@ -3,7 +3,7 @@
 //! Handles requesting storage quotes from network nodes and
 //! managing payment for data storage.
 
-use crate::data::client::Client;
+use crate::data::client::{record_peer_outcome, Client};
 use crate::data::error::{Error, Result};
 use ant_node::ant_protocol::{
     ChunkMessage, ChunkMessageBody, ChunkQuoteRequest, ChunkQuoteResponse,
@@ -14,7 +14,7 @@ use ant_node::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
 use evmlib::common::Amount;
 use evmlib::PaymentQuote;
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 /// Compute XOR distance between a peer's ID bytes and a target address.
@@ -106,6 +106,7 @@ impl Client {
             let node_clone = node.clone();
 
             let quote_future = async move {
+                let start = Instant::now();
                 let result = send_and_await_chunk_response(
                     &node_clone,
                     &peer_id_clone,
@@ -146,6 +147,12 @@ impl Client {
                     || Error::Timeout(format!("Timeout waiting for quote from {peer_id_clone}")),
                 )
                 .await;
+
+                let reachable = !matches!(&result, Err(Error::Network(_) | Error::Timeout(_)));
+                let rtt_ms = reachable
+                    .then(|| u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
+                record_peer_outcome(&node_clone, peer_id_clone, &addrs_clone, reachable, rtt_ms)
+                    .await;
 
                 (peer_id_clone, addrs_clone, result)
             };
