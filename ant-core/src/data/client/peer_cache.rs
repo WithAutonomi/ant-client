@@ -86,8 +86,9 @@ mod tests {
 
     #[test]
     fn globally_routable_v4() {
+        // 8.8.8.8 (Google DNS) — genuinely public, not in any reserved range.
         assert!(is_globally_routable(&SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             80
         )));
         assert!(!is_globally_routable(&SocketAddr::new(
@@ -102,12 +103,22 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
             80
         )));
+        // 203.0.113.0/24 is TEST-NET-3 documentation — rejected by
+        // `is_documentation()`, which is the behaviour we want: quality
+        // metrics should not land on addresses that are never dialed in
+        // production by spec.
+        assert!(!is_globally_routable(&SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            80
+        )));
     }
 
     #[test]
     fn globally_routable_v6() {
+        // 2606:4700:4700::1111 (Cloudflare DNS) — a real public v6 outside
+        // the `2001:db8::/32` documentation prefix.
         assert!(is_globally_routable(&SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
             80
         )));
         assert!(!is_globally_routable(&SocketAddr::new(
