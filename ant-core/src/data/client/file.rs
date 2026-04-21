@@ -450,7 +450,12 @@ pub struct UploadCostEstimate {
 
 
 /// Result of a file upload: the `DataMap` needed to retrieve the file.
+///
+/// Marked `#[non_exhaustive]` so adding a new field in future is not a
+/// breaking change for downstream consumers that construct or pattern-match
+/// on this struct.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FileUploadResult {
     /// The data map containing chunk metadata for reconstruction.
     pub data_map: DataMap,
@@ -462,9 +467,13 @@ pub struct FileUploadResult {
     pub storage_cost_atto: String,
     /// Total gas cost in wei. 0 if no on-chain transactions were made.
     pub gas_cost_wei: u128,
-    /// Chunk address of the serialized `DataMap`, set only for [`Visibility::Public`]
-    /// uploads. Share this address so others can retrieve the file without the
-    /// local `DataMap` (via [`Client::data_map_fetch`] then [`Client::file_download`]).
+    /// Chunk address of the serialized `DataMap`, set only for
+    /// [`Visibility::Public`] uploads. **`Some` means this address is
+    /// retrievable from the network (via [`Client::data_map_fetch`])**, not
+    /// necessarily that *this* upload paid to store it — if the serialized
+    /// `DataMap` hashed to a chunk that was already on the network (same
+    /// file uploaded before; deterministic via self-encryption), the address
+    /// is still returned but no storage payment was made for it.
     pub data_map_address: Option<[u8; 32]>,
 }
 
@@ -498,17 +507,22 @@ pub enum ExternalPaymentInfo {
 /// Note: This struct stays in Rust memory — only the public fields of
 /// `payment_info` are sent to the frontend. `PreparedChunk` contains
 /// non-serializable network types, so the full struct cannot derive `Serialize`.
+///
+/// Marked `#[non_exhaustive]` so adding a new field in future is not a
+/// breaking change for downstream consumers.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct PreparedUpload {
     /// The data map for later retrieval.
     pub data_map: DataMap,
     /// Payment information — either wave-batch or merkle depending on chunk count.
     pub payment_info: ExternalPaymentInfo,
-    /// Chunk address of the serialized `DataMap` when this upload was prepared
-    /// with [`Visibility::Public`]. The address is `Some` whenever the data
-    /// map chunk has been bundled into `payment_info` for payment; it is
-    /// carried through to [`FileUploadResult::data_map_address`] after
-    /// finalization.
+    /// Chunk address of the serialized `DataMap` when this upload was
+    /// prepared with [`Visibility::Public`]. `Some` means the address is
+    /// retrievable on the network after finalization — either because this
+    /// upload paid to store the chunk in `payment_info`, or because the
+    /// chunk was already on the network (deterministic self-encryption).
+    /// Carried through to [`FileUploadResult::data_map_address`].
     pub data_map_address: Option<[u8; 32]>,
 }
 
@@ -925,6 +939,22 @@ impl Client {
             for result in results {
                 if let Some(prepared) = result? {
                     prepared_chunks.push(prepared);
+                }
+            }
+
+            // Surface the "DataMap chunk was already on the network" case
+            // so debugging "why is data_map_address set but no storage cost
+            // appears for it?" doesn't require reading the source. See the
+            // `data_map_address` doc comment for why this is still a valid
+            // `Some(addr)` outcome.
+            if let Some(addr) = data_map_address {
+                if !prepared_chunks.iter().any(|c| c.address == addr) {
+                    info!(
+                        "Public upload: DataMap chunk {} was already stored \
+                         on the network — address is retrievable without a \
+                         new payment",
+                        hex::encode(addr)
+                    );
                 }
             }
 

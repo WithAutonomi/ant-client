@@ -5,7 +5,9 @@
 mod support;
 
 use ant_core::data::{compute_address, Client, ExternalPaymentInfo, Visibility};
+use evmlib::common::{QuoteHash, TxHash};
 use serial_test::serial;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -213,6 +215,87 @@ async fn test_file_prepare_upload_visibility() {
         }
         other => panic!("expected wave-batch for a 4KB file, got {other:?}"),
     }
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// Full public-upload round-trip (wave-batch path).
+///
+/// Simulates the external-signer flow end-to-end: prepare → sign payments
+/// via the testnet wallet → finalize → `data_map_fetch` using only the
+/// returned address → `file_download` → assert recovered bytes equal the
+/// original. Proves the data_map_address actually refers to a retrievable
+/// DataMap on the network, not just a hash recorded in memory.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_public_upload_round_trip_wave_batch() {
+    let (client, testnet) = setup().await;
+
+    let original = vec![0x5au8; 4096];
+    let mut input_file = NamedTempFile::new().expect("create temp file");
+    input_file.write_all(&original).expect("write temp file");
+    input_file.flush().expect("flush temp file");
+
+    // Phase 1: prepare as public.
+    let prepared = client
+        .file_prepare_upload_with_visibility(input_file.path(), Visibility::Public)
+        .await
+        .expect("public prepare should succeed");
+    let data_map_address = prepared
+        .data_map_address
+        .expect("public prepare must record the DataMap address");
+
+    // Phase 2: simulate an external signer by paying for the quotes with the
+    // testnet wallet and collecting the resulting (quote_hash, tx_hash) map.
+    let payments = match &prepared.payment_info {
+        ExternalPaymentInfo::WaveBatch { payment_intent, .. } => payment_intent.payments.clone(),
+        other => panic!("expected wave-batch payment for a 4KB file, got {other:?}"),
+    };
+    let (tx_hash_map, _gas) = testnet
+        .wallet()
+        .pay_for_quotes(payments)
+        .await
+        .expect("testnet wallet should pay for quotes");
+    let tx_hash_map: HashMap<QuoteHash, TxHash> = tx_hash_map.into_iter().collect();
+
+    // Phase 3: finalize. The data map chunk is stored alongside the data
+    // chunks in this single call — no second network trip needed.
+    let result = client
+        .finalize_upload(prepared, &tx_hash_map)
+        .await
+        .expect("finalize_upload should succeed");
+    assert_eq!(
+        result.data_map_address,
+        Some(data_map_address),
+        "FileUploadResult must carry the DataMap address forward from PreparedUpload"
+    );
+
+    // Phase 4: a fresh retriever can fetch the data map using only the
+    // shared address — they did not participate in the upload.
+    let fetched_data_map = client
+        .data_map_fetch(&data_map_address)
+        .await
+        .expect("data_map_fetch must retrieve the stored DataMap");
+
+    // Phase 5: download + verify content.
+    let output_dir = TempDir::new().expect("create output temp dir");
+    let output_path = output_dir.path().join("round_trip_out.bin");
+    let bytes_written = client
+        .file_download(&fetched_data_map, &output_path)
+        .await
+        .expect("file_download should succeed");
+    assert_eq!(
+        bytes_written,
+        original.len() as u64,
+        "bytes_written should equal original size"
+    );
+
+    let downloaded = std::fs::read(&output_path).expect("read downloaded file");
+    assert_eq!(
+        downloaded, original,
+        "downloaded bytes must equal the original file"
+    );
 
     drop(client);
     testnet.teardown().await;
