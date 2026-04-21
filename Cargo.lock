@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -903,7 +903,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.10.0-rc.16"
+version = "0.10.1"
+source = "git+https://github.com/withAutonomi/ant-node.git?branch=mick%2Falways-masque-relay-rebased#197c31dc110ed94dd9bbb47aa4a45e67d2d907b6"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -5109,6 +5110,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.22.0"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=mick%2Falways-masque-relay-rebased#007e06c8759da23cfc5eeb942093a59578bb238e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5221,7 +5223,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.31.0"
+version = "0.32.0"
+source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=mick%2Falways-masque-relay-rebased#87f92d022d10d00d874fc69e3fb4b268e84719b0"
 dependencies = [
  "anyhow",
  "async-trait",
