@@ -4,17 +4,17 @@
 
 mod support;
 
-use ant_core::data::{compute_address, Client, ClientConfig};
+use ant_core::data::{compute_address, Client};
 use bytes::Bytes;
 use serial_test::serial;
 use std::sync::Arc;
-use support::{MiniTestnet, DEFAULT_NODE_COUNT};
+use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 
 async fn setup() -> (Client, MiniTestnet) {
     let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(3).expect("Node 3 should exist");
 
-    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
+    let client = Client::from_node(Arc::clone(&node), test_client_config())
         .with_wallet(testnet.wallet().clone());
 
     (client, testnet)
@@ -184,7 +184,7 @@ async fn test_chunk_get_is_always_free() {
     // Reads are free so the wallet absence should not matter.
     // Using the same node ensures the DHT routes to the same storing peer.
     let node = testnet.node(3).expect("Node 3 should exist");
-    let no_wallet_client = Client::from_node(Arc::clone(&node), ClientConfig::default());
+    let no_wallet_client = Client::from_node(Arc::clone(&node), test_client_config());
 
     let retrieved = no_wallet_client
         .chunk_get(&address)
@@ -245,7 +245,7 @@ async fn test_chunk_put_no_wallet_fails() {
     let node = testnet.node(3).expect("Node 3 should exist");
 
     // Client WITHOUT wallet
-    let client = Client::from_node(Arc::clone(&node), ClientConfig::default());
+    let client = Client::from_node(Arc::clone(&node), test_client_config());
 
     let content = Bytes::from("chunk_put without wallet test");
     let result = client.chunk_put(content).await;

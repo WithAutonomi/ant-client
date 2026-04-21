@@ -15,6 +15,7 @@
     clippy::used_underscore_binding
 )]
 
+use ant_core::data::ClientConfig;
 use ant_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
 use ant_node::core::{
     CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
@@ -41,9 +42,23 @@ const BOOTSTRAP_COUNT: usize = 2;
 const SPAWN_DELAY_MS: u64 = 200;
 const STABILIZATION_TIMEOUT_SECS: u64 = 180;
 
-/// Default node count for standard E2E tests. Must exceed `CLOSE_GROUP_SIZE`
-/// so that quote collection can find enough peers.
-pub const DEFAULT_NODE_COUNT: usize = CLOSE_GROUP_SIZE + 1;
+/// Default node count for standard E2E tests.
+///
+/// `CLOSE_GROUP_SIZE` (7) is the quorum the client needs for a quote to
+/// succeed, so spawning exactly that many — or `+ 1` — leaves zero slack:
+/// a single slow peer drops the count to 6 and fails the whole test with
+/// `InsufficientPeers("Got 6 quotes, need 7. ...")`.
+///
+/// This is systematic on macOS CI runners, which are heavily virtualised
+/// (nested virt) and roughly half the CPU throughput of Linux runners.
+/// The 8-node QUIC handshake burst saturates the CPU and at least one
+/// peer consistently can't complete its handshake within the 10 s default
+/// per-peer timeout. Linux runners finish all 8 handshakes comfortably.
+///
+/// Spawning `CLOSE_GROUP_SIZE * 2` gives us one full group of slack — if
+/// up to 7 peers are slow, quote collection still reaches quorum. Each
+/// extra node is cheap (~200 ms spawn delay) compared to a flaky suite.
+pub const DEFAULT_NODE_COUNT: usize = CLOSE_GROUP_SIZE * 2;
 
 /// Index of the median quote in a `SingleNodePayment` quotes array.
 pub const MEDIAN_QUOTE_INDEX: usize = CLOSE_GROUP_SIZE / 2;
@@ -52,6 +67,28 @@ pub const MEDIAN_QUOTE_INDEX: usize = CLOSE_GROUP_SIZE / 2;
 const TEST_REWARDS_ADDRESS: [u8; 20] = [0x01; 20];
 /// Max records for quoting metrics.
 const TEST_MAX_RECORDS: usize = 1280;
+
+/// `ClientConfig` tuned for the in-process `MiniTestnet`.
+///
+/// Production defaults (`quote_timeout_secs = 10`, `store_timeout_secs = 10`)
+/// assume dedicated CPU and residential-grade network timing. E2E tests
+/// spawn a full P2P network inside a single CI VM, so all QUIC handshakes,
+/// DHT lookups, and payment round-trips compete for the same cores. On
+/// heavily-virtualised runners (macOS GitHub Actions in particular), the
+/// 10 s per-peer timeout fires before the slowest peer can finish its
+/// handshake, which surfaces as `InsufficientPeers("Got 6 quotes, need 7")`.
+///
+/// 60 s is deliberately conservative: in the happy path everything completes
+/// in well under a second, so the larger budget only shows up on flakes.
+/// The merkle suite already uses 120 s for the same reason.
+#[must_use]
+pub fn test_client_config() -> ClientConfig {
+    ClientConfig {
+        quote_timeout_secs: 60,
+        store_timeout_secs: 60,
+        ..Default::default()
+    }
+}
 
 pub struct TestNode {
     pub p2p_node: Option<Arc<P2PNode>>,
