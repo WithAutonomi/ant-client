@@ -4,18 +4,18 @@
 
 mod support;
 
-use ant_core::data::{Client, ClientConfig};
+use ant_core::data::Client;
 use bytes::Bytes;
 use self_encryption::encrypt;
 use serial_test::serial;
 use std::sync::Arc;
-use support::{MiniTestnet, DEFAULT_NODE_COUNT};
+use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 
 async fn setup() -> (Client, MiniTestnet) {
     let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(4).expect("Node 4 should exist");
 
-    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
+    let client = Client::from_node(Arc::clone(&node), test_client_config())
         .with_wallet(testnet.wallet().clone());
 
     (client, testnet)
