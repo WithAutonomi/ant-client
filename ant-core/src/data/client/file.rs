@@ -596,13 +596,13 @@ impl Client {
     /// chunks are cleaned up automatically when the function returns.
     ///
     /// Gas cost is an advisory heuristic, not a live gas-oracle query. It is
-    /// derived from realistic per-transaction budgets (see
-    /// [`GAS_PER_WAVE_TX`], [`GAS_PER_MERKLE_TX`]) priced at
-    /// [`ARBITRUM_GAS_PRICE_WEI`]. Real gas varies with network conditions.
+    /// derived from realistic per-transaction budgets (`GAS_PER_WAVE_TX`,
+    /// `GAS_PER_MERKLE_TX`) priced at `ARBITRUM_GAS_PRICE_WEI`. Real gas
+    /// varies with network conditions.
     ///
     /// If the first sampled chunk is already stored on the network, the
     /// function retries with subsequent chunk addresses (up to
-    /// [`ESTIMATE_SAMPLE_CAP`]). If every sampled address reports stored,
+    /// `ESTIMATE_SAMPLE_CAP`). If every sampled address reports stored,
     /// a [`Error::CostEstimationInconclusive`] is returned so callers can
     /// decide how to react rather than trust a bogus "free" estimate. Only
     /// when every address in the file is stored do we return a zero-cost
