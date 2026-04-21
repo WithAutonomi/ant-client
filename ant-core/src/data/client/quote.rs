@@ -3,7 +3,8 @@
 //! Handles requesting storage quotes from network nodes and
 //! managing payment for data storage.
 
-use crate::data::client::{record_peer_outcome, Client};
+use crate::data::client::peer_cache::record_peer_outcome;
+use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_node::ant_protocol::{
     ChunkMessage, ChunkMessageBody, ChunkQuoteRequest, ChunkQuoteResponse,
@@ -148,10 +149,9 @@ impl Client {
                 )
                 .await;
 
-                let reachable = !matches!(&result, Err(Error::Network(_) | Error::Timeout(_)));
-                let rtt_ms = reachable
-                    .then(|| u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
-                record_peer_outcome(&node_clone, peer_id_clone, &addrs_clone, reachable, rtt_ms)
+                let success = result.is_ok();
+                let rtt_ms = success.then(|| start.elapsed().as_millis() as u64);
+                record_peer_outcome(&node_clone, peer_id_clone, &addrs_clone, success, rtt_ms)
                     .await;
 
                 (peer_id_clone, addrs_clone, result)
