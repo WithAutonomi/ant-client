@@ -200,6 +200,9 @@ impl MiniTestnet {
         // Generate ML-DSA-65 identity for this node
         let identity = Arc::new(NodeIdentity::generate().expect("generate node identity"));
 
+        // IPv4-only is intentional for these loopback-only tests: everything
+        // binds to 127.0.0.1 on the local host, so dual-stack would add no
+        // value and pulls in v6 loopback quirks on some CI runners.
         let mut core_config = CoreNodeConfig::builder()
             .port(listen_addr.port())
             .ipv6(false)
