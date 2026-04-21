@@ -21,7 +21,7 @@ use evmlib::merkle_payments::{
 };
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use xor_name::XorName;
 
@@ -300,31 +300,57 @@ impl Client {
         data_size: u64,
         merkle_payment_timestamp: u64,
     ) -> Result<Vec<MerklePaymentCandidatePool>> {
+        let total_pools = midpoint_proofs.len();
+        let overall_start = Instant::now();
         let mut pool_futures = FuturesUnordered::new();
 
-        for midpoint_proof in midpoint_proofs {
+        for (idx, midpoint_proof) in midpoint_proofs.iter().enumerate() {
             let pool_address = midpoint_proof.address();
             let mp = midpoint_proof.clone();
+            let pool_idx = idx;
             pool_futures.push(async move {
-                let candidate_nodes = self
+                let pool_start = Instant::now();
+                let result = self
                     .get_merkle_candidate_pool(
                         &pool_address.0,
                         data_type,
                         data_size,
                         merkle_payment_timestamp,
                     )
-                    .await?;
-                Ok::<_, Error>(MerklePaymentCandidatePool {
-                    midpoint_proof: mp,
-                    candidate_nodes,
-                })
+                    .await;
+                let pool_ms = pool_start.elapsed().as_millis();
+                (pool_idx, pool_ms, mp, result)
             });
         }
 
-        let mut pools = Vec::with_capacity(midpoint_proofs.len());
-        while let Some(result) = pool_futures.next().await {
-            pools.push(result?);
+        let mut pools = Vec::with_capacity(total_pools);
+        let mut completed = 0usize;
+        while let Some((pool_idx, pool_ms, mp, result)) = pool_futures.next().await {
+            completed += 1;
+            match result {
+                Ok(candidate_nodes) => {
+                    info!(
+                        "merkle phase=pool pool={pool_idx}/{total_pools} completed={completed}/{total_pools} elapsed_ms={pool_ms} overall_ms={}",
+                        overall_start.elapsed().as_millis()
+                    );
+                    pools.push(MerklePaymentCandidatePool {
+                        midpoint_proof: mp,
+                        candidate_nodes,
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        "merkle phase=pool pool={pool_idx}/{total_pools} failed elapsed_ms={pool_ms}: {e}"
+                    );
+                    return Err(e);
+                }
+            }
         }
+
+        info!(
+            "merkle phase=pools_total pools={total_pools} elapsed_ms={}",
+            overall_start.elapsed().as_millis()
+        );
 
         Ok(pools)
     }
@@ -343,14 +369,56 @@ impl Client {
 
         // Query extra peers to handle validation failures (bad sigs, wrong type, etc.)
         let query_count = CANDIDATES_PER_POOL * 2;
+
+        // Prefer the local routing table over an iterative Kademlia lookup.
+        //
+        // On a well-bootstrapped client the routing table already holds more
+        // than enough peers to satisfy a merkle candidate pool (we need 16,
+        // the routing table typically has dozens). A Kademlia `find_closest`
+        // network round costs seconds-to-minutes on WAN because every
+        // iteration waits on one response from α=3 peers that may be dead
+        // or behind strict NAT — and we kick off 16 of these in parallel
+        // for merkle, so they starve each other for transport resources.
+        //
+        // The sequence below does an instantaneous routing-table read and
+        // falls back to the iterative lookup only when the local table is
+        // too sparse (fresh bootstrap, tiny network).
+        let dht_start = Instant::now();
         let mut remote_peers = self
             .network()
-            .find_closest_peers(address, query_count)
-            .await?;
+            .find_closest_peers_local(address, query_count)
+            .await;
+        let mut used_network_lookup = false;
 
-        // If DHT closest-nodes didn't return enough, supplement with connected peers.
-        // On small networks the DHT iterative lookup may not discover enough peers
-        // close to a random pool address, but we know more peers via direct connections.
+        if remote_peers.len() < CANDIDATES_PER_POOL {
+            // Local table was insufficient — fall back to iterative lookup.
+            debug!(
+                "merkle: local routing table yielded {} peers, falling back to network lookup for {}",
+                remote_peers.len(),
+                hex::encode(address)
+            );
+            used_network_lookup = true;
+            remote_peers = self
+                .network()
+                .find_closest_peers(address, query_count)
+                .await?;
+        }
+
+        let dht_ms = dht_start.elapsed().as_millis();
+        info!(
+            "merkle phase=dht addr={} peers={} source={} elapsed_ms={dht_ms}",
+            hex::encode(address),
+            remote_peers.len(),
+            if used_network_lookup {
+                "network"
+            } else {
+                "local"
+            },
+        );
+
+        // If neither source returned enough, supplement with any other
+        // currently-connected peers. This backstops tiny devnets where the
+        // routing table + iterative lookup still don't cover `CANDIDATES_PER_POOL`.
         if remote_peers.len() < CANDIDATES_PER_POOL {
             let connected = self.network().connected_peers().await;
             for peer in connected {
@@ -461,31 +529,50 @@ impl Client {
     ) -> Result<[MerklePaymentCandidateNode; CANDIDATES_PER_POOL]> {
         let mut candidates = Vec::with_capacity(CANDIDATES_PER_POOL);
         let mut failures: Vec<String> = Vec::new();
+        let collect_start = Instant::now();
+        let mut responses_received = 0usize;
 
         while let Some((peer_id, result)) = futures.next().await {
+            responses_received += 1;
+            let peer_ms = collect_start.elapsed().as_millis();
             match result {
                 Ok(candidate) => {
                     if !verify_merkle_candidate_signature(&candidate) {
                         warn!("Invalid ML-DSA-65 signature from merkle candidate {peer_id}");
                         failures.push(format!("{peer_id}: invalid signature"));
+                        debug!(
+                            "merkle phase=candidate peer={peer_id} result=bad_sig t_ms={peer_ms}"
+                        );
                         continue;
                     }
                     if candidate.merkle_payment_timestamp != merkle_payment_timestamp {
                         warn!("Timestamp mismatch from merkle candidate {peer_id}");
                         failures.push(format!("{peer_id}: timestamp mismatch"));
+                        debug!("merkle phase=candidate peer={peer_id} result=ts_mismatch t_ms={peer_ms}");
                         continue;
                     }
                     candidates.push(candidate);
+                    debug!(
+                        "merkle phase=candidate peer={peer_id} result=ok t_ms={peer_ms} total_ok={}",
+                        candidates.len()
+                    );
                     if candidates.len() >= CANDIDATES_PER_POOL {
                         break;
                     }
                 }
                 Err(e) => {
-                    debug!("Failed to get merkle candidate from {peer_id}: {e}");
+                    debug!("merkle phase=candidate peer={peer_id} result=err t_ms={peer_ms}: {e}");
                     failures.push(format!("{peer_id}: {e}"));
                 }
             }
         }
+
+        debug!(
+            "merkle phase=candidate_collect ok={} err={} responses={responses_received} elapsed_ms={}",
+            candidates.len(),
+            failures.len(),
+            collect_start.elapsed().as_millis()
+        );
 
         if candidates.len() < CANDIDATES_PER_POOL {
             return Err(Error::InsufficientPeers(format!(

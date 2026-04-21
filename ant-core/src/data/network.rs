@@ -109,6 +109,39 @@ impl Network {
             .collect())
     }
 
+    /// Find the closest peers to a target address using only the local
+    /// routing table.
+    ///
+    /// Unlike [`find_closest_peers`], this performs **no** iterative network
+    /// RPC — it returns the XOR-closest peers currently in the routing table.
+    /// That makes it bounded and fast (microseconds) at the cost of freshness:
+    /// a peer that just joined the network won't appear until a subsequent
+    /// bootstrap / background refresh.
+    ///
+    /// Use this when you need "some set of addresses close to X" but don't
+    /// require the guaranteed K-closest contract, and latency matters. Good
+    /// fit for quote collection where the caller already over-queries and
+    /// accepts any validated responder.
+    pub async fn find_closest_peers_local(
+        &self,
+        target: &[u8; 32],
+        count: usize,
+    ) -> Vec<(PeerId, Vec<MultiAddr>)> {
+        let local_peer_id = self.node.peer_id();
+        let closest_nodes = self
+            .node
+            .dht()
+            .find_closest_nodes_local(target, count + 1)
+            .await;
+
+        closest_nodes
+            .into_iter()
+            .filter(|n| n.peer_id != *local_peer_id)
+            .take(count)
+            .map(|n| (n.peer_id, n.addresses))
+            .collect()
+    }
+
     /// Get all currently connected peers.
     pub async fn connected_peers(&self) -> Vec<PeerId> {
         self.node.connected_peers().await
