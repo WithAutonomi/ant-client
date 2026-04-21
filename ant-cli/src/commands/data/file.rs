@@ -7,7 +7,9 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use ant_core::data::{Client, DataMap, DownloadEvent, PaymentMode, UploadEvent};
+use ant_core::data::{
+    Client, DataMap, DownloadEvent, Error as DataError, PaymentMode, UploadEvent,
+};
 
 use super::chunk::parse_address;
 
@@ -467,11 +469,8 @@ async fn handle_file_cost(
 ) -> anyhow::Result<()> {
     let file_size = std::fs::metadata(path)?.len();
 
-    let estimate = if json_output {
-        client
-            .estimate_upload_cost(path, mode, None)
-            .await
-            .map_err(|e| anyhow::anyhow!("Cost estimation failed: {e}"))?
+    let raw_result = if json_output {
+        client.estimate_upload_cost(path, mode, None).await
     } else {
         let (tx, rx) = mpsc::channel(64);
         let pb_handle = tokio::spawn(drive_upload_progress(
@@ -483,8 +482,20 @@ async fn handle_file_cost(
 
         let result = client.estimate_upload_cost(path, mode, Some(tx)).await;
         let _ = pb_handle.await;
+        result
+    };
 
-        result.map_err(|e| anyhow::anyhow!("Cost estimation failed: {e}"))?
+    let estimate = match raw_result {
+        Ok(e) => e,
+        Err(DataError::CostEstimationInconclusive(msg)) => {
+            anyhow::bail!(
+                "Cost estimation inconclusive: {msg}. The sampled chunks are \
+                 already stored on the network, so we can't sample a representative \
+                 price for the rest of the file. Try again later or upload a file \
+                 that contains some new data."
+            );
+        }
+        Err(e) => anyhow::bail!("Cost estimation failed: {e}"),
     };
 
     if json_output {

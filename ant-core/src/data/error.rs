@@ -68,6 +68,15 @@ pub enum Error {
     #[error("insufficient disk space: {0}")]
     InsufficientDiskSpace(String),
 
+    /// Cost estimation could not reach a representative quote.
+    ///
+    /// Returned by [`crate::data::Client::estimate_upload_cost`] when every
+    /// sampled chunk address reported `AlreadyStored`, so the network price
+    /// for the remainder of the file cannot be inferred from a sample.
+    /// The attached message describes how many addresses were tried.
+    #[error("cost estimation inconclusive: {0}")]
+    CostEstimationInconclusive(String),
+
     /// Upload partially succeeded -- some chunks stored, some failed after retries.
     ///
     /// The `stored` addresses can be used for progress tracking and resume.
@@ -185,6 +194,17 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "insufficient disk space: need 100 MB but only 10 MB available"
+        );
+    }
+
+    #[test]
+    fn test_display_cost_estimation_inconclusive() {
+        let err = Error::CostEstimationInconclusive(
+            "sampled 5 addresses, all already stored".to_string(),
+        );
+        assert_eq!(
+            err.to_string(),
+            "cost estimation inconclusive: sampled 5 addresses, all already stored"
         );
     }
 
