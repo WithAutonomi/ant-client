@@ -10,6 +10,7 @@ pub mod data;
 pub mod file;
 pub mod merkle;
 pub mod payment;
+pub(crate) mod peer_cache;
 pub mod quote;
 
 use crate::data::client::cache::ChunkCache;
@@ -78,6 +79,14 @@ pub struct ClientConfig {
     /// defaults to `false` and threads through to the same
     /// `CoreNodeConfig::builder().local(...)` call.
     pub allow_loopback: bool,
+    /// Bind a dual-stack IPv6 socket (`true`) or an IPv4-only socket
+    /// (`false`). Defaults to `true`, matching the CLI default.
+    ///
+    /// Set to `false` only when running on hosts without a working IPv6
+    /// stack, to avoid advertising unreachable v6 addresses to the DHT
+    /// (which causes slow connects and junk DHT address records). This
+    /// mirrors the `--ipv4-only` flag in `ant-cli`.
+    pub ipv6: bool,
 }
 
 impl Default for ClientConfig {
@@ -89,6 +98,7 @@ impl Default for ClientConfig {
             quote_concurrency: DEFAULT_QUOTE_CONCURRENCY,
             store_concurrency: DEFAULT_STORE_CONCURRENCY,
             allow_loopback: false,
+            ipv6: true,
         }
     }
 }
@@ -123,9 +133,10 @@ impl Client {
 
     /// Create a client connected to bootstrap peers.
     ///
-    /// Threads `config.allow_loopback` through to `Network::new`, which
-    /// controls the saorsa-transport `local` flag on the underlying
-    /// `CoreNodeConfig`. See `ClientConfig::allow_loopback` for details.
+    /// Threads `config.allow_loopback` and `config.ipv6` through to
+    /// `Network::new`, which controls the saorsa-transport `local` and
+    /// `ipv6` flags on the underlying `CoreNodeConfig`. See
+    /// `ClientConfig::allow_loopback` and `ClientConfig::ipv6` for details.
     ///
     /// # Errors
     ///
@@ -135,11 +146,12 @@ impl Client {
         config: ClientConfig,
     ) -> Result<Self> {
         debug!(
-            "Connecting to Autonomi network with {} bootstrap peers (allow_loopback={})",
+            "Connecting to Autonomi network with {} bootstrap peers (allow_loopback={}, ipv6={})",
             bootstrap_peers.len(),
             config.allow_loopback,
+            config.ipv6,
         );
-        let network = Network::new(bootstrap_peers, config.allow_loopback).await?;
+        let network = Network::new(bootstrap_peers, config.allow_loopback, config.ipv6).await?;
         Ok(Self {
             config,
             network,

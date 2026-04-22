@@ -3,6 +3,7 @@
 //! Handles requesting storage quotes from network nodes and
 //! managing payment for data storage.
 
+use crate::data::client::peer_cache::record_peer_outcome;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_node::ant_protocol::{
@@ -14,8 +15,8 @@ use ant_node::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
 use evmlib::common::Amount;
 use evmlib::PaymentQuote;
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::time::Duration;
-use tracing::{debug, warn};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
 
 /// Compute XOR distance between a peer's ID bytes and a target address.
 ///
@@ -106,6 +107,7 @@ impl Client {
             let node_clone = node.clone();
 
             let quote_future = async move {
+                let start = Instant::now();
                 let result = send_and_await_chunk_response(
                     &node_clone,
                     &peer_id_clone,
@@ -147,6 +149,11 @@ impl Client {
                 )
                 .await;
 
+                let success = result.is_ok();
+                let rtt_ms = success.then(|| start.elapsed().as_millis() as u64);
+                record_peer_outcome(&node_clone, peer_id_clone, &addrs_clone, success, rtt_ms)
+                    .await;
+
                 (peer_id_clone, addrs_clone, result)
             };
 
@@ -167,7 +174,7 @@ impl Client {
                             quotes.push((peer_id, addrs, quote, price));
                         }
                         Err(Error::AlreadyStored) => {
-                            debug!("Peer {peer_id} reports chunk already stored");
+                            info!("Peer {peer_id} reports chunk already stored");
                             let dist = xor_distance(&peer_id, address);
                             already_stored_peers.push((peer_id, dist));
                         }
@@ -221,9 +228,12 @@ impl Client {
             }
         }
 
-        if quotes.len() >= CLOSE_GROUP_SIZE {
-            let total_responses = quotes.len() + failures.len() + already_stored_peers.len();
+        let already_stored_count = already_stored_peers.len();
+        let failure_count = failures.len();
+        let quote_count = quotes.len();
+        let total_responses = quote_count + failure_count + already_stored_count;
 
+        if quotes.len() >= CLOSE_GROUP_SIZE {
             // Sort by XOR distance to target, keep the closest CLOSE_GROUP_SIZE.
             quotes.sort_by(|a, b| {
                 let dist_a = xor_distance(&a.0, address);
@@ -232,8 +242,8 @@ impl Client {
             });
             quotes.truncate(CLOSE_GROUP_SIZE);
 
-            debug!(
-                "Collected {} quotes for address {} (from {total_responses} responses)",
+            info!(
+                "Collected {} quotes for address {} ({total_responses} responses: {quote_count} ok, {already_stored_count} already_stored, {failure_count} failed)",
                 quotes.len(),
                 hex::encode(address),
             );
@@ -241,8 +251,7 @@ impl Client {
         }
 
         Err(Error::InsufficientPeers(format!(
-            "Got {} quotes, need {CLOSE_GROUP_SIZE}. Failures: [{}]",
-            quotes.len(),
+            "Got {quote_count} quotes, need {CLOSE_GROUP_SIZE} ({total_responses} responses: {already_stored_count} already_stored, {failure_count} failed). Failures: [{}]",
             failures.join("; ")
         )))
     }

@@ -5,7 +5,7 @@
 
 use crate::data::error::{Error, Result};
 use ant_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
-use ant_node::core::{CoreNodeConfig, MultiAddr, NodeMode, P2PNode, PeerId};
+use ant_node::core::{CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode, PeerId};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -25,21 +25,38 @@ impl Network {
     /// testing. Public Autonomi network peers reject the QUIC handshake
     /// variant produced when `local = true`, so production callers must pass
     /// `false` (this is what `ant-cli` does by default — see
-    /// `ant-cli/src/main.rs::create_client_node_raw`, which builds the same
-    /// `CoreNodeConfig` directly with `.local(allow_loopback)`).
+    /// `ant-cli/src/main.rs::create_client_node_raw`, which builds a similar
+    /// `CoreNodeConfig` directly, with `ipv6` toggled by the `--ipv4-only`
+    /// flag).
+    ///
+    /// `ipv6` controls whether the node binds a dual-stack IPv6 socket
+    /// (`true`) or an IPv4-only socket (`false`). The default for library
+    /// callers should be `true` to match the CLI default; set it to `false`
+    /// only when running on hosts without a working IPv6 stack, to avoid
+    /// advertising unreachable v6 addresses to the DHT.
     ///
     /// # Errors
     ///
     /// Returns an error if the P2P node cannot be created or bootstrapping fails.
-    pub async fn new(bootstrap_peers: &[SocketAddr], allow_loopback: bool) -> Result<Self> {
+    pub async fn new(
+        bootstrap_peers: &[SocketAddr],
+        allow_loopback: bool,
+        ipv6: bool,
+    ) -> Result<Self> {
         let mut core_config = CoreNodeConfig::builder()
             .port(0)
-            .ipv6(true)
+            .ipv6(ipv6)
             .local(allow_loopback)
             .mode(NodeMode::Client)
             .max_message_size(MAX_WIRE_MESSAGE_SIZE)
             .build()
             .map_err(|e| Error::Network(format!("Failed to create core config: {e}")))?;
+
+        // Clients never enforce IP-diversity limits: they don't host data and
+        // their routing table exists only to find peers, not to be defended
+        // against Sybil clustering. Strict per-IP / per-subnet caps would
+        // silently drop legitimate testnet peers that share an IP or /24.
+        core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
         core_config.bootstrap_peers = bootstrap_peers
             .iter()
@@ -105,7 +122,10 @@ impl Network {
             .into_iter()
             .filter(|n| n.peer_id != *local_peer_id)
             .take(count)
-            .map(|n| (n.peer_id, n.addresses))
+            .map(|n| {
+                let addrs = n.addresses_by_priority();
+                (n.peer_id, addrs)
+            })
             .collect())
     }
 

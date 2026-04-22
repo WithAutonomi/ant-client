@@ -29,7 +29,8 @@ use xor_name::XorName;
 pub const DEFAULT_MERKLE_THRESHOLD: usize = 64;
 
 /// Payment mode for uploads.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PaymentMode {
     /// Automatically choose: merkle for batches >= threshold, single otherwise.
     #[default]

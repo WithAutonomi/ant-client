@@ -22,7 +22,8 @@ pub use ant_node::client::{compute_address, DataChunk, XorName};
 pub use client::batch::{finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk};
 pub use client::data::DataUploadResult;
 pub use client::file::{
-    DownloadEvent, ExternalPaymentInfo, FileUploadResult, PreparedUpload, UploadEvent, Visibility,
+    DownloadEvent, ExternalPaymentInfo, FileUploadResult, PreparedUpload, UploadCostEstimate,
+    UploadEvent, Visibility,
 };
 pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
@@ -34,7 +35,7 @@ pub use self_encryption::DataMap;
 
 // Re-export networking types needed by CLI for P2P node creation
 pub use ant_node::ant_protocol::{MAX_CHUNK_SIZE, MAX_WIRE_MESSAGE_SIZE};
-pub use ant_node::core::{CoreNodeConfig, MultiAddr, NodeMode, P2PNode};
+pub use ant_node::core::{CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode};
 pub use ant_node::devnet::DevnetManifest;
 
 // Re-export EVM types needed by CLI for wallet and network setup

@@ -38,7 +38,7 @@ tracing = "0.1"
 bytes = "1"
 lru = "0.16"
 rand = "0.8"
-ant-node = "0.10.1"
+ant-node = { git = "https://github.com/WithAutonomi/ant-node.git", branch = "rc-2026.4.2" }
 saorsa-pqc = "0.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -58,6 +58,11 @@ anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
 tokio-test = "0.4"
 rmp-serde = "1"
+# Direct access to BootstrapManager used by the cold-start-from-disk test,
+# which populates a cache via `add_peer_trusted` (bypasses Sybil rate limits)
+# and then verifies reload after save. Version tracks ant-node's transitive
+# saorsa-core dep.
+saorsa-core = "0.23"
 
 [[example]]
 name = "start-local-devnet"

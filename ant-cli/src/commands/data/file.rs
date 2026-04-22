@@ -7,7 +7,9 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use ant_core::data::{Client, DataMap, DownloadEvent, PaymentMode, UploadEvent};
+use ant_core::data::{
+    Client, DataMap, DownloadEvent, Error as DataError, PaymentMode, UploadEvent,
+};
 
 use super::chunk::parse_address;
 
@@ -51,6 +53,20 @@ pub enum FileAction {
         /// Output file path (required).
         #[arg(short, long)]
         output: PathBuf,
+    },
+    /// Estimate the cost of uploading a file without uploading.
+    ///
+    /// Encrypts the file locally to determine chunk count, then queries
+    /// the network for a price quote. No payment or wallet required.
+    Cost {
+        /// Path to the file to estimate.
+        path: PathBuf,
+        /// Force merkle batch payment mode for the estimate.
+        #[arg(long, conflicts_with = "no_merkle")]
+        merkle: bool,
+        /// Force single payment mode for the estimate.
+        #[arg(long, conflicts_with = "merkle")]
+        no_merkle: bool,
     },
 }
 
@@ -100,6 +116,20 @@ impl FileAction {
                     verbose,
                 )
                 .await
+            }
+            FileAction::Cost {
+                path,
+                merkle,
+                no_merkle,
+            } => {
+                let mode = if merkle {
+                    PaymentMode::Merkle
+                } else if no_merkle {
+                    PaymentMode::Single
+                } else {
+                    PaymentMode::Auto
+                };
+                handle_file_cost(client, &path, mode, json, verbose).await
             }
         }
     }
@@ -425,6 +455,60 @@ async fn handle_file_download(
         println!("  File: {}", output_path.display());
         println!("  Size: {}", format_size(file_size));
         println!("  Time: {:.1}s", elapsed.as_secs_f64());
+    }
+
+    Ok(())
+}
+
+async fn handle_file_cost(
+    client: &Client,
+    path: &Path,
+    mode: PaymentMode,
+    json_output: bool,
+    verbose: u8,
+) -> anyhow::Result<()> {
+    let file_size = std::fs::metadata(path)?.len();
+
+    let raw_result = if json_output {
+        client.estimate_upload_cost(path, mode, None).await
+    } else {
+        let (tx, rx) = mpsc::channel(64);
+        let pb_handle = tokio::spawn(drive_upload_progress(
+            rx,
+            path.display().to_string(),
+            file_size,
+            verbose,
+        ));
+
+        let result = client.estimate_upload_cost(path, mode, Some(tx)).await;
+        let _ = pb_handle.await;
+        result
+    };
+
+    let estimate = match raw_result {
+        Ok(e) => e,
+        Err(DataError::CostEstimationInconclusive(msg)) => {
+            anyhow::bail!(
+                "Cost estimation inconclusive: {msg}. The sampled chunks are \
+                 already stored on the network, so we can't sample a representative \
+                 price for the rest of the file. Try again later or upload a file \
+                 that contains some new data."
+            );
+        }
+        Err(e) => anyhow::bail!("Cost estimation failed: {e}"),
+    };
+
+    if json_output {
+        println!("{}", serde_json::to_string(&estimate)?);
+    } else {
+        let gas_wei: u128 = estimate.estimated_gas_cost_wei.parse().unwrap_or(0);
+        let cost_display = format_cost(&estimate.storage_cost_atto, gas_wei);
+
+        println!();
+        println!("Estimated upload cost for {}", path.display());
+        println!("  Size:    {}", format_size(estimate.file_size));
+        println!("  Chunks:  {}", estimate.chunk_count);
+        println!("  Cost:    {cost_display}");
     }
 
     Ok(())
