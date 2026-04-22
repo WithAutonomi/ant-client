@@ -1,6 +1,7 @@
 /target
 .cargo/config.toml
 .claude/plans/
+.claude/scheduled_tasks.lock
 .claude/settings.local.json
 .claude/skills/
 .planning/
