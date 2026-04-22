@@ -19,9 +19,11 @@ use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_node::ant_protocol::DATA_TYPE_CHUNK;
 use ant_node::client::compute_address;
+use ant_node::core::{MultiAddr, PeerId};
 use bytes::Bytes;
-use evmlib::common::QuoteHash;
-use evmlib::common::TxHash;
+use evmlib::common::{Amount, QuoteHash, TxHash};
+use evmlib::merkle_payments::MAX_LEAVES;
+use evmlib::PaymentQuote;
 use fs2::FileExt;
 use futures::stream::{self, StreamExt};
 use self_encryption::{get_root_data_map_parallel, stream_encrypt, streaming_decrypt, DataMap};
@@ -74,8 +76,46 @@ pub enum DownloadEvent {
     ChunksFetched { fetched: usize, total: usize },
 }
 
+/// One entry in the per-chunk quote list returned by
+/// [`Client::get_store_quotes`]: the responding peer, its addresses, the
+/// signed quote it returned, and the payment amount it is demanding.
+type QuoteEntry = (PeerId, Vec<MultiAddr>, PaymentQuote, Amount);
+
 /// Number of chunks per upload wave (matches batch.rs PAYMENT_WAVE_SIZE).
 const UPLOAD_WAVE_SIZE: usize = 64;
+
+/// Maximum number of distinct chunk addresses to sample when probing for a
+/// representative quote in [`Client::estimate_upload_cost`].
+///
+/// Bounded small so we never spend more than a couple of round-trips on the
+/// `AlreadyStored` retry path, which only matters when many leading chunks
+/// of a file already live on the network.
+const ESTIMATE_SAMPLE_CAP: usize = 5;
+
+/// Gas used by one `pay_for_quotes` transaction that packs up to
+/// `UPLOAD_WAVE_SIZE` (quote_hash, rewards_address, amount) entries.
+///
+/// `batch_pay` in `batch.rs` flattens every chunk's close-group quotes into a
+/// single EVM call, so the dominant cost is the SSTOREs for each entry plus
+/// the base tx overhead. On Arbitrum that is roughly
+/// `21_000 + 64 × (20_000 + small)` ≈ 1.3M; we round up to 1.5M as a
+/// conservative per-wave upper bound.
+const GAS_PER_WAVE_TX: u128 = 1_500_000;
+
+/// Gas used by one merkle batch payment transaction.
+///
+/// One on-chain tx per merkle sub-batch, but each tx verifies a merkle tree
+/// and posts a pool commitment, so budget higher than a plain transfer.
+const GAS_PER_MERKLE_TX: u128 = 500_000;
+
+/// Advisory gas price (wei/gas) used to turn the gas estimate into an ETH
+/// figure when no live gas oracle is consulted.
+///
+/// Arbitrum One typically settles around 0.1 gwei on quiet blocks; we use
+/// that as the default so the CLI prints a sensible order-of-magnitude
+/// number. Users should treat the reported gas cost as an estimate, not a
+/// commitment — real gas is bid at submission time.
+const ARBITRUM_GAS_PRICE_WEI: u128 = 100_000_000;
 
 /// Extra headroom percentage for disk space check.
 ///
@@ -373,6 +413,24 @@ fn check_disk_space_for_spill(file_size: u64) -> Result<()> {
     Ok(())
 }
 
+/// Estimated cost of uploading a file, returned by
+/// [`Client::estimate_upload_cost`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UploadCostEstimate {
+    /// Original file size in bytes.
+    pub file_size: u64,
+    /// Number of chunks the file would be split into (data chunks only,
+    /// does not include the DataMap chunk added during public uploads).
+    pub chunk_count: usize,
+    /// Estimated total storage cost in atto (token smallest unit).
+    pub storage_cost_atto: String,
+    /// Estimated gas cost in wei as a string. This is a rough heuristic
+    /// based on chunk count and payment mode, NOT a live gas price query.
+    pub estimated_gas_cost_wei: String,
+    /// Payment mode that would be used.
+    pub payment_mode: PaymentMode,
+}
+
 /// Result of a file upload: the `DataMap` needed to retrieve the file.
 #[derive(Debug, Clone)]
 pub struct FileUploadResult {
@@ -526,6 +584,189 @@ impl Client {
     /// or any chunk cannot be stored.
     pub async fn file_upload(&self, path: &Path) -> Result<FileUploadResult> {
         self.file_upload_with_mode(path, PaymentMode::Auto).await
+    }
+
+    /// Estimate the cost of uploading a file without actually uploading.
+    ///
+    /// Encrypts the file to determine chunk count and sizes, then requests
+    /// a single quote from the network for a representative chunk. The
+    /// per-chunk price is extrapolated to the total chunk count.
+    ///
+    /// The estimate is fast (~2-5s) and does not require a wallet. Spilled
+    /// chunks are cleaned up automatically when the function returns.
+    ///
+    /// Gas cost is an advisory heuristic, not a live gas-oracle query. It is
+    /// derived from realistic per-transaction budgets (`GAS_PER_WAVE_TX`,
+    /// `GAS_PER_MERKLE_TX`) priced at `ARBITRUM_GAS_PRICE_WEI`. Real gas
+    /// varies with network conditions.
+    ///
+    /// If the first sampled chunk is already stored on the network, the
+    /// function retries with subsequent chunk addresses (up to
+    /// `ESTIMATE_SAMPLE_CAP`). If every sampled address reports stored,
+    /// a [`Error::CostEstimationInconclusive`] is returned so callers can
+    /// decide how to react rather than trust a bogus "free" estimate. Only
+    /// when every address in the file is stored do we return a zero-cost
+    /// estimate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, encryption fails,
+    /// the network cannot provide a quote, or every sampled chunk is
+    /// already stored ([`Error::CostEstimationInconclusive`]).
+    pub async fn estimate_upload_cost(
+        &self,
+        path: &Path,
+        mode: PaymentMode,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<UploadCostEstimate> {
+        let file_size = std::fs::metadata(path).map_err(Error::Io)?.len();
+
+        if file_size < 3 {
+            return Err(Error::InvalidData(
+                "File too small: self-encryption requires at least 3 bytes".into(),
+            ));
+        }
+
+        check_disk_space_for_spill(file_size)?;
+
+        info!(
+            "Estimating upload cost for {} ({file_size} bytes)",
+            path.display()
+        );
+
+        let (spill, _data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
+        let chunk_count = spill.len();
+
+        if let Some(ref tx) = progress {
+            let _ = tx
+                .send(UploadEvent::Encrypted {
+                    total_chunks: chunk_count,
+                })
+                .await;
+        }
+
+        info!("Encrypted into {chunk_count} chunks, requesting quote");
+
+        // Sample up to ESTIMATE_SAMPLE_CAP distinct chunk addresses. A single
+        // AlreadyStored result says nothing about the rest of the file — the
+        // first chunk is often a DataMap-adjacent chunk that collides with
+        // prior uploads even when 99% of the file is new. Only treat the
+        // whole file as "fully stored" when every sample comes back stored.
+        let sample_limit = spill.addresses.len().min(ESTIMATE_SAMPLE_CAP);
+        let mut sampled = 0usize;
+        let mut all_already_stored = true;
+        let mut quotes_opt: Option<Vec<QuoteEntry>> = None;
+
+        for addr in spill.addresses.iter().take(sample_limit) {
+            sampled += 1;
+            let chunk_bytes = spill.read_chunk(addr)?;
+            let data_size = u64::try_from(chunk_bytes.len())
+                .map_err(|e| Error::InvalidData(format!("chunk size too large: {e}")))?;
+            match self
+                .get_store_quotes(addr, data_size, DATA_TYPE_CHUNK)
+                .await
+            {
+                Ok(q) => {
+                    quotes_opt = Some(q);
+                    all_already_stored = false;
+                    break;
+                }
+                Err(Error::AlreadyStored) => {
+                    debug!(
+                        "Sample chunk {} already stored; trying next address ({sampled}/{sample_limit})",
+                        hex::encode(addr)
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let uses_merkle = should_use_merkle(chunk_count, mode);
+
+        let quotes = match quotes_opt {
+            Some(q) => q,
+            None if all_already_stored && sampled == chunk_count => {
+                // Every address in the file was sampled and every one is
+                // already on the network — returning a zero-cost estimate is
+                // accurate in this case.
+                info!("All {chunk_count} chunks already stored; returning zero-cost estimate");
+                return Ok(UploadCostEstimate {
+                    file_size,
+                    chunk_count,
+                    storage_cost_atto: "0".into(),
+                    estimated_gas_cost_wei: "0".into(),
+                    payment_mode: if uses_merkle {
+                        PaymentMode::Merkle
+                    } else {
+                        PaymentMode::Single
+                    },
+                });
+            }
+            None => {
+                return Err(Error::CostEstimationInconclusive(format!(
+                    "sampled {sampled} chunk addresses out of {chunk_count} and every \
+                     one reported AlreadyStored; cannot infer a representative price \
+                     for the remaining chunks"
+                )));
+            }
+        };
+
+        // Use the median price × 3 (matches SingleNodePayment::from_quotes
+        // which pays 3x the median to incentivize reliable storage).
+        let mut prices: Vec<Amount> = quotes.iter().map(|(_, _, _, price)| *price).collect();
+        prices.sort();
+        let median_price = prices
+            .get(prices.len() / 2)
+            .copied()
+            .unwrap_or(Amount::ZERO);
+        let per_chunk_cost = median_price * Amount::from(3u64);
+
+        let chunk_count_u64 = u64::try_from(chunk_count).unwrap_or(u64::MAX);
+        let total_storage = per_chunk_cost * Amount::from(chunk_count_u64);
+
+        // Estimate gas cost from realistic per-transaction budgets rather
+        // than a flat per-chunk or per-wave number.
+        //
+        // - Single mode: `batch_pay` packs up to UPLOAD_WAVE_SIZE chunks'
+        //   close-group quotes into one `pay_for_quotes` call on Arbitrum.
+        //   The dominant cost is one SSTORE per entry plus base tx overhead,
+        //   so we use GAS_PER_WAVE_TX (≈1.5M) as a conservative upper bound
+        //   on a full wave and multiply by the number of waves. The previous
+        //   per-wave figure of 150k was closer to a single-entry transfer
+        //   and understated cost by 5–10x for full waves.
+        // - Merkle mode: one tx per sub-batch that verifies a merkle tree
+        //   and posts a pool commitment (GAS_PER_MERKLE_TX ≈ 500k each).
+        //
+        // Gas is priced at ARBITRUM_GAS_PRICE_WEI (~0.1 gwei, a typical
+        // Arbitrum baseline). Treat the result as advisory, not a commitment.
+        let waves = u128::try_from(chunk_count.div_ceil(UPLOAD_WAVE_SIZE)).unwrap_or(u128::MAX);
+        let merkle_batches = u128::try_from(chunk_count.div_ceil(MAX_LEAVES)).unwrap_or(u128::MAX);
+        let estimated_gas: u128 = if uses_merkle {
+            merkle_batches
+                .saturating_mul(GAS_PER_MERKLE_TX)
+                .saturating_mul(ARBITRUM_GAS_PRICE_WEI)
+        } else {
+            waves
+                .saturating_mul(GAS_PER_WAVE_TX)
+                .saturating_mul(ARBITRUM_GAS_PRICE_WEI)
+        };
+
+        info!(
+            "Estimate: {chunk_count} chunks, storage={total_storage} atto, gas~={estimated_gas} wei"
+        );
+
+        Ok(UploadCostEstimate {
+            file_size,
+            chunk_count,
+            storage_cost_atto: total_storage.to_string(),
+            estimated_gas_cost_wei: estimated_gas.to_string(),
+            payment_mode: if uses_merkle {
+                PaymentMode::Merkle
+            } else {
+                PaymentMode::Single
+            },
+        })
     }
 
     /// Phase 1 of external-signer upload: encrypt file and prepare chunks.
