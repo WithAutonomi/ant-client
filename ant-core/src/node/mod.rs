@@ -212,6 +212,7 @@ pub fn node_status_offline(registry_path: &Path) -> Result<NodeStatusResult> {
             status: NodeStatus::Stopped,
             pid: None,
             uptime_secs: None,
+            pending_version: None,
         })
         .collect();
     let total_stopped = nodes.len() as u32;

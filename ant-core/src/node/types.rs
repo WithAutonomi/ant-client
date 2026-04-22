@@ -70,6 +70,10 @@ pub enum NodeStatus {
     Running,
     Stopping,
     Errored,
+    /// The node's on-disk binary has been replaced by an auto-upgrade, but the process has not
+    /// yet restarted. The supervisor is waiting for the current process to exit and will then
+    /// respawn it against the new binary.
+    UpgradeScheduled,
 }
 
 /// Persisted configuration for a single node.
@@ -100,6 +104,10 @@ pub struct NodeInfo {
     pub status: NodeStatus,
     pub pid: Option<u32>,
     pub uptime_secs: Option<u64>,
+    /// Set only when `status == UpgradeScheduled`: the new version that the replaced on-disk
+    /// binary reports. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_version: Option<String>,
 }
 
 /// Result of a daemon start operation.
@@ -348,6 +356,10 @@ pub struct NodeStatusSummary {
     /// Seconds since the node process started (only set when running).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uptime_secs: Option<u64>,
+    /// Set only when `status == UpgradeScheduled`: the new version that the replaced on-disk
+    /// binary reports. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_version: Option<String>,
 }
 
 /// Result of querying node status across all registered nodes.
@@ -394,6 +406,32 @@ mod tests {
     fn node_status_serializes_snake_case() {
         let json = serde_json::to_string(&NodeStatus::Running).unwrap();
         assert_eq!(json, "\"running\"");
+    }
+
+    #[test]
+    fn node_status_upgrade_scheduled_serializes() {
+        let json = serde_json::to_string(&NodeStatus::UpgradeScheduled).unwrap();
+        assert_eq!(json, "\"upgrade_scheduled\"");
+        let parsed: NodeStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, NodeStatus::UpgradeScheduled);
+    }
+
+    #[test]
+    fn node_status_summary_with_pending_version() {
+        let summary = NodeStatusSummary {
+            node_id: 7,
+            name: "antnode-7".to_string(),
+            version: "0.10.1".to_string(),
+            status: NodeStatus::UpgradeScheduled,
+            pid: Some(4242),
+            uptime_secs: Some(3600),
+            pending_version: Some("0.10.11-rc.1".to_string()),
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"status\":\"upgrade_scheduled\""));
+        assert!(json.contains("\"pending_version\":\"0.10.11-rc.1\""));
+        let roundtrip: NodeStatusSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.pending_version.as_deref(), Some("0.10.11-rc.1"));
     }
 
     #[test]
@@ -478,6 +516,7 @@ mod tests {
                     status: NodeStatus::Running,
                     pid: Some(1234),
                     uptime_secs: Some(60),
+                    pending_version: None,
                 },
                 NodeStatusSummary {
                     node_id: 2,
@@ -486,6 +525,7 @@ mod tests {
                     status: NodeStatus::Stopped,
                     pid: None,
                     uptime_secs: None,
+                    pending_version: None,
                 },
             ],
             total_running: 1,
@@ -510,6 +550,7 @@ mod tests {
             status: NodeStatus::Running,
             pid: Some(5678),
             uptime_secs: Some(120),
+            pending_version: None,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"node_id\":1"));
@@ -518,6 +559,7 @@ mod tests {
         assert!(json.contains("\"status\":\"running\""));
         assert!(json.contains("\"pid\":5678"));
         assert!(json.contains("\"uptime_secs\":120"));
+        assert!(!json.contains("pending_version"));
 
         // None fields should be omitted
         let stopped = NodeStatusSummary {
@@ -527,10 +569,12 @@ mod tests {
             status: NodeStatus::Stopped,
             pid: None,
             uptime_secs: None,
+            pending_version: None,
         };
         let json_stopped = serde_json::to_string(&stopped).unwrap();
         assert!(!json_stopped.contains("pid"));
         assert!(!json_stopped.contains("uptime_secs"));
+        assert!(!json_stopped.contains("pending_version"));
     }
 
     #[test]

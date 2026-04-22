@@ -399,7 +399,10 @@ pub fn extract_zip(data: &[u8], install_dir: &Path, binary_name: &str) -> Result
 }
 
 /// Extract the version string from a node binary by running `<binary> --version`.
-async fn extract_version(binary_path: &Path) -> Result<String> {
+///
+/// `pub(crate)` so the supervisor can poll the on-disk binary's version to detect
+/// auto-upgrade state without duplicating the parse logic.
+pub(crate) async fn extract_version(binary_path: &Path) -> Result<String> {
     let output = tokio::process::Command::new(binary_path)
         .arg("--version")
         .output()

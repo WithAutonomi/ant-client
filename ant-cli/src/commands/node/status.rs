@@ -47,12 +47,19 @@ impl StatusArgs {
                     NodeStatus::Starting => format!("{} {}", "●".yellow(), "Starting".yellow()),
                     NodeStatus::Stopping => format!("{} {}", "●".yellow(), "Stopping".yellow()),
                     NodeStatus::Errored => format!("{} {}", "●".red(), "Errored".red()),
+                    NodeStatus::UpgradeScheduled => {
+                        format!("{} {}", "●".cyan(), "Upgrade scheduled".cyan())
+                    }
+                };
+                let version_display = match &node.pending_version {
+                    Some(pending) => format!("{} → {}", node.version, pending),
+                    None => node.version.clone(),
                 };
                 println!(
-                    "  {:<4} {:<14} {:<10} {}",
+                    "  {:<4} {:<14} {:<18} {}",
                     node.node_id.to_string().bold(),
                     node.name,
-                    node.version.dimmed(),
+                    version_display.dimmed(),
                     status_display
                 );
             }

@@ -3,13 +3,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
+use crate::node::binary::extract_version;
 use crate::node::events::NodeEvent;
 use crate::node::process::spawn::spawn_node;
+use crate::node::registry::NodeRegistry;
 use crate::node::types::{
     NodeConfig, NodeStarted, NodeStatus, NodeStopFailed, NodeStopped, StopNodeResult,
 };
+
+/// How often the upgrade-detection task polls each running node's binary for a version change.
+pub const UPGRADE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Maximum restart attempts before marking a node as errored.
 const MAX_CRASHES_BEFORE_ERRORED: u32 = 5;
@@ -37,6 +43,8 @@ struct NodeRuntime {
     started_at: Option<Instant>,
     restart_count: u32,
     first_crash_at: Option<Instant>,
+    /// When `status == UpgradeScheduled`, the target version the on-disk binary now reports.
+    pending_version: Option<String>,
 }
 
 impl Supervisor {
@@ -55,6 +63,7 @@ impl Supervisor {
         &mut self,
         config: &NodeConfig,
         supervisor_ref: Arc<RwLock<Supervisor>>,
+        registry_ref: Arc<RwLock<NodeRegistry>>,
     ) -> Result<NodeStarted> {
         let node_id = config.id;
 
@@ -96,6 +105,7 @@ impl Supervisor {
                         started_at: None,
                         restart_count: 0,
                         first_crash_at: None,
+                        pending_version: None,
                     },
                 );
                 return Err(Error::ProcessSpawn(format!(
@@ -118,6 +128,7 @@ impl Supervisor {
                 started_at: Some(Instant::now()),
                 restart_count: 0,
                 first_crash_at: None,
+                pending_version: None,
             },
         );
 
@@ -133,7 +144,7 @@ impl Supervisor {
         let event_tx = self.event_tx.clone();
         let config = config.clone();
         tokio::spawn(async move {
-            monitor_node(child, config, supervisor_ref, event_tx).await;
+            monitor_node(child, config, supervisor_ref, registry_ref, event_tx).await;
         });
 
         Ok(result)
@@ -241,6 +252,34 @@ impl Supervisor {
             .and_then(|s| s.started_at.map(|t| t.elapsed().as_secs()))
     }
 
+    /// The target version when the node is in `UpgradeScheduled` state, otherwise `None`.
+    pub fn node_pending_version(&self, node_id: u32) -> Option<String> {
+        self.node_states
+            .get(&node_id)
+            .and_then(|s| s.pending_version.clone())
+    }
+
+    /// Transition a Running node into `UpgradeScheduled` with the target version.
+    ///
+    /// Only affects nodes currently in `Running`: any other state is left alone (a stopped
+    /// node legitimately has an out-of-date binary; a node already in UpgradeScheduled has
+    /// already been marked). Returns `true` if the transition happened.
+    fn mark_upgrade_scheduled(&mut self, node_id: u32, pending_version: String) -> bool {
+        let Some(state) = self.node_states.get_mut(&node_id) else {
+            return false;
+        };
+        if state.status != NodeStatus::Running {
+            return false;
+        }
+        state.status = NodeStatus::UpgradeScheduled;
+        state.pending_version = Some(pending_version.clone());
+        let _ = self.event_tx.send(NodeEvent::UpgradeScheduled {
+            node_id,
+            pending_version,
+        });
+        true
+    }
+
     /// Check whether a node is running.
     pub fn is_running(&self, node_id: u32) -> bool {
         self.node_states
@@ -255,7 +294,10 @@ impl Supervisor {
         let mut errored = 0u32;
         for state in self.node_states.values() {
             match state.status {
-                NodeStatus::Running | NodeStatus::Starting => running += 1,
+                // UpgradeScheduled means the process is still running; count it with running.
+                NodeStatus::Running | NodeStatus::Starting | NodeStatus::UpgradeScheduled => {
+                    running += 1
+                }
                 NodeStatus::Stopped | NodeStatus::Stopping => stopped += 1,
                 NodeStatus::Errored => errored += 1,
             }
@@ -319,6 +361,73 @@ impl Supervisor {
     }
 }
 
+/// Periodically probe each Running node's on-disk binary for a version change.
+///
+/// When a node's binary-on-disk reports a different version than was recorded in the registry
+/// at `ant node add` time, ant-node has replaced the binary in place as part of its auto-upgrade
+/// flow and will restart the process shortly. We flip the node to `UpgradeScheduled` with the
+/// target version, which lets `ant node status` render the in-between state and lets
+/// `monitor_node` reclassify the upcoming clean exit as an expected restart rather than a crash.
+///
+/// The task exits when `shutdown` is cancelled.
+pub fn spawn_upgrade_monitor(
+    registry: Arc<RwLock<NodeRegistry>>,
+    supervisor: Arc<RwLock<Supervisor>>,
+    interval: Duration,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // Skip the immediate first tick — we don't want to probe while nodes are still in the
+        // Starting -> Running transition.
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = ticker.tick() => {},
+            }
+
+            // Collect a snapshot of (node_id, binary_path, recorded_version, current_pending)
+            // to release the locks before running --version subprocesses (which take time).
+            let candidates: Vec<(u32, std::path::PathBuf, String, Option<String>)> = {
+                let reg = registry.read().await;
+                let sup = supervisor.read().await;
+                reg.list()
+                    .into_iter()
+                    .filter_map(|config| match sup.node_status(config.id) {
+                        Ok(NodeStatus::Running) => Some((
+                            config.id,
+                            config.binary_path.clone(),
+                            config.version.clone(),
+                            sup.node_pending_version(config.id),
+                        )),
+                        _ => None,
+                    })
+                    .collect()
+            };
+
+            for (node_id, binary_path, recorded_version, current_pending) in candidates {
+                let observed = match extract_version(&binary_path).await {
+                    Ok(v) => v,
+                    // Transient failures (e.g. binary mid-replacement) — skip this round.
+                    Err(_) => continue,
+                };
+                if observed == recorded_version {
+                    continue;
+                }
+                if current_pending.as_deref() == Some(observed.as_str()) {
+                    continue;
+                }
+                supervisor
+                    .write()
+                    .await
+                    .mark_upgrade_scheduled(node_id, observed);
+            }
+        }
+    });
+}
+
 /// Build CLI arguments for the node binary from a NodeConfig.
 pub fn build_node_args(config: &NodeConfig) -> Vec<String> {
     let mut args = vec![
@@ -349,6 +458,12 @@ pub fn build_node_args(config: &NodeConfig) -> Vec<String> {
         args.push(peer.clone());
     }
 
+    // The daemon's supervisor is the service manager. Tell ant-node not to spawn its own
+    // replacement on auto-upgrade; instead, exit cleanly and let us respawn. Without this,
+    // ant-node's default spawn-grandchild-then-exit flow races for the node's port during
+    // the parent's graceful shutdown and the grandchild fails to bind.
+    args.push("--stop-on-upgrade".to_string());
+
     args
 }
 
@@ -368,8 +483,9 @@ async fn spawn_node_from_config(config: &NodeConfig) -> Result<tokio::process::C
 /// Monitor a node process. On exit, handle restart logic.
 async fn monitor_node(
     mut child: tokio::process::Child,
-    config: NodeConfig,
+    mut config: NodeConfig,
     supervisor: Arc<RwLock<Supervisor>>,
+    registry: Arc<RwLock<NodeRegistry>>,
     event_tx: broadcast::Sender<NodeEvent>,
 ) {
     let node_id = config.id;
@@ -378,27 +494,81 @@ async fn monitor_node(
         // Wait for the process to exit
         let exit_status = child.wait().await;
 
-        // Check if the node was intentionally stopped
-        {
+        // Check whether this is a scheduled upgrade restart or an intentional stop.
+        let status_at_exit = {
             let sup = supervisor.read().await;
-            if let Ok(status) = sup.node_status(node_id) {
-                if status == NodeStatus::Stopped || status == NodeStatus::Stopping {
-                    return;
+            sup.node_status(node_id).ok()
+        };
+
+        match status_at_exit {
+            Some(NodeStatus::Stopped) | Some(NodeStatus::Stopping) => return,
+            Some(NodeStatus::UpgradeScheduled) => {
+                // ant-node cleanly exited after replacing its binary in place. Respawn
+                // directly (no backoff, no crash counter) and refresh the recorded version.
+                match respawn_upgraded_node(&mut config, &supervisor, &registry, &event_tx).await {
+                    Ok(new_child) => {
+                        child = new_child;
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(NodeEvent::NodeErrored {
+                            node_id,
+                            message: format!("Failed to respawn after upgrade: {e}"),
+                        });
+                        let mut sup = supervisor.write().await;
+                        sup.update_state(node_id, NodeStatus::Errored, None);
+                        return;
+                    }
                 }
             }
+            _ => {}
         }
 
         let exit_code = exit_status.ok().and_then(|s| s.code());
 
+        // A process-reported exit that wasn't user-initiated (Stopping was filtered above) is
+        // either an auto-upgrade (exit 0 after ant-node replaced its binary) or a crash. In
+        // neither case should the node be parked in `Stopped` — that state is reserved for
+        // intentional user stops.
+        //
+        // Distinguish upgrade from crash by checking whether the on-disk binary's version
+        // drifted from the registry. Between replacing its binary and actually exiting,
+        // ant-node can hold the process open for anywhere from seconds to minutes, depending
+        // on in-flight work and its own config. The periodic version poll will usually have
+        // flipped the node to `UpgradeScheduled` well before the exit, but when the window is
+        // short we cannot rely on that — hence this synchronous re-check here.
         if exit_code == Some(0) {
-            // Clean exit
-            let mut sup = supervisor.write().await;
-            sup.update_state(node_id, NodeStatus::Stopped, None);
-            let _ = event_tx.send(NodeEvent::NodeStopped { node_id });
-            return;
+            if let Ok(disk_version) = extract_version(&config.binary_path).await {
+                if disk_version != config.version {
+                    {
+                        let mut sup = supervisor.write().await;
+                        sup.mark_upgrade_scheduled(node_id, disk_version.clone());
+                    }
+                    match respawn_upgraded_node(&mut config, &supervisor, &registry, &event_tx)
+                        .await
+                    {
+                        Ok(new_child) => {
+                            child = new_child;
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(NodeEvent::NodeErrored {
+                                node_id,
+                                message: format!("Failed to respawn after upgrade: {e}"),
+                            });
+                            let mut sup = supervisor.write().await;
+                            sup.update_state(node_id, NodeStatus::Errored, None);
+                            return;
+                        }
+                    }
+                }
+            }
+            // Exit 0 but the binary didn't change — fall through to the crash / restart path.
+            // We report the crash with the exit code preserved; the crash counter guards
+            // against infinite restart loops if the process keeps exiting immediately.
         }
 
-        // Crash
+        // Crash (or clean exit that wasn't an upgrade)
         let _ = event_tx.send(NodeEvent::NodeCrashed { node_id, exit_code });
 
         let (should_restart, attempt, backoff) = {
@@ -457,6 +627,61 @@ async fn monitor_node(
             }
         }
     }
+}
+
+/// Respawn a node whose `UpgradeScheduled` status tells us the exit was expected.
+///
+/// On success: persists the new version to the registry, updates the in-memory config clone,
+/// clears pending_version, sets status back to Running, and fires `NodeUpgraded`.
+async fn respawn_upgraded_node(
+    config: &mut NodeConfig,
+    supervisor: &Arc<RwLock<Supervisor>>,
+    registry: &Arc<RwLock<NodeRegistry>>,
+    event_tx: &broadcast::Sender<NodeEvent>,
+) -> Result<tokio::process::Child> {
+    let node_id = config.id;
+    let old_version = config.version.clone();
+
+    let new_child = spawn_node_from_config(config).await?;
+    let pid = new_child
+        .id()
+        .ok_or_else(|| Error::ProcessSpawn("Failed to get PID after upgrade respawn".into()))?;
+
+    // Read the new version from the replaced binary. If this fails we still consider the respawn
+    // successful; we just don't refresh the recorded version this round.
+    let new_version = extract_version(&config.binary_path).await.ok();
+
+    if let Some(ref version) = new_version {
+        config.version = version.clone();
+        let mut reg = registry.write().await;
+        if let Ok(stored) = reg.get_mut(node_id) {
+            stored.version = version.clone();
+            let _ = reg.save();
+        }
+    }
+
+    {
+        let mut sup = supervisor.write().await;
+        if let Some(state) = sup.node_states.get_mut(&node_id) {
+            state.status = NodeStatus::Running;
+            state.pid = Some(pid);
+            state.started_at = Some(Instant::now());
+            state.pending_version = None;
+            state.restart_count = 0;
+            state.first_crash_at = None;
+        }
+    }
+
+    let _ = event_tx.send(NodeEvent::NodeStarted { node_id, pid });
+    if let Some(version) = new_version {
+        let _ = event_tx.send(NodeEvent::NodeUpgraded {
+            node_id,
+            old_version,
+            new_version: version,
+        });
+    }
+
+    Ok(new_child)
 }
 
 /// Timeout for graceful shutdown before force-killing.
@@ -627,6 +852,7 @@ mod tests {
         assert!(args.contains(&"--bootstrap".to_string()));
         assert!(args.contains(&"peer1".to_string()));
         assert!(args.contains(&"peer2".to_string()));
+        assert!(args.contains(&"--stop-on-upgrade".to_string()));
     }
 
     #[test]
@@ -655,6 +881,7 @@ mod tests {
         assert!(!args.contains(&"--port".to_string()));
         assert!(!args.contains(&"--metrics-port".to_string()));
         assert!(!args.contains(&"--bootstrap".to_string()));
+        assert!(args.contains(&"--stop-on-upgrade".to_string()));
     }
 
     #[test]
@@ -671,6 +898,7 @@ mod tests {
                 started_at: Some(Instant::now()),
                 restart_count: 0,
                 first_crash_at: None,
+                pending_version: None,
             },
         );
 
@@ -714,6 +942,7 @@ mod tests {
                 started_at: Some(Instant::now()),
                 restart_count: 0,
                 first_crash_at: None,
+                pending_version: None,
             },
         );
         sup.node_states.insert(
@@ -724,6 +953,7 @@ mod tests {
                 started_at: None,
                 restart_count: 0,
                 first_crash_at: None,
+                pending_version: None,
             },
         );
         sup.node_states.insert(
@@ -734,6 +964,7 @@ mod tests {
                 started_at: None,
                 restart_count: 5,
                 first_crash_at: None,
+                pending_version: None,
             },
         );
 
@@ -741,6 +972,86 @@ mod tests {
         assert_eq!(running, 1);
         assert_eq!(stopped, 1);
         assert_eq!(errored, 1);
+    }
+
+    #[test]
+    fn mark_upgrade_scheduled_only_affects_running_nodes() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut sup = Supervisor::new(tx);
+
+        sup.node_states.insert(
+            1,
+            NodeRuntime {
+                status: NodeStatus::Running,
+                pid: Some(111),
+                started_at: Some(Instant::now()),
+                restart_count: 0,
+                first_crash_at: None,
+                pending_version: None,
+            },
+        );
+        sup.node_states.insert(
+            2,
+            NodeRuntime {
+                status: NodeStatus::Stopped,
+                pid: None,
+                started_at: None,
+                restart_count: 0,
+                first_crash_at: None,
+                pending_version: None,
+            },
+        );
+
+        // Running node: transitions to UpgradeScheduled with pending_version set and event fires.
+        let affected = sup.mark_upgrade_scheduled(1, "0.10.11-rc.1".to_string());
+        assert!(affected);
+        assert_eq!(sup.node_status(1).unwrap(), NodeStatus::UpgradeScheduled);
+        assert_eq!(sup.node_pending_version(1).as_deref(), Some("0.10.11-rc.1"));
+        match rx.try_recv() {
+            Ok(NodeEvent::UpgradeScheduled {
+                node_id,
+                pending_version,
+            }) => {
+                assert_eq!(node_id, 1);
+                assert_eq!(pending_version, "0.10.11-rc.1");
+            }
+            other => panic!("expected UpgradeScheduled event, got {other:?}"),
+        }
+
+        // Stopped node: untouched, no event fired.
+        let affected = sup.mark_upgrade_scheduled(2, "0.10.11-rc.1".to_string());
+        assert!(!affected);
+        assert_eq!(sup.node_status(2).unwrap(), NodeStatus::Stopped);
+        assert!(sup.node_pending_version(2).is_none());
+
+        // Already-UpgradeScheduled node: calling again is a no-op.
+        let affected = sup.mark_upgrade_scheduled(1, "0.10.12".to_string());
+        assert!(!affected);
+        // Pending version is the original one set.
+        assert_eq!(sup.node_pending_version(1).as_deref(), Some("0.10.11-rc.1"));
+    }
+
+    #[test]
+    fn node_counts_counts_upgrade_scheduled_as_running() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut sup = Supervisor::new(tx);
+
+        sup.node_states.insert(
+            1,
+            NodeRuntime {
+                status: NodeStatus::UpgradeScheduled,
+                pid: Some(111),
+                started_at: Some(Instant::now()),
+                restart_count: 0,
+                first_crash_at: None,
+                pending_version: Some("0.10.11-rc.1".to_string()),
+            },
+        );
+
+        let (running, stopped, errored) = sup.node_counts();
+        assert_eq!(running, 1);
+        assert_eq!(stopped, 0);
+        assert_eq!(errored, 0);
     }
 
     #[tokio::test]
@@ -765,6 +1076,7 @@ mod tests {
                 started_at: None,
                 restart_count: 0,
                 first_crash_at: None,
+                pending_version: None,
             },
         );
 
@@ -786,6 +1098,7 @@ mod tests {
                 started_at: Some(Instant::now()),
                 restart_count: 0,
                 first_crash_at: None,
+                pending_version: None,
             },
         );
         // Node 2: already stopped
@@ -797,6 +1110,7 @@ mod tests {
                 started_at: None,
                 restart_count: 0,
                 first_crash_at: None,
+                pending_version: None,
             },
         );
 
