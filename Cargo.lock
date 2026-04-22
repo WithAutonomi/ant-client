@@ -905,7 +905,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.10.1"
-source = "git+https://github.com/withAutonomi/ant-node.git?branch=mick%2Falways-masque-relay-rebased#5ba564a665c41147d5c993eaf9939f13bd4a6a57"
+source = "git+https://github.com/withAutonomi/ant-node.git?branch=mick%2Falways-masque-relay-rebased#5d25e1f1ac91cd82d24116a085dfc1c26d0096ae"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -5127,7 +5127,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.22.0"
-source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=mick%2Falways-masque-relay-rebased#65583ed9cbdf79b185f315b13d8c1463ca60e309"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=mick%2Falways-masque-relay-rebased#d37491fd2ead4b2e81f85a8d3c43e707bbafacc7"
 dependencies = [
  "anyhow",
  "async-trait",
