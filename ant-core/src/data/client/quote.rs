@@ -3,6 +3,7 @@
 //! Handles requesting storage quotes from network nodes and
 //! managing payment for data storage.
 
+use crate::data::client::peer_cache::record_peer_outcome;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_node::ant_protocol::{
@@ -14,7 +15,7 @@ use ant_node::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
 use evmlib::common::Amount;
 use evmlib::PaymentQuote;
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Compute XOR distance between a peer's ID bytes and a target address.
@@ -106,6 +107,7 @@ impl Client {
             let node_clone = node.clone();
 
             let quote_future = async move {
+                let start = Instant::now();
                 let result = send_and_await_chunk_response(
                     &node_clone,
                     &peer_id_clone,
@@ -146,6 +148,11 @@ impl Client {
                     || Error::Timeout(format!("Timeout waiting for quote from {peer_id_clone}")),
                 )
                 .await;
+
+                let success = result.is_ok();
+                let rtt_ms = success.then(|| start.elapsed().as_millis() as u64);
+                record_peer_outcome(&node_clone, peer_id_clone, &addrs_clone, success, rtt_ms)
+                    .await;
 
                 (peer_id_clone, addrs_clone, result)
             };
