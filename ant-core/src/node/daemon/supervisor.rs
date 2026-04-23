@@ -80,6 +80,13 @@ fn read_node_pid(data_dir: &Path) -> Option<u32> {
 fn find_running_node_process(sys: &sysinfo::System, config: &NodeConfig) -> Option<u32> {
     let target_data_dir = config.data_dir.as_path();
     for (pid, process) in sys.processes() {
+        // On Linux, `sys.processes()` enumerates /proc/<pid>/task/<tid> too, so
+        // worker threads appear alongside their thread-group leader and share
+        // the same exe + cmdline. Skip threads — we want the TGID (the real
+        // process), which is the only PID safe to signal.
+        if process.thread_kind().is_some() {
+            continue;
+        }
         let Some(exe) = process.exe() else {
             continue;
         };
@@ -108,6 +115,24 @@ fn find_running_node_process(sys: &sysinfo::System, config: &NodeConfig) -> Opti
     None
 }
 
+/// Check whether `pid` refers to a live, non-thread process. On Linux,
+/// `kill(tid, 0)` returns success for any thread's TID, not just the
+/// thread-group leader — so liveness alone is not enough to trust a PID
+/// loaded from the pid file. Consulting sysinfo's `thread_kind()` tells us
+/// whether the entry is a userland thread (TID) vs. the actual process
+/// (TGID). A missing sysinfo entry with a live PID is still treated as a
+/// process, since older daemons could have written the PID before sysinfo
+/// saw it.
+fn pid_is_live_process(pid: u32, sys: &sysinfo::System) -> bool {
+    if !is_process_alive(pid) {
+        return false;
+    }
+    match sys.process(sysinfo::Pid::from_u32(pid)) {
+        Some(process) => process.thread_kind().is_none(),
+        None => true,
+    }
+}
+
 /// Determine the PID to adopt for a node, trying the pid file first and
 /// falling back to a process-table scan. On successful scan, writes the pid
 /// file so the next adoption takes the fast path.
@@ -115,11 +140,12 @@ fn find_running_node_process(sys: &sysinfo::System, config: &NodeConfig) -> Opti
 /// Returns `None` if no live process can be attributed to this node.
 fn resolve_adopted_pid(config: &NodeConfig, sys: &sysinfo::System) -> Option<u32> {
     if let Some(pid) = read_node_pid(&config.data_dir) {
-        if is_process_alive(pid) {
+        if pid_is_live_process(pid, sys) {
             return Some(pid);
         }
-        // Pid file points at a dead process. Don't leave it around to mislead
-        // the next adoption pass.
+        // Pid file points at a dead process or a thread TID (legacy daemons
+        // could record a TID because the fallback scan saw threads). Don't
+        // leave it around to mislead the next adoption pass.
         remove_node_pid(&config.data_dir);
     }
 
