@@ -144,7 +144,7 @@ fn build_router(state: Arc<AppState>) -> Router {
     // don't send Origin headers so CORS doesn't affect them.
     let origin = format!("http://127.0.0.1:{}", state.bound_port);
     let cors = CorsLayer::new()
-        .allow_origin(origin.parse::<HeaderValue>().unwrap())
+        .allow_origin([origin.parse::<HeaderValue>().unwrap()])
         .allow_methods(Any)
         .allow_headers(Any);
 
