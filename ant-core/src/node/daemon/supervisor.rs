@@ -61,6 +61,84 @@ fn read_node_pid(data_dir: &Path) -> Option<u32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
+/// Scan the OS process table for a running node that matches `config`, as a
+/// fallback for when `<data_dir>/node.pid` is missing or stale.
+///
+/// Nodes spawned by a pre-adoption daemon never had a pid file written, so
+/// without this scan the first restart after installing the adoption fix
+/// would leave every previously-running node classified as Stopped. The scan
+/// matches on:
+///
+/// - executable path identical to `config.binary_path`, AND
+/// - command line containing `--root-dir` (as a standalone arg or
+///   `--root-dir=<path>`) whose value resolves to `config.data_dir`.
+///
+/// The double match keeps us safe when multiple nodes share the same binary
+/// on disk (common on installs where one copy services several data dirs).
+///
+/// Returns `None` if no running process matches.
+fn find_running_node_process(sys: &sysinfo::System, config: &NodeConfig) -> Option<u32> {
+    let target_data_dir = config.data_dir.as_path();
+    for (pid, process) in sys.processes() {
+        let Some(exe) = process.exe() else {
+            continue;
+        };
+        if exe != config.binary_path.as_path() {
+            continue;
+        }
+
+        let cmd = process.cmd();
+        let matches_root_dir = cmd.iter().enumerate().any(|(i, arg)| {
+            let arg = arg.to_string_lossy();
+            if let Some(value) = arg.strip_prefix("--root-dir=") {
+                Path::new(value) == target_data_dir
+            } else if arg == "--root-dir" {
+                cmd.get(i + 1)
+                    .map(|v| Path::new(&*v.to_string_lossy()) == target_data_dir)
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        });
+
+        if matches_root_dir {
+            return Some(pid.as_u32());
+        }
+    }
+    None
+}
+
+/// Determine the PID to adopt for a node, trying the pid file first and
+/// falling back to a process-table scan. `process_table` is lazily populated
+/// — we avoid paying the `System::new_all` cost when every node's pid file
+/// is present and valid, and amortise it across nodes when any scan is
+/// required. On successful scan, writes the pid file so the next adoption
+/// takes the fast path.
+///
+/// Returns `None` if no live process can be attributed to this node.
+fn resolve_adopted_pid(
+    config: &NodeConfig,
+    process_table: &mut Option<sysinfo::System>,
+) -> Option<u32> {
+    if let Some(pid) = read_node_pid(&config.data_dir) {
+        if is_process_alive(pid) {
+            return Some(pid);
+        }
+        // Pid file points at a dead process. Don't leave it around to mislead
+        // the next adoption pass.
+        remove_node_pid(&config.data_dir);
+    }
+
+    let sys = process_table.get_or_insert_with(|| {
+        let mut s = sysinfo::System::new();
+        s.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        s
+    });
+    let pid = find_running_node_process(sys, config)?;
+    write_node_pid(&config.data_dir, pid);
+    Some(pid)
+}
+
 /// Maximum restart attempts before marking a node as errored.
 const MAX_CRASHES_BEFORE_ERRORED: u32 = 5;
 
@@ -362,39 +440,45 @@ impl Supervisor {
 
     /// Restore running-node state from a previous daemon instance.
     ///
-    /// For each registered node, reads `<data_dir>/node.pid` and checks whether the
-    /// PID is still a live OS process. Live ones are inserted into `node_states` as
-    /// `Running`; stale pid files (process gone) are cleaned up. Must be called
-    /// before the HTTP server starts accepting requests — the window between
-    /// `Supervisor::new` and adoption is where the API would otherwise report
-    /// live nodes as `Stopped`.
+    /// For each registered node, determines the PID to adopt via
+    /// `resolve_adopted_pid`: try `<data_dir>/node.pid` first, and if it's
+    /// missing or stale, fall back to a process-table scan matching the
+    /// node's binary path and `--root-dir` argument. Live matches are
+    /// inserted into `node_states` as `Running`.
     ///
-    /// Adopted nodes have no associated `monitor_node` task (the `tokio::process::Child`
-    /// handle belonged to the previous daemon, and `tokio::process::Child::wait` only
-    /// works for the process's actual parent). Their exits are detected instead by
-    /// the `spawn_liveness_monitor` polling task.
+    /// The scan is what covers the upgrade path: nodes spawned by a
+    /// pre-adoption daemon never had a pid file written, so without the
+    /// fallback the first restart after installing this fix would still
+    /// leave every previously-running node classified as Stopped.
+    ///
+    /// Must be called before the HTTP server starts accepting requests —
+    /// the window between `Supervisor::new` and adoption is where the API
+    /// would otherwise report live nodes as Stopped. Adopted nodes have no
+    /// associated `monitor_node` task (the `tokio::process::Child` handle
+    /// belonged to the previous daemon, and `tokio::process::Child::wait`
+    /// only works for the process's actual parent). Their exits are
+    /// detected instead by the `spawn_liveness_monitor` polling task.
     ///
     /// Returns the list of node IDs that were adopted.
     pub fn adopt_from_registry(&mut self, registry: &NodeRegistry) -> Vec<u32> {
         let mut adopted = Vec::new();
+        // Populated lazily on the first scan so deployments where every
+        // node's pid file is present pay zero for process-table enumeration.
+        let mut process_table: Option<sysinfo::System> = None;
         for config in registry.list() {
-            let Some(pid) = read_node_pid(&config.data_dir) else {
+            let Some(pid) = resolve_adopted_pid(config, &mut process_table) else {
                 continue;
             };
-            if !is_process_alive(pid) {
-                remove_node_pid(&config.data_dir);
-                continue;
-            }
             self.node_states.insert(
                 config.id,
                 NodeRuntime {
                     status: NodeStatus::Running,
                     pid: Some(pid),
                     // Best-effort: the real start time lives in the OS process table
-                    // and can't be read portably without a dependency. Users observing
-                    // uptime across daemon restarts see it reset from zero, which is
-                    // the right trade vs. the previous behaviour (every node reporting
-                    // Stopped despite a live process).
+                    // and can't be read portably without pulling in more of sysinfo's
+                    // surface. Users observing uptime across daemon restarts see it
+                    // reset from zero, which is the right trade vs. the previous
+                    // behaviour (every node reporting Stopped despite a live process).
                     started_at: Some(Instant::now()),
                     restart_count: 0,
                     first_crash_at: None,
