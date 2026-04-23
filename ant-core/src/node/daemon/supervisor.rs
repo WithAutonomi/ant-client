@@ -470,6 +470,11 @@ impl Supervisor {
             state.pid = pid;
             if status == NodeStatus::Running {
                 state.started_at = Some(Instant::now());
+            } else {
+                // Clear uptime tracking for non-running states so status
+                // responses don't report a stale `uptime_secs` after the node
+                // exits (e.g. liveness monitor detecting an external kill).
+                state.started_at = None;
             }
         }
     }
