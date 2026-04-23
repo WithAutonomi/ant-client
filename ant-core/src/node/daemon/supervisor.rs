@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,163 @@ use crate::node::types::{
 
 /// How often the upgrade-detection task polls each running node's binary for a version change.
 pub const UPGRADE_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often the liveness poll verifies that each Running node's OS process still exists.
+///
+/// Nodes the current daemon spawned are watched via their owned `Child` handle in
+/// `monitor_node`, so this poll exists purely to catch exits of nodes adopted across
+/// a daemon restart (whose `Child` handle died with the previous daemon). Five seconds
+/// is a rough trade-off: long enough that the syscall cost is negligible, short enough
+/// that a crashed adopted node still looks broken to the user within a few heartbeats.
+pub const LIVENESS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Path of the pid file a running node writes to so a future daemon instance can
+/// adopt it across restarts. Lives alongside the node's other on-disk state.
+fn node_pid_file(data_dir: &Path) -> PathBuf {
+    data_dir.join("node.pid")
+}
+
+/// Persist the running node's PID to `<data_dir>/node.pid`. Best-effort: a failure
+/// here only costs us the ability to adopt the node after a daemon restart, so we
+/// warn and continue rather than aborting the start.
+fn write_node_pid(data_dir: &Path, pid: u32) {
+    let path = node_pid_file(data_dir);
+    if let Err(e) = std::fs::write(&path, pid.to_string()) {
+        tracing::warn!(
+            "Failed to write node pid file at {}: {e}. Node will still run, but a future \
+             daemon restart will not be able to adopt it.",
+            path.display()
+        );
+    }
+}
+
+/// Remove the pid file. Called on every terminal-exit path in `monitor_node` so the
+/// next daemon doesn't try to adopt a PID belonging to a process that's gone.
+fn remove_node_pid(data_dir: &Path) {
+    let _ = std::fs::remove_file(node_pid_file(data_dir));
+}
+
+/// Read the pid file without validating liveness. Returns `None` if the file is
+/// missing or its contents can't be parsed as a u32.
+fn read_node_pid(data_dir: &Path) -> Option<u32> {
+    std::fs::read_to_string(node_pid_file(data_dir))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Scan the OS process table for a running node that matches `config`, as a
+/// fallback for when `<data_dir>/node.pid` is missing or stale.
+///
+/// Nodes spawned by a pre-adoption daemon never had a pid file written, so
+/// without this scan the first restart after installing the adoption fix
+/// would leave every previously-running node classified as Stopped. The scan
+/// matches on:
+///
+/// - executable path identical to `config.binary_path`, AND
+/// - command line containing `--root-dir` (as a standalone arg or
+///   `--root-dir=<path>`) whose value resolves to `config.data_dir`.
+///
+/// The double match keeps us safe when multiple nodes share the same binary
+/// on disk (common on installs where one copy services several data dirs).
+///
+/// Returns `None` if no running process matches.
+fn find_running_node_process(sys: &sysinfo::System, config: &NodeConfig) -> Option<u32> {
+    let target_data_dir = config.data_dir.as_path();
+    for (pid, process) in sys.processes() {
+        // On Linux, `sys.processes()` enumerates /proc/<pid>/task/<tid> too, so
+        // worker threads appear alongside their thread-group leader and share
+        // the same exe + cmdline. Skip threads — we want the TGID (the real
+        // process), which is the only PID safe to signal.
+        if process.thread_kind().is_some() {
+            continue;
+        }
+        let Some(exe) = process.exe() else {
+            continue;
+        };
+        if exe != config.binary_path.as_path() {
+            continue;
+        }
+
+        let cmd = process.cmd();
+        let matches_root_dir = cmd.iter().enumerate().any(|(i, arg)| {
+            let arg = arg.to_string_lossy();
+            if let Some(value) = arg.strip_prefix("--root-dir=") {
+                Path::new(value) == target_data_dir
+            } else if arg == "--root-dir" {
+                cmd.get(i + 1)
+                    .map(|v| Path::new(&*v.to_string_lossy()) == target_data_dir)
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        });
+
+        if matches_root_dir {
+            return Some(pid.as_u32());
+        }
+    }
+    None
+}
+
+/// Check whether `pid` refers to a live, non-thread process. On Linux,
+/// `kill(tid, 0)` returns success for any thread's TID, not just the
+/// thread-group leader — so liveness alone is not enough to trust a PID
+/// loaded from the pid file. Consulting sysinfo's `thread_kind()` tells us
+/// whether the entry is a userland thread (TID) vs. the actual process
+/// (TGID). A missing sysinfo entry with a live PID is still treated as a
+/// process, since older daemons could have written the PID before sysinfo
+/// saw it.
+fn pid_is_live_process(pid: u32, sys: &sysinfo::System) -> bool {
+    if !is_process_alive(pid) {
+        return false;
+    }
+    match sys.process(sysinfo::Pid::from_u32(pid)) {
+        Some(process) => process.thread_kind().is_none(),
+        None => true,
+    }
+}
+
+/// Determine the PID to adopt for a node, trying the pid file first and
+/// falling back to a process-table scan. On successful scan, writes the pid
+/// file so the next adoption takes the fast path.
+///
+/// Returns `None` if no live process can be attributed to this node.
+fn resolve_adopted_pid(config: &NodeConfig, sys: &sysinfo::System) -> Option<u32> {
+    if let Some(pid) = read_node_pid(&config.data_dir) {
+        if pid_is_live_process(pid, sys) {
+            return Some(pid);
+        }
+        // Pid file points at a dead process or a thread TID (legacy daemons
+        // could record a TID because the fallback scan saw threads). Don't
+        // leave it around to mislead the next adoption pass.
+        remove_node_pid(&config.data_dir);
+    }
+
+    let pid = find_running_node_process(sys, config)?;
+    write_node_pid(&config.data_dir, pid);
+    Some(pid)
+}
+
+/// Build an `Instant` that reports the real process start time when
+/// `.elapsed()` is called on it — so uptime survives daemon restarts
+/// accurately for adopted nodes.
+///
+/// `sysinfo::Process::start_time()` returns seconds since the UNIX epoch
+/// (wall clock). `Instant` is monotonic and can't be constructed from a
+/// wall-clock value directly, so we back-date `Instant::now()` by the
+/// process's age. Returns `None` if the PID isn't in the snapshot (the
+/// process exited between scan and this call), if the system clock looks
+/// broken, or if subtraction would overflow (unrealistically-old process
+/// start times).
+fn process_started_at(sys: &sysinfo::System, pid: u32) -> Option<Instant> {
+    let start_secs = sys.process(sysinfo::Pid::from_u32(pid))?.start_time();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let age = now_secs.saturating_sub(start_secs);
+    Instant::now().checked_sub(Duration::from_secs(age))
+}
 
 /// Maximum restart attempts before marking a node as errored.
 const MAX_CRASHES_BEFORE_ERRORED: u32 = 5;
@@ -312,8 +470,82 @@ impl Supervisor {
             state.pid = pid;
             if status == NodeStatus::Running {
                 state.started_at = Some(Instant::now());
+            } else {
+                // Clear uptime tracking for non-running states so status
+                // responses don't report a stale `uptime_secs` after the node
+                // exits (e.g. liveness monitor detecting an external kill).
+                state.started_at = None;
             }
         }
+    }
+
+    /// Restore running-node state from a previous daemon instance.
+    ///
+    /// For each registered node, determines the PID to adopt via
+    /// `resolve_adopted_pid`: try `<data_dir>/node.pid` first, and if it's
+    /// missing or stale, fall back to a process-table scan matching the
+    /// node's binary path and `--root-dir` argument. Live matches are
+    /// inserted into `node_states` as `Running`.
+    ///
+    /// The scan is what covers the upgrade path: nodes spawned by a
+    /// pre-adoption daemon never had a pid file written, so without the
+    /// fallback the first restart after installing this fix would still
+    /// leave every previously-running node classified as Stopped.
+    ///
+    /// Must be called before the HTTP server starts accepting requests —
+    /// the window between `Supervisor::new` and adoption is where the API
+    /// would otherwise report live nodes as Stopped. Adopted nodes have no
+    /// associated `monitor_node` task (the `tokio::process::Child` handle
+    /// belonged to the previous daemon, and `tokio::process::Child::wait`
+    /// only works for the process's actual parent). Their exits are
+    /// detected instead by the `spawn_liveness_monitor` polling task.
+    ///
+    /// Returns the list of node IDs that were adopted.
+    pub fn adopt_from_registry(&mut self, registry: &NodeRegistry) -> Vec<u32> {
+        // Populated upfront so every adopted node gets its real start time via
+        // `process_started_at`, not just those that went through the scan
+        // fallback. The extra ~50 ms at daemon startup is a one-time cost
+        // that's cheaper than users seeing uptime reset every time the daemon
+        // restarts.
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::everything(),
+        );
+
+        let mut adopted = Vec::new();
+        for config in registry.list() {
+            let Some(pid) = resolve_adopted_pid(config, &sys) else {
+                continue;
+            };
+            self.node_states.insert(
+                config.id,
+                NodeRuntime {
+                    status: NodeStatus::Running,
+                    pid: Some(pid),
+                    // Back-date to the real process start time so uptime
+                    // reported to the API is wall-clock accurate across
+                    // daemon restarts. Falls back to `Instant::now()` only
+                    // if sysinfo can't report the start time (PID raced out
+                    // of the snapshot, or a broken clock) — better to show
+                    // uptime counting from adoption than to claim the node
+                    // is Stopped.
+                    started_at: Some(
+                        process_started_at(&sys, pid).unwrap_or_else(Instant::now),
+                    ),
+                    restart_count: 0,
+                    first_crash_at: None,
+                    pending_version: None,
+                },
+            );
+            let _ = self.event_tx.send(NodeEvent::NodeStarted {
+                node_id: config.id,
+                pid,
+            });
+            adopted.push(config.id);
+        }
+        adopted
     }
 
     /// Record a crash and determine if the node should be restarted or marked errored.
@@ -468,6 +700,10 @@ pub fn build_node_args(config: &NodeConfig) -> Vec<String> {
 }
 
 /// Spawn a node process from a NodeConfig.
+///
+/// Writes `<data_dir>/node.pid` on successful spawn so that a future daemon instance
+/// can adopt the running process via `Supervisor::adopt_from_registry`. The file is
+/// cleaned up by `monitor_node` on the node's terminal exit.
 async fn spawn_node_from_config(config: &NodeConfig) -> Result<tokio::process::Child> {
     let args = build_node_args(config);
     let env_vars: Vec<(String, String)> = config.env_variables.clone().into_iter().collect();
@@ -477,13 +713,30 @@ async fn spawn_node_from_config(config: &NodeConfig) -> Result<tokio::process::C
         .as_deref()
         .unwrap_or(config.data_dir.as_path());
 
-    spawn_node(&config.binary_path, &args, &env_vars, log_dir).await
+    let child = spawn_node(&config.binary_path, &args, &env_vars, log_dir).await?;
+    if let Some(pid) = child.id() {
+        write_node_pid(&config.data_dir, pid);
+    }
+    Ok(child)
 }
 
-/// Monitor a node process. On exit, handle restart logic.
+/// Monitor a node process. On exit, handle restart logic. On permanent exit
+/// (user stop, crash limit, errored), cleans up the pid file so a subsequent
+/// daemon restart doesn't try to adopt a dead process.
 async fn monitor_node(
-    mut child: tokio::process::Child,
+    child: tokio::process::Child,
     mut config: NodeConfig,
+    supervisor: Arc<RwLock<Supervisor>>,
+    registry: Arc<RwLock<NodeRegistry>>,
+    event_tx: broadcast::Sender<NodeEvent>,
+) {
+    monitor_node_inner(child, &mut config, supervisor, registry, event_tx).await;
+    remove_node_pid(&config.data_dir);
+}
+
+async fn monitor_node_inner(
+    mut child: tokio::process::Child,
+    config: &mut NodeConfig,
     supervisor: Arc<RwLock<Supervisor>>,
     registry: Arc<RwLock<NodeRegistry>>,
     event_tx: broadcast::Sender<NodeEvent>,
@@ -505,7 +758,7 @@ async fn monitor_node(
             Some(NodeStatus::UpgradeScheduled) => {
                 // ant-node cleanly exited after replacing its binary in place. Respawn
                 // directly (no backoff, no crash counter) and refresh the recorded version.
-                match respawn_upgraded_node(&mut config, &supervisor, &registry, &event_tx).await {
+                match respawn_upgraded_node(config, &supervisor, &registry, &event_tx).await {
                     Ok(new_child) => {
                         child = new_child;
                         continue;
@@ -544,7 +797,7 @@ async fn monitor_node(
                         let mut sup = supervisor.write().await;
                         sup.mark_upgrade_scheduled(node_id, disk_version.clone());
                     }
-                    match respawn_upgraded_node(&mut config, &supervisor, &registry, &event_tx)
+                    match respawn_upgraded_node(config, &supervisor, &registry, &event_tx)
                         .await
                     {
                         Ok(new_child) => {
@@ -593,7 +846,7 @@ async fn monitor_node(
         tokio::time::sleep(backoff).await;
 
         // Try to restart
-        match spawn_node_from_config(&config).await {
+        match spawn_node_from_config(&*config).await {
             Ok(new_child) => {
                 let pid = match new_child.id() {
                     Some(pid) => pid,
@@ -713,6 +966,64 @@ async fn graceful_kill(pid: u32) {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Poll each Running node's PID for OS liveness every `LIVENESS_POLL_INTERVAL`,
+/// flipping dead ones to `Stopped` and emitting `NodeStopped`.
+///
+/// Exists to detect exits of nodes adopted across a daemon restart
+/// (`Supervisor::adopt_from_registry`). Daemon-spawned nodes have a
+/// `monitor_node` task awaiting on the owned `Child` handle, which detects
+/// exit immediately — the poll is redundant-but-harmless for them. Adopted
+/// nodes don't have a `Child` (it died with the previous daemon), so the poll
+/// is the only way the supervisor learns that one has exited.
+///
+/// The task terminates when `shutdown` is cancelled.
+pub fn spawn_liveness_monitor(
+    registry: Arc<RwLock<NodeRegistry>>,
+    supervisor: Arc<RwLock<Supervisor>>,
+    event_tx: broadcast::Sender<NodeEvent>,
+    interval: Duration,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
+
+            // Snapshot candidates to release locks before the per-process syscalls.
+            let candidates: Vec<(u32, u32, PathBuf)> = {
+                let sup = supervisor.read().await;
+                let reg = registry.read().await;
+                reg.list()
+                    .into_iter()
+                    .filter_map(|config| {
+                        let pid = sup.node_pid(config.id)?;
+                        matches!(sup.node_status(config.id), Ok(NodeStatus::Running))
+                            .then_some((config.id, pid, config.data_dir.clone()))
+                    })
+                    .collect()
+            };
+
+            for (node_id, pid, data_dir) in candidates {
+                if is_process_alive(pid) {
+                    continue;
+                }
+                let mut sup = supervisor.write().await;
+                // Re-check under the write lock to avoid racing with a concurrent
+                // start/stop that flipped the state between the snapshot and now.
+                if !matches!(sup.node_status(node_id), Ok(NodeStatus::Running)) {
+                    continue;
+                }
+                sup.update_state(node_id, NodeStatus::Stopped, None);
+                let _ = event_tx.send(NodeEvent::NodeStopped { node_id });
+                remove_node_pid(&data_dir);
+            }
+        }
+    });
 }
 
 #[cfg(unix)]
