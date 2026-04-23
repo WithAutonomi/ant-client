@@ -15,7 +15,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
 use crate::node::binary::NoopProgress;
-use crate::node::daemon::supervisor::{spawn_upgrade_monitor, Supervisor, UPGRADE_POLL_INTERVAL};
+use crate::node::daemon::supervisor::{
+    spawn_liveness_monitor, spawn_upgrade_monitor, Supervisor, LIVENESS_POLL_INTERVAL,
+    UPGRADE_POLL_INTERVAL,
+};
 use crate::node::events::NodeEvent;
 use crate::node::registry::NodeRegistry;
 use crate::node::types::{
@@ -62,10 +65,27 @@ pub async fn start(
     let registry = Arc::new(RwLock::new(registry));
     let supervisor = Arc::new(RwLock::new(Supervisor::new(event_tx.clone())));
 
+    // Adopt node processes spawned by a previous daemon instance. Must run before
+    // `axum::serve` starts accepting requests — the window between supervisor
+    // creation and adoption is where `/api/v1/nodes/status` would otherwise report
+    // live nodes as Stopped (the supervisor's default when it has no runtime entry).
+    {
+        let reg = registry.read().await;
+        let mut sup = supervisor.write().await;
+        let adopted = sup.adopt_from_registry(&reg);
+        if !adopted.is_empty() {
+            tracing::info!(
+                "Adopted {} running node(s) from a previous daemon instance: {:?}",
+                adopted.len(),
+                adopted
+            );
+        }
+    }
+
     let state = Arc::new(AppState {
         registry: registry.clone(),
         supervisor: supervisor.clone(),
-        event_tx,
+        event_tx: event_tx.clone(),
         start_time: Instant::now(),
         config: config.clone(),
         bound_port: bound_addr.port(),
@@ -75,9 +95,20 @@ pub async fn start(
     // ant-node's auto-upgrade, and flip them to UpgradeScheduled so the supervisor knows the
     // next exit is expected.
     spawn_upgrade_monitor(
+        registry.clone(),
+        supervisor.clone(),
+        UPGRADE_POLL_INTERVAL,
+        shutdown.clone(),
+    );
+
+    // Background task: poll adopted nodes' PIDs for OS liveness. Daemon-spawned nodes
+    // get exit detection via `monitor_node`'s owned `Child` handle; adopted nodes don't,
+    // so this poll is the only way the supervisor learns when one of them exits.
+    spawn_liveness_monitor(
         registry,
         supervisor,
-        UPGRADE_POLL_INTERVAL,
+        event_tx,
+        LIVENESS_POLL_INTERVAL,
         shutdown.clone(),
     );
 
