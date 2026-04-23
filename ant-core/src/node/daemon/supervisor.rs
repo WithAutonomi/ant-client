@@ -109,17 +109,11 @@ fn find_running_node_process(sys: &sysinfo::System, config: &NodeConfig) -> Opti
 }
 
 /// Determine the PID to adopt for a node, trying the pid file first and
-/// falling back to a process-table scan. `process_table` is lazily populated
-/// — we avoid paying the `System::new_all` cost when every node's pid file
-/// is present and valid, and amortise it across nodes when any scan is
-/// required. On successful scan, writes the pid file so the next adoption
-/// takes the fast path.
+/// falling back to a process-table scan. On successful scan, writes the pid
+/// file so the next adoption takes the fast path.
 ///
 /// Returns `None` if no live process can be attributed to this node.
-fn resolve_adopted_pid(
-    config: &NodeConfig,
-    process_table: &mut Option<sysinfo::System>,
-) -> Option<u32> {
+fn resolve_adopted_pid(config: &NodeConfig, sys: &sysinfo::System) -> Option<u32> {
     if let Some(pid) = read_node_pid(&config.data_dir) {
         if is_process_alive(pid) {
             return Some(pid);
@@ -129,23 +123,30 @@ fn resolve_adopted_pid(
         remove_node_pid(&config.data_dir);
     }
 
-    let sys = process_table.get_or_insert_with(|| {
-        // `refresh_processes` with the default `ProcessRefreshKind` skips the
-        // command line on Windows (and on some Linux configurations), which
-        // would make the `--root-dir` match below silently return no-matches
-        // even for a live process whose exe path is correct. Force the full
-        // refresh so `process.cmd()` is actually populated.
-        let mut s = sysinfo::System::new();
-        s.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::All,
-            true,
-            sysinfo::ProcessRefreshKind::everything(),
-        );
-        s
-    });
     let pid = find_running_node_process(sys, config)?;
     write_node_pid(&config.data_dir, pid);
     Some(pid)
+}
+
+/// Build an `Instant` that reports the real process start time when
+/// `.elapsed()` is called on it — so uptime survives daemon restarts
+/// accurately for adopted nodes.
+///
+/// `sysinfo::Process::start_time()` returns seconds since the UNIX epoch
+/// (wall clock). `Instant` is monotonic and can't be constructed from a
+/// wall-clock value directly, so we back-date `Instant::now()` by the
+/// process's age. Returns `None` if the PID isn't in the snapshot (the
+/// process exited between scan and this call), if the system clock looks
+/// broken, or if subtraction would overflow (unrealistically-old process
+/// start times).
+fn process_started_at(sys: &sysinfo::System, pid: u32) -> Option<Instant> {
+    let start_secs = sys.process(sysinfo::Pid::from_u32(pid))?.start_time();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let age = now_secs.saturating_sub(start_secs);
+    Instant::now().checked_sub(Duration::from_secs(age))
 }
 
 /// Maximum restart attempts before marking a node as errored.
@@ -470,12 +471,21 @@ impl Supervisor {
     ///
     /// Returns the list of node IDs that were adopted.
     pub fn adopt_from_registry(&mut self, registry: &NodeRegistry) -> Vec<u32> {
+        // Populated upfront so every adopted node gets its real start time via
+        // `process_started_at`, not just those that went through the scan
+        // fallback. The extra ~50 ms at daemon startup is a one-time cost
+        // that's cheaper than users seeing uptime reset every time the daemon
+        // restarts.
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::everything(),
+        );
+
         let mut adopted = Vec::new();
-        // Populated lazily on the first scan so deployments where every
-        // node's pid file is present pay zero for process-table enumeration.
-        let mut process_table: Option<sysinfo::System> = None;
         for config in registry.list() {
-            let Some(pid) = resolve_adopted_pid(config, &mut process_table) else {
+            let Some(pid) = resolve_adopted_pid(config, &sys) else {
                 continue;
             };
             self.node_states.insert(
@@ -483,12 +493,16 @@ impl Supervisor {
                 NodeRuntime {
                     status: NodeStatus::Running,
                     pid: Some(pid),
-                    // Best-effort: the real start time lives in the OS process table
-                    // and can't be read portably without pulling in more of sysinfo's
-                    // surface. Users observing uptime across daemon restarts see it
-                    // reset from zero, which is the right trade vs. the previous
-                    // behaviour (every node reporting Stopped despite a live process).
-                    started_at: Some(Instant::now()),
+                    // Back-date to the real process start time so uptime
+                    // reported to the API is wall-clock accurate across
+                    // daemon restarts. Falls back to `Instant::now()` only
+                    // if sysinfo can't report the start time (PID raced out
+                    // of the snapshot, or a broken clock) — better to show
+                    // uptime counting from adoption than to claim the node
+                    // is Stopped.
+                    started_at: Some(
+                        process_started_at(&sys, pid).unwrap_or_else(Instant::now),
+                    ),
                     restart_count: 0,
                     first_crash_at: None,
                     pending_version: None,
