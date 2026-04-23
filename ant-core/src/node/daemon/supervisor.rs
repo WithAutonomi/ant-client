@@ -130,8 +130,17 @@ fn resolve_adopted_pid(
     }
 
     let sys = process_table.get_or_insert_with(|| {
+        // `refresh_processes` with the default `ProcessRefreshKind` skips the
+        // command line on Windows (and on some Linux configurations), which
+        // would make the `--root-dir` match below silently return no-matches
+        // even for a live process whose exe path is correct. Force the full
+        // refresh so `process.cmd()` is actually populated.
         let mut s = sysinfo::System::new();
-        s.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        s.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::everything(),
+        );
         s
     });
     let pid = find_running_node_process(sys, config)?;
