@@ -32,13 +32,13 @@ impl StatusArgs {
 
             // Table header
             println!(
-                "  {:<4} {:<14} {:<10} {}",
+                "  {:<4} {:<14} {:<18} {}",
                 "ID".dimmed(),
                 "Name".dimmed(),
                 "Version".dimmed(),
                 "Status".dimmed()
             );
-            println!("  {}", "─".repeat(44).dimmed());
+            println!("  {}", "─".repeat(52).dimmed());
 
             for node in &result.nodes {
                 let status_display = match node.status {
