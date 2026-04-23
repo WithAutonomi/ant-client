@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -905,8 +905,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.11.0-rc.1"
-source = "git+https://github.com/WithAutonomi/ant-node.git?branch=rc-2026.4.2#2ba556e4af1b606ed2cf52c01674060cb0ab8ce3"
+version = "0.11.0-rc.2"
+source = "git+https://github.com/WithAutonomi/ant-node.git?branch=rc-2026.4.2#943ca2b3472b8400361bafd8747ca4068e6a95ce"
 dependencies = [
  "aes-gcm-siv",
  "blake3",
@@ -5160,7 +5160,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.24.0-rc.1"
-source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=rc-2026.4.2#a2813e83526c70048f5a564848b05e8088d786e4"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=rc-2026.4.2#33a3e586db4f88d895e37bfae2f1df2de9ba8752"
 dependencies = [
  "anyhow",
  "async-trait",
