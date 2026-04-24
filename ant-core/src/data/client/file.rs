@@ -448,7 +448,6 @@ pub struct UploadCostEstimate {
     pub payment_mode: PaymentMode,
 }
 
-
 /// Result of a file upload: the `DataMap` needed to retrieve the file.
 ///
 /// Marked `#[non_exhaustive]` so adding a new field in future is not a

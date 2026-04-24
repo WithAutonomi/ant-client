@@ -531,9 +531,7 @@ impl Supervisor {
                     // of the snapshot, or a broken clock) — better to show
                     // uptime counting from adoption than to claim the node
                     // is Stopped.
-                    started_at: Some(
-                        process_started_at(&sys, pid).unwrap_or_else(Instant::now),
-                    ),
+                    started_at: Some(process_started_at(&sys, pid).unwrap_or_else(Instant::now)),
                     restart_count: 0,
                     first_crash_at: None,
                     pending_version: None,
@@ -797,9 +795,7 @@ async fn monitor_node_inner(
                         let mut sup = supervisor.write().await;
                         sup.mark_upgrade_scheduled(node_id, disk_version.clone());
                     }
-                    match respawn_upgraded_node(config, &supervisor, &registry, &event_tx)
-                        .await
-                    {
+                    match respawn_upgraded_node(config, &supervisor, &registry, &event_tx).await {
                         Ok(new_child) => {
                             child = new_child;
                             continue;
@@ -995,18 +991,19 @@ pub fn spawn_liveness_monitor(
             }
 
             // Snapshot candidates to release locks before the per-process syscalls.
-            let candidates: Vec<(u32, u32, PathBuf)> = {
-                let sup = supervisor.read().await;
-                let reg = registry.read().await;
-                reg.list()
-                    .into_iter()
-                    .filter_map(|config| {
-                        let pid = sup.node_pid(config.id)?;
-                        matches!(sup.node_status(config.id), Ok(NodeStatus::Running))
-                            .then_some((config.id, pid, config.data_dir.clone()))
-                    })
-                    .collect()
-            };
+            let candidates: Vec<(u32, u32, PathBuf)> =
+                {
+                    let sup = supervisor.read().await;
+                    let reg = registry.read().await;
+                    reg.list()
+                        .into_iter()
+                        .filter_map(|config| {
+                            let pid = sup.node_pid(config.id)?;
+                            matches!(sup.node_status(config.id), Ok(NodeStatus::Running))
+                                .then_some((config.id, pid, config.data_dir.clone()))
+                        })
+                        .collect()
+                };
 
             for (node_id, pid, data_dir) in candidates {
                 if is_process_alive(pid) {
