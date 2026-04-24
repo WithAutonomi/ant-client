@@ -902,8 +902,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.11.0"
-source = "git+https://github.com/WithAutonomi/ant-node?branch=anselme%2Fextract-ant-protocol#dd076513cbed325c5edd72924ba5c7de387e57e0"
+version = "0.11.0-rc.2"
+source = "git+https://github.com/WithAutonomi/ant-node?branch=anselme%2Fextract-ant-protocol#0f203ebbf20ff42e8eca033215f953c158ac6e50"
 dependencies = [
  "aes-gcm-siv",
  "ant-protocol",
@@ -953,7 +953,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.0.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=597dbdb1b680a43d80a082d77076ff2080444079#597dbdb1b680a43d80a082d77076ff2080444079"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=chore%2Frepin-saorsa-core-rc-2026.4.2#b4360b1802bc6090047a6a67cc2b593402bf52fb"
 dependencies = [
  "blake3",
  "bytes",
@@ -2457,6 +2457,18 @@ version = "4.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ca9601fb2d62598ee17836250842873a413586e5d7ed88b356e38ddbb0ec631"
 dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "enum_dispatch"
+version = "0.3.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa18ce2bc66555b3218614519ac839ddb759a7d6720732f979ef8d13be147ecd"
+dependencies = [
+ "once_cell",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -5131,9 +5143,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.23.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d459ba0e4f1a3ac918a1d6b17db392cccde2ee74569545d171d7644fc6463cc7"
+version = "0.24.0-rc.1"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=rc-2026.4.2#33a3e586db4f88d895e37bfae2f1df2de9ba8752"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5246,9 +5257,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.32.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "250826f52ac60992947359218d83c21f658aa85407e3980a5dbb258eff4c0cc3"
+version = "0.33.0-rc.1"
+source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=rc-2026.4.2#8b44b242fd62023c1a96728382ddd72917a63a4a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5260,6 +5270,7 @@ dependencies = [
  "core-foundation 0.9.4",
  "dashmap",
  "dirs 5.0.1",
+ "enum_dispatch",
  "futures-util",
  "hex",
  "igd-next",
