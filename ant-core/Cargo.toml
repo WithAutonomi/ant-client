@@ -44,7 +44,7 @@ rand = "0.8"
 # sysinfo, so the crate is loaded lazily and the cost is bounded to first-time
 # upgrade scenarios.
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
-ant-node = { git = "https://github.com/WithAutonomi/ant-node.git", branch = "rc-2026.4.2" }
+ant-node = "0.11.0"
 saorsa-pqc = "0.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
