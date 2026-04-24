@@ -44,6 +44,19 @@ pub enum NodeEvent {
         version: String,
         path: PathBuf,
     },
+    /// Emitted when the supervisor detects that a node's on-disk binary has been
+    /// replaced by its auto-upgrade, ahead of the node process restarting.
+    UpgradeScheduled {
+        node_id: u32,
+        pending_version: String,
+    },
+    /// Emitted after the supervisor has respawned a node against its replaced binary and
+    /// observed the new version.
+    NodeUpgraded {
+        node_id: u32,
+        old_version: String,
+        new_version: String,
+    },
 }
 
 impl NodeEvent {
@@ -60,6 +73,8 @@ impl NodeEvent {
             NodeEvent::DownloadStarted { .. } => "download_started",
             NodeEvent::DownloadProgress { .. } => "download_progress",
             NodeEvent::DownloadComplete { .. } => "download_complete",
+            NodeEvent::UpgradeScheduled { .. } => "upgrade_scheduled",
+            NodeEvent::NodeUpgraded { .. } => "node_upgraded",
         }
     }
 }
@@ -107,5 +122,32 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: NodeEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.event_type(), "download_progress");
+    }
+
+    #[test]
+    fn upgrade_scheduled_event_serializes() {
+        let event = NodeEvent::UpgradeScheduled {
+            node_id: 2,
+            pending_version: "0.10.11-rc.1".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"upgrade_scheduled\""));
+        assert!(json.contains("\"node_id\":2"));
+        assert!(json.contains("\"pending_version\":\"0.10.11-rc.1\""));
+        assert_eq!(event.event_type(), "upgrade_scheduled");
+    }
+
+    #[test]
+    fn node_upgraded_event_serializes() {
+        let event = NodeEvent::NodeUpgraded {
+            node_id: 3,
+            old_version: "0.10.1".to_string(),
+            new_version: "0.10.11-rc.1".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"node_upgraded\""));
+        assert!(json.contains("\"old_version\":\"0.10.1\""));
+        assert!(json.contains("\"new_version\":\"0.10.11-rc.1\""));
+        assert_eq!(event.event_type(), "node_upgraded");
     }
 }

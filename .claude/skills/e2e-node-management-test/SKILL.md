@@ -209,9 +209,156 @@ Verify: response includes `access-control-allow-origin: http://127.0.0.1:<port>`
 (case-insensitive check). A cross-origin request (e.g., `Origin: http://example.com`) should NOT
 receive this header.
 
-### Phase 8: Cleanup
+### Phase 8: Daemon restart adoption
 
-**Step 8.1 — Stop all nodes:**
+This phase validates the adoption behaviour introduced by the `adopt_from_registry` path in
+`supervisor.rs`. When the daemon restarts, running node processes must be re-attached (not
+respawned), their PIDs must match the pre-restart PIDs, and `uptime_secs` must be continuous
+(not reset to 0). Both the happy path (via `node.pid` files) and the fallback path (via OS
+process-table scan) must succeed, and the liveness monitor must detect an externally killed
+node on its next poll.
+
+**Step 8.1 — Capture baseline PIDs, uptimes, and data_dirs:**
+
+```
+ant node status --json
+```
+
+For each of the 3 `running` nodes, record `node_id`, `service_name`, `pid`, and `uptime_secs`.
+These are the baseline values used in the assertions that follow.
+
+Also fetch each node's `data_dir` via the REST API (needed in Step 8.5):
+
+```bash
+curl -s <api_base>/nodes/1 | jq -r '.data_dir'
+curl -s <api_base>/nodes/2 | jq -r '.data_dir'
+curl -s <api_base>/nodes/3 | jq -r '.data_dir'
+```
+
+**Step 8.2 — Stop the daemon (leave nodes running):**
+
+```
+ant node daemon stop --json
+```
+
+Verify: response contains `pid` (the stopped daemon's pid).
+
+Verify the 3 node processes are **still alive** using OS-native tools — the daemon must not
+kill its nodes on shutdown:
+
+- Linux/macOS: `ps -p <pid>` for each baseline pid — exit code 0 means alive
+- Windows: `tasklist /FI "PID eq <pid>"` for each baseline pid — output should list the process
+
+All 3 node processes must still be running. Any failure here means daemon shutdown is killing
+nodes, which is a regression.
+
+**Step 8.3 — Restart the daemon (happy-path adoption via pid file):**
+
+```
+ant node daemon start --json
+```
+
+Verify: JSON response contains `pid` (the new daemon pid) and `already_running` is `false`.
+
+```
+ant node status --json
+```
+
+Verify:
+- `nodes` array has 3 entries, all with status `running`
+- For each node, `pid` **equals** the baseline `pid` captured in Step 8.1 (adopted — not
+  respawned)
+- For each node, `uptime_secs` is **greater than or equal to** the baseline `uptime_secs`
+  (continuous, not reset to 0)
+
+This confirms happy-path adoption via the `node.pid` file in each node's data directory.
+
+**Step 8.4 — Stop the daemon again (prepare for fallback scan):**
+
+```
+ant node daemon stop --json
+```
+
+Verify the 3 node processes are still alive (same check as Step 8.2).
+
+**Step 8.5 — Simulate a pre-adoption daemon (remove pid files):**
+
+For each `data_dir` captured in Step 8.1, delete the `node.pid` file. This simulates nodes
+spawned by a daemon build that predates the adoption feature and never wrote the pid file.
+
+- Linux/macOS:
+  ```bash
+  rm -f "<data_dir_1>/node.pid" "<data_dir_2>/node.pid" "<data_dir_3>/node.pid"
+  ```
+- Windows:
+  ```
+  del "<data_dir_1>\node.pid" "<data_dir_2>\node.pid" "<data_dir_3>\node.pid"
+  ```
+
+Verify each file is gone before proceeding.
+
+**Step 8.6 — Restart the daemon (fallback process-table scan):**
+
+```
+ant node daemon start --json
+```
+
+```
+ant node status --json
+```
+
+Verify the same assertions as Step 8.3:
+- 3 nodes, all `running`
+- PIDs match the Step 8.1 baseline
+- `uptime_secs` is continuous (>= baseline)
+
+This confirms the fallback path: when `node.pid` is missing, the supervisor scans the OS
+process table (via `sysinfo`) and matches processes by `binary_path` + `--root-dir` argument.
+
+**Step 8.7 — Liveness monitor detects an external kill:**
+
+Kill `node1` externally (outside the daemon), using its baseline pid from Step 8.1:
+
+- Linux/macOS: `kill -9 <node1_pid>`
+- Windows: `taskkill /F /PID <node1_pid>`
+
+Wait ~10 seconds for the liveness monitor to observe the exit (it polls every 5s; allow
+margin):
+
+- Linux/macOS: `sleep 10`
+- Windows: `timeout /T 10 /NOBREAK`
+
+Then query status:
+
+```
+ant node status --json
+```
+
+Verify:
+- `node1`'s status is `stopped` (or `errored`) — the daemon detected the exit
+- For `node1`, `pid` and `uptime_secs` are **not present** (omitted via `skip_serializing_if`,
+  same as Step 6.5)
+- `node2` and `node3` remain `running` with their Step 8.1 baseline PIDs
+
+**Step 8.8 — Restart the killed node:**
+
+Return to the "3 running nodes" state expected by the Cleanup phase:
+
+```
+ant node start --service-name node1 --json
+```
+
+Verify the response shows a new `pid` for `node1` (a fresh process).
+
+```
+ant node status --json
+```
+
+Verify all 3 nodes are `running` before proceeding to cleanup.
+
+### Phase 9: Cleanup
+
+**Step 9.1 — Stop all nodes:**
 
 ```
 ant node stop --json
@@ -219,7 +366,7 @@ ant node stop --json
 
 Verify all nodes stopped.
 
-**Step 8.2 — Reset:**
+**Step 9.2 — Reset:**
 
 ```
 ant node reset --force --json
@@ -227,7 +374,7 @@ ant node reset --force --json
 
 Verify: `nodes_cleared` is 3.
 
-**Step 8.3 — Stop the daemon:**
+**Step 9.3 — Stop the daemon:**
 
 ```
 ant node daemon stop --json
@@ -235,7 +382,7 @@ ant node daemon stop --json
 
 Verify: response contains `pid`.
 
-**Step 8.4 — Verify daemon stopped:**
+**Step 9.4 — Verify daemon stopped:**
 
 ```
 ant node daemon status --json
@@ -243,7 +390,7 @@ ant node daemon status --json
 
 Verify: `running` is `false`.
 
-### Phase 9: Report
+### Phase 10: Report
 
 Print a summary of all test steps and their results. Include the operating system and architecture
 at the top of the report (e.g., from `uname -a` on Linux/macOS or `systeminfo` on Windows):
@@ -274,11 +421,21 @@ Phase 7: REST API
   [PASS] 7.4 GET /console
   [PASS] 7.5 CORS headers
 
-Phase 8: Cleanup
-  [PASS] 8.1 Stop all nodes
-  [PASS] 8.2 Reset
-  [PASS] 8.3 Daemon stop
-  [PASS] 8.4 Daemon not running
+Phase 8: Daemon Restart Adoption
+  [PASS] 8.1 Baseline PIDs/uptimes/data_dirs captured
+  [PASS] 8.2 Daemon stop (nodes still alive)
+  [PASS] 8.3 Daemon restart — happy-path adoption (pid file)
+  [PASS] 8.4 Daemon stop (prepare for fallback test)
+  [PASS] 8.5 node.pid files removed
+  [PASS] 8.6 Daemon restart — fallback process-table scan
+  [PASS] 8.7 Liveness monitor detected external kill
+  [PASS] 8.8 Killed node restarted
+
+Phase 9: Cleanup
+  [PASS] 9.1 Stop all nodes
+  [PASS] 9.2 Reset
+  [PASS] 9.3 Daemon stop
+  [PASS] 9.4 Daemon not running
 
 Result: ALL TESTS PASSED
 ```
