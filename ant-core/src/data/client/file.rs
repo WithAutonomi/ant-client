@@ -457,6 +457,13 @@ pub struct FileUploadResult {
     pub data_map: DataMap,
     /// Number of chunks stored on the network.
     pub chunks_stored: usize,
+    /// Number of chunks that failed to store. Always 0 for a successful
+    /// upload — partial-failure information is conveyed via
+    /// [`crate::data::Error::PartialUpload`] instead.
+    pub chunks_failed: usize,
+    /// Total number of chunks the upload attempted to store. On full
+    /// success this equals `chunks_stored`.
+    pub total_chunks: usize,
     /// Which payment mode was actually used (not just requested).
     pub payment_mode_used: PaymentMode,
     /// Total storage cost paid in token units (atto). "0" if all chunks already existed.
@@ -1002,11 +1009,13 @@ impl Client {
                 let wave_result = self.store_paid_chunks(paid_chunks).await;
                 if !wave_result.failed.is_empty() {
                     let failed_count = wave_result.failed.len();
+                    let stored_count = wave_result.stored.len();
                     return Err(Error::PartialUpload {
                         stored: wave_result.stored.clone(),
-                        stored_count: wave_result.stored.len(),
+                        stored_count,
                         failed: wave_result.failed,
                         failed_count,
+                        total_chunks: stored_count + failed_count,
                         reason: "finalize_upload: chunk storage failed after retries".into(),
                     });
                 }
@@ -1017,6 +1026,8 @@ impl Client {
                 Ok(FileUploadResult {
                     data_map: prepared.data_map,
                     chunks_stored,
+                    chunks_failed: 0,
+                    total_chunks: chunks_stored,
                     payment_mode_used: PaymentMode::Single,
                     storage_cost_atto: "0".into(),
                     gas_cost_wei: 0,
@@ -1064,6 +1075,8 @@ impl Client {
                 Ok(FileUploadResult {
                     data_map: prepared.data_map,
                     chunks_stored,
+                    chunks_failed: 0,
+                    total_chunks: chunks_stored,
                     payment_mode_used: PaymentMode::Merkle,
                     storage_cost_atto: "0".into(),
                     gas_cost_wei: 0,
@@ -1154,6 +1167,8 @@ impl Client {
                         return Ok(FileUploadResult {
                             data_map,
                             chunks_stored: stored,
+                            chunks_failed: 0,
+                            total_chunks: chunk_count,
                             payment_mode_used: PaymentMode::Single,
                             storage_cost_atto: sc,
                             gas_cost_wei: gc,
@@ -1180,6 +1195,8 @@ impl Client {
         Ok(FileUploadResult {
             data_map,
             chunks_stored,
+            chunks_failed: 0,
+            total_chunks: chunk_count,
             payment_mode_used: actual_mode,
             storage_cost_atto,
             gas_cost_wei,
@@ -1309,6 +1326,7 @@ impl Client {
         let total_chunks = spill.len();
         let waves: Vec<&[[u8; 32]]> = spill.waves().collect();
         let wave_count = waves.len();
+        let mut stored_addresses: Vec<[u8; 32]> = Vec::new();
 
         for (wave_idx, wave_addrs) in waves.into_iter().enumerate() {
             let wave_num = wave_idx + 1;
@@ -1323,28 +1341,49 @@ impl Client {
                 let proof_bytes = batch_result.proofs.get(&addr).cloned();
                 async move {
                     let proof = proof_bytes.ok_or_else(|| {
-                        Error::Payment(format!(
-                            "Missing merkle proof for chunk {}",
-                            hex::encode(addr)
-                        ))
+                        (
+                            addr,
+                            Error::Payment(format!(
+                                "Missing merkle proof for chunk {}",
+                                hex::encode(addr)
+                            )),
+                        )
                     })?;
-                    let peers = self.close_group_peers(&addr).await?;
-                    self.chunk_put_to_close_group(content, proof, &peers).await
+                    let peers = self.close_group_peers(&addr).await.map_err(|e| (addr, e))?;
+                    self.chunk_put_to_close_group(content, proof, &peers)
+                        .await
+                        .map(|_| addr)
+                        .map_err(|e| (addr, e))
                 }
             }))
             .buffer_unordered(self.config().store_concurrency);
 
             while let Some(result) = upload_stream.next().await {
-                result?;
-                total_stored += 1;
-                info!("Stored {total_stored}/{total_chunks}");
-                if let Some(tx) = progress {
-                    let _ = tx
-                        .send(UploadEvent::ChunkStored {
-                            stored: total_stored,
-                            total: total_chunks,
-                        })
-                        .await;
+                match result {
+                    Ok(addr) => {
+                        stored_addresses.push(addr);
+                        total_stored += 1;
+                        info!("Stored {total_stored}/{total_chunks}");
+                        if let Some(tx) = progress {
+                            let _ = tx
+                                .send(UploadEvent::ChunkStored {
+                                    stored: total_stored,
+                                    total: total_chunks,
+                                })
+                                .await;
+                        }
+                    }
+                    Err((addr, e)) => {
+                        warn!("merkle upload failed for chunk {}: {e}", hex::encode(addr));
+                        return Err(Error::PartialUpload {
+                            stored: stored_addresses,
+                            stored_count: total_stored,
+                            failed: vec![(addr, e.to_string())],
+                            failed_count: 1,
+                            total_chunks,
+                            reason: format!("merkle chunk upload failed: {e}"),
+                        });
+                    }
                 }
             }
 

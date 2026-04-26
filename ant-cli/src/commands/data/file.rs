@@ -147,12 +147,9 @@ async fn handle_file_upload(
         path.display()
     );
 
-    let result = if json_output {
+    let upload_outcome = if json_output {
         // No progress bars in JSON mode
-        client
-            .file_upload_with_mode(path, mode)
-            .await
-            .map_err(|e| anyhow::anyhow!("File upload failed: {e}"))?
+        client.file_upload_with_mode(path, mode).await
     } else {
         // Set up progress channel and drive progress bars
         let (tx, rx) = mpsc::channel(64);
@@ -167,7 +164,33 @@ async fn handle_file_upload(
         // Wait for progress display to finish (sender dropped → receiver exits)
         let _ = pb_handle.await;
 
-        upload_result.map_err(|e| anyhow::anyhow!("File upload failed: {e}"))?
+        upload_result
+    };
+
+    let result = match upload_outcome {
+        Ok(r) => r,
+        Err(DataError::PartialUpload {
+            stored_count,
+            failed_count,
+            total_chunks,
+            reason,
+            ..
+        }) => {
+            if json_output {
+                let out = UploadFailureJson {
+                    error: "partial_upload",
+                    total_chunks,
+                    chunks_stored: stored_count,
+                    chunks_failed: failed_count,
+                    reason: &reason,
+                };
+                println!("{}", serde_json::to_string(&out)?);
+            }
+            anyhow::bail!(
+                "Upload failed: {stored_count}/{total_chunks} stored, {failed_count} failed: {reason}"
+            );
+        }
+        Err(e) => anyhow::bail!("File upload failed: {e}"),
     };
 
     let elapsed = start.elapsed();
@@ -195,6 +218,9 @@ async fn handle_file_upload(
                 datamap: None,
                 mode: "public".into(),
                 chunks: total_chunks,
+                total_chunks,
+                chunks_stored: total_chunks,
+                chunks_failed: 0,
                 size: file_size,
                 storage_cost_atto: result.storage_cost_atto.clone(),
                 gas_cost_wei: result.gas_cost_wei.to_string(),
@@ -234,6 +260,9 @@ async fn handle_file_upload(
                 datamap: Some(datamap_path.display().to_string()),
                 mode: "private".into(),
                 chunks: result.chunks_stored,
+                total_chunks: result.total_chunks,
+                chunks_stored: result.chunks_stored,
+                chunks_failed: result.chunks_failed,
                 size: file_size,
                 storage_cost_atto: result.storage_cost_atto.clone(),
                 gas_cost_wei: result.gas_cost_wei.to_string(),
@@ -487,10 +516,22 @@ struct UploadJsonResult {
     datamap: Option<String>,
     mode: String,
     chunks: usize,
+    total_chunks: usize,
+    chunks_stored: usize,
+    chunks_failed: usize,
     size: u64,
     storage_cost_atto: String,
     gas_cost_wei: String,
     elapsed_secs: f64,
+}
+
+#[derive(Serialize)]
+struct UploadFailureJson<'a> {
+    error: &'a str,
+    total_chunks: usize,
+    chunks_stored: usize,
+    chunks_failed: usize,
+    reason: &'a str,
 }
 
 #[derive(Serialize)]

@@ -388,9 +388,10 @@ impl Client {
                     warn!("{failed_count} chunks failed to store after retries");
                     return Err(Error::PartialUpload {
                         stored: all_addresses.clone(),
-                        stored_count: all_addresses.len(),
+                        stored_count: stored_offset + all_addresses.len(),
                         failed: wave_result.failed,
                         failed_count,
+                        total_chunks: file_total,
                         reason: "wave store failed after retries".into(),
                     });
                 }
@@ -436,9 +437,10 @@ impl Client {
                 warn!("{failed_count} chunks failed to store after retries (final wave)");
                 return Err(Error::PartialUpload {
                     stored: all_addresses.clone(),
-                    stored_count: all_addresses.len(),
+                    stored_count: stored_offset + all_addresses.len(),
                     failed: wave_result.failed,
                     failed_count,
+                    total_chunks: file_total,
                     reason: "final wave store failed after retries".into(),
                 });
             }
