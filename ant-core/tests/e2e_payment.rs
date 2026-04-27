@@ -292,7 +292,7 @@ async fn test_chunk_put_fails_with_insufficient_funds() {
     // Create a wallet with zero balance by using a random private key
     // (not the Anvil-funded default key)
     let evm_network = testnet.evm_network().clone();
-    let empty_wallet = evmlib::wallet::Wallet::new_from_private_key(
+    let empty_wallet = ant_protocol::evm::Wallet::new_from_private_key(
         evm_network,
         "0x0000000000000000000000000000000000000000000000000000000000000001",
     )

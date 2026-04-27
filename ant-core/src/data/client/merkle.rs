@@ -6,19 +6,17 @@
 
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_node::ant_protocol::{
-    ChunkMessage, ChunkMessageBody, MerkleCandidateQuoteRequest, MerkleCandidateQuoteResponse,
+use ant_protocol::evm::{
+    Amount, MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
+    MidpointProof, PoolCommitment, CANDIDATES_PER_POOL, MAX_LEAVES,
 };
-use ant_node::client::send_and_await_chunk_response;
-use ant_node::payment::quote::verify_merkle_candidate_signature;
-use ant_node::payment::serialize_merkle_proof;
+use ant_protocol::payment::{serialize_merkle_proof, verify_merkle_candidate_signature};
+use ant_protocol::transport::PeerId;
+use ant_protocol::{
+    send_and_await_chunk_response, ChunkMessage, ChunkMessageBody, MerkleCandidateQuoteRequest,
+    MerkleCandidateQuoteResponse,
+};
 use bytes::Bytes;
-use evmlib::common::Amount;
-use evmlib::merkle_batch_payment::PoolCommitment;
-use evmlib::merkle_payments::{
-    MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
-    MidpointProof, CANDIDATES_PER_POOL, MAX_LEAVES,
-};
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -453,7 +451,7 @@ impl Client {
         futures: &mut FuturesUnordered<
             impl std::future::Future<
                 Output = (
-                    ant_node::core::PeerId,
+                    PeerId,
                     std::result::Result<MerklePaymentCandidateNode, Error>,
                 ),
             >,
@@ -624,9 +622,7 @@ mod send_assertions {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use evmlib::common::Amount;
-    use evmlib::merkle_payments::{MerkleTree, CANDIDATES_PER_POOL};
-    use evmlib::RewardsAddress;
+    use ant_protocol::evm::{Amount, MerkleTree, RewardsAddress, CANDIDATES_PER_POOL};
 
     // =========================================================================
     // should_use_merkle (free function, no Client needed)
@@ -743,10 +739,8 @@ mod tests {
 
     #[test]
     fn test_merkle_proof_serialize_deserialize_roundtrip() {
-        use ant_node::payment::{deserialize_merkle_proof, serialize_merkle_proof};
-        use evmlib::common::Amount;
-        use evmlib::merkle_payments::MerklePaymentCandidateNode;
-        use evmlib::RewardsAddress;
+        use ant_protocol::evm::{Amount, MerklePaymentCandidateNode, RewardsAddress};
+        use ant_protocol::payment::{deserialize_merkle_proof, serialize_merkle_proof};
 
         let addrs = make_test_addresses(4);
         let xornames: Vec<XorName> = addrs.iter().map(|a| XorName(*a)).collect();
@@ -803,8 +797,8 @@ mod tests {
         // Simulates what collect_validated_candidates checks
         let candidate = MerklePaymentCandidateNode {
             pub_key: vec![0u8; 32],
-            price: evmlib::common::Amount::ZERO,
-            reward_address: evmlib::RewardsAddress::new([0u8; 20]),
+            price: ant_protocol::evm::Amount::ZERO,
+            reward_address: ant_protocol::evm::RewardsAddress::new([0u8; 20]),
             merkle_payment_timestamp: 1000,
             signature: vec![0u8; 64],
         };
@@ -898,7 +892,7 @@ mod tests {
 
     #[test]
     fn test_finalize_merkle_batch_proofs_are_deserializable() {
-        use ant_node::payment::deserialize_merkle_proof;
+        use ant_protocol::payment::deserialize_merkle_proof;
 
         let prepared = make_prepared_merkle_batch(8);
         let winner_hash = prepared.candidate_pools[0].hash();

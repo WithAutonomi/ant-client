@@ -8,14 +8,14 @@ use crate::data::client::file::UploadEvent;
 use crate::data::client::payment::peer_id_to_encoded;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_node::ant_protocol::DATA_TYPE_CHUNK;
-use ant_node::client::{compute_address, XorName};
-use ant_node::core::{MultiAddr, PeerId};
-use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
+use ant_protocol::evm::{
+    Amount, EncodedPeerId, PayForQuotesError, PaymentQuote, ProofOfPayment, QuoteHash,
+    RewardsAddress, TxHash,
+};
+use ant_protocol::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
+use ant_protocol::transport::{MultiAddr, PeerId};
+use ant_protocol::{compute_address, XorName, DATA_TYPE_CHUNK};
 use bytes::Bytes;
-use evmlib::common::{Amount, QuoteHash, TxHash};
-use evmlib::wallet::PayForQuotesError;
-use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use futures::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -628,8 +628,8 @@ mod send_assertions {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use ant_node::payment::single_node::QuotePaymentInfo;
-    use ant_node::CLOSE_GROUP_SIZE;
+    use ant_protocol::payment::QuotePaymentInfo;
+    use ant_protocol::CLOSE_GROUP_SIZE;
 
     /// Median index in the quotes array.
     const MEDIAN_INDEX: usize = CLOSE_GROUP_SIZE / 2;

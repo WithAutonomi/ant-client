@@ -1,5 +1,8 @@
 pub mod binary;
 pub mod daemon;
+// `LocalDevnet` wraps `ant_node::devnet::Devnet`. Gated behind `devnet`
+// so default builds of ant-core don't link ant-node at all.
+#[cfg(feature = "devnet")]
 pub mod devnet;
 pub mod events;
 pub mod process;

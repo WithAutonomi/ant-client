@@ -6,11 +6,11 @@
 use crate::data::client::ClientConfig;
 use crate::data::error::{Error, Result};
 use crate::data::Client;
-use ant_node::core::MultiAddr;
-use ant_node::devnet::{Devnet, DevnetConfig, DevnetEvmInfo, DevnetManifest};
-use evmlib::testnet::Testnet;
-use evmlib::wallet::Wallet;
-use evmlib::Network as EvmNetwork;
+use ant_node::devnet::{Devnet, DevnetConfig};
+use ant_protocol::evm::testnet::Testnet;
+use ant_protocol::evm::{Network as EvmNetwork, Wallet};
+use ant_protocol::transport::MultiAddr;
+use ant_protocol::{DevnetEvmInfo, DevnetManifest};
 use std::path::Path;
 use std::time::SystemTime;
 use tracing::info;

@@ -3,7 +3,7 @@
 //! Wires client-side peer contacts into saorsa-core's `BootstrapManager`
 //! so the persistent cache reflects real peer quality across sessions.
 
-use ant_node::core::{MultiAddr, P2PNode, PeerId};
+use ant_protocol::transport::{MultiAddr, P2PNode, PeerId};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tracing::debug;

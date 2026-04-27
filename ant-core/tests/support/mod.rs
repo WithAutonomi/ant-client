@@ -16,20 +16,21 @@
 )]
 
 use ant_core::data::ClientConfig;
-use ant_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
-use ant_node::core::{
-    CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
-};
+// Node-internal types (test harness needs to *be* a node) — direct
+// ant-node import is correct here. ant-node is a dev-dep so this is
+// only linked into test binaries.
 use ant_node::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
 };
 use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
-use ant_node::CLOSE_GROUP_SIZE;
-use evmlib::testnet::Testnet;
-use evmlib::wallet::Wallet;
-use evmlib::Network as EvmNetwork;
-use evmlib::RewardsAddress;
+// Wire / transport / EVM types: route through ant-protocol so the test
+// harness exercises the same surface the client does.
+use ant_protocol::evm::{testnet::Testnet, Network as EvmNetwork, RewardsAddress, Wallet};
+use ant_protocol::transport::{
+    CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
+};
+use ant_protocol::{CLOSE_GROUP_SIZE, MAX_WIRE_MESSAGE_SIZE};
 use rand::Rng;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -199,7 +200,7 @@ impl MiniTestnet {
         // Approve token spend for the unified payment vault contract
         let vault_address = evm_network.payment_vault_address();
         wallet
-            .approve_to_spend_tokens(*vault_address, evmlib::common::U256::MAX)
+            .approve_to_spend_tokens(*vault_address, ant_protocol::evm::U256::MAX)
             .await
             .expect("approve payment vault token spend");
 
@@ -295,11 +296,11 @@ impl MiniTestnet {
         let pub_key_bytes = identity.public_key().as_bytes().to_vec();
         let sk_bytes = identity.secret_key_bytes().to_vec();
         let sk = {
-            use saorsa_pqc::pqc::types::MlDsaSecretKey;
+            use ant_protocol::pqc::ops::MlDsaSecretKey;
             MlDsaSecretKey::from_bytes(&sk_bytes).expect("deserialize ML-DSA-65 secret key")
         };
         quote_generator.set_signer(pub_key_bytes, move |msg| {
-            use saorsa_pqc::pqc::MlDsaOperations;
+            use ant_protocol::pqc::ops::MlDsaOperations;
             let ml_dsa = MlDsa65::new();
             ml_dsa
                 .sign(&sk, msg)
@@ -329,7 +330,7 @@ impl MiniTestnet {
                         let node = Arc::clone(&handler_node);
                         let topic_clone = topic.clone();
                         tokio::spawn(async move {
-                            if topic_clone != ant_node::CHUNK_PROTOCOL_ID {
+                            if topic_clone != ant_protocol::CHUNK_PROTOCOL_ID {
                                 return;
                             }
                             match protocol.try_handle_request(&data).await {

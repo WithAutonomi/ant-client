@@ -69,7 +69,7 @@ struct CostResult {
 /// Measure ANT and gas cost for a single upload.
 async fn measure_upload_cost(
     client: &Client,
-    wallet: &evmlib::wallet::Wallet,
+    wallet: &ant_protocol::evm::Wallet,
     path: &Path,
     mode: PaymentMode,
     file_size_mb: u64,

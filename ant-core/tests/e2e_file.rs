@@ -5,7 +5,7 @@
 mod support;
 
 use ant_core::data::{compute_address, Client, ExternalPaymentInfo, Visibility};
-use evmlib::common::{QuoteHash, TxHash};
+use ant_protocol::evm::{QuoteHash, TxHash};
 use serial_test::serial;
 use std::collections::HashMap;
 use std::io::Write;
