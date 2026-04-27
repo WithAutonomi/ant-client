@@ -2,6 +2,10 @@
 name = "ant-cli"
 version = "0.2.0"
 edition = "2021"
+description = "Unified CLI (`ant`) for the Autonomi network: store and retrieve data, and manage local nodes."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/WithAutonomi/ant-client"
+readme = "../README.md"
 
 [[bin]]
 name = "ant"
