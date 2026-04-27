@@ -2,6 +2,10 @@
 name = "ant-core"
 version = "0.2.0"
 edition = "2021"
+description = "Headless Rust library for the Autonomi network: data storage and retrieval with self-encryption and EVM payments, plus node lifecycle management."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/WithAutonomi/ant-client"
+readme = "../README.md"
 
 [dependencies]
 # Node management
