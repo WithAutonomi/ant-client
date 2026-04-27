@@ -12,11 +12,13 @@ pub use client::{Client, ClientConfig};
 pub use error::{Error, Result};
 pub use network::Network;
 
-// Re-export LocalDevnet from its new home in the node module
+// LocalDevnet (and the optional node-side dep it pulls in) is gated behind
+// the `devnet` feature. Default builds of ant-core do not link ant-node.
+#[cfg(feature = "devnet")]
 pub use crate::node::devnet::LocalDevnet;
 
-// Re-export commonly used types from ant-node
-pub use ant_node::client::{compute_address, DataChunk, XorName};
+// Re-export commonly used types from the wire protocol crate.
+pub use ant_protocol::{compute_address, DataChunk, XorName};
 
 // Re-export client data types
 pub use client::batch::{finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk};
@@ -33,13 +35,16 @@ pub use client::merkle::{
 // Re-export self-encryption types
 pub use self_encryption::DataMap;
 
-// Re-export networking types needed by CLI for P2P node creation
-pub use ant_node::ant_protocol::{MAX_CHUNK_SIZE, MAX_WIRE_MESSAGE_SIZE};
-pub use ant_node::core::{CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode};
-pub use ant_node::devnet::DevnetManifest;
+// Re-export networking types needed by CLI for P2P node creation. The
+// devnet manifest types live in ant-protocol because both the node
+// (writer) and the CLI (reader) need them; they are always available
+// regardless of the `devnet` feature.
+pub use ant_protocol::transport::{
+    CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode,
+};
+pub use ant_protocol::{DevnetManifest, MAX_CHUNK_SIZE, MAX_WIRE_MESSAGE_SIZE};
 
 // Re-export EVM types needed by CLI for wallet and network setup
-pub use evmlib::common::{Address as EvmAddress, U256};
-pub use evmlib::wallet::Wallet;
-pub use evmlib::CustomNetwork;
-pub use evmlib::Network as EvmNetwork;
+pub use ant_protocol::evm::{
+    Address as EvmAddress, CustomNetwork, Network as EvmNetwork, Wallet, U256,
+};

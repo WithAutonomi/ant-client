@@ -4,8 +4,10 @@
 //! for the client library.
 
 use crate::data::error::{Error, Result};
-use ant_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
-use ant_node::core::{CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode, PeerId};
+use ant_protocol::transport::{
+    CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode, PeerId,
+};
+use ant_protocol::MAX_WIRE_MESSAGE_SIZE;
 use std::net::SocketAddr;
 use std::sync::Arc;
 

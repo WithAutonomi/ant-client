@@ -16,10 +16,9 @@ pub mod quote;
 use crate::data::client::cache::ChunkCache;
 use crate::data::error::{Error, Result};
 use crate::data::network::Network;
-use ant_node::client::XorName;
-use ant_node::core::{MultiAddr, P2PNode, PeerId};
-use ant_node::CLOSE_GROUP_SIZE;
-use evmlib::wallet::Wallet;
+use ant_protocol::evm::Wallet;
+use ant_protocol::transport::{MultiAddr, P2PNode, PeerId};
+use ant_protocol::{XorName, CLOSE_GROUP_SIZE};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::debug;
@@ -111,7 +110,7 @@ pub struct Client {
     config: ClientConfig,
     network: Network,
     wallet: Option<Arc<Wallet>>,
-    evm_network: Option<evmlib::Network>,
+    evm_network: Option<ant_protocol::evm::Network>,
     chunk_cache: ChunkCache,
     next_request_id: AtomicU64,
 }
@@ -178,7 +177,7 @@ impl Client {
     /// This enables token approval and contract interactions
     /// for external-signer flows where the private key lives outside Rust.
     #[must_use]
-    pub fn with_evm_network(mut self, network: evmlib::Network) -> Self {
+    pub fn with_evm_network(mut self, network: ant_protocol::evm::Network) -> Self {
         self.evm_network = Some(network);
         self
     }
@@ -188,7 +187,7 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if neither `with_evm_network` nor `with_wallet` was called.
-    pub(crate) fn require_evm_network(&self) -> Result<&evmlib::Network> {
+    pub(crate) fn require_evm_network(&self) -> Result<&ant_protocol::evm::Network> {
         if let Some(ref net) = self.evm_network {
             return Ok(net);
         }

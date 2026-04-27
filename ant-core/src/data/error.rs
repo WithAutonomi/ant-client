@@ -95,6 +95,10 @@ pub enum Error {
     },
 }
 
+// ant-node is only linked when the `devnet` feature is on, so the
+// blanket `From` impl follows that gate. LocalDevnet maps node errors
+// to `Error::Network` via this conversion; default builds never see it.
+#[cfg(feature = "devnet")]
 impl From<ant_node::Error> for Error {
     fn from(e: ant_node::Error) -> Self {
         Self::Network(e.to_string())

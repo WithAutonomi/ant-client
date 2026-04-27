@@ -6,14 +6,12 @@
 use crate::data::client::peer_cache::record_peer_outcome;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_node::ant_protocol::{
-    ChunkMessage, ChunkMessageBody, ChunkQuoteRequest, ChunkQuoteResponse,
+use ant_protocol::evm::{Amount, PaymentQuote};
+use ant_protocol::transport::{MultiAddr, PeerId};
+use ant_protocol::{
+    send_and_await_chunk_response, ChunkMessage, ChunkMessageBody, ChunkQuoteRequest,
+    ChunkQuoteResponse, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
 };
-use ant_node::client::send_and_await_chunk_response;
-use ant_node::core::{MultiAddr, PeerId};
-use ant_node::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
-use evmlib::common::Amount;
-use evmlib::PaymentQuote;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};

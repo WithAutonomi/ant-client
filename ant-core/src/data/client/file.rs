@@ -17,13 +17,10 @@ use crate::data::client::merkle::{
 };
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_node::ant_protocol::DATA_TYPE_CHUNK;
-use ant_node::client::compute_address;
-use ant_node::core::{MultiAddr, PeerId};
+use ant_protocol::evm::{Amount, PaymentQuote, QuoteHash, TxHash, MAX_LEAVES};
+use ant_protocol::transport::{MultiAddr, PeerId};
+use ant_protocol::{compute_address, DATA_TYPE_CHUNK};
 use bytes::Bytes;
-use evmlib::common::{Amount, QuoteHash, TxHash};
-use evmlib::merkle_payments::MAX_LEAVES;
-use evmlib::PaymentQuote;
 use fs2::FileExt;
 use futures::stream::{self, StreamExt};
 use self_encryption::{get_root_data_map_parallel, stream_encrypt, streaming_decrypt, DataMap};
@@ -1246,7 +1243,7 @@ impl Client {
         progress: Option<&mpsc::Sender<UploadEvent>>,
     ) -> Result<(usize, String, u128)> {
         let mut total_stored = 0usize;
-        let mut total_storage = evmlib::common::Amount::ZERO;
+        let mut total_storage = Amount::ZERO;
         let mut total_gas: u128 = 0;
         let total_chunks = spill.len();
         let waves: Vec<&[[u8; 32]]> = spill.waves().collect();
@@ -1276,7 +1273,7 @@ impl Client {
                 .batch_upload_chunks_with_events(wave_data, progress, total_stored, total_chunks)
                 .await?;
             total_stored += addresses.len();
-            if let Ok(cost) = wave_storage.parse::<evmlib::common::Amount>() {
+            if let Ok(cost) = wave_storage.parse::<Amount>() {
                 total_storage += cost;
             }
             total_gas = total_gas.saturating_add(wave_gas);
