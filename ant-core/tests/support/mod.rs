@@ -289,6 +289,10 @@ impl MiniTestnet {
             local_rewards_address: rewards_address,
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
+        // Wire the P2P node into the verifier so the merkle pay-yourself
+        // closeness check can do its DHT lookup. Without this, the
+        // verifier fail-closes on every merkle payment (PR #77 defense).
+        payment_verifier.attach_p2p_node(Arc::clone(&node));
         let metrics_tracker = QuotingMetricsTracker::new(TEST_MAX_RECORDS);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
