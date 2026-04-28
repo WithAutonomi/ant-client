@@ -35,6 +35,14 @@ pub use client::merkle::{
 // Re-export self-encryption types
 pub use self_encryption::DataMap;
 
+// Datamap file persistence helpers. Canonical path is
+// `ant_core::datamap_file::*`; these convenience re-exports let existing
+// `ant_core::data` callers reach them without an extra import.
+pub use crate::datamap_file::{
+    datamap_filename_for, original_name_from_datamap, read_datamap, write_datamap, CollisionPolicy,
+    DATAMAP_EXTENSION,
+};
+
 // Re-export networking types needed by CLI for P2P node creation. The
 // devnet manifest types live in ant-protocol because both the node
 // (writer) and the CLI (reader) need them; they are always available

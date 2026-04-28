@@ -8,8 +8,9 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use ant_core::data::{
-    Client, DataMap, DownloadEvent, Error as DataError, PaymentMode, UploadEvent,
+    Client, CollisionPolicy, DownloadEvent, Error as DataError, PaymentMode, UploadEvent,
 };
+use ant_core::datamap_file::{original_name_from_datamap, read_datamap, write_datamap};
 
 use super::chunk::parse_address;
 
@@ -37,11 +38,17 @@ pub enum FileAction {
         /// Override the store concurrency. Applies only to this upload.
         #[arg(long)]
         store_concurrency: Option<usize>,
+        /// Replace any existing `<filename>.datamap` instead of writing a
+        /// suffixed `<filename>-2.datamap`. Restores the pre-helper behaviour
+        /// for scripts that re-upload the same path repeatedly.
+        #[arg(long)]
+        overwrite: bool,
     },
     /// Download a file from the network.
     ///
     /// Public:  `ant file download ADDRESS -o output.pdf`
-    /// Private: `ant file download --datamap photo.datamap -o photo.jpg`
+    /// Private: `ant file download --datamap photo.jpg.datamap`
+    /// Private (custom output): `ant file download --datamap photo.jpg.datamap -o keep.jpg`
     Download {
         /// Hex-encoded address (public data map address).
         /// Required unless --datamap is provided.
@@ -50,9 +57,12 @@ pub enum FileAction {
         /// Path to a local data map file (for private downloads).
         #[arg(long)]
         datamap: Option<PathBuf>,
-        /// Output file path (required).
+        /// Output file path. Required for `--address` downloads. Optional for
+        /// `--datamap` downloads — defaults to the original filename derived
+        /// from the datamap basename (e.g. `photo.jpg.datamap` → `photo.jpg`,
+        /// written to the current directory).
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
     },
     /// Estimate the cost of uploading a file without uploading.
     ///
@@ -82,7 +92,33 @@ impl FileAction {
             _ => (None, None),
         }
     }
+}
 
+/// Resolve the on-disk output path for `file download`.
+///
+/// `--address` downloads have nothing to derive from, so `-o/--output` is
+/// mandatory. `--datamap` downloads default to the original filename baked
+/// into the datamap basename (`photo.jpg.datamap` → `photo.jpg`), written
+/// to the current working directory.
+fn resolve_download_output(
+    output: Option<PathBuf>,
+    datamap: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(p) = output {
+        return Ok(p);
+    }
+    let dm = datamap
+        .ok_or_else(|| anyhow::anyhow!("-o/--output is required when downloading by --address"))?;
+    let basename = original_name_from_datamap(dm).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cannot derive output filename from {}; pass -o/--output explicitly",
+            dm.display()
+        )
+    })?;
+    Ok(PathBuf::from(basename))
+}
+
+impl FileAction {
     pub async fn execute(self, client: &Client, json: bool, verbose: u8) -> anyhow::Result<()> {
         match self {
             FileAction::Upload {
@@ -92,6 +128,7 @@ impl FileAction {
                 no_merkle,
                 store_timeout: _,
                 store_concurrency: _,
+                overwrite,
             } => {
                 let mode = if merkle {
                     PaymentMode::Merkle
@@ -100,18 +137,24 @@ impl FileAction {
                 } else {
                     PaymentMode::Auto
                 };
-                handle_file_upload(client, &path, public, mode, json, verbose).await
+                let policy = if overwrite {
+                    CollisionPolicy::Overwrite
+                } else {
+                    CollisionPolicy::NumericSuffix
+                };
+                handle_file_upload(client, &path, public, mode, policy, json, verbose).await
             }
             FileAction::Download {
                 address,
                 datamap,
                 output,
             } => {
+                let resolved_output = resolve_download_output(output, datamap.as_deref())?;
                 handle_file_download(
                     client,
                     address.as_deref(),
                     datamap.as_deref(),
-                    output,
+                    resolved_output,
                     json,
                     verbose,
                 )
@@ -140,6 +183,7 @@ async fn handle_file_upload(
     path: &Path,
     public: bool,
     mode: PaymentMode,
+    collision_policy: CollisionPolicy,
     json_output: bool,
     verbose: u8,
 ) -> anyhow::Result<()> {
@@ -230,9 +274,19 @@ async fn handle_file_upload(
             result.chunks_stored
         );
     } else {
-        let datamap_path = path.with_extension("datamap");
-        let datamap_bytes = serialize_datamap(&result.data_map)?;
-        std::fs::write(&datamap_path, &datamap_bytes)?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let original_name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Cannot determine source filename from {}", path.display())
+            })?;
+        let datamap_path =
+            write_datamap(parent, &original_name, &result.data_map, collision_policy)
+                .map_err(|e| anyhow::anyhow!("Failed to persist datamap: {e}"))?;
 
         let cost_display = format_cost(&result.storage_cost_atto, result.gas_cost_wei);
 
@@ -258,10 +312,7 @@ async fn handle_file_upload(
             println!("  Time:    {:.1}s", elapsed.as_secs_f64());
             println!();
             println!("Download this file with:");
-            println!(
-                "  ant file download --datamap {} -o <FILE>",
-                datamap_path.display()
-            );
+            println!("  ant file download --datamap {}", datamap_path.display());
         }
 
         info!(
@@ -366,8 +417,7 @@ async fn handle_file_download(
         let dm_path = datamap_path
             .ok_or_else(|| anyhow::anyhow!("--datamap required for private download"))?;
         info!("Downloading file using datamap: {}", dm_path.display());
-        let datamap_bytes = std::fs::read(dm_path)?;
-        deserialize_datamap(&datamap_bytes)?
+        read_datamap(dm_path).map_err(|e| anyhow::anyhow!("Failed to read datamap: {e}"))?
     };
 
     if json_output {
@@ -561,14 +611,6 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
-}
-
-fn serialize_datamap(data_map: &DataMap) -> anyhow::Result<Vec<u8>> {
-    rmp_serde::to_vec(data_map).map_err(|e| anyhow::anyhow!("DataMap serialization failed: {e}"))
-}
-
-fn deserialize_datamap(bytes: &[u8]) -> anyhow::Result<DataMap> {
-    rmp_serde::from_slice(bytes).map_err(|e| anyhow::anyhow!("DataMap deserialization failed: {e}"))
 }
 
 /// Format storage cost for human display.

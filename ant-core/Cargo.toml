@@ -137,3 +137,7 @@ path = "tests/e2e_huge_file.rs"
 [[test]]
 name = "e2e_upload_costs"
 path = "tests/e2e_upload_costs.rs"
+
+[[test]]
+name = "datamap_file"
+path = "tests/datamap_file.rs"
