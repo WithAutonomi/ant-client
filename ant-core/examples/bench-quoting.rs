@@ -48,6 +48,13 @@ enum Mode {
     /// to exercise the adaptive controller's `quote` channel.
     /// Dumps the per-rep cap progression so we can see slow-start.
     Batch,
+    /// Drives `client.chunk_get` over many random addresses through
+    /// the same buffer_unordered shape `data_download` uses, so we
+    /// can compare main's static `quote_concurrency` cap against
+    /// feat's adaptive controller on the download hot path. No
+    /// payment needed; "not found" responses still exercise the
+    /// full DHT lookup and per-peer GET RPC pipeline.
+    Download,
     Both,
 }
 
@@ -57,6 +64,7 @@ impl Mode {
             "normal" | "single" => Some(Self::Normal),
             "merkle" => Some(Self::Merkle),
             "batch" => Some(Self::Batch),
+            "download" => Some(Self::Download),
             "both" => Some(Self::Both),
             _ => None,
         }
@@ -687,6 +695,88 @@ fn quote_cap(client: &Client) -> usize {
     client.controller().quote.current()
 }
 
+/// Resolve the runtime fetch concurrency cap. On the adaptive
+/// branch this reads the controller's fetch channel; on baseline
+/// main it falls back to `ClientConfig::quote_concurrency` since
+/// `data_download` historically used the quote knob for downloads.
+fn fetch_cap(client: &Client) -> usize {
+    client.controller().fetch.current()
+}
+
+// --------------------------------------------------------------------------
+// Download bench — drives `chunk_get` over many random addresses to
+// time the DHT lookup + GET RPC pipeline that `data_download` uses.
+// No payment needed; "not found" responses still walk the same path.
+// --------------------------------------------------------------------------
+
+async fn bench_download_once(
+    client: &Client,
+    rep: usize,
+    chunks_per_rep: usize,
+    cap_override: Option<usize>,
+) -> Rep {
+    use futures::stream::StreamExt;
+
+    let mut stages: Vec<(String, u128)> = Vec::new();
+    let total_t0 = Instant::now();
+
+    let addrs: Vec<[u8; 32]> = (0..chunks_per_rep)
+        .map(|_| rand::thread_rng().gen())
+        .collect();
+
+    let cap = cap_override.unwrap_or_else(|| fetch_cap(client));
+    stages.push(("fetch_cap_before".into(), cap as u128));
+
+    let t = Instant::now();
+    let results: Vec<Result<_, _>> = futures::stream::iter(addrs)
+        .map(|addr| {
+            let c = client;
+            async move { c.chunk_get(&addr).await }
+        })
+        .buffer_unordered(cap)
+        .collect()
+        .await;
+    let total_ms = t.elapsed().as_millis();
+    stages.push(("get_total_ms".into(), total_ms));
+
+    let mut found = 0usize;
+    let mut not_found = 0usize;
+    let mut err = 0usize;
+    for r in &results {
+        match r {
+            Ok(Some(_)) => found += 1,
+            Ok(None) => not_found += 1,
+            Err(_) => err += 1,
+        }
+    }
+    stages.push(("found".into(), found as u128));
+    stages.push(("not_found".into(), not_found as u128));
+    stages.push(("err".into(), err as u128));
+
+    let cap_after = fetch_cap(client);
+    stages.push(("fetch_cap_after".into(), cap_after as u128));
+
+    let per_chunk_ms = if chunks_per_rep > 0 {
+        total_ms / chunks_per_rep as u128
+    } else {
+        0
+    };
+    stages.push(("get_per_chunk_ms".into(), per_chunk_ms));
+
+    Rep {
+        rep,
+        stages_ms: stages,
+        total_ms: total_t0.elapsed().as_millis(),
+        // Random addresses: ok=true means every call returned (with
+        // not-found or content), no transport errors. We don't
+        // require found>0 because the addresses are random.
+        ok: err == 0,
+        note: format!(
+            "{found} found, {not_found} not-found, {err} err; cap {cap}->{cap_after}",
+        ),
+    }
+}
+
 // --------------------------------------------------------------------------
 // Reporting
 // --------------------------------------------------------------------------
@@ -857,6 +947,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let summary = summarise(&reps);
         let label = format!(
             "batch-quoting ({} reps, {} chunks/rep, controller-driven)",
+            args.reps, args.chunks_per_rep
+        );
+        print_report(&label, &reps, &summary);
+        full_report.push((label, reps, summary));
+    }
+
+    if matches!(args.mode, Mode::Download | Mode::Both) {
+        let mut reps = Vec::with_capacity(args.reps);
+        for i in 0..args.reps {
+            eprintln!(
+                "download rep {}/{} (chunks_per_rep={})...",
+                i + 1,
+                args.reps,
+                args.chunks_per_rep
+            );
+            let r = match tokio::time::timeout(
+                rep_cap,
+                bench_download_once(&client, i + 1, args.chunks_per_rep, args.batch_cap_override),
+            )
+            .await
+            {
+                Ok(rep) => rep,
+                Err(_) => Rep {
+                    rep: i + 1,
+                    stages_ms: vec![],
+                    total_ms: rep_cap.as_millis(),
+                    ok: false,
+                    note: format!("(rep timeout {}s)", args.rep_timeout_secs),
+                },
+            };
+            eprintln!(
+                "  => rep {} done ok={} total={}ms  {}",
+                r.rep, r.ok, r.total_ms, r.note
+            );
+            reps.push(r);
+        }
+        let summary = summarise(&reps);
+        let label = format!(
+            "download ({} reps, {} chunks/rep, controller-driven fetch)",
             args.reps, args.chunks_per_rep
         );
         print_report(&label, &reps, &summary);
