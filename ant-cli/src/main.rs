@@ -130,21 +130,30 @@ async fn run() -> anyhow::Result<()> {
         }
         Commands::File { action } => {
             let needs_wallet = matches!(action, commands::data::FileAction::Upload { .. });
-            // Extract per-upload overrides before building the client.
+            // Extract per-upload overrides BEFORE building the client
+            // so the adaptive controller picks them up at construction.
             let (store_timeout_override, store_concurrency_override) = action.upload_overrides();
-            let mut client = build_data_client(&data_ctx, needs_wallet, json).await?;
-            if let Some(t) = store_timeout_override {
-                client.config_mut().store_timeout_secs = t;
-            }
-            if let Some(c) = store_concurrency_override {
-                client.config_mut().store_concurrency = c;
-            }
-            action.execute(&client, json).await?;
+            let client = build_data_client(
+                &data_ctx,
+                needs_wallet,
+                json,
+                store_timeout_override,
+                store_concurrency_override,
+            )
+            .await?;
+            let result = action.execute(&client, json).await;
+            // Persist whatever the controller learned this run, even
+            // on error — partial signal is still better than cold next
+            // time. Drop will also fire as a backstop.
+            client.save_adaptive_snapshot();
+            result?;
         }
         Commands::Chunk { action } => {
             let needs_wallet = matches!(action, commands::data::ChunkAction::Put { .. });
-            let client = build_data_client(&data_ctx, needs_wallet, json).await?;
-            action.execute(&client).await?;
+            let client = build_data_client(&data_ctx, needs_wallet, json, None, None).await?;
+            let result = action.execute(&client).await;
+            client.save_adaptive_snapshot();
+            result?;
         }
         Commands::Update(args) => {
             args.execute(json).await?;
@@ -168,10 +177,19 @@ struct DataCliContext {
 }
 
 /// Build a data client with wallet if SECRET_KEY is set.
+///
+/// Per-action overrides (`store_timeout_override`,
+/// `store_concurrency_override`) are applied BEFORE constructing the
+/// adaptive controller, so the controller actually honors them as
+/// caps. Mutating `client.config_mut()` after construction would be a
+/// no-op for the controller (the controller is built once at
+/// `Client::from_node`).
 async fn build_data_client(
     ctx: &DataCliContext,
     needs_wallet: bool,
     quiet: bool,
+    store_timeout_override: Option<u64>,
+    store_concurrency_override: Option<usize>,
 ) -> anyhow::Result<Client> {
     let private_key = std::env::var("SECRET_KEY")
         .ok()
@@ -241,11 +259,61 @@ async fn build_data_client(
         store_timeout_secs: ctx.store_timeout_secs,
         ..Default::default()
     };
+    // Legacy default values are treated as "not pinned" by build_controller
+    // (so the default ClientConfig doesn't silently lower the new
+    // adaptive ceilings). Mirror that here so the deprecation warning
+    // doesn't lie when a user passes a value equal to the legacy default.
+    const LEGACY_QUOTE_DEFAULT: usize = 32;
+    const LEGACY_STORE_DEFAULT: usize = 8;
     if let Some(concurrency) = ctx.quote_concurrency {
+        if concurrency == LEGACY_QUOTE_DEFAULT {
+            eprintln!(
+                "warning: --quote-concurrency={concurrency} matches the legacy \
+                 default and is silently ignored by the adaptive controller. \
+                 Pass a different value to actually cap the quote channel."
+            );
+        } else {
+            eprintln!(
+                "warning: --quote-concurrency is deprecated; the adaptive controller \
+                 sizes quote concurrency from observed signals. Your value \
+                 ({concurrency}) caps the quote channel only (store and download \
+                 are unaffected) and will be removed in a future release."
+            );
+        }
         config.quote_concurrency = concurrency;
     }
     if let Some(concurrency) = ctx.store_concurrency {
+        if concurrency == LEGACY_STORE_DEFAULT {
+            eprintln!(
+                "warning: --store-concurrency={concurrency} matches the legacy \
+                 default and is silently ignored by the adaptive controller. \
+                 Pass a different value to actually cap the store channel."
+            );
+        } else {
+            eprintln!(
+                "warning: --store-concurrency is deprecated; the adaptive controller \
+                 sizes store concurrency from observed signals. Your value \
+                 ({concurrency}) caps the store channel only (quote and download \
+                 are unaffected) and will be removed in a future release."
+            );
+        }
         config.store_concurrency = concurrency;
+    }
+    // Per-action overrides (e.g. `ant file upload --store-concurrency`)
+    // applied here, BEFORE Client::from_node so the adaptive
+    // controller actually picks them up. Mutating `config_mut()` after
+    // construction is a no-op for the controller's per-channel max.
+    if let Some(t) = store_timeout_override {
+        config.store_timeout_secs = t;
+    }
+    if let Some(c) = store_concurrency_override {
+        eprintln!(
+            "warning: --store-concurrency on upload is deprecated; the \
+             adaptive controller sizes store concurrency from observed \
+             signals. Your value ({c}) caps the store channel only and \
+             will be removed in a future release."
+        );
+        config.store_concurrency = c;
     }
 
     let mut client = Client::from_node(node, config);

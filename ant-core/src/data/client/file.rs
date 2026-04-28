@@ -10,7 +10,9 @@
 //!
 //! For in-memory data uploads, see the `data` module.
 
+use crate::data::client::adaptive::observe_op;
 use crate::data::client::batch::{finalize_batch_payment, PaymentIntent, PreparedChunk};
+use crate::data::client::classify_error;
 use crate::data::client::merkle::{
     finalize_merkle_batch, should_use_merkle, MerkleBatchPaymentResult, PaymentMode,
     PreparedMerkleBatch,
@@ -931,9 +933,20 @@ impl Client {
             }
         } else {
             // Wave-batch path: collect quotes per chunk concurrently.
-            let quote_concurrency = self.config().quote_concurrency;
+            let quote_limiter = self.controller().quote.clone();
+            let quote_concurrency = quote_limiter.current();
             let results: Vec<Result<Option<PreparedChunk>>> = stream::iter(chunk_data)
-                .map(|content| async move { self.prepare_chunk_payment(content).await })
+                .map(|content| {
+                    let limiter = quote_limiter.clone();
+                    async move {
+                        observe_op(
+                            &limiter,
+                            || async move { self.prepare_chunk_payment(content).await },
+                            classify_error,
+                        )
+                        .await
+                    }
+                })
                 .buffer_unordered(quote_concurrency)
                 .collect()
                 .await;
@@ -1337,8 +1350,11 @@ impl Client {
                 wave.len()
             );
 
+            let store_limiter = self.controller().store.clone();
+            let store_concurrency = store_limiter.current();
             let mut upload_stream = stream::iter(wave.into_iter().map(|(content, addr)| {
                 let proof_bytes = batch_result.proofs.get(&addr).cloned();
+                let limiter = store_limiter.clone();
                 async move {
                     let proof = proof_bytes.ok_or_else(|| {
                         (
@@ -1350,13 +1366,19 @@ impl Client {
                         )
                     })?;
                     let peers = self.close_group_peers(&addr).await.map_err(|e| (addr, e))?;
-                    self.chunk_put_to_close_group(content, proof, &peers)
-                        .await
-                        .map(|_| addr)
-                        .map_err(|e| (addr, e))
+                    observe_op(
+                        &limiter,
+                        || async move {
+                            self.chunk_put_to_close_group(content, proof, &peers).await
+                        },
+                        classify_error,
+                    )
+                    .await
+                    .map(|_| addr)
+                    .map_err(|e| (addr, e))
                 }
             }))
-            .buffer_unordered(self.config().store_concurrency);
+            .buffer_unordered(store_concurrency);
 
             while let Some(result) = upload_stream.next().await {
                 match result {
@@ -1468,22 +1490,32 @@ impl Client {
             let resolved = tokio::task::block_in_place(|| {
                 let counter_ref = resolve_counter.clone();
                 let progress_ref = resolve_progress.clone();
+                let fetch_limiter = self.controller().fetch.clone();
                 let fetch = |batch: &[(usize, XorName)]| {
                     let batch_owned: Vec<(usize, XorName)> = batch.to_vec();
                     let counter = counter_ref.clone();
                     let prog = progress_ref.clone();
+                    let limiter = fetch_limiter.clone();
                     handle.block_on(async {
-                        let mut futs = futures::stream::FuturesUnordered::new();
-                        for (idx, hash) in batch_owned {
-                            let addr = hash.0;
-                            futs.push(async move {
-                                let result = self.chunk_get(&addr).await;
-                                (idx, hash, result)
-                            });
-                        }
-                        let mut results = Vec::with_capacity(futs.len());
+                        let cap = limiter.current();
+                        let mut stream = futures::stream::iter(batch_owned)
+                            .map(|(idx, hash)| {
+                                let addr = hash.0;
+                                let limiter = limiter.clone();
+                                async move {
+                                    let result = observe_op(
+                                        &limiter,
+                                        || async move { self.chunk_get(&addr).await },
+                                        classify_error,
+                                    )
+                                    .await;
+                                    (idx, hash, result)
+                                }
+                            })
+                            .buffer_unordered(cap);
+                        let mut results = Vec::new();
                         while let Some((idx, hash, result)) =
-                            futures::StreamExt::next(&mut futs).await
+                            futures::StreamExt::next(&mut stream).await
                         {
                             let chunk = result
                                 .map_err(|e| {
@@ -1504,6 +1536,15 @@ impl Client {
                                 let _ = tx.try_send(DownloadEvent::MapChunkFetched { fetched });
                             }
                         }
+                        // CRITICAL: self_encryption::get_root_data_map_parallel
+                        // pairs the returned Vec POSITIONALLY with the input
+                        // hashes via .zip() and discards our idx field. We
+                        // used buffer_unordered, so completions arrive in
+                        // arbitrary order. Sort by idx to restore the input
+                        // order before returning, otherwise chunk bytes get
+                        // paired with the wrong hashes and the root data
+                        // map is corrupted.
+                        results.sort_by_key(|(idx, _)| *idx);
                         Ok(results)
                     })
                 };
@@ -1531,24 +1572,35 @@ impl Client {
         let fetched_for_closure = fetched_counter.clone();
         let progress_for_closure = progress.clone();
 
+        let fetch_limiter_outer = self.controller().fetch.clone();
         let stream = streaming_decrypt(&root_map, |batch: &[(usize, XorName)]| {
             let batch_owned: Vec<(usize, XorName)> = batch.to_vec();
             let fetched_ref = fetched_for_closure.clone();
             let progress_ref = progress_for_closure.clone();
+            let fetch_limiter = fetch_limiter_outer.clone();
 
             tokio::task::block_in_place(|| {
                 handle.block_on(async {
-                    let mut futs = futures::stream::FuturesUnordered::new();
-                    for (idx, hash) in batch_owned {
-                        let addr = hash.0;
-                        futs.push(async move {
-                            let result = self.chunk_get(&addr).await;
-                            (idx, hash, result)
-                        });
-                    }
+                    let cap = fetch_limiter.current();
+                    let mut stream = futures::stream::iter(batch_owned)
+                        .map(|(idx, hash)| {
+                            let addr = hash.0;
+                            let limiter = fetch_limiter.clone();
+                            async move {
+                                let result = observe_op(
+                                    &limiter,
+                                    || async move { self.chunk_get(&addr).await },
+                                    classify_error,
+                                )
+                                .await;
+                                (idx, hash, result)
+                            }
+                        })
+                        .buffer_unordered(cap);
 
-                    let mut results = Vec::with_capacity(futs.len());
-                    while let Some((idx, hash, result)) = futures::StreamExt::next(&mut futs).await
+                    let mut results = Vec::new();
+                    while let Some((idx, hash, result)) =
+                        futures::StreamExt::next(&mut stream).await
                     {
                         let addr_hex = hex::encode(hash.0);
                         let chunk = result
@@ -1573,6 +1625,13 @@ impl Client {
                             });
                         }
                     }
+                    // streaming_decrypt itself sort_by_keys before
+                    // zipping, but the same closure is also passed
+                    // through get_root_data_map_parallel internally
+                    // (see self_encryption::stream_decrypt.rs::new), and
+                    // THAT path zips positionally without sorting. Sort
+                    // here so both consumers see input order.
+                    results.sort_by_key(|(idx, _)| *idx);
                     Ok(results)
                 })
             })

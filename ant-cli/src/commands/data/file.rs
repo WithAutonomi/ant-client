@@ -32,11 +32,15 @@ pub enum FileAction {
         /// Disable merkle batch payment, always use per-chunk payments.
         #[arg(long, conflicts_with = "merkle")]
         no_merkle: bool,
-        /// Override the store timeout (seconds). Applies only to this upload.
-        #[arg(long)]
+        /// **Deprecated.** Per-upload override for the store timeout
+        /// (seconds). The adaptive controller now sizes timeouts from
+        /// observed RTT; this override is retained for one release.
+        #[arg(long, hide = true)]
         store_timeout: Option<u64>,
-        /// Override the store concurrency. Applies only to this upload.
-        #[arg(long)]
+        /// **Deprecated.** Per-upload override for store concurrency.
+        /// The adaptive controller now sizes concurrency from observed
+        /// signals; this override is retained for one release.
+        #[arg(long, hide = true)]
         store_concurrency: Option<usize>,
     },
     /// Download a file from the network.
