@@ -6,14 +6,16 @@
 //! For file-based streaming uploads that avoid loading the entire
 //! file into memory, see the `file` module.
 
+use crate::data::client::adaptive::{observe_op, rebucketed_ordered};
 use crate::data::client::batch::{PaymentIntent, PreparedChunk};
+use crate::data::client::classify_error;
 use crate::data::client::file::{ExternalPaymentInfo, PreparedUpload};
 use crate::data::client::merkle::PaymentMode;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::{compute_address, DATA_TYPE_CHUNK};
 use bytes::Bytes;
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::stream::StreamExt;
 use self_encryption::{decrypt, encrypt, DataMap, EncryptedChunk};
 use tracing::{debug, info};
 
@@ -177,9 +179,20 @@ impl Client {
             .map(|chunk| chunk.content)
             .collect();
 
-        let quote_concurrency = self.config().quote_concurrency;
+        let quote_limiter = self.controller().quote.clone();
+        let quote_concurrency = quote_limiter.current().min(chunk_count.max(1));
         let results: Vec<Result<Option<PreparedChunk>>> = futures::stream::iter(chunk_contents)
-            .map(|content| async move { self.prepare_chunk_payment(content).await })
+            .map(|content| {
+                let limiter = quote_limiter.clone();
+                async move {
+                    observe_op(
+                        &limiter,
+                        || async move { self.prepare_chunk_payment(content).await },
+                        classify_error,
+                    )
+                    .await
+                }
+            })
             .buffer_unordered(quote_concurrency)
             .collect()
             .await;
@@ -252,8 +265,9 @@ impl Client {
     /// Download and decrypt data from the network using its `DataMap`.
     ///
     /// Retrieves all chunks referenced by the data map, then decrypts
-    /// and reassembles the original content. Fetches chunks concurrently
-    /// (bounded by `quote_concurrency`) while preserving order.
+    /// and reassembles the original content. Fetches chunks concurrently;
+    /// the fan-out is sized by the adaptive controller's `fetch` channel
+    /// and ramps up under healthy conditions.
     ///
     /// # Errors
     ///
@@ -266,21 +280,40 @@ impl Client {
         // stream::iter over references combined with async closures.
         let addresses: Vec<[u8; 32]> = chunk_infos.iter().map(|info| info.dst_hash.0).collect();
 
-        let encrypted_chunks: Vec<EncryptedChunk> = stream::iter(addresses)
-            .map(|address| async move {
-                let chunk = self.chunk_get(&address).await?.ok_or_else(|| {
-                    Error::InvalidData(format!(
-                        "Missing chunk {} required for data reconstruction",
-                        hex::encode(address)
+        // Rolling rebucketing: re-reads the controller's fetch cap as
+        // each slot frees, so a long download (e.g. 10 GB = ~2500
+        // chunks) sees adaptive growth/decay mid-flight without batch
+        // fences. Output is index-sorted so self_encryption decrypt
+        // sees DataMap-ordered chunks.
+        let fetch_limiter = self.controller().fetch.clone();
+        let encrypted_chunks: Vec<EncryptedChunk> = rebucketed_ordered(
+            &fetch_limiter,
+            addresses.into_iter().enumerate(),
+            |(idx, address)| {
+                let limiter = fetch_limiter.clone();
+                async move {
+                    let chunk = observe_op(
+                        &limiter,
+                        || async move { self.chunk_get(&address).await },
+                        classify_error,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        Error::InvalidData(format!(
+                            "Missing chunk {} required for data reconstruction",
+                            hex::encode(address)
+                        ))
+                    })?;
+                    Ok::<_, Error>((
+                        idx,
+                        EncryptedChunk {
+                            content: chunk.content,
+                        },
                     ))
-                })?;
-                Ok::<_, Error>(EncryptedChunk {
-                    content: chunk.content,
-                })
-            })
-            .buffered(self.config().quote_concurrency)
-            .try_collect()
-            .await?;
+                }
+            },
+        )
+        .await?;
 
         debug!(
             "All {} chunks retrieved, decrypting",

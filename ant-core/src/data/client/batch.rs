@@ -4,6 +4,8 @@
 //! wave in a single EVM transaction. Stores from wave N are pipelined
 //! with quote collection for wave N+1 via `tokio::join!`.
 
+use crate::data::client::adaptive::observe_op;
+use crate::data::client::classify_error;
 use crate::data::client::file::UploadEvent;
 use crate::data::client::payment::peer_id_to_encoded;
 use crate::data::client::Client;
@@ -306,9 +308,12 @@ impl Client {
         }
 
         let total_chunks = chunks.len();
-        let quote_concurrency = self.config().quote_concurrency;
-        let store_concurrency = self.config().store_concurrency;
-        debug!("Batch uploading {total_chunks} chunks in waves of {PAYMENT_WAVE_SIZE} (quote_concurrency: {quote_concurrency}, store_concurrency: {store_concurrency})");
+        let quote_cap = self.controller().quote.current();
+        let store_cap = self.controller().store.current();
+        debug!(
+            "Batch uploading {total_chunks} chunks in waves of {PAYMENT_WAVE_SIZE} \
+             (current adaptive caps — quote: {quote_cap}, store: {store_cap})"
+        );
 
         let mut all_addresses = Vec::with_capacity(total_chunks);
         let mut seen_addresses: HashSet<XorName> = HashSet::new();
@@ -470,11 +475,26 @@ impl Client {
             })
             .collect();
 
+        let quote_limiter = self.controller().quote.clone();
+        // Batch-aware fan-out: clamp to chunk_count so we never
+        // pay for fan-out slots we cannot fill on a partial wave.
+        // See PERF-RESULTS.md — measured ~30% slowdown when
+        // cap > batch size on quoting workloads (live mainnet).
+        let quote_concurrency = quote_limiter.current().min(chunk_count.max(1));
         let mut quote_stream = stream::iter(chunks_with_addr)
-            .map(|(content, address)| async move {
-                (address, self.prepare_chunk_payment(content).await)
+            .map(|(content, address)| {
+                let limiter = quote_limiter.clone();
+                async move {
+                    let result = observe_op(
+                        &limiter,
+                        || async move { self.prepare_chunk_payment(content).await },
+                        classify_error,
+                    )
+                    .await;
+                    (address, result)
+                }
             })
-            .buffer_unordered(self.config().quote_concurrency);
+            .buffer_unordered(quote_concurrency);
 
         let mut prepared = Vec::with_capacity(chunk_count);
         let mut already_stored = Vec::new();
@@ -545,21 +565,30 @@ impl Client {
                 );
             }
 
+            let store_limiter = self.controller().store.clone();
+            let store_concurrency = store_limiter.current().min(to_retry.len().max(1));
             let mut upload_stream = stream::iter(to_retry)
                 .map(|chunk| {
                     let chunk_clone = chunk.clone();
+                    let limiter = store_limiter.clone();
                     async move {
-                        let result = self
-                            .chunk_put_to_close_group(
-                                chunk.content,
-                                chunk.proof_bytes,
-                                &chunk.quoted_peers,
-                            )
-                            .await;
+                        let result = observe_op(
+                            &limiter,
+                            || async move {
+                                self.chunk_put_to_close_group(
+                                    chunk.content,
+                                    chunk.proof_bytes,
+                                    &chunk.quoted_peers,
+                                )
+                                .await
+                            },
+                            classify_error,
+                        )
+                        .await;
                         (chunk_clone, result)
                     }
                 })
-                .buffer_unordered(self.config().store_concurrency);
+                .buffer_unordered(store_concurrency);
 
             let mut failed_this_round = Vec::new();
             while let Some((chunk, result)) = upload_stream.next().await {

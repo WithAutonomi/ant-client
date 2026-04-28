@@ -37,26 +37,32 @@ pub struct Cli {
     #[arg(long)]
     pub ipv4_only: bool,
 
-    /// Timeout for lightweight network operations such as quotes and DHT
-    /// lookups (seconds).
-    #[arg(long, default_value_t = 10)]
+    /// Per-op timeout for quote / DHT-lookup operations (seconds).
+    /// Static knob; the adaptive controller does not currently size
+    /// timeouts.
+    #[arg(long, default_value_t = 10, hide = true)]
     pub quote_timeout_secs: u64,
 
-    /// Timeout for chunk store/retrieve operations (seconds).
-    /// Chunk PUTs transfer multi-MB payloads, so this should be longer than
-    /// the quote timeout.
-    #[arg(long, default_value_t = 60)]
+    /// Per-op timeout for chunk store / retrieve operations (seconds).
+    /// Static knob; the adaptive controller does not currently size
+    /// timeouts.
+    #[arg(long, default_value_t = 60, hide = true)]
     pub store_timeout_secs: u64,
 
-    /// Maximum number of chunks quoted or downloaded concurrently.
-    /// Defaults to 32. Safe to set high — quoting is pure network I/O.
-    #[arg(long)]
+    /// **Deprecated.** Adaptive controller now sizes quote
+    /// concurrency from observed network signals. Setting this caps
+    /// the controller's max for the quote channel only (does not
+    /// affect store or download). Removed in a future release.
+    /// Must be > 0.
+    #[arg(long, hide = true, value_parser = parse_positive_usize)]
     pub quote_concurrency: Option<usize>,
 
-    /// Maximum number of chunks stored concurrently during uploads.
-    /// Defaults to half the available CPU threads. Lower values are
-    /// more reliable when storing to NAT-restricted nodes.
-    #[arg(long, alias = "chunk-concurrency")]
+    /// **Deprecated.** Adaptive controller now sizes store
+    /// concurrency from observed network signals. Setting this caps
+    /// the controller's max for the store channel only (does not
+    /// affect quote or download). Removed in a future release.
+    /// Must be > 0.
+    #[arg(long, alias = "chunk-concurrency", hide = true, value_parser = parse_positive_usize)]
     pub store_concurrency: Option<usize>,
 
     /// Increase verbosity. By default no logs are emitted (privacy by design).
@@ -96,4 +102,17 @@ pub enum Commands {
     },
     /// Update the ant binary to the latest version
     Update(UpdateArgs),
+}
+
+/// clap value parser that rejects 0 for the deprecated concurrency
+/// pins (a pin of 0 silently disables itself in the controller, which
+/// is confusing — fail fast at parse time instead).
+fn parse_positive_usize(s: &str) -> Result<usize, String> {
+    let n: usize = s
+        .parse()
+        .map_err(|e| format!("not a non-negative integer: {e}"))?;
+    if n == 0 {
+        return Err("must be > 0".to_string());
+    }
+    Ok(n)
 }
