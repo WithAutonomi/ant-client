@@ -8,6 +8,7 @@ pub mod error;
 pub mod network;
 
 pub use client::cache::ChunkCache;
+pub use client::chunk::PeerPool;
 pub use client::{Client, ClientConfig};
 pub use error::{Error, Result};
 pub use network::Network;
