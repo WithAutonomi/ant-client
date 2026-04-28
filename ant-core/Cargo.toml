@@ -1,6 +1,6 @@
 [package]
 name = "ant-core"
-version = "0.2.0"
+version = "0.2.1-rc.1"
 edition = "2021"
 description = "Headless Rust library for the Autonomi network: data storage and retrieval with self-encryption and EVM payments, plus node lifecycle management."
 license = "MIT OR Apache-2.0"
@@ -36,7 +36,7 @@ tower-http = { version = "0.6.8", features = ["cors"] }
 # under `ant_protocol::{evm, transport, pqc}`. This is the ONE pin for
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
-ant-protocol = "2.0.1"
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "rc-2026.4.3" }
 xor_name = "5"
 self_encryption = "0.35.0"
 futures = "0.3"

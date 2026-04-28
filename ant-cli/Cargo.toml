@@ -1,6 +1,6 @@
 [package]
 name = "ant-cli"
-version = "0.2.0"
+version = "0.2.1-rc.1"
 edition = "2021"
 description = "Unified CLI (`ant`) for the Autonomi network: store and retrieve data, and manage local nodes."
 license = "MIT OR Apache-2.0"
