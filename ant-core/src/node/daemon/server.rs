@@ -15,7 +15,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
 use crate::node::binary::NoopProgress;
-use crate::node::daemon::supervisor::Supervisor;
+use crate::node::daemon::supervisor::{
+    spawn_liveness_monitor, spawn_upgrade_monitor, Supervisor, LIVENESS_POLL_INTERVAL,
+    UPGRADE_POLL_INTERVAL,
+};
 use crate::node::events::NodeEvent;
 use crate::node::registry::NodeRegistry;
 use crate::node::types::{
@@ -26,7 +29,7 @@ use crate::node::types::{
 
 /// Shared application state for the daemon HTTP server.
 pub struct AppState {
-    pub registry: RwLock<NodeRegistry>,
+    pub registry: Arc<RwLock<NodeRegistry>>,
     pub supervisor: Arc<RwLock<Supervisor>>,
     pub event_tx: broadcast::Sender<NodeEvent>,
     pub start_time: Instant,
@@ -40,7 +43,7 @@ pub struct AppState {
 /// Returns the actual address the server bound to (useful when port is 0).
 pub async fn start(
     config: DaemonConfig,
-    registry: NodeRegistry,
+    mut registry: NodeRegistry,
     shutdown: CancellationToken,
 ) -> Result<SocketAddr> {
     let (event_tx, _) = broadcast::channel(256);
@@ -53,14 +56,61 @@ pub async fn start(
         .local_addr()
         .map_err(|e| crate::error::Error::BindError(e.to_string()))?;
 
+    // Heal any stale `version` entries in the registry. If an earlier daemon ran without the
+    // upgrade-aware supervisor, the on-disk binary may have been replaced without the registry
+    // being updated. We re-read each binary's version and persist any differences before the
+    // supervisor comes up, so subsequent status queries reflect reality.
+    reconcile_registry_versions(&mut registry).await;
+
+    let registry = Arc::new(RwLock::new(registry));
+    let supervisor = Arc::new(RwLock::new(Supervisor::new(event_tx.clone())));
+
+    // Adopt node processes spawned by a previous daemon instance. Must run before
+    // `axum::serve` starts accepting requests — the window between supervisor
+    // creation and adoption is where `/api/v1/nodes/status` would otherwise report
+    // live nodes as Stopped (the supervisor's default when it has no runtime entry).
+    {
+        let reg = registry.read().await;
+        let mut sup = supervisor.write().await;
+        let adopted = sup.adopt_from_registry(&reg);
+        if !adopted.is_empty() {
+            tracing::info!(
+                "Adopted {} running node(s) from a previous daemon instance: {:?}",
+                adopted.len(),
+                adopted
+            );
+        }
+    }
+
     let state = Arc::new(AppState {
-        registry: RwLock::new(registry),
-        supervisor: Arc::new(RwLock::new(Supervisor::new(event_tx.clone()))),
-        event_tx,
+        registry: registry.clone(),
+        supervisor: supervisor.clone(),
+        event_tx: event_tx.clone(),
         start_time: Instant::now(),
         config: config.clone(),
         bound_port: bound_addr.port(),
     });
+
+    // Background task: probe each Running node's on-disk binary for version drift caused by
+    // ant-node's auto-upgrade, and flip them to UpgradeScheduled so the supervisor knows the
+    // next exit is expected.
+    spawn_upgrade_monitor(
+        registry.clone(),
+        supervisor.clone(),
+        UPGRADE_POLL_INTERVAL,
+        shutdown.clone(),
+    );
+
+    // Background task: poll adopted nodes' PIDs for OS liveness. Daemon-spawned nodes
+    // get exit detection via `monitor_node`'s owned `Child` handle; adopted nodes don't,
+    // so this poll is the only way the supervisor learns when one of them exits.
+    spawn_liveness_monitor(
+        registry,
+        supervisor,
+        event_tx,
+        LIVENESS_POLL_INTERVAL,
+        shutdown.clone(),
+    );
 
     let app = build_router(state.clone());
 
@@ -94,7 +144,7 @@ fn build_router(state: Arc<AppState>) -> Router {
     // don't send Origin headers so CORS doesn't affect them.
     let origin = format!("http://127.0.0.1:{}", state.bound_port);
     let cors = CorsLayer::new()
-        .allow_origin(origin.parse::<HeaderValue>().unwrap())
+        .allow_origin([origin.parse::<HeaderValue>().unwrap()])
         .allow_methods(Any)
         .allow_headers(Any);
 
@@ -173,12 +223,15 @@ async fn get_nodes_status(State(state): State<Arc<AppState>>) -> Json<NodeStatus
             .unwrap_or(NodeStatus::Stopped);
 
         match status {
-            NodeStatus::Running | NodeStatus::Starting => total_running += 1,
+            NodeStatus::Running | NodeStatus::Starting | NodeStatus::UpgradeScheduled => {
+                total_running += 1
+            }
             _ => total_stopped += 1,
         }
 
         let pid = supervisor.node_pid(config.id);
         let uptime_secs = supervisor.node_uptime_secs(config.id);
+        let pending_version = supervisor.node_pending_version(config.id);
 
         nodes.push(NodeStatusSummary {
             node_id: config.id,
@@ -187,6 +240,7 @@ async fn get_nodes_status(State(state): State<Arc<AppState>>) -> Json<NodeStatus
             status,
             pid,
             uptime_secs,
+            pending_version,
         });
     }
 
@@ -217,12 +271,14 @@ async fn get_node_detail(
     let status = supervisor.node_status(id).unwrap_or(NodeStatus::Stopped);
     let pid = supervisor.node_pid(id);
     let uptime_secs = supervisor.node_uptime_secs(id);
+    let pending_version = supervisor.node_pending_version(id);
 
     Ok(Json(NodeInfo {
         config,
         status,
         pid,
         uptime_secs,
+        pending_version,
     }))
 }
 
@@ -328,7 +384,11 @@ async fn post_start_node(
         ));
     }
 
-    match supervisor.start_node(&config, supervisor_ref).await {
+    let registry_ref = state.registry.clone();
+    match supervisor
+        .start_node(&config, supervisor_ref, registry_ref)
+        .await
+    {
         Ok(started) => Ok(Json(started)),
         Err(crate::error::Error::NodeAlreadyRunning(id)) => {
             let pid = supervisor.node_pid(id);
@@ -364,6 +424,7 @@ async fn post_start_all(State(state): State<Arc<AppState>>) -> Json<StartNodeRes
     let mut already_running = Vec::new();
 
     let supervisor_ref = state.supervisor.clone();
+    let registry_ref = state.registry.clone();
 
     for config in &configs {
         let mut supervisor = state.supervisor.write().await;
@@ -372,7 +433,10 @@ async fn post_start_all(State(state): State<Arc<AppState>>) -> Json<StartNodeRes
             continue;
         }
 
-        match supervisor.start_node(config, supervisor_ref.clone()).await {
+        match supervisor
+            .start_node(config, supervisor_ref.clone(), registry_ref.clone())
+            .await
+        {
             Ok(result) => started.push(result),
             Err(crate::error::Error::NodeAlreadyRunning(id)) => {
                 already_running.push(id);
@@ -744,4 +808,135 @@ fn write_file(path: &PathBuf, contents: &str) -> Result<()> {
     }
     std::fs::write(path, contents)?;
     Ok(())
+}
+
+/// Refresh each registered node's `version` against what its on-disk binary reports.
+///
+/// Intended as a one-time pass at daemon startup to heal registries left in a stale state by
+/// earlier daemon versions that didn't track auto-upgrades. Missing binaries and transient
+/// `--version` failures are silently skipped so daemon startup never aborts on this.
+async fn reconcile_registry_versions(registry: &mut NodeRegistry) {
+    let node_ids: Vec<u32> = registry.list().iter().map(|c| c.id).collect();
+    let mut changed = false;
+
+    for id in node_ids {
+        let (binary_path, recorded_version) = match registry.get(id) {
+            Ok(c) => (c.binary_path.clone(), c.version.clone()),
+            Err(_) => continue,
+        };
+
+        if !binary_path.exists() {
+            continue;
+        }
+
+        let Ok(disk_version) = crate::node::binary::extract_version(&binary_path).await else {
+            continue;
+        };
+
+        if disk_version == recorded_version {
+            continue;
+        }
+
+        if let Ok(entry) = registry.get_mut(id) {
+            entry.version = disk_version;
+            changed = true;
+        }
+    }
+
+    if changed {
+        let _ = registry.save();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::node::registry::NodeRegistry;
+    use crate::node::types::NodeConfig;
+    use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_fake_binary(path: &std::path::Path, stdout: &str) {
+        let script = format!("#!/bin/sh\nprintf '%s\\n' '{stdout}'\n");
+        std::fs::write(path, script).unwrap();
+        let mut perm = std::fs::metadata(path).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(path, perm).unwrap();
+    }
+
+    fn seed_config(binary_path: PathBuf, version: &str, data_dir: PathBuf) -> NodeConfig {
+        NodeConfig {
+            id: 0,
+            service_name: String::new(),
+            rewards_address: "0x0".into(),
+            data_dir,
+            log_dir: None,
+            node_port: None,
+            metrics_port: None,
+            network_id: Some(1),
+            binary_path,
+            version: version.into(),
+            env_variables: HashMap::new(),
+            bootstrap_peers: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_updates_stale_version_and_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = tmp.path().join("registry.json");
+        let bin_path = tmp.path().join("ant-node");
+        write_fake_binary(&bin_path, "ant-node 0.10.11-rc.1");
+
+        let mut registry = NodeRegistry::load(&reg_path).unwrap();
+        let id = registry.add(seed_config(
+            bin_path.clone(),
+            "0.10.1",
+            tmp.path().join("data"),
+        ));
+        registry.save().unwrap();
+
+        reconcile_registry_versions(&mut registry).await;
+
+        assert_eq!(registry.get(id).unwrap().version, "0.10.11-rc.1");
+
+        let reloaded = NodeRegistry::load(&reg_path).unwrap();
+        assert_eq!(reloaded.get(id).unwrap().version, "0.10.11-rc.1");
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_matching_version_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = tmp.path().join("registry.json");
+        let bin_path = tmp.path().join("ant-node");
+        write_fake_binary(&bin_path, "ant-node 0.10.1");
+
+        let mut registry = NodeRegistry::load(&reg_path).unwrap();
+        let id = registry.add(seed_config(
+            bin_path.clone(),
+            "0.10.1",
+            tmp.path().join("data"),
+        ));
+
+        reconcile_registry_versions(&mut registry).await;
+
+        assert_eq!(registry.get(id).unwrap().version, "0.10.1");
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_missing_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = tmp.path().join("registry.json");
+
+        let mut registry = NodeRegistry::load(&reg_path).unwrap();
+        let id = registry.add(seed_config(
+            tmp.path().join("does-not-exist"),
+            "0.10.1",
+            tmp.path().join("data"),
+        ));
+
+        reconcile_registry_versions(&mut registry).await;
+
+        assert_eq!(registry.get(id).unwrap().version, "0.10.1");
+    }
 }

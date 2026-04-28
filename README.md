@@ -27,6 +27,20 @@ irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 |
 
 ## Quick Start
 
+### Store and retrieve a file (production)
+
+```bash
+# Upload (private — DataMap saved locally)
+SECRET_KEY=0x... ant file upload photo.jpg -b 1.2.3.4:12000
+# Output:
+#   Upload complete!
+#     Datamap: photo.datamap
+#     Chunks:  3
+
+# Download using the local DataMap
+ant file download --datamap photo.datamap -o photo_copy.jpg -b 1.2.3.4:12000
+```
+
 ### Store and retrieve a file (local devnet)
 
 ```bash
@@ -76,12 +90,12 @@ ant chunk get abc123def456... --bootstrap ...
 | Flag | Description |
 |------|-------------|
 | `--json` | Output structured JSON instead of human-readable text |
-| `--bootstrap <IP:PORT>` | Bootstrap peer addresses (comma-separated, for data operations) |
+| `-b, --bootstrap <IP:PORT>` | Bootstrap peer addresses, comma-separated or repeated (`-b 1.2.3.4:10000,5.6.7.8:10000`) |
 | `--devnet-manifest <PATH>` | Path to devnet manifest JSON file |
 | `--allow-loopback` | Allow loopback connections (required for local devnet) |
 | `--timeout-secs <N>` | Network operation timeout in seconds (default: 60) |
-| `--log-level <LEVEL>` | Log level: trace, debug, info, warn, error (default: info) |
-| `--evm-network <NET>` | EVM network for payments: `arbitrum-one`, `arbitrum-sepolia`, or `local` |
+| `-v, --verbose` | Increase verbosity: `-v` info, `-vv` debug, `-vvv` trace. Default: no logs (privacy by design) |
+| `--evm-network <NET>` | EVM network: `arbitrum-one` (default), `arbitrum-sepolia`, or `local` |
 
 ### `ant file` — File Operations
 
@@ -93,10 +107,19 @@ Upload a file to the network. The file is split into encrypted chunks, each paid
 
 ```
 $ SECRET_KEY=0x... ant file upload my_data.bin --public
-ADDRESS=a1b2c3d4e5f6...
-MODE=public
-CHUNKS=7
-TOTAL_SIZE=450000
+Connecting to network... done
+Approving token spend... done
+Uploading my_data.bin (439.5 KB)...
+Storing public data map... done
+
+Upload complete!
+  Address: a1b2c3d4e5f6...
+  Chunks:  7
+  Size:    439.5 KB
+  Time:    12.3s
+
+Anyone can download this file with:
+  ant file download a1b2c3d4e5f6...
 ```
 
 **Options:**
@@ -121,11 +144,21 @@ Download a file from the network.
 ```
 # Public download (by address)
 $ ant file download a1b2c3d4e5f6... -o restored.bin
-Downloaded 450000 bytes to restored.bin
+Connecting to network... done
+Downloading from network...
+Download complete!
+  File: restored.bin
+  Size: 439.5 KB
+  Time: 3.2s
 
 # Private download (from local DataMap)
 $ ant file download --datamap my_data.bin.datamap -o restored.bin
-Downloaded 450000 bytes to restored.bin
+Connecting to network... done
+Downloading from network...
+Download complete!
+  File: restored.bin
+  Size: 439.5 KB
+  Time: 2.8s
 ```
 
 **Options:**
@@ -628,10 +661,19 @@ cargo fmt --all -- --check
 
 # Run the CLI
 cargo run --bin ant -- --help
-cargo run --bin ant -- file upload photo.jpg --public --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback
+cargo run --bin ant -- file upload photo.jpg --public --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback --evm-network local
 cargo run --bin ant -- node daemon status
 ```
 
 ## License
 
-TBD
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

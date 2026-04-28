@@ -10,12 +10,12 @@
 mod support;
 
 use ant_core::data::client::merkle::PaymentMode;
-use ant_core::data::{Client, ClientConfig};
+use ant_core::data::Client;
 use serial_test::serial;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use support::MiniTestnet;
+use support::{test_client_config, MiniTestnet};
 use tempfile::TempDir;
 
 /// Simple xorshift64 PRNG for deterministic, incompressible test data.
@@ -69,7 +69,7 @@ struct CostResult {
 /// Measure ANT and gas cost for a single upload.
 async fn measure_upload_cost(
     client: &Client,
-    wallet: &evmlib::wallet::Wallet,
+    wallet: &ant_protocol::evm::Wallet,
     path: &Path,
     mode: PaymentMode,
     file_size_mb: u64,
@@ -188,7 +188,7 @@ async fn test_upload_cost_comparison() {
     // Need 20+ nodes for merkle payment pools (CANDIDATES_PER_POOL = 16)
     let testnet = MiniTestnet::start(20).await;
     let node = testnet.node(3).expect("Node 3 should exist");
-    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
+    let client = Client::from_node(Arc::clone(&node), test_client_config())
         .with_wallet(testnet.wallet().clone());
 
     let work_dir = TempDir::new().expect("create work dir");
@@ -274,11 +274,10 @@ async fn test_upload_cost_comparison() {
                     single.file_size_mb,
                     format_wei(single.gas_cost_wei),
                     format_wei(merkle.gas_cost_wei),
-                    if merkle.gas_cost_wei > 0 {
-                        single.gas_cost_wei / merkle.gas_cost_wei
-                    } else {
-                        0
-                    }
+                    single
+                        .gas_cost_wei
+                        .checked_div(merkle.gas_cost_wei)
+                        .unwrap_or(0)
                 );
             }
         }

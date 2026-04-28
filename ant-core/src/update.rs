@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use ant_protocol::pqc::api::{ml_dsa_65, MlDsaPublicKey, MlDsaSignature, MlDsaVariant};
 use futures_util::StreamExt;
-use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSignature, MlDsaVariant};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -225,11 +225,12 @@ pub async fn perform_update(
     progress.report_complete("Signature verified");
 
     progress.report_started("Extracting archive...");
-    let binary_path = if download_url.ends_with(".zip") {
+    let extracted = if download_url.ends_with(".zip") {
         extract_zip(&archive_bytes, tmp_dir.path(), CLI_BINARY_NAME)?
     } else {
         extract_tar_gz(&archive_bytes, tmp_dir.path(), CLI_BINARY_NAME)?
     };
+    let binary_path = extracted.binary_path;
 
     // Verify the extracted binary reports the expected version.
     let actual_version = extract_version(&binary_path).await;
@@ -430,12 +431,24 @@ async fn extract_version(binary_path: &Path) -> Result<String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Expect output like "ant 0.3.4" — extract the version part.
-    Ok(stdout
+    Ok(parse_version_from_stdout(&stdout).to_string())
+}
+
+/// Extract the version token from `--version` stdout.
+///
+/// Only the first line is inspected: historically `ant --version` was a single
+/// line like `ant 0.1.4`, but a richer multi-line long-version string ending
+/// with `License: MIT or Apache-2.0` shipped briefly and caused this parser —
+/// in 0.1.2 through 0.1.4 — to pick up `Apache-2.0` as the version. Scoping
+/// to the first line keeps us compatible with both forms.
+fn parse_version_from_stdout(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .next()
+        .unwrap_or_default()
         .split_whitespace()
         .last()
         .unwrap_or("unknown")
-        .to_string())
 }
 
 /// Replace the current executable with the new binary.
@@ -499,6 +512,38 @@ fn parse_version(version: &str) -> Result<semver::Version> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_version_from_stdout_single_line() {
+        assert_eq!(parse_version_from_stdout("ant 0.1.4"), "0.1.4");
+        assert_eq!(parse_version_from_stdout("ant 0.1.4\n"), "0.1.4");
+    }
+
+    #[test]
+    fn parse_version_from_stdout_multi_line_license_trailer() {
+        // This is the exact shape that broke 0.1.2–0.1.4 self-update.
+        let stdout = "ant 0.1.4\n\
+            Autonomi network client\n\
+            \n\
+            Repository: https://github.com/WithAutonomi/ant-client\n\
+            License:    MIT or Apache-2.0\n";
+        assert_eq!(parse_version_from_stdout(stdout), "0.1.4");
+    }
+
+    #[test]
+    fn parse_version_from_stdout_empty() {
+        assert_eq!(parse_version_from_stdout(""), "unknown");
+    }
+
+    #[test]
+    fn parse_version_from_stdout_blank_first_line() {
+        assert_eq!(parse_version_from_stdout("\nant 0.1.4\n"), "unknown");
+    }
+
+    #[test]
+    fn parse_version_from_stdout_leading_whitespace() {
+        assert_eq!(parse_version_from_stdout("   ant 0.1.4\n"), "0.1.4");
+    }
 
     #[test]
     fn parse_version_valid() {

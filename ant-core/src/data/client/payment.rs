@@ -5,10 +5,9 @@
 
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_node::core::{MultiAddr, PeerId};
-use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
-use evmlib::wallet::Wallet;
-use evmlib::{EncodedPeerId, ProofOfPayment};
+use ant_protocol::evm::{EncodedPeerId, ProofOfPayment, Wallet};
+use ant_protocol::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
+use ant_protocol::transport::{MultiAddr, PeerId};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -110,7 +109,7 @@ impl Client {
 
         let vault_address = evm_network.payment_vault_address();
         wallet
-            .approve_to_spend_tokens(*vault_address, evmlib::common::U256::MAX)
+            .approve_to_spend_tokens(*vault_address, ant_protocol::evm::U256::MAX)
             .await
             .map_err(|e| Error::Payment(format!("Token approval failed: {e}")))?;
         info!("Token spend approved for payment vault contract");

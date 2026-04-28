@@ -11,8 +11,7 @@ use crate::data::client::file::{ExternalPaymentInfo, PreparedUpload};
 use crate::data::client::merkle::PaymentMode;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_node::ant_protocol::DATA_TYPE_CHUNK;
-use ant_node::client::compute_address;
+use ant_protocol::{compute_address, DATA_TYPE_CHUNK};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use self_encryption::{decrypt, encrypt, DataMap, EncryptedChunk};
@@ -53,7 +52,8 @@ impl Client {
             .map(|chunk| chunk.content)
             .collect();
 
-        let addresses = self.batch_upload_chunks(chunk_contents).await?;
+        let (addresses, _storage_cost, _gas_cost) =
+            self.batch_upload_chunks(chunk_contents).await?;
         let chunks_stored = addresses.len();
 
         info!("Data uploaded: {chunks_stored} chunks stored ({content_len} bytes original)");
@@ -113,7 +113,7 @@ impl Client {
                 Ok(result) => result,
                 Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
                     info!("Merkle needs more peers ({msg}), falling back to wave-batch");
-                    let addresses = self.batch_upload_chunks(chunk_contents).await?;
+                    let (addresses, _sc, _gc) = self.batch_upload_chunks(chunk_contents).await?;
                     return Ok(DataUploadResult {
                         data_map,
                         chunks_stored: addresses.len(),
@@ -135,7 +135,7 @@ impl Client {
             })
         } else {
             // Wave-based batch payment path (single EVM tx per wave).
-            let addresses = self.batch_upload_chunks(chunk_contents).await?;
+            let (addresses, _sc, _gc) = self.batch_upload_chunks(chunk_contents).await?;
 
             info!(
                 "Data uploaded: {} chunks stored ({content_len} bytes original)",
@@ -177,10 +177,10 @@ impl Client {
             .map(|chunk| chunk.content)
             .collect();
 
-        let concurrency = self.config().chunk_concurrency;
+        let quote_concurrency = self.config().quote_concurrency;
         let results: Vec<Result<Option<PreparedChunk>>> = futures::stream::iter(chunk_contents)
             .map(|content| async move { self.prepare_chunk_payment(content).await })
-            .buffer_unordered(concurrency)
+            .buffer_unordered(quote_concurrency)
             .collect()
             .await;
 
@@ -205,6 +205,7 @@ impl Client {
                 prepared_chunks,
                 payment_intent,
             },
+            data_map_address: None,
         })
     }
 
@@ -252,7 +253,7 @@ impl Client {
     ///
     /// Retrieves all chunks referenced by the data map, then decrypts
     /// and reassembles the original content. Fetches chunks concurrently
-    /// (bounded by `chunk_concurrency`) while preserving order.
+    /// (bounded by `quote_concurrency`) while preserving order.
     ///
     /// # Errors
     ///
@@ -277,7 +278,7 @@ impl Client {
                     content: chunk.content,
                 })
             })
-            .buffered(self.config().chunk_concurrency)
+            .buffered(self.config().quote_concurrency)
             .try_collect()
             .await?;
 

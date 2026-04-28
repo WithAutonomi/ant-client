@@ -15,20 +15,22 @@
     clippy::used_underscore_binding
 )]
 
-use ant_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
-use ant_node::core::{
-    CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
-};
+use ant_core::data::ClientConfig;
+// Node-internal types (test harness needs to *be* a node) — direct
+// ant-node import is correct here. ant-node is a dev-dep so this is
+// only linked into test binaries.
 use ant_node::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
 };
 use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
-use ant_node::CLOSE_GROUP_SIZE;
-use evmlib::testnet::Testnet;
-use evmlib::wallet::Wallet;
-use evmlib::Network as EvmNetwork;
-use evmlib::RewardsAddress;
+// Wire / transport / EVM types: route through ant-protocol so the test
+// harness exercises the same surface the client does.
+use ant_protocol::evm::{testnet::Testnet, Network as EvmNetwork, RewardsAddress, Wallet};
+use ant_protocol::transport::{
+    CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
+};
+use ant_protocol::{CLOSE_GROUP_SIZE, MAX_WIRE_MESSAGE_SIZE};
 use rand::Rng;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -41,9 +43,23 @@ const BOOTSTRAP_COUNT: usize = 2;
 const SPAWN_DELAY_MS: u64 = 200;
 const STABILIZATION_TIMEOUT_SECS: u64 = 180;
 
-/// Default node count for standard E2E tests. Must exceed `CLOSE_GROUP_SIZE`
-/// so that quote collection can find enough peers.
-pub const DEFAULT_NODE_COUNT: usize = CLOSE_GROUP_SIZE + 1;
+/// Default node count for standard E2E tests.
+///
+/// `CLOSE_GROUP_SIZE` (7) is the quorum the client needs for a quote to
+/// succeed, so spawning exactly that many — or `+ 1` — leaves zero slack:
+/// a single slow peer drops the count to 6 and fails the whole test with
+/// `InsufficientPeers("Got 6 quotes, need 7. ...")`.
+///
+/// This is systematic on macOS CI runners, which are heavily virtualised
+/// (nested virt) and roughly half the CPU throughput of Linux runners.
+/// The 8-node QUIC handshake burst saturates the CPU and at least one
+/// peer consistently can't complete its handshake within the 10 s default
+/// per-peer timeout. Linux runners finish all 8 handshakes comfortably.
+///
+/// Spawning `CLOSE_GROUP_SIZE * 2` gives us one full group of slack — if
+/// up to 7 peers are slow, quote collection still reaches quorum. Each
+/// extra node is cheap (~200 ms spawn delay) compared to a flaky suite.
+pub const DEFAULT_NODE_COUNT: usize = CLOSE_GROUP_SIZE * 2;
 
 /// Index of the median quote in a `SingleNodePayment` quotes array.
 pub const MEDIAN_QUOTE_INDEX: usize = CLOSE_GROUP_SIZE / 2;
@@ -52,6 +68,28 @@ pub const MEDIAN_QUOTE_INDEX: usize = CLOSE_GROUP_SIZE / 2;
 const TEST_REWARDS_ADDRESS: [u8; 20] = [0x01; 20];
 /// Max records for quoting metrics.
 const TEST_MAX_RECORDS: usize = 1280;
+
+/// `ClientConfig` tuned for the in-process `MiniTestnet`.
+///
+/// Production defaults (`quote_timeout_secs = 10`, `store_timeout_secs = 10`)
+/// assume dedicated CPU and residential-grade network timing. E2E tests
+/// spawn a full P2P network inside a single CI VM, so all QUIC handshakes,
+/// DHT lookups, and payment round-trips compete for the same cores. On
+/// heavily-virtualised runners (macOS GitHub Actions in particular), the
+/// 10 s per-peer timeout fires before the slowest peer can finish its
+/// handshake, which surfaces as `InsufficientPeers("Got 6 quotes, need 7")`.
+///
+/// 60 s is deliberately conservative: in the happy path everything completes
+/// in well under a second, so the larger budget only shows up on flakes.
+/// The merkle suite already uses 120 s for the same reason.
+#[must_use]
+pub fn test_client_config() -> ClientConfig {
+    ClientConfig {
+        quote_timeout_secs: 60,
+        store_timeout_secs: 60,
+        ..Default::default()
+    }
+}
 
 pub struct TestNode {
     pub p2p_node: Option<Arc<P2PNode>>,
@@ -162,7 +200,7 @@ impl MiniTestnet {
         // Approve token spend for the unified payment vault contract
         let vault_address = evm_network.payment_vault_address();
         wallet
-            .approve_to_spend_tokens(*vault_address, evmlib::common::U256::MAX)
+            .approve_to_spend_tokens(*vault_address, ant_protocol::evm::U256::MAX)
             .await
             .expect("approve payment vault token spend");
 
@@ -200,6 +238,9 @@ impl MiniTestnet {
         // Generate ML-DSA-65 identity for this node
         let identity = Arc::new(NodeIdentity::generate().expect("generate node identity"));
 
+        // IPv4-only is intentional for these loopback-only tests: everything
+        // binds to 127.0.0.1 on the local host, so dual-stack would add no
+        // value and pulls in v6 loopback quirks on some CI runners.
         let mut core_config = CoreNodeConfig::builder()
             .port(listen_addr.port())
             .ipv6(false)
@@ -248,6 +289,10 @@ impl MiniTestnet {
             local_rewards_address: rewards_address,
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
+        // Wire the P2P node into the verifier so the merkle pay-yourself
+        // closeness check can do its DHT lookup. Without this, the
+        // verifier fail-closes on every merkle payment (PR #77 defense).
+        payment_verifier.attach_p2p_node(Arc::clone(&node));
         let metrics_tracker = QuotingMetricsTracker::new(TEST_MAX_RECORDS);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
@@ -255,11 +300,11 @@ impl MiniTestnet {
         let pub_key_bytes = identity.public_key().as_bytes().to_vec();
         let sk_bytes = identity.secret_key_bytes().to_vec();
         let sk = {
-            use saorsa_pqc::pqc::types::MlDsaSecretKey;
+            use ant_protocol::pqc::ops::MlDsaSecretKey;
             MlDsaSecretKey::from_bytes(&sk_bytes).expect("deserialize ML-DSA-65 secret key")
         };
         quote_generator.set_signer(pub_key_bytes, move |msg| {
-            use saorsa_pqc::pqc::MlDsaOperations;
+            use ant_protocol::pqc::ops::MlDsaOperations;
             let ml_dsa = MlDsa65::new();
             ml_dsa
                 .sign(&sk, msg)
@@ -289,7 +334,7 @@ impl MiniTestnet {
                         let node = Arc::clone(&handler_node);
                         let topic_clone = topic.clone();
                         tokio::spawn(async move {
-                            if topic_clone != ant_node::CHUNK_PROTOCOL_ID {
+                            if topic_clone != ant_protocol::CHUNK_PROTOCOL_ID {
                                 return;
                             }
                             match protocol.try_handle_request(&data).await {

@@ -1,5 +1,8 @@
 pub mod binary;
 pub mod daemon;
+// `LocalDevnet` wraps `ant_node::devnet::Devnet`. Gated behind `devnet`
+// so default builds of ant-core don't link ant-node at all.
+#[cfg(feature = "devnet")]
 pub mod devnet;
 pub mod events;
 pub mod process;
@@ -68,8 +71,9 @@ pub async fn add_nodes(
 
     // Resolve the binary (downloads to cache if needed)
     let install_dir = binary::binary_install_dir()?;
-    let (cached_binary, version) =
-        binary::resolve_binary(&opts.binary_source, &install_dir, progress).await?;
+    let resolved = binary::resolve_binary(&opts.binary_source, &install_dir, progress).await?;
+    let cached_binary = resolved.path;
+    let version = resolved.version;
 
     // Load registry with file lock
     let (mut registry, _lock) = NodeRegistry::load_locked(registry_path)?;
@@ -130,6 +134,13 @@ pub async fn add_nodes(
             std::fs::set_permissions(&node_binary, std::fs::Permissions::from_mode(0o755))?;
         }
         node.binary_path = node_binary;
+
+        // Copy bootstrap_peers.toml alongside the binary so the node can
+        // discover production network peers on startup.
+        if let Some(ref bp_path) = resolved.bootstrap_peers_path {
+            let dest = node.data_dir.join(binary::BOOTSTRAP_PEERS_FILE);
+            std::fs::copy(bp_path, &dest)?;
+        }
 
         nodes_added.push(node.clone());
     }
@@ -204,6 +215,7 @@ pub fn node_status_offline(registry_path: &Path) -> Result<NodeStatusResult> {
             status: NodeStatus::Stopped,
             pid: None,
             uptime_secs: None,
+            pending_version: None,
         })
         .collect();
     let total_stopped = nodes.len() as u32;

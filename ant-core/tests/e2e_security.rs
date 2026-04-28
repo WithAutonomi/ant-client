@@ -7,20 +7,19 @@
 
 mod support;
 
-use ant_core::data::{compute_address, Client, ClientConfig};
-use ant_node::core::PeerId;
-use ant_node::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
+use ant_core::data::{compute_address, Client};
+use ant_protocol::evm::{Amount, EncodedPeerId, ProofOfPayment, RewardsAddress, TxHash};
+use ant_protocol::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
+use ant_protocol::transport::PeerId;
 use bytes::Bytes;
-use evmlib::common::{Amount, TxHash};
-use evmlib::{EncodedPeerId, ProofOfPayment, RewardsAddress};
 use serial_test::serial;
 use std::sync::Arc;
-use support::{MiniTestnet, DEFAULT_NODE_COUNT, MEDIAN_QUOTE_INDEX};
+use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT, MEDIAN_QUOTE_INDEX};
 
 async fn setup() -> (Client, MiniTestnet) {
     let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(3).expect("Node 3 should exist");
-    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
+    let client = Client::from_node(Arc::clone(&node), test_client_config())
         .with_wallet(testnet.wallet().clone());
     (client, testnet)
 }
@@ -343,7 +342,7 @@ async fn test_attack_client_without_wallet() {
     let node = testnet.node(3).expect("Node 3 should exist");
 
     // Create client WITHOUT wallet
-    let client = Client::from_node(Arc::clone(&node), ClientConfig::default());
+    let client = Client::from_node(Arc::clone(&node), test_client_config());
 
     let content = Bytes::from("no wallet attack test data");
     let result = client.chunk_put(content).await;

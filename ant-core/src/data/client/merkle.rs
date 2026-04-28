@@ -6,18 +6,17 @@
 
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_node::ant_protocol::{
-    ChunkMessage, ChunkMessageBody, MerkleCandidateQuoteRequest, MerkleCandidateQuoteResponse,
+use ant_protocol::evm::{
+    Amount, MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
+    MidpointProof, PoolCommitment, CANDIDATES_PER_POOL, MAX_LEAVES,
 };
-use ant_node::client::send_and_await_chunk_response;
-use ant_node::payment::quote::verify_merkle_candidate_signature;
-use ant_node::payment::serialize_merkle_proof;
+use ant_protocol::payment::{serialize_merkle_proof, verify_merkle_candidate_signature};
+use ant_protocol::transport::PeerId;
+use ant_protocol::{
+    send_and_await_chunk_response, ChunkMessage, ChunkMessageBody, MerkleCandidateQuoteRequest,
+    MerkleCandidateQuoteResponse,
+};
 use bytes::Bytes;
-use evmlib::merkle_batch_payment::PoolCommitment;
-use evmlib::merkle_payments::{
-    MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
-    MidpointProof, CANDIDATES_PER_POOL, MAX_LEAVES,
-};
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -28,7 +27,8 @@ use xor_name::XorName;
 pub const DEFAULT_MERKLE_THRESHOLD: usize = 64;
 
 /// Payment mode for uploads.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PaymentMode {
     /// Automatically choose: merkle for batches >= threshold, single otherwise.
     #[default]
@@ -46,6 +46,10 @@ pub struct MerkleBatchPaymentResult {
     pub proofs: HashMap<[u8; 32], Vec<u8>>,
     /// Number of chunks in the batch.
     pub chunk_count: usize,
+    /// Total storage cost in atto (token smallest unit).
+    pub storage_cost_atto: String,
+    /// Total gas cost in wei.
+    pub gas_cost_wei: u128,
 }
 
 /// Prepared merkle batch ready for external payment.
@@ -146,7 +150,7 @@ impl Client {
         let chunk_count = addresses.len();
         let xornames: Vec<XorName> = addresses.iter().map(|a| XorName(*a)).collect();
 
-        info!("Building merkle tree for {chunk_count} chunks");
+        debug!("Building merkle tree for {chunk_count} chunks");
 
         // 1. Build merkle tree
         let tree = MerkleTree::from_xornames(xornames)
@@ -158,14 +162,14 @@ impl Client {
             .map_err(|e| Error::Payment(format!("System time error: {e}")))?
             .as_secs();
 
-        info!("Merkle tree: depth={depth}, leaves={chunk_count}, ts={merkle_payment_timestamp}");
+        debug!("Merkle tree: depth={depth}, leaves={chunk_count}, ts={merkle_payment_timestamp}");
 
         // 2. Get reward candidates (midpoint proofs)
         let midpoint_proofs = tree
             .reward_candidates(merkle_payment_timestamp)
             .map_err(|e| Error::Payment(format!("Failed to generate reward candidates: {e}")))?;
 
-        info!(
+        debug!(
             "Collecting candidate pools from {} midpoints (concurrent)",
             midpoint_proofs.len()
         );
@@ -212,7 +216,7 @@ impl Client {
             "Submitting merkle batch payment on-chain (depth={})",
             prepared.depth
         );
-        let (winner_pool_hash, _amount, _gas_info) = wallet
+        let (winner_pool_hash, amount, gas_info) = wallet
             .pay_for_merkle_tree(
                 prepared.depth,
                 prepared.pool_commitments.clone(),
@@ -226,7 +230,10 @@ impl Client {
             hex::encode(winner_pool_hash)
         );
 
-        finalize_merkle_batch(prepared, winner_pool_hash)
+        let mut result = finalize_merkle_batch(prepared, winner_pool_hash)?;
+        result.storage_cost_atto = amount.to_string();
+        result.gas_cost_wei = gas_info.gas_cost_wei;
+        Ok(result)
     }
 
     /// Handle batches larger than `MAX_LEAVES` by splitting into sub-batches.
@@ -239,6 +246,8 @@ impl Client {
         let sub_batches: Vec<&[[u8; 32]]> = addresses.chunks(MAX_LEAVES).collect();
         let total_sub_batches = sub_batches.len();
         let mut all_proofs = HashMap::with_capacity(addresses.len());
+        let mut total_storage = Amount::ZERO;
+        let mut total_gas: u128 = 0;
 
         for (i, chunk) in sub_batches.into_iter().enumerate() {
             match self
@@ -246,6 +255,10 @@ impl Client {
                 .await
             {
                 Ok(sub_result) => {
+                    if let Ok(cost) = sub_result.storage_cost_atto.parse::<Amount>() {
+                        total_storage += cost;
+                    }
+                    total_gas = total_gas.saturating_add(sub_result.gas_cost_wei);
                     all_proofs.extend(sub_result.proofs);
                 }
                 Err(e) => {
@@ -263,6 +276,8 @@ impl Client {
                     return Ok(MerkleBatchPaymentResult {
                         chunk_count: all_proofs.len(),
                         proofs: all_proofs,
+                        storage_cost_atto: total_storage.to_string(),
+                        gas_cost_wei: total_gas,
                     });
                 }
             }
@@ -271,6 +286,8 @@ impl Client {
         Ok(MerkleBatchPaymentResult {
             chunk_count: addresses.len(),
             proofs: all_proofs,
+            storage_cost_atto: total_storage.to_string(),
+            gas_cost_wei: total_gas,
         })
     }
 
@@ -321,7 +338,7 @@ impl Client {
         merkle_payment_timestamp: u64,
     ) -> Result<[MerklePaymentCandidateNode; CANDIDATES_PER_POOL]> {
         let node = self.network().node();
-        let timeout = Duration::from_secs(self.config().timeout_secs);
+        let timeout = Duration::from_secs(self.config().quote_timeout_secs);
 
         // Query extra peers to handle validation failures (bad sigs, wrong type, etc.)
         let query_count = CANDIDATES_PER_POOL * 2;
@@ -434,7 +451,7 @@ impl Client {
         futures: &mut FuturesUnordered<
             impl std::future::Future<
                 Output = (
-                    ant_node::core::PeerId,
+                    PeerId,
                     std::result::Result<MerklePaymentCandidateNode, Error>,
                 ),
             >,
@@ -514,7 +531,7 @@ impl Client {
                 }
             },
         ))
-        .buffer_unordered(self.config().chunk_concurrency);
+        .buffer_unordered(self.config().store_concurrency);
 
         while let Some(result) = upload_stream.next().await {
             result?;
@@ -575,6 +592,8 @@ pub fn finalize_merkle_batch(
     Ok(MerkleBatchPaymentResult {
         proofs,
         chunk_count,
+        storage_cost_atto: "0".to_string(),
+        gas_cost_wei: 0,
     })
 }
 
@@ -603,9 +622,7 @@ mod send_assertions {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use evmlib::common::Amount;
-    use evmlib::merkle_payments::{MerkleTree, CANDIDATES_PER_POOL};
-    use evmlib::RewardsAddress;
+    use ant_protocol::evm::{Amount, MerkleTree, RewardsAddress, CANDIDATES_PER_POOL};
 
     // =========================================================================
     // should_use_merkle (free function, no Client needed)
@@ -722,10 +739,8 @@ mod tests {
 
     #[test]
     fn test_merkle_proof_serialize_deserialize_roundtrip() {
-        use ant_node::payment::{deserialize_merkle_proof, serialize_merkle_proof};
-        use evmlib::common::Amount;
-        use evmlib::merkle_payments::MerklePaymentCandidateNode;
-        use evmlib::RewardsAddress;
+        use ant_protocol::evm::{Amount, MerklePaymentCandidateNode, RewardsAddress};
+        use ant_protocol::payment::{deserialize_merkle_proof, serialize_merkle_proof};
 
         let addrs = make_test_addresses(4);
         let xornames: Vec<XorName> = addrs.iter().map(|a| XorName(*a)).collect();
@@ -782,8 +797,8 @@ mod tests {
         // Simulates what collect_validated_candidates checks
         let candidate = MerklePaymentCandidateNode {
             pub_key: vec![0u8; 32],
-            price: evmlib::common::Amount::ZERO,
-            reward_address: evmlib::RewardsAddress::new([0u8; 20]),
+            price: ant_protocol::evm::Amount::ZERO,
+            reward_address: ant_protocol::evm::RewardsAddress::new([0u8; 20]),
             merkle_payment_timestamp: 1000,
             signature: vec![0u8; 64],
         };
@@ -877,7 +892,7 @@ mod tests {
 
     #[test]
     fn test_finalize_merkle_batch_proofs_are_deserializable() {
-        use ant_node::payment::deserialize_merkle_proof;
+        use ant_protocol::payment::deserialize_merkle_proof;
 
         let prepared = make_prepared_merkle_batch(8);
         let winner_hash = prepared.candidate_pools[0].hash();

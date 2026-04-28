@@ -3,7 +3,7 @@
 //! Caches recently fetched chunks in memory to avoid re-fetching
 //! the same content-addressed data from the network.
 
-use ant_node::client::XorName;
+use ant_protocol::XorName;
 use bytes::Bytes;
 use lru::LruCache;
 use std::num::NonZeroUsize;

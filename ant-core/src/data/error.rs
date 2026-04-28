@@ -68,10 +68,21 @@ pub enum Error {
     #[error("insufficient disk space: {0}")]
     InsufficientDiskSpace(String),
 
+    /// Cost estimation could not reach a representative quote.
+    ///
+    /// Returned by [`crate::data::Client::estimate_upload_cost`] when every
+    /// sampled chunk address reported `AlreadyStored`, so the network price
+    /// for the remainder of the file cannot be inferred from a sample.
+    /// The attached message describes how many addresses were tried.
+    #[error("cost estimation inconclusive: {0}")]
+    CostEstimationInconclusive(String),
+
     /// Upload partially succeeded -- some chunks stored, some failed after retries.
     ///
     /// The `stored` addresses can be used for progress tracking and resume.
-    #[error("partial upload: {stored_count} stored, {failed_count} failed: {reason}")]
+    #[error(
+        "partial upload: {stored_count}/{total_chunks} stored, {failed_count} failed: {reason}"
+    )]
     PartialUpload {
         /// Addresses of successfully stored chunks.
         stored: Vec<[u8; 32]>,
@@ -81,11 +92,17 @@ pub enum Error {
         failed: Vec<([u8; 32], String)>,
         /// Number of failed chunks.
         failed_count: usize,
+        /// Total number of chunks the upload was attempting to store.
+        total_chunks: usize,
         /// Root cause description.
         reason: String,
     },
 }
 
+// ant-node is only linked when the `devnet` feature is on, so the
+// blanket `From` impl follows that gate. LocalDevnet maps node errors
+// to `Error::Network` via this conversion; default builds never see it.
+#[cfg(feature = "devnet")]
 impl From<ant_node::Error> for Error {
     fn from(e: ant_node::Error) -> Self {
         Self::Network(e.to_string())
@@ -185,6 +202,17 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "insufficient disk space: need 100 MB but only 10 MB available"
+        );
+    }
+
+    #[test]
+    fn test_display_cost_estimation_inconclusive() {
+        let err = Error::CostEstimationInconclusive(
+            "sampled 5 addresses, all already stored".to_string(),
+        );
+        assert_eq!(
+            err.to_string(),
+            "cost estimation inconclusive: sampled 5 addresses, all already stored"
         );
     }
 

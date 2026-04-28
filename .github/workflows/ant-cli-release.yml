@@ -279,26 +279,10 @@ jobs:
           path: artifacts/*
           retention-days: 1
 
-  publish-crate:
-    name: publish ant-core to crates.io
-    runs-on: ubuntu-latest
-    if: ${{ !contains(github.ref_name, '-rc.') }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: publish ant-core
-        working-directory: ant-core
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish
-
   release:
     name: create github release
     runs-on: ubuntu-latest
-    needs: [sign-releases, publish-crate]
-    if: ${{ !cancelled() && needs.sign-releases.result == 'success' }}
+    needs: [sign-releases]
     steps:
       - uses: actions/checkout@v4
 
