@@ -63,16 +63,17 @@ pub enum CollisionPolicy {
     Overwrite,
     /// Insert `-N` (starting at 2) between the filename and `.datamap`.
     /// `holiday.jpg.datamap` → `holiday.jpg-2.datamap` → `-3` → … capped at
-    /// [`MAX_COLLISION_ATTEMPTS`].
+    /// `MAX_COLLISION_ATTEMPTS` (1000).
     NumericSuffix,
 }
 
 /// Construct the canonical datamap filename for an arbitrary input filename.
 ///
 /// Appends `.datamap` without replacing any existing extension, then runs
-/// the result through [`sanitize_filename`] so platform-illegal characters
-/// don't reach the filesystem. Falls back to `datamap.datamap` when the
-/// input sanitizes to an empty string.
+/// the result through filename sanitization (alphanumerics + a small set
+/// of punctuation kept; everything else replaced with `_`) so platform-
+/// illegal characters don't reach the filesystem. Falls back to
+/// `datamap.datamap` when the input sanitizes to an empty string.
 ///
 /// Pure function: takes only the basename, never a path with separators.
 pub fn datamap_filename_for(original_name: &str) -> String {
