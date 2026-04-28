@@ -80,7 +80,9 @@ pub enum Error {
     /// Upload partially succeeded -- some chunks stored, some failed after retries.
     ///
     /// The `stored` addresses can be used for progress tracking and resume.
-    #[error("partial upload: {stored_count} stored, {failed_count} failed: {reason}")]
+    #[error(
+        "partial upload: {stored_count}/{total_chunks} stored, {failed_count} failed: {reason}"
+    )]
     PartialUpload {
         /// Addresses of successfully stored chunks.
         stored: Vec<[u8; 32]>,
@@ -90,6 +92,8 @@ pub enum Error {
         failed: Vec<([u8; 32], String)>,
         /// Number of failed chunks.
         failed_count: usize,
+        /// Total number of chunks the upload was attempting to store.
+        total_chunks: usize,
         /// Root cause description.
         reason: String,
     },

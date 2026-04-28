@@ -13,6 +13,7 @@ use ant_core::data::{
 use ant_core::datamap_file::{original_name_from_datamap, read_datamap, write_datamap};
 
 use super::chunk::parse_address;
+use crate::progress;
 
 /// File subcommands.
 #[derive(Subcommand, Debug)]
@@ -119,7 +120,7 @@ fn resolve_download_output(
 }
 
 impl FileAction {
-    pub async fn execute(self, client: &Client, json: bool, verbose: u8) -> anyhow::Result<()> {
+    pub async fn execute(self, client: &Client, json: bool) -> anyhow::Result<()> {
         match self {
             FileAction::Upload {
                 path,
@@ -142,7 +143,7 @@ impl FileAction {
                 } else {
                     CollisionPolicy::NumericSuffix
                 };
-                handle_file_upload(client, &path, public, mode, policy, json, verbose).await
+                handle_file_upload(client, &path, public, mode, policy, json).await
             }
             FileAction::Download {
                 address,
@@ -156,7 +157,6 @@ impl FileAction {
                     datamap.as_deref(),
                     resolved_output,
                     json,
-                    verbose,
                 )
                 .await
             }
@@ -172,7 +172,7 @@ impl FileAction {
                 } else {
                     PaymentMode::Auto
                 };
-                handle_file_cost(client, &path, mode, json, verbose).await
+                handle_file_cost(client, &path, mode, json).await
             }
         }
     }
@@ -185,7 +185,6 @@ async fn handle_file_upload(
     mode: PaymentMode,
     collision_policy: CollisionPolicy,
     json_output: bool,
-    verbose: u8,
 ) -> anyhow::Result<()> {
     let file_size = std::fs::metadata(path)?.len();
     if file_size < 3 {
@@ -198,12 +197,9 @@ async fn handle_file_upload(
         path.display()
     );
 
-    let result = if json_output {
+    let upload_outcome = if json_output {
         // No progress bars in JSON mode
-        client
-            .file_upload_with_mode(path, mode)
-            .await
-            .map_err(|e| anyhow::anyhow!("File upload failed: {e}"))?
+        client.file_upload_with_mode(path, mode).await
     } else {
         // Set up progress channel and drive progress bars
         let (tx, rx) = mpsc::channel(64);
@@ -211,7 +207,6 @@ async fn handle_file_upload(
             rx,
             path.display().to_string(),
             file_size,
-            verbose,
         ));
 
         let upload_result = client.file_upload_with_progress(path, mode, Some(tx)).await;
@@ -219,14 +214,40 @@ async fn handle_file_upload(
         // Wait for progress display to finish (sender dropped → receiver exits)
         let _ = pb_handle.await;
 
-        upload_result.map_err(|e| anyhow::anyhow!("File upload failed: {e}"))?
+        upload_result
+    };
+
+    let result = match upload_outcome {
+        Ok(r) => r,
+        Err(DataError::PartialUpload {
+            stored_count,
+            failed_count,
+            total_chunks,
+            reason,
+            ..
+        }) => {
+            if json_output {
+                let out = UploadFailureJson {
+                    error: "partial_upload",
+                    total_chunks,
+                    chunks_stored: stored_count,
+                    chunks_failed: failed_count,
+                    reason: &reason,
+                };
+                println!("{}", serde_json::to_string(&out)?);
+            }
+            anyhow::bail!(
+                "Upload failed: {stored_count}/{total_chunks} stored, {failed_count} failed: {reason}"
+            );
+        }
+        Err(e) => anyhow::bail!("File upload failed: {e}"),
     };
 
     let elapsed = start.elapsed();
 
     if public {
-        let spinner = if !json_output && verbose == 0 {
-            Some(new_spinner("Storing public data map..."))
+        let spinner = if !json_output {
+            Some(progress::new_spinner("Storing public data map..."))
         } else {
             None
         };
@@ -247,6 +268,9 @@ async fn handle_file_upload(
                 datamap: None,
                 mode: "public".into(),
                 chunks: total_chunks,
+                total_chunks,
+                chunks_stored: total_chunks,
+                chunks_failed: 0,
                 size: file_size,
                 storage_cost_atto: result.storage_cost_atto.clone(),
                 gas_cost_wei: result.gas_cost_wei.to_string(),
@@ -296,6 +320,9 @@ async fn handle_file_upload(
                 datamap: Some(datamap_path.display().to_string()),
                 mode: "private".into(),
                 chunks: result.chunks_stored,
+                total_chunks: result.total_chunks,
+                chunks_stored: result.chunks_stored,
+                chunks_failed: result.chunks_failed,
                 size: file_size,
                 storage_cost_atto: result.storage_cost_atto.clone(),
                 gas_cost_wei: result.gas_cost_wei.to_string(),
@@ -326,13 +353,14 @@ async fn handle_file_upload(
 }
 
 /// Drive upload progress from the event channel.
-/// When `verbose > 0`, progress bars are hidden to avoid garbling the
-/// per-chunk `info!` lines that tracing emits to stderr.
+///
+/// Bars and spinners are routed through the shared `MultiProgress` (see
+/// `progress` module), so they coexist with tracing log lines emitted at any
+/// verbosity level.
 async fn drive_upload_progress(
     mut rx: mpsc::Receiver<UploadEvent>,
     filename: String,
     file_size: u64,
-    verbose: u8,
 ) {
     let bar_style = ProgressStyle::with_template(
         "{spinner:.cyan} {msg}\n  [{bar:40.cyan/dim}] {pos}/{len} chunks",
@@ -341,16 +369,10 @@ async fn drive_upload_progress(
     .progress_chars("━╸━")
     .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
 
-    let show_bars = verbose == 0 && std::io::IsTerminal::is_terminal(&std::io::stderr());
-
-    let mut pb = if show_bars {
-        new_spinner(&format!(
-            "Encrypting {filename} ({})...",
-            format_size(file_size)
-        ))
-    } else {
-        ProgressBar::hidden()
-    };
+    let mut pb = progress::new_spinner(&format!(
+        "Encrypting {filename} ({})...",
+        format_size(file_size)
+    ));
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -360,12 +382,10 @@ async fn drive_upload_progress(
             UploadEvent::Encrypted { total_chunks } => {
                 pb.finish_and_clear();
                 eprintln!("Encrypted into {total_chunks} chunks");
-                if show_bars {
-                    pb = ProgressBar::new(total_chunks as u64);
-                    pb.set_style(bar_style.clone());
-                    pb.set_message(format!("Uploading {filename}"));
-                    pb.enable_steady_tick(Duration::from_millis(80));
-                }
+                pb = progress::attach(ProgressBar::new(total_chunks as u64));
+                pb.set_style(bar_style.clone());
+                pb.set_message(format!("Uploading {filename}"));
+                pb.enable_steady_tick(Duration::from_millis(80));
             }
             UploadEvent::QuotingChunks { .. } => {}
             UploadEvent::ChunkQuoted { quoted, total: _ } => {
@@ -395,15 +415,14 @@ async fn handle_file_download(
     datamap_path: Option<&Path>,
     output: PathBuf,
     json_output: bool,
-    verbose: u8,
 ) -> anyhow::Result<()> {
     let output_path = output;
     let start = Instant::now();
 
     let data_map = if let Some(addr_hex) = address {
         info!("Downloading public file from address {addr_hex}");
-        if !json_output && verbose == 0 {
-            let spinner = new_spinner("Fetching data map...");
+        if !json_output {
+            let spinner = progress::new_spinner("Fetching data map...");
             let result = client.data_map_fetch(&parse_address(addr_hex)?).await;
             spinner.finish_and_clear();
             result.map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
@@ -428,21 +447,8 @@ async fn handle_file_download(
     } else {
         let (tx, mut rx) = mpsc::channel(64);
 
-        let show_bars = verbose == 0 && std::io::IsTerminal::is_terminal(&std::io::stderr());
         let progress_handle = tokio::spawn(async move {
-            let mut pb = if show_bars {
-                let s = ProgressBar::new_spinner();
-                s.set_style(
-                    ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                        .expect("valid template")
-                        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-                );
-                s.set_message("Resolving data map...");
-                s.enable_steady_tick(Duration::from_millis(80));
-                s
-            } else {
-                ProgressBar::hidden()
-            };
+            let mut pb = progress::new_spinner("Resolving data map...");
 
             let bar_style = ProgressStyle::with_template(
                 "{spinner:.cyan} Downloading\n  [{bar:40.cyan/dim}] {pos}/{len} chunks",
@@ -463,11 +469,7 @@ async fn handle_file_download(
                     }
                     DownloadEvent::DataMapResolved { total_chunks } => {
                         pb.finish_and_clear();
-                        pb = if show_bars {
-                            ProgressBar::new(total_chunks as u64)
-                        } else {
-                            ProgressBar::hidden()
-                        };
+                        pb = progress::attach(ProgressBar::new(total_chunks as u64));
                         pb.set_style(bar_style.clone());
                         pb.set_message("Downloading");
                         pb.enable_steady_tick(Duration::from_millis(80));
@@ -515,7 +517,6 @@ async fn handle_file_cost(
     path: &Path,
     mode: PaymentMode,
     json_output: bool,
-    verbose: u8,
 ) -> anyhow::Result<()> {
     let file_size = std::fs::metadata(path)?.len();
 
@@ -527,7 +528,6 @@ async fn handle_file_cost(
             rx,
             path.display().to_string(),
             file_size,
-            verbose,
         ));
 
         let result = client.estimate_upload_cost(path, mode, Some(tx)).await;
@@ -572,6 +572,9 @@ struct UploadJsonResult {
     datamap: Option<String>,
     mode: String,
     chunks: usize,
+    total_chunks: usize,
+    chunks_stored: usize,
+    chunks_failed: usize,
     size: u64,
     storage_cost_atto: String,
     gas_cost_wei: String,
@@ -579,26 +582,19 @@ struct UploadJsonResult {
 }
 
 #[derive(Serialize)]
+struct UploadFailureJson<'a> {
+    error: &'a str,
+    total_chunks: usize,
+    chunks_stored: usize,
+    chunks_failed: usize,
+    reason: &'a str,
+}
+
+#[derive(Serialize)]
 struct DownloadJsonResult {
     file: String,
     size: u64,
     elapsed_secs: f64,
-}
-
-fn new_spinner(msg: &str) -> ProgressBar {
-    let pb = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-        ProgressBar::new_spinner()
-    } else {
-        ProgressBar::hidden()
-    };
-    pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .expect("valid template")
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-    );
-    pb.set_message(msg.to_string());
-    pb.enable_steady_tick(Duration::from_millis(80));
-    pb
 }
 
 fn format_size(bytes: u64) -> String {

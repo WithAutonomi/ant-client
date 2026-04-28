@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod progress;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -7,7 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
 use tracing::info;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -55,19 +55,20 @@ async fn run() -> anyhow::Result<()> {
         let filter = match (EnvFilter::try_from_default_env().ok(), cli.verbose) {
             (Some(f), _) => Some(f),
             (None, 0) => None,
-            (None, 1) => Some(EnvFilter::new("ant_core=info,ant_cli=info")),
-            (None, 2) => Some(EnvFilter::new("ant_core=debug,ant_cli=debug")),
+            (None, 1) => Some(EnvFilter::new(verbose_filter("info"))),
+            (None, 2) => Some(EnvFilter::new(verbose_filter("debug"))),
             (None, _) => Some(EnvFilter::new("trace")),
         };
         if let Some(filter) = filter {
             tracing_subscriber::registry()
-                .with(fmt::layer().with_writer(std::io::stderr))
+                .with(fmt::layer().with_writer(progress::ProgressAwareWriter))
                 .with(filter)
                 .init();
         }
     }
 
     // Separate the command from the rest of the CLI args to avoid partial-move issues.
+    // `verbose` was consumed by the tracing filter init above.
     let Cli {
         json,
         command,
@@ -77,7 +78,7 @@ async fn run() -> anyhow::Result<()> {
         ipv4_only,
         quote_timeout_secs,
         store_timeout_secs,
-        verbose,
+        verbose: _,
         evm_network,
         quote_concurrency,
         store_concurrency,
@@ -138,7 +139,7 @@ async fn run() -> anyhow::Result<()> {
             if let Some(c) = store_concurrency_override {
                 client.config_mut().store_concurrency = c;
             }
-            action.execute(&client, json, verbose).await?;
+            action.execute(&client, json).await?;
         }
         Commands::Chunk { action } => {
             let needs_wallet = matches!(action, commands::data::ChunkAction::Put { .. });
@@ -183,11 +184,14 @@ async fn build_data_client(
     let manifest = load_manifest(ctx)?;
     let bootstrap = resolve_bootstrap_from(ctx, manifest.as_ref())?;
 
-    // Connection phase with animated spinner showing peer discovery in real-time
+    // Connection phase with animated spinner showing peer discovery in real-time.
+    // The spinner is the user-facing UI; tracing::info! provides log-level visibility
+    // when `-v` is set.
+    info!("Connecting to autonomi network");
     let node = if quiet {
         create_client_node(bootstrap, ctx.allow_loopback, ctx.ipv4_only).await?
     } else {
-        let spinner = new_spinner("Connecting to autonomi network...");
+        let spinner = progress::new_spinner("Connecting to autonomi network...");
 
         let node = match create_client_node_raw(bootstrap, ctx.allow_loopback, ctx.ipv4_only).await
         {
@@ -198,10 +202,13 @@ async fn build_data_client(
             }
         };
 
-        // Poll peer count during node.start() to show real-time discovery
+        // Poll peer count during node.start() to show real-time discovery.
+        // The spinner reflects every change; `info!` only fires on each new
+        // peer-count milestone to avoid flooding the log.
         let spinner_clone = spinner.clone();
         let node_clone = node.clone();
         let poll_handle = tokio::spawn(async move {
+            let mut last_logged = 0usize;
             loop {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let count = node_clone.connected_peers().await.len();
@@ -209,6 +216,10 @@ async fn build_data_client(
                     spinner_clone.set_message(format!(
                         "Connecting to autonomi network... (found {count} peers)"
                     ));
+                }
+                if count > last_logged {
+                    info!("Discovered {count} peer(s)");
+                    last_logged = count;
                 }
             }
         });
@@ -220,6 +231,7 @@ async fn build_data_client(
         start_result.map_err(|e| anyhow::anyhow!("Failed to start P2P node: {e}"))?;
 
         let peers = node.connected_peers().await.len();
+        info!("Connected to autonomi network ({peers} peers)");
         eprintln!("Connected to autonomi network (found {peers} peers)");
         node
     };
@@ -248,10 +260,12 @@ async fn build_data_client(
         client = client.with_wallet(wallet);
 
         if !quiet {
-            let spinner = new_spinner("Approving token spend...");
+            info!("Approving token spend");
+            let spinner = progress::new_spinner("Approving token spend...");
             let approval = client.approve_token_spend().await;
             spinner.finish_and_clear();
             approval.map_err(|e| anyhow::anyhow!("Token approval failed: {e}"))?;
+            info!("Token spend approved");
             eprintln!("Token spend approved");
         } else {
             client
@@ -264,22 +278,25 @@ async fn build_data_client(
     Ok(client)
 }
 
-/// Create a styled spinner for long-running operations.
-/// Hidden when stderr is not a terminal (piped output).
-fn new_spinner(msg: &str) -> ProgressBar {
-    let pb = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-        ProgressBar::new_spinner()
-    } else {
-        ProgressBar::hidden()
-    };
-    pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .expect("valid template")
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-    );
-    pb.set_message(msg.to_string());
-    pb.enable_steady_tick(Duration::from_millis(80));
-    pb
+/// Build the EnvFilter directives string for `-v` / `-vv`.
+///
+/// Targets cover ant-cli/ant-core plus the network-layer crates (ant_node, evmlib,
+/// saorsa_core, saorsa_transport, saorsa_pqc) so that peer discovery / connection
+/// events are visible at info/debug levels.
+fn verbose_filter(level: &str) -> String {
+    [
+        "ant_cli",
+        "ant_core",
+        "ant_node",
+        "evmlib",
+        "saorsa_core",
+        "saorsa_transport",
+        "saorsa_pqc",
+    ]
+    .iter()
+    .map(|t| format!("{t}={level}"))
+    .collect::<Vec<_>>()
+    .join(",")
 }
 
 fn require_secret_key() -> anyhow::Result<String> {
