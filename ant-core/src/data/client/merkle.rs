@@ -342,29 +342,25 @@ impl Client {
         let node = self.network().node();
         let timeout = Duration::from_secs(self.config().quote_timeout_secs);
 
-        // Query extra peers to handle validation failures (bad sigs, wrong type, etc.)
+        // Over-collect: query 2× the pool size so that responses we end up
+        // discarding (bad sigs, wrong timestamps, dropped quotes) don't block
+        // the pool from filling. We pick the closest 16 by XOR distance later
+        // (see `collect_validated_candidates`); padding from non-close peers
+        // is *not* a valid fallback because the receiving node's verifier
+        // (`PaymentVerifier::verify_merkle_candidate_closeness`) does its own
+        // iterative DHT lookup against the pool midpoint and rejects any pool
+        // whose candidates aren't actually XOR-closest to that midpoint.
         let query_count = CANDIDATES_PER_POOL * 2;
-        let mut remote_peers = self
+        let remote_peers = self
             .network()
             .find_closest_peers(address, query_count)
             .await?;
 
-        // If DHT closest-nodes didn't return enough, supplement with connected peers.
-        // On small networks the DHT iterative lookup may not discover enough peers
-        // close to a random pool address, but we know more peers via direct connections.
-        if remote_peers.len() < CANDIDATES_PER_POOL {
-            let connected = self.network().connected_peers().await;
-            for peer in connected {
-                if !remote_peers.iter().any(|(id, _)| *id == peer) {
-                    remote_peers.push((peer, vec![]));
-                }
-            }
-        }
-
         if remote_peers.len() < CANDIDATES_PER_POOL {
             return Err(Error::InsufficientPeers(format!(
-                "Found {} peers, need {CANDIDATES_PER_POOL} for merkle candidate pool. \
-                 Use --no-merkle or a larger network.",
+                "DHT closest-peers lookup returned {} peers, need at least \
+                 {CANDIDATES_PER_POOL} to build a merkle candidate pool. Retry once \
+                 the routing table populates further, or use --no-merkle.",
                 remote_peers.len()
             )));
         }
@@ -443,11 +439,30 @@ impl Client {
             candidate_futures.push(fut);
         }
 
-        self.collect_validated_candidates(&mut candidate_futures, merkle_payment_timestamp)
-            .await
+        self.collect_validated_candidates(
+            &mut candidate_futures,
+            address,
+            merkle_payment_timestamp,
+        )
+        .await
     }
 
-    /// Collect and validate merkle candidate responses until we have enough.
+    /// Collect and validate merkle candidate responses, then return the
+    /// `CANDIDATES_PER_POOL` candidates whose `PeerId`s are XOR-closest to the
+    /// pool midpoint address.
+    ///
+    /// Selection-by-XOR-distance (not by response order) is load-bearing: the
+    /// receiving node's `PaymentVerifier::verify_merkle_candidate_closeness`
+    /// runs its own iterative DHT lookup against the pool midpoint and
+    /// requires `CANDIDATE_CLOSENESS_REQUIRED` of our 16 candidates to appear
+    /// in *its* closest-K set. Picking the first 16 to respond — the previous
+    /// behaviour — leaks slow-but-genuinely-close peers out of the pool and
+    /// replaces them with fast-but-farther peers, tipping the verifier below
+    /// its tolerance and rejecting every chunk in the batch.
+    ///
+    /// Per-peer latency is already bounded by `quote_timeout_secs`, so
+    /// draining the entire `FuturesUnordered` adds no worst-case time over
+    /// the previous early-break behaviour.
     async fn collect_validated_candidates(
         &self,
         futures: &mut FuturesUnordered<
@@ -458,9 +473,10 @@ impl Client {
                 ),
             >,
         >,
+        pool_address: &[u8; 32],
         merkle_payment_timestamp: u64,
     ) -> Result<[MerklePaymentCandidateNode; CANDIDATES_PER_POOL]> {
-        let mut candidates = Vec::with_capacity(CANDIDATES_PER_POOL);
+        let mut scored: Vec<(PeerId, MerklePaymentCandidateNode)> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
 
         while let Some((peer_id, result)) = futures.next().await {
@@ -476,10 +492,7 @@ impl Client {
                         failures.push(format!("{peer_id}: timestamp mismatch"));
                         continue;
                     }
-                    candidates.push(candidate);
-                    if candidates.len() >= CANDIDATES_PER_POOL {
-                        break;
-                    }
+                    scored.push((peer_id, candidate));
                 }
                 Err(e) => {
                     debug!("Failed to get merkle candidate from {peer_id}: {e}");
@@ -488,15 +501,36 @@ impl Client {
             }
         }
 
-        if candidates.len() < CANDIDATES_PER_POOL {
+        if scored.len() < CANDIDATES_PER_POOL {
             return Err(Error::InsufficientPeers(format!(
                 "Got {} merkle candidates, need {CANDIDATES_PER_POOL}. Failures: [{}]",
-                candidates.len(),
+                scored.len(),
                 failures.join("; ")
             )));
         }
 
-        candidates.truncate(CANDIDATES_PER_POOL);
+        // Sort by XOR distance to the pool midpoint and keep the closest
+        // `CANDIDATES_PER_POOL`. Honest peers' transport-level `PeerId` is the
+        // BLAKE3 hash of the same `pub_key` they sign their candidate with —
+        // the hash the verifier derives at check time — so ranking by
+        // `peer_id` here matches the verifier's frame of reference.
+        let target = PeerId::from_bytes(*pool_address);
+        scored.sort_by(|(a, _), (b, _)| a.xor_distance(&target).cmp(&b.xor_distance(&target)));
+        let total_responders = scored.len();
+        scored.truncate(CANDIDATES_PER_POOL);
+
+        // Build-marker log: a fingerprint string for verifying that a
+        // deployed binary actually contains the by-distance pool selection
+        // (grep `MERKLE_POOL_BY_DISTANCE_v1` in node/client logs).
+        debug!(
+            "MERKLE_POOL_BY_DISTANCE_v1: kept closest {} of {} valid responders for pool midpoint {}",
+            scored.len(),
+            total_responders,
+            hex::encode(pool_address),
+        );
+
+        let candidates: Vec<MerklePaymentCandidateNode> =
+            scored.into_iter().map(|(_, c)| c).collect();
         candidates
             .try_into()
             .map_err(|_| Error::Payment("Failed to convert candidates to fixed array".to_string()))
