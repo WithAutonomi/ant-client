@@ -771,9 +771,7 @@ async fn bench_download_once(
         // not-found or content), no transport errors. We don't
         // require found>0 because the addresses are random.
         ok: err == 0,
-        note: format!(
-            "{found} found, {not_found} not-found, {err} err; cap {cap}->{cap_after}",
-        ),
+        note: format!("{found} found, {not_found} not-found, {err} err; cap {cap}->{cap_after}",),
     }
 }
 
