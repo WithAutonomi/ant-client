@@ -106,6 +106,10 @@ required-features = ["devnet"]
 name = "start-devnet-sepolia"
 path = "examples/start-devnet-sepolia.rs"
 
+[[example]]
+name = "bench-quoting"
+path = "examples/bench-quoting.rs"
+
 [[test]]
 name = "e2e_chunk"
 path = "tests/e2e_chunk.rs"
