@@ -44,17 +44,29 @@ ant file download --datamap photo.datamap -o photo_copy.jpg -b 1.2.3.4:12000
 ### Store and retrieve a file (local devnet)
 
 ```bash
-# 1. Start a local devnet (spins up nodes + a local Anvil EVM chain)
-cargo run --example start-local-devnet
+# 1. Start a local devnet (spins up 25 nodes + a local Anvil EVM chain)
+cargo run --release --example start-local-devnet
 
-# 2. Upload a file
-SECRET_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-    ant file upload photo.jpg --public \
-    --devnet-manifest /tmp/ant-devnet-manifest.json --allow-loopback --evm-network local
+# 2. Upload a file (the manifest is auto-written to the shared data dir)
+SECRET_KEY=0x... ant file upload photo.jpg --public \
+    --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback --evm-network local
 
 # 3. Download it back
-ant file download <address> -o photo_copy.jpg \
-    --devnet-manifest /tmp/ant-devnet-manifest.json --allow-loopback --evm-network local
+ant file download abc123... -o photo_copy.jpg \
+    --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback --evm-network local
+```
+
+### Store and retrieve a file (Arbitrum mainnet)
+
+```bash
+# Upload (private — DataMap saved locally)
+SECRET_KEY=0x... ant file upload photo.jpg \
+    --bootstrap 1.2.3.4:12000 --evm-network arbitrum-one
+# Output: DATAMAP_FILE=photo.jpg.datamap
+
+# Download using the local DataMap
+ant file download --datamap photo.jpg.datamap -o photo_copy.jpg \
+    --bootstrap 1.2.3.4:12000 --evm-network arbitrum-one
 ```
 
 ### Low-level chunk operations
@@ -474,28 +486,40 @@ Autonomi supports two payment strategies:
 
 ### Local Development with Devnet
 
-`LocalDevnet` spins up a local Autonomi network with an embedded Anvil EVM blockchain for development and testing:
+Two ready-made examples spin up a local network and write a manifest to the shared data directory (`~/.local/share/ant/` on Linux, `~/Library/Application Support/ant/` on macOS, `%APPDATA%\ant\` on Windows). Any consumer that checks this directory — ant-gui, ant-cli, ant-tui — will auto-detect the devnet.
+
+```bash
+# Local Anvil devnet (25 nodes + embedded EVM blockchain)
+# Includes a pre-funded wallet key in the manifest
+cargo run --release --example start-local-devnet
+
+# Sepolia testnet devnet (25 nodes + real Arbitrum Sepolia contracts)
+# No wallet key — connect your own funded Sepolia wallet
+cargo run --release --example start-devnet-sepolia
+```
+
+Both write `devnet-manifest.json` to the shared data dir and clean it up on Ctrl+C.
+
+The [ant-gui](https://github.com/WithAutonomi/ant-ui) desktop app auto-detects the manifest on startup and switches to devnet/Sepolia mode — no manual configuration needed. The manifest can also be passed to the CLI explicitly via `--devnet-manifest <path>`.
+
+#### Programmatic usage
 
 ```rust
 use ant_core::data::LocalDevnet;
 
-// Start a minimal devnet (5 nodes + Anvil EVM chain)
-let mut devnet = LocalDevnet::start_minimal().await?;
+// Start a devnet (25 nodes + Anvil EVM chain)
+let devnet = LocalDevnet::start(DevnetConfig::default()).await?;
 
 // Create a client with a pre-funded wallet (ready to upload)
 let client = devnet.create_funded_client().await?;
 
-// Upload data
-let result = client.data_upload(Bytes::from("test payload")).await?;
-
-// Write manifest for CLI usage
-devnet.write_manifest(Path::new("/tmp/devnet.json")).await?;
+// Write manifest for discovery by other tools
+let manifest_path = ant_core::config::data_dir()?.join("devnet-manifest.json");
+devnet.write_manifest(&manifest_path).await?;
 
 // Clean up
 devnet.shutdown().await?;
 ```
-
-The manifest JSON can be passed to the CLI via `--devnet-manifest` for local testing.
 
 ### Chunk Cache
 
@@ -637,7 +661,7 @@ cargo fmt --all -- --check
 
 # Run the CLI
 cargo run --bin ant -- --help
-cargo run --bin ant -- --devnet-manifest /tmp/ant-devnet-manifest.json --allow-loopback --evm-network local file upload photo.jpg
+cargo run --bin ant -- file upload photo.jpg --public --devnet-manifest ~/.local/share/ant/devnet-manifest.json --allow-loopback --evm-network local
 cargo run --bin ant -- node daemon status
 ```
 

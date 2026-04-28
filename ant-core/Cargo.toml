@@ -102,6 +102,10 @@ path = "examples/start-local-devnet.rs"
 # not found" error, so require the feature explicitly.
 required-features = ["devnet"]
 
+[[example]]
+name = "start-devnet-sepolia"
+path = "examples/start-devnet-sepolia.rs"
+
 [[test]]
 name = "e2e_chunk"
 path = "tests/e2e_chunk.rs"
