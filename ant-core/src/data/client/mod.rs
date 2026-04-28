@@ -225,32 +225,19 @@ fn build_controller(config: &ClientConfig) -> (AdaptiveController, Option<PathBu
         adaptive::default_persist_path()
     };
 
-    // Hint self_encryption's STREAM_DECRYPT_BATCH_SIZE based on the
-    // controller's current fetch cap (post-warm-start). The upstream
-    // value is `LazyLock<usize>` evaluated once per process from the
-    // env var; setting the env var here, before any download path
-    // touches `streaming_decrypt`, lets the LazyLock pick up our
-    // adaptive value. Subsequent runtime adaptation of fan-out still
-    // works because we re-read `controller.fetch.current()` per batch
-    // inside the streaming_decrypt callback — this just sizes the
-    // batches self_encryption asks us for. We deliberately do NOT
-    // overwrite a value the user has already exported, so power
-    // users can still pin it.
-    if std::env::var_os("STREAM_DECRYPT_BATCH_SIZE").is_none() {
-        let cap = controller.fetch.current();
-        // Safety: writing env vars from a single-threaded init
-        // before any async work spawns is sound. `Client::from_node`
-        // and `Client::connect` are the only callers, and both are
-        // invoked at the top of an executable's main flow.
-        // SAFETY: caller invariant — see the doc comment above.
-        unsafe {
-            std::env::set_var("STREAM_DECRYPT_BATCH_SIZE", cap.to_string());
-        }
-        debug!(
-            batch_size = cap,
-            "adaptive: hinted STREAM_DECRYPT_BATCH_SIZE"
-        );
-    }
+    // Note: self_encryption's `STREAM_DECRYPT_BATCH_SIZE` is a
+    // `LazyLock<usize>` populated from the env var at first access
+    // and frozen for the process lifetime. Setting the env var from
+    // Rust would require `std::env::set_var`, which is `unsafe`
+    // since Rust 1.80 (it races against concurrent reads in any
+    // other thread); per project policy, `unsafe` is banned.
+    //
+    // The adaptive controller still drives fan-out *inside* each
+    // batch — we re-read `controller.fetch.current()` in the
+    // `streaming_decrypt` callback. The upstream batch size only
+    // controls how many chunks `self_encryption` asks us for at a
+    // time (default 10). For larger batch sizes export
+    // `STREAM_DECRYPT_BATCH_SIZE` before launching the process.
 
     (controller, persist_path)
 }
