@@ -280,6 +280,18 @@ impl Client {
         // stream::iter over references combined with async closures.
         let addresses: Vec<[u8; 32]> = chunk_infos.iter().map(|info| info.dst_hash.0).collect();
 
+        // Build ONE peer pool from a single DHT lookup, then reuse it
+        // for every chunk's GET. On networks where find_closest_peers
+        // dominates per-chunk wall-clock, this turns a download from
+        // O(N * lookup_time) into O(lookup_time + N * RPC_time).
+        let pool = self.build_peer_pool_for(&addresses).await?;
+        debug!(
+            "Built peer pool of {} for {} chunks",
+            pool.len(),
+            addresses.len()
+        );
+        let pool_ref = &pool;
+
         // Rolling rebucketing: re-reads the controller's fetch cap as
         // each slot frees, so a long download (e.g. 10 GB = ~2500
         // chunks) sees adaptive growth/decay mid-flight without batch
@@ -294,7 +306,7 @@ impl Client {
                 async move {
                     let chunk = observe_op(
                         &limiter,
-                        || async move { self.chunk_get(&address).await },
+                        || async move { self.chunk_get_with_pool(&address, pool_ref).await },
                         classify_error,
                     )
                     .await?
