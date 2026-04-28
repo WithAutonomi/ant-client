@@ -476,7 +476,11 @@ impl Client {
             .collect();
 
         let quote_limiter = self.controller().quote.clone();
-        let quote_concurrency = quote_limiter.current();
+        // Batch-aware fan-out: clamp to chunk_count so we never
+        // pay for fan-out slots we cannot fill on a partial wave.
+        // See PERF-RESULTS.md — measured ~30% slowdown when
+        // cap > batch size on quoting workloads (live mainnet).
+        let quote_concurrency = quote_limiter.current().min(chunk_count.max(1));
         let mut quote_stream = stream::iter(chunks_with_addr)
             .map(|(content, address)| {
                 let limiter = quote_limiter.clone();
@@ -562,7 +566,7 @@ impl Client {
             }
 
             let store_limiter = self.controller().store.clone();
-            let store_concurrency = store_limiter.current();
+            let store_concurrency = store_limiter.current().min(to_retry.len().max(1));
             let mut upload_stream = stream::iter(to_retry)
                 .map(|chunk| {
                     let chunk_clone = chunk.clone();

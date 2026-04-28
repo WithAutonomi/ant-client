@@ -933,8 +933,10 @@ impl Client {
             }
         } else {
             // Wave-batch path: collect quotes per chunk concurrently.
+            // Clamp fan-out to chunk_count so a partial wave doesn't
+            // pay for slots it can't fill (see PERF-RESULTS.md).
             let quote_limiter = self.controller().quote.clone();
-            let quote_concurrency = quote_limiter.current();
+            let quote_concurrency = quote_limiter.current().min(chunk_count.max(1));
             let results: Vec<Result<Option<PreparedChunk>>> = stream::iter(chunk_data)
                 .map(|content| {
                     let limiter = quote_limiter.clone();
@@ -1351,7 +1353,9 @@ impl Client {
             );
 
             let store_limiter = self.controller().store.clone();
-            let store_concurrency = store_limiter.current();
+            // Clamp fan-out to wave size — partial last wave should
+            // not pay for extra slots (see PERF-RESULTS.md).
+            let store_concurrency = store_limiter.current().min(wave.len().max(1));
             let mut upload_stream = stream::iter(wave.into_iter().map(|(content, addr)| {
                 let proof_bytes = batch_result.proofs.get(&addr).cloned();
                 let limiter = store_limiter.clone();
@@ -1497,7 +1501,11 @@ impl Client {
                     let prog = progress_ref.clone();
                     let limiter = fetch_limiter.clone();
                     handle.block_on(async {
-                        let cap = limiter.current();
+                        // Clamp fan-out to batch size — self_encryption
+                        // requests small batches (default 10), so a
+                        // higher cap from the controller would be slots
+                        // we never fill (see PERF-RESULTS.md).
+                        let cap = limiter.current().min(batch_owned.len().max(1));
                         let mut stream = futures::stream::iter(batch_owned)
                             .map(|(idx, hash)| {
                                 let addr = hash.0;
@@ -1581,7 +1589,8 @@ impl Client {
 
             tokio::task::block_in_place(|| {
                 handle.block_on(async {
-                    let cap = fetch_limiter.current();
+                    // Clamp fan-out to batch size — see PERF-RESULTS.md.
+                    let cap = fetch_limiter.current().min(batch_owned.len().max(1));
                     let mut stream = futures::stream::iter(batch_owned)
                         .map(|(idx, hash)| {
                             let addr = hash.0;

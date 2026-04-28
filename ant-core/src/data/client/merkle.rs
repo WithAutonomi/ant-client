@@ -519,7 +519,10 @@ impl Client {
     ) -> Result<usize> {
         let mut stored = 0usize;
         let store_limiter = self.controller().store.clone();
-        let store_concurrency = store_limiter.current();
+        // Clamp fan-out to batch size — partial batches should not
+        // pay for unused slots (see PERF-RESULTS.md).
+        let batch_size = chunk_contents.len();
+        let store_concurrency = store_limiter.current().min(batch_size.max(1));
         let mut upload_stream = stream::iter(chunk_contents.into_iter().zip(addresses).map(
             |(content, addr)| {
                 let proof_bytes = batch_result.proofs.get(&addr).cloned();

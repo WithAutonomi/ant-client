@@ -180,7 +180,7 @@ impl Client {
             .collect();
 
         let quote_limiter = self.controller().quote.clone();
-        let quote_concurrency = quote_limiter.current();
+        let quote_concurrency = quote_limiter.current().min(chunk_count.max(1));
         let results: Vec<Result<Option<PreparedChunk>>> = futures::stream::iter(chunk_contents)
             .map(|content| {
                 let limiter = quote_limiter.clone();
