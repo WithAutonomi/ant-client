@@ -51,7 +51,9 @@ pub const DATAMAP_EXTENSION: &str = "datamap";
 /// In normal use a directory will see at most a handful of repeated
 /// uploads; this bound just protects against pathological state (e.g.
 /// thousands of stale entries) so we fail fast instead of looping.
-const MAX_COLLISION_ATTEMPTS: u32 = 100;
+/// Set generously (1000) so legitimate users with many backups of the
+/// same file don't hit a confusing error before pathological state does.
+const MAX_COLLISION_ATTEMPTS: u32 = 1000;
 
 /// Behaviour when a target datamap filename already exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,10 +105,15 @@ pub fn original_name_from_datamap(path: &Path) -> Option<OsString> {
 /// Write `dm` to `dir` using the canonical naming and the given collision
 /// policy. Returns the absolute path to the written file.
 ///
-/// Atomicity: writes to a tempfile in `dir` then renames into place, so a
-/// crash during write cannot leave a half-serialized datamap at the target
-/// path. The tempfile is created on the same filesystem as `dir` to keep
-/// the rename atomic across all supported platforms.
+/// Atomicity: writes to a tempfile in `dir`, fsyncs the file, renames into
+/// place, then (on Unix) best-effort-fsyncs the parent directory. A crash
+/// at any point cannot leave a half-serialized datamap at the target
+/// path, and on Unix the rename itself is durable across power loss
+/// because the directory entry is flushed. The tempfile is created on
+/// the same filesystem as `dir` to keep the rename atomic. Windows
+/// relies on NTFS metadata journaling for rename durability — we do not
+/// fsync the directory there because Windows does not expose that
+/// operation through `std::fs`.
 pub fn write_datamap(
     dir: &Path,
     original_name: &str,
@@ -191,5 +198,18 @@ fn write_atomic(dir: &Path, target: &Path, bytes: &[u8]) -> Result<()> {
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(target).map_err(|e| Error::Io(e.error))?;
+    // On Unix, fsync the parent directory so the rename itself survives
+    // a crash. On ext4 (default mount opts) and btrfs the rename can
+    // otherwise be lost if the directory entry hasn't reached disk. This
+    // is best-effort — a failure here means we wrote a valid datamap but
+    // can't prove the rename is durable, which is no worse than where we
+    // were before the call. Windows has no portable directory-fsync, so
+    // we skip it there and lean on NTFS metadata journaling.
+    #[cfg(unix)]
+    {
+        if let Ok(dir_handle) = fs::File::open(dir) {
+            let _ = dir_handle.sync_all();
+        }
+    }
     Ok(())
 }

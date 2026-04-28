@@ -659,3 +659,65 @@ fn format_cost(storage_cost_atto: &str, gas_cost_wei: u128) -> String {
     let gas = format_gas_cost(gas_cost_wei);
     format!("{storage} (gas: {gas})")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_download_output_returns_explicit_output_unchanged() {
+        let explicit = PathBuf::from("custom/path.bin");
+        let datamap = PathBuf::from("photo.jpg.datamap");
+        let resolved =
+            resolve_download_output(Some(explicit.clone()), Some(datamap.as_path())).unwrap();
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn resolve_download_output_explicit_wins_even_without_datamap() {
+        let explicit = PathBuf::from("out.bin");
+        let resolved = resolve_download_output(Some(explicit.clone()), None).unwrap();
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn resolve_download_output_derives_from_datamap_basename() {
+        let datamap = PathBuf::from("photo.jpg.datamap");
+        let resolved = resolve_download_output(None, Some(datamap.as_path())).unwrap();
+        assert_eq!(resolved, PathBuf::from("photo.jpg"));
+    }
+
+    #[test]
+    fn resolve_download_output_derives_from_full_datamap_path() {
+        let datamap = PathBuf::from("/tmp/sub/archive.tar.gz.datamap");
+        let resolved = resolve_download_output(None, Some(datamap.as_path())).unwrap();
+        assert_eq!(resolved, PathBuf::from("archive.tar.gz"));
+    }
+
+    #[test]
+    fn resolve_download_output_errors_on_address_download_without_output() {
+        let err = resolve_download_output(None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("--output"),
+            "expected --output guidance, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_download_output_errors_on_bare_dot_datamap() {
+        // `.datamap` strips to an empty stem; we refuse to default-save
+        // to "" and instead instruct the user to pass -o.
+        let datamap = PathBuf::from(".datamap");
+        let err = resolve_download_output(None, Some(datamap.as_path())).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Cannot derive"), "got: {msg}");
+        assert!(msg.contains("-o/--output"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_download_output_errors_on_non_datamap_extension() {
+        let datamap = PathBuf::from("photo.jpg");
+        let err = resolve_download_output(None, Some(datamap.as_path())).unwrap_err();
+        assert!(err.to_string().contains("Cannot derive"));
+    }
+}
