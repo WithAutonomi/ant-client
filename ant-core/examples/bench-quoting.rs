@@ -25,27 +25,29 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
 
 use ant_core::data::{Client, ClientConfig};
-use ant_node::ant_protocol::{
-    ChunkMessage, ChunkMessageBody, ChunkQuoteRequest, ChunkQuoteResponse,
-    MerkleCandidateQuoteRequest, MerkleCandidateQuoteResponse,
+use ant_protocol::evm::{MerklePaymentCandidateNode, PaymentQuote, CANDIDATES_PER_POOL};
+use ant_protocol::transport::PeerId;
+use ant_protocol::{
+    compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
+    ChunkQuoteRequest, ChunkQuoteResponse, MerkleCandidateQuoteRequest,
+    MerkleCandidateQuoteResponse, CLOSE_GROUP_SIZE,
 };
-use ant_node::client::send_and_await_chunk_response;
-use ant_node::core::PeerId;
-use ant_node::{CLOSE_GROUP_SIZE, compute_address};
-use evmlib::merkle_payments::{CANDIDATES_PER_POOL, MerklePaymentCandidateNode};
-use evmlib::PaymentQuote;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::Rng;
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Normal,
     Merkle,
+    /// Drives `client.prepare_chunk_payment` over many random chunks
+    /// to exercise the adaptive controller's `quote` channel.
+    /// Dumps the per-rep cap progression so we can see slow-start.
+    Batch,
     Both,
 }
 
@@ -54,6 +56,7 @@ impl Mode {
         match s {
             "normal" | "single" => Some(Self::Normal),
             "merkle" => Some(Self::Merkle),
+            "batch" => Some(Self::Batch),
             "both" => Some(Self::Both),
             _ => None,
         }
@@ -66,6 +69,15 @@ struct Args {
     /// For merkle stress test: how many midpoint lookups to fire concurrently
     /// per rep (mirrors the 16-pool real upload path).
     concurrency: usize,
+    /// Number of chunks per rep in `Batch` mode. Drives the
+    /// adaptive controller's `quote` channel through `prepare_chunk_payment`.
+    chunks_per_rep: usize,
+    /// Override the buffer_unordered cap used in `Batch` mode. If
+    /// unset, falls back to whatever the runtime cap is (controller
+    /// on adaptive branch; `ClientConfig::quote_concurrency` static
+    /// elsewhere). Set this to compare both branches at identical
+    /// fan-out.
+    batch_cap_override: Option<usize>,
     /// Hard per-rep cap. A rep that exceeds this is recorded as `ok=false`
     /// with `(rep timeout)` noted. Prevents a single hung Kademlia lookup
     /// from blocking the bench for hours.
@@ -81,6 +93,8 @@ impl Args {
         let mut mode = Mode::Both;
         let mut reps = 5usize;
         let mut concurrency = 1usize;
+        let mut chunks_per_rep = 64usize;
+        let mut batch_cap_override: Option<usize> = None;
         let mut rep_timeout_secs = 180u64;
         let mut json_out = None;
         let mut bootstrap_cli: Vec<SocketAddr> = Vec::new();
@@ -89,10 +103,14 @@ impl Args {
             match a.as_str() {
                 "--mode" => {
                     let v = args.next().expect("--mode needs a value");
-                    mode = Mode::parse(&v).expect("--mode must be normal|merkle|both");
+                    mode = Mode::parse(&v).expect("--mode must be normal|merkle|batch|both");
                 }
                 "--reps" => {
-                    reps = args.next().expect("--reps needs a value").parse().expect("int");
+                    reps = args
+                        .next()
+                        .expect("--reps needs a value")
+                        .parse()
+                        .expect("int");
                 }
                 "--concurrency" => {
                     concurrency = args
@@ -100,6 +118,21 @@ impl Args {
                         .expect("--concurrency needs a value")
                         .parse()
                         .expect("int");
+                }
+                "--chunks-per-rep" => {
+                    chunks_per_rep = args
+                        .next()
+                        .expect("--chunks-per-rep needs a value")
+                        .parse()
+                        .expect("int");
+                }
+                "--batch-cap" => {
+                    let v: usize = args
+                        .next()
+                        .expect("--batch-cap needs a value")
+                        .parse()
+                        .expect("int");
+                    batch_cap_override = Some(v);
                 }
                 "--rep-timeout-secs" => {
                     rep_timeout_secs = args
@@ -136,6 +169,8 @@ impl Args {
             mode,
             reps,
             concurrency,
+            chunks_per_rep,
+            batch_cap_override,
             rep_timeout_secs,
             json_out,
             bootstrap,
@@ -204,7 +239,11 @@ fn percentile(sorted: &[u128], p: f64) -> u128 {
     if sorted.is_empty() {
         return 0;
     }
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
 }
@@ -281,7 +320,10 @@ async fn bench_normal_once(client: &Client, rep: usize) -> Rep {
         }
     };
     stages.push(("find_closest_peers".into(), t0.elapsed().as_millis()));
-    stages.push(("find_closest_peers_returned_count".into(), peers.len() as u128));
+    stages.push((
+        "find_closest_peers_returned_count".into(),
+        peers.len() as u128,
+    ));
 
     if peers.len() < CLOSE_GROUP_SIZE {
         return Rep {
@@ -325,12 +367,12 @@ async fn bench_normal_once(client: &Client, rep: usize) -> Rep {
                 per_peer_timeout,
                 &addrs_clone,
                 |body| match body {
-                    ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success { quote, .. }) => {
-                        match rmp_serde::from_slice::<PaymentQuote>(&quote) {
-                            Ok(q) => Some(Ok(q)),
-                            Err(e) => Some(Err(format!("deser: {e}"))),
-                        }
-                    }
+                    ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                        quote, ..
+                    }) => match rmp_serde::from_slice::<PaymentQuote>(&quote) {
+                        Ok(q) => Some(Ok(q)),
+                        Err(e) => Some(Err(format!("deser: {e}"))),
+                    },
                     ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => {
                         Some(Err(format!("err: {e}")))
                     }
@@ -417,7 +459,7 @@ async fn bench_merkle_once(client: &Client, rep: usize, concurrency: usize) -> R
     }
 
     let mut find_ms: Vec<u128> = Vec::new();
-    type PoolPeers = Vec<(PeerId, Vec<ant_node::core::MultiAddr>)>;
+    type PoolPeers = Vec<(PeerId, Vec<ant_protocol::transport::MultiAddr>)>;
     let mut pool_peer_sets: Vec<([u8; 32], PoolPeers)> = Vec::new();
     while let Some((target, ms, res)) = find_futs.next().await {
         find_ms.push(ms);
@@ -471,31 +513,32 @@ async fn bench_merkle_once(client: &Client, rep: usize, concurrency: usize) -> R
             expected += 1;
             quote_futs.push(async move {
                 let t = Instant::now();
-                let res: Result<MerklePaymentCandidateNode, String> = send_and_await_chunk_response(
-                    &node_clone,
-                    &peer_id_clone,
-                    bytes,
-                    request_id,
-                    per_peer_timeout,
-                    &addrs_clone,
-                    |body| match body {
-                        ChunkMessageBody::MerkleCandidateQuoteResponse(
-                            MerkleCandidateQuoteResponse::Success { candidate_node },
-                        ) => match rmp_serde::from_slice::<MerklePaymentCandidateNode>(
-                            &candidate_node,
-                        ) {
-                            Ok(n) => Some(Ok(n)),
-                            Err(e) => Some(Err(format!("deser: {e}"))),
+                let res: Result<MerklePaymentCandidateNode, String> =
+                    send_and_await_chunk_response(
+                        &node_clone,
+                        &peer_id_clone,
+                        bytes,
+                        request_id,
+                        per_peer_timeout,
+                        &addrs_clone,
+                        |body| match body {
+                            ChunkMessageBody::MerkleCandidateQuoteResponse(
+                                MerkleCandidateQuoteResponse::Success { candidate_node },
+                            ) => match rmp_serde::from_slice::<MerklePaymentCandidateNode>(
+                                &candidate_node,
+                            ) {
+                                Ok(n) => Some(Ok(n)),
+                                Err(e) => Some(Err(format!("deser: {e}"))),
+                            },
+                            ChunkMessageBody::MerkleCandidateQuoteResponse(
+                                MerkleCandidateQuoteResponse::Error(e),
+                            ) => Some(Err(format!("err: {e}"))),
+                            _ => None,
                         },
-                        ChunkMessageBody::MerkleCandidateQuoteResponse(
-                            MerkleCandidateQuoteResponse::Error(e),
-                        ) => Some(Err(format!("err: {e}"))),
-                        _ => None,
-                    },
-                    |e| format!("send: {e}"),
-                    || "timeout".to_string(),
-                )
-                .await;
+                        |e| format!("send: {e}"),
+                        || "timeout".to_string(),
+                    )
+                    .await;
                 (peer_id_clone, t.elapsed().as_millis(), res.is_ok())
             });
         }
@@ -550,13 +593,112 @@ async fn bench_merkle_once(client: &Client, rep: usize, concurrency: usize) -> R
 }
 
 // --------------------------------------------------------------------------
+// Batch quote bench — drives the adaptive controller's `quote` channel.
+// --------------------------------------------------------------------------
+
+/// Times preparing payment for `chunks_per_rep` random chunks via
+/// `client.prepare_chunk_payment`. This goes through the controller's
+/// `quote` channel (sized by `controller.quote.current()` in
+/// `Client::batch_upload_chunks`), so the cap actually moves. We
+/// record the final cap for quote/store/fetch on each rep so the
+/// JSON dump shows the AIMD trajectory.
+async fn bench_batch_once(
+    client: &Client,
+    rep: usize,
+    chunks_per_rep: usize,
+    cap_override: Option<usize>,
+) -> Rep {
+    use bytes::Bytes;
+    use futures::stream::StreamExt;
+
+    let mut stages: Vec<(String, u128)> = Vec::new();
+    let total_t0 = Instant::now();
+
+    // Generate `chunks_per_rep` random chunks. Random content means
+    // each address is fresh so we always go through the full quoting
+    // path (no AlreadyStored shortcuts).
+    let chunks: Vec<Bytes> = (0..chunks_per_rep)
+        .map(|_| {
+            let mut buf = vec![0u8; 4096];
+            rand::thread_rng().fill(&mut buf[..]);
+            Bytes::from(buf)
+        })
+        .collect();
+
+    // Pipeline cap: explicit override takes precedence (so both
+    // branches can be benched at identical fan-out for fair
+    // comparison). Otherwise read from the controller.
+    let cap_for_pipeline = cap_override.unwrap_or_else(|| quote_cap(client));
+    stages.push(("quote_cap_before".into(), cap_for_pipeline as u128));
+
+    let t_quote = Instant::now();
+    let results: Vec<Result<_, _>> = futures::stream::iter(chunks)
+        .map(|content| {
+            let c = client;
+            async move { c.prepare_chunk_payment(content).await }
+        })
+        .buffer_unordered(cap_for_pipeline)
+        .collect()
+        .await;
+    let quote_ms = t_quote.elapsed().as_millis();
+    stages.push(("quote_total_ms".into(), quote_ms));
+
+    let mut ok_count = 0usize;
+    let mut already_stored = 0usize;
+    let mut err_count = 0usize;
+    for r in &results {
+        match r {
+            Ok(Some(_)) => ok_count += 1,
+            Ok(None) => already_stored += 1,
+            Err(_) => err_count += 1,
+        }
+    }
+    stages.push(("ok_count".into(), ok_count as u128));
+    stages.push(("already_stored".into(), already_stored as u128));
+    stages.push(("err_count".into(), err_count as u128));
+
+    let cap_after = quote_cap(client);
+    stages.push(("quote_cap_after".into(), cap_after as u128));
+
+    // Per-chunk wall time; for buffer_unordered with fan-out N this
+    // is dominated by the slowest peer in any one batch, so it's a
+    // proxy for "how often did we hit the slow tail".
+    let per_chunk_ms = if chunks_per_rep > 0 {
+        quote_ms / chunks_per_rep as u128
+    } else {
+        0
+    };
+    stages.push(("quote_per_chunk_ms".into(), per_chunk_ms));
+
+    Rep {
+        rep,
+        stages_ms: stages,
+        total_ms: total_t0.elapsed().as_millis(),
+        ok: err_count == 0 && ok_count + already_stored == chunks_per_rep,
+        note: format!(
+            "{ok_count} quoted, {already_stored} already-stored, {err_count} err; cap {cap_for_pipeline}->{cap_after}",
+        ),
+    }
+}
+
+/// Resolve the runtime quote concurrency cap from the adaptive
+/// controller. Lives on the feat branch only.
+fn quote_cap(client: &Client) -> usize {
+    client.controller().quote.current()
+}
+
+// --------------------------------------------------------------------------
 // Reporting
 // --------------------------------------------------------------------------
 
 fn print_report(label: &str, reps: &[Rep], summary: &[StageSummary]) {
     println!();
     println!("=== {label} ===");
-    println!("reps: {} total, {} ok", reps.len(), reps.iter().filter(|r| r.ok).count());
+    println!(
+        "reps: {} total, {} ok",
+        reps.len(),
+        reps.iter().filter(|r| r.ok).count()
+    );
     println!(
         "{:<30} {:>10} {:>10} {:>10} {:>10} {:>6}",
         "stage", "p50_ms", "p95_ms", "max_ms", "mean_ms", "n"
@@ -677,6 +819,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let label = format!(
             "merkle-quoting ({} reps, {} concurrent midpoint lookups/rep)",
             args.reps, args.concurrency
+        );
+        print_report(&label, &reps, &summary);
+        full_report.push((label, reps, summary));
+    }
+
+    if matches!(args.mode, Mode::Batch | Mode::Both) {
+        let mut reps = Vec::with_capacity(args.reps);
+        for i in 0..args.reps {
+            eprintln!(
+                "batch rep {}/{} (chunks_per_rep={})...",
+                i + 1,
+                args.reps,
+                args.chunks_per_rep
+            );
+            let r = match tokio::time::timeout(
+                rep_cap,
+                bench_batch_once(&client, i + 1, args.chunks_per_rep, args.batch_cap_override),
+            )
+            .await
+            {
+                Ok(rep) => rep,
+                Err(_) => Rep {
+                    rep: i + 1,
+                    stages_ms: vec![],
+                    total_ms: rep_cap.as_millis(),
+                    ok: false,
+                    note: format!("(rep timeout {}s)", args.rep_timeout_secs),
+                },
+            };
+            eprintln!(
+                "  => rep {} done ok={} total={}ms  {}",
+                r.rep, r.ok, r.total_ms, r.note
+            );
+            reps.push(r);
+        }
+        let summary = summarise(&reps);
+        let label = format!(
+            "batch-quoting ({} reps, {} chunks/rep, controller-driven)",
+            args.reps, args.chunks_per_rep
         );
         print_report(&label, &reps, &summary);
         full_report.push((label, reps, summary));
