@@ -870,7 +870,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rmp-serde",
- "saorsa-core",
+ "saorsa-core 0.24.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "self-replace",
  "self_encryption",
  "semver 1.0.28",
@@ -932,7 +932,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.13.2",
  "rmp-serde",
- "saorsa-core",
+ "saorsa-core 0.24.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "saorsa-pqc 0.5.1",
  "self-replace",
  "self_encryption",
@@ -956,8 +956,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe630f23f4adae05beba7e2c0861ab9c1a6d2cc88c98898e3742bed3a5a4ce35"
+source = "git+https://github.com/WithAutonomi/ant-protocol.git?branch=mick%2Fremove-bootstrap-cache#70fe8a035899e784c9b3d4520b62dc9151a93f45"
 dependencies = [
  "blake3",
  "bytes",
@@ -965,7 +964,7 @@ dependencies = [
  "hex",
  "postcard",
  "rmp-serde",
- "saorsa-core",
+ "saorsa-core 0.24.0 (git+https://github.com/saorsa-labs/saorsa-core.git?branch=mick%2Fremove-bootstrap-cache)",
  "saorsa-pqc 0.5.1",
  "serde",
  "tokio",
@@ -5174,7 +5173,38 @@ dependencies = [
  "postcard",
  "rand 0.8.6",
  "saorsa-pqc 0.5.1",
- "saorsa-transport",
+ "saorsa-transport 0.33.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "wyz",
+]
+
+[[package]]
+name = "saorsa-core"
+version = "0.24.0"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=mick%2Fremove-bootstrap-cache#37d13d8b1f447f3dcb35995e9d7ccd68b6eb54f7"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "bytes",
+ "dashmap",
+ "dirs 6.0.0",
+ "futures",
+ "hex",
+ "lru",
+ "once_cell",
+ "parking_lot",
+ "postcard",
+ "rand 0.8.6",
+ "saorsa-pqc 0.5.1",
+ "saorsa-transport 0.33.0 (git+https://github.com/saorsa-labs/saorsa-transport.git?branch=mick%2Fremove-bootstrap-cache)",
  "serde",
  "serde_json",
  "tempfile",
@@ -5274,6 +5304,65 @@ name = "saorsa-transport"
 version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9df373519d88540825f435bf3c5c6e300377871b28f16cdd461db3c3f4bb5323"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-lc-rs",
+ "blake3",
+ "bytes",
+ "chrono",
+ "clap",
+ "core-foundation 0.9.4",
+ "dashmap",
+ "dirs 5.0.1",
+ "enum_dispatch",
+ "futures-util",
+ "hex",
+ "igd-next",
+ "indexmap 2.14.0",
+ "keyring",
+ "libc",
+ "lru-slab",
+ "nix",
+ "once_cell",
+ "parking_lot",
+ "pin-project-lite",
+ "quinn-udp 0.6.1",
+ "rand 0.8.6",
+ "rcgen",
+ "regex",
+ "reqwest 0.13.2",
+ "rustc-hash",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "rustls-platform-verifier",
+ "rustls-post-quantum",
+ "saorsa-pqc 0.4.2",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "slab",
+ "socket2 0.5.10",
+ "system-configuration 0.6.1",
+ "thiserror 2.0.18",
+ "time",
+ "tinyvec",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width",
+ "uuid",
+ "windows 0.58.0",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "saorsa-transport"
+version = "0.33.0"
+source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=mick%2Fremove-bootstrap-cache#f3ad915d1395755675f41108b1391ea346267ef2"
 dependencies = [
  "anyhow",
  "async-trait",
