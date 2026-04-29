@@ -3,7 +3,6 @@
 //! Chunks are immutable, content-addressed data blocks where the address
 //! is the BLAKE3 hash of the content.
 
-use crate::data::client::peer_cache::record_peer_outcome;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::transport::{MultiAddr, PeerId};
@@ -15,7 +14,7 @@ use ant_protocol::{
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::future::Future;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{debug, warn};
 
 /// Data type identifier for chunks (used in quote requests).
@@ -237,12 +236,6 @@ impl Client {
         )
         .await;
 
-        // No RTT recorded on the PUT path: the wall-clock is dominated by
-        // the ~4 MB payload upload, which reflects the uploader's uplink
-        // rather than the peer's responsiveness. Quote-path and GET-path
-        // RTTs still feed quality scoring.
-        record_peer_outcome(node, *target_peer, peer_addrs, result.is_ok(), None).await;
-
         result
     }
 
@@ -412,7 +405,6 @@ impl Client {
         let addr_hex = hex::encode(address);
         let timeout_secs = self.config().store_timeout_secs;
 
-        let start = Instant::now();
         let result = send_and_await_chunk_response(
             node,
             peer,
@@ -461,10 +453,6 @@ impl Client {
             },
         )
         .await;
-
-        let success = result.is_ok();
-        let rtt_ms = success.then(|| start.elapsed().as_millis() as u64);
-        record_peer_outcome(node, *peer, peer_addrs, success, rtt_ms).await;
 
         result
     }

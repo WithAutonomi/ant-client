@@ -37,8 +37,6 @@
 //!
 //! - Not a payment-batching controller. Wave / batch sizes are
 //!   orthogonal (gas-economics tradeoff, not throughput).
-//! - Not a peer-quality scorer. That lives in `peer_cache` and feeds
-//!   `BootstrapManager`. Outcomes flow into both, separately.
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;

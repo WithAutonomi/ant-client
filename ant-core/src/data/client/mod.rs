@@ -11,7 +11,6 @@ pub mod data;
 pub mod file;
 pub mod merkle;
 pub mod payment;
-pub(crate) mod peer_cache;
 pub mod quote;
 
 use crate::data::client::adaptive::{AdaptiveConfig, AdaptiveController, ChannelStart, Outcome};
