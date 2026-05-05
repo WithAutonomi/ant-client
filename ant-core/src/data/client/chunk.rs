@@ -22,7 +22,7 @@ use tracing::{debug, warn};
 const CHUNK_DATA_TYPE: u32 = 0;
 
 /// Store-response timeout for non-merkle chunk PUTs.
-const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn store_response_timeout_for_proof(proof: &[u8], merkle_timeout_secs: u64) -> Duration {
     match detect_proof_type(proof) {
