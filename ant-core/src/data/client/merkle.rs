@@ -127,12 +127,51 @@ pub(crate) fn chunk_contents_for_upload_addresses(
     chunk_contents: Vec<Bytes>,
     addresses: &[[u8; 32]],
 ) -> Result<Vec<Bytes>> {
-    let mut chunks_by_address: HashMap<[u8; 32], VecDeque<Bytes>> = HashMap::new();
+    if addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut needed_by_address: HashMap<[u8; 32], usize> = HashMap::new();
+    for address in addresses {
+        *needed_by_address.entry(*address).or_default() += 1;
+    }
+
+    let mut chunks_by_address: HashMap<[u8; 32], VecDeque<Bytes>> =
+        HashMap::with_capacity(needed_by_address.len());
+    let mut remaining = addresses.len();
     for chunk in chunk_contents {
-        chunks_by_address
-            .entry(compute_address(&chunk))
-            .or_default()
-            .push_back(chunk);
+        let address = compute_address(&chunk);
+        if let Some(needed) = needed_by_address.get_mut(&address) {
+            if *needed > 0 {
+                chunks_by_address
+                    .entry(address)
+                    .or_default()
+                    .push_back(chunk);
+                *needed -= 1;
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    for (address, needed) in &needed_by_address {
+        if *needed == 0 {
+            continue;
+        }
+
+        if chunks_by_address.contains_key(address) {
+            return Err(Error::InvalidData(format!(
+                "missing duplicate chunk content for merkle address {}",
+                hex::encode(address)
+            )));
+        }
+
+        return Err(Error::InvalidData(format!(
+            "missing chunk content for merkle address {}",
+            hex::encode(address)
+        )));
     }
 
     let mut selected = Vec::with_capacity(addresses.len());
@@ -950,6 +989,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(selected, vec![repeated.clone(), repeated]);
+    }
+
+    #[test]
+    fn chunk_contents_for_upload_addresses_ignores_unrequested_duplicates() {
+        let requested = Bytes::from_static(b"requested-content");
+        let unrequested = Bytes::from_static(b"unrequested-content");
+        let requested_addr = compute_address(&requested);
+
+        let selected = chunk_contents_for_upload_addresses(
+            vec![
+                unrequested.clone(),
+                requested.clone(),
+                unrequested.clone(),
+                unrequested,
+            ],
+            &[requested_addr],
+        )
+        .unwrap();
+
+        assert_eq!(selected, vec![requested]);
     }
 
     #[test]
