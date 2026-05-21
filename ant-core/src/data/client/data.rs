@@ -10,14 +10,13 @@ use crate::data::client::adaptive::{observe_op, rebucketed_ordered};
 use crate::data::client::batch::{PaymentIntent, PreparedChunk};
 use crate::data::client::classify_error;
 use crate::data::client::file::{ExternalPaymentInfo, PreparedUpload, Visibility};
-use crate::data::client::merkle::PaymentMode;
+use crate::data::client::merkle::{chunk_contents_for_upload_addresses, PaymentMode};
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::{compute_address, DATA_TYPE_CHUNK};
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use self_encryption::{decrypt, encrypt, DataMap, EncryptedChunk};
-use std::collections::HashSet;
 use tracing::{debug, info};
 
 /// Result of an in-memory data upload: the `DataMap` needed to retrieve the data.
@@ -134,11 +133,8 @@ impl Client {
                 });
             }
 
-            let to_upload: HashSet<[u8; 32]> = merkle_plan.to_upload.iter().copied().collect();
-            let chunk_contents: Vec<Bytes> = chunk_contents
-                .into_iter()
-                .filter(|chunk| to_upload.contains(&compute_address(chunk)))
-                .collect();
+            let chunk_contents =
+                chunk_contents_for_upload_addresses(chunk_contents, &merkle_plan.to_upload)?;
 
             let remaining_chunks = merkle_plan.to_upload.len();
             if !self.should_use_merkle(remaining_chunks, mode) {

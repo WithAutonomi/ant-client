@@ -16,12 +16,12 @@ use ant_protocol::evm::{
 use ant_protocol::payment::{serialize_merkle_proof, verify_merkle_candidate_signature};
 use ant_protocol::transport::PeerId;
 use ant_protocol::{
-    send_and_await_chunk_response, ChunkMessage, ChunkMessageBody, MerkleCandidateQuoteRequest,
-    MerkleCandidateQuoteResponse,
+    compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
+    MerkleCandidateQuoteRequest, MerkleCandidateQuoteResponse,
 };
 use bytes::Bytes;
 use futures::stream::{self, FuturesUnordered, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -117,6 +117,42 @@ impl std::fmt::Debug for PreparedMerkleBatch {
             .field("addresses", &self.addresses.len())
             .finish()
     }
+}
+
+/// Select chunk contents that correspond to `addresses`, preserving address order.
+///
+/// Extra chunk contents are ignored; missing contents for any requested address
+/// are treated as corrupted upload state.
+pub(crate) fn chunk_contents_for_upload_addresses(
+    chunk_contents: Vec<Bytes>,
+    addresses: &[[u8; 32]],
+) -> Result<Vec<Bytes>> {
+    let mut chunks_by_address: HashMap<[u8; 32], VecDeque<Bytes>> = HashMap::new();
+    for chunk in chunk_contents {
+        chunks_by_address
+            .entry(compute_address(&chunk))
+            .or_default()
+            .push_back(chunk);
+    }
+
+    let mut selected = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let chunks = chunks_by_address.get_mut(address).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "missing chunk content for merkle address {}",
+                hex::encode(address)
+            ))
+        })?;
+        let chunk = chunks.pop_front().ok_or_else(|| {
+            Error::InvalidData(format!(
+                "missing duplicate chunk content for merkle address {}",
+                hex::encode(address)
+            ))
+        })?;
+        selected.push(chunk);
+    }
+
+    Ok(selected)
 }
 
 /// Determine whether to use merkle payments for a given batch size.
@@ -708,6 +744,12 @@ impl Client {
         // Clamp fan-out to batch size — partial batches should not
         // pay for unused slots (see PERF-RESULTS.md).
         let batch_size = chunk_contents.len();
+        if batch_size != addresses.len() {
+            return Err(Error::InvalidData(format!(
+                "merkle upload has {batch_size} chunk contents but {} addresses",
+                addresses.len()
+            )));
+        }
         let store_concurrency = store_limiter.current().min(batch_size.max(1));
         let mut upload_stream = stream::iter(chunk_contents.into_iter().zip(addresses).map(
             |(content, addr)| {
@@ -878,6 +920,48 @@ mod tests {
     #[test]
     fn test_threshold_value() {
         assert_eq!(DEFAULT_MERKLE_THRESHOLD, 64);
+    }
+
+    #[test]
+    fn chunk_contents_for_upload_addresses_preserves_requested_order() {
+        let first = Bytes::from_static(b"first");
+        let second = Bytes::from_static(b"second");
+        let first_addr = compute_address(&first);
+        let second_addr = compute_address(&second);
+
+        let selected = chunk_contents_for_upload_addresses(
+            vec![first.clone(), second.clone()],
+            &[second_addr, first_addr],
+        )
+        .unwrap();
+
+        assert_eq!(selected, vec![second, first]);
+    }
+
+    #[test]
+    fn chunk_contents_for_upload_addresses_preserves_duplicate_requests() {
+        let repeated = Bytes::from_static(b"same-content");
+        let other = Bytes::from_static(b"other-content");
+        let repeated_addr = compute_address(&repeated);
+
+        let selected = chunk_contents_for_upload_addresses(
+            vec![repeated.clone(), other, repeated.clone()],
+            &[repeated_addr, repeated_addr],
+        )
+        .unwrap();
+
+        assert_eq!(selected, vec![repeated.clone(), repeated]);
+    }
+
+    #[test]
+    fn chunk_contents_for_upload_addresses_errors_for_missing_content() {
+        let present = Bytes::from_static(b"present-content");
+        let missing = Bytes::from_static(b"missing-content");
+        let missing_addr = compute_address(&missing);
+
+        let result = chunk_contents_for_upload_addresses(vec![present], &[missing_addr]);
+
+        assert!(matches!(result, Err(Error::InvalidData(_))));
     }
 
     // =========================================================================
