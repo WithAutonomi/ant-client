@@ -179,9 +179,8 @@ impl Client {
     /// and returns per-chunk proofs. Splits into sub-batches if > `MAX_LEAVES`.
     ///
     /// This low-level helper assumes the caller has already selected the
-    /// addresses that need payment. User-facing upload paths call
-    /// [`Client::plan_merkle_upload`] first to skip chunks already stored on
-    /// the network.
+    /// addresses that need payment. User-facing upload paths first run the
+    /// merkle upload planner to skip chunks already stored on the network.
     ///
     /// # Errors
     ///
