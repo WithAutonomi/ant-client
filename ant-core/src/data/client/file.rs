@@ -174,6 +174,8 @@ struct ChunkSpill {
     addresses: Vec<[u8; 32]>,
     /// Tracks seen addresses for deduplication.
     seen: HashSet<[u8; 32]>,
+    /// Byte size per spilled chunk address.
+    sizes: HashMap<[u8; 32], u64>,
     /// Running total of unique chunk byte sizes (for average-size calculation).
     total_bytes: u64,
 }
@@ -229,6 +231,7 @@ impl ChunkSpill {
             _lock: lock_file,
             addresses: Vec::new(),
             seen: HashSet::new(),
+            sizes: HashMap::new(),
             total_bytes: 0,
         })
     }
@@ -337,7 +340,9 @@ impl ChunkSpill {
         }
         let path = self.dir.join(hex::encode(address));
         std::fs::write(&path, content)?;
-        self.total_bytes += content.len() as u64;
+        let content_len = content.len() as u64;
+        self.sizes.insert(address, content_len);
+        self.total_bytes += content_len;
         self.addresses.push(address);
         Ok(())
     }
@@ -352,12 +357,23 @@ impl ChunkSpill {
         self.total_bytes
     }
 
-    /// Average chunk size in bytes (for quoting metrics).
-    fn avg_chunk_size(&self) -> u64 {
-        if self.addresses.is_empty() {
-            return 0;
-        }
-        self.total_bytes / self.addresses.len() as u64
+    /// Address and byte-size pairs for all spilled chunks.
+    fn chunk_entries(&self) -> Result<Vec<([u8; 32], u64)>> {
+        self.addresses
+            .iter()
+            .map(|address| {
+                self.sizes
+                    .get(address)
+                    .copied()
+                    .map(|size| (*address, size))
+                    .ok_or_else(|| {
+                        Error::Storage(format!(
+                            "missing size for spilled chunk {}",
+                            hex::encode(address)
+                        ))
+                    })
+            })
+            .collect()
     }
 
     /// Read a single chunk back from disk by address.
@@ -370,11 +386,6 @@ impl ChunkSpill {
             ))
         })?;
         Ok(Bytes::from(data))
-    }
-
-    /// Iterate over address slices in wave-sized groups.
-    fn waves(&self) -> std::slice::Chunks<'_, [u8; 32]> {
-        self.addresses.chunks(UPLOAD_WAVE_SIZE)
     }
 
     /// Read a wave of chunks from disk.
@@ -564,8 +575,8 @@ pub struct FileUploadResult {
     /// upload — partial-failure information is conveyed via
     /// [`crate::data::Error::PartialUpload`] instead.
     pub chunks_failed: usize,
-    /// Total number of chunks the upload attempted to store. On full
-    /// success this equals `chunks_stored`.
+    /// Total number of chunks in the upload, including chunks that were
+    /// already stored and skipped. On full success this equals `chunks_stored`.
     pub total_chunks: usize,
     /// Which payment mode was actually used (not just requested).
     pub payment_mode_used: PaymentMode,
@@ -608,9 +619,9 @@ pub enum ExternalPaymentInfo {
     Merkle {
         /// The prepared merkle batch (public fields sent to frontend, private fields stay in Rust).
         prepared_batch: PreparedMerkleBatch,
-        /// Raw chunk contents (needed for upload after payment).
+        /// Raw chunk contents that still need upload after the preflight check.
         chunk_contents: Vec<Bytes>,
-        /// Chunk addresses in order (needed for upload after payment).
+        /// Chunk addresses that still need upload after the preflight check.
         chunk_addresses: Vec<[u8; 32]>,
     },
 }
@@ -632,7 +643,9 @@ pub enum ExternalPaymentInfo {
 pub struct PreparedUpload {
     /// The data map for later retrieval.
     pub data_map: DataMap,
-    /// Payment information — either wave-batch or merkle depending on chunk count.
+    /// Payment information for chunks that still need payment after the
+    /// already-stored preflight. This may be wave-batch even when the original
+    /// chunk count was merkle-eligible if fewer than two chunks remain.
     pub payment_info: ExternalPaymentInfo,
     /// Chunk address of the serialized `DataMap` when this upload was
     /// prepared with [`Visibility::Public`]. `Some` means the address is
@@ -641,6 +654,11 @@ pub struct PreparedUpload {
     /// chunk was already on the network (deterministic self-encryption).
     /// Carried through to [`FileUploadResult::data_map_address`].
     pub data_map_address: Option<[u8; 32]>,
+    /// Chunk addresses already present on the network when this upload was
+    /// prepared. These do not require payment or PUT during finalization.
+    pub already_stored_addresses: Vec<[u8; 32]>,
+    /// Total chunk count for the upload, including already-stored chunks.
+    pub total_chunks: usize,
 }
 
 /// Return type for [`spawn_file_encryption`]: chunk receiver, `DataMap` oneshot, join handle.
@@ -1045,105 +1063,191 @@ impl Client {
                 .await;
         }
 
-        let payment_info = if should_use_merkle(chunk_count, PaymentMode::Auto) {
-            // Merkle path: build tree, collect candidate pools, return for external payment.
-            info!("Using merkle batch preparation for {chunk_count} file chunks");
+        let (payment_info, already_stored_addresses) =
+            if should_use_merkle(chunk_count, PaymentMode::Auto) {
+                // Merkle path: build tree, collect candidate pools, return for external payment.
+                info!("Using merkle batch preparation for {chunk_count} file chunks");
 
-            let addresses: Vec<[u8; 32]> = chunk_data.iter().map(|c| compute_address(c)).collect();
+                let chunk_entries: Vec<([u8; 32], u64)> = chunk_data
+                    .iter()
+                    .map(|chunk| {
+                        let size = u64::try_from(chunk.len()).map_err(|e| {
+                            Error::InvalidData(format!("chunk size too large: {e}"))
+                        })?;
+                        Ok((compute_address(chunk), size))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
 
-            let avg_size =
-                chunk_data.iter().map(bytes::Bytes::len).sum::<usize>() / chunk_count.max(1);
-            let avg_size_u64 = u64::try_from(avg_size).unwrap_or(0);
+                let merkle_plan = self
+                    .plan_merkle_upload(chunk_entries, DATA_TYPE_CHUNK, progress.as_ref())
+                    .await?;
 
-            let prepared_batch = self
-                .prepare_merkle_batch_external(&addresses, DATA_TYPE_CHUNK, avg_size_u64)
-                .await?;
-
-            info!(
-                "File prepared for external merkle signing: {} chunks, depth={} ({})",
-                chunk_count,
-                prepared_batch.depth,
-                path.display()
-            );
-
-            ExternalPaymentInfo::Merkle {
-                prepared_batch,
-                chunk_contents: chunk_data,
-                chunk_addresses: addresses,
-            }
-        } else {
-            // Wave-batch path: collect quotes per chunk concurrently, emitting
-            // a `ChunkQuoted` event after each completion so callers can drive
-            // a progress bar through the (slow) quoting phase.
-            // Clamp fan-out to chunk_count so a partial wave doesn't
-            // pay for slots it can't fill (see PERF-RESULTS.md).
-            let quote_limiter = self.controller().quote.clone();
-            let quote_concurrency = quote_limiter.current().min(chunk_count.max(1));
-            let mut quote_stream = stream::iter(chunk_data)
-                .map(|content| {
-                    let limiter = quote_limiter.clone();
-                    async move {
-                        observe_op(
-                            &limiter,
-                            || async move { self.prepare_chunk_payment(content).await },
-                            classify_error,
-                        )
-                        .await
-                    }
-                })
-                .buffer_unordered(quote_concurrency);
-
-            let mut prepared_chunks = Vec::with_capacity(spill.len());
-            let mut quoted = 0usize;
-            while let Some(result) = quote_stream.next().await {
-                if let Some(prepared) = result? {
-                    prepared_chunks.push(prepared);
-                }
-                quoted += 1;
-                if let Some(ref tx) = progress {
-                    let _ = tx.try_send(UploadEvent::ChunkQuoted {
-                        quoted,
-                        total: chunk_count,
-                    });
-                }
-            }
-
-            // Surface the "DataMap chunk was already on the network" case
-            // so debugging "why is data_map_address set but no storage cost
-            // appears for it?" doesn't require reading the source. See the
-            // `data_map_address` doc comment for why this is still a valid
-            // `Some(addr)` outcome.
-            if let Some(addr) = data_map_address {
-                if !prepared_chunks.iter().any(|c| c.address == addr) {
+                if merkle_plan.to_upload.is_empty() {
                     info!(
-                        "Public upload: DataMap chunk {} was already stored \
-                         on the network — address is retrievable without a \
-                         new payment",
-                        hex::encode(addr)
+                        "All {chunk_count} file chunks already stored; no external payment needed"
                     );
+                    (
+                        ExternalPaymentInfo::WaveBatch {
+                            prepared_chunks: Vec::new(),
+                            payment_intent: PaymentIntent::from_prepared_chunks(&[]),
+                        },
+                        merkle_plan.already_stored,
+                    )
+                } else {
+                    let to_upload: HashSet<[u8; 32]> =
+                        merkle_plan.to_upload.iter().copied().collect();
+                    let chunk_data: Vec<Bytes> = chunk_data
+                        .into_iter()
+                        .filter(|chunk| to_upload.contains(&compute_address(chunk)))
+                        .collect();
+
+                    if !should_use_merkle(merkle_plan.to_upload.len(), PaymentMode::Auto) {
+                        info!(
+                            "{} file chunks need upload after merkle preflight; \
+                             preparing wave-batch payment",
+                            merkle_plan.to_upload.len()
+                        );
+                        let (payment_info, mut wave_already_stored) = self
+                            .prepare_wave_batch_external_chunks(
+                                chunk_data,
+                                progress.as_ref(),
+                                chunk_count,
+                            )
+                            .await?;
+                        let mut already_stored = merkle_plan.already_stored;
+                        already_stored.append(&mut wave_already_stored);
+                        (payment_info, already_stored)
+                    } else {
+                        let prepared_batch = self
+                            .prepare_merkle_batch_external(
+                                &merkle_plan.to_upload,
+                                DATA_TYPE_CHUNK,
+                                merkle_plan.to_upload_avg_size(),
+                            )
+                            .await?;
+
+                        info!(
+                            "File prepared for external merkle signing: {} chunks, depth={} ({})",
+                            merkle_plan.to_upload.len(),
+                            prepared_batch.depth,
+                            path.display()
+                        );
+
+                        (
+                            ExternalPaymentInfo::Merkle {
+                                prepared_batch,
+                                chunk_contents: chunk_data,
+                                chunk_addresses: merkle_plan.to_upload,
+                            },
+                            merkle_plan.already_stored,
+                        )
+                    }
                 }
+            } else {
+                self.prepare_wave_batch_external_chunks(chunk_data, progress.as_ref(), chunk_count)
+                    .await?
+            };
+
+        // Surface the "DataMap chunk was already on the network" case
+        // so debugging "why is data_map_address set but no storage cost
+        // appears for it?" doesn't require reading the source. See the
+        // `data_map_address` doc comment for why this is still a valid
+        // `Some(addr)` outcome.
+        if let Some(addr) = data_map_address {
+            let data_map_needs_payment = match &payment_info {
+                ExternalPaymentInfo::WaveBatch {
+                    prepared_chunks, ..
+                } => prepared_chunks.iter().any(|c| c.address == addr),
+                ExternalPaymentInfo::Merkle {
+                    chunk_addresses, ..
+                } => chunk_addresses.contains(&addr),
+            };
+            if !data_map_needs_payment {
+                info!(
+                    "Public upload: DataMap chunk {} was already stored \
+                     on the network — address is retrievable without a \
+                     new payment",
+                    hex::encode(addr)
+                );
             }
-
-            let payment_intent = PaymentIntent::from_prepared_chunks(&prepared_chunks);
-
-            info!(
-                "File prepared for external signing: {} chunks, total {} atto ({})",
-                prepared_chunks.len(),
-                payment_intent.total_amount,
-                path.display()
-            );
-
-            ExternalPaymentInfo::WaveBatch {
-                prepared_chunks,
-                payment_intent,
-            }
-        };
+        }
 
         Ok(PreparedUpload {
             data_map,
             payment_info,
             data_map_address,
+            already_stored_addresses,
+            total_chunks: chunk_count,
         })
+    }
+
+    async fn prepare_wave_batch_external_chunks(
+        &self,
+        chunk_data: Vec<Bytes>,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+        progress_total: usize,
+    ) -> Result<(ExternalPaymentInfo, Vec<[u8; 32]>)> {
+        let chunk_count = chunk_data.len();
+        let chunks_with_addr: Vec<(Bytes, [u8; 32])> = chunk_data
+            .into_iter()
+            .map(|content| {
+                let address = compute_address(&content);
+                (content, address)
+            })
+            .collect();
+
+        // Wave-batch path: collect quotes per chunk concurrently, emitting
+        // a `ChunkQuoted` event after each completion so callers can drive
+        // a progress bar through the slow quote phase.
+        let quote_limiter = self.controller().quote.clone();
+        let quote_concurrency = quote_limiter.current().min(chunk_count.max(1));
+        let mut quote_stream = stream::iter(chunks_with_addr)
+            .map(|(content, address)| {
+                let limiter = quote_limiter.clone();
+                async move {
+                    let result = observe_op(
+                        &limiter,
+                        || async move { self.prepare_chunk_payment(content).await },
+                        classify_error,
+                    )
+                    .await;
+                    (address, result)
+                }
+            })
+            .buffer_unordered(quote_concurrency);
+
+        let mut prepared_chunks = Vec::with_capacity(chunk_count);
+        let mut already_stored = Vec::new();
+        let mut quoted = 0usize;
+        while let Some((address, result)) = quote_stream.next().await {
+            match result? {
+                Some(prepared) => prepared_chunks.push(prepared),
+                None => already_stored.push(address),
+            }
+            quoted += 1;
+            if let Some(tx) = progress {
+                let _ = tx.try_send(UploadEvent::ChunkQuoted {
+                    quoted,
+                    total: progress_total,
+                });
+            }
+        }
+
+        let payment_intent = PaymentIntent::from_prepared_chunks(&prepared_chunks);
+        info!(
+            "Prepared external wave-batch payment: {} chunks, {} already stored, total {} atto",
+            prepared_chunks.len(),
+            already_stored.len(),
+            payment_intent.total_amount,
+        );
+
+        Ok((
+            ExternalPaymentInfo::WaveBatch {
+                prepared_chunks,
+                payment_intent,
+            },
+            already_stored,
+        ))
     }
 
     /// Phase 2 of external-signer upload (wave-batch): finalize with externally-signed tx hashes.
@@ -1181,29 +1285,38 @@ impl Client {
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<FileUploadResult> {
         let data_map_address = prepared.data_map_address;
+        let already_stored_addresses = prepared.already_stored_addresses;
+        let already_stored_count = already_stored_addresses.len();
+        let total_chunks = prepared.total_chunks;
         match prepared.payment_info {
             ExternalPaymentInfo::WaveBatch {
                 prepared_chunks,
                 payment_intent: _,
             } => {
-                let total_chunks = prepared_chunks.len();
                 let paid_chunks = finalize_batch_payment(prepared_chunks, tx_hash_map)?;
                 let wave_result = self
-                    .store_paid_chunks_with_events(paid_chunks, progress.as_ref(), 0, total_chunks)
+                    .store_paid_chunks_with_events(
+                        paid_chunks,
+                        progress.as_ref(),
+                        already_stored_count,
+                        total_chunks,
+                    )
                     .await;
                 if !wave_result.failed.is_empty() {
                     let failed_count = wave_result.failed.len();
-                    let stored_count = wave_result.stored.len();
+                    let stored_count = already_stored_count + wave_result.stored.len();
+                    let mut stored = already_stored_addresses;
+                    stored.extend(wave_result.stored);
                     return Err(Error::PartialUpload {
-                        stored: wave_result.stored.clone(),
+                        stored,
                         stored_count,
                         failed: wave_result.failed,
                         failed_count,
-                        total_chunks: stored_count + failed_count,
+                        total_chunks,
                         reason: "finalize_upload: chunk storage failed after retries".into(),
                     });
                 }
-                let chunks_stored = wave_result.stored.len();
+                let chunks_stored = already_stored_count + wave_result.stored.len();
 
                 info!("External-signer upload finalized: {chunks_stored} chunks stored");
 
@@ -1214,7 +1327,7 @@ impl Client {
                     data_map: prepared.data_map,
                     chunks_stored,
                     chunks_failed: 0,
-                    total_chunks: chunks_stored,
+                    total_chunks,
                     payment_mode_used: PaymentMode::Single,
                     storage_cost_atto: "0".into(),
                     gas_cost_wei: 0,
@@ -1267,6 +1380,8 @@ impl Client {
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<FileUploadResult> {
         let data_map_address = prepared.data_map_address;
+        let already_stored_count = prepared.already_stored_addresses.len();
+        let total_chunks = prepared.total_chunks;
         match prepared.payment_info {
             ExternalPaymentInfo::Merkle {
                 prepared_batch,
@@ -1280,6 +1395,8 @@ impl Client {
                         chunk_addresses,
                         &batch_result,
                         progress.as_ref(),
+                        already_stored_count,
+                        total_chunks,
                     )
                     .await?;
 
@@ -1289,7 +1406,7 @@ impl Client {
                     data_map: prepared.data_map,
                     chunks_stored,
                     chunks_failed: 0,
-                    total_chunks: chunks_stored,
+                    total_chunks,
                     payment_mode_used: PaymentMode::Merkle,
                     storage_cost_atto: "0".into(),
                     gas_cost_wei: 0,
@@ -1386,63 +1503,16 @@ impl Client {
         {
             info!("Using merkle batch payment for {chunk_count} file chunks");
 
-            let batch_result = if let Some((_cache_path, cached)) =
-                crate::data::client::cached_merkle::try_load_for_file(&file_path_key)
+            let merkle_plan = match self
+                .plan_merkle_upload(spill.chunk_entries()?, DATA_TYPE_CHUNK, progress.as_ref())
+                .await
             {
-                // Validate the cache matches this upload. If the
-                // file was edited between attempts the cached
-                // proofs would no longer be valid for the new
-                // chunk addresses; in that case drop the cache
-                // and pay fresh.
-                let addresses_match = spill
-                    .addresses
-                    .iter()
-                    .all(|addr| cached.proofs.contains_key(addr));
-                if addresses_match && cached.proofs.len() == chunk_count {
-                    info!(
-                        "Skipping merkle payment phase; resuming with \
-                             cached proofs ({} chunks)",
-                        cached.proofs.len()
-                    );
-                    Ok(cached)
-                } else {
-                    info!(
-                        "Cached merkle receipt does not match current file \
-                             content (cached={}, file={chunk_count}). \
-                             Discarding cache and paying fresh.",
-                        cached.proofs.len()
-                    );
-                    crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
-                    self.pay_for_merkle_batch(
-                        &spill.addresses,
-                        DATA_TYPE_CHUNK,
-                        spill.avg_chunk_size(),
-                    )
-                    .await
-                    .inspect(|result| {
-                        crate::data::client::cached_merkle::try_save(&file_path_key, result);
-                    })
-                }
-            } else {
-                self.pay_for_merkle_batch(&spill.addresses, DATA_TYPE_CHUNK, spill.avg_chunk_size())
-                    .await
-                    .inspect(|result| {
-                        // Save BEFORE the store phase so a crash
-                        // mid-upload leaves a resumable receipt.
-                        crate::data::client::cached_merkle::try_save(&file_path_key, result);
-                    })
-            };
-
-            let batch_result = match batch_result {
-                Ok(result) => result,
+                Ok(plan) => plan,
                 Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
-                    info!("Merkle needs more peers ({msg}), falling back to wave-batch");
+                    info!("Merkle preflight needs more peers ({msg}), falling back to wave-batch");
                     let (stored, sc, gc, fb_stats) = self
                         .upload_waves_single(&spill, progress.as_ref(), Some(&file_path_key))
                         .await?;
-                    // Full file success on the single-node fallback path:
-                    // the cached single-node receipt (if any) is no longer
-                    // needed.
                     crate::data::client::cached_single::try_delete_for_file(&file_path_key);
                     return Ok(FileUploadResult {
                         data_map,
@@ -1461,13 +1531,177 @@ impl Client {
                 Err(e) => return Err(e),
             };
 
-            let (stored, sc, gc, stats) = self
-                .upload_waves_merkle(&spill, &batch_result, progress.as_ref())
-                .await?;
-            // Upload succeeded end-to-end; the cached receipt is
-            // no longer needed.
-            crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
-            (stored, PaymentMode::Merkle, sc, gc, stats)
+            if merkle_plan.to_upload.is_empty() {
+                info!("All {chunk_count} merkle chunks already stored; skipping payment");
+                crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
+                crate::data::client::cached_single::try_delete_for_file(&file_path_key);
+                (
+                    chunk_count,
+                    PaymentMode::Merkle,
+                    "0".to_string(),
+                    0,
+                    WaveAggregateStats::default(),
+                )
+            } else if !self.should_use_merkle(merkle_plan.to_upload.len(), mode) {
+                let remaining_chunks = merkle_plan.to_upload.len();
+                let cached_merkle =
+                    crate::data::client::cached_merkle::try_load_for_file(&file_path_key);
+                if let Some((_cache_path, cached)) = cached_merkle {
+                    let addresses_match = merkle_plan
+                        .to_upload
+                        .iter()
+                        .all(|addr| cached.proofs.contains_key(addr));
+                    if addresses_match {
+                        info!(
+                            "{remaining_chunks} chunks remain below merkle threshold; \
+                             reusing cached merkle proofs"
+                        );
+                        let (stored, sc, gc, stats) = self
+                            .upload_waves_merkle(
+                                &spill,
+                                &merkle_plan.to_upload,
+                                &cached,
+                                &merkle_plan.already_stored,
+                                progress.as_ref(),
+                            )
+                            .await?;
+                        crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
+                        (stored, PaymentMode::Merkle, sc, gc, stats)
+                    } else {
+                        info!(
+                            "{remaining_chunks} chunks remain below merkle threshold, \
+                             and the cached merkle receipt does not cover them. \
+                             Discarding cache and using single-node payment."
+                        );
+                        crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
+                        let (stored, sc, gc, stats) = self
+                            .upload_spill_addresses_single(
+                                &spill,
+                                &merkle_plan.to_upload,
+                                progress.as_ref(),
+                                merkle_plan.already_stored.len(),
+                                chunk_count,
+                                Some(&file_path_key),
+                            )
+                            .await?;
+                        crate::data::client::cached_single::try_delete_for_file(&file_path_key);
+                        (stored, PaymentMode::Single, sc, gc, stats)
+                    }
+                } else {
+                    info!(
+                        "{remaining_chunks} chunks need upload after merkle preflight; \
+                         using single-node payment"
+                    );
+                    let (stored, sc, gc, stats) = self
+                        .upload_spill_addresses_single(
+                            &spill,
+                            &merkle_plan.to_upload,
+                            progress.as_ref(),
+                            merkle_plan.already_stored.len(),
+                            chunk_count,
+                            Some(&file_path_key),
+                        )
+                        .await?;
+                    crate::data::client::cached_single::try_delete_for_file(&file_path_key);
+                    (stored, PaymentMode::Single, sc, gc, stats)
+                }
+            } else {
+                let batch_result = if let Some((_cache_path, cached)) =
+                    crate::data::client::cached_merkle::try_load_for_file(&file_path_key)
+                {
+                    // Validate the cache against the chunks that still need
+                    // storage. Extra proofs are harmless: a previous attempt
+                    // may have paid for chunks that are now already stored.
+                    let addresses_match = merkle_plan
+                        .to_upload
+                        .iter()
+                        .all(|addr| cached.proofs.contains_key(addr));
+                    if addresses_match {
+                        info!(
+                            "Skipping merkle payment phase; resuming with \
+                             cached proofs for {} remaining chunks",
+                            merkle_plan.to_upload.len()
+                        );
+                        Ok(cached)
+                    } else {
+                        info!(
+                            "Cached merkle receipt does not cover the current \
+                             remaining chunks (cached={}, remaining={}). \
+                             Discarding cache and paying fresh.",
+                            cached.proofs.len(),
+                            merkle_plan.to_upload.len()
+                        );
+                        crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
+                        self.pay_for_merkle_batch(
+                            &merkle_plan.to_upload,
+                            DATA_TYPE_CHUNK,
+                            merkle_plan.to_upload_avg_size(),
+                        )
+                        .await
+                        .inspect(|result| {
+                            crate::data::client::cached_merkle::try_save(&file_path_key, result);
+                        })
+                    }
+                } else {
+                    self.pay_for_merkle_batch(
+                        &merkle_plan.to_upload,
+                        DATA_TYPE_CHUNK,
+                        merkle_plan.to_upload_avg_size(),
+                    )
+                    .await
+                    .inspect(|result| {
+                        // Save BEFORE the store phase so a crash
+                        // mid-upload leaves a resumable receipt.
+                        crate::data::client::cached_merkle::try_save(&file_path_key, result);
+                    })
+                };
+
+                let batch_result = match batch_result {
+                    Ok(result) => result,
+                    Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
+                        info!("Merkle needs more peers ({msg}), falling back to wave-batch");
+                        let (stored, sc, gc, fb_stats) = self
+                            .upload_spill_addresses_single(
+                                &spill,
+                                &merkle_plan.to_upload,
+                                progress.as_ref(),
+                                merkle_plan.already_stored.len(),
+                                chunk_count,
+                                Some(&file_path_key),
+                            )
+                            .await?;
+                        crate::data::client::cached_single::try_delete_for_file(&file_path_key);
+                        return Ok(FileUploadResult {
+                            data_map,
+                            chunks_stored: stored,
+                            chunks_failed: 0,
+                            total_chunks: chunk_count,
+                            payment_mode_used: PaymentMode::Single,
+                            storage_cost_atto: sc,
+                            gas_cost_wei: gc,
+                            data_map_address: None,
+                            chunk_attempts_total: fb_stats.chunk_attempts_total,
+                            store_durations_ms: fb_stats.store_durations_ms,
+                            retries_histogram: fb_stats.retries_histogram,
+                        });
+                    }
+                    Err(e) => return Err(e),
+                };
+
+                let (stored, sc, gc, stats) = self
+                    .upload_waves_merkle(
+                        &spill,
+                        &merkle_plan.to_upload,
+                        &batch_result,
+                        &merkle_plan.already_stored,
+                        progress.as_ref(),
+                    )
+                    .await?;
+                // Upload succeeded end-to-end; the cached receipt is
+                // no longer needed.
+                crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
+                (stored, PaymentMode::Merkle, sc, gc, stats)
+            }
         } else {
             let (stored, sc, gc, stats) = self
                 .upload_waves_single(&spill, progress.as_ref(), Some(&file_path_key))
@@ -1553,12 +1787,31 @@ impl Client {
         progress: Option<&mpsc::Sender<UploadEvent>>,
         resume_key: Option<&str>,
     ) -> Result<(usize, String, u128, WaveAggregateStats)> {
-        let mut total_stored = 0usize;
+        self.upload_spill_addresses_single(
+            spill,
+            &spill.addresses,
+            progress,
+            0,
+            spill.len(),
+            resume_key,
+        )
+        .await
+    }
+
+    async fn upload_spill_addresses_single(
+        &self,
+        spill: &ChunkSpill,
+        addresses: &[[u8; 32]],
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+        stored_offset: usize,
+        total_chunks: usize,
+        resume_key: Option<&str>,
+    ) -> Result<(usize, String, u128, WaveAggregateStats)> {
+        let mut total_stored = stored_offset;
         let mut total_storage = Amount::ZERO;
         let mut total_gas: u128 = 0;
         let mut agg_stats = WaveAggregateStats::default();
-        let total_chunks = spill.len();
-        let waves: Vec<&[[u8; 32]]> = spill.waves().collect();
+        let waves: Vec<&[[u8; 32]]> = addresses.chunks(UPLOAD_WAVE_SIZE).collect();
         let wave_count = waves.len();
 
         for (wave_idx, wave_addrs) in waves.into_iter().enumerate() {
@@ -1640,14 +1893,16 @@ impl Client {
     async fn upload_waves_merkle(
         &self,
         spill: &ChunkSpill,
+        addresses: &[[u8; 32]],
         batch_result: &MerkleBatchPaymentResult,
+        already_stored_addresses: &[[u8; 32]],
         progress: Option<&mpsc::Sender<UploadEvent>>,
     ) -> Result<(usize, String, u128, WaveAggregateStats)> {
-        let mut total_stored = 0usize;
-        let total_chunks = spill.len();
-        let waves: Vec<&[[u8; 32]]> = spill.waves().collect();
+        let mut total_stored = already_stored_addresses.len();
+        let total_chunks = total_stored + addresses.len();
+        let waves: Vec<&[[u8; 32]]> = addresses.chunks(UPLOAD_WAVE_SIZE).collect();
         let wave_count = waves.len();
-        let mut stored_addresses: Vec<[u8; 32]> = Vec::new();
+        let mut stored_addresses: Vec<[u8; 32]> = already_stored_addresses.to_vec();
         let mut agg_stats = WaveAggregateStats::default();
 
         for (wave_idx, wave_addrs) in waves.into_iter().enumerate() {
@@ -2121,7 +2376,9 @@ mod tests {
 
         assert_eq!(spill.len(), 2);
         assert_eq!(spill.total_bytes(), 1024 + 2048);
-        assert_eq!(spill.avg_chunk_size(), (1024 + 2048) / 2);
+        let chunk_entries = spill.chunk_entries().unwrap();
+        let entry_total: u64 = chunk_entries.iter().map(|(_, size)| *size).sum();
+        assert_eq!(entry_total, 1024 + 2048);
 
         // Read back and verify
         let chunk1 = spill.read_chunk(spill.addresses.first().unwrap()).unwrap();
