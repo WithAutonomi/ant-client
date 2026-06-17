@@ -53,6 +53,10 @@ pub struct PreparedChunk {
     pub payment: SingleNodePayment,
     /// Peer quotes for building `ProofOfPayment`.
     pub peer_quotes: Vec<(EncodedPeerId, PaymentQuote)>,
+    /// ADR-0003: the signed commitments the bound quotes shipped, forwarded as
+    /// sidecars in the PUT bundle so storers cross-check synchronously. Empty
+    /// when every quote was baseline (no commitment to pin).
+    pub commitment_sidecars: Vec<Vec<u8>>,
 }
 
 /// Chunk paid but not yet stored. Produced by [`Client::batch_pay`].
@@ -210,6 +214,9 @@ fn build_paid_chunks(
                 peer_quotes: chunk.peer_quotes,
             },
             tx_hashes,
+            // ADR-0003: forward the bound quotes' commitments so storers
+            // cross-check synchronously; stripped before persistence node-side.
+            commitment_sidecars: chunk.commitment_sidecars,
         };
 
         let proof_bytes = serialize_single_node_proof(&proof)
@@ -272,11 +279,17 @@ impl Client {
         // Use node-reported prices directly — no contract price fetch needed.
         let mut peer_quotes = Vec::with_capacity(quotes_with_peers.len());
         let mut quotes_for_payment = Vec::with_capacity(quotes_with_peers.len());
+        // ADR-0003: forward each bound quote's commitment sidecar (baseline
+        // quotes ship none); `get_store_quotes` already verified the binding.
+        let mut commitment_sidecars = Vec::new();
 
-        for (peer_id, _addrs, quote, price) in quotes_with_peers {
+        for (peer_id, _addrs, quote, price, commitment) in quotes_with_peers {
             let encoded = peer_id_to_encoded(&peer_id)?;
             peer_quotes.push((encoded, quote.clone()));
             quotes_for_payment.push((quote, price));
+            if let Some(sidecar) = commitment {
+                commitment_sidecars.push(sidecar);
+            }
         }
 
         let payment = SingleNodePayment::from_quotes(quotes_for_payment)
@@ -288,6 +301,7 @@ impl Client {
             quoted_peers,
             payment,
             peer_quotes,
+            commitment_sidecars,
         }))
     }
 
@@ -1082,6 +1096,7 @@ mod tests {
             quoted_peers: Vec::new(),
             payment: SingleNodePayment { quotes },
             peer_quotes: Vec::new(),
+            commitment_sidecars: Vec::new(),
         }
     }
 
@@ -1193,6 +1208,8 @@ mod tests {
                     rewards_address: RewardsAddress::new([1u8; 20]),
                     pub_key: vec![],
                     signature: vec![],
+                    committed_key_count: 0,
+                    commitment_pin: None,
                 };
                 (EncodedPeerId::from([i as u8; 32]), quote)
             })
