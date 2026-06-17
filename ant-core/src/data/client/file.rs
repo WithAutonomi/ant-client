@@ -139,8 +139,15 @@ pub enum FileChunkPeerStatus {
 
 /// One entry in the per-chunk quote list returned by
 /// [`Client::get_store_quotes`]: the responding peer, its addresses, the
-/// signed quote it returned, and the payment amount it is demanding.
-type QuoteEntry = (PeerId, Vec<MultiAddr>, PaymentQuote, Amount);
+/// signed quote it returned, the payment amount it is demanding, and (ADR-0003)
+/// the opaque signed-commitment blob the node shipped with the quote.
+type QuoteEntry = (
+    PeerId,
+    Vec<MultiAddr>,
+    PaymentQuote,
+    Amount,
+    Option<Vec<u8>>,
+);
 
 type DownloadBatchEntry = (usize, std::result::Result<Bytes, XorName>);
 
@@ -1330,7 +1337,7 @@ impl Client {
 
         // Use the median price × 3 (matches SingleNodePayment::from_quotes
         // which pays 3x the median to incentivize reliable storage).
-        let mut prices: Vec<Amount> = quotes.iter().map(|(_, _, _, price)| *price).collect();
+        let mut prices: Vec<Amount> = quotes.iter().map(|(_, _, _, price, _)| *price).collect();
         prices.sort();
         let median_price = prices
             .get(prices.len() / 2)

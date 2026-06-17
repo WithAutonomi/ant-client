@@ -42,10 +42,14 @@ async fn collect_and_pay(client: &Client, content: &Bytes) -> (PaymentProof, Vec
     // Build peer_quotes and payment
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes.len());
-    for (peer_id, _addrs, quote, price) in quotes {
+    let mut commitment_sidecars = Vec::new();
+    for (peer_id, _addrs, quote, price, commitment) in quotes {
         let encoded = EncodedPeerId::new(*peer_id.as_bytes());
         peer_quotes.push((encoded, quote.clone()));
         quotes_for_payment.push((quote, price));
+        if let Some(sidecar) = commitment {
+            commitment_sidecars.push(sidecar);
+        }
     }
 
     // Pay on-chain
@@ -57,6 +61,7 @@ async fn collect_and_pay(client: &Client, content: &Bytes) -> (PaymentProof, Vec
     let proof = PaymentProof {
         proof_of_payment: ProofOfPayment { peer_quotes },
         tx_hashes,
+        commitment_sidecars,
     };
     let proof_bytes = serialize_single_node_proof(&proof).expect("serialize proof");
 
@@ -86,6 +91,7 @@ async fn test_attack_forged_signature() {
             peer_quotes: tampered_quotes,
         },
         tx_hashes: proof.tx_hashes.clone(),
+        commitment_sidecars: proof.commitment_sidecars.clone(),
     };
     let tampered_bytes = rmp_serde::to_vec(&tampered_proof).expect("serialize tampered proof");
 
@@ -192,7 +198,7 @@ async fn test_attack_zero_amount_payment() {
 
     let target_peer = quotes.first().expect("should have quotes").0;
     let mut peer_quotes = Vec::with_capacity(quotes.len());
-    for (peer_id, _addrs, quote, _price) in quotes {
+    for (peer_id, _addrs, quote, _price, _commitment) in quotes {
         let encoded = EncodedPeerId::new(*peer_id.as_bytes());
         peer_quotes.push((encoded, quote));
     }
@@ -201,6 +207,7 @@ async fn test_attack_zero_amount_payment() {
     let fake_proof = PaymentProof {
         proof_of_payment: ProofOfPayment { peer_quotes },
         tx_hashes: vec![],
+        commitment_sidecars: vec![],
     };
     let fake_bytes = rmp_serde::to_vec(&fake_proof).expect("serialize fake proof");
 
@@ -236,7 +243,7 @@ async fn test_attack_fabricated_tx_hash() {
 
     let target_peer = quotes.first().expect("should have quotes").0;
     let mut peer_quotes = Vec::with_capacity(quotes.len());
-    for (peer_id, _addrs, quote, _price) in quotes {
+    for (peer_id, _addrs, quote, _price, _commitment) in quotes {
         let encoded = EncodedPeerId::new(*peer_id.as_bytes());
         peer_quotes.push((encoded, quote));
     }
@@ -246,6 +253,7 @@ async fn test_attack_fabricated_tx_hash() {
     let fake_proof = PaymentProof {
         proof_of_payment: ProofOfPayment { peer_quotes },
         tx_hashes: vec![fake_tx_hash],
+        commitment_sidecars: vec![],
     };
     let fake_bytes = rmp_serde::to_vec(&fake_proof).expect("serialize fake proof");
 
@@ -317,6 +325,7 @@ async fn test_attack_corrupted_public_key() {
             peer_quotes: tampered_quotes,
         },
         tx_hashes: proof.tx_hashes.clone(),
+        commitment_sidecars: proof.commitment_sidecars.clone(),
     };
     let tampered_bytes = rmp_serde::to_vec(&tampered_proof).expect("serialize tampered proof");
 
@@ -385,16 +394,20 @@ async fn test_attack_underpayment_single_node() {
     // to target the median peer after from_quotes() sorts internally.
     let peer_by_rewards: Vec<(PeerId, RewardsAddress)> = quotes
         .iter()
-        .map(|(pid, _, q, _)| (*pid, q.rewards_address))
+        .map(|(pid, _, q, _, _)| (*pid, q.rewards_address))
         .collect();
 
     // 2. Build SingleNodePayment normally (sorts by price, median gets 3×)
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes.len());
-    for (peer_id, _addrs, quote, price) in quotes {
+    let mut commitment_sidecars = Vec::new();
+    for (peer_id, _addrs, quote, price, commitment) in quotes {
         let encoded = EncodedPeerId::new(*peer_id.as_bytes());
         peer_quotes.push((encoded, quote.clone()));
         quotes_for_payment.push((quote, price));
+        if let Some(sidecar) = commitment {
+            commitment_sidecars.push(sidecar);
+        }
     }
 
     let mut payment = SingleNodePayment::from_quotes(quotes_for_payment)
@@ -434,6 +447,7 @@ async fn test_attack_underpayment_single_node() {
     let proof = PaymentProof {
         proof_of_payment: ProofOfPayment { peer_quotes },
         tx_hashes,
+        commitment_sidecars,
     };
     let proof_bytes = serialize_single_node_proof(&proof).expect("serialize proof");
 
@@ -473,15 +487,19 @@ async fn test_attack_underpayment_half_price() {
 
     let peer_by_rewards: Vec<(PeerId, RewardsAddress)> = quotes
         .iter()
-        .map(|(pid, _, q, _)| (*pid, q.rewards_address))
+        .map(|(pid, _, q, _, _)| (*pid, q.rewards_address))
         .collect();
 
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes.len());
-    for (peer_id, _addrs, quote, price) in quotes {
+    let mut commitment_sidecars = Vec::new();
+    for (peer_id, _addrs, quote, price, commitment) in quotes {
         let encoded = EncodedPeerId::new(*peer_id.as_bytes());
         peer_quotes.push((encoded, quote.clone()));
         quotes_for_payment.push((quote, price));
+        if let Some(sidecar) = commitment {
+            commitment_sidecars.push(sidecar);
+        }
     }
 
     let mut payment = SingleNodePayment::from_quotes(quotes_for_payment)
@@ -512,6 +530,7 @@ async fn test_attack_underpayment_half_price() {
     let proof = PaymentProof {
         proof_of_payment: ProofOfPayment { peer_quotes },
         tx_hashes,
+        commitment_sidecars,
     };
     let proof_bytes = serialize_single_node_proof(&proof).expect("serialize proof");
 

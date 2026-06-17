@@ -119,6 +119,19 @@ pub enum Error {
         detail: String,
     },
 
+    /// ADR-0003: a quote's commitment binding does not hold — its price is not
+    /// `calculate_price(committed_key_count)`, its `(count, pin)` shape is
+    /// incoherent, or a shipped commitment does not match the pinned count/hash.
+    /// The storer's arithmetic gate would reject such a quote, so the client
+    /// drops it before paying ("the client pays nothing it cannot resolve").
+    #[error("bad quote commitment from peer {peer_id}: {detail}")]
+    BadQuoteCommitment {
+        /// The peer ID we got the quote from.
+        peer_id: String,
+        /// Diagnostic detail (which binding rule failed).
+        detail: String,
+    },
+
     /// Not enough disk space for the operation.
     #[error("insufficient disk space: {0}")]
     InsufficientDiskSpace(String),
