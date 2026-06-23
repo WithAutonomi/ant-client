@@ -3,7 +3,9 @@
 //! Connects quote collection, on-chain EVM payment, and proof serialization.
 //! Every PUT to the network requires a valid payment proof.
 
-use crate::data::client::quote::{select_paid_quote_for_payment, StoreQuote};
+use crate::data::client::quote::{
+    select_paid_quote_for_payment, select_paid_quote_for_payment_with_target, StoreQuote,
+};
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{Amount, EncodedPeerId, PaymentQuote, ProofOfPayment, Wallet};
@@ -45,6 +47,20 @@ pub(crate) fn paid_quote_payment_from_store_quotes(
     let (peer_id, _, quote, _) = select_paid_quote_for_payment(quotes).ok_or_else(|| {
         Error::Payment("No successful quote available for single-node payment".to_string())
     })?;
+    let payment_info = paid_quote_payment_info(quote)?;
+    Ok((*peer_id, quote.clone(), payment_info))
+}
+
+pub(crate) fn paid_quote_payment_from_store_quotes_with_target(
+    quotes: &[StoreQuote],
+    acceptance_target: usize,
+) -> Result<(PeerId, PaymentQuote, QuotePaymentInfo)> {
+    let (peer_id, _, quote, _) =
+        select_paid_quote_for_payment_with_target(quotes, acceptance_target).ok_or_else(|| {
+            Error::Payment(format!(
+                "No paid quote satisfies the acceptance target of {acceptance_target}"
+            ))
+        })?;
     let payment_info = paid_quote_payment_info(quote)?;
     Ok((*peer_id, quote.clone(), payment_info))
 }
@@ -91,7 +107,10 @@ impl Client {
             .await?;
         let quotes_with_peers = quote_plan.quotes;
         let (paid_peer_id, paid_quote, paid_quote_info) =
-            paid_quote_payment_from_store_quotes(&quotes_with_peers)?;
+            paid_quote_payment_from_store_quotes_with_target(
+                &quotes_with_peers,
+                quote_plan.paid_quote_acceptance_target,
+            )?;
 
         // Capture all quoted peers for replication by the caller.
         let quoted_peers = quote_plan.put_peers;

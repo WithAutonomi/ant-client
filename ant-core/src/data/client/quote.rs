@@ -268,6 +268,12 @@ fn paid_quote_acceptance_target() -> usize {
     witnessed_close_group_quorum()
 }
 
+fn paid_quote_acceptance_target_after_already_stored(already_stored: usize) -> usize {
+    paid_quote_acceptance_target()
+        .saturating_sub(already_stored)
+        .max(1)
+}
+
 fn witnessed_close_group_quorum_for_missing_views(missing_views: usize) -> usize {
     witnessed_close_group_quorum()
         .saturating_sub(missing_views)
@@ -297,6 +303,12 @@ type WitnessedVoteData = (HashMap<PeerId, DHTNode>, VotersByPeer, Vec<(PeerId, u
 pub(crate) struct StoreQuotePlan {
     pub(crate) quotes: Vec<StoreQuote>,
     pub(crate) put_peers: Vec<(PeerId, Vec<MultiAddr>)>,
+    pub(crate) paid_quote_acceptance_target: usize,
+}
+
+struct StoreQuoteCollection {
+    quotes: Vec<StoreQuote>,
+    paid_quote_acceptance_target: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -524,6 +536,27 @@ fn sort_quotes_by_distance(quotes: &mut [StoreQuote], address: &[u8; 32]) {
     });
 }
 
+fn close_group_already_stored_count(
+    quotes: &[StoreQuote],
+    already_stored_peers: &[(PeerId, [u8; 32])],
+    address: &[u8; 32],
+) -> usize {
+    let mut all_peers_by_distance: Vec<(bool, [u8; 32])> = Vec::new();
+    for (peer_id, _, _, _) in quotes {
+        all_peers_by_distance.push((false, peer_xor_distance(peer_id, address)));
+    }
+    for (_, dist) in already_stored_peers {
+        all_peers_by_distance.push((true, *dist));
+    }
+    all_peers_by_distance.sort_by_key(|a| a.1);
+
+    all_peers_by_distance
+        .iter()
+        .take(CLOSE_GROUP_SIZE)
+        .filter(|(is_stored, _)| *is_stored)
+        .count()
+}
+
 fn paid_quote_would_pass_floor(paid_price: Amount, quoted_price: Amount) -> bool {
     let Some(paid_scaled) = paid_price.checked_mul(Amount::from(PAID_QUOTE_FLOOR_DENOMINATOR))
     else {
@@ -544,8 +577,11 @@ fn paid_quote_acceptance_count(paid_price: Amount, quotes: &[StoreQuote]) -> usi
         .count()
 }
 
-pub(crate) fn select_paid_quote_for_payment(quotes: &[StoreQuote]) -> Option<&StoreQuote> {
-    let acceptance_target = paid_quote_acceptance_target();
+pub(crate) fn select_paid_quote_for_payment_with_target(
+    quotes: &[StoreQuote],
+    acceptance_target: usize,
+) -> Option<&StoreQuote> {
+    let acceptance_target = acceptance_target.max(1);
     if quotes.len() < acceptance_target {
         return None;
     }
@@ -560,6 +596,10 @@ pub(crate) fn select_paid_quote_for_payment(quotes: &[StoreQuote]) -> Option<&St
         .iter()
         .find(|(_, price)| paid_quote_acceptance_count(*price, quotes) >= acceptance_target)
         .map(|(quote_index, _)| &quotes[*quote_index])
+}
+
+pub(crate) fn select_paid_quote_for_payment(quotes: &[StoreQuote]) -> Option<&StoreQuote> {
+    select_paid_quote_for_payment_with_target(quotes, paid_quote_acceptance_target())
 }
 
 fn select_closest_quotes(mut quotes: Vec<StoreQuote>, address: &[u8; 32]) -> Vec<StoreQuote> {
@@ -617,7 +657,7 @@ impl Client {
             .map(|peer| (peer.peer_id, peer.addrs))
             .collect();
         let initial_put_peers = witnessed_selection.initial_put_peers;
-        let quotes = self
+        let quote_collection = self
             .collect_store_quotes_from_remote_peers(
                 address,
                 data_size,
@@ -628,8 +668,9 @@ impl Client {
             .await?;
 
         Ok(StoreQuotePlan {
-            quotes,
+            quotes: quote_collection.quotes,
             put_peers: initial_put_peers,
+            paid_quote_acceptance_target: quote_collection.paid_quote_acceptance_target,
         })
     }
 
@@ -651,14 +692,16 @@ impl Client {
             .find_closest_peers(address, peer_query_count)
             .await?;
 
-        self.collect_store_quotes_from_remote_peers(
-            address,
-            data_size,
-            data_type,
-            remote_peers,
-            QuoteSelectionPolicy::ClosestByDistance,
-        )
-        .await
+        Ok(self
+            .collect_store_quotes_from_remote_peers(
+                address,
+                data_size,
+                data_type,
+                remote_peers,
+                QuoteSelectionPolicy::ClosestByDistance,
+            )
+            .await?
+            .quotes)
     }
 
     async fn select_witnessed_quote_selection(
@@ -718,7 +761,7 @@ impl Client {
         data_type: u32,
         remote_peers: Vec<(PeerId, Vec<MultiAddr>)>,
         quote_selection_policy: QuoteSelectionPolicy,
-    ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
+    ) -> Result<StoreQuoteCollection> {
         let peer_query_count = remote_peers.len();
 
         let node = self.network().node();
@@ -815,40 +858,26 @@ impl Client {
             bad_quote_count += bad_dropped;
         }
 
-        // Check already-stored: only count votes from the closest CLOSE_GROUP_SIZE peers.
-        if !already_stored_peers.is_empty() {
-            let mut all_peers_by_distance: Vec<(bool, [u8; 32])> = Vec::new();
-            for (peer_id, _, _, _) in &quotes {
-                all_peers_by_distance.push((false, peer_xor_distance(peer_id, address)));
-            }
-            for (_, dist) in &already_stored_peers {
-                all_peers_by_distance.push((true, *dist));
-            }
-            all_peers_by_distance.sort_by_key(|a| a.1);
-
-            let close_group_stored = all_peers_by_distance
-                .iter()
-                .take(CLOSE_GROUP_SIZE)
-                .filter(|(is_stored, _)| *is_stored)
-                .count();
-
-            if close_group_stored >= CLOSE_GROUP_MAJORITY {
-                debug!(
-                    "Chunk {} already stored ({close_group_stored}/{CLOSE_GROUP_SIZE} close-group peers confirm)",
-                    hex::encode(address)
-                );
-                return Err(Error::AlreadyStored);
-            }
+        let close_group_stored =
+            close_group_already_stored_count(&quotes, &already_stored_peers, address);
+        if close_group_stored >= CLOSE_GROUP_MAJORITY {
+            debug!(
+                "Chunk {} already stored ({close_group_stored}/{CLOSE_GROUP_SIZE} close-group peers confirm)",
+                hex::encode(address)
+            );
+            return Err(Error::AlreadyStored);
         }
 
         let already_stored_count = already_stored_peers.len();
         let failure_count = failures.len();
         let quote_count = quotes.len();
         let total_responses = quote_count + failure_count + already_stored_count;
+        let paid_quote_acceptance_target =
+            paid_quote_acceptance_target_after_already_stored(close_group_stored);
 
         let required_quotes = match quote_selection_policy {
             QuoteSelectionPolicy::ClosestByDistance => CLOSE_GROUP_SIZE,
-            QuoteSelectionPolicy::PaidQuoteOnly => paid_quote_acceptance_target(),
+            QuoteSelectionPolicy::PaidQuoteOnly => paid_quote_acceptance_target,
         };
 
         if quotes.len() >= required_quotes {
@@ -864,7 +893,10 @@ impl Client {
                 selected_quotes.len(),
                 hex::encode(address),
             );
-            return Ok(selected_quotes);
+            return Ok(StoreQuoteCollection {
+                quotes: selected_quotes,
+                paid_quote_acceptance_target,
+            });
         }
 
         Err(Error::InsufficientPeers(format!(
@@ -1277,6 +1309,29 @@ mod tests {
             select_paid_quote_for_payment(&quotes).is_none(),
             "payment selection should fail before spending without quorum-priced quote data"
         );
+    }
+
+    #[test]
+    fn paid_quote_target_is_reduced_by_already_stored_close_group_votes() {
+        assert_eq!(paid_quote_acceptance_target_after_already_stored(0), 5);
+        assert_eq!(paid_quote_acceptance_target_after_already_stored(2), 3);
+        assert_eq!(paid_quote_acceptance_target_after_already_stored(5), 1);
+    }
+
+    #[test]
+    fn paid_quote_selection_uses_reduced_target_after_already_stored_votes() {
+        let quotes = vec![
+            synthetic_quote(1, 595),
+            synthetic_quote(2, 1046),
+            synthetic_quote(3, 1052),
+        ];
+        let target = paid_quote_acceptance_target_after_already_stored(2);
+
+        let (peer_id, _, _, price) = select_paid_quote_for_payment_with_target(&quotes, target)
+            .expect("three quotes plus two already-stored votes should satisfy the target");
+
+        assert_eq!(*peer_id, synthetic_peer(2));
+        assert_eq!(*price, Amount::from(1046u64));
     }
 
     #[test]
