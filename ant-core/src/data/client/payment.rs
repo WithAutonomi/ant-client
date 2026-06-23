@@ -4,7 +4,8 @@
 //! Every PUT to the network requires a valid payment proof.
 
 use crate::data::client::quote::{
-    select_paid_quote_for_payment, select_paid_quote_for_payment_with_target, StoreQuote,
+    select_paid_quote_for_payment, select_paid_quote_for_payment_with_target_and_views, StoreQuote,
+    WitnessViewsByResponder,
 };
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
@@ -51,16 +52,21 @@ pub(crate) fn paid_quote_payment_from_store_quotes(
     Ok((*peer_id, quote.clone(), payment_info))
 }
 
-pub(crate) fn paid_quote_payment_from_store_quotes_with_target(
+pub(crate) fn paid_quote_payment_from_store_quotes_with_target_and_views(
     quotes: &[StoreQuote],
     acceptance_target: usize,
+    witness_views: &WitnessViewsByResponder,
 ) -> Result<(PeerId, PaymentQuote, QuotePaymentInfo)> {
-    let (peer_id, _, quote, _) =
-        select_paid_quote_for_payment_with_target(quotes, acceptance_target).ok_or_else(|| {
-            Error::Payment(format!(
-                "No paid quote satisfies the acceptance target of {acceptance_target}"
-            ))
-        })?;
+    let (peer_id, _, quote, _) = select_paid_quote_for_payment_with_target_and_views(
+        quotes,
+        acceptance_target,
+        witness_views,
+    )
+    .ok_or_else(|| {
+        Error::Payment(format!(
+            "No paid quote satisfies the acceptance target of {acceptance_target}"
+        ))
+    })?;
     let payment_info = paid_quote_payment_info(quote)?;
     Ok((*peer_id, quote.clone(), payment_info))
 }
@@ -78,6 +84,7 @@ impl Client {
     /// This orchestrates the full payment flow:
     /// 1. Query `CLOSE_GROUP_SIZE` witnessed peers and collect enough quotes
     ///    to pick one that should satisfy the witnessed-quorum price floors
+    ///    and paid-quote issuer checks
     /// 2. Select one paid quote and pay 3x its node-reported price
     /// 3. Pay on-chain via the wallet
     /// 4. Serialize `PaymentProof` with transaction hashes
@@ -107,9 +114,10 @@ impl Client {
             .await?;
         let quotes_with_peers = quote_plan.quotes;
         let (paid_peer_id, paid_quote, paid_quote_info) =
-            paid_quote_payment_from_store_quotes_with_target(
+            paid_quote_payment_from_store_quotes_with_target_and_views(
                 &quotes_with_peers,
                 quote_plan.paid_quote_acceptance_target,
+                &quote_plan.witness_views,
             )?;
 
         // Capture all quoted peers for replication by the caller.

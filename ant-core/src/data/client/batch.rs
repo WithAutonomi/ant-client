@@ -8,7 +8,7 @@ use crate::data::client::adaptive::observe_op;
 use crate::data::client::classify_error;
 use crate::data::client::file::UploadEvent;
 use crate::data::client::payment::{
-    paid_quote_payment_from_store_quotes_with_target, peer_id_to_encoded,
+    paid_quote_payment_from_store_quotes_with_target_and_views, peer_id_to_encoded,
 };
 use crate::data::client::Client;
 use crate::data::error::{Error, PartialUploadSpend, Result};
@@ -269,9 +269,10 @@ impl Client {
         let quoted_peers = quote_plan.put_peers;
 
         let (paid_peer_id, paid_quote, paid_quote_info) =
-            paid_quote_payment_from_store_quotes_with_target(
+            paid_quote_payment_from_store_quotes_with_target_and_views(
                 &quotes_with_peers,
                 quote_plan.paid_quote_acceptance_target,
+                &quote_plan.witness_views,
             )?;
         let peer_quotes = vec![(peer_id_to_encoded(&paid_peer_id)?, paid_quote)];
         let payment = PreparedChunkPayment {

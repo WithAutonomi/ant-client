@@ -296,6 +296,7 @@ fn peer_list(peers: &[PeerId]) -> Vec<String> {
 }
 
 pub(crate) type StoreQuote = (PeerId, Vec<MultiAddr>, PaymentQuote, Amount);
+pub(crate) type WitnessViewsByResponder = HashMap<PeerId, HashSet<PeerId>>;
 type StoreQuoteRequestResult = (PeerId, Vec<MultiAddr>, Result<(PaymentQuote, Amount)>);
 type VotersByPeer = HashMap<PeerId, HashSet<PeerId>>;
 type WitnessedVoteData = (HashMap<PeerId, DHTNode>, VotersByPeer, Vec<(PeerId, usize)>);
@@ -304,6 +305,7 @@ pub(crate) struct StoreQuotePlan {
     pub(crate) quotes: Vec<StoreQuote>,
     pub(crate) put_peers: Vec<(PeerId, Vec<MultiAddr>)>,
     pub(crate) paid_quote_acceptance_target: usize,
+    pub(crate) witness_views: WitnessViewsByResponder,
 }
 
 struct StoreQuoteCollection {
@@ -326,7 +328,8 @@ struct WitnessedQuotePeer {
 #[derive(Debug, Clone)]
 struct WitnessedQuoteSelection {
     quote_peers: Vec<WitnessedQuotePeer>,
-    initial_put_peers: Vec<(PeerId, Vec<MultiAddr>)>,
+    put_peers: Vec<(PeerId, Vec<MultiAddr>)>,
+    witness_views: WitnessViewsByResponder,
 }
 
 #[derive(Clone, Copy)]
@@ -354,6 +357,21 @@ fn witnessed_responder_views(witnessed: &WitnessedCloseGroup) -> Vec<String> {
                 .map(|node| node.peer_id)
                 .collect::<Vec<_>>();
             format!("{}=>{:?}", view.responder, peer_list(&peers))
+        })
+        .collect()
+}
+
+fn witnessed_responder_view_sets(witnessed: &WitnessedCloseGroup) -> WitnessViewsByResponder {
+    witnessed
+        .responder_views
+        .iter()
+        .map(|view| {
+            let closest = view
+                .closest
+                .iter()
+                .map(|node| node.peer_id)
+                .collect::<HashSet<_>>();
+            (view.responder, closest)
         })
         .collect()
 }
@@ -497,17 +515,10 @@ fn witnessed_quote_selection_or_error(
         )));
     }
 
-    let initial_put_peers = witnessed
-        .initial_closest
-        .iter()
-        .take(CLOSE_GROUP_SIZE)
-        .map(|node| (node.peer_id, node.addresses_by_priority()))
-        .collect::<Vec<_>>();
-
-    if initial_put_peers.len() < CLOSE_GROUP_SIZE {
+    if witnessed.initial_closest.len() < CLOSE_GROUP_SIZE {
         return Err(Error::InsufficientPeers(format!(
             "Witnessed close group returned only {}/{} initial PUT peers before payment. {}",
-            initial_put_peers.len(),
+            witnessed.initial_closest.len(),
             CLOSE_GROUP_SIZE,
             witnessed_close_group_diagnostics(address, witnessed, quorum)
         )));
@@ -520,11 +531,16 @@ fn witnessed_quote_selection_or_error(
             peer_id: candidate.node.peer_id,
             addrs: candidate.node.addresses_by_priority(),
         })
+        .collect::<Vec<_>>();
+    let put_peers = quote_peers
+        .iter()
+        .map(|peer| (peer.peer_id, peer.addrs.clone()))
         .collect();
 
     Ok(WitnessedQuoteSelection {
         quote_peers,
-        initial_put_peers,
+        put_peers,
+        witness_views: witnessed_responder_view_sets(witnessed),
     })
 }
 
@@ -577,6 +593,39 @@ fn paid_quote_acceptance_count(paid_price: Amount, quotes: &[StoreQuote]) -> usi
         .count()
 }
 
+fn paid_quote_issuer_is_accepted_by_responder(
+    paid_peer_id: &PeerId,
+    responder: &PeerId,
+    witness_views: &WitnessViewsByResponder,
+) -> bool {
+    if paid_peer_id == responder {
+        return true;
+    }
+
+    witness_views
+        .get(responder)
+        .is_some_and(|view| view.contains(paid_peer_id))
+}
+
+fn paid_quote_acceptance_count_with_views(
+    paid_peer_id: &PeerId,
+    paid_price: Amount,
+    quotes: &[StoreQuote],
+    witness_views: &WitnessViewsByResponder,
+) -> usize {
+    quotes
+        .iter()
+        .filter(|(responder, _, quote, _)| {
+            paid_quote_would_pass_floor(paid_price, quote.price)
+                && paid_quote_issuer_is_accepted_by_responder(
+                    paid_peer_id,
+                    responder,
+                    witness_views,
+                )
+        })
+        .count()
+}
+
 pub(crate) fn select_paid_quote_for_payment_with_target(
     quotes: &[StoreQuote],
     acceptance_target: usize,
@@ -595,6 +644,32 @@ pub(crate) fn select_paid_quote_for_payment_with_target(
     by_price
         .iter()
         .find(|(_, price)| paid_quote_acceptance_count(*price, quotes) >= acceptance_target)
+        .map(|(quote_index, _)| &quotes[*quote_index])
+}
+
+pub(crate) fn select_paid_quote_for_payment_with_target_and_views<'a>(
+    quotes: &'a [StoreQuote],
+    acceptance_target: usize,
+    witness_views: &WitnessViewsByResponder,
+) -> Option<&'a StoreQuote> {
+    let acceptance_target = acceptance_target.max(1);
+    if quotes.len() < acceptance_target {
+        return None;
+    }
+
+    let mut by_price: Vec<(usize, Amount)> = quotes
+        .iter()
+        .enumerate()
+        .map(|(index, (_, _, quote, _))| (index, quote.price))
+        .collect();
+    by_price.sort_by_key(|(index, price)| (*price, *index));
+    by_price
+        .iter()
+        .find(|(quote_index, price)| {
+            let (paid_peer_id, _, _, _) = &quotes[*quote_index];
+            paid_quote_acceptance_count_with_views(paid_peer_id, *price, quotes, witness_views)
+                >= acceptance_target
+        })
         .map(|(quote_index, _)| &quotes[*quote_index])
 }
 
@@ -643,7 +718,8 @@ impl Client {
     ///
     /// The quote request is still fanned out to `CLOSE_GROUP_SIZE` witnessed
     /// peers, but callers only include one selected paid quote in the proof.
-    /// PUT targets remain the initial witnessed close group.
+    /// PUT targets match that witnessed quote peer set so the paid quote is
+    /// validated by the same local views used during quote selection.
     pub(crate) async fn get_store_quote_plan(
         &self,
         address: &[u8; 32],
@@ -656,7 +732,8 @@ impl Client {
             .into_iter()
             .map(|peer| (peer.peer_id, peer.addrs))
             .collect();
-        let initial_put_peers = witnessed_selection.initial_put_peers;
+        let put_peers = witnessed_selection.put_peers;
+        let witness_views = witnessed_selection.witness_views;
         let quote_collection = self
             .collect_store_quotes_from_remote_peers(
                 address,
@@ -669,8 +746,9 @@ impl Client {
 
         Ok(StoreQuotePlan {
             quotes: quote_collection.quotes,
-            put_peers: initial_put_peers,
+            put_peers,
             paid_quote_acceptance_target: quote_collection.paid_quote_acceptance_target,
+            witness_views,
         })
     }
 
@@ -926,6 +1004,7 @@ mod tests {
     use ant_protocol::evm::RewardsAddress;
     use ant_protocol::pqc::ops::{MlDsaOperations, MlDsaPublicKey};
     use ant_protocol::transport::{DHTNode, MlDsa65, ResponderView, WitnessedCloseGroup};
+    use std::collections::{HashMap, HashSet};
     use std::time::SystemTime;
     use xor_name::XorName;
 
@@ -1031,6 +1110,20 @@ mod tests {
             .iter()
             .map(|(peer_id, _)| peer_id.as_bytes()[0])
             .collect()
+    }
+
+    fn witness_views_from_seed_lists(entries: &[(u8, &[u8])]) -> WitnessViewsByResponder {
+        entries
+            .iter()
+            .map(|(responder, closest)| {
+                let closest = closest
+                    .iter()
+                    .copied()
+                    .map(synthetic_peer)
+                    .collect::<HashSet<_>>();
+                (synthetic_peer(*responder), closest)
+            })
+            .collect::<HashMap<_, _>>()
     }
 
     /// Independent re-implementation of the storer-side binding spec
@@ -1228,9 +1321,47 @@ mod tests {
             vec![1, 2, 3, 4, 5, 6, 7]
         );
         assert_eq!(
-            put_peer_seeds(&selection.initial_put_peers),
+            put_peer_seeds(&selection.put_peers),
             vec![1, 2, 3, 4, 5, 6, 7]
         );
+    }
+
+    #[test]
+    fn witnessed_put_peers_follow_final_quote_window() {
+        let address = [0u8; 32];
+        let witnessed = WitnessedCloseGroup {
+            target: address,
+            k: CLOSE_GROUP_SIZE,
+            initial_closest: witnessed_test_nodes(&[2, 3, 4, 5, 6, 7, 8]),
+            responder_views: vec![
+                witnessed_test_view(2, &[1, 2, 3, 4, 5, 6, 7]),
+                witnessed_test_view(3, &[1, 2, 3, 4, 5, 6, 7]),
+                witnessed_test_view(4, &[1, 2, 3, 4, 5, 6, 7]),
+                witnessed_test_view(5, &[1, 2, 3, 4, 5, 6, 7]),
+                witnessed_test_view(6, &[1, 2, 3, 4, 5, 6, 7]),
+                witnessed_test_view(7, &[1, 2, 3, 4, 5, 6, 7]),
+                witnessed_test_view(8, &[1, 2, 3, 4, 5, 6, 7]),
+            ],
+        };
+
+        let selection = witnessed_quote_selection_or_error(
+            &address,
+            &witnessed,
+            CLOSE_GROUP_SIZE,
+            witnessed_close_group_quorum(),
+        )
+        .expect("final witnessed candidates should be used for quote and PUT");
+
+        let final_witnessed_seeds = vec![1, 2, 3, 4, 5, 6, 7];
+        assert_eq!(
+            selection
+                .quote_peers
+                .iter()
+                .map(|peer| peer.peer_id.as_bytes()[0])
+                .collect::<Vec<_>>(),
+            final_witnessed_seeds
+        );
+        assert_eq!(put_peer_seeds(&selection.put_peers), final_witnessed_seeds);
     }
 
     #[test]
@@ -1332,6 +1463,47 @@ mod tests {
 
         assert_eq!(*peer_id, synthetic_peer(2));
         assert_eq!(*price, Amount::from(1046u64));
+    }
+
+    #[test]
+    fn paid_quote_selection_requires_witnessed_issuer_acceptance() {
+        const CHEAP_PRICE: u64 = 100;
+        const SELECTED_PRICE: u64 = 105;
+        const THIRD_QUOTE_PRICE: u64 = 110;
+        const FOURTH_QUOTE_PRICE: u64 = 112;
+        const FIFTH_QUOTE_PRICE: u64 = 115;
+        const HIGH_OUTLIER_PRICE: u64 = 300;
+        const HIGHEST_OUTLIER_PRICE: u64 = 310;
+        const ACCEPTANCE_TARGET: usize = 5;
+
+        let quotes = vec![
+            synthetic_quote(1, CHEAP_PRICE),
+            synthetic_quote(2, SELECTED_PRICE),
+            synthetic_quote(3, THIRD_QUOTE_PRICE),
+            synthetic_quote(4, FOURTH_QUOTE_PRICE),
+            synthetic_quote(5, FIFTH_QUOTE_PRICE),
+            synthetic_quote(6, HIGH_OUTLIER_PRICE),
+            synthetic_quote(7, HIGHEST_OUTLIER_PRICE),
+        ];
+        let witness_views = witness_views_from_seed_lists(&[
+            (1, &[1, 2]),
+            (2, &[1, 2]),
+            (3, &[1, 2]),
+            (4, &[2]),
+            (5, &[2]),
+            (6, &[2]),
+            (7, &[2]),
+        ]);
+
+        let (peer_id, _, _, price) = select_paid_quote_for_payment_with_target_and_views(
+            &quotes,
+            ACCEPTANCE_TARGET,
+            &witness_views,
+        )
+        .expect("second-cheapest quote should satisfy price floor and issuer-local views");
+
+        assert_eq!(*peer_id, synthetic_peer(2));
+        assert_eq!(*price, Amount::from(SELECTED_PRICE));
     }
 
     #[test]
