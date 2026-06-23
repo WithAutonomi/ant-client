@@ -556,16 +556,35 @@ impl Client {
             // freshly-quoted peers, bypassing the EVM transaction.
             let mut needs_pay: Vec<PreparedChunk> = Vec::with_capacity(prepared_chunks.len());
             let mut cached_paid: Vec<PaidChunk> = Vec::new();
+            let mut stale_cached: Vec<([u8; 32], Vec<u8>)> = Vec::new();
             for prep in prepared_chunks {
                 if let Some(proof_bytes) = cached_proofs.get(&prep.address).cloned() {
-                    cached_paid.push(PaidChunk {
-                        content: prep.content,
-                        address: prep.address,
-                        quoted_peers: prep.quoted_peers,
-                        proof_bytes,
-                    });
+                    if cached_proof_matches_current_quote_floor(&proof_bytes, &prep) {
+                        cached_paid.push(PaidChunk {
+                            content: prep.content,
+                            address: prep.address,
+                            quoted_peers: prep.quoted_peers,
+                            proof_bytes,
+                        });
+                    } else {
+                        stale_cached.push((prep.address, proof_bytes));
+                        needs_pay.push(prep);
+                    }
                 } else {
                     needs_pay.push(prep);
+                }
+            }
+            if let Some(key) = resume_key {
+                if !stale_cached.is_empty() {
+                    info!(
+                        "Wave {wave_num}/{wave_count}: discarding {} cached payment proofs \
+                         below current quote floor",
+                        stale_cached.len()
+                    );
+                    crate::data::client::cached_single::try_drop_proofs_for_file(
+                        key,
+                        &stale_cached,
+                    );
                 }
             }
             if !cached_paid.is_empty() {
@@ -908,6 +927,38 @@ fn log_wave_summary(result: &WaveResult) {
     );
 }
 
+/// Returns true when a cached proof's embedded quote prices still meet
+/// the current fresh quote floor selected for this chunk.
+fn cached_proof_matches_current_quote_floor(proof_bytes: &[u8], prepared: &PreparedChunk) -> bool {
+    let Some(current_floor) = prepared
+        .payment
+        .quotes
+        .iter()
+        .map(|quote| quote.price)
+        .max()
+    else {
+        return false;
+    };
+
+    match deserialize_proof(proof_bytes) {
+        Ok((proof, _tx_hashes)) => proof_matches_current_quote_floor(&proof, current_floor),
+        Err(_) => false,
+    }
+}
+
+/// A cached proof can only be replayed if every embedded quote is at least
+/// as expensive as the fresh quote floor. With one paid quote this is the
+/// exact check; with older multi-quote proofs it is deliberately
+/// conservative because the storer may derive its payable quote from the
+/// full embedded set.
+fn proof_matches_current_quote_floor(proof: &ProofOfPayment, current_floor: Amount) -> bool {
+    !proof.peer_quotes.is_empty()
+        && proof
+            .peer_quotes
+            .iter()
+            .all(|(_, quote)| quote.price >= current_floor)
+}
+
 /// Safety margin subtracted from the storer's `QUOTE_MAX_AGE_SECS` (24 h)
 /// when deciding to trust a cached proof.
 ///
@@ -1209,6 +1260,62 @@ mod tests {
             })
             .collect();
         ProofOfPayment { peer_quotes }
+    }
+
+    fn make_proof_with_prices(prices: &[u64]) -> ProofOfPayment {
+        let peer_quotes = prices
+            .iter()
+            .enumerate()
+            .map(|(i, price)| {
+                let quote = PaymentQuote {
+                    content: xor_name::XorName([0u8; 32]),
+                    timestamp: SystemTime::UNIX_EPOCH,
+                    price: Amount::from(*price),
+                    rewards_address: RewardsAddress::new([1u8; 20]),
+                    pub_key: vec![],
+                    signature: vec![],
+                };
+                (EncodedPeerId::from([i as u8; 32]), quote)
+            })
+            .collect();
+        ProofOfPayment { peer_quotes }
+    }
+
+    #[test]
+    fn proof_matches_current_quote_floor_accepts_current_or_higher_price() {
+        let proof = make_proof_with_prices(&[120]);
+
+        assert!(proof_matches_current_quote_floor(&proof, Amount::from(100)));
+    }
+
+    #[test]
+    fn proof_matches_current_quote_floor_rejects_stale_lower_price() {
+        let proof = make_proof_with_prices(&[80]);
+
+        assert!(!proof_matches_current_quote_floor(
+            &proof,
+            Amount::from(100)
+        ));
+    }
+
+    #[test]
+    fn proof_matches_current_quote_floor_rejects_any_lower_multi_quote_price() {
+        let proof = make_proof_with_prices(&[100, 80, 130]);
+
+        assert!(!proof_matches_current_quote_floor(
+            &proof,
+            Amount::from(100)
+        ));
+    }
+
+    #[test]
+    fn proof_matches_current_quote_floor_rejects_empty_proof() {
+        let proof = make_proof_with_prices(&[]);
+
+        assert!(!proof_matches_current_quote_floor(
+            &proof,
+            Amount::from(100)
+        ));
     }
 
     fn default_max_future_skew() -> Duration {
