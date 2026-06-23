@@ -22,7 +22,9 @@ pub use crate::node::devnet::LocalDevnet;
 pub use ant_protocol::{compute_address, DataChunk, XorName};
 
 // Re-export client data types
-pub use client::batch::{finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk};
+pub use client::batch::{
+    finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk, PreparedChunkPayment,
+};
 pub use client::data::DataUploadResult;
 pub use client::file::{
     CostEstimateConfidence, DownloadEvent, ExternalPaymentInfo, FileUploadResult, PreparedUpload,

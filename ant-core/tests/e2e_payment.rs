@@ -13,6 +13,8 @@ use serial_test::serial;
 use std::sync::Arc;
 use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 
+const EXPECTED_WITNESSED_QUOTE_TARGET: usize = 5;
+
 async fn setup() -> (Client, MiniTestnet) {
     let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(3).expect("Node 3 should exist");
@@ -254,10 +256,11 @@ async fn test_quote_collection() {
         .await
         .expect("get_store_quotes should succeed");
 
-    // At least 5 quotes required
+    // One paid quote goes into the proof, but the selector needs enough quote
+    // data to choose a price expected to pass the witnessed-quorum floors.
     assert!(
-        quotes.len() >= 5,
-        "Should receive at least 5 quotes, got {}",
+        quotes.len() >= EXPECTED_WITNESSED_QUOTE_TARGET,
+        "Should receive at least {EXPECTED_WITNESSED_QUOTE_TARGET} quotes, got {}",
         quotes.len()
     );
 

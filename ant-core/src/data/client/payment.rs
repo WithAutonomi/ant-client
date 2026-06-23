@@ -3,14 +3,51 @@
 //! Connects quote collection, on-chain EVM payment, and proof serialization.
 //! Every PUT to the network requires a valid payment proof.
 
-use crate::data::client::quote::median_paid_quote_issuer;
+use crate::data::client::quote::{select_paid_quote_for_payment, StoreQuote};
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_protocol::evm::{EncodedPeerId, ProofOfPayment, Wallet};
-use ant_protocol::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
+use ant_protocol::evm::{Amount, EncodedPeerId, PaymentQuote, ProofOfPayment, Wallet};
+use ant_protocol::payment::{serialize_single_node_proof, PaymentProof, QuotePaymentInfo};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use std::sync::Arc;
 use tracing::{debug, info};
+
+/// Single-node payment amount multiplier required by storer verification.
+const PAID_QUOTE_PAYMENT_MULTIPLIER: u64 = 3;
+
+pub(crate) fn paid_quote_payment_info(quote: &PaymentQuote) -> Result<QuotePaymentInfo> {
+    if quote.price.is_zero() {
+        return Err(Error::Payment(
+            "Paid quote has zero price; refusing to build an unpaid storage proof".to_string(),
+        ));
+    }
+
+    let amount = quote
+        .price
+        .checked_mul(Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER))
+        .ok_or_else(|| {
+            Error::Payment(format!(
+                "Price overflow when calculating {PAID_QUOTE_PAYMENT_MULTIPLIER}x paid quote"
+            ))
+        })?;
+
+    Ok(QuotePaymentInfo {
+        quote_hash: quote.hash(),
+        rewards_address: quote.rewards_address,
+        amount,
+        price: quote.price,
+    })
+}
+
+pub(crate) fn paid_quote_payment_from_store_quotes(
+    quotes: &[StoreQuote],
+) -> Result<(PeerId, PaymentQuote, QuotePaymentInfo)> {
+    let (peer_id, _, quote, _) = select_paid_quote_for_payment(quotes).ok_or_else(|| {
+        Error::Payment("No successful quote available for single-node payment".to_string())
+    })?;
+    let payment_info = paid_quote_payment_info(quote)?;
+    Ok((*peer_id, quote.clone(), payment_info))
+}
 
 impl Client {
     /// Get the wallet, returning an error if not configured.
@@ -23,8 +60,9 @@ impl Client {
     /// Pay for storage and return the serialized payment proof bytes.
     ///
     /// This orchestrates the full payment flow:
-    /// 1. Collect `CLOSE_GROUP_SIZE` quotes from the witnessed close group
-    /// 2. Build `SingleNodePayment` using node-reported prices (median 3x, others 0)
+    /// 1. Query `CLOSE_GROUP_SIZE` witnessed peers and collect enough quotes
+    ///    to pick one that should satisfy the witnessed-quorum price floors
+    /// 2. Select one paid quote and pay 3x its node-reported price
     /// 3. Pay on-chain via the wallet
     /// 4. Serialize `PaymentProof` with transaction hashes
     ///
@@ -33,8 +71,8 @@ impl Client {
     /// Returns an error if the wallet is not set, quotes cannot be collected,
     /// on-chain payment fails, or serialization fails.
     /// Returns `(proof_bytes, quoted_peers)`. `quoted_peers` are the
-    /// `CLOSE_GROUP_SIZE` peers that provided quotes — callers should store
-    /// the chunk to at least `CLOSE_GROUP_MAJORITY` of these peers.
+    /// `CLOSE_GROUP_SIZE` witnessed PUT targets — callers should store the
+    /// chunk to at least `CLOSE_GROUP_MAJORITY` of these peers.
     pub async fn pay_for_storage(
         &self,
         address: &[u8; 32],
@@ -52,44 +90,43 @@ impl Client {
             .get_store_quote_plan(address, data_size, data_type)
             .await?;
         let quotes_with_peers = quote_plan.quotes;
-        let median_quote_issuer =
-            median_paid_quote_issuer(&quotes_with_peers).ok_or_else(|| {
-                Error::Payment(
-                    "Failed to select median quote issuer from witnessed quotes".to_string(),
-                )
-            })?;
+        let (paid_peer_id, paid_quote, paid_quote_info) =
+            paid_quote_payment_from_store_quotes(&quotes_with_peers)?;
 
         // Capture all quoted peers for replication by the caller.
         let quoted_peers = quote_plan.put_peers;
 
-        // 2. Build peer_quotes for ProofOfPayment + quotes for SingleNodePayment.
-        // Use node-reported prices directly — no contract price fetch needed.
-        let mut peer_quotes = Vec::with_capacity(quotes_with_peers.len());
-        let mut quotes_for_payment = Vec::with_capacity(quotes_with_peers.len());
-
-        for (peer_id, _addrs, quote, price) in quotes_with_peers {
-            let encoded = peer_id_to_encoded(&peer_id)?;
-            peer_quotes.push((encoded, quote.clone()));
-            quotes_for_payment.push((quote, price));
-        }
-
-        // 3. Create SingleNodePayment (sorts by price, selects median)
-        let payment = SingleNodePayment::from_quotes(quotes_for_payment)
-            .map_err(|e| Error::Payment(format!("Failed to create payment: {e}")))?;
+        let peer_quotes = vec![(peer_id_to_encoded(&paid_peer_id)?, paid_quote)];
 
         info!(
-            "Selected SNP median paid quote issuer {} for address {} (median price: {})",
-            median_quote_issuer.0,
+            "Selected SNP paid quote issuer {} for address {} (price: {}, amount: {})",
+            paid_peer_id,
             hex::encode(address),
-            median_quote_issuer.1
+            paid_quote_info.price,
+            paid_quote_info.amount
         );
-        info!("Payment total: {} atto", payment.total_amount());
 
         // 4. Pay on-chain
-        let tx_hashes = payment
-            .pay(wallet)
-            .await
-            .map_err(|e| Error::Payment(format!("On-chain payment failed: {e}")))?;
+        let payments = vec![(
+            paid_quote_info.quote_hash,
+            paid_quote_info.rewards_address,
+            paid_quote_info.amount,
+        )];
+        let (tx_hash_map, _gas_info) = wallet.pay_for_quotes(payments).await.map_err(
+            |ant_protocol::evm::PayForQuotesError(err, _)| {
+                Error::Payment(format!("On-chain payment failed: {err}"))
+            },
+        )?;
+        let tx_hash = tx_hash_map
+            .get(&paid_quote_info.quote_hash)
+            .copied()
+            .ok_or_else(|| {
+                Error::Payment(format!(
+                    "Missing transaction hash for paid quote {}",
+                    paid_quote_info.quote_hash
+                ))
+            })?;
+        let tx_hashes = vec![tx_hash];
 
         info!(
             "On-chain payment succeeded: {} transactions",
