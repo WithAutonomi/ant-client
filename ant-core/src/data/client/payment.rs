@@ -83,7 +83,7 @@ impl Client {
     ///
     /// This orchestrates the full payment flow:
     /// 1. Query `CLOSE_GROUP_SIZE` witnessed peers and collect enough quotes
-    ///    to pick one that should satisfy the witnessed-quorum price floors
+    ///    to pick one that should satisfy the storage-majority price floors
     ///    and paid-quote issuer checks
     /// 2. Select one paid quote and pay 3x its node-reported price
     /// 3. Pay on-chain via the wallet

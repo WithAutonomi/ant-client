@@ -265,7 +265,7 @@ fn witnessed_close_group_quorum() -> usize {
 }
 
 fn paid_quote_acceptance_target() -> usize {
-    witnessed_close_group_quorum()
+    CLOSE_GROUP_MAJORITY
 }
 
 fn paid_quote_acceptance_target_after_already_stored(already_stored: usize) -> usize {
@@ -694,7 +694,7 @@ impl Client {
     /// Builds a quorum-witnessed candidate set, requests quotes from the
     /// closest `CLOSE_GROUP_SIZE` witnessed peers concurrently, and requires
     /// enough successful responses to select one paid quote that should pass
-    /// the witnessed-quorum price floors.
+    /// the storage-majority price floors.
     ///
     /// Returns `Error::AlreadyStored` early if `CLOSE_GROUP_MAJORITY` peers
     /// report the chunk is already stored.
@@ -1402,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn paid_quote_selection_uses_lowest_quote_that_clears_witnessed_floor_target() {
+    fn paid_quote_selection_uses_lowest_quote_that_clears_storage_majority_floor_target() {
         let quotes = vec![
             synthetic_quote(1, 595),
             synthetic_quote(2, 690),
@@ -1417,7 +1417,7 @@ mod tests {
     }
 
     #[test]
-    fn paid_quote_selection_ignores_two_high_outliers_when_five_lower_quotes_clear() {
+    fn paid_quote_selection_ignores_high_outliers_when_four_lower_quotes_clear() {
         let quotes = vec![
             synthetic_quote(1, 100),
             synthetic_quote(2, 110),
@@ -1429,24 +1429,55 @@ mod tests {
         ];
         let (peer_id, _, _, price) =
             select_paid_quote_for_payment(&quotes).expect("quotes should have a paid quote");
-        assert_eq!(*peer_id, synthetic_peer(3));
-        assert_eq!(*price, Amount::from(120u64));
+        assert_eq!(*peer_id, synthetic_peer(2));
+        assert_eq!(*price, Amount::from(110u64));
     }
 
     #[test]
-    fn paid_quote_selection_requires_witnessed_quorum_of_successful_quotes() {
+    fn paid_quote_selection_requires_storage_majority_of_successful_quotes() {
         let quotes = vec![synthetic_quote(4, 40)];
         assert!(
             select_paid_quote_for_payment(&quotes).is_none(),
-            "payment selection should fail before spending without quorum-priced quote data"
+            "payment selection should fail before spending without majority-priced quote data"
         );
     }
 
     #[test]
     fn paid_quote_target_is_reduced_by_already_stored_close_group_votes() {
-        assert_eq!(paid_quote_acceptance_target_after_already_stored(0), 5);
-        assert_eq!(paid_quote_acceptance_target_after_already_stored(2), 3);
+        assert_eq!(paid_quote_acceptance_target_after_already_stored(0), 4);
+        assert_eq!(paid_quote_acceptance_target_after_already_stored(2), 2);
         assert_eq!(paid_quote_acceptance_target_after_already_stored(5), 1);
+    }
+
+    #[test]
+    fn paid_quote_selection_allows_storage_majority_of_successful_quotes() {
+        const CHEAP_PRICE: u64 = 100;
+        const SELECTED_PRICE: u64 = 110;
+        const THIRD_QUOTE_PRICE: u64 = 120;
+        const FOURTH_QUOTE_PRICE: u64 = 130;
+
+        let quotes = vec![
+            synthetic_quote(1, CHEAP_PRICE),
+            synthetic_quote(2, SELECTED_PRICE),
+            synthetic_quote(3, THIRD_QUOTE_PRICE),
+            synthetic_quote(4, FOURTH_QUOTE_PRICE),
+        ];
+        let witness_views = witness_views_from_seed_lists(&[
+            (1, &[1, 2]),
+            (2, &[1, 2]),
+            (3, &[1, 2]),
+            (4, &[1, 2]),
+        ]);
+
+        let (peer_id, _, _, price) = select_paid_quote_for_payment_with_target_and_views(
+            &quotes,
+            paid_quote_acceptance_target(),
+            &witness_views,
+        )
+        .expect("four accepting quotes should satisfy the storage-majority target");
+
+        assert_eq!(*peer_id, synthetic_peer(2));
+        assert_eq!(*price, Amount::from(SELECTED_PRICE));
     }
 
     #[test]
@@ -1474,7 +1505,7 @@ mod tests {
         const FIFTH_QUOTE_PRICE: u64 = 115;
         const HIGH_OUTLIER_PRICE: u64 = 300;
         const HIGHEST_OUTLIER_PRICE: u64 = 310;
-        const ACCEPTANCE_TARGET: usize = 5;
+        const ACCEPTANCE_TARGET: usize = CLOSE_GROUP_MAJORITY;
 
         let quotes = vec![
             synthetic_quote(1, CHEAP_PRICE),

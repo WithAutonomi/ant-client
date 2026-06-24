@@ -8,12 +8,13 @@
 mod support;
 
 use ant_core::data::{compute_address, Client};
+use ant_protocol::CLOSE_GROUP_MAJORITY;
 use bytes::Bytes;
 use serial_test::serial;
 use std::sync::Arc;
 use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 
-const EXPECTED_WITNESSED_QUOTE_TARGET: usize = 5;
+const EXPECTED_PAID_QUOTE_TARGET: usize = CLOSE_GROUP_MAJORITY;
 
 async fn setup() -> (Client, MiniTestnet) {
     let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
@@ -257,10 +258,10 @@ async fn test_quote_collection() {
         .expect("get_store_quotes should succeed");
 
     // One paid quote goes into the proof, but the selector needs enough quote
-    // data to choose a price expected to pass the witnessed-quorum floors.
+    // data to choose a price expected to pass storage-majority floors.
     assert!(
-        quotes.len() >= EXPECTED_WITNESSED_QUOTE_TARGET,
-        "Should receive at least {EXPECTED_WITNESSED_QUOTE_TARGET} quotes, got {}",
+        quotes.len() >= EXPECTED_PAID_QUOTE_TARGET,
+        "Should receive at least {EXPECTED_PAID_QUOTE_TARGET} quotes, got {}",
         quotes.len()
     );
 
