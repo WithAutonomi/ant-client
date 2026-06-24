@@ -21,6 +21,7 @@ use crate::data::client::merkle::{
     merkle_store_with_retry, should_use_merkle, MerkleBatchPaymentResult, PaymentMode,
     PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
 };
+use crate::data::client::payment::paid_quote_payment_from_store_quotes;
 use crate::data::client::Client;
 use crate::data::error::{Error, PartialUploadSpend, Result};
 use ant_protocol::evm::{Amount, PaymentQuote, QuoteHash, TxHash, MAX_LEAVES};
@@ -1329,15 +1330,10 @@ impl Client {
             }
         };
 
-        // Use the median price × 3 (matches SingleNodePayment::from_quotes
-        // which pays 3x the median to incentivize reliable storage).
-        let mut prices: Vec<Amount> = quotes.iter().map(|(_, _, _, price)| *price).collect();
-        prices.sort();
-        let median_price = prices
-            .get(prices.len() / 2)
-            .copied()
-            .unwrap_or(Amount::ZERO);
-        let per_chunk_cost = median_price * Amount::from(3u64);
+        // Match the live single-node payment path: one selected quote is paid
+        // at the storer-required multiplier.
+        let (_, _, paid_quote_info) = paid_quote_payment_from_store_quotes(&quotes)?;
+        let per_chunk_cost = paid_quote_info.amount;
 
         let chunk_count_u64 = u64::try_from(chunk_count).unwrap_or(u64::MAX);
         let total_storage = per_chunk_cost * Amount::from(chunk_count_u64);
