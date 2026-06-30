@@ -492,9 +492,18 @@ fn peer_list(peers: &[PeerId]) -> Vec<String> {
 /// One collected store quote, carrying (ADR-0004) the opaque signed-commitment
 /// sidecar the node shipped with its quote (`None` for a baseline quote), to be
 /// forwarded in the PUT bundle and cross-checked by storers.
-pub(crate) type StoreQuote = (PeerId, Vec<MultiAddr>, PaymentQuote, Amount, Option<Vec<u8>>);
-type StoreQuoteRequestResult =
-    (PeerId, Vec<MultiAddr>, Result<(PaymentQuote, Amount, Option<Vec<u8>>)>);
+pub(crate) type StoreQuote = (
+    PeerId,
+    Vec<MultiAddr>,
+    PaymentQuote,
+    Amount,
+    Option<Vec<u8>>,
+);
+type StoreQuoteRequestResult = (
+    PeerId,
+    Vec<MultiAddr>,
+    Result<(PaymentQuote, Amount, Option<Vec<u8>>)>,
+);
 type VotersByPeer = HashMap<PeerId, HashSet<PeerId>>;
 type WitnessedVoteData = (HashMap<PeerId, DHTNode>, VotersByPeer, Vec<(PeerId, usize)>);
 
@@ -1463,7 +1472,13 @@ mod tests {
     fn synthetic_quote(
         seed: u8,
         price: u64,
-    ) -> (PeerId, Vec<MultiAddr>, PaymentQuote, Amount, Option<Vec<u8>>) {
+    ) -> (
+        PeerId,
+        Vec<MultiAddr>,
+        PaymentQuote,
+        Amount,
+        Option<Vec<u8>>,
+    ) {
         let amount = Amount::from(price);
         let quote = PaymentQuote {
             content: XorName([0u8; 32]),
