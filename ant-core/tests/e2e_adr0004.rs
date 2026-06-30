@@ -1,11 +1,11 @@
-//! ADR-0003 end-to-end: commitment-bound quote pricing.
+//! ADR-0004 end-to-end: commitment-bound quote pricing.
 //!
 //! Proves, against a real in-process QUIC testnet + Anvil EVM, that:
 //!
 //! 1. A node carrying a live storage commitment emits a COMMITMENT-BOUND quote:
 //!    `committed_key_count == N`, `commitment_pin == Some`, the price is exactly
 //!    `calculate_price(N)`, and the signed commitment is SHIPPED in the quote
-//!    response (ADR-0003 "the commitment arrived with the quote").
+//!    response (ADR-0004 "the commitment arrived with the quote").
 //! 2. The client's forced-price gate ACCEPTS those bound quotes (they are
 //!    self-consistent) and a full pay → store → retrieve round-trip succeeds —
 //!    so the storer accepts the bound quotes and the forwarded sidecars too.
@@ -39,7 +39,7 @@ const COMMITTED_KEYS: u32 = 9_000;
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn adr0003_bound_quotes_are_shipped_priced_and_resolve() {
+async fn adr0004_bound_quotes_are_shipped_priced_and_resolve() {
     let testnet = MiniTestnet::start_with_commitments(DEFAULT_NODE_COUNT, COMMITTED_KEYS).await;
     let node = testnet.node(3).expect("node 3 exists");
     let client = Client::from_node(Arc::clone(&node), test_client_config())
@@ -48,7 +48,7 @@ async fn adr0003_bound_quotes_are_shipped_priced_and_resolve() {
     let content = Bytes::from("adr-0003 bound-quote payload");
     let address = compute_address(&content);
 
-    // Collect quotes directly so we can inspect the ADR-0003 binding the client
+    // Collect quotes directly so we can inspect the ADR-0004 binding the client
     // verified before it would pay.
     let quotes = client
         .get_store_quotes(&address, content.len() as u64, 0)
@@ -141,7 +141,7 @@ async fn adr0003_bound_quotes_are_shipped_priced_and_resolve() {
 /// This guards the baseline branch of the same forced-price gate.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn adr0003_baseline_quotes_still_work() {
+async fn adr0004_baseline_quotes_still_work() {
     let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(3).expect("node 3 exists");
     let client = Client::from_node(Arc::clone(&node), test_client_config())

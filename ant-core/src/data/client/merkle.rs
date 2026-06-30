@@ -37,7 +37,7 @@ use xor_name::XorName;
 /// Default threshold: use merkle payments when chunk count >= this value.
 pub const DEFAULT_MERKLE_THRESHOLD: usize = 64;
 
-/// ADR-0003 resolve-before-pay gate for a merkle candidate — the merkle-path
+/// ADR-0004 resolve-before-pay gate for a merkle candidate — the merkle-path
 /// equivalent of the single-node `quote_commitment_binding_is_valid`. Runs the
 /// FULL binding check (shape, cap, exact price, and for bound candidates the
 /// commitment parse, peer-binding, signature, `hash == pin`, and
@@ -163,7 +163,7 @@ pub struct PreparedMerkleBatch {
     tree: MerkleTree,
     /// Internal: chunk addresses in order.
     addresses: Vec<[u8; 32]>,
-    /// ADR-0003: validated commitment sidecars keyed by `(peer, pin)`, collected
+    /// ADR-0004: validated commitment sidecars keyed by `(peer, pin)`, collected
     /// during candidate validation. At proof time the winner pool's candidates
     /// forward theirs in `MerklePaymentProof.commitment_sidecars`.
     commitment_sidecars: HashMap<(PeerId, [u8; 32]), Vec<u8>>,
@@ -528,7 +528,7 @@ impl Client {
         );
 
         // 3. Collect candidate pools from the network (all pools in parallel).
-        //    Each candidate's ADR-0003 binding is verified during collection and
+        //    Each candidate's ADR-0004 binding is verified during collection and
         //    its commitment sidecar captured (keyed by peer, pin).
         let (candidate_pools, commitment_sidecars) = self
             .build_candidate_pools(
@@ -695,7 +695,7 @@ impl Client {
         }
 
         let mut pools = Vec::with_capacity(midpoint_proofs.len());
-        // ADR-0003: merged map of every validated candidate's commitment sidecar,
+        // ADR-0004: merged map of every validated candidate's commitment sidecar,
         // keyed by (peer, pin). At proof time the winner pool's candidates look
         // up their sidecars here to forward in the merkle PUT bundle.
         let mut sidecars: HashMap<(PeerId, [u8; 32]), Vec<u8>> = HashMap::new();
@@ -888,7 +888,7 @@ impl Client {
                         failures.push(format!("{peer_id}: candidate pub_key/peer mismatch"));
                         continue;
                     }
-                    // ADR-0003: the FULL resolve-before-pay binding check, same as
+                    // ADR-0004: the FULL resolve-before-pay binding check, same as
                     // the single-node path — a candidate priced off its committed
                     // count, or shipping an unresolvable/forged commitment, is
                     // dropped before it can enter a pool the client pays. Checked
@@ -896,7 +896,7 @@ impl Client {
                     if let Err(detail) =
                         merkle_candidate_binding_is_valid(&candidate_peer, &candidate, &commitment)
                     {
-                        warn!("Dropping merkle candidate {peer_id} — ADR-0003 binding invalid: {detail}");
+                        warn!("Dropping merkle candidate {peer_id} — ADR-0004 binding invalid: {detail}");
                         failures.push(format!("{peer_id}: bad commitment binding ({detail})"));
                         continue;
                     }
@@ -1446,7 +1446,7 @@ pub fn finalize_merkle_batch(
             ))
         })?;
 
-    // ADR-0003: collect the winner pool's candidate commitment sidecars (those
+    // ADR-0004: collect the winner pool's candidate commitment sidecars (those
     // that were bound + validated during collection), to forward in each proof
     // so the storer can cross-check synchronously. Built once for the pool.
     let winner_sidecars: Vec<Vec<u8>> = winner_pool

@@ -119,7 +119,7 @@ pub enum Error {
         detail: String,
     },
 
-    /// ADR-0003: a quote's commitment binding does not hold — its price is not
+    /// ADR-0004: a quote's commitment binding does not hold — its price is not
     /// `calculate_price(committed_key_count)`, its `(count, pin)` shape is
     /// incoherent, or a shipped commitment does not match the pinned count/hash.
     /// The storer's arithmetic gate would reject such a quote, so the client
