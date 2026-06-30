@@ -68,7 +68,7 @@ impl Client {
         // Use node-reported prices directly — no contract price fetch needed.
         let mut peer_quotes = Vec::with_capacity(quotes_with_peers.len());
         let mut quotes_for_payment = Vec::with_capacity(quotes_with_peers.len());
-        // ADR-0003: forward the signed commitment each bound quote shipped, so
+        // ADR-0004: forward the signed commitment each bound quote shipped, so
         // the storers can cross-check the quote's count against the original
         // commitment synchronously ("the commitment arrived with the quote").
         // A baseline quote ships none. `get_store_quotes` already verified each

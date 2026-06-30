@@ -146,7 +146,7 @@ pub enum FileChunkPeerStatus {
 
 /// One entry in the per-chunk quote list returned by
 /// [`Client::get_store_quotes`]: the responding peer, its addresses, the
-/// signed quote it returned, the payment amount it is demanding, and (ADR-0003)
+/// signed quote it returned, the payment amount it is demanding, and (ADR-0004)
 /// the opaque signed-commitment blob the node shipped with the quote.
 type QuoteEntry = (
     PeerId,
@@ -978,6 +978,13 @@ pub struct FileUploadResult {
 }
 
 /// Payment information for external signing — either wave-batch or merkle.
+// ADR-0004 added the signed commitment fields (`committed_key_count`,
+// `commitment_pin`) to the merkle candidate quotes carried inside
+// `PreparedMerkleBatch`, which grew the `Merkle` variant past the
+// `large_enum_variant` threshold. This enum is constructed one-off per payment
+// (never held in bulk collections), so the size delta is harmless; allow it
+// rather than box a field on the security-sensitive merkle-finalize path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ExternalPaymentInfo {
     /// Wave-batch: individual (quote_hash, rewards_address, amount) tuples.

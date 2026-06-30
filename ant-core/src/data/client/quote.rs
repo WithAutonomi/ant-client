@@ -61,7 +61,7 @@ const QUOTE_COLLECTION_TIMEOUT_SECS: u64 = 120;
 const ML_DSA_PUB_KEY_LEN: usize = 1952;
 
 /// One collected quote: the responding peer, its addresses, the signed quote,
-/// the price it demands, and (ADR-0003) the opaque signed-commitment blob the
+/// the price it demands, and (ADR-0004) the opaque signed-commitment blob the
 /// node shipped alongside the quote (`None` for a baseline quote), to be
 /// forwarded as a sidecar in the PUT bundle.
 type QuotedPeer = (
@@ -71,9 +71,6 @@ type QuotedPeer = (
     Amount,
     Option<Vec<u8>>,
 );
-
-/// Per-peer classification outcome: `(quote, price, commitment)` on success.
-type QuoteResult = std::result::Result<(PaymentQuote, Amount, Option<Vec<u8>>), Error>;
 
 /// Check that a quote's `pub_key` is well-formed and BLAKE3-hashes to the
 /// claimed `peer_id`.
@@ -85,7 +82,7 @@ type QuoteResult = std::result::Result<(PaymentQuote, Amount, Option<Vec<u8>>), 
 /// failing either check causes the storer to reject the entire close-group
 /// proof and burn the chunk's payment.
 ///
-/// This is the cheap structural pre-check. ADR-0003 additionally has the client
+/// This is the cheap structural pre-check. ADR-0004 additionally has the client
 /// run `verify_quote_content` + `verify_quote_signature` (the full ML-DSA check)
 /// in [`classify_quote_response`] before paying, so a quote the storer would
 /// reject never gets paid.
@@ -96,7 +93,7 @@ fn quote_binding_is_valid(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
     compute_address(&quote.pub_key) == *peer_id.as_bytes()
 }
 
-/// ADR-0003 client-side resolve-before-pay gate — "the client pays nothing it
+/// ADR-0004 client-side resolve-before-pay gate — "the client pays nothing it
 /// cannot resolve", the ceiling's load-bearing wall (ADR §"The client pays
 /// nothing it cannot resolve").
 ///
@@ -206,7 +203,7 @@ fn quote_commitment_binding_is_valid(
 /// `ant-node/src/payment/verifier.rs` — the cheap BLAKE3 binding —
 /// so we drop misbehaving peers' quotes before payment.
 ///
-/// ADR-0003: the client now ALSO runs the storer's `verify_quote_content` and
+/// ADR-0004: the client now ALSO runs the storer's `verify_quote_content` and
 /// `verify_quote_signature` (ML-DSA-65) before paying, so "the client pays
 /// nothing it cannot resolve" covers the quote's own validity too, not just the
 /// commitment binding. This matches what the merkle path already does
@@ -224,7 +221,7 @@ fn quote_commitment_binding_is_valid(
 /// - `Err(Error::BadQuoteBinding { .. })` — bad binding (mirrors the
 ///   storer-side rejection). Outer collector counts these via the typed
 ///   variant (no string matching).
-/// - `Err(Error::BadQuoteCommitment { .. })` — ADR-0003 forced-price binding
+/// - `Err(Error::BadQuoteCommitment { .. })` — ADR-0004 forced-price binding
 ///   failed (price off the curve, incoherent shape, or a bound quote that did
 ///   not ship its commitment); dropped before payment like a bad binding.
 /// - `Err(Error::Serialization(...))` — the quote bytes did not deserialize.
@@ -264,7 +261,7 @@ fn classify_quote_response(
         });
     }
 
-    // ADR-0003 "the client runs the full binding check": verify the quote's OWN
+    // ADR-0004 "the client runs the full binding check": verify the quote's OWN
     // ML-DSA-65 signature and that it is for THIS content, before paying —
     // exactly what the storer checks and what the merkle path already does
     // client-side. A quote with a valid pub_key binding but a bad signature or
@@ -282,13 +279,13 @@ fn classify_quote_response(
         });
     }
 
-    // ADR-0003 forced-price gate: drop a quote whose price is not exactly the
+    // ADR-0004 forced-price gate: drop a quote whose price is not exactly the
     // public formula of its committed count, whose (count, pin) shape is
     // incoherent, or which is bound but did not ship its commitment. The storer
     // re-runs the arithmetic and would reject the bundle; we drop it here so we
     // never pay a quote we cannot resolve.
     if let Err(detail) = quote_commitment_binding_is_valid(peer_id, &payment_quote, &commitment) {
-        warn!("Dropping response from {peer_id} — ADR-0003 binding invalid: {detail}");
+        warn!("Dropping response from {peer_id} — ADR-0004 binding invalid: {detail}");
         return Err(Error::BadQuoteCommitment {
             peer_id: peer_id.to_string(),
             detail,
@@ -368,7 +365,14 @@ async fn request_store_quote_from_peer(
             ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
                 quote,
                 already_stored,
-            }) => Some(classify_quote_response(&peer_id, &quote, already_stored)),
+                commitment,
+            }) => Some(classify_quote_response(
+                &peer_id,
+                &address,
+                &quote,
+                already_stored,
+                commitment,
+            )),
             ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => Some(Err(
                 Error::Protocol(format!("Quote error from {peer_id}: {e}")),
             )),
@@ -386,7 +390,7 @@ async fn request_store_quote_from_peer(
 fn record_store_quote_result(
     peer_id: PeerId,
     addrs: Vec<MultiAddr>,
-    quote_result: Result<(PaymentQuote, Amount)>,
+    quote_result: Result<(PaymentQuote, Amount, Option<Vec<u8>>)>,
     address: &[u8; 32],
     quotes: &mut Vec<StoreQuote>,
     already_stored_peers: &mut Vec<(PeerId, [u8; 32])>,
@@ -394,8 +398,8 @@ fn record_store_quote_result(
     bad_quote_count: &mut usize,
 ) {
     match quote_result {
-        Ok((quote, price)) => {
-            quotes.push((peer_id, addrs, quote, price));
+        Ok((quote, price, commitment)) => {
+            quotes.push((peer_id, addrs, quote, price, commitment));
         }
         Err(Error::AlreadyStored) => {
             info!("Peer {peer_id} reports chunk already stored");
@@ -485,8 +489,12 @@ fn peer_list(peers: &[PeerId]) -> Vec<String> {
     peers.iter().map(ToString::to_string).collect()
 }
 
-pub(crate) type StoreQuote = (PeerId, Vec<MultiAddr>, PaymentQuote, Amount);
-type StoreQuoteRequestResult = (PeerId, Vec<MultiAddr>, Result<(PaymentQuote, Amount)>);
+/// One collected store quote, carrying (ADR-0004) the opaque signed-commitment
+/// sidecar the node shipped with its quote (`None` for a baseline quote), to be
+/// forwarded in the PUT bundle and cross-checked by storers.
+pub(crate) type StoreQuote = (PeerId, Vec<MultiAddr>, PaymentQuote, Amount, Option<Vec<u8>>);
+type StoreQuoteRequestResult =
+    (PeerId, Vec<MultiAddr>, Result<(PaymentQuote, Amount, Option<Vec<u8>>)>);
 type VotersByPeer = HashMap<PeerId, HashSet<PeerId>>;
 type WitnessedVoteData = (HashMap<PeerId, DHTNode>, VotersByPeer, Vec<(PeerId, usize)>);
 
@@ -720,9 +728,7 @@ fn witnessed_quote_selection_or_error(
     })
 }
 
-pub(crate) fn median_paid_quote_issuer(
-    quotes: &[(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)],
-) -> Option<(PeerId, Amount)> {
+pub(crate) fn median_paid_quote_issuer(quotes: &[StoreQuote]) -> Option<(PeerId, Amount)> {
     if quotes.len() <= MEDIAN_QUOTE_INDEX {
         return None;
     }
@@ -730,7 +736,7 @@ pub(crate) fn median_paid_quote_issuer(
     let mut by_price: Vec<(usize, PeerId, Amount)> = quotes
         .iter()
         .enumerate()
-        .map(|(index, (peer_id, _, _, price))| (index, *peer_id, *price))
+        .map(|(index, (peer_id, _, _, price, _))| (index, *peer_id, *price))
         .collect();
     by_price.sort_by_key(|(index, _, price)| (*price, *index));
     by_price
@@ -758,7 +764,7 @@ fn median_paid_quote_issuer_for_indices(
         .iter()
         .enumerate()
         .map(|(selected_index, quote_index)| {
-            let (peer_id, _, _, price) = &quotes[*quote_index];
+            let (peer_id, _, _, price, _) = &quotes[*quote_index];
             (selected_index, *peer_id, *price)
         })
         .collect();
@@ -900,7 +906,7 @@ impl Client {
         address: &[u8; 32],
         data_size: u64,
         data_type: u32,
-    ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
+    ) -> Result<Vec<StoreQuote>> {
         Ok(self
             .get_store_quote_plan(address, data_size, data_type)
             .await?
@@ -974,7 +980,7 @@ impl Client {
         address: &[u8; 32],
         data_size: u64,
         data_type: u32,
-    ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
+    ) -> Result<Vec<StoreQuote>> {
         let peer_query_count = fault_tolerant_quote_query_count();
         let remote_peers = self
             .network()
@@ -1085,7 +1091,7 @@ impl Client {
         data_type: u32,
         remote_peers: Vec<(PeerId, Vec<MultiAddr>)>,
         quote_selection_policy: QuoteSelectionPolicy,
-    ) -> Result<Vec<(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)>> {
+    ) -> Result<Vec<StoreQuote>> {
         let peer_query_count = remote_peers.len();
 
         let node = self.network().node();
@@ -1388,7 +1394,7 @@ mod tests {
     /// Build a quote tuple whose `pub_key` correctly hashes to its peer_id.
     /// Signature is left empty: this filter does not verify signatures.
     ///
-    /// The quote is a valid ADR-0003 **baseline**: `(0, None)` priced at
+    /// The quote is a valid ADR-0004 **baseline**: `(0, None)` priced at
     /// `calculate_price(0)`, so it passes the forced-price gate in
     /// `classify_quote_response`. The 5th tuple element is the (absent)
     /// commitment sidecar.
@@ -1454,7 +1460,10 @@ mod tests {
         PeerId::from_bytes([seed; 32])
     }
 
-    fn synthetic_quote(seed: u8, price: u64) -> (PeerId, Vec<MultiAddr>, PaymentQuote, Amount) {
+    fn synthetic_quote(
+        seed: u8,
+        price: u64,
+    ) -> (PeerId, Vec<MultiAddr>, PaymentQuote, Amount, Option<Vec<u8>>) {
         let amount = Amount::from(price);
         let quote = PaymentQuote {
             content: XorName([0u8; 32]),
@@ -1463,18 +1472,20 @@ mod tests {
             rewards_address: RewardsAddress::new([0u8; 20]),
             pub_key: Vec::new(),
             signature: Vec::new(),
+            committed_key_count: 0,
+            commitment_pin: None,
         };
-        (synthetic_peer(seed), Vec::new(), quote, amount)
+        (synthetic_peer(seed), Vec::new(), quote, amount, None)
     }
 
     fn synthetic_voters(seeds: &[u8]) -> HashSet<PeerId> {
         seeds.iter().copied().map(synthetic_peer).collect()
     }
 
-    fn quote_peer_seeds(quotes: &[(PeerId, Vec<MultiAddr>, PaymentQuote, Amount)]) -> Vec<u8> {
+    fn quote_peer_seeds(quotes: &[StoreQuote]) -> Vec<u8> {
         quotes
             .iter()
-            .map(|(peer_id, _, _, _)| peer_id.as_bytes()[0])
+            .map(|(peer_id, _, _, _, _)| peer_id.as_bytes()[0])
             .collect()
     }
 
@@ -1950,7 +1961,7 @@ mod tests {
             median_paid_quote_issuer(&selected).expect("selected quotes have a median");
         let selected_peers = selected
             .iter()
-            .map(|(peer_id, _, _, _)| *peer_id)
+            .map(|(peer_id, _, _, _, _)| *peer_id)
             .collect::<HashSet<_>>();
         assert_eq!(median_peer_id, synthetic_peer(MEDIAN_ISSUER_SEED));
         assert_eq!(
@@ -2371,7 +2382,7 @@ mod tests {
     }
 
     // ============================================================
-    // ADR-0003: quote_commitment_binding_is_valid (forced-price gate)
+    // ADR-0004: quote_commitment_binding_is_valid (forced-price gate)
     //
     // Mirrors the storer-side `binding_violation` in
     // `ant-node/src/payment/verifier.rs`. The client runs this before
@@ -2380,7 +2391,7 @@ mod tests {
     // and for bound quotes: parse + peer-binding + signature + hash==pin +
     // count==key_count) using the shared ant-protocol commitment type, so an
     // unresolvable/forged commitment is never paid. A live resolve against a
-    // REAL signed commitment is proven in the e2e suite (e2e_adr0003.rs).
+    // REAL signed commitment is proven in the e2e suite (e2e_adr0004.rs).
     // ============================================================
 
     /// A throwaway peer id for tests that fail BEFORE commitment resolution

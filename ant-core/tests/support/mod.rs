@@ -118,7 +118,7 @@ impl MiniTestnet {
         Self::start_inner(node_count, None).await
     }
 
-    /// ADR-0003: start a testnet where every node carries a live storage
+    /// ADR-0004: start a testnet where every node carries a live storage
     /// commitment over `key_count` synthetic keys, so they emit COMMITMENT-BOUND
     /// quotes (price = `calculate_price(key_count)`, pinned, commitment shipped
     /// in the quote response). Exercises the full node→client→storer binding
@@ -373,7 +373,7 @@ impl MiniTestnet {
         // and payment closeness checks use the node's live DHT view.
         protocol.attach_p2p_node(Arc::clone(&node));
 
-        // ADR-0003: optionally give this node a live storage commitment so it
+        // ADR-0004: optionally give this node a live storage commitment so it
         // emits COMMITMENT-BOUND quotes (price = calculate_price(key_count),
         // pinned, with the signed commitment shipped in the quote response).
         // Without this the node has no commitment source and emits baseline
@@ -483,7 +483,7 @@ impl MiniTestnet {
     }
 }
 
-/// ADR-0003: build a live `ResponderCommitmentState` holding one current
+/// ADR-0004: build a live `ResponderCommitmentState` holding one current
 /// commitment over `key_count` synthetic keys, signed by `identity`'s ML-DSA-65
 /// key and bound to its peer id (`BLAKE3(pub_key)`). Returned as the
 /// `CommitmentSource` the quote generator prices against — so the node emits a

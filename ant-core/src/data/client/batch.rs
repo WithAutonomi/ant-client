@@ -53,7 +53,7 @@ pub struct PreparedChunk {
     pub payment: SingleNodePayment,
     /// Peer quotes for building `ProofOfPayment`.
     pub peer_quotes: Vec<(EncodedPeerId, PaymentQuote)>,
-    /// ADR-0003: the signed commitments the bound quotes shipped, forwarded as
+    /// ADR-0004: the signed commitments the bound quotes shipped, forwarded as
     /// sidecars in the PUT bundle so storers cross-check synchronously. Empty
     /// when every quote was baseline (no commitment to pin).
     pub commitment_sidecars: Vec<Vec<u8>>,
@@ -214,7 +214,7 @@ fn build_paid_chunks(
                 peer_quotes: chunk.peer_quotes,
             },
             tx_hashes,
-            // ADR-0003: forward the bound quotes' commitments so storers
+            // ADR-0004: forward the bound quotes' commitments so storers
             // cross-check synchronously; stripped before persistence node-side.
             commitment_sidecars: chunk.commitment_sidecars,
         };
@@ -279,7 +279,7 @@ impl Client {
         // Use node-reported prices directly — no contract price fetch needed.
         let mut peer_quotes = Vec::with_capacity(quotes_with_peers.len());
         let mut quotes_for_payment = Vec::with_capacity(quotes_with_peers.len());
-        // ADR-0003: forward each bound quote's commitment sidecar (baseline
+        // ADR-0004: forward each bound quote's commitment sidecar (baseline
         // quotes ship none); `get_store_quotes` already verified the binding.
         let mut commitment_sidecars = Vec::new();
 
