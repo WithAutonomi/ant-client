@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.2.11"
+version = "0.2.8"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.3.1"
+version = "0.2.8"
 dependencies = [
  "alloy",
  "ant-node",
@@ -892,9 +892,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbbc1f23610ffb700cd85bbf7519ebe29c767ccffc85480c29277da627de41de"
+version = "0.14.1"
+source = "git+https://github.com/grumbach/ant-node?branch=adr-0003-commitment-bound-pricing#195981f53a92f1a6522f8bf96c903c2259c50a09"
 dependencies = [
  "ant-protocol",
  "blake3",
@@ -942,9 +941,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a35986649c5963ec808efb44621d8b94716cc2ef5a041ea9a1875487578097c"
+version = "2.2.1"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=adr-0003-commitment-bound-pricing#140adea15c4f7e3594d13a017a0770677171322b"
 dependencies = [
  "blake3",
  "bytes",
@@ -2010,9 +2008,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.20"
+version = "0.9.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2530,8 +2528,7 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebd96cf24017cd31cd422c80de3078a821b7884a5b1feb00087e98209326c676"
+source = "git+https://github.com/WithAutonomi/evmlib?branch=adr-0003-signed-quote-fields#4adfdb5615271f716e4233681fb4cf640a0a34d0"
 dependencies = [
  "alloy",
  "ant-merkle",
@@ -3261,7 +3258,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -4579,9 +4576,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.15"
+version = "0.11.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
+checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -5250,9 +5247,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.26.2"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d9c05644c46b8de670aa5c8eea037b90731f1f204e8aa5d8a2f03496d740401"
+checksum = "c3f44ef51271c8bfc5b5305f73831a5090fde070553e2a96636feae109b4fdc4"
 dependencies = [
  "anyhow",
  "async-trait",
