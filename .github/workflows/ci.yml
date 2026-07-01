@@ -92,7 +92,7 @@ jobs:
           anvil --version
           forge --version
       - name: Run E2E tests (serial)
-        run: cargo test -p ant-core --features test-utils --test e2e_chunk --test e2e_data --test e2e_file --test e2e_payment --test e2e_security --test e2e_cost_estimate -- --test-threads=1
+        run: cargo test -p ant-core --features test-utils --test e2e_chunk --test e2e_data --test e2e_file --test e2e_payment --test e2e_security --test e2e_cost_estimate --test e2e_adr0004 -- --test-threads=1
 
   test-merkle:
     name: Merkle E2E (${{ matrix.os }})
