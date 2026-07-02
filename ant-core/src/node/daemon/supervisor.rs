@@ -795,6 +795,31 @@ async fn running_nodes(
         .collect()
 }
 
+/// Delete a directory tree, retrying briefly to tolerate transient locks.
+///
+/// A node we just killed can hold its data files open for a short moment after exit — on Windows
+/// especially (its LMDB memory map and its own copied `ant-node` binary), and antivirus/indexers can
+/// grab transient handles — so `remove_dir_all` fails with "access denied / in use" until the OS
+/// releases them. A bounded exponential backoff gives it time; on Unix the first attempt almost
+/// always succeeds. Returns `Ok` on success or if the directory is already gone.
+async fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut delay = Duration::from_millis(100);
+    for attempt in 1..=MAX_ATTEMPTS {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            // Already gone — nothing left to reclaim; treat as success.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if attempt == MAX_ATTEMPTS => return Err(e),
+            Err(_) => {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(1));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Evict a single node: stop it, delete its data directory, persist the eviction marker, mark its
 /// runtime state, and emit an event. Best-effort — individual failures are logged but do not abort
 /// the wider cycle, since leaving a half-evicted node is worse than continuing.
@@ -813,25 +838,40 @@ async fn evict_node(
         tracing::warn!("Eviction: failed to stop node {node_id} before deletion: {e}");
     }
 
-    // 2. Delete the data directory — this is what actually reclaims disk space.
+    // 2. Delete the data directory — this is what actually reclaims disk space. A just-killed node
+    //    can briefly hold its files open (LMDB memory map, and its own copied binary in the data
+    //    dir); on Windows `remove_dir_all` then fails with "access denied / in use" until the OS
+    //    releases those handles. Retry with backoff so the reclaim actually happens.
     let reclaimed = candidate.size_bytes;
-    if let Err(e) = std::fs::remove_dir_all(&candidate.data_dir) {
-        // If the directory is already gone that's fine; otherwise warn but still record the
-        // eviction so the node doesn't keep being re-selected.
-        if candidate.data_dir.exists() {
-            tracing::warn!(
-                "Eviction: failed to delete data dir {} for node {node_id}: {e}",
+    let deleted = match remove_dir_all_with_retry(&candidate.data_dir).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                "Eviction: could not delete data dir {} for node {node_id} after retries: {e}. \
+                 Disk space was NOT reclaimed; manual cleanup may be required.",
                 candidate.data_dir.display()
             );
+            false
         }
-    }
+    };
+    let reclaimed_bytes = if deleted { reclaimed } else { 0 };
 
-    let reason = format!(
-        "Automatically evicted to reclaim disk space: only {} free on its partition. \
-         Its data directory was deleted, recovering ~{}.",
-        fmt_bytes(available_before),
-        fmt_bytes(reclaimed),
-    );
+    let reason = if deleted {
+        format!(
+            "Automatically evicted to reclaim disk space: only {} free on its partition. \
+             Its data directory was deleted, recovering ~{}.",
+            fmt_bytes(available_before),
+            fmt_bytes(reclaimed),
+        )
+    } else {
+        format!(
+            "Automatically evicted due to low disk space (only {} free on its partition), but its \
+             data directory could not be deleted, so space was not reclaimed. Manual cleanup of {} \
+             may be needed.",
+            fmt_bytes(available_before),
+            candidate.data_dir.display(),
+        )
+    };
 
     // 3. Persist the eviction marker so the `Evicted` status survives daemon restarts.
     {
@@ -840,7 +880,7 @@ async fn evict_node(
             config.eviction = Some(EvictionRecord {
                 reason: reason.clone(),
                 evicted_at: now_unix_secs(),
-                reclaimed_bytes: reclaimed,
+                reclaimed_bytes,
             });
         }
         if let Err(e) = reg.save() {
@@ -855,11 +895,11 @@ async fn evict_node(
         .await
         .update_state(node_id, NodeStatus::Evicted, None);
 
-    tracing::info!("Evicted node {node_id}, reclaimed ~{} ({reason})", fmt_bytes(reclaimed));
+    tracing::info!("Evicted node {node_id}, reclaimed ~{} ({reason})", fmt_bytes(reclaimed_bytes));
     let _ = event_tx.send(NodeEvent::NodeEvicted {
         node_id,
         reason,
-        reclaimed_bytes: reclaimed,
+        reclaimed_bytes,
     });
 }
 
@@ -1463,6 +1503,21 @@ fn is_process_alive(pid: u32) -> bool {
 mod tests {
     use super::*;
     use crate::node::types::{EvmNetwork, UpgradeChannel};
+
+    #[tokio::test]
+    async fn remove_dir_all_with_retry_deletes_tree_and_tolerates_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("node-data");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("data.mdb"), vec![0u8; 128]).unwrap();
+
+        // Deletes an existing tree.
+        remove_dir_all_with_retry(&dir).await.unwrap();
+        assert!(!dir.exists());
+
+        // Idempotent: an already-gone path is treated as success (no error).
+        remove_dir_all_with_retry(&dir).await.unwrap();
+    }
 
     #[test]
     fn adopted_flag_lifecycle() {
