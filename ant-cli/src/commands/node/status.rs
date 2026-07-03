@@ -66,20 +66,13 @@ impl StatusArgs {
                     NodeStatus::Starting => format!("{} {}", "●".yellow(), "Starting".yellow()),
                     NodeStatus::Stopping => format!("{} {}", "●".yellow(), "Stopping".yellow()),
                     NodeStatus::Errored => format!("{} {}", "●".red(), "Errored".red()),
-                    NodeStatus::UpgradeScheduled => {
-                        format!("{} {}", "●".cyan(), "Upgrade scheduled".cyan())
-                    }
                     NodeStatus::Evicted => format!("{} {}", "●".magenta(), "Evicted".magenta()),
-                };
-                let version_display = match &node.pending_version {
-                    Some(pending) => format!("{} → {}", node.version, pending),
-                    None => node.version.clone(),
                 };
                 println!(
                     "  {:<4} {:<14} {:<18} {}",
                     node.node_id.to_string().bold(),
                     node.name,
-                    version_display.dimmed(),
+                    node.version.dimmed(),
                     status_display
                 );
                 // Supplementary text explaining an eviction, plus how to clear it.
