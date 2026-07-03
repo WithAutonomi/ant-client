@@ -15,7 +15,8 @@ use crate::node::events::NodeEvent;
 use crate::node::process::spawn::spawn_node;
 use crate::node::registry::NodeRegistry;
 use crate::node::types::{
-    EvictionRecord, NodeConfig, NodeStarted, NodeStatus, NodeStopFailed, NodeStopped, StopNodeResult,
+    EvictionRecord, NodeConfig, NodeStarted, NodeStatus, NodeStopFailed, NodeStopped,
+    StopNodeResult,
 };
 
 /// How often the upgrade-detection task polls each running node's binary for a version change.
@@ -209,6 +210,10 @@ pub struct Supervisor {
     /// auto-upgrade, respawn for these nodes happen in the liveness monitor instead. A node
     /// leaves this set once this daemon (re)spawns it and owns a `monitor_node` for it.
     adopted: HashSet<u32>,
+    /// Nodes currently being evicted (stop + data-dir delete in progress). Checked and set under
+    /// the supervisor write lock, so it atomically excludes a concurrent `start_node` for the whole
+    /// stop/delete window — before which the persisted eviction marker is not yet visible.
+    evicting: HashSet<u32>,
 }
 
 struct NodeRuntime {
@@ -227,6 +232,7 @@ impl Supervisor {
             event_tx,
             node_states: HashMap::new(),
             adopted: HashSet::new(),
+            evicting: HashSet::new(),
         }
     }
 
@@ -234,6 +240,19 @@ impl Supervisor {
     /// backed by an owning `monitor_node` task in this daemon.
     pub fn is_adopted(&self, node_id: u32) -> bool {
         self.adopted.contains(&node_id)
+    }
+
+    /// Mark a node as under eviction so `start_node` refuses it for the whole stop/delete window.
+    /// Both this and the `start_node` check run under the supervisor write lock, so a concurrent
+    /// start can never slip in and spawn the node while its data directory is being deleted.
+    fn begin_evicting(&mut self, node_id: u32) {
+        self.evicting.insert(node_id);
+    }
+
+    /// Clear the eviction-in-progress flag (the persisted `eviction` marker keeps the node
+    /// unstartable afterwards).
+    fn finish_evicting(&mut self, node_id: u32) {
+        self.evicting.remove(&node_id);
     }
 
     /// Mark a node as owned by this daemon (i.e. it now has a `monitor_node` task). Clears
@@ -255,8 +274,10 @@ impl Supervisor {
         let node_id = config.id;
 
         // An evicted node's data directory has been deleted; it must not be restarted. Recovery is
-        // to dismiss it (remove from the registry) and add a fresh node.
-        if config.eviction.is_some() {
+        // to dismiss it (remove from the registry) and add a fresh node. The persisted marker covers
+        // the settled case; the in-progress `evicting` set (set under this same lock) covers the
+        // window where the delete is still running and the marker's config may not be visible yet.
+        if config.eviction.is_some() || self.evicting.contains(&node_id) {
             return Err(Error::NodeEvicted(node_id));
         }
 
@@ -712,7 +733,7 @@ pub fn spawn_upgrade_monitor(
 /// eviction, and (3) evicts the selected candidate on any partition that is at/below the threshold
 /// *and* still has at least two nodes (so a node remains to benefit). Eviction stops the process,
 /// deletes the data directory, records a persisted [`EvictionRecord`], and emits an event. It
-/// re-measures and may evict again — bounded by [`MAX_EVICTIONS_PER_CYCLE`] — because a single
+/// re-measures and may evict again — bounded by `MAX_EVICTIONS_PER_CYCLE` — because a single
 /// eviction may not free enough on a heavily over-provisioned partition.
 ///
 /// The task exits when `shutdown` is cancelled.
@@ -756,14 +777,18 @@ async fn run_eviction_cycle(
         // A partition needs an eviction when it is at/below the threshold and has a spare node to
         // sacrifice (≥2 nodes, so one remains). The sole-node case is deliberately left for the
         // health layer to surface as Critical rather than auto-evicting the only node.
-        let target = partitions.iter().find(|p| {
-            p.available_bytes <= thresholds.eviction_bytes && p.nodes.len() >= 2
-        });
+        let target = partitions
+            .iter()
+            .find(|p| p.available_bytes <= thresholds.eviction_bytes && p.nodes.len() >= 2);
 
         let Some(partition) = target else {
             // Nothing more to evict: publish the current health and finish this cycle.
-            publish_health(health, event_tx, FleetHealth::from_partitions(&partitions, thresholds))
-                .await;
+            publish_health(
+                health,
+                event_tx,
+                FleetHealth::from_partitions(&partitions, thresholds),
+            )
+            .await;
             return;
         };
 
@@ -771,13 +796,25 @@ async fn run_eviction_cycle(
             break;
         };
 
-        evict_node(registry, supervisor, event_tx, &candidate, partition.available_bytes).await;
+        evict_node(
+            registry,
+            supervisor,
+            event_tx,
+            &candidate,
+            partition.available_bytes,
+        )
+        .await;
     }
 
     // Reached the per-cycle eviction cap (or hit a candidate-less partition): refresh health so the
     // snapshot reflects reality before the next tick.
     let partitions = disk::partition_states(running_nodes(registry, supervisor).await);
-    publish_health(health, event_tx, FleetHealth::from_partitions(&partitions, thresholds)).await;
+    publish_health(
+        health,
+        event_tx,
+        FleetHealth::from_partitions(&partitions, thresholds),
+    )
+    .await;
 }
 
 /// Snapshot of currently-running, non-evicted nodes as `(id, data_dir)` pairs.
@@ -820,9 +857,35 @@ async fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Evict a single node: stop it, delete its data directory, persist the eviction marker, mark its
-/// runtime state, and emit an event. Best-effort — individual failures are logged but do not abort
-/// the wider cycle, since leaving a half-evicted node is worse than continuing.
+/// Write (or overwrite) a node's persisted eviction marker and save the registry.
+async fn persist_eviction_marker(
+    registry: &Arc<RwLock<NodeRegistry>>,
+    node_id: u32,
+    reason: &str,
+    evicted_at: u64,
+    reclaimed_bytes: u64,
+) {
+    let mut reg = registry.write().await;
+    if let Ok(config) = reg.get_mut(node_id) {
+        config.eviction = Some(EvictionRecord {
+            reason: reason.to_string(),
+            evicted_at,
+            reclaimed_bytes,
+        });
+    }
+    if let Err(e) = reg.save() {
+        tracing::error!("Eviction: failed to persist registry for node {node_id}: {e}");
+    }
+}
+
+/// Evict a single node: make it unstartable, stop it, delete its data directory, finalise the
+/// persisted marker, and emit an event.
+///
+/// Ordering matters for safety. The node is made unstartable *before* the stop/delete window — via
+/// the in-memory `evicting` flag (set under the supervisor lock, so it atomically excludes a
+/// concurrent `start_node`) and a persisted eviction marker (which also survives a daemon crash
+/// mid-delete). Only then do we stop and delete. Rollback is deliberately not attempted: once the
+/// process is stopped the node stays `Evicted` (terminal) whether or not the delete succeeds.
 async fn evict_node(
     registry: &Arc<RwLock<NodeRegistry>>,
     supervisor: &Arc<RwLock<Supervisor>>,
@@ -831,18 +894,28 @@ async fn evict_node(
     available_before: u64,
 ) {
     let node_id = candidate.node_id;
+    let reclaimable = candidate.size_bytes;
+    let evicted_at = now_unix_secs();
 
-    // 1. Stop the process. The monitor_node task sees the Stopping/Stopped transition and will not
-    //    respawn it.
+    // 1. Make the node unstartable up front (before we touch the process or its files).
+    supervisor.write().await.begin_evicting(node_id);
+    let pending_reason = format!(
+        "Automatically evicted to reclaim disk space: only {} free on its partition. \
+         Deleting its data directory to recover ~{}.",
+        fmt_bytes(available_before),
+        fmt_bytes(reclaimable),
+    );
+    persist_eviction_marker(registry, node_id, &pending_reason, evicted_at, reclaimable).await;
+
+    // 2. Stop the process (still marked Running, so this actually kills it). The monitor_node task
+    //    sees the Stopping/Stopped transition and will not respawn it.
     if let Err(e) = supervisor.write().await.stop_node(node_id).await {
         tracing::warn!("Eviction: failed to stop node {node_id} before deletion: {e}");
     }
 
-    // 2. Delete the data directory — this is what actually reclaims disk space. A just-killed node
-    //    can briefly hold its files open (LMDB memory map, and its own copied binary in the data
-    //    dir); on Windows `remove_dir_all` then fails with "access denied / in use" until the OS
-    //    releases those handles. Retry with backoff so the reclaim actually happens.
-    let reclaimed = candidate.size_bytes;
+    // 3. Delete the data directory — this reclaims the disk space. A just-killed node can briefly
+    //    hold its files open (LMDB memory map, its own copied binary); on Windows `remove_dir_all`
+    //    then fails until the OS releases the handles, so retry with backoff.
     let deleted = match remove_dir_all_with_retry(&candidate.data_dir).await {
         Ok(()) => true,
         Err(e) => {
@@ -854,48 +927,42 @@ async fn evict_node(
             false
         }
     };
-    let reclaimed_bytes = if deleted { reclaimed } else { 0 };
 
-    let reason = if deleted {
-        format!(
-            "Automatically evicted to reclaim disk space: only {} free on its partition. \
-             Its data directory was deleted, recovering ~{}.",
-            fmt_bytes(available_before),
-            fmt_bytes(reclaimed),
+    // 4. Finalise the marker to reflect what actually happened, flip runtime state to Evicted, and
+    //    clear the in-progress flag (the persisted marker keeps the node unstartable from here).
+    let (reclaimed_bytes, reason) = if deleted {
+        (
+            reclaimable,
+            format!(
+                "Automatically evicted to reclaim disk space: only {} free on its partition. \
+                 Its data directory was deleted, recovering ~{}.",
+                fmt_bytes(available_before),
+                fmt_bytes(reclaimable),
+            ),
         )
     } else {
-        format!(
-            "Automatically evicted due to low disk space (only {} free on its partition), but its \
-             data directory could not be deleted, so space was not reclaimed. Manual cleanup of {} \
-             may be needed.",
-            fmt_bytes(available_before),
-            candidate.data_dir.display(),
+        (
+            0,
+            format!(
+                "Automatically evicted due to low disk space (only {} free on its partition), but \
+                 its data directory could not be deleted, so space was not reclaimed. Manual \
+                 cleanup of {} may be needed.",
+                fmt_bytes(available_before),
+                candidate.data_dir.display(),
+            ),
         )
     };
-
-    // 3. Persist the eviction marker so the `Evicted` status survives daemon restarts.
+    persist_eviction_marker(registry, node_id, &reason, evicted_at, reclaimed_bytes).await;
     {
-        let mut reg = registry.write().await;
-        if let Ok(config) = reg.get_mut(node_id) {
-            config.eviction = Some(EvictionRecord {
-                reason: reason.clone(),
-                evicted_at: now_unix_secs(),
-                reclaimed_bytes,
-            });
-        }
-        if let Err(e) = reg.save() {
-            tracing::error!("Eviction: failed to persist registry after evicting node {node_id}: {e}");
-        }
+        let mut sup = supervisor.write().await;
+        sup.update_state(node_id, NodeStatus::Evicted, None);
+        sup.finish_evicting(node_id);
     }
 
-    // 4. Reflect the terminal state in the supervisor's runtime view (status queries also derive
-    //    Evicted from the marker, so this is belt-and-suspenders for any in-memory reader).
-    supervisor
-        .write()
-        .await
-        .update_state(node_id, NodeStatus::Evicted, None);
-
-    tracing::info!("Evicted node {node_id}, reclaimed ~{} ({reason})", fmt_bytes(reclaimed_bytes));
+    tracing::info!(
+        "Evicted node {node_id}, reclaimed ~{} ({reason})",
+        fmt_bytes(reclaimed_bytes)
+    );
     let _ = event_tx.send(NodeEvent::NodeEvicted {
         node_id,
         reason,
@@ -1517,6 +1584,47 @@ mod tests {
 
         // Idempotent: an already-gone path is treated as success (no error).
         remove_dir_all_with_retry(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_node_rejects_a_node_being_evicted() {
+        let (tx, _rx) = broadcast::channel(16);
+        let sup = Arc::new(RwLock::new(Supervisor::new(tx)));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = Arc::new(RwLock::new(
+            NodeRegistry::load(&tmp.path().join("reg.json")).unwrap(),
+        ));
+
+        let config = NodeConfig {
+            id: 7,
+            service_name: "node7".to_string(),
+            rewards_address: "0xabc".to_string(),
+            data_dir: tmp.path().join("node-7"),
+            log_dir: None,
+            node_port: None,
+            binary_path: "/bin/node".into(),
+            version: "0.1.0".to_string(),
+            env_variables: HashMap::new(),
+            bootstrap_peers: vec![],
+            upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
+            eviction: None,
+        };
+
+        // Flagged as evicting -> start is refused before any spawn attempt, closing the race with
+        // the concurrent stop/delete in evict_node.
+        sup.write().await.begin_evicting(7);
+        let res = sup
+            .write()
+            .await
+            .start_node(&config, sup.clone(), reg.clone())
+            .await;
+        assert!(matches!(res, Err(Error::NodeEvicted(7))));
+
+        // Clearing the flag removes the in-progress guard (the persisted marker takes over).
+        sup.write().await.finish_evicting(7);
+        assert!(!sup.read().await.evicting.contains(&7));
     }
 
     #[test]

@@ -117,7 +117,11 @@ fn print_fleet_health(health: &FleetHealth) {
     println!("  {} Fleet health: {}", dot, label);
 
     // Surface the reason(s) whenever the fleet is not fully healthy.
-    for check in health.checks.iter().filter(|c| c.level != HealthLevel::Green) {
+    for check in health
+        .checks
+        .iter()
+        .filter(|c| c.level != HealthLevel::Green)
+    {
         println!("    {} {}", "→".dimmed(), check.summary.dimmed());
     }
     println!();

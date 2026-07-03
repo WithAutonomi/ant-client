@@ -194,7 +194,7 @@ pub fn reset(registry_path: &Path) -> Result<ResetResult> {
 /// Get the status of all registered nodes without the daemon.
 ///
 /// Since the daemon is not running, nodes are reported as `Stopped` — except those carrying a
-/// persisted [`EvictionRecord`], which are reported as `Evicted` (the marker survives independently
+/// persisted [`EvictionRecord`](crate::node::types::EvictionRecord), which are reported as `Evicted` (the marker survives independently
 /// of the daemon).
 pub fn node_status_offline(registry_path: &Path) -> Result<NodeStatusResult> {
     let registry = NodeRegistry::load(registry_path)?;

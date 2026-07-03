@@ -71,11 +71,19 @@ impl PartitionState {
     }
 }
 
-/// Recursively sum the size of every regular file under `path`.
+/// Recursively sum the **allocated** disk usage of every regular file under `path`.
 ///
-/// Symlinks are not followed. Returns 0 if `path` does not exist. Best-effort: entries that cannot
-/// be read are skipped rather than aborting the walk, so a transient permission error on one file
-/// does not corrupt the eviction decision.
+/// Because eviction is automatic and destructive, this must reflect the space that deleting the tree
+/// would actually reclaim — not the logical file length. LMDB's `data.mdb` is a sparse file whose
+/// logical length is the (often multi-GiB) map size while its allocated blocks are only the bytes it
+/// really uses; ranking "smallest data dir" or reporting "reclaimed bytes" off `len()` would be
+/// badly wrong. On Unix we therefore use allocated blocks (`blocks() * 512`); elsewhere we fall back
+/// to logical length.
+///
+/// Symlinks are never followed: entries are examined with `symlink_metadata`, and a symlink is
+/// skipped entirely so the walk cannot escape the node's data directory and count unrelated data.
+/// Returns 0 if `path` does not exist. Best-effort: entries that cannot be read are skipped rather
+/// than aborting the walk, so a transient permission error does not corrupt the eviction decision.
 pub fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
@@ -85,20 +93,40 @@ pub fn dir_size(path: &Path) -> u64 {
             Err(_) => continue,
         };
         for entry in entries.flatten() {
-            // `symlink_metadata` does not traverse symlinks, so we never double-count or escape the
-            // tree via a link.
-            let meta = match entry.metadata() {
+            // `symlink_metadata` reports the entry itself, never the symlink target.
+            let meta = match std::fs::symlink_metadata(entry.path()) {
                 Ok(meta) => meta,
                 Err(_) => continue,
             };
-            if meta.is_dir() {
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                // Do not follow — recursing or counting through a link could escape the tree.
+                continue;
+            } else if file_type.is_dir() {
                 stack.push(entry.path());
-            } else if meta.is_file() {
-                total = total.saturating_add(meta.len());
+            } else if file_type.is_file() {
+                total = total.saturating_add(allocated_size(&meta));
             }
         }
     }
     total
+}
+
+/// Disk space a regular file actually occupies.
+///
+/// On Unix this is the allocated block count (`blocks() * 512`, per POSIX these are always 512-byte
+/// units regardless of filesystem block size), which correctly reflects sparse files. On other
+/// platforms std exposes no allocated size, so we fall back to the logical length.
+fn allocated_size(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
 }
 
 /// Free bytes on the partition hosting `path` (or its nearest existing ancestor).
@@ -223,16 +251,61 @@ mod tests {
     #[test]
     fn dir_size_sums_nested_files() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("a.bin"), vec![0u8; 1000]).unwrap();
+        // Non-zero bytes so no filesystem can silently hole-punch them away.
+        std::fs::write(tmp.path().join("a.bin"), vec![1u8; 1000]).unwrap();
         let sub = tmp.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
-        std::fs::write(sub.join("b.bin"), vec![0u8; 2500]).unwrap();
-        assert_eq!(dir_size(tmp.path()), 3500);
+        std::fs::write(sub.join("b.bin"), vec![1u8; 2500]).unwrap();
+        // dir_size reports allocated blocks, which for fully-written files is at least the logical
+        // 3500 bytes (block-rounded upward).
+        assert!(dir_size(tmp.path()) >= 3500);
     }
 
     #[test]
     fn dir_size_zero_for_missing_path() {
         assert_eq!(dir_size(Path::new("/nonexistent/path/xyz")), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_size_does_not_follow_symlinks() {
+        // A node data dir containing a symlink to a large external file must not have that file's
+        // size counted — following it could escape the tree and count unrelated data.
+        let tmp = tempfile::tempdir().unwrap();
+        let node_dir = tmp.path().join("node");
+        std::fs::create_dir(&node_dir).unwrap();
+        std::fs::write(node_dir.join("real.bin"), vec![1u8; 4000]).unwrap();
+
+        let external = tmp.path().join("external_big.bin");
+        std::fs::write(&external, vec![1u8; 5_000_000]).unwrap();
+        std::os::unix::fs::symlink(&external, node_dir.join("link")).unwrap();
+
+        // Only real.bin is counted; the 5 MB symlink target is not.
+        let size = dir_size(&node_dir);
+        assert!(size > 0);
+        assert!(size < 1_000_000, "symlink target was followed: {size}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_size_uses_allocated_not_logical_size() {
+        use std::io::Write;
+        // A sparse file (LMDB's data.mdb behaves this way): 20 MiB logical, ~0 allocated.
+        let tmp = tempfile::tempdir().unwrap();
+        let f = std::fs::File::create(tmp.path().join("sparse.mdb")).unwrap();
+        f.set_len(20 * 1024 * 1024).unwrap();
+        drop(f);
+        // Also a small fully-written file so the dir isn't empty.
+        let mut real = std::fs::File::create(tmp.path().join("real.bin")).unwrap();
+        real.write_all(&[1u8; 2000]).unwrap();
+        drop(real);
+
+        // Allocated usage is far below the 20 MiB logical size of the sparse file.
+        let size = dir_size(tmp.path());
+        assert!(
+            size < 1024 * 1024,
+            "expected allocated size well under 1 MiB, got {size}"
+        );
     }
 
     #[test]
@@ -243,8 +316,9 @@ mod tests {
         let d2 = tmp.path().join("node-2");
         std::fs::create_dir_all(&d1).unwrap();
         std::fs::create_dir_all(&d2).unwrap();
-        std::fs::write(d1.join("data"), vec![0u8; 4000]).unwrap();
-        std::fs::write(d2.join("data"), vec![0u8; 1000]).unwrap();
+        // Clearly different allocated sizes (non-zero bytes) so selection is by size, not tie-break.
+        std::fs::write(d1.join("data"), vec![1u8; 200_000]).unwrap();
+        std::fs::write(d2.join("data"), vec![1u8; 1000]).unwrap();
 
         let states = partition_states(vec![(1, d1), (2, d2)]);
         assert_eq!(states.len(), 1, "co-located nodes share one partition");

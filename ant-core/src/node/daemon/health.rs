@@ -197,7 +197,11 @@ fn disk_space_check(p: &PartitionState, thresholds: &DiskThresholds) -> HealthCh
     } else {
         (
             HealthLevel::Green,
-            format!("Disk space healthy on {}: {} free.", p.partition, fmt_bytes(available)),
+            format!(
+                "Disk space healthy on {}: {} free.",
+                p.partition,
+                fmt_bytes(available)
+            ),
         )
     };
 
