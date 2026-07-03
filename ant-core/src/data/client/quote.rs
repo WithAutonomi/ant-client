@@ -2433,6 +2433,36 @@ mod tests {
         }
     }
 
+    /// Build a VALIDLY-SIGNED `StorageCommitment` bound to `kp`'s peer id, so a
+    /// test can pass peer-binding + signature and isolate the `hash == pin` and
+    /// `count == key_count` sub-checks. Mirrors ant-node's commitment signing:
+    /// the canonical payload (`root || key_count(LE) || peer_id || pk_len(LE) ||
+    /// pub_key`) signed under `DOMAIN_COMMITMENT`.
+    fn signed_commitment(kp: &Keypair, root: [u8; 32], key_count: u32) -> StorageCommitment {
+        use ant_protocol::payment::commitment::DOMAIN_COMMITMENT;
+        use ant_protocol::pqc::api::{ml_dsa_65, MlDsaSecretKey as ApiSecretKey, MlDsaVariant};
+        let peer = compute_address(&kp.pub_key_bytes);
+        let mut payload = Vec::with_capacity(32 + 4 + 32 + 4 + kp.pub_key_bytes.len());
+        payload.extend_from_slice(&root);
+        payload.extend_from_slice(&key_count.to_le_bytes());
+        payload.extend_from_slice(&peer);
+        payload.extend_from_slice(&(kp.pub_key_bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&kp.pub_key_bytes);
+        let sk = ApiSecretKey::from_bytes(MlDsaVariant::MlDsa65, &kp.secret_key_bytes)
+            .expect("api secret key");
+        let signature = ml_dsa_65()
+            .sign_with_context(&sk, &payload, DOMAIN_COMMITMENT)
+            .expect("sign commitment")
+            .to_bytes();
+        StorageCommitment {
+            root,
+            key_count,
+            sender_peer_id: peer,
+            sender_public_key: kp.pub_key_bytes.clone(),
+            signature,
+        }
+    }
+
     #[test]
     fn binding_baseline_ok_only_at_baseline_price() {
         // (0, None) priced at calculate_price(0) is the valid baseline.
@@ -2485,7 +2515,7 @@ mod tests {
     }
 
     #[test]
-    fn binding_rejects_garbage_and_wrong_pin_commitment() {
+    fn binding_rejects_unparseable_and_peer_unbound_commitment() {
         // A bound quote whose shipped commitment is garbage (doesn't even
         // deserialize) is rejected — the client never pays an unresolvable pin.
         let q = quote_with_binding(500, Some([9u8; 32]), calculate_price(500));
@@ -2494,10 +2524,11 @@ mod tests {
             "an unparseable commitment must be rejected before payment"
         );
 
-        // A well-formed-but-wrong commitment (valid StorageCommitment bytes that
-        // do NOT hash to the quote's pin / aren't bound to the peer) is also
-        // rejected. We serialize a real StorageCommitment shape with mismatched
-        // fields; it fails peer-binding first, then would fail hash==pin.
+        // A well-formed StorageCommitment that is NOT bound to the quoting peer
+        // (its sender_peer_id / pubkey don't derive the peer id) is rejected at
+        // the peer-binding check. The signature / hash==pin / count==key_count
+        // sub-checks are covered by the dedicated tests below, which pass
+        // peer-binding first so each isolates exactly one sub-check.
         let bogus = StorageCommitment {
             root: [1u8; 32],
             key_count: 500,
@@ -2509,6 +2540,59 @@ mod tests {
         assert!(
             quote_commitment_binding_is_valid(&any_peer(), &q, &Some(blob)).is_err(),
             "a commitment not bound to the quoting peer must be rejected before payment"
+        );
+    }
+
+    #[test]
+    fn binding_rejects_commitment_with_invalid_signature() {
+        // Correctly-bound commitment (passes peer-binding) but with a corrupted
+        // signature: must be rejected at the signature check. Deleting that check
+        // would let a peer attest any (root, key_count) without holding the key.
+        let kp = gen_keypair();
+        let mut commitment = signed_commitment(&kp, [6u8; 32], 500);
+        commitment.signature[0] ^= 0xFF; // still 3293 bytes, no longer valid
+        // Pin the (corrupted) commitment so the hash==pin check would pass; the
+        // only thing wrong is the signature, isolating that sub-check.
+        let pin = commitment_hash(&commitment).expect("hash");
+        let blob = rmp_serde::to_vec(&commitment).expect("serialize commitment");
+        let q = quote_with_binding(500, Some(pin), calculate_price(500));
+        let res = quote_commitment_binding_is_valid(&kp.peer_id, &q, &Some(blob));
+        let err = res.expect_err("commitment with an invalid signature must be rejected");
+        assert!(err.contains("signature"), "should fail at the signature check: {err}");
+    }
+
+    #[test]
+    fn binding_rejects_commitment_that_does_not_hash_to_pin() {
+        // Validly-signed, correctly-bound commitment, but the quote pins a
+        // DIFFERENT hash: must be rejected. Deleting the hash==pin check would
+        // let a peer ship any commitment it holds for a pin it doesn't back.
+        let kp = gen_keypair();
+        let commitment = signed_commitment(&kp, [5u8; 32], 500);
+        let wrong_pin = [0xAB; 32];
+        assert_ne!(commitment_hash(&commitment), Some(wrong_pin));
+        let blob = rmp_serde::to_vec(&commitment).expect("serialize commitment");
+        let q = quote_with_binding(500, Some(wrong_pin), calculate_price(500));
+        let res = quote_commitment_binding_is_valid(&kp.peer_id, &q, &Some(blob));
+        let err = res.expect_err("commitment that does not hash to the pin must be rejected");
+        assert!(err.contains("hash"), "should fail at the hash==pin check: {err}");
+    }
+
+    #[test]
+    fn binding_rejects_count_disagreeing_with_commitment() {
+        // Validly-signed, correctly-bound, correctly-pinned commitment attesting
+        // key_count=400, but the quote claims 500 (priced on-curve for 500):
+        // must be rejected. Deleting the count==key_count check would let a peer
+        // price against an inflated count while committing to fewer keys.
+        let kp = gen_keypair();
+        let commitment = signed_commitment(&kp, [7u8; 32], 400);
+        let pin = commitment_hash(&commitment).expect("hash");
+        let blob = rmp_serde::to_vec(&commitment).expect("serialize commitment");
+        let q = quote_with_binding(500, Some(pin), calculate_price(500));
+        let res = quote_commitment_binding_is_valid(&kp.peer_id, &q, &Some(blob));
+        let err = res.expect_err("a quote count disagreeing with the commitment must be rejected");
+        assert!(
+            err.contains("key_count") || err.contains("attests"),
+            "should fail at the count==key_count check: {err}"
         );
     }
 

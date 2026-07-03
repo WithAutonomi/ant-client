@@ -45,7 +45,7 @@ async fn adr0004_bound_quotes_are_shipped_priced_and_resolve() {
     let client = Client::from_node(Arc::clone(&node), test_client_config())
         .with_wallet(testnet.wallet().clone());
 
-    let content = Bytes::from("adr-0003 bound-quote payload");
+    let content = Bytes::from("adr-0004 bound-quote payload");
     let address = compute_address(&content);
 
     // Collect quotes directly so we can inspect the ADR-0004 binding the client
@@ -147,7 +147,7 @@ async fn adr0004_baseline_quotes_still_work() {
     let client = Client::from_node(Arc::clone(&node), test_client_config())
         .with_wallet(testnet.wallet().clone());
 
-    let content = Bytes::from("adr-0003 baseline payload");
+    let content = Bytes::from("adr-0004 baseline payload");
     let address = compute_address(&content);
 
     let quotes = client
