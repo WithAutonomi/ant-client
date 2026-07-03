@@ -2551,14 +2551,17 @@ mod tests {
         let kp = gen_keypair();
         let mut commitment = signed_commitment(&kp, [6u8; 32], 500);
         commitment.signature[0] ^= 0xFF; // still 3293 bytes, no longer valid
-        // Pin the (corrupted) commitment so the hash==pin check would pass; the
-        // only thing wrong is the signature, isolating that sub-check.
+                                         // Pin the (corrupted) commitment so the hash==pin check would pass; the
+                                         // only thing wrong is the signature, isolating that sub-check.
         let pin = commitment_hash(&commitment).expect("hash");
         let blob = rmp_serde::to_vec(&commitment).expect("serialize commitment");
         let q = quote_with_binding(500, Some(pin), calculate_price(500));
         let res = quote_commitment_binding_is_valid(&kp.peer_id, &q, &Some(blob));
         let err = res.expect_err("commitment with an invalid signature must be rejected");
-        assert!(err.contains("signature"), "should fail at the signature check: {err}");
+        assert!(
+            err.contains("signature"),
+            "should fail at the signature check: {err}"
+        );
     }
 
     #[test]
@@ -2574,7 +2577,10 @@ mod tests {
         let q = quote_with_binding(500, Some(wrong_pin), calculate_price(500));
         let res = quote_commitment_binding_is_valid(&kp.peer_id, &q, &Some(blob));
         let err = res.expect_err("commitment that does not hash to the pin must be rejected");
-        assert!(err.contains("hash"), "should fail at the hash==pin check: {err}");
+        assert!(
+            err.contains("hash"),
+            "should fail at the hash==pin check: {err}"
+        );
     }
 
     #[test]
