@@ -15,9 +15,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
 use crate::node::binary::NoopProgress;
+use crate::node::daemon::health::{DiskThresholds, FleetHealth};
 use crate::node::daemon::supervisor::{
-    spawn_liveness_monitor, spawn_upgrade_monitor, Supervisor, LIVENESS_POLL_INTERVAL,
-    UPGRADE_POLL_INTERVAL,
+    spawn_eviction_monitor, spawn_liveness_monitor, spawn_upgrade_monitor, Supervisor,
+    EVICTION_POLL_INTERVAL, LIVENESS_POLL_INTERVAL, UPGRADE_POLL_INTERVAL,
 };
 use crate::node::events::NodeEvent;
 use crate::node::registry::NodeRegistry;
@@ -36,6 +37,9 @@ pub struct AppState {
     pub config: DaemonConfig,
     /// The actual address the server bound to (resolves port 0 to real port).
     pub bound_port: u16,
+    /// Latest fleet health snapshot, refreshed by the eviction monitor and served at
+    /// `GET /api/v1/health`.
+    pub health: Arc<RwLock<FleetHealth>>,
 }
 
 /// Start the daemon HTTP server.
@@ -82,6 +86,8 @@ pub async fn start(
         }
     }
 
+    let health = Arc::new(RwLock::new(FleetHealth::healthy()));
+
     let state = Arc::new(AppState {
         registry: registry.clone(),
         supervisor: supervisor.clone(),
@@ -89,6 +95,7 @@ pub async fn start(
         start_time: Instant::now(),
         config: config.clone(),
         bound_port: bound_addr.port(),
+        health: health.clone(),
     });
 
     // Background task: probe each Running node's on-disk binary for version drift caused by
@@ -98,6 +105,20 @@ pub async fn start(
         registry.clone(),
         supervisor.clone(),
         UPGRADE_POLL_INTERVAL,
+        shutdown.clone(),
+    );
+
+    // Background task: monitor free disk space at node data directories. Refreshes the fleet health
+    // snapshot every tick and auto-evicts a node (smallest data dir) on any partition that has
+    // fallen to the eviction threshold while ≥2 nodes remain. The threshold is a fixed internal
+    // constant (mirroring ant-node's own refuse-to-store reserve), not user-configurable.
+    spawn_eviction_monitor(
+        registry.clone(),
+        supervisor.clone(),
+        event_tx.clone(),
+        health,
+        DiskThresholds::default(),
+        EVICTION_POLL_INTERVAL,
         shutdown.clone(),
     );
 
@@ -151,6 +172,7 @@ fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/console", get(get_console))
         .route("/api/v1/status", get(get_status))
+        .route("/api/v1/health", get(get_health))
         .route("/api/v1/events", get(get_events))
         .route("/api/v1/nodes/status", get(get_nodes_status))
         .route("/api/v1/nodes", post(post_nodes))
@@ -183,6 +205,13 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<DaemonStatus> {
         nodes_stopped: stopped,
         nodes_errored: errored,
     })
+}
+
+/// GET /api/v1/health — Current fleet health (overall level + per-check findings).
+///
+/// Refreshed by the eviction monitor; reflects disk pressure and the next eviction candidate.
+async fn get_health(State(state): State<Arc<AppState>>) -> Json<FleetHealth> {
+    Json(state.health.read().await.clone())
 }
 
 async fn get_events(
@@ -218,9 +247,15 @@ async fn get_nodes_status(State(state): State<Arc<AppState>>) -> Json<NodeStatus
     let mut total_stopped = 0u32;
 
     for config in registry.list() {
-        let status = supervisor
-            .node_status(config.id)
-            .unwrap_or(NodeStatus::Stopped);
+        // An evicted node has no live process: its persisted marker takes precedence over any
+        // runtime status the supervisor might still report.
+        let status = if config.eviction.is_some() {
+            NodeStatus::Evicted
+        } else {
+            supervisor
+                .node_status(config.id)
+                .unwrap_or(NodeStatus::Stopped)
+        };
 
         match status {
             NodeStatus::Running | NodeStatus::Starting | NodeStatus::UpgradeScheduled => {
@@ -229,9 +264,15 @@ async fn get_nodes_status(State(state): State<Arc<AppState>>) -> Json<NodeStatus
             _ => total_stopped += 1,
         }
 
-        let pid = supervisor.node_pid(config.id);
-        let uptime_secs = supervisor.node_uptime_secs(config.id);
-        let pending_version = supervisor.node_pending_version(config.id);
+        let (pid, uptime_secs, pending_version) = if config.eviction.is_some() {
+            (None, None, None)
+        } else {
+            (
+                supervisor.node_pid(config.id),
+                supervisor.node_uptime_secs(config.id),
+                supervisor.node_pending_version(config.id),
+            )
+        };
 
         nodes.push(NodeStatusSummary {
             node_id: config.id,
@@ -241,6 +282,7 @@ async fn get_nodes_status(State(state): State<Arc<AppState>>) -> Json<NodeStatus
             pid,
             uptime_secs,
             pending_version,
+            eviction: config.eviction.clone(),
         });
     }
 
@@ -268,10 +310,17 @@ async fn get_node_detail(
     };
 
     let supervisor = state.supervisor.read().await;
-    let status = supervisor.node_status(id).unwrap_or(NodeStatus::Stopped);
-    let pid = supervisor.node_pid(id);
-    let uptime_secs = supervisor.node_uptime_secs(id);
-    let pending_version = supervisor.node_pending_version(id);
+    // A persisted eviction marker takes precedence over any runtime status.
+    let (status, pid, uptime_secs, pending_version) = if config.eviction.is_some() {
+        (NodeStatus::Evicted, None, None, None)
+    } else {
+        (
+            supervisor.node_status(id).unwrap_or(NodeStatus::Stopped),
+            supervisor.node_pid(id),
+            supervisor.node_uptime_secs(id),
+            supervisor.node_pending_version(id),
+        )
+    };
 
     Ok(Json(NodeInfo {
         config,
@@ -363,6 +412,21 @@ async fn post_start_node(
     };
     drop(registry);
 
+    // An evicted node's data directory is gone; refuse to start it (recovery is to dismiss and
+    // re-add, not restart).
+    if config.eviction.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Node {id} has been evicted and cannot be started. Dismiss it with \
+                     `ant node dismiss {id}` and add a new node instead."
+                ),
+                "current_state": { "node_id": id, "status": "evicted" }
+            })),
+        ));
+    }
+
     let supervisor_ref = state.supervisor.clone();
 
     // Acquire write lock once for atomic check-and-act (avoids TOCTOU race)
@@ -416,7 +480,14 @@ async fn post_start_node(
 /// POST /api/v1/nodes/start-all — Start all registered nodes.
 async fn post_start_all(State(state): State<Arc<AppState>>) -> Json<StartNodeResult> {
     let registry = state.registry.read().await;
-    let configs: Vec<_> = registry.list().into_iter().cloned().collect();
+    // Evicted nodes have no data directory; skip them silently rather than attempting a spawn that
+    // would fail. They remain visible as `Evicted` in status until dismissed.
+    let configs: Vec<_> = registry
+        .list()
+        .into_iter()
+        .filter(|c| c.eviction.is_none())
+        .cloned()
+        .collect();
     drop(registry);
 
     let mut started = Vec::new();
@@ -475,6 +546,20 @@ async fn post_stop_node(
     };
     drop(registry);
 
+    // An evicted node is already stopped and its data directory deleted; there is nothing to stop.
+    if config.eviction.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Node {id} has been evicted; there is nothing to stop. Dismiss it with \
+                     `ant node dismiss {id}`."
+                ),
+                "current_state": { "node_id": id, "status": "evicted" }
+            })),
+        ));
+    }
+
     // Acquire write lock once for atomic check-and-act (avoids TOCTOU race)
     let mut supervisor = state.supervisor.write().await;
     if !supervisor.is_running(id) {
@@ -523,9 +608,11 @@ async fn post_stop_node(
 /// POST /api/v1/nodes/stop-all — Stop all running nodes.
 async fn post_stop_all(State(state): State<Arc<AppState>>) -> Json<StopNodeResult> {
     let registry = state.registry.read().await;
+    // Skip evicted nodes — there is nothing to stop, and they should stay `Evicted` until dismissed.
     let configs: Vec<(u32, String)> = registry
         .list()
         .into_iter()
+        .filter(|c| c.eviction.is_none())
         .map(|c| (c.id, c.service_name.clone()))
         .collect();
     drop(registry);
@@ -878,6 +965,7 @@ mod tests {
             bootstrap_peers: vec![],
             upgrade_channel: None,
             evm_network: EvmNetwork::default(),
+            eviction: None,
         }
     }
 

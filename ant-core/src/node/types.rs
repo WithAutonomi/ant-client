@@ -74,6 +74,28 @@ pub enum NodeStatus {
     /// yet restarted. The supervisor is waiting for the current process to exit and will then
     /// respawn it against the new binary.
     UpgradeScheduled,
+    /// The daemon automatically stopped this node and deleted its data directory to reclaim disk
+    /// space for the remaining nodes. This is a terminal state derived from a persisted
+    /// [`EvictionRecord`] on the node's config — it survives daemon restarts and is cleared only
+    /// when the user dismisses the node (which removes it from the registry entirely).
+    Evicted,
+}
+
+/// Record of an automatic eviction, persisted on a node's [`NodeConfig`] so that the `evicted`
+/// state survives daemon restarts.
+///
+/// [`NodeStatus`] is otherwise runtime-only (rebuilt from process scans on startup), so the
+/// presence of this record — not live process state — is what makes a node report as
+/// [`NodeStatus::Evicted`]. Eviction deletes the node's data directory but keeps the registry
+/// entry until the user dismisses it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct EvictionRecord {
+    /// Human-readable explanation of why the node was evicted (shown to the user).
+    pub reason: String,
+    /// Unix epoch seconds at which the eviction occurred.
+    pub evicted_at: u64,
+    /// Approximate number of bytes reclaimed by deleting the node's data directory.
+    pub reclaimed_bytes: u64,
 }
 
 /// Persisted configuration for a single node.
@@ -98,6 +120,12 @@ pub struct NodeConfig {
     /// EVM network the node uses for storage payments.
     #[serde(default)]
     pub evm_network: EvmNetwork,
+    /// Set when the daemon has automatically evicted this node to reclaim disk space. Its presence
+    /// makes the node report as [`NodeStatus::Evicted`] regardless of runtime state, and persists
+    /// across daemon restarts. `None` for normal nodes. Backwards compatible: defaults to `None`
+    /// when absent from an older registry file.
+    #[serde(default)]
+    pub eviction: Option<EvictionRecord>,
 }
 
 /// Runtime information for a running node (held in daemon memory only).
@@ -424,6 +452,10 @@ pub struct NodeStatusSummary {
     /// binary reports. Omitted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_version: Option<String>,
+    /// Set only when `status == Evicted`: details of why/when the node was evicted, so the CLI and
+    /// GUI can show supplementary text. Omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eviction: Option<EvictionRecord>,
 }
 
 /// Result of querying node status across all registered nodes.
@@ -481,6 +513,59 @@ mod tests {
     }
 
     #[test]
+    fn node_status_evicted_serializes() {
+        let json = serde_json::to_string(&NodeStatus::Evicted).unwrap();
+        assert_eq!(json, "\"evicted\"");
+        let parsed: NodeStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, NodeStatus::Evicted);
+    }
+
+    #[test]
+    fn node_config_eviction_defaults_to_none_for_old_registry() {
+        // A registry entry written before the eviction field existed must still deserialize.
+        let legacy = r#"{
+            "id": 1,
+            "service_name": "antnode-1",
+            "rewards_address": "0xabc",
+            "data_dir": "/data/node-1",
+            "log_dir": null,
+            "node_port": null,
+            "metrics_port": null,
+            "network_id": 1,
+            "binary_path": "/bin/antnode",
+            "version": "0.1.0",
+            "env_variables": {},
+            "bootstrap_peers": []
+        }"#;
+        let config: NodeConfig = serde_json::from_str(legacy).unwrap();
+        assert!(config.eviction.is_none());
+        assert!(config.upgrade_channel.is_none());
+    }
+
+    #[test]
+    fn eviction_record_roundtrips_on_summary() {
+        let summary = NodeStatusSummary {
+            node_id: 3,
+            name: "antnode-3".to_string(),
+            version: "0.1.0".to_string(),
+            status: NodeStatus::Evicted,
+            pid: None,
+            uptime_secs: None,
+            pending_version: None,
+            eviction: Some(EvictionRecord {
+                reason: "Low disk: 480 MiB free, evicting smallest node".to_string(),
+                evicted_at: 1_700_000_000,
+                reclaimed_bytes: 2_147_483_648,
+            }),
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"status\":\"evicted\""));
+        assert!(json.contains("\"reclaimed_bytes\":2147483648"));
+        let parsed: NodeStatusSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.eviction.unwrap().evicted_at, 1_700_000_000);
+    }
+
+    #[test]
     fn node_status_summary_with_pending_version() {
         let summary = NodeStatusSummary {
             node_id: 7,
@@ -490,6 +575,7 @@ mod tests {
             pid: Some(4242),
             uptime_secs: Some(3600),
             pending_version: Some("0.10.11-rc.1".to_string()),
+            eviction: None,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"status\":\"upgrade_scheduled\""));
@@ -580,6 +666,7 @@ mod tests {
                     pid: Some(1234),
                     uptime_secs: Some(60),
                     pending_version: None,
+                    eviction: None,
                 },
                 NodeStatusSummary {
                     node_id: 2,
@@ -589,6 +676,7 @@ mod tests {
                     pid: None,
                     uptime_secs: None,
                     pending_version: None,
+                    eviction: None,
                 },
             ],
             total_running: 1,
@@ -614,6 +702,7 @@ mod tests {
             pid: Some(5678),
             uptime_secs: Some(120),
             pending_version: None,
+            eviction: None,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"node_id\":1"));
@@ -633,6 +722,7 @@ mod tests {
             pid: None,
             uptime_secs: None,
             pending_version: None,
+            eviction: None,
         };
         let json_stopped = serde_json::to_string(&stopped).unwrap();
         assert!(!json_stopped.contains("pid"));

@@ -2,10 +2,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
+use crate::node::daemon::health::FleetHealth;
 use crate::node::process::detach;
 use crate::node::types::{
     DaemonConfig, DaemonInfo, DaemonStartResult, DaemonStatus, DaemonStopResult, NodeStarted,
-    NodeStatusResult, NodeStopped, StartNodeResult, StopNodeResult,
+    NodeStatusResult, NodeStopped, RemoveNodeResult, StartNodeResult, StopNodeResult,
 };
 
 /// Get the daemon's current status by querying its REST API.
@@ -196,6 +197,49 @@ pub async fn stop_node(config: &DaemonConfig, node_id: u32) -> Result<NodeStoppe
 
     if resp.status().is_success() {
         resp.json::<NodeStopped>()
+            .await
+            .map_err(|e| Error::HttpRequest(e.to_string()))
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(Error::HttpRequest(body))
+    }
+}
+
+/// Dismiss a node — remove it from the registry — via the daemon REST API.
+///
+/// Intended for evicted nodes (whose data directory has already been deleted), but the daemon will
+/// remove any non-running node. Running nodes are rejected with a conflict error.
+pub async fn dismiss_node(config: &DaemonConfig, node_id: u32) -> Result<RemoveNodeResult> {
+    let port = read_port_file(&config.port_file_path).ok_or(Error::DaemonNotRunning)?;
+
+    let url = format!("http://127.0.0.1:{port}/api/v1/nodes/{node_id}");
+    let resp = reqwest::Client::new()
+        .delete(&url)
+        .send()
+        .await
+        .map_err(|e| Error::HttpRequest(e.to_string()))?;
+
+    if resp.status().is_success() {
+        resp.json::<RemoveNodeResult>()
+            .await
+            .map_err(|e| Error::HttpRequest(e.to_string()))
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(Error::HttpRequest(body))
+    }
+}
+
+/// Get the current fleet health snapshot via the daemon REST API.
+pub async fn fleet_health(config: &DaemonConfig) -> Result<FleetHealth> {
+    let port = read_port_file(&config.port_file_path).ok_or(Error::DaemonNotRunning)?;
+
+    let url = format!("http://127.0.0.1:{port}/api/v1/health");
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| Error::HttpRequest(e.to_string()))?;
+
+    if resp.status().is_success() {
+        resp.json::<FleetHealth>()
             .await
             .map_err(|e| Error::HttpRequest(e.to_string()))
     } else {

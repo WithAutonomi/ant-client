@@ -98,6 +98,7 @@ pub async fn add_nodes(
             bootstrap_peers: opts.bootstrap_peers.clone(),
             upgrade_channel: opts.upgrade_channel,
             evm_network: opts.evm_network,
+            eviction: None,
         };
 
         let assigned_id = registry.add(config);
@@ -192,20 +193,30 @@ pub fn reset(registry_path: &Path) -> Result<ResetResult> {
 
 /// Get the status of all registered nodes without the daemon.
 ///
-/// Since the daemon is not running, all nodes are reported as `Stopped`.
+/// Since the daemon is not running, nodes are reported as `Stopped` — except those carrying a
+/// persisted [`EvictionRecord`](crate::node::types::EvictionRecord), which are reported as `Evicted` (the marker survives independently
+/// of the daemon).
 pub fn node_status_offline(registry_path: &Path) -> Result<NodeStatusResult> {
     let registry = NodeRegistry::load(registry_path)?;
     let nodes: Vec<NodeStatusSummary> = registry
         .list()
         .iter()
-        .map(|config| NodeStatusSummary {
-            node_id: config.id,
-            name: config.service_name.clone(),
-            version: config.version.clone(),
-            status: NodeStatus::Stopped,
-            pid: None,
-            uptime_secs: None,
-            pending_version: None,
+        .map(|config| {
+            let status = if config.eviction.is_some() {
+                NodeStatus::Evicted
+            } else {
+                NodeStatus::Stopped
+            };
+            NodeStatusSummary {
+                node_id: config.id,
+                name: config.service_name.clone(),
+                version: config.version.clone(),
+                status,
+                pid: None,
+                uptime_secs: None,
+                pending_version: None,
+                eviction: config.eviction.clone(),
+            }
         })
         .collect();
     let total_stopped = nodes.len() as u32;
@@ -484,6 +495,7 @@ mod tests {
             bootstrap_peers: vec![],
             upgrade_channel: None,
             evm_network: EvmNetwork::default(),
+            eviction: None,
         });
         registry.save().unwrap();
         drop(_lock);
@@ -568,6 +580,7 @@ mod tests {
             bootstrap_peers: vec![],
             upgrade_channel: None,
             evm_network: EvmNetwork::default(),
+            eviction: None,
         });
         registry.add(NodeConfig {
             id: 0,
@@ -582,6 +595,7 @@ mod tests {
             bootstrap_peers: vec![],
             upgrade_channel: None,
             evm_network: EvmNetwork::default(),
+            eviction: None,
         });
         registry.save().unwrap();
         drop(_lock);
@@ -604,6 +618,47 @@ mod tests {
         assert!(result.nodes.is_empty());
         assert_eq!(result.total_running, 0);
         assert_eq!(result.total_stopped, 0);
+    }
+
+    #[test]
+    fn node_status_offline_reports_evicted_from_marker() {
+        use crate::node::types::EvictionRecord;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = test_registry_path(tmp.path());
+
+        let (mut registry, _lock) = NodeRegistry::load_locked(&reg_path).unwrap();
+        registry.add(NodeConfig {
+            id: 0,
+            service_name: String::new(),
+            rewards_address: "0xtest".to_string(),
+            data_dir: PathBuf::from("/tmp/test-evicted"),
+            log_dir: None,
+            node_port: None,
+            binary_path: PathBuf::from("/usr/bin/antnode"),
+            version: "0.110.0".to_string(),
+            env_variables: HashMap::new(),
+            bootstrap_peers: vec![],
+            upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
+            eviction: Some(EvictionRecord {
+                reason: "Low disk space".to_string(),
+                evicted_at: 1_700_000_000,
+                reclaimed_bytes: 1_000_000,
+            }),
+        });
+        registry.save().unwrap();
+        drop(_lock);
+
+        let result = node_status_offline(&reg_path).unwrap();
+        assert_eq!(result.nodes.len(), 1);
+        // The persisted marker makes the node report as Evicted even with the daemon down,
+        // and carries its supplementary reason text through to the summary.
+        assert_eq!(result.nodes[0].status, NodeStatus::Evicted);
+        assert_eq!(
+            result.nodes[0].eviction.as_ref().unwrap().reason,
+            "Low disk space"
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod add;
 pub mod daemon;
+pub mod dismiss;
 pub mod reset;
 pub mod start;
 pub mod status;
@@ -9,6 +10,7 @@ use clap::Subcommand;
 
 use crate::commands::node::add::AddArgs;
 use crate::commands::node::daemon::DaemonCommand;
+use crate::commands::node::dismiss::DismissArgs;
 use crate::commands::node::reset::ResetArgs;
 use crate::commands::node::start::StartArgs;
 use crate::commands::node::status::StatusArgs;
@@ -23,6 +25,8 @@ pub enum NodeCommand {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    /// Dismiss an evicted node, removing it from the registry/list
+    Dismiss(DismissArgs),
     /// Reset all node state (removes all data, logs, and clears the registry)
     Reset(ResetArgs),
     /// Start node(s). With no arguments starts all nodes; use --service-name for a specific node.

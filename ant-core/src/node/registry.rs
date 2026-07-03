@@ -150,6 +150,7 @@ mod tests {
             bootstrap_peers: vec![],
             upgrade_channel: None,
             evm_network: EvmNetwork::default(),
+            eviction: None,
         }
     }
 
@@ -171,6 +172,48 @@ mod tests {
         let id = reg.add(make_config(0));
         assert_eq!(id, 1);
         assert_eq!(reg.get(id).unwrap().rewards_address, "0xtest");
+    }
+
+    #[test]
+    fn loads_pre_upgrade_registry_file() {
+        // A registry written by an older daemon: each node still carries the now-removed
+        // `network_id`/`metrics_port` fields and lacks `evm_network`/`eviction`. A new daemon must
+        // load it (unknown fields ignored, new fields defaulted) rather than erroring on upgrade.
+        let legacy = r#"{
+            "schema_version": 1,
+            "nodes": {
+                "1": {
+                    "id": 1,
+                    "service_name": "node1",
+                    "rewards_address": "0xabc",
+                    "data_dir": "/data/node-1",
+                    "log_dir": "/logs/node-1",
+                    "node_port": 12000,
+                    "metrics_port": 13000,
+                    "network_id": 2,
+                    "binary_path": "/bin/antnode",
+                    "version": "0.1.0",
+                    "env_variables": {},
+                    "bootstrap_peers": ["peer1"],
+                    "upgrade_channel": null
+                }
+            },
+            "next_id": 2
+        }"#;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().with_extension("json");
+        std::fs::write(&path, legacy).unwrap();
+
+        let reg = NodeRegistry::load(&path).unwrap();
+        let node = reg.get(1).unwrap();
+        // Preserved fields survive the round-trip.
+        assert_eq!(node.node_port, Some(12000));
+        assert_eq!(node.bootstrap_peers, vec!["peer1".to_string()]);
+        // Removed fields are ignored (no deny_unknown_fields); new fields take their defaults.
+        assert!(node.eviction.is_none());
+        assert_eq!(node.evm_network, crate::node::types::EvmNetwork::default());
+        assert_eq!(reg.next_id, 2);
     }
 
     #[test]
