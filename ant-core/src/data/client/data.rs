@@ -16,9 +16,11 @@ use crate::data::error::{Error, Result};
 use ant_protocol::{compute_address, DATA_TYPE_CHUNK};
 use bytes::Bytes;
 use futures::stream::StreamExt;
-use self_encryption::{decrypt, encrypt, DataMap, EncryptedChunk};
+use self_encryption::{decrypt, encrypt, get_root_data_map, DataMap, EncryptedChunk};
 use std::num::NonZeroUsize;
+use tokio::runtime::Handle;
 use tracing::{debug, info};
+use xor_name::XorName;
 
 /// Result of an in-memory data upload: the `DataMap` needed to retrieve the data.
 #[derive(Debug, Clone)]
@@ -436,11 +438,20 @@ impl Client {
     /// the fan-out is sized by the adaptive controller's `fetch` channel
     /// and ramps up under healthy conditions.
     ///
+    /// Large uploads produce a *shrunk* (child) `DataMap` whose `infos()`
+    /// reference wrapper chunks rather than the root content chunks. Such a
+    /// map is resolved back to its root form (see [`resolve_root_data_map`])
+    /// before download, keeping this primitive symmetric with `data_upload`.
+    ///
+    /// [`resolve_root_data_map`]: Self::resolve_root_data_map
+    ///
     /// # Errors
     ///
     /// Returns an error if any chunk cannot be retrieved or decryption fails.
     pub async fn data_download(&self, data_map: &DataMap) -> Result<Bytes> {
-        let chunk_infos = data_map.infos();
+        let root_data_map = self.resolve_root_data_map(data_map).await?;
+
+        let chunk_infos = root_data_map.infos();
         debug!("Downloading data ({} chunks)", chunk_infos.len());
 
         // Extract owned addresses to avoid HRTB lifetime issue with
@@ -484,12 +495,72 @@ impl Client {
             encrypted_chunks.len()
         );
 
-        let content = decrypt(data_map, &encrypted_chunks)
+        let content = decrypt(&root_data_map, &encrypted_chunks)
             .map_err(|e| Error::Encryption(format!("Failed to decrypt data: {e}")))?;
 
         info!("Data downloaded and decrypted ({} bytes)", content.len());
 
         Ok(content)
+    }
+
+    /// Resolve a possibly-shrunk `DataMap` to its root (flat) form.
+    ///
+    /// `data_upload` shrinks large maps via self-encryption's
+    /// `shrink_data_map`: the serialized map is recursively encrypted into
+    /// wrapper chunks (which are uploaded alongside the content chunks) and
+    /// the returned map has `is_child() == true`. Its `infos()` reference the
+    /// outermost wrapper chunks, *not* the root content chunks, so handing it
+    /// straight to `decrypt` fails with a missing-chunk error for a root-level
+    /// chunk that was never fetched.
+    ///
+    /// This fetches the wrapper chunks and unshrinks recursively (via
+    /// `self_encryption::get_root_data_map`) until it obtains the root map,
+    /// whose `infos()` reference the actual content chunks. A map that is not
+    /// a child is returned unchanged without any network access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a wrapper chunk cannot be retrieved or the map
+    /// cannot be unshrunk.
+    async fn resolve_root_data_map(&self, data_map: &DataMap) -> Result<DataMap> {
+        if !data_map.is_child() {
+            return Ok(data_map.clone());
+        }
+
+        debug!("DataMap is shrunk (child); resolving root data map");
+
+        // `get_root_data_map` drives a synchronous `FnMut` fetcher, so bridge
+        // to the async `chunk_get` via `block_in_place` + `block_on` (the same
+        // pattern `file_download` uses). Requires a multi-threaded runtime.
+        let handle = Handle::current();
+        let root = tokio::task::block_in_place(|| {
+            let mut get_chunk =
+                |name: XorName| -> std::result::Result<Bytes, self_encryption::Error> {
+                    let address = name.0;
+                    handle.block_on(async {
+                        let chunk = self
+                            .chunk_get(&address)
+                            .await
+                            .map_err(|e| {
+                                self_encryption::Error::Generic(format!(
+                                    "Network fetch failed for wrapper chunk {}: {e}",
+                                    hex::encode(address)
+                                ))
+                            })?
+                            .ok_or_else(|| {
+                                self_encryption::Error::Generic(format!(
+                                    "Missing wrapper chunk {} required to resolve root DataMap",
+                                    hex::encode(address)
+                                ))
+                            })?;
+                        Ok(chunk.content)
+                    })
+                };
+            get_root_data_map(data_map.clone(), &mut get_chunk)
+        })
+        .map_err(|e| Error::Encryption(format!("Failed to resolve root data map: {e}")))?;
+
+        Ok(root)
     }
 }
 
