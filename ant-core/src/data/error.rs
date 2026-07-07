@@ -156,6 +156,39 @@ pub enum Error {
         /// Root cause description.
         reason: String,
     },
+
+    /// A wave-batch external-signer finalize stored only some chunks *after*
+    /// the external wallet had already paid on-chain.
+    ///
+    /// Unlike [`Error::PartialUpload`], the on-chain payment is **not** lost:
+    /// `retry` carries the paid proofs for the chunks that did not store, so
+    /// the caller can re-drive storage against the same payment via
+    /// [`crate::data::Client::finalize_resume`] without paying again. Boxed to
+    /// keep the `Error` enum small (`clippy::result_large_err`).
+    #[error(
+        "finalize stored {stored_count}/{total_chunks} after payment, \
+         {failed_count} unstored (retryable): {reason}"
+    )]
+    FinalizeStorePaidFailed {
+        /// Cumulative addresses stored so far.
+        stored: Vec<[u8; 32]>,
+        /// Number of chunks stored so far.
+        stored_count: usize,
+        /// Addresses and error messages of chunks still unstored.
+        failed: Vec<([u8; 32], String)>,
+        /// Number of chunks still unstored.
+        failed_count: usize,
+        /// Total number of chunks the upload was attempting to store.
+        total_chunks: usize,
+        /// On-chain storage spend already committed. Gas is paid by the
+        /// external signer out-of-band, so it stays 0 here.
+        spend: Box<PartialUploadSpend>,
+        /// Paid-but-unstored retry material. Feed to
+        /// [`crate::data::Client::finalize_resume`] to retry without re-paying.
+        retry: Box<crate::data::client::file::PaidRetryState>,
+        /// Root cause description.
+        reason: String,
+    },
 }
 
 /// On-chain spend recorded on a [`Error::PartialUpload`].

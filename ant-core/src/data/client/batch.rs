@@ -77,8 +77,13 @@ pub struct PaidChunk {
 pub struct WaveResult {
     /// Successfully stored chunk addresses.
     pub stored: Vec<XorName>,
-    /// Chunks that failed to store after all retries.
+    /// Chunks that failed to store after all retries (address + error text).
     pub failed: Vec<(XorName, String)>,
+    /// The paid [`PaidChunk`]s for the entries in `failed`, retained so a
+    /// caller can re-drive storage against the *same* on-chain payment without
+    /// re-quoting or re-paying. Parallel to `failed` (same order). Empty when
+    /// `failed` is empty.
+    pub failed_chunks: Vec<PaidChunk>,
     /// Sum of store-RPC attempts across all chunks in this wave (>= stored.len() + failed.len()).
     pub chunk_attempts_total: usize,
     /// Per-chunk wall-clock (ms) from first attempt to successful store. Only populated for stored chunks.
@@ -854,6 +859,7 @@ impl Client {
                 let result = WaveResult {
                     stored,
                     failed: Vec::new(),
+                    failed_chunks: Vec::new(),
                     chunk_attempts_total,
                     store_durations_ms,
                     retries_per_chunk,
@@ -863,13 +869,19 @@ impl Client {
             }
 
             if attempt == MAX_RETRIES {
-                let failed = failed_this_round
-                    .into_iter()
-                    .map(|(c, e)| (c.address, e))
-                    .collect();
+                // Keep the paid chunks (not just their addresses) so a
+                // post-payment store failure stays retryable without paying
+                // again — the proofs live in each `PaidChunk`.
+                let mut failed = Vec::with_capacity(failed_this_round.len());
+                let mut failed_chunks = Vec::with_capacity(failed_this_round.len());
+                for (chunk, err) in failed_this_round {
+                    failed.push((chunk.address, err));
+                    failed_chunks.push(chunk);
+                }
                 let result = WaveResult {
                     stored,
                     failed,
+                    failed_chunks,
                     chunk_attempts_total,
                     store_durations_ms,
                     retries_per_chunk,
@@ -890,6 +902,7 @@ impl Client {
         let result = WaveResult {
             stored,
             failed: Vec::new(),
+            failed_chunks: Vec::new(),
             chunk_attempts_total,
             store_durations_ms,
             retries_per_chunk,

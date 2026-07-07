@@ -76,7 +76,8 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         | Error::Io(_)
         | Error::Protocol(_)
         | Error::Storage(_)
-        | Error::PartialUpload { .. } => Outcome::NetworkError,
+        | Error::PartialUpload { .. }
+        | Error::FinalizeStorePaidFailed { .. } => Outcome::NetworkError,
         Error::AlreadyStored
         | Error::Encryption(_)
         | Error::Crypto(_)
@@ -769,6 +770,7 @@ mod tests {
             | Error::CostEstimationInconclusive(_)
             | Error::Cancelled(_)
             | Error::PartialUpload { .. }
+            | Error::FinalizeStorePaidFailed { .. }
             | Error::BadQuoteBinding { .. }
             | Error::RemotePut { .. }
             | Error::CloseGroupShortfall(_) => (),

@@ -12,7 +12,7 @@
 
 use crate::data::client::adaptive::{observe_op, rebucketed_unordered};
 use crate::data::client::batch::{
-    finalize_batch_payment, PaymentIntent, PreparedChunk, WaveAggregateStats,
+    finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk, WaveAggregateStats, WaveResult,
 };
 use crate::data::client::chunk::ChunkPeerGetResult;
 use crate::data::client::classify_error;
@@ -1026,6 +1026,61 @@ pub struct PreparedUpload {
     pub total_chunks: usize,
 }
 
+/// Post-payment retry material for a wave-batch external-signer finalize.
+///
+/// Handed back inside [`Error::FinalizeStorePaidFailed`] when chunk storage
+/// fails *after* the external wallet has already paid on-chain. It carries the
+/// paid [`PaidChunk`] proofs for the chunks that did not store, so a caller can
+/// re-drive storage against the **same** payment via
+/// [`Client::finalize_resume`] — no re-quoting, no second on-chain payment.
+///
+/// Re-storing a chunk that actually did land is a safe, idempotent PUT
+/// (chunks are content-addressed), so retrying the whole unstored set is
+/// always sound even if the failure report was pessimistic.
+///
+/// This value stays resident in Rust memory: `PaidChunk::quoted_peers` holds
+/// non-serializable network types (`PeerId`, `MultiAddr`), so FFI consumers
+/// retain it as an opaque handle rather than serializing it across the
+/// boundary. Marked `#[non_exhaustive]` so new fields are not breaking.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct PaidRetryState {
+    /// Data map for the upload, forwarded to the eventual [`FileUploadResult`].
+    data_map: DataMap,
+    /// Public data-map chunk address, if this was a public upload.
+    data_map_address: Option<[u8; 32]>,
+    /// Total chunk count for the upload, including already-stored chunks.
+    total_chunks: usize,
+    /// Cumulative addresses stored so far (already-on-network chunks plus any
+    /// stored across prior finalize/resume attempts).
+    stored_addresses: Vec<[u8; 32]>,
+    /// Paid-but-unstored chunks to retry. Their proofs are already paid.
+    unstored: Vec<PaidChunk>,
+    /// Storage cost already committed on-chain, in atto-tokens. Reported again
+    /// if a resume attempt still fails.
+    storage_cost_atto: String,
+}
+
+impl PaidRetryState {
+    /// Number of paid chunks still awaiting storage.
+    #[must_use]
+    pub fn unstored_count(&self) -> usize {
+        self.unstored.len()
+    }
+
+    /// Number of chunks already stored (across this and prior attempts).
+    #[must_use]
+    pub fn stored_count(&self) -> usize {
+        self.stored_addresses.len()
+    }
+
+    /// Total chunk count for the upload.
+    #[must_use]
+    pub fn total_chunks(&self) -> usize {
+        self.total_chunks
+    }
+}
+
 /// Return type for [`spawn_file_encryption`]: chunk receiver, `DataMap` oneshot, join handle.
 type EncryptionChannels = (
     tokio::sync::mpsc::Receiver<Bytes>,
@@ -1714,6 +1769,11 @@ impl Client {
     /// Returns an error if the prepared upload used merkle payment (use
     /// [`Client::finalize_upload_merkle`] instead), proof construction fails,
     /// or any chunk cannot be stored.
+    ///
+    /// If storage fails *after* payment, the error is
+    /// [`Error::FinalizeStorePaidFailed`], which carries a [`PaidRetryState`]:
+    /// the payment is retained and the unstored chunks can be re-driven with
+    /// [`Client::finalize_resume`] without paying again.
     pub async fn finalize_upload(
         &self,
         prepared: PreparedUpload,
@@ -1739,7 +1799,6 @@ impl Client {
     ) -> Result<FileUploadResult> {
         let data_map_address = prepared.data_map_address;
         let already_stored_addresses = prepared.already_stored_addresses;
-        let already_stored_count = already_stored_addresses.len();
         let total_chunks = prepared.total_chunks;
         match prepared.payment_info {
             ExternalPaymentInfo::WaveBatch {
@@ -1747,57 +1806,19 @@ impl Client {
                 payment_intent,
             } => {
                 let paid_chunks = finalize_batch_payment(prepared_chunks, tx_hash_map)?;
-                let wave_result = self
-                    .store_paid_chunks_with_events(
-                        paid_chunks,
-                        progress.as_ref(),
-                        already_stored_count,
-                        total_chunks,
-                    )
-                    .await;
-                if !wave_result.failed.is_empty() {
-                    let failed_count = wave_result.failed.len();
-                    let stored_count = already_stored_count + wave_result.stored.len();
-                    let mut stored = already_stored_addresses;
-                    stored.extend(wave_result.stored);
-                    return Err(Error::PartialUpload {
-                        stored,
-                        stored_count,
-                        failed: wave_result.failed,
-                        failed_count,
-                        total_chunks,
-                        // Report the storage spend known from the payment intent
-                        // the external signer was handed. Gas is paid by the
-                        // signer out-of-band, so it stays unknown (0).
-                        spend: Box::new(PartialUploadSpend {
-                            storage_cost_atto: payment_intent.total_amount.to_string(),
-                            gas_cost_wei: 0,
-                        }),
-                        reason: "finalize_upload: chunk storage failed after retries".into(),
-                    });
-                }
-                let chunks_stored = already_stored_count + wave_result.stored.len();
-
-                info!("External-signer upload finalized: {chunks_stored} chunks stored");
-
-                let mut stats = WaveAggregateStats::default();
-                stats.absorb(&wave_result);
-
-                Ok(FileUploadResult {
+                // The initial attempt is just a `PaidRetryState` with nothing
+                // stored yet from this wave. Storage spend is known from the
+                // payment intent handed to the external signer; gas is paid by
+                // the signer out-of-band, so it stays unknown (0).
+                let state = PaidRetryState {
                     data_map: prepared.data_map,
-                    chunks_stored,
-                    chunks_failed: 0,
-                    total_chunks,
-                    payment_mode_used: PaymentMode::Single,
-                    // Storage spend is known from the payment intent; gas is
-                    // paid by the external signer out-of-band (unknown here).
-                    storage_cost_atto: payment_intent.total_amount.to_string(),
-                    gas_cost_wei: 0,
                     data_map_address,
-                    chunk_attempts_total: stats.chunk_attempts_total,
-                    store_durations_ms: stats.store_durations_ms,
-                    retries_histogram: stats.retries_histogram,
-                })
+                    total_chunks,
+                    stored_addresses: already_stored_addresses,
+                    unstored: paid_chunks,
+                    storage_cost_atto: payment_intent.total_amount.to_string(),
+                };
+                self.store_paid_wave(state, progress.as_ref()).await
             }
             ExternalPaymentInfo::Merkle { .. } => Err(Error::Payment(
                 "Cannot finalize merkle upload with wave-batch tx hashes. \
@@ -1807,11 +1828,144 @@ impl Client {
         }
     }
 
+    /// Resume a wave-batch external-signer finalize that failed to store some
+    /// chunks *after* payment, using the [`PaidRetryState`] handed back on
+    /// [`Error::FinalizeStorePaidFailed`].
+    ///
+    /// Re-drives storage for the still-unstored paid chunks against the **same**
+    /// on-chain payment — no re-quoting, no second payment. Safe to call
+    /// repeatedly: on success it returns the full [`FileUploadResult`]; if some
+    /// chunks still fail it again returns [`Error::FinalizeStorePaidFailed`]
+    /// with a reduced retry state, so a caller can loop until it drains or
+    /// gives up.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::FinalizeStorePaidFailed`] if some chunks still fail to
+    /// store after retries.
+    pub async fn finalize_resume(&self, retry: PaidRetryState) -> Result<FileUploadResult> {
+        self.finalize_resume_with_progress(retry, None).await
+    }
+
+    /// Resume a failed wave-batch finalize with progress events.
+    ///
+    /// Same as [`Client::finalize_resume`] but emits [`UploadEvent::ChunkStored`]
+    /// on the provided channel as each remaining chunk is stored.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Client::finalize_resume`].
+    pub async fn finalize_resume_with_progress(
+        &self,
+        retry: PaidRetryState,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
+        self.store_paid_wave(retry, progress.as_ref()).await
+    }
+
+    /// Drive storage of a set of already-paid wave-batch chunks and assemble the
+    /// finalize result.
+    ///
+    /// Shared by the initial [`Client::finalize_upload_with_progress`] and
+    /// [`Client::finalize_resume_with_progress`]. On a post-store failure it
+    /// returns [`Error::FinalizeStorePaidFailed`] carrying a [`PaidRetryState`]
+    /// so the same payment can be retried without re-quoting or re-paying.
+    ///
+    /// The state's `stored_addresses` is the cumulative set of chunk addresses
+    /// already on the network (chunks skipped during preflight plus any stored
+    /// on earlier attempts); `unstored` is the paid set to (re-)attempt now.
+    async fn store_paid_wave(
+        &self,
+        state: PaidRetryState,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
+        let PaidRetryState {
+            data_map,
+            data_map_address,
+            total_chunks,
+            stored_addresses: prior_stored,
+            unstored: to_store,
+            storage_cost_atto,
+        } = state;
+        let stored_before = prior_stored.len();
+        let wave_result = self
+            .store_paid_chunks_with_events(to_store, progress, stored_before, total_chunks)
+            .await;
+
+        let mut stats = WaveAggregateStats::default();
+        stats.absorb(&wave_result);
+        let WaveResult {
+            stored: wave_stored,
+            failed,
+            failed_chunks,
+            ..
+        } = wave_result;
+
+        // Fold this round's successes into the cumulative stored set.
+        let mut stored_addresses = prior_stored;
+        stored_addresses.extend(wave_stored);
+        let stored_count = stored_addresses.len();
+
+        if !failed.is_empty() {
+            let failed_count = failed.len();
+            // The payment is NOT lost: hand back the paid-but-unstored proofs so
+            // the caller can re-drive storage against the same payment.
+            let retry = PaidRetryState {
+                data_map,
+                data_map_address,
+                total_chunks,
+                stored_addresses: stored_addresses.clone(),
+                unstored: failed_chunks,
+                storage_cost_atto: storage_cost_atto.clone(),
+            };
+            return Err(Error::FinalizeStorePaidFailed {
+                stored: stored_addresses,
+                stored_count,
+                failed,
+                failed_count,
+                total_chunks,
+                spend: Box::new(PartialUploadSpend {
+                    storage_cost_atto,
+                    gas_cost_wei: 0,
+                }),
+                retry: Box::new(retry),
+                reason: "finalize: chunk storage failed after retries \
+                         (payment retained — retry with finalize_resume)"
+                    .into(),
+            });
+        }
+
+        info!("External-signer upload finalized: {stored_count} chunks stored");
+
+        Ok(FileUploadResult {
+            data_map,
+            chunks_stored: stored_count,
+            chunks_failed: 0,
+            total_chunks,
+            payment_mode_used: PaymentMode::Single,
+            storage_cost_atto,
+            gas_cost_wei: 0,
+            data_map_address,
+            chunk_attempts_total: stats.chunk_attempts_total,
+            store_durations_ms: stats.store_durations_ms,
+            retries_histogram: stats.retries_histogram,
+        })
+    }
+
     /// Phase 2 of external-signer upload (merkle): finalize with winner pool hash.
     ///
     /// Takes a [`PreparedUpload`] that used merkle payment and the `winner_pool_hash`
     /// returned by the on-chain merkle payment transaction. Generates proofs and
     /// stores chunks on the network.
+    ///
+    /// # Retryability
+    ///
+    /// Unlike the wave-batch [`Client::finalize_upload`], the merkle path is
+    /// **not yet retryable after payment**: a post-payment store failure
+    /// consumes the proofs and does not hand back retry state. Callers must
+    /// treat a failed merkle finalize as non-recoverable without re-paying.
+    /// Making merkle finalize resumable is tracked as a follow-up to
+    /// [`Client::finalize_resume`].
     ///
     /// # Errors
     ///
@@ -3420,6 +3574,70 @@ mod tests {
         assert_eq!(merkle_store_cap(usize::MAX), MERKLE_STORE_MAX_IN_FLIGHT);
         // Never zero — always make progress.
         assert_eq!(merkle_store_cap(0), 1);
+    }
+
+    fn fake_paid_chunk(addr_byte: u8) -> PaidChunk {
+        PaidChunk {
+            content: Bytes::new(),
+            address: [addr_byte; 32],
+            quoted_peers: vec![],
+            proof_bytes: vec![],
+        }
+    }
+
+    #[test]
+    fn paid_retry_state_reports_counts() {
+        let state = PaidRetryState {
+            data_map: DataMap::new(Vec::new()),
+            data_map_address: None,
+            total_chunks: 5,
+            stored_addresses: vec![[9u8; 32], [8u8; 32], [7u8; 32]],
+            unstored: vec![fake_paid_chunk(1), fake_paid_chunk(2)],
+            storage_cost_atto: "1200".into(),
+        };
+        assert_eq!(state.unstored_count(), 2);
+        assert_eq!(state.stored_count(), 3);
+        assert_eq!(state.total_chunks(), 5);
+    }
+
+    #[test]
+    fn finalize_store_paid_failed_marks_retryable_and_keeps_proofs() {
+        let state = PaidRetryState {
+            data_map: DataMap::new(Vec::new()),
+            data_map_address: None,
+            total_chunks: 4,
+            stored_addresses: vec![[0u8; 32]],
+            unstored: vec![fake_paid_chunk(1)],
+            storage_cost_atto: "500".into(),
+        };
+        let err = Error::FinalizeStorePaidFailed {
+            stored: vec![[0u8; 32]],
+            stored_count: 1,
+            failed: vec![([1u8; 32], "store failed".into())],
+            failed_count: 1,
+            total_chunks: 4,
+            spend: Box::new(PartialUploadSpend {
+                storage_cost_atto: "500".into(),
+                gas_cost_wei: 0,
+            }),
+            retry: Box::new(state),
+            reason: "chunk storage failed".into(),
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("1/4"), "got: {msg}");
+        assert!(msg.contains("retryable"), "got: {msg}");
+
+        // The paid retry material must survive on the error so a caller can
+        // re-drive storage with finalize_resume without paying again.
+        match err {
+            Error::FinalizeStorePaidFailed { retry, .. } => {
+                assert_eq!(retry.unstored_count(), 1);
+                assert_eq!(retry.stored_count(), 1);
+                assert_eq!(retry.total_chunks(), 4);
+            }
+            other => panic!("expected FinalizeStorePaidFailed, got {other:?}"),
+        }
     }
 
     #[test]
