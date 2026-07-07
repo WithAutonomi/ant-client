@@ -540,42 +540,63 @@ impl Client {
         debug!("DataMap is shrunk (child); resolving root data map");
 
         // `get_root_data_map` drives a synchronous `FnMut` fetcher, so bridge
-        // to the async `chunk_get` via `block_in_place` + `block_on` (the same
-        // pattern `file_download` uses). `block_in_place` panics on a
-        // current-thread runtime, so reject that precondition with a clear
-        // error instead of letting it panic inside the fetcher.
+        // to the async `chunk_get_observed` via `block_in_place` + `block_on`
+        // (the same pattern `file_download` uses). The observed variant feeds
+        // the adaptive fetch limiter, keeping the wrapper-chunk fetches
+        // consistent with the content-chunk fetches in `data_download`.
+        // `block_in_place` panics on a current-thread runtime, so reject that
+        // precondition with a clear error instead of letting it panic inside
+        // the fetcher.
         let handle = Handle::current();
         ensure_shrunk_resolution_runtime(handle.runtime_flavor())?;
 
-        let root = tokio::task::block_in_place(|| {
+        // The self-encryption fetcher may only yield `self_encryption::Error`.
+        // Capture the underlying `ant-core` error out-of-band so a missing
+        // wrapper chunk surfaces as `Error::InvalidData` (matching the
+        // content-chunk path) and a network failure keeps its `Timeout` /
+        // `Network` classification, instead of every resolution failure
+        // flattening to `Error::Encryption`.
+        let mut fetch_error: Option<Error> = None;
+        let resolve_result = tokio::task::block_in_place(|| {
             let mut get_chunk =
                 |name: XorName| -> std::result::Result<Bytes, self_encryption::Error> {
                     let address = name.0;
                     handle.block_on(async {
-                        let chunk = self
-                            .chunk_get(&address)
-                            .await
-                            .map_err(|e| {
-                                self_encryption::Error::Generic(format!(
-                                    "Network fetch failed for wrapper chunk {}: {e}",
-                                    hex::encode(address)
-                                ))
-                            })?
-                            .ok_or_else(|| {
-                                self_encryption::Error::Generic(format!(
+                        match self.chunk_get_observed(&address).await {
+                            Ok(Some(chunk)) => Ok(chunk.content),
+                            Ok(None) => Err(record_wrapper_fetch_error(
+                                &mut fetch_error,
+                                Error::InvalidData(format!(
                                     "Missing wrapper chunk {} required to resolve root DataMap",
                                     hex::encode(address)
-                                ))
-                            })?;
-                        Ok(chunk.content)
+                                )),
+                            )),
+                            Err(e) => Err(record_wrapper_fetch_error(&mut fetch_error, e)),
+                        }
                     })
                 };
             get_root_data_map(data_map.clone(), &mut get_chunk)
-        })
-        .map_err(|e| Error::Encryption(format!("Failed to resolve root data map: {e}")))?;
+        });
 
-        Ok(root)
+        resolve_result.map_err(|e| {
+            fetch_error.take().unwrap_or_else(|| {
+                Error::Encryption(format!("Failed to resolve root data map: {e}"))
+            })
+        })
     }
+}
+
+/// Stash the real `ant-core` error behind a self-encryption fetch failure and
+/// return the `self_encryption::Error` the fetcher is required to yield.
+///
+/// `get_root_data_map`'s fetcher may only return `self_encryption::Error`, which
+/// would otherwise flatten a missing chunk or a classified network error into a
+/// generic `Error::Encryption`. Recording the descriptive error in `slot` lets
+/// [`Client::resolve_root_data_map`] recover it and preserve the error taxonomy.
+fn record_wrapper_fetch_error(slot: &mut Option<Error>, error: Error) -> self_encryption::Error {
+    let message = error.to_string();
+    *slot = Some(error);
+    self_encryption::Error::Generic(message)
 }
 
 /// Reject resolving a shrunk `DataMap` on a current-thread Tokio runtime.
