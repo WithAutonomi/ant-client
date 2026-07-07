@@ -22,13 +22,15 @@
 
 mod support;
 
-use ant_core::data::{compute_address, Client};
+use ant_core::data::client::merkle::PaymentMode;
+use ant_core::data::{compute_address, Client, ClientConfig};
 use ant_protocol::payment::calculate_price;
 use ant_protocol::payment::commitment::{
     commitment_hash, verify_commitment_signature, StorageCommitment,
 };
 use bytes::Bytes;
 use serial_test::serial;
+use std::io::Write;
 use std::sync::Arc;
 use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 
@@ -180,6 +182,46 @@ async fn adr0004_baseline_quotes_still_work() {
         .await
         .expect("paid put with baseline quotes must succeed");
     assert_eq!(stored, address);
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// DEV-01 regression: a FORCED-MERKLE upload against a network where every
+/// node carries a live storage commitment (bound candidates). On DEV-01 this
+/// exact combination started failing the moment nodes rotated their first
+/// commitment (2026-07-06 19:38 UTC) while single-node payments kept working.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn adr0004_merkle_upload_against_bound_candidates() {
+    // 35 nodes: merkle pools need 16 valid candidates per pool.
+    let testnet = MiniTestnet::start_with_commitments(35, COMMITTED_KEYS).await;
+    let node = testnet.node(5).expect("node 5 exists");
+    let config = ClientConfig {
+        quote_timeout_secs: 120,
+        store_timeout_secs: 120,
+        close_group_size: 20,
+        ..Default::default()
+    };
+    let client = Client::from_node(Arc::clone(&node), config).with_wallet(testnet.wallet().clone());
+
+    // 500KB file — self-encryption produces 3+ chunks (>=2 needed for merkle).
+    let data: Vec<u8> = (0u8..=255).cycle().take(500_000).collect();
+    let mut input_file = tempfile::NamedTempFile::new().expect("create temp file");
+    input_file.write_all(&data).expect("write temp file");
+    input_file.flush().expect("flush temp file");
+
+    let result = client
+        .file_upload_with_mode(input_file.path(), PaymentMode::Merkle)
+        .await
+        .expect("merkle upload against bound candidates must succeed");
+
+    assert_eq!(
+        result.payment_mode_used,
+        PaymentMode::Merkle,
+        "payment_mode_used must be Merkle"
+    );
+    assert!(result.chunks_stored >= 3, "chunks must be stored");
 
     drop(client);
     testnet.teardown().await;

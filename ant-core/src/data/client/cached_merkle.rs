@@ -49,7 +49,8 @@
 use crate::config;
 use crate::data::client::merkle::MerkleBatchPaymentResult;
 use crate::error::Result;
-use std::fs::{self, DirEntry, File};
+use ant_protocol::payment::{deserialize_merkle_proof, serialize_merkle_proof};
+use std::fs::{self, DirEntry, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
@@ -283,9 +284,110 @@ fn is_expired_filename(name: &str) -> bool {
 
 fn read_receipt(path: &Path) -> Result<MerkleBatchPaymentResult> {
     let handle = File::open(path)?;
-    let receipt: MerkleBatchPaymentResult = rmp_serde::decode::from_read(BufReader::new(handle))
-        .map_err(|e| crate::error::Error::Io(std::io::Error::other(e.to_string())))?;
+    let mut receipt: MerkleBatchPaymentResult =
+        rmp_serde::decode::from_read(BufReader::new(handle))
+            .map_err(|e| crate::error::Error::Io(std::io::Error::other(e.to_string())))?;
+
+    if strip_commitment_sidecars(&mut receipt) {
+        info!(
+            "Stripped legacy commitment sidecars from cached merkle receipt at {}",
+            path.display()
+        );
+        // Best-effort write-back so the strip happens once; a failure here
+        // only means we re-strip on the next load.
+        if let Err(e) = overwrite_receipt(path, &receipt) {
+            warn!(
+                "Failed to persist slimmed merkle receipt at {}: {e}",
+                path.display()
+            );
+        }
+    }
+
     Ok(receipt)
+}
+
+/// Strip ADR-0004 commitment sidecars from every proof in a cached receipt.
+///
+/// Receipts saved by clients built before sidecars were dropped from the
+/// per-chunk merkle proofs carry all 16 winner-pool sidecars in EVERY proof
+/// (~214 KB per proof), which pushed the proof past the storer's
+/// payment-proof size cap — resuming with them would replay the exact
+/// failure the slim proofs fixed. Stripping is always safe: the pool hash
+/// and address branch stay exactly as paid on-chain, and storers resolve
+/// commitment pins from gossip or a `GetCommitmentByPin` fetch. Returns
+/// whether anything was stripped.
+fn strip_commitment_sidecars(receipt: &mut MerkleBatchPaymentResult) -> bool {
+    let mut stripped = false;
+    for proof_bytes in receipt.proofs.values_mut() {
+        // Non-merkle or unreadable proof bytes are left untouched; the
+        // storer remains the judge of those.
+        let Ok(mut proof) = deserialize_merkle_proof(proof_bytes) else {
+            continue;
+        };
+        if proof.commitment_sidecars.is_empty() {
+            continue;
+        }
+        proof.commitment_sidecars.clear();
+        match serialize_merkle_proof(&proof) {
+            Ok(slim) => {
+                *proof_bytes = slim;
+                stripped = true;
+            }
+            Err(e) => warn!("Failed to re-serialize slimmed cached merkle proof: {e}"),
+        }
+    }
+    stripped
+}
+
+/// Overwrite a cached receipt via `tmp + fsync + rename` (same canonical
+/// path), mirroring `cached_single::write_receipt_atomic`: an interrupted
+/// write must never truncate the only copy of a paid receipt — losing it
+/// forces the user to re-pay. The tmp name carries pid + nanos and is opened
+/// with `create_new`, so concurrent migrations (threads or processes) can
+/// never share a tmp inode — a residual name collision fails this best-effort
+/// write instead of corrupting it, and the next load simply re-strips. A
+/// leftover tmp from a crash is harmless (the canonical stays intact until
+/// rename) and ages out with the same `<ts>_` filename prefix.
+fn overwrite_receipt(path: &Path, receipt: &MerkleBatchPaymentResult) -> Result<()> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let tmp_path = path.with_extension(format!("{pid}-{nanos}.tmp"));
+    {
+        let handle = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        let mut writer = BufWriter::new(handle);
+        if let Err(e) = rmp_serde::encode::write(&mut writer, receipt) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(crate::error::Error::Io(std::io::Error::other(
+                e.to_string(),
+            )));
+        }
+        // `into_inner` flushes; a swallowed flush error here would defeat
+        // the atomicity, so surface it.
+        let handle = match writer.into_inner() {
+            Ok(handle) => handle,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(crate::error::Error::Io(std::io::Error::other(format!(
+                    "BufWriter flush failed: {e}"
+                ))));
+            }
+        };
+        if let Err(e) = handle.sync_all() {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+    }
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -303,6 +405,101 @@ mod tests {
             gas_cost_wei: 0,
             merkle_payment_timestamp: ts,
         }
+    }
+
+    /// A serialized merkle proof carrying legacy commitment sidecars, as saved
+    /// by clients built before sidecars were dropped from per-chunk proofs.
+    fn fat_merkle_proof_bytes(ts: u64) -> Vec<u8> {
+        use ant_protocol::evm::{
+            Amount, MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof,
+            MerkleTree, RewardsAddress, CANDIDATES_PER_POOL,
+        };
+        use xor_name::XorName;
+
+        let xornames: Vec<XorName> = (0..4u8).map(|i| XorName([i; 32])).collect();
+        let tree = MerkleTree::from_xornames(xornames.clone()).unwrap();
+        let midpoint = tree.reward_candidates(ts).unwrap().remove(0);
+        let candidate_nodes: [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] =
+            std::array::from_fn(|i| MerklePaymentCandidateNode {
+                pub_key: vec![i as u8; 32],
+                price: Amount::from(1024u64),
+                reward_address: RewardsAddress::new([i as u8; 20]),
+                merkle_payment_timestamp: ts,
+                signature: vec![i as u8; 64],
+                committed_key_count: 9_000,
+                commitment_pin: Some([7u8; 32]),
+            });
+        let pool = MerklePaymentCandidatePool {
+            midpoint_proof: midpoint,
+            candidate_nodes,
+        };
+        let address_proof = tree.generate_address_proof(0, xornames[0]).unwrap();
+        let mut proof = MerklePaymentProof::new(xornames[0], address_proof, pool);
+        proof.commitment_sidecars = vec![vec![0xAB; 5_000]; CANDIDATES_PER_POOL];
+        serialize_merkle_proof(&proof).unwrap()
+    }
+
+    /// DEV-01 recovery: a receipt cached by a pre-fix client carries proofs
+    /// with all 16 commitment sidecars (~342 KB each on the wire) — resuming
+    /// with them would replay the storer's size rejection. Loading must strip
+    /// the sidecars while leaving the paid pool and address branch intact.
+    #[test]
+    fn strip_removes_legacy_sidecars_and_is_idempotent() {
+        let ts = 1_000_000;
+        let fat = fat_merkle_proof_bytes(ts);
+        let mut proofs: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        proofs.insert([0u8; 32], fat.clone());
+        // A non-merkle blob must pass through untouched.
+        proofs.insert([1u8; 32], vec![1, 2, 3]);
+        let mut receipt = MerkleBatchPaymentResult {
+            proofs,
+            chunk_count: 2,
+            storage_cost_atto: "0".to_string(),
+            gas_cost_wei: 0,
+            merkle_payment_timestamp: ts,
+        };
+
+        assert!(strip_commitment_sidecars(&mut receipt));
+
+        let slim = receipt.proofs.get(&[0u8; 32]).unwrap();
+        assert!(slim.len() < fat.len(), "stripped proof must shrink");
+        let proof = deserialize_merkle_proof(slim).unwrap();
+        assert!(proof.commitment_sidecars.is_empty());
+        assert_eq!(receipt.proofs.get(&[1u8; 32]).unwrap(), &vec![1, 2, 3]);
+
+        // Second pass finds nothing left to strip.
+        assert!(!strip_commitment_sidecars(&mut receipt));
+    }
+
+    /// The strip write-back must replace the canonical receipt atomically:
+    /// new content lands, and no `.tmp` sibling survives a successful write.
+    #[test]
+    fn overwrite_receipt_is_atomic_and_leaves_no_tmp() -> Result<()> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("anselme-merkle-overwrite-test-{nanos}"));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("123_abcd");
+        fs::write(&path, b"pre-fix receipt bytes")?;
+
+        overwrite_receipt(&path, &dummy_receipt(42))?;
+
+        let reloaded = read_receipt(&path)?;
+        assert_eq!(reloaded.merkle_payment_timestamp, 42);
+        let leftover_tmps = fs::read_dir(&dir)?
+            .flatten()
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+            })
+            .count();
+        assert_eq!(leftover_tmps, 0, "no tmp sibling may survive");
+
+        fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[test]
