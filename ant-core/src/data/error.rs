@@ -157,8 +157,8 @@ pub enum Error {
         reason: String,
     },
 
-    /// A wave-batch external-signer finalize stored only some chunks *after*
-    /// the external wallet had already paid on-chain.
+    /// An external-signer finalize (wave-batch or merkle) stored only some
+    /// chunks *after* the external wallet had already paid on-chain.
     ///
     /// Unlike [`Error::PartialUpload`], the on-chain payment is **not** lost:
     /// `retry` carries the paid proofs for the chunks that did not store, so
