@@ -18,7 +18,7 @@ use bytes::Bytes;
 use futures::stream::StreamExt;
 use self_encryption::{decrypt, encrypt, get_root_data_map, DataMap, EncryptedChunk};
 use std::num::NonZeroUsize;
-use tokio::runtime::Handle;
+use tokio::runtime::{Handle, RuntimeFlavor};
 use tracing::{debug, info};
 use xor_name::XorName;
 
@@ -440,14 +440,19 @@ impl Client {
     ///
     /// Large uploads produce a *shrunk* (child) `DataMap` whose `infos()`
     /// reference wrapper chunks rather than the root content chunks. Such a
-    /// map is resolved back to its root form (see [`resolve_root_data_map`])
-    /// before download, keeping this primitive symmetric with `data_upload`.
+    /// map is resolved back to its root form before download, keeping this
+    /// primitive symmetric with `data_upload`.
     ///
-    /// [`resolve_root_data_map`]: Self::resolve_root_data_map
+    /// Resolving a shrunk map bridges self-encryption's synchronous fetcher
+    /// onto the async network via `block_in_place`, so it requires a
+    /// multi-threaded Tokio runtime; on a current-thread runtime it returns
+    /// [`Error::Config`] instead of panicking. Flat maps (the common case)
+    /// take neither path, so this requirement never applies to them.
     ///
     /// # Errors
     ///
-    /// Returns an error if any chunk cannot be retrieved or decryption fails.
+    /// Returns an error if any chunk cannot be retrieved, if decryption fails,
+    /// or if a shrunk map must be resolved on a current-thread runtime.
     pub async fn data_download(&self, data_map: &DataMap) -> Result<Bytes> {
         let root_data_map = self.resolve_root_data_map(data_map).await?;
 
@@ -518,10 +523,15 @@ impl Client {
     /// whose `infos()` reference the actual content chunks. A map that is not
     /// a child is returned unchanged without any network access.
     ///
+    /// Resolution bridges self-encryption's synchronous fetcher onto the async
+    /// network via `block_in_place`, which requires a multi-threaded Tokio
+    /// runtime. On a current-thread runtime this returns [`Error::Config`]
+    /// rather than letting `block_in_place` panic.
+    ///
     /// # Errors
     ///
-    /// Returns an error if a wrapper chunk cannot be retrieved or the map
-    /// cannot be unshrunk.
+    /// Returns an error if called on a current-thread runtime, if a wrapper
+    /// chunk cannot be retrieved, or if the map cannot be unshrunk.
     async fn resolve_root_data_map(&self, data_map: &DataMap) -> Result<DataMap> {
         if !data_map.is_child() {
             return Ok(data_map.clone());
@@ -531,8 +541,12 @@ impl Client {
 
         // `get_root_data_map` drives a synchronous `FnMut` fetcher, so bridge
         // to the async `chunk_get` via `block_in_place` + `block_on` (the same
-        // pattern `file_download` uses). Requires a multi-threaded runtime.
+        // pattern `file_download` uses). `block_in_place` panics on a
+        // current-thread runtime, so reject that precondition with a clear
+        // error instead of letting it panic inside the fetcher.
         let handle = Handle::current();
+        ensure_shrunk_resolution_runtime(handle.runtime_flavor())?;
+
         let root = tokio::task::block_in_place(|| {
             let mut get_chunk =
                 |name: XorName| -> std::result::Result<Bytes, self_encryption::Error> {
@@ -562,6 +576,24 @@ impl Client {
 
         Ok(root)
     }
+}
+
+/// Reject resolving a shrunk `DataMap` on a current-thread Tokio runtime.
+///
+/// Resolution uses `block_in_place` to bridge self-encryption's synchronous
+/// chunk fetcher onto the async network, and `block_in_place` panics on a
+/// current-thread runtime. Mapping that precondition to [`Error::Config`]
+/// turns a hard panic into a recoverable error for library consumers that
+/// drive `data_download` from a current-thread runtime.
+fn ensure_shrunk_resolution_runtime(flavor: RuntimeFlavor) -> Result<()> {
+    if flavor == RuntimeFlavor::CurrentThread {
+        return Err(Error::Config(
+            "resolving a shrunk DataMap requires a multi-threaded Tokio runtime, \
+             but data_download was called on a current-thread runtime"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn decode_data_map_chunk(content: &[u8]) -> Result<DataMap> {
@@ -616,5 +648,25 @@ mod send_assertions {
     async fn _data_prepare_upload_with_visibility_is_send(client: &Client) {
         let fut = client.data_prepare_upload_with_visibility(Bytes::new(), Visibility::Public);
         _assert_send(&fut);
+    }
+}
+
+#[cfg(test)]
+mod runtime_guard_tests {
+    use super::*;
+
+    #[test]
+    fn shrunk_resolution_rejects_current_thread_runtime() {
+        // A current-thread runtime cannot drive `block_in_place`, so the guard
+        // must surface a descriptive `Error::Config` rather than panicking.
+        assert!(matches!(
+            ensure_shrunk_resolution_runtime(RuntimeFlavor::CurrentThread),
+            Err(Error::Config(_))
+        ));
+    }
+
+    #[test]
+    fn shrunk_resolution_accepts_multi_thread_runtime() {
+        assert!(ensure_shrunk_resolution_runtime(RuntimeFlavor::MultiThread).is_ok());
     }
 }
