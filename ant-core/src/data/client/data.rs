@@ -183,6 +183,12 @@ impl Client {
                     chunk_count,
                 )
                 .await?;
+            // `merkle_upload_chunks` no longer re-raises `outcome.fatal`, so the
+            // whole-file data path re-raises it here to keep its all-or-nothing
+            // contract (a non-quorum error aborts the upload).
+            if let Some(e) = outcome.fatal {
+                return Err(e);
+            }
             // Unlike `FileUploadResult`, `DataUploadResult` cannot express a
             // partial store, and the returned `data_map` is unusable unless
             // every chunk landed (download fails on any missing chunk). So a

@@ -18,8 +18,8 @@ use crate::data::client::chunk::ChunkPeerGetResult;
 use crate::data::client::classify_error;
 use crate::data::client::merkle::{
     chunk_contents_for_upload_addresses, finalize_merkle_batch, merkle_deferred_retry,
-    merkle_store_with_retry, should_use_merkle, MerkleBatchPaymentResult, PaymentMode,
-    PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
+    merkle_store_with_retry, should_use_merkle, MerkleBatchPaymentResult, MerkleStoreOutcome,
+    PaymentMode, PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
 };
 use crate::data::client::Client;
 use crate::data::error::{Error, PartialUploadSpend, Result};
@@ -1044,7 +1044,10 @@ pub struct PreparedUpload {
 /// non-serializable network types (`PeerId`, `MultiAddr`), so FFI consumers
 /// retain it as an opaque handle rather than serializing it across the
 /// boundary. Marked `#[non_exhaustive]` so new fields are not breaking.
-#[derive(Debug)]
+///
+/// `Debug` is implemented manually and **redacted**: it prints only counts, not
+/// chunk bodies or payment proofs, so `{:?}` logging downstream cannot leak
+/// private upload material.
 #[non_exhaustive]
 pub struct PaidRetryState {
     /// Data map for the upload, forwarded to the eventual [`FileUploadResult`].
@@ -1061,7 +1064,6 @@ pub struct PaidRetryState {
 }
 
 /// Payment-mode-specific retry material carried by [`PaidRetryState`].
-#[derive(Debug)]
 enum PaidRetryKind {
     /// Wave-batch: each unstored chunk carries its own paid proof.
     Wave {
@@ -1110,6 +1112,24 @@ impl PaidRetryState {
     }
 }
 
+// Redacted `Debug`: counts only, never chunk bodies or payment proofs, so
+// downstream `{:?}` logging cannot leak private upload material.
+impl std::fmt::Debug for PaidRetryState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mode = match self.kind {
+            PaidRetryKind::Wave { .. } => "wave",
+            PaidRetryKind::Merkle { .. } => "merkle",
+        };
+        f.debug_struct("PaidRetryState")
+            .field("mode", &mode)
+            .field("total_chunks", &self.total_chunks)
+            .field("stored_count", &self.stored_addresses.len())
+            .field("unstored_count", &self.unstored_count())
+            .field("data_map_address", &self.data_map_address.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Fields shared by both finalize drivers, bundled to keep their signatures
 /// under the argument-count lint and to carry the cumulative store progress
 /// across resume attempts.
@@ -1120,6 +1140,237 @@ struct RetryShared {
     /// Cumulative addresses already on the network (preflight-skipped chunks
     /// plus anything stored on earlier attempts).
     prior_stored: Vec<[u8; 32]>,
+}
+
+/// Assemble the finalize result from a completed wave-batch store.
+///
+/// Pure (no I/O): the network store happens in
+/// [`Client::store_paid_wave`], and all the retry-state / success logic lives
+/// here so it can be unit-tested without a network. On a residual failure it
+/// returns [`Error::FinalizeStorePaidFailed`] carrying the paid-but-unstored
+/// `PaidChunk`s so the same payment can be resumed.
+fn assemble_wave_result(
+    shared: RetryShared,
+    storage_cost_atto: String,
+    wave_result: WaveResult,
+) -> Result<FileUploadResult> {
+    let RetryShared {
+        data_map,
+        data_map_address,
+        total_chunks,
+        prior_stored,
+    } = shared;
+
+    let mut stats = WaveAggregateStats::default();
+    stats.absorb(&wave_result);
+    let WaveResult {
+        stored: wave_stored,
+        failed,
+        failed_chunks,
+        ..
+    } = wave_result;
+
+    // Fold this round's successes into the cumulative stored set.
+    let mut stored_addresses = prior_stored;
+    stored_addresses.extend(wave_stored);
+    let stored_count = stored_addresses.len();
+
+    if !failed.is_empty() {
+        let failed_count = failed.len();
+        let retry = PaidRetryState {
+            data_map,
+            data_map_address,
+            total_chunks,
+            stored_addresses: stored_addresses.clone(),
+            kind: PaidRetryKind::Wave {
+                unstored: failed_chunks,
+                storage_cost_atto: storage_cost_atto.clone(),
+            },
+        };
+        return Err(Error::FinalizeStorePaidFailed {
+            stored: stored_addresses,
+            stored_count,
+            failed,
+            failed_count,
+            total_chunks,
+            spend: Box::new(PartialUploadSpend {
+                storage_cost_atto,
+                gas_cost_wei: 0,
+            }),
+            retry: Box::new(retry),
+            reason: "finalize: chunk storage failed after retries \
+                     (payment retained — retry with finalize_resume)"
+                .into(),
+        });
+    }
+
+    info!("External-signer upload finalized: {stored_count} chunks stored");
+
+    Ok(FileUploadResult {
+        data_map,
+        chunks_stored: stored_count,
+        chunks_failed: 0,
+        total_chunks,
+        payment_mode_used: PaymentMode::Single,
+        storage_cost_atto,
+        gas_cost_wei: 0,
+        data_map_address,
+        chunk_attempts_total: stats.chunk_attempts_total,
+        store_durations_ms: stats.store_durations_ms,
+        retries_histogram: stats.retries_histogram,
+    })
+}
+
+/// Classify a merkle-store fatal error. Returns `true` when re-storing cannot
+/// possibly help — the paid proof/data itself is broken (a missing/corrupt
+/// proof, a missing body, a serialization or signature failure) — so the error
+/// must stay terminal. Returns `false` for transient conditions
+/// (network/timeout/io/protocol/storage) that struck *after* payment and which
+/// a resume against the same payment can recover.
+fn merkle_fatal_is_unrecoverable(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Payment(_)
+            | Error::InvalidData(_)
+            | Error::Serialization(_)
+            | Error::Crypto(_)
+            | Error::SignatureVerification(_)
+    )
+}
+
+/// Assemble the finalize result from a completed merkle store.
+///
+/// Pure (no I/O), like [`assemble_wave_result`]. `contents`/`addresses` are the
+/// set that was (re-)attempted this round; `outcome` is what the store
+/// produced, including any `outcome.fatal`.
+///
+/// Failure handling:
+/// - An *unrecoverable* fatal (see [`merkle_fatal_is_unrecoverable`]) is
+///   returned as-is — the batch is unusable and no retry can fix it.
+/// - Otherwise, any chunk not confirmed stored (quorum shortfalls *and* chunks
+///   left unattempted when a transient fatal aborted the pass) is folded into a
+///   [`PaidRetryState`] carrying the unstored bodies and the reusable batch
+///   proofs (filtered to just the unstored subset). The same on-chain payment
+///   is then resumable via [`Client::finalize_resume`] with no new pool.
+fn assemble_merkle_result(
+    shared: RetryShared,
+    mut batch_result: MerkleBatchPaymentResult,
+    contents: Vec<Bytes>,
+    addresses: Vec<[u8; 32]>,
+    outcome: MerkleStoreOutcome,
+) -> Result<FileUploadResult> {
+    let RetryShared {
+        data_map,
+        data_map_address,
+        total_chunks,
+        prior_stored,
+    } = shared;
+
+    let MerkleStoreOutcome {
+        stored_addresses: newly_stored,
+        failed_addresses,
+        fatal,
+        stats,
+        ..
+    } = outcome;
+
+    // A genuinely-unrecoverable fatal stays terminal: re-storing a broken proof
+    // or body cannot help, so we do not hand back retry state.
+    if fatal.as_ref().is_some_and(merkle_fatal_is_unrecoverable) {
+        return Err(fatal.expect("checked is_some just above"));
+    }
+
+    // Anything the store did not confirm is unstored — this covers both quorum
+    // shortfalls (`failed_addresses`) and chunks left unattempted when a
+    // transient fatal aborted the pass (input minus confirmed).
+    let stored_set: HashSet<[u8; 32]> = newly_stored.iter().copied().collect();
+    let bodies: HashMap<[u8; 32], Bytes> = addresses.iter().copied().zip(contents).collect();
+    let unstored_addresses: Vec<[u8; 32]> = addresses
+        .into_iter()
+        .filter(|a| !stored_set.contains(a))
+        .collect();
+
+    // Fold this round's confirmed stores into the cumulative stored set.
+    let mut stored_addresses = prior_stored;
+    stored_addresses.extend(newly_stored);
+    let stored_count = stored_addresses.len();
+
+    if !unstored_addresses.is_empty() {
+        let unstored_contents = unstored_addresses
+            .iter()
+            .map(|a| bodies.get(a).cloned())
+            .collect::<Option<Vec<Bytes>>>()
+            .ok_or_else(|| {
+                Error::InvalidData(
+                    "merkle finalize: missing chunk body for an unstored address".into(),
+                )
+            })?;
+
+        // Report every unstored chunk, using the store's per-chunk message where
+        // one exists and a generic note for chunks aborted before an attempt.
+        let msg_by_addr: HashMap<[u8; 32], String> = failed_addresses.into_iter().collect();
+        let failed: Vec<([u8; 32], String)> = unstored_addresses
+            .iter()
+            .map(|a| {
+                let msg = msg_by_addr.get(a).cloned().unwrap_or_else(|| {
+                    "not stored (pass aborted before this chunk was attempted)".to_string()
+                });
+                (*a, msg)
+            })
+            .collect();
+        let failed_count = failed.len();
+
+        // Keep only the proofs still needed (the unstored subset) — smaller
+        // retry state and a smaller surface of paid material held in memory.
+        let unstored_set: HashSet<[u8; 32]> = unstored_addresses.iter().copied().collect();
+        batch_result
+            .proofs
+            .retain(|addr, _| unstored_set.contains(addr));
+
+        let storage_cost_atto = batch_result.storage_cost_atto.clone();
+        let retry = PaidRetryState {
+            data_map,
+            data_map_address,
+            total_chunks,
+            stored_addresses: stored_addresses.clone(),
+            kind: PaidRetryKind::Merkle {
+                batch_result,
+                unstored_contents,
+                unstored_addresses,
+            },
+        };
+        return Err(Error::FinalizeStorePaidFailed {
+            stored: stored_addresses,
+            stored_count,
+            failed,
+            failed_count,
+            total_chunks,
+            spend: Box::new(PartialUploadSpend {
+                storage_cost_atto,
+                gas_cost_wei: 0,
+            }),
+            retry: Box::new(retry),
+            reason: "finalize (merkle): chunk storage failed after retries \
+                     (payment retained — retry with finalize_resume)"
+                .into(),
+        });
+    }
+
+    info!("External-signer merkle upload finalized: {stored_count} chunks stored");
+
+    Ok(FileUploadResult {
+        data_map,
+        chunks_stored: stored_count,
+        chunks_failed: 0,
+        total_chunks,
+        payment_mode_used: PaymentMode::Merkle,
+        storage_cost_atto: batch_result.storage_cost_atto,
+        gas_cost_wei: 0,
+        data_map_address,
+        chunk_attempts_total: stats.chunk_attempts_total,
+        store_durations_ms: stats.store_durations_ms,
+        retries_histogram: stats.retries_histogram,
+    })
 }
 
 /// Return type for [`spawn_file_encryption`]: chunk receiver, `DataMap` oneshot, join handle.
@@ -1884,6 +2135,12 @@ impl Client {
     /// [`Error::FinalizeStorePaidFailed`] with a reduced retry state, so a
     /// caller can loop until it drains or gives up.
     ///
+    /// The stats on the returned [`FileUploadResult`] (`chunk_attempts_total`,
+    /// `store_durations_ms`, `retries_histogram`) describe **only the resuming
+    /// call**, not the lifetime of the original finalize plus every resume — the
+    /// `chunks_stored`/`total_chunks` counts are cumulative, but the retry/
+    /// timing metrics are per-call by design.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::FinalizeStorePaidFailed`] if some chunks still fail to
@@ -1960,77 +2217,15 @@ impl Client {
         storage_cost_atto: String,
         progress: Option<&mpsc::Sender<UploadEvent>>,
     ) -> Result<FileUploadResult> {
-        let RetryShared {
-            data_map,
-            data_map_address,
-            total_chunks,
-            prior_stored,
-        } = shared;
-        let stored_before = prior_stored.len();
+        let stored_before = shared.prior_stored.len();
         let wave_result = self
-            .store_paid_chunks_with_events(to_store, progress, stored_before, total_chunks)
+            .store_paid_chunks_with_events(to_store, progress, stored_before, shared.total_chunks)
             .await;
-
-        let mut stats = WaveAggregateStats::default();
-        stats.absorb(&wave_result);
-        let WaveResult {
-            stored: wave_stored,
-            failed,
-            failed_chunks,
-            ..
-        } = wave_result;
-
-        // Fold this round's successes into the cumulative stored set.
-        let mut stored_addresses = prior_stored;
-        stored_addresses.extend(wave_stored);
-        let stored_count = stored_addresses.len();
-
-        if !failed.is_empty() {
-            let failed_count = failed.len();
-            // The payment is NOT lost: hand back the paid-but-unstored proofs so
-            // the caller can re-drive storage against the same payment.
-            let retry = PaidRetryState {
-                data_map,
-                data_map_address,
-                total_chunks,
-                stored_addresses: stored_addresses.clone(),
-                kind: PaidRetryKind::Wave {
-                    unstored: failed_chunks,
-                    storage_cost_atto: storage_cost_atto.clone(),
-                },
-            };
-            return Err(Error::FinalizeStorePaidFailed {
-                stored: stored_addresses,
-                stored_count,
-                failed,
-                failed_count,
-                total_chunks,
-                spend: Box::new(PartialUploadSpend {
-                    storage_cost_atto,
-                    gas_cost_wei: 0,
-                }),
-                retry: Box::new(retry),
-                reason: "finalize: chunk storage failed after retries \
-                         (payment retained — retry with finalize_resume)"
-                    .into(),
-            });
-        }
-
-        info!("External-signer upload finalized: {stored_count} chunks stored");
-
-        Ok(FileUploadResult {
-            data_map,
-            chunks_stored: stored_count,
-            chunks_failed: 0,
-            total_chunks,
-            payment_mode_used: PaymentMode::Single,
-            storage_cost_atto,
-            gas_cost_wei: 0,
-            data_map_address,
-            chunk_attempts_total: stats.chunk_attempts_total,
-            store_durations_ms: stats.store_durations_ms,
-            retries_histogram: stats.retries_histogram,
-        })
+        // All retry-state assembly lives in the pure `assemble_wave_result` so
+        // it is unit-testable without a network. This method only performs the
+        // network store; it never quotes or pays — so resuming a failed
+        // finalize re-enters here and cannot trigger a second payment.
+        assemble_wave_result(shared, storage_cost_atto, wave_result)
     }
 
     /// Drive storage of an already-paid merkle batch and assemble the finalize
@@ -2044,9 +2239,11 @@ impl Client {
     /// same `batch_result`, and [`Client::finalize_resume`] re-drives just those
     /// chunks against the same payment — no new pool, no new winner hash.
     ///
-    /// A *fatal* (non-quorum) store error — e.g. a missing proof — is not
-    /// recoverable by re-storing and is propagated as-is, matching the prior
-    /// all-or-nothing behaviour for that class.
+    /// A *fatal* store error is split by class: a genuinely unrecoverable one
+    /// (proof/data corruption — re-storing cannot help) is propagated as-is,
+    /// while a transient one (network/timeout/io/protocol/storage after
+    /// payment) is folded into the retry state so the same payment can still be
+    /// resumed. See [`assemble_merkle_result`].
     ///
     /// `contents`/`addresses` are the paid set to (re-)attempt now;
     /// `shared.prior_stored` is the cumulative set already on the network.
@@ -2058,104 +2255,25 @@ impl Client {
         addresses: Vec<[u8; 32]>,
         progress: Option<&mpsc::Sender<UploadEvent>>,
     ) -> Result<FileUploadResult> {
-        let RetryShared {
-            data_map,
-            data_map_address,
-            total_chunks,
-            prior_stored,
-        } = shared;
-        let stored_before = prior_stored.len();
+        let stored_before = shared.prior_stored.len();
 
-        // Keep a cheap (refcounted) address -> body map so the unstored chunks
-        // can be carried into a retry state on failure. `Bytes::clone` is an
-        // O(1) refcount bump, not a copy.
-        let bodies: HashMap<[u8; 32], Bytes> = addresses
-            .iter()
-            .copied()
-            .zip(contents.iter().cloned())
-            .collect();
-
-        // `merkle_upload_chunks` re-raises a fatal (non-quorum) error as `Err`,
-        // so past this point the outcome only carries recoverable quorum
-        // shortfalls in `failed_addresses`.
+        // `merkle_upload_chunks` no longer re-raises a fatal error; it returns
+        // the outcome with `outcome.fatal` set, so the pure
+        // `assemble_merkle_result` can decide recoverable-vs-terminal. This
+        // method only performs the network store — it never quotes or pays, so
+        // resuming cannot trigger a second payment.
         let outcome = self
             .merkle_upload_chunks(
-                contents,
-                addresses,
+                contents.clone(),
+                addresses.clone(),
                 &batch_result,
                 progress,
                 stored_before,
-                total_chunks,
+                shared.total_chunks,
             )
             .await?;
 
-        // Fold this round's confirmed stores into the cumulative stored set.
-        // `outcome.stored` already counts the `stored_before` carry-in, so the
-        // cumulative address count matches it.
-        let mut stored_addresses = prior_stored;
-        stored_addresses.extend(outcome.stored_addresses.iter().copied());
-        let stored_count = stored_addresses.len();
-
-        if !outcome.failed_addresses.is_empty() {
-            let failed = outcome.failed_addresses;
-            let failed_count = failed.len();
-            // Carry the unstored bodies + the reusable batch proofs so the same
-            // payment can be retried without a new pool.
-            let unstored_addresses: Vec<[u8; 32]> = failed.iter().map(|(a, _)| *a).collect();
-            let unstored_contents = unstored_addresses
-                .iter()
-                .map(|a| bodies.get(a).cloned())
-                .collect::<Option<Vec<Bytes>>>()
-                .ok_or_else(|| {
-                    Error::InvalidData(
-                        "merkle finalize: missing chunk body for a failed address".into(),
-                    )
-                })?;
-            let retry = PaidRetryState {
-                data_map,
-                data_map_address,
-                total_chunks,
-                stored_addresses: stored_addresses.clone(),
-                kind: PaidRetryKind::Merkle {
-                    batch_result,
-                    unstored_contents,
-                    unstored_addresses,
-                },
-            };
-            return Err(Error::FinalizeStorePaidFailed {
-                stored: stored_addresses,
-                stored_count,
-                failed,
-                failed_count,
-                total_chunks,
-                // Merkle storage cost is not surfaced per-chunk here; gas is
-                // paid by the external signer out-of-band.
-                spend: Box::new(PartialUploadSpend {
-                    storage_cost_atto: "0".into(),
-                    gas_cost_wei: 0,
-                }),
-                retry: Box::new(retry),
-                reason: "finalize (merkle): chunk storage failed after retries \
-                         (payment retained — retry with finalize_resume)"
-                    .into(),
-            });
-        }
-
-        info!("External-signer merkle upload finalized: {stored_count} chunks stored");
-
-        Ok(FileUploadResult {
-            data_map,
-            chunks_stored: stored_count,
-            chunks_failed: 0,
-            total_chunks,
-            payment_mode_used: PaymentMode::Merkle,
-            storage_cost_atto: "0".into(),
-            gas_cost_wei: 0,
-            data_map_address,
-            chunk_attempts_total: outcome.stats.chunk_attempts_total,
-            store_durations_ms: outcome.stats.store_durations_ms,
-            retries_histogram: outcome.stats.retries_histogram,
-        })
+        assemble_merkle_result(shared, batch_result, contents, addresses, outcome)
     }
 
     /// Phase 2 of external-signer upload (merkle): finalize with winner pool hash.
@@ -3861,6 +3979,258 @@ mod tests {
             }
             other => panic!("expected FinalizeStorePaidFailed, got {other:?}"),
         }
+    }
+
+    // --- Behavioural round-trip tests for the #140 path ------------------
+    // These drive the pure assembly functions that hold all the retry logic,
+    // simulating "first store attempt fails, resume succeeds" deterministically
+    // without a network. Neither `assemble_*_result` nor the `store_paid_*`
+    // wrappers have any quote/pay path, so a successful resume structurally
+    // cannot trigger a second on-chain payment.
+
+    fn test_shared(prior: Vec<[u8; 32]>, total: usize, dma: Option<[u8; 32]>) -> RetryShared {
+        RetryShared {
+            data_map: DataMap::new(Vec::new()),
+            data_map_address: dma,
+            total_chunks: total,
+            prior_stored: prior,
+        }
+    }
+
+    fn wave_result_from(stored: Vec<[u8; 32]>, failed_chunks: Vec<PaidChunk>) -> WaveResult {
+        let failed = failed_chunks
+            .iter()
+            .map(|c| (c.address, "store failed".to_string()))
+            .collect();
+        WaveResult {
+            stored,
+            failed,
+            failed_chunks,
+            chunk_attempts_total: 0,
+            store_durations_ms: vec![],
+            retries_per_chunk: vec![],
+        }
+    }
+
+    fn merkle_batch(addrs: &[[u8; 32]], cost: &str) -> MerkleBatchPaymentResult {
+        MerkleBatchPaymentResult {
+            proofs: addrs.iter().map(|a| (*a, vec![a[0]])).collect(),
+            chunk_count: addrs.len(),
+            storage_cost_atto: cost.into(),
+            gas_cost_wei: 0,
+            merkle_payment_timestamp: 0,
+        }
+    }
+
+    fn merkle_outcome(
+        stored: Vec<[u8; 32]>,
+        failed: Vec<[u8; 32]>,
+        fatal: Option<Error>,
+    ) -> MerkleStoreOutcome {
+        MerkleStoreOutcome {
+            stored_addresses: stored,
+            failed_addresses: failed
+                .into_iter()
+                .map(|a| (a, "short of quorum".to_string()))
+                .collect(),
+            fatal,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wave_finalize_then_resume_succeeds_without_new_payment() {
+        let dma = Some([9u8; 32]);
+        // 1 chunk already on the network (preflight), 3 paid this finalize.
+        let shared = test_shared(vec![[0u8; 32]], 4, dma);
+        let chunk_b = fake_paid_chunk(2);
+        let chunk_c = fake_paid_chunk(3);
+
+        // Round 1: A stores, B and C fail.
+        let r1 = wave_result_from(vec![[1u8; 32]], vec![chunk_b.clone(), chunk_c.clone()]);
+        let err = assemble_wave_result(shared, "1200".into(), r1).unwrap_err();
+
+        let retry = match err {
+            Error::FinalizeStorePaidFailed {
+                stored_count,
+                failed_count,
+                spend,
+                retry,
+                ..
+            } => {
+                assert_eq!(stored_count, 2, "preflight + A");
+                assert_eq!(failed_count, 2, "B and C");
+                assert_eq!(spend.storage_cost_atto, "1200");
+                *retry
+            }
+            other => panic!("expected FinalizeStorePaidFailed, got {other:?}"),
+        };
+        assert_eq!(retry.unstored_count(), 2);
+        assert_eq!(retry.stored_count(), 2);
+        assert_eq!(
+            retry.data_map_address, dma,
+            "public data-map address preserved"
+        );
+
+        // Round 2 (resume): re-drive exactly the unstored chunks; now they store.
+        let PaidRetryState {
+            data_map,
+            data_map_address,
+            total_chunks,
+            stored_addresses,
+            kind,
+        } = retry;
+        let (unstored, storage_cost_atto) = match kind {
+            PaidRetryKind::Wave {
+                unstored,
+                storage_cost_atto,
+            } => (unstored, storage_cost_atto),
+            _ => panic!("expected wave kind"),
+        };
+        let resumed = RetryShared {
+            data_map,
+            data_map_address,
+            total_chunks,
+            prior_stored: stored_addresses,
+        };
+        let stored2: Vec<[u8; 32]> = unstored.iter().map(|c| c.address).collect();
+        let r2 = wave_result_from(stored2, vec![]);
+        let result = assemble_wave_result(resumed, storage_cost_atto, r2).unwrap();
+
+        assert_eq!(result.chunks_stored, 4, "all chunks now stored");
+        assert_eq!(result.total_chunks, 4);
+        assert_eq!(result.chunks_failed, 0);
+        assert_eq!(
+            result.storage_cost_atto, "1200",
+            "spend carried across resume"
+        );
+        assert_eq!(result.data_map_address, dma);
+    }
+
+    #[test]
+    fn merkle_finalize_then_resume_succeeds_and_reports_spend() {
+        let dma = Some([9u8; 32]);
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let batch = merkle_batch(&[a, b, c], "777");
+        let shared = test_shared(vec![[0u8; 32]], 4, dma);
+        let contents = vec![
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"b"),
+            Bytes::from_static(b"c"),
+        ];
+
+        // Round 1: A stores, B and C short of quorum.
+        let outcome1 = merkle_outcome(vec![a], vec![b, c], None);
+        let err =
+            assemble_merkle_result(shared, batch, contents, vec![a, b, c], outcome1).unwrap_err();
+
+        let retry = match err {
+            Error::FinalizeStorePaidFailed {
+                stored_count,
+                failed_count,
+                spend,
+                retry,
+                ..
+            } => {
+                assert_eq!(stored_count, 2);
+                assert_eq!(failed_count, 2);
+                assert_eq!(spend.storage_cost_atto, "777", "real merkle spend, not 0");
+                *retry
+            }
+            other => panic!("expected FinalizeStorePaidFailed, got {other:?}"),
+        };
+        assert_eq!(retry.unstored_count(), 2);
+
+        let (batch2, contents2, addrs2, prior2, dm, dma2, total2) = match retry {
+            PaidRetryState {
+                data_map,
+                data_map_address,
+                total_chunks,
+                stored_addresses,
+                kind:
+                    PaidRetryKind::Merkle {
+                        batch_result,
+                        unstored_contents,
+                        unstored_addresses,
+                    },
+            } => {
+                // Proofs filtered to just the unstored subset.
+                assert_eq!(batch_result.proofs.len(), 2);
+                assert!(batch_result.proofs.contains_key(&b));
+                assert!(batch_result.proofs.contains_key(&c));
+                assert!(!batch_result.proofs.contains_key(&a));
+                (
+                    batch_result,
+                    unstored_contents,
+                    unstored_addresses,
+                    stored_addresses,
+                    data_map,
+                    data_map_address,
+                    total_chunks,
+                )
+            }
+            _ => panic!("expected merkle kind"),
+        };
+        assert_eq!(dma2, dma, "public data-map address preserved");
+
+        // Round 2 (resume): both remaining chunks store.
+        let resumed = RetryShared {
+            data_map: dm,
+            data_map_address: dma2,
+            total_chunks: total2,
+            prior_stored: prior2,
+        };
+        let outcome2 = merkle_outcome(addrs2.clone(), vec![], None);
+        let result = assemble_merkle_result(resumed, batch2, contents2, addrs2, outcome2).unwrap();
+
+        assert_eq!(result.chunks_stored, 4);
+        assert_eq!(result.storage_cost_atto, "777");
+        assert_eq!(result.data_map_address, dma);
+    }
+
+    #[test]
+    fn merkle_transient_fatal_is_retryable() {
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let batch = merkle_batch(&[a, b, c], "5");
+        let shared = test_shared(vec![], 3, None);
+        let contents = vec![
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"b"),
+            Bytes::from_static(b"c"),
+        ];
+        // A stored, B short of quorum, then a transient network error aborted
+        // the pass before C was attempted.
+        let outcome = merkle_outcome(vec![a], vec![b], Some(Error::Timeout("net".into())));
+        let err =
+            assemble_merkle_result(shared, batch, contents, vec![a, b, c], outcome).unwrap_err();
+
+        match err {
+            Error::FinalizeStorePaidFailed { retry, .. } => {
+                // Everything not confirmed stored is retryable: B and C.
+                assert_eq!(retry.unstored_count(), 2);
+            }
+            other => panic!("transient fatal must stay retryable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merkle_unrecoverable_fatal_is_terminal() {
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let batch = merkle_batch(&[a, b], "5");
+        let shared = test_shared(vec![], 2, None);
+        let contents = vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")];
+        // A missing/corrupt proof is not recoverable by re-storing.
+        let outcome = merkle_outcome(
+            vec![a],
+            vec![],
+            Some(Error::Payment("missing proof".into())),
+        );
+        let err = assemble_merkle_result(shared, batch, contents, vec![a, b], outcome).unwrap_err();
+
+        assert!(
+            matches!(err, Error::Payment(_)),
+            "unrecoverable fatal must stay terminal, got {err:?}"
+        );
     }
 
     #[test]
