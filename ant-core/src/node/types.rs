@@ -67,13 +67,13 @@ pub struct DaemonInfo {
 pub enum NodeStatus {
     Stopped,
     Starting,
+    /// The `upgrade_scheduled` alias accepts the retired status emitted by pre-removal daemons: an
+    /// upgrade-scheduled node is functionally running, so a newer client reading an older daemon's
+    /// status maps the old value here rather than failing to deserialize.
+    #[serde(alias = "upgrade_scheduled")]
     Running,
     Stopping,
     Errored,
-    /// The node's on-disk binary has been replaced by an auto-upgrade, but the process has not
-    /// yet restarted. The supervisor is waiting for the current process to exit and will then
-    /// respawn it against the new binary.
-    UpgradeScheduled,
     /// The daemon automatically stopped this node and deleted its data directory to reclaim disk
     /// space for the remaining nodes. This is a terminal state derived from a persisted
     /// [`EvictionRecord`] on the node's config — it survives daemon restarts and is cleared only
@@ -136,10 +136,6 @@ pub struct NodeInfo {
     pub status: NodeStatus,
     pub pid: Option<u32>,
     pub uptime_secs: Option<u64>,
-    /// Set only when `status == UpgradeScheduled`: the new version that the replaced on-disk
-    /// binary reports. Omitted otherwise.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pending_version: Option<String>,
 }
 
 /// Result of a daemon start operation.
@@ -448,10 +444,6 @@ pub struct NodeStatusSummary {
     /// Seconds since the node process started (only set when running).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uptime_secs: Option<u64>,
-    /// Set only when `status == UpgradeScheduled`: the new version that the replaced on-disk
-    /// binary reports. Omitted otherwise.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pending_version: Option<String>,
     /// Set only when `status == Evicted`: details of why/when the node was evicted, so the CLI and
     /// GUI can show supplementary text. Omitted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -505,11 +497,12 @@ mod tests {
     }
 
     #[test]
-    fn node_status_upgrade_scheduled_serializes() {
-        let json = serde_json::to_string(&NodeStatus::UpgradeScheduled).unwrap();
-        assert_eq!(json, "\"upgrade_scheduled\"");
-        let parsed: NodeStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, NodeStatus::UpgradeScheduled);
+    fn node_status_upgrade_scheduled_deserializes_as_running() {
+        // Backwards compatibility: the retired `upgrade_scheduled` status emitted by a pre-removal
+        // daemon must still deserialize (as the functionally-equivalent Running) so a newer client
+        // talking to an older daemon during a rolling upgrade doesn't error.
+        let parsed: NodeStatus = serde_json::from_str("\"upgrade_scheduled\"").unwrap();
+        assert_eq!(parsed, NodeStatus::Running);
     }
 
     #[test]
@@ -551,7 +544,6 @@ mod tests {
             status: NodeStatus::Evicted,
             pid: None,
             uptime_secs: None,
-            pending_version: None,
             eviction: Some(EvictionRecord {
                 reason: "Low disk: 480 MiB free, evicting smallest node".to_string(),
                 evicted_at: 1_700_000_000,
@@ -563,25 +555,6 @@ mod tests {
         assert!(json.contains("\"reclaimed_bytes\":2147483648"));
         let parsed: NodeStatusSummary = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.eviction.unwrap().evicted_at, 1_700_000_000);
-    }
-
-    #[test]
-    fn node_status_summary_with_pending_version() {
-        let summary = NodeStatusSummary {
-            node_id: 7,
-            name: "antnode-7".to_string(),
-            version: "0.10.1".to_string(),
-            status: NodeStatus::UpgradeScheduled,
-            pid: Some(4242),
-            uptime_secs: Some(3600),
-            pending_version: Some("0.10.11-rc.1".to_string()),
-            eviction: None,
-        };
-        let json = serde_json::to_string(&summary).unwrap();
-        assert!(json.contains("\"status\":\"upgrade_scheduled\""));
-        assert!(json.contains("\"pending_version\":\"0.10.11-rc.1\""));
-        let roundtrip: NodeStatusSummary = serde_json::from_str(&json).unwrap();
-        assert_eq!(roundtrip.pending_version.as_deref(), Some("0.10.11-rc.1"));
     }
 
     #[test]
@@ -665,7 +638,6 @@ mod tests {
                     status: NodeStatus::Running,
                     pid: Some(1234),
                     uptime_secs: Some(60),
-                    pending_version: None,
                     eviction: None,
                 },
                 NodeStatusSummary {
@@ -675,7 +647,6 @@ mod tests {
                     status: NodeStatus::Stopped,
                     pid: None,
                     uptime_secs: None,
-                    pending_version: None,
                     eviction: None,
                 },
             ],
@@ -701,7 +672,6 @@ mod tests {
             status: NodeStatus::Running,
             pid: Some(5678),
             uptime_secs: Some(120),
-            pending_version: None,
             eviction: None,
         };
         let json = serde_json::to_string(&summary).unwrap();
@@ -711,7 +681,6 @@ mod tests {
         assert!(json.contains("\"status\":\"running\""));
         assert!(json.contains("\"pid\":5678"));
         assert!(json.contains("\"uptime_secs\":120"));
-        assert!(!json.contains("pending_version"));
 
         // None fields should be omitted
         let stopped = NodeStatusSummary {
@@ -721,13 +690,11 @@ mod tests {
             status: NodeStatus::Stopped,
             pid: None,
             uptime_secs: None,
-            pending_version: None,
             eviction: None,
         };
         let json_stopped = serde_json::to_string(&stopped).unwrap();
         assert!(!json_stopped.contains("pid"));
         assert!(!json_stopped.contains("uptime_secs"));
-        assert!(!json_stopped.contains("pending_version"));
     }
 
     #[test]

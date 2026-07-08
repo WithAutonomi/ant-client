@@ -214,7 +214,6 @@ pub fn node_status_offline(registry_path: &Path) -> Result<NodeStatusResult> {
                 status,
                 pid: None,
                 uptime_secs: None,
-                pending_version: None,
                 eviction: config.eviction.clone(),
             }
         })

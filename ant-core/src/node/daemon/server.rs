@@ -17,8 +17,8 @@ use crate::error::Result;
 use crate::node::binary::NoopProgress;
 use crate::node::daemon::health::{DiskThresholds, FleetHealth};
 use crate::node::daemon::supervisor::{
-    spawn_eviction_monitor, spawn_liveness_monitor, spawn_upgrade_monitor, Supervisor,
-    EVICTION_POLL_INTERVAL, LIVENESS_POLL_INTERVAL, UPGRADE_POLL_INTERVAL,
+    spawn_eviction_monitor, spawn_liveness_monitor, Supervisor, EVICTION_POLL_INTERVAL,
+    LIVENESS_POLL_INTERVAL,
 };
 use crate::node::events::NodeEvent;
 use crate::node::registry::NodeRegistry;
@@ -97,16 +97,6 @@ pub async fn start(
         bound_port: bound_addr.port(),
         health: health.clone(),
     });
-
-    // Background task: probe each Running node's on-disk binary for version drift caused by
-    // ant-node's auto-upgrade, and flip them to UpgradeScheduled so the supervisor knows the
-    // next exit is expected.
-    spawn_upgrade_monitor(
-        registry.clone(),
-        supervisor.clone(),
-        UPGRADE_POLL_INTERVAL,
-        shutdown.clone(),
-    );
 
     // Background task: monitor free disk space at node data directories. Refreshes the fleet health
     // snapshot every tick and auto-evicts a node (smallest data dir) on any partition that has
@@ -258,19 +248,16 @@ async fn get_nodes_status(State(state): State<Arc<AppState>>) -> Json<NodeStatus
         };
 
         match status {
-            NodeStatus::Running | NodeStatus::Starting | NodeStatus::UpgradeScheduled => {
-                total_running += 1
-            }
+            NodeStatus::Running | NodeStatus::Starting => total_running += 1,
             _ => total_stopped += 1,
         }
 
-        let (pid, uptime_secs, pending_version) = if config.eviction.is_some() {
-            (None, None, None)
+        let (pid, uptime_secs) = if config.eviction.is_some() {
+            (None, None)
         } else {
             (
                 supervisor.node_pid(config.id),
                 supervisor.node_uptime_secs(config.id),
-                supervisor.node_pending_version(config.id),
             )
         };
 
@@ -281,7 +268,6 @@ async fn get_nodes_status(State(state): State<Arc<AppState>>) -> Json<NodeStatus
             status,
             pid,
             uptime_secs,
-            pending_version,
             eviction: config.eviction.clone(),
         });
     }
@@ -311,14 +297,13 @@ async fn get_node_detail(
 
     let supervisor = state.supervisor.read().await;
     // A persisted eviction marker takes precedence over any runtime status.
-    let (status, pid, uptime_secs, pending_version) = if config.eviction.is_some() {
-        (NodeStatus::Evicted, None, None, None)
+    let (status, pid, uptime_secs) = if config.eviction.is_some() {
+        (NodeStatus::Evicted, None, None)
     } else {
         (
             supervisor.node_status(id).unwrap_or(NodeStatus::Stopped),
             supervisor.node_pid(id),
             supervisor.node_uptime_secs(id),
-            supervisor.node_pending_version(id),
         )
     };
 
@@ -327,7 +312,6 @@ async fn get_node_detail(
         status,
         pid,
         uptime_secs,
-        pending_version,
     }))
 }
 
