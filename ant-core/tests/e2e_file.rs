@@ -4,7 +4,9 @@
 
 mod support;
 
-use ant_core::data::{compute_address, Client, ExternalPaymentInfo, PaymentMode, Visibility};
+use ant_core::data::{
+    compute_address, Client, ClientConfig, Error, ExternalPaymentInfo, PaymentMode, Visibility,
+};
 use ant_protocol::evm::{QuoteHash, TxHash};
 use serial_test::serial;
 use std::collections::HashMap;
@@ -354,6 +356,164 @@ async fn test_public_upload_round_trip_wave_batch() {
     assert_eq!(
         downloaded, original,
         "downloaded bytes must equal the original file"
+    );
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// #140 (wave-batch), Tier 1: a post-payment store failure on a real
+/// (in-process) testnet must surface `FinalizeStorePaidFailed` carrying a
+/// `PaidRetryState`, the wallet must NOT be charged again by the failed
+/// finalize, and the retry state must be re-drivable via `finalize_resume`
+/// without re-paying.
+///
+/// This proves the *real* store path (not a mocked `WaveResult`) produces the
+/// retry material and that resume re-enters storage with no second payment. The
+/// success-after-resume half needs the ability to restart a downed node, which
+/// `MiniTestnet` does not support — it is tracked as a devnet follow-up
+/// (WithAutonomi/ant-client#144).
+///
+/// `#[ignore]`: this drives storage against deliberately-killed peers, so its
+/// wall-clock is dominated by transport dial timeouts (several minutes, and
+/// markedly slower on virtualised macOS runners). The deterministic coverage of
+/// the same logic lives in the `assemble_*_result` unit tests, which run in CI;
+/// this test is a real-network proof run on demand:
+/// `cargo test -p ant-core --test e2e_file -- --ignored <name>`.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[ignore = "slow real-network test (~6 min, dead-peer dial timeouts); run on demand"]
+async fn test_finalize_after_payment_failure_yields_retryable_state_wave() {
+    let mut testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
+    let node = testnet.node(3).expect("Node 3 should exist");
+    // Prepare/quote against the healthy network needs the usual generous quote
+    // budget, but the store phase runs after we intentionally collapse the
+    // network, so a short store timeout lets each doomed attempt give up
+    // quickly instead of waiting the full 60 s per round.
+    let config = ClientConfig {
+        quote_timeout_secs: 60,
+        store_timeout_secs: 3,
+        ..Default::default()
+    };
+    let client = Client::from_node(Arc::clone(&node), config).with_wallet(testnet.wallet().clone());
+
+    let original = vec![0x5au8; 4096];
+    let mut input_file = NamedTempFile::new().expect("create temp file");
+    input_file.write_all(&original).expect("write temp file");
+    input_file.flush().expect("flush temp file");
+
+    // Phase 1: prepare (public → wave-batch for 4 KB) while the network is healthy.
+    let prepared = client
+        .file_prepare_upload_with_visibility(input_file.path(), Visibility::Public)
+        .await
+        .expect("prepare should succeed");
+    let total_chunks = prepared.total_chunks;
+
+    // Phase 2: pay the quotes (external-signer simulation).
+    let payments = match &prepared.payment_info {
+        ExternalPaymentInfo::WaveBatch { payment_intent, .. } => payment_intent.payments.clone(),
+        other => panic!("expected wave-batch payment for a 4KB file, got {other:?}"),
+    };
+    let (tx_hash_map, _gas) = testnet
+        .wallet()
+        .pay_for_quotes(payments)
+        .await
+        .expect("testnet wallet should pay for quotes");
+    let tx_hash_map: HashMap<QuoteHash, TxHash> = tx_hash_map.into_iter().collect();
+
+    // Baseline token balance AFTER payment: neither finalize nor resume may
+    // spend any more tokens (the whole point of #140 is "pay once").
+    let balance_after_payment = client
+        .wallet()
+        .expect("wallet should be set")
+        .balance_of_tokens()
+        .await
+        .expect("balance query should succeed");
+
+    // Phase 3: collapse the network below store quorum AFTER payment. Keep the
+    // client's own node (index 3) plus two others; kill the rest so no chunk's
+    // close group can reach quorum. `CLOSE_GROUP_SIZE` is 7, so 3 survivors
+    // cannot satisfy any chunk.
+    let keep = [0usize, 1, 3];
+    for i in 0..DEFAULT_NODE_COUNT {
+        if !keep.contains(&i) {
+            testnet.shutdown_node(i);
+        }
+    }
+    assert_eq!(
+        testnet.running_node_count(),
+        keep.len(),
+        "only the kept nodes should remain"
+    );
+
+    // Phase 4: finalize stores against a network that cannot reach quorum. The
+    // payment is already spent, so the failure MUST be a retryable
+    // `FinalizeStorePaidFailed`, not a payment-stranding error.
+    let err = client
+        .finalize_upload(prepared, &tx_hash_map)
+        .await
+        .expect_err("finalize must fail with the network below quorum");
+
+    let (unstored_after_finalize, retry) = match err {
+        Error::FinalizeStorePaidFailed {
+            retry,
+            failed_count,
+            total_chunks: reported_total,
+            ..
+        } => {
+            assert_eq!(reported_total, total_chunks);
+            assert!(failed_count > 0, "some chunks must be unstored");
+            assert_eq!(retry.total_chunks(), total_chunks);
+            assert!(
+                retry.unstored_count() > 0,
+                "retry state must carry the paid-but-unstored chunks"
+            );
+            (retry.unstored_count(), retry)
+        }
+        other => panic!("expected FinalizeStorePaidFailed, got {other:?}"),
+    };
+
+    // The failed finalize must not have spent any more tokens.
+    let balance_after_finalize = client
+        .wallet()
+        .expect("wallet should be set")
+        .balance_of_tokens()
+        .await
+        .expect("balance query should succeed");
+    assert_eq!(
+        balance_after_payment, balance_after_finalize,
+        "a failed finalize must not spend additional tokens"
+    );
+
+    // Phase 5: resume is re-drivable end-to-end. The network is still below
+    // quorum, so this resume also fails — but it exercises the *real* resume
+    // path (dispatch → store → assemble) and must not re-pay or lose the retry
+    // material: it hands back an equivalent `PaidRetryState`.
+    let err2 = client
+        .finalize_resume(*retry)
+        .await
+        .expect_err("resume against a still-collapsed network fails again");
+    match err2 {
+        Error::FinalizeStorePaidFailed { retry, .. } => {
+            assert_eq!(
+                retry.unstored_count(),
+                unstored_after_finalize,
+                "no progress against a dead network, but no loss of retry material"
+            );
+        }
+        other => panic!("expected FinalizeStorePaidFailed on resume, got {other:?}"),
+    }
+
+    // Resume must not have spent any tokens either.
+    let balance_after_resume = client
+        .wallet()
+        .expect("wallet should be set")
+        .balance_of_tokens()
+        .await
+        .expect("balance query should succeed");
+    assert_eq!(
+        balance_after_payment, balance_after_resume,
+        "finalize_resume must not enter any payment path"
     );
 
     drop(client);
