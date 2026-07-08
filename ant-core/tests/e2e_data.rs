@@ -7,9 +7,18 @@ mod support;
 use ant_core::data::Client;
 use bytes::Bytes;
 use self_encryption::encrypt;
+use self_encryption::MAX_CHUNK_SIZE;
 use serial_test::serial;
 use std::sync::Arc;
 use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
+
+/// Payload size that forces self-encryption to shrink the `DataMap`.
+///
+/// A file produces exactly 3 chunks until it exceeds `3 * MAX_CHUNK_SIZE`, and
+/// self-encryption only shrinks a map with more than 3 chunk infos. Four full
+/// chunks (`4 * MAX_CHUNK_SIZE`) clears that boundary regardless of the
+/// configured chunk size, so the returned map has `is_child() == true`.
+const SHRUNK_DATAMAP_PAYLOAD_BYTES: usize = 4 * MAX_CHUNK_SIZE;
 
 async fn setup() -> (Client, MiniTestnet) {
     let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
@@ -80,6 +89,67 @@ async fn test_data_large_content() {
         "downloaded size should match"
     );
     assert_eq!(downloaded, content, "content should match exactly");
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// Regression test: a payload large enough to shrink the `DataMap` must still
+/// round-trip through `data_upload`/`data_download`.
+///
+/// Before the fix, `data_download` fed the shrunk map's wrapper-level `infos()`
+/// straight to `self_encryption::decrypt`, which never fetched the root content
+/// chunks and failed with `Encryption("... Missing chunk ...")`. Small payloads
+/// (<= 3 chunks, flat map) hid the bug because they are never shrunk.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_data_shrunk_datamap_round_trip() {
+    let (client, testnet) = setup().await;
+
+    // Patterned data so a correct round-trip must reproduce the exact bytes,
+    // not merely match on length.
+    let content: Vec<u8> = (0u8..=255)
+        .cycle()
+        .take(SHRUNK_DATAMAP_PAYLOAD_BYTES)
+        .collect();
+    let content = Bytes::from(content);
+
+    let result = client
+        .data_upload(content.clone())
+        .await
+        .expect("data_upload should succeed");
+
+    // Guard: if this payload ever stops producing a shrunk (child) map, the
+    // test would silently stop exercising the regression it protects against.
+    assert!(
+        result.data_map.is_child(),
+        "payload of {} bytes should produce a shrunk (child) DataMap (infos={})",
+        SHRUNK_DATAMAP_PAYLOAD_BYTES,
+        result.data_map.infos().len()
+    );
+
+    let mut downloaded = None;
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        match client.data_download(&result.data_map).await {
+            Ok(d) => {
+                downloaded = Some(d);
+                break;
+            }
+            Err(e) if attempt < 2 => {
+                eprintln!("attempt {attempt}: data_download failed: {e}");
+            }
+            Err(e) => panic!("data_download of shrunk DataMap should succeed: {e}"),
+        }
+    }
+    let downloaded = downloaded.expect("data_download should succeed after retries");
+
+    assert_eq!(
+        downloaded, content,
+        "downloaded content should match original for a shrunk DataMap"
+    );
 
     drop(client);
     testnet.teardown().await;
