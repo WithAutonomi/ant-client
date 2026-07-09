@@ -892,8 +892,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.14.2"
-source = "git+https://github.com/grumbach/ant-node?branch=adr-0003-commitment-bound-pricing#ff7a547b627f2a18e630802feb02adeedb34ec1c"
+version = "0.14.3"
+source = "git+https://github.com/grumbach/ant-node?branch=adr-0005-earned-reward-eligibility#ec8b12be06f3049ad1015a52044a28792033a7b9"
 dependencies = [
  "ant-protocol",
  "blake3",
@@ -942,7 +942,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=adr-0003-commitment-bound-pricing#3a4eb638abbbec2ec88823f14bfe66e11d70d9b5"
+source = "git+https://github.com/grumbach/ant-protocol?branch=adr-0005-earned-reward-eligibility#246ad516c87eb0531127abff86a1258d842052b8"
 dependencies = [
  "blake3",
  "bytes",

@@ -18,8 +18,11 @@ use ant_protocol::payment::commitment::{
     MAX_COMMITMENT_SIDECAR_BYTES,
 };
 use ant_protocol::payment::{
-    calculate_price, serialize_merkle_proof, verify_merkle_candidate_signature,
+    calculate_price, serialize_merkle_proof, verify_audit_report,
+    verify_merkle_candidate_signature, AuditReport, MAX_AUDIT_REPORT_BYTES,
 };
+
+use crate::data::client::eligibility::{self, EligibilityPolicy};
 use ant_protocol::transport::PeerId;
 use ant_protocol::{
     compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
@@ -706,7 +709,18 @@ impl Client {
         let timeout = Duration::from_secs(self.config().quote_timeout_secs);
 
         // Query extra peers to handle validation failures (bad sigs, wrong type, etc.)
-        let query_count = CANDIDATES_PER_POOL * 2;
+        // ADR-0005: when the eligibility gate is ENFORCING, widen the query so
+        // the gate has eligible substitutes beyond the closest 32 — exactly the
+        // single-node rationale ("a single ineligible fast responder would
+        // force degraded mode"), and it applies at least as strongly here:
+        // merkle needs 16 eligible candidates vs single-node's 7, so it is the
+        // MORE likely path to spurious degraded/ungated selection. Observe-only
+        // keeps the fixed over-query (and byte cost) unchanged.
+        let query_count = if EligibilityPolicy::default().enforce {
+            CANDIDATES_PER_POOL * 4
+        } else {
+            CANDIDATES_PER_POOL * 2
+        };
         let mut remote_peers = self
             .network()
             .find_closest_peers(address, query_count)
@@ -736,11 +750,15 @@ impl Client {
 
         for (peer_id, peer_addrs) in &remote_peers {
             let request_id = self.next_request_id();
+            // ADR-0005: fresh nonce per candidate request; the responder's
+            // audit report must echo (and sign) it.
+            let report_nonce: [u8; 32] = rand::random();
             let request = MerkleCandidateQuoteRequest {
                 address: *address,
                 data_type,
                 data_size,
                 merkle_payment_timestamp,
+                report_nonce,
             };
             let message = ChunkMessage {
                 request_id,
@@ -772,12 +790,15 @@ impl Client {
                             MerkleCandidateQuoteResponse::Success {
                                 candidate_node,
                                 commitment,
+                                audit_report,
                             },
                         ) => {
                             match rmp_serde::from_slice::<MerklePaymentCandidateNode>(
                                 &candidate_node,
                             ) {
-                                Ok(node) => Some(Ok((node, commitment))),
+                                Ok(node) => {
+                                    Some(Ok((node, commitment, audit_report, report_nonce)))
+                                }
                                 Err(e) => Some(Err(Error::Serialization(format!(
                                     "Failed to deserialize candidate node from {peer_id_clone}: {e}"
                                 )))),
@@ -829,7 +850,15 @@ impl Client {
             impl std::future::Future<
                 Output = (
                     PeerId,
-                    std::result::Result<(MerklePaymentCandidateNode, Option<Vec<u8>>), Error>,
+                    std::result::Result<
+                        (
+                            MerklePaymentCandidateNode,
+                            Option<Vec<u8>>,
+                            Option<Vec<u8>>,
+                            [u8; 32],
+                        ),
+                        Error,
+                    >,
                 ),
             >,
         >,
@@ -837,11 +866,14 @@ impl Client {
         merkle_payment_timestamp: u64,
     ) -> Result<[MerklePaymentCandidateNode; CANDIDATES_PER_POOL]> {
         let mut valid: Vec<(PeerId, MerklePaymentCandidateNode)> = Vec::new();
+        // ADR-0005: verified audit reports by reporter, for the pool-selection
+        // eligibility gate below. Dropped after selection, never forwarded.
+        let mut reports: HashMap<PeerId, AuditReport> = HashMap::new();
         let mut failures: Vec<String> = Vec::new();
 
         while let Some((peer_id, result)) = futures.next().await {
             match result {
-                Ok((candidate, commitment)) => {
+                Ok((candidate, commitment, audit_report, report_nonce)) => {
                     if !verify_merkle_candidate_signature(&candidate) {
                         warn!("Invalid ML-DSA-65 signature from merkle candidate {peer_id}");
                         failures.push(format!("{peer_id}: invalid signature"));
@@ -880,6 +912,33 @@ impl Client {
                         failures.push(format!("{peer_id}: bad commitment binding ({detail})"));
                         continue;
                     }
+                    // ADR-0005: resolve the candidate's signed audit report.
+                    // Auxiliary testimony about OTHER peers — absent or
+                    // unverifiable never invalidates this candidate; it just
+                    // vouches for nobody this round.
+                    if let Some(bytes) = &audit_report {
+                        if bytes.len() <= MAX_AUDIT_REPORT_BYTES {
+                            match rmp_serde::from_slice::<AuditReport>(bytes) {
+                                Ok(report)
+                                    if verify_audit_report(
+                                        &report,
+                                        &candidate.pub_key,
+                                        candidate_peer.as_bytes(),
+                                        &report_nonce,
+                                    ) =>
+                                {
+                                    reports.insert(candidate_peer, report);
+                                }
+                                _ => warn!(
+                                    "Ignoring invalid audit report from merkle candidate {peer_id}"
+                                ),
+                            }
+                        } else {
+                            warn!(
+                                "Ignoring oversized audit report from merkle candidate {peer_id}"
+                            );
+                        }
+                    }
                     valid.push((candidate_peer, candidate));
                 }
                 Err(e) => {
@@ -899,6 +958,22 @@ impl Client {
 
         let target_peer = PeerId::from_bytes(*target_address);
         valid.sort_by_key(|(peer_id, _)| peer_id.xor_distance(&target_peer));
+
+        // ADR-0005 gate at pool composition: when enforcing AND a full pool of
+        // eligible candidates exists, the pool is filled eligible-only (order
+        // stays closest-first, keeping the storer's 13-of-16 close-set check
+        // satisfiable) — so whichever candidate the contract picks is
+        // eligible. Otherwise today's closest-16 applies (observe-only or
+        // explicitly degraded), logged inside the gate.
+        let valid = eligibility::gate_quoter_set(
+            valid,
+            |(peer_id, candidate)| (*peer_id, candidate.committed_key_count),
+            &reports,
+            &EligibilityPolicy::default(),
+            CANDIDATES_PER_POOL,
+            "merkle-pool",
+        );
+        drop(reports);
 
         let candidates: Vec<MerklePaymentCandidateNode> = valid
             .into_iter()

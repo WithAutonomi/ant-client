@@ -356,6 +356,7 @@ async fn bench_normal_once(client: &Client, rep: usize) -> Rep {
                 address,
                 data_size: 1024,
                 data_type: 0,
+                report_nonce: [0u8; 32],
             }),
         };
         let bytes = match msg.encode() {
@@ -509,6 +510,7 @@ async fn bench_merkle_once(client: &Client, rep: usize, concurrency: usize) -> R
                     data_type: 0,
                     data_size: 1024,
                     merkle_payment_timestamp,
+                    report_nonce: [0u8; 32],
                 }),
             };
             let bytes = match msg.encode() {

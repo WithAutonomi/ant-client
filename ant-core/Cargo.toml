@@ -65,7 +65,7 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # `ant-protocol` pin above points at a git branch, this ant-node must point at
 # the matching ant-node branch carrying the same saorsa-core / ant-protocol
 # lineage rather than a released version.
-ant-node = { git = "https://github.com/grumbach/ant-node", branch = "adr-0003-commitment-bound-pricing", optional = true }
+ant-node = { git = "https://github.com/grumbach/ant-node", branch = "adr-0005-earned-reward-eligibility", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -96,7 +96,7 @@ test-utils = []
 # always compile even without the `devnet` feature. Pinned to the same
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
-ant-node = { git = "https://github.com/grumbach/ant-node", branch = "adr-0003-commitment-bound-pricing", features = ["test-utils"] }
+ant-node = { git = "https://github.com/grumbach/ant-node", branch = "adr-0005-earned-reward-eligibility", features = ["test-utils"] }
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
