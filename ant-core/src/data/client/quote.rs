@@ -42,8 +42,8 @@ const WITNESSED_QUORUM_DENOMINATOR: usize = 3;
 /// Number of closest nodes each initial witnessed responder contributes.
 const SINGLE_NODE_WITNESSED_VIEW_COUNT: usize = 20;
 
-/// Index of the paid median quote after sorting by quoted price.
-const MEDIAN_QUOTE_INDEX: usize = CLOSE_GROUP_SIZE / 2;
+/// Minimum quote count accepted by the single-node payment path.
+const SINGLE_NODE_MIN_QUOTE_COUNT: usize = 1;
 
 /// Overall timeout for collecting quote responses. Must accommodate
 /// connect_with_fallback cascade (direct 5s + hole-punch 15s×3 + relay 30s ≈
@@ -430,6 +430,10 @@ fn single_node_quote_query_count() -> usize {
     CLOSE_GROUP_SIZE
 }
 
+fn single_node_min_quote_count() -> usize {
+    SINGLE_NODE_MIN_QUOTE_COUNT
+}
+
 fn fault_tolerant_quote_query_count() -> usize {
     CLOSE_GROUP_SIZE * FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER
 }
@@ -738,9 +742,11 @@ fn witnessed_quote_selection_or_error(
 }
 
 pub(crate) fn median_paid_quote_issuer(quotes: &[StoreQuote]) -> Option<(PeerId, Amount)> {
-    if quotes.len() <= MEDIAN_QUOTE_INDEX {
+    if quotes.is_empty() {
         return None;
     }
+
+    let median_quote_index = quotes.len() / 2;
 
     let mut by_price: Vec<(usize, PeerId, Amount)> = quotes
         .iter()
@@ -749,7 +755,7 @@ pub(crate) fn median_paid_quote_issuer(quotes: &[StoreQuote]) -> Option<(PeerId,
         .collect();
     by_price.sort_by_key(|(index, _, price)| (*price, *index));
     by_price
-        .get(MEDIAN_QUOTE_INDEX)
+        .get(median_quote_index)
         .map(|(_, peer_id, price)| (*peer_id, *price))
 }
 
@@ -765,9 +771,11 @@ fn median_paid_quote_issuer_for_indices(
     quotes: &[StoreQuote],
     indices: &[usize],
 ) -> Option<(PeerId, Amount)> {
-    if indices.len() <= MEDIAN_QUOTE_INDEX {
+    if indices.is_empty() {
         return None;
     }
+
+    let median_quote_index = indices.len() / 2;
 
     let mut by_price: Vec<(usize, PeerId, Amount)> = indices
         .iter()
@@ -779,7 +787,7 @@ fn median_paid_quote_issuer_for_indices(
         .collect();
     by_price.sort_by_key(|(selected_index, _, price)| (*price, *selected_index));
     by_price
-        .get(MEDIAN_QUOTE_INDEX)
+        .get(median_quote_index)
         .map(|(_, peer_id, price)| (*peer_id, *price))
 }
 
@@ -827,43 +835,56 @@ fn select_witnessed_median_voter_quotes(
     address: &[u8; 32],
     voters_by_peer: &VotersByPeer,
     required_support: usize,
+    min_quote_count: usize,
+    target_quote_count: usize,
 ) -> Option<Vec<StoreQuote>> {
-    if quotes.len() < CLOSE_GROUP_SIZE {
+    if min_quote_count == 0
+        || target_quote_count < min_quote_count
+        || quotes.len() < min_quote_count
+    {
         return None;
     }
 
     sort_quotes_by_distance(&mut quotes, address);
 
-    let mut best_indices: Option<(usize, Vec<usize>)> = None;
-    let mut current_indices = Vec::with_capacity(CLOSE_GROUP_SIZE);
-    visit_quote_subsets(
-        quotes.len(),
-        CLOSE_GROUP_SIZE,
-        0,
-        &mut current_indices,
-        &mut |indices| {
-            let Some((_, support)) = median_issuer_voter_support(&quotes, indices, voters_by_peer)
-            else {
-                return;
-            };
-            if support < required_support {
-                return;
-            }
-            match &best_indices {
-                Some((best_support, best)) if *best_support > support => {}
-                Some((best_support, best))
-                    if *best_support == support && best.as_slice() <= indices => {}
-                _ => best_indices = Some((support, indices.to_vec())),
-            }
-        },
-    );
+    let max_quote_count = target_quote_count.min(quotes.len());
+    for quote_count in (min_quote_count..=max_quote_count).rev() {
+        let mut best_indices: Option<(usize, Vec<usize>)> = None;
+        let mut current_indices = Vec::with_capacity(quote_count);
+        visit_quote_subsets(
+            quotes.len(),
+            quote_count,
+            0,
+            &mut current_indices,
+            &mut |indices| {
+                let Some((_, support)) =
+                    median_issuer_voter_support(&quotes, indices, voters_by_peer)
+                else {
+                    return;
+                };
+                if support < required_support {
+                    return;
+                }
+                match &best_indices {
+                    Some((best_support, best)) if *best_support > support => {}
+                    Some((best_support, best))
+                        if *best_support == support && best.as_slice() <= indices => {}
+                    _ => best_indices = Some((support, indices.to_vec())),
+                }
+            },
+        );
 
-    best_indices.map(|(_, indices)| {
-        indices
-            .into_iter()
-            .map(|index| quotes[index].clone())
-            .collect()
-    })
+        if let Some((_, indices)) = best_indices {
+            return Some(
+                indices
+                    .into_iter()
+                    .map(|index| quotes[index].clone())
+                    .collect(),
+            );
+        }
+    }
+
+    None
 }
 
 fn put_peers_with_median_voters_first(
@@ -897,12 +918,11 @@ fn put_peers_with_median_voters_first(
 impl Client {
     /// Get storage quotes from the closest peers for a given address.
     ///
-    /// Builds a quorum-witnessed candidate set with at least
-    /// `CLOSE_GROUP_SIZE` peers, requests quotes from all of them concurrently,
-    /// and returns the closest supported `CLOSE_GROUP_SIZE` successful
-    /// responders. When multiple sets are possible, the client prefers the
-    /// one with the strongest paid-median voter support, then the closest
-    /// peers by XOR distance.
+    /// Builds a quorum-witnessed candidate set, still attempts to collect the
+    /// close-group quote count, and returns the largest supported successful
+    /// quote set. The single-node path now only requires one valid quote to
+    /// proceed, but still pays the median quote from the selected set when more
+    /// quotes were successfully fetched.
     ///
     /// Returns `Error::AlreadyStored` early if `CLOSE_GROUP_MAJORITY` peers
     /// report the chunk is already stored.
@@ -1010,8 +1030,10 @@ impl Client {
         &self,
         address: &[u8; 32],
     ) -> Result<WitnessedQuoteSelection> {
-        // The quote/quorum/consensus scope is the closest CLOSE_GROUP_SIZE.
-        let required = single_node_quote_query_count();
+        // Query the close-group width, but single-node payment now only needs
+        // one valid witnessed quote to proceed.
+        let close_group_query_count = single_node_quote_query_count();
+        let required_quotes = single_node_min_quote_count();
         // Contact the closest PUT_TARGET_WIDTH peers directly so the whole
         // PUT-target set's addresses arrive in this single query. A network
         // with fewer than that near the target can't satisfy the wide lookup,
@@ -1031,12 +1053,12 @@ impl Client {
                 debug!(
                     target = %hex::encode(address),
                     "Wide witnessed lookup ({PUT_TARGET_WIDTH}) failed ({wide_err}); \
-                     retrying at close-group width ({required})"
+                     retrying at close-group width ({close_group_query_count})"
                 );
                 self.network()
                     .find_witnessed_close_group_with_view_count(
                         address,
-                        required,
+                        close_group_query_count,
                         SINGLE_NODE_WITNESSED_VIEW_COUNT,
                     )
                     .await
@@ -1079,7 +1101,7 @@ impl Client {
         );
 
         let mut selection =
-            witnessed_quote_selection_or_error(address, &witnessed_quote, required, quorum)?;
+            witnessed_quote_selection_or_error(address, &witnessed_quote, required_quotes, quorum)?;
         // Widen the PUT-target set to the closest PUT_TARGET_WIDTH
         // directly-contacted peers; the quote set above stays the closest
         // CLOSE_GROUP_SIZE. The same proof is reused on all of them.
@@ -1110,13 +1132,23 @@ impl Client {
             hex::encode(address)
         );
 
-        if remote_peers.len() < CLOSE_GROUP_SIZE {
+        let min_quote_count = match &quote_selection_policy {
+            QuoteSelectionPolicy::ClosestByDistance => CLOSE_GROUP_SIZE,
+            QuoteSelectionPolicy::WitnessedMedianVoters { .. } => single_node_min_quote_count(),
+        };
+        let target_quote_count = match &quote_selection_policy {
+            QuoteSelectionPolicy::ClosestByDistance => CLOSE_GROUP_SIZE,
+            QuoteSelectionPolicy::WitnessedMedianVoters { .. } => single_node_quote_query_count(),
+        }
+        .min(peer_query_count);
+
+        if remote_peers.len() < min_quote_count {
             return Err(Error::InsufficientPeers(format!(
-                "Found {} peers, need {CLOSE_GROUP_SIZE}",
-                remote_peers.len()
+                "Found {} peers, need {min_quote_count}",
+                remote_peers.len(),
             )));
         }
-        debug_assert!(peer_query_count >= CLOSE_GROUP_SIZE);
+        debug_assert!(peer_query_count >= min_quote_count);
 
         let per_peer_timeout = Duration::from_secs(self.config().quote_timeout_secs);
         let overall_timeout = Duration::from_secs(QUOTE_COLLECTION_TIMEOUT_SECS);
@@ -1165,7 +1197,7 @@ impl Client {
                             ));
                         }
 
-                        if quotes.len() >= CLOSE_GROUP_SIZE || quote_futures.is_empty() {
+                        if quotes.len() >= target_quote_count || quote_futures.is_empty() {
                             break;
                         }
 
@@ -1297,25 +1329,32 @@ impl Client {
         let quote_count = quotes.len();
         let total_responses = quote_count + failure_count + already_stored_count;
 
-        if quotes.len() >= CLOSE_GROUP_SIZE {
+        if quotes.len() >= min_quote_count {
             let selected_quotes = match quote_selection_policy {
                 QuoteSelectionPolicy::ClosestByDistance => select_closest_quotes(quotes, address),
                 QuoteSelectionPolicy::WitnessedMedianVoters {
                     voters_by_peer,
                     quorum,
-                } => select_witnessed_median_voter_quotes(quotes, address, &voters_by_peer, quorum)
-                    .ok_or_else(|| {
-                        Error::InsufficientPeers(format!(
-                            "Got {quote_count} quotes, need {CLOSE_GROUP_SIZE} whose paid \
+                } => select_witnessed_median_voter_quotes(
+                    quotes,
+                    address,
+                    &voters_by_peer,
+                    quorum,
+                    min_quote_count,
+                    target_quote_count,
+                )
+                .ok_or_else(|| {
+                    Error::InsufficientPeers(format!(
+                        "Got {quote_count} quotes, need at least {min_quote_count} whose paid \
                                  median issuer is recognised by at least {} \
                                  selected witness peers ({total_responses} responses: \
                                  {already_stored_count} already_stored, {failure_count} failed \
                                  including {bad_quote_count} with mismatched peer bindings). \
                                  Failures: [{}]",
-                            quorum,
-                            failures.join("; ")
-                        ))
-                    })?,
+                        quorum,
+                        failures.join("; ")
+                    ))
+                })?,
             };
 
             info!(
@@ -1329,7 +1368,7 @@ impl Client {
         }
 
         Err(Error::InsufficientPeers(format!(
-            "Got {quote_count} quotes, need {CLOSE_GROUP_SIZE} ({total_responses} responses: \
+            "Got {quote_count} quotes, need {min_quote_count} ({total_responses} responses: \
              {already_stored_count} already_stored, {failure_count} failed including \
              {bad_quote_count} with mismatched peer bindings). Failures: [{}]",
             failures.join("; ")
@@ -1607,6 +1646,7 @@ mod tests {
     #[test]
     fn quote_query_counts_keep_single_node_close_group_only() {
         assert_eq!(single_node_quote_query_count(), CLOSE_GROUP_SIZE);
+        assert_eq!(single_node_min_quote_count(), 1);
         assert_eq!(SINGLE_NODE_WITNESSED_VIEW_COUNT, 20);
         assert!(SINGLE_NODE_WITNESSED_VIEW_COUNT > single_node_quote_query_count());
         assert_eq!(witnessed_close_group_quorum(), 5);
@@ -1936,9 +1976,15 @@ mod tests {
         );
 
         let quorum = witnessed_close_group_quorum();
-        let selected =
-            select_witnessed_median_voter_quotes(quotes, &address, &voters_by_peer, quorum)
-                .expect("a supported close-group quote set should be selected");
+        let selected = select_witnessed_median_voter_quotes(
+            quotes,
+            &address,
+            &voters_by_peer,
+            quorum,
+            single_node_min_quote_count(),
+            CLOSE_GROUP_SIZE,
+        )
+        .expect("a supported close-group quote set should be selected");
 
         assert_eq!(quote_peer_seeds(&selected), vec![1, 2, 3, 6, 7, 8, 9]);
         let (median_peer_id, _) =
@@ -1968,9 +2014,15 @@ mod tests {
         );
 
         let quorum = witnessed_close_group_quorum();
-        let selected =
-            select_witnessed_median_voter_quotes(quotes, &address, &voters_by_peer, quorum)
-                .expect("direct witness recognition should support the paid median issuer");
+        let selected = select_witnessed_median_voter_quotes(
+            quotes,
+            &address,
+            &voters_by_peer,
+            quorum,
+            single_node_min_quote_count(),
+            CLOSE_GROUP_SIZE,
+        )
+        .expect("direct witness recognition should support the paid median issuer");
 
         let (median_peer_id, _) =
             median_paid_quote_issuer(&selected).expect("selected quotes have a median");
@@ -1987,6 +2039,38 @@ mod tests {
             "recognising witnesses need not also be selected quote issuers"
         );
         assert_eq!(voters_by_peer[&median_peer_id].len(), quorum);
+    }
+
+    #[test]
+    fn witnessed_quote_selection_allows_single_required_quote() {
+        const QUOTE_ISSUER_SEED: u8 = 7;
+
+        let address = [0u8; 32];
+        let quotes = vec![
+            synthetic_quote(QUOTE_ISSUER_SEED, 10),
+            synthetic_quote(1, 20),
+            synthetic_quote(2, 30),
+        ];
+        let mut voters_by_peer = HashMap::new();
+        voters_by_peer.insert(
+            synthetic_peer(QUOTE_ISSUER_SEED),
+            synthetic_voters(&[1, 2, 3, 4, 5]),
+        );
+
+        let selected = select_witnessed_median_voter_quotes(
+            quotes,
+            &address,
+            &voters_by_peer,
+            witnessed_close_group_quorum(),
+            single_node_min_quote_count(),
+            CLOSE_GROUP_SIZE,
+        )
+        .expect("one quorum-supported quote is enough for SNP payment");
+
+        assert_eq!(quote_peer_seeds(&selected), vec![QUOTE_ISSUER_SEED]);
+        let (median_peer_id, _) =
+            median_paid_quote_issuer(&selected).expect("single quote is its own median");
+        assert_eq!(median_peer_id, synthetic_peer(QUOTE_ISSUER_SEED));
     }
 
     #[test]
@@ -2015,6 +2099,8 @@ mod tests {
             &address,
             &voters_by_peer,
             witnessed_close_group_quorum(),
+            single_node_min_quote_count(),
+            CLOSE_GROUP_SIZE,
         );
 
         assert!(

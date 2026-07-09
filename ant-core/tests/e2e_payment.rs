@@ -254,10 +254,10 @@ async fn test_quote_collection() {
         .await
         .expect("get_store_quotes should succeed");
 
-    // At least 5 quotes required
+    // Single-node payment now needs only one valid witnessed quote.
     assert!(
-        quotes.len() >= 5,
-        "Should receive at least 5 quotes, got {}",
+        !quotes.is_empty(),
+        "Should receive at least one quote, got {}",
         quotes.len()
     );
 

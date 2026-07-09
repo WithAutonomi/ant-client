@@ -1342,7 +1342,7 @@ impl Client {
             }
         };
 
-        // Use the median price × 3 (matches SingleNodePayment::from_quotes
+        // Use the median price × 3 (matches the single-node payment builder
         // which pays 3x the median to incentivize reliable storage).
         let mut prices: Vec<Amount> = quotes.iter().map(|(_, _, _, price, _)| *price).collect();
         prices.sort();
