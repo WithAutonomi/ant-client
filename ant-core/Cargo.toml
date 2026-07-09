@@ -37,7 +37,7 @@ tower-http = { version = "0.6.8", features = ["cors"] }
 # under `ant_protocol::{evm, transport, pqc}`. This is the ONE pin for
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
-ant-protocol = "2.3.0"
+ant-protocol = "3.0.0"
 xor_name = "5"
 self_encryption = "0.36"
 futures = "0.3"
@@ -62,10 +62,10 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # `ant-protocol` pin above — a version skew pulls a second copy of
 # `saorsa-core` into the graph and makes `ant_node`'s and `ant_protocol`'s
 # `MultiAddr` mutually incompatible in `node/devnet.rs`. While the runtime
-# `ant-protocol` pin above points at a released version, this ant-node must
-# track the matching released version carrying the same saorsa-core /
-# ant-protocol lineage.
-ant-node = { version = "0.14.3", optional = true }
+# `ant-protocol` pin above points at an immutable git rev, so this ant-node must
+# point at the matching ADR-0005 ant-node PR rev carrying the same saorsa-core /
+# ant-protocol lineage rather than a released version.
+ant-node = { git = "https://github.com/grumbach/ant-node", rev = "111320385aa5a4eb8d90a19c13e63a7aaf172af4", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -96,7 +96,12 @@ test-utils = []
 # always compile even without the `devnet` feature. Pinned to the same
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
-ant-node = { version = "0.14.3", features = ["test-utils"] }
+# `ant-protocol` pin above points at an immutable git rev, so this ant-node must
+# point at the matching ADR-0005 ant-node PR rev carrying the same saorsa-core /
+# ant-protocol lineage rather than a released version. The dev-dep enables
+# `test-utils` so the e2e/integration suite can reach the node's test-only
+# payment-verifier helpers.
+ant-node = { git = "https://github.com/grumbach/ant-node", rev = "111320385aa5a4eb8d90a19c13e63a7aaf172af4", features = ["test-utils"] }
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }

@@ -1,3 +1,20 @@
 [workspace]
 members = ["ant-core", "ant-cli"]
 resolver = "2"
+# ─── TEMPORARY: STRIP BEFORE MERGE — ADR-0004/0005 coordinated cutover ───
+# The ADR-0004 commitment-bound-quote types and the ADR-0005 audit-report wire
+# types are not yet published to crates.io, so this workspace pins them to
+# immutable PR revs (never a mutable branch) so the build is reproducible; the
+# committed Cargo.lock records the exact resolution.
+#
+# AT RELEASE (once the ADR-0004/0005 versions are published, in order
+# evmlib → ant-protocol):
+#   1. delete this entire [patch.crates-io] block, AND
+#   2. bump the `ant-protocol` pin in ant-core/Cargo.toml to the published
+#      version (evmlib is re-exported through ant-protocol, no direct pin):
+#        ant-protocol = "3.0.0"   # <- published ADR-0005 ant-protocol (major: wire change)
+[patch.crates-io]
+evmlib = { git = "https://github.com/WithAutonomi/evmlib", branch = "adr-0003-signed-quote-fields" }
+# ADR-0005 audit-report wire types (github.com/WithAutonomi/ant-protocol/pull/19),
+# pinned to the immutable PR rev.
+ant-protocol = { git = "https://github.com/grumbach/ant-protocol", rev = "2015113270bbde8204a1740674bed2ada52d2ca6" }

@@ -3,6 +3,7 @@
 //! Handles requesting storage quotes from network nodes and
 //! managing payment for data storage.
 
+use crate::data::client::eligibility::{self, EligibilityPolicy};
 use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::client::PUT_TARGET_WIDTH;
@@ -13,6 +14,7 @@ use ant_protocol::payment::commitment::{
     commitment_hash, verify_commitment_signature, StorageCommitment, MAX_COMMITMENT_KEY_COUNT,
     MAX_COMMITMENT_SIDECAR_BYTES,
 };
+use ant_protocol::payment::{verify_audit_report, AuditReport, MAX_AUDIT_REPORT_BYTES};
 use ant_protocol::payment::{verify_quote_content, verify_quote_signature};
 use ant_protocol::transport::{
     DHTNode, MultiAddr, P2PNode, PeerId, ResponderView, WitnessedCloseGroup,
@@ -71,6 +73,12 @@ type QuotedPeer = (
     Amount,
     Option<Vec<u8>>,
 );
+
+/// A classified quote response: the verified quote, its price, and the
+/// ADR-0004 commitment sidecar. The ADR-0005 audit report travels separately
+/// (a sink filled for every VERIFIED responder, including already-stored
+/// voters — their testimony counts even though they issue no payable quote).
+type ClassifiedQuote = (PaymentQuote, Amount, Option<Vec<u8>>);
 
 /// Check that a quote's `pub_key` is well-formed and BLAKE3-hashes to the
 /// claimed `peer_id`.
@@ -229,13 +237,17 @@ fn quote_commitment_binding_is_valid(
 /// On success the returned commitment is the opaque signed-commitment blob the
 /// node shipped with the quote (`None` for a baseline quote), to be forwarded
 /// as a sidecar in the PUT bundle.
+#[allow(clippy::too_many_arguments)]
 fn classify_quote_response(
     peer_id: &PeerId,
     expected_content: &[u8; 32],
     quote_bytes: &[u8],
     already_stored: bool,
     commitment: Option<Vec<u8>>,
-) -> std::result::Result<(PaymentQuote, Amount, Option<Vec<u8>>), Error> {
+    audit_report: Option<Vec<u8>>,
+    report_nonce: &[u8; 32],
+    report_sink: &std::sync::Mutex<Option<AuditReport>>,
+) -> std::result::Result<ClassifiedQuote, Error> {
     let payment_quote = rmp_serde::from_slice::<PaymentQuote>(quote_bytes).map_err(|e| {
         Error::Serialization(format!("Failed to deserialize quote from {peer_id}: {e}"))
     })?;
@@ -292,10 +304,58 @@ fn classify_quote_response(
         });
     }
 
+    // ADR-0005: resolve the responder's signed audit report BEFORE the
+    // already-stored short-circuit — an already-stored voter issues no
+    // payable quote, but its (fully verified) testimony about other peers
+    // still counts toward the eligibility quorum. The report is auxiliary:
+    // absent or unverifiable never invalidates this peer's own quote; it
+    // just means this responder vouches for nobody this round. The signature
+    // is checked against the quote's own (already peer-bound) public key,
+    // and the echoed nonce proves the report was generated for this request.
+    let report = audit_report.and_then(|bytes| {
+        // Structured size line — the local-testnet runner greps these for the
+        // overhead budget check (build/verify timing is measured by the runner).
+        debug!(
+            target: "adr5::report_size",
+            peer = %peer_id,
+            bytes = bytes.len(),
+            "audit report received"
+        );
+        if bytes.len() > MAX_AUDIT_REPORT_BYTES {
+            warn!(
+                "Ignoring oversized audit report from {peer_id} ({} bytes)",
+                bytes.len()
+            );
+            return None;
+        }
+        let parsed: AuditReport = match rmp_serde::from_slice(&bytes) {
+            Ok(report) => report,
+            Err(e) => {
+                warn!("Ignoring unparseable audit report from {peer_id}: {e}");
+                return None;
+            }
+        };
+        if verify_audit_report(
+            &parsed,
+            &payment_quote.pub_key,
+            peer_id.as_bytes(),
+            report_nonce,
+        ) {
+            Some(parsed)
+        } else {
+            warn!("Ignoring audit report from {peer_id} — signature/nonce/shape check failed");
+            None
+        }
+    });
+    if let Ok(mut sink) = report_sink.lock() {
+        *sink = report;
+    }
+
     if already_stored {
         debug!("Peer {peer_id} already has chunk");
         return Err(Error::AlreadyStored);
     }
+
     let price = payment_quote.price;
     debug!("Received quote from {peer_id}: price = {price}");
     Ok((payment_quote, price, commitment))
@@ -331,10 +391,15 @@ async fn request_store_quote_from_peer(
     data_type: u32,
     per_peer_timeout: Duration,
 ) -> StoreQuoteRequestResult {
+    // ADR-0005: a fresh random nonce per request; the responder's audit
+    // report must echo (and sign) it, so reports cannot be precomputed or
+    // replayed across requests.
+    let report_nonce: [u8; 32] = rand::random();
     let request = ChunkQuoteRequest {
         address,
         data_size,
         data_type,
+        report_nonce,
     };
     let message = ChunkMessage {
         request_id,
@@ -350,10 +415,15 @@ async fn request_store_quote_from_peer(
                 Err(Error::Protocol(format!(
                     "Failed to encode quote request for {peer_id}: {e}"
                 ))),
+                None,
             );
         }
     };
 
+    // Sink for the responder's verified audit report: filled by the
+    // classifier for every VERIFIED responder, including already-stored
+    // voters whose classification is an Err(AlreadyStored).
+    let report_sink = std::sync::Mutex::new(None);
     let result = send_and_await_chunk_response(
         &node,
         &peer_id,
@@ -366,12 +436,16 @@ async fn request_store_quote_from_peer(
                 quote,
                 already_stored,
                 commitment,
+                audit_report,
             }) => Some(classify_quote_response(
                 &peer_id,
                 &address,
                 &quote,
                 already_stored,
                 commitment,
+                audit_report,
+                &report_nonce,
+                &report_sink,
             )),
             ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => Some(Err(
                 Error::Protocol(format!("Quote error from {peer_id}: {e}")),
@@ -383,20 +457,29 @@ async fn request_store_quote_from_peer(
     )
     .await;
 
-    (peer_id, peer_addrs, result)
+    let report = report_sink.into_inner().unwrap_or_default();
+    (peer_id, peer_addrs, result, report)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn record_store_quote_result(
     peer_id: PeerId,
     addrs: Vec<MultiAddr>,
-    quote_result: Result<(PaymentQuote, Amount, Option<Vec<u8>>)>,
+    quote_result: Result<ClassifiedQuote>,
+    report: Option<AuditReport>,
     address: &[u8; 32],
     quotes: &mut Vec<StoreQuote>,
+    reports: &mut HashMap<PeerId, AuditReport>,
     already_stored_peers: &mut Vec<(PeerId, [u8; 32])>,
     failures: &mut Vec<String>,
     bad_quote_count: &mut usize,
 ) {
+    // ADR-0005: keep every VERIFIED responder's report for the
+    // collection-time eligibility decision (already-stored voters testify
+    // too); dropped after selection, never forwarded.
+    if let Some(report) = report {
+        reports.insert(peer_id, report);
+    }
     match quote_result {
         Ok((quote, price, commitment)) => {
             quotes.push((peer_id, addrs, quote, price, commitment));
@@ -417,11 +500,12 @@ fn record_store_quote_result(
 }
 
 fn witnessed_quote_launch_budget(
+    target: usize,
     successful_quotes: usize,
     in_flight: usize,
     remaining_peers: usize,
 ) -> usize {
-    CLOSE_GROUP_SIZE
+    target
         .saturating_sub(successful_quotes.saturating_add(in_flight))
         .min(remaining_peers)
 }
@@ -502,7 +586,8 @@ pub(crate) type StoreQuote = (
 type StoreQuoteRequestResult = (
     PeerId,
     Vec<MultiAddr>,
-    Result<(PaymentQuote, Amount, Option<Vec<u8>>)>,
+    Result<ClassifiedQuote>,
+    Option<AuditReport>,
 );
 type VotersByPeer = HashMap<PeerId, HashSet<PeerId>>;
 type WitnessedVoteData = (HashMap<PeerId, DHTNode>, VotersByPeer, Vec<(PeerId, usize)>);
@@ -1125,6 +1210,9 @@ impl Client {
         // the closest witnessed peers first and only falls back to further
         // witnessed peers when a closer peer fails to produce a usable quote.
         let mut quotes = Vec::with_capacity(peer_query_count);
+        // ADR-0005: verified audit reports by reporter, for the collection-time
+        // eligibility gate below. Dropped after selection.
+        let mut reports: HashMap<PeerId, AuditReport> = HashMap::new();
         let mut already_stored_peers: Vec<(PeerId, [u8; 32])> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
 
@@ -1139,6 +1227,19 @@ impl Client {
             QuoteSelectionPolicy::WitnessedMedianVoters { .. }
         );
 
+        // ADR-0005: when the eligibility gate is ENFORCING, collect quotes
+        // from the whole witnessed candidate set instead of stopping at the
+        // first CLOSE_GROUP_SIZE successes — the gate needs eligible
+        // substitutes beyond the closest 7, or a single ineligible fast
+        // responder would force degraded mode. Observe-only keeps today's
+        // early-stop behaviour (and byte cost) unchanged.
+        let eligibility_policy = EligibilityPolicy::default();
+        let collection_target = if eligibility_policy.enforce {
+            remote_peers.len().max(CLOSE_GROUP_SIZE)
+        } else {
+            CLOSE_GROUP_SIZE
+        };
+
         if staged_witnessed_collection {
             let mut quote_futures = FuturesUnordered::new();
             let mut next_peer_index = 0usize;
@@ -1146,6 +1247,7 @@ impl Client {
                 tokio::time::timeout(overall_timeout, async {
                     loop {
                         let launch_count = witnessed_quote_launch_budget(
+                            collection_target,
                             quotes.len(),
                             quote_futures.len(),
                             remote_peers.len().saturating_sub(next_peer_index),
@@ -1165,11 +1267,12 @@ impl Client {
                             ));
                         }
 
-                        if quotes.len() >= CLOSE_GROUP_SIZE || quote_futures.is_empty() {
+                        if quotes.len() >= collection_target || quote_futures.is_empty() {
                             break;
                         }
 
-                        let Some((peer_id, addrs, quote_result)) = quote_futures.next().await
+                        let Some((peer_id, addrs, quote_result, report)) =
+                            quote_futures.next().await
                         else {
                             break;
                         };
@@ -1177,8 +1280,10 @@ impl Client {
                             peer_id,
                             addrs,
                             quote_result,
+                            report,
                             address,
                             &mut quotes,
+                            &mut reports,
                             &mut already_stored_peers,
                             &mut failures,
                             &mut bad_quote_count,
@@ -1219,13 +1324,17 @@ impl Client {
 
             let collect_result: std::result::Result<std::result::Result<(), Error>, _> =
                 tokio::time::timeout(overall_timeout, async {
-                    while let Some((peer_id, addrs, quote_result)) = quote_futures.next().await {
+                    while let Some((peer_id, addrs, quote_result, report)) =
+                        quote_futures.next().await
+                    {
                         record_store_quote_result(
                             peer_id,
                             addrs,
                             quote_result,
+                            report,
                             address,
                             &mut quotes,
+                            &mut reports,
                             &mut already_stored_peers,
                             &mut failures,
                             &mut bad_quote_count,
@@ -1297,6 +1406,20 @@ impl Client {
         let quote_count = quotes.len();
         let total_responses = quote_count + failure_count + already_stored_count;
 
+        // ADR-0005 gate at collection: when enforcing AND a full close group of
+        // eligible quoters exists, selection runs on the eligible subset — so
+        // whoever wins the median is eligible. Otherwise (observe-only, or too
+        // few eligible = explicitly degraded) today's rules apply, logged.
+        let quotes = eligibility::gate_quoter_set(
+            quotes,
+            |(peer_id, _, quote, _, _): &StoreQuote| (*peer_id, quote.committed_key_count),
+            &reports,
+            &eligibility_policy,
+            CLOSE_GROUP_SIZE,
+            "single-node",
+        );
+        drop(reports);
+
         if quotes.len() >= CLOSE_GROUP_SIZE {
             let selected_quotes = match quote_selection_policy {
                 QuoteSelectionPolicy::ClosestByDistance => select_closest_quotes(quotes, address),
@@ -1357,6 +1480,45 @@ mod tests {
     use ant_protocol::transport::{DHTNode, MlDsa65, ResponderView, WitnessedCloseGroup};
     use std::time::SystemTime;
     use xor_name::XorName;
+
+    /// P3 guard (codex impl-gate): a VERIFIED report arriving with an
+    /// `Err(AlreadyStored)` classification must still reach the eligibility
+    /// report map — already-stored voters testify too.
+    #[test]
+    fn already_stored_responder_report_reaches_the_map() {
+        use ant_protocol::payment::AuditReport;
+
+        let peer = PeerId::from_bytes([3u8; 32]);
+        let report = AuditReport {
+            reporter_peer_id: [3u8; 32],
+            nonce: [1u8; 32],
+            rows: Vec::new(),
+            signature: Vec::new(),
+        };
+        let mut quotes = Vec::new();
+        let mut reports = HashMap::new();
+        let mut already = Vec::new();
+        let mut failures = Vec::new();
+        let mut bad = 0usize;
+        record_store_quote_result(
+            peer,
+            Vec::new(),
+            Err(Error::AlreadyStored),
+            Some(report),
+            &[9u8; 32],
+            &mut quotes,
+            &mut reports,
+            &mut already,
+            &mut failures,
+            &mut bad,
+        );
+        assert!(quotes.is_empty());
+        assert_eq!(already.len(), 1, "already-stored vote recorded");
+        assert!(
+            reports.contains_key(&peer),
+            "already-stored responder's testimony must reach the report map"
+        );
+    }
 
     /// A real ML-DSA-65 keypair plus its derived peer ID.
     struct Keypair {
@@ -1623,29 +1785,50 @@ mod tests {
     #[test]
     fn witnessed_quote_launch_budget_keeps_exact_quote_window() {
         assert_eq!(
-            witnessed_quote_launch_budget(0, 0, CLOSE_GROUP_SIZE * 2),
+            witnessed_quote_launch_budget(CLOSE_GROUP_SIZE, 0, 0, CLOSE_GROUP_SIZE * 2),
             CLOSE_GROUP_SIZE,
             "initial SNP quote fetch should launch the closest seven peers"
         );
         assert_eq!(
-            witnessed_quote_launch_budget(1, CLOSE_GROUP_SIZE - 1, CLOSE_GROUP_SIZE),
+            witnessed_quote_launch_budget(
+                CLOSE_GROUP_SIZE,
+                1,
+                CLOSE_GROUP_SIZE - 1,
+                CLOSE_GROUP_SIZE
+            ),
             0,
             "a successful quote should not launch an extra fallback"
         );
         assert_eq!(
-            witnessed_quote_launch_budget(0, CLOSE_GROUP_SIZE - 1, CLOSE_GROUP_SIZE),
+            witnessed_quote_launch_budget(
+                CLOSE_GROUP_SIZE,
+                0,
+                CLOSE_GROUP_SIZE - 1,
+                CLOSE_GROUP_SIZE
+            ),
             1,
             "a failed in-flight quote should launch the next closest fallback"
         );
         assert_eq!(
-            witnessed_quote_launch_budget(CLOSE_GROUP_SIZE - 1, 0, 3),
+            witnessed_quote_launch_budget(CLOSE_GROUP_SIZE, CLOSE_GROUP_SIZE - 1, 0, 3),
             1,
             "only one more peer is needed for the seventh quote"
         );
         assert_eq!(
-            witnessed_quote_launch_budget(0, 0, CLOSE_GROUP_SIZE - 1),
+            witnessed_quote_launch_budget(CLOSE_GROUP_SIZE, 0, 0, CLOSE_GROUP_SIZE - 1),
             CLOSE_GROUP_SIZE - 1,
             "launch budget is capped by remaining candidates"
+        );
+        // ADR-0005 enforcement widens the target to the whole candidate set.
+        assert_eq!(
+            witnessed_quote_launch_budget(
+                CLOSE_GROUP_SIZE * 2,
+                CLOSE_GROUP_SIZE,
+                0,
+                CLOSE_GROUP_SIZE
+            ),
+            CLOSE_GROUP_SIZE,
+            "an enforcing client keeps collecting past the first seven"
         );
     }
 
@@ -2264,7 +2447,16 @@ mod tests {
         let content = [7u8; 32];
         let (peer_id, quote) = signed_baseline_quote(content);
         let bytes = serialize_quote(&quote);
-        let result = classify_quote_response(&peer_id, &content, &bytes, false, None);
+        let result = classify_quote_response(
+            &peer_id,
+            &content,
+            &bytes,
+            false,
+            None,
+            None,
+            &[0u8; 32],
+            &std::sync::Mutex::new(None),
+        );
         match result {
             Ok((q, price, commitment)) => {
                 assert_eq!(q.pub_key, quote.pub_key);
@@ -2283,7 +2475,16 @@ mod tests {
         let (peer_id, mut quote) = signed_baseline_quote(content);
         quote.signature = vec![0u8; quote.signature.len()]; // corrupt the signature
         let bytes = serialize_quote(&quote);
-        let result = classify_quote_response(&peer_id, &content, &bytes, false, None);
+        let result = classify_quote_response(
+            &peer_id,
+            &content,
+            &bytes,
+            false,
+            None,
+            None,
+            &[0u8; 32],
+            &std::sync::Mutex::new(None),
+        );
         assert!(
             matches!(result, Err(Error::BadQuoteBinding { .. })),
             "a quote with an invalid signature must be rejected; got {result:?}"
@@ -2295,7 +2496,16 @@ mod tests {
         // A validly-signed quote for a DIFFERENT address is dropped before pay.
         let (peer_id, quote) = signed_baseline_quote([7u8; 32]);
         let bytes = serialize_quote(&quote);
-        let result = classify_quote_response(&peer_id, &[9u8; 32], &bytes, false, None);
+        let result = classify_quote_response(
+            &peer_id,
+            &[9u8; 32],
+            &bytes,
+            false,
+            None,
+            None,
+            &[0u8; 32],
+            &std::sync::Mutex::new(None),
+        );
         assert!(
             matches!(result, Err(Error::BadQuoteBinding { .. })),
             "a quote for the wrong content must be rejected; got {result:?}"
@@ -2306,7 +2516,16 @@ mod tests {
     fn classifier_rejects_crossed_keypair_with_typed_error() {
         let (peer_id, _, quote, _, _) = bad_quote_real();
         let bytes = serialize_quote(&quote);
-        let result = classify_quote_response(&peer_id, &[0u8; 32], &bytes, false, None);
+        let result = classify_quote_response(
+            &peer_id,
+            &[0u8; 32],
+            &bytes,
+            false,
+            None,
+            None,
+            &[0u8; 32],
+            &std::sync::Mutex::new(None),
+        );
         match result {
             Err(Error::BadQuoteBinding {
                 peer_id: pid,
@@ -2337,7 +2556,16 @@ mod tests {
         let (peer_id, _, quote, _, _) = bad_quote_real();
         let bytes = serialize_quote(&quote);
         // The peer claims already_stored=true, but its quote has a crossed key.
-        let result = classify_quote_response(&peer_id, &[0u8; 32], &bytes, true, None);
+        let result = classify_quote_response(
+            &peer_id,
+            &[0u8; 32],
+            &bytes,
+            true,
+            None,
+            None,
+            &[0u8; 32],
+            &std::sync::Mutex::new(None),
+        );
         assert!(
             matches!(result, Err(Error::BadQuoteBinding { .. })),
             "crossed-key peer must be classified BadQuoteBinding even when \
@@ -2352,7 +2580,16 @@ mod tests {
         let content = [7u8; 32];
         let (peer_id, quote) = signed_baseline_quote(content);
         let bytes = serialize_quote(&quote);
-        let result = classify_quote_response(&peer_id, &content, &bytes, true, None);
+        let result = classify_quote_response(
+            &peer_id,
+            &content,
+            &bytes,
+            true,
+            None,
+            None,
+            &[0u8; 32],
+            &std::sync::Mutex::new(None),
+        );
         assert!(
             matches!(result, Err(Error::AlreadyStored)),
             "honest peer's already_stored vote must be honoured; got {result:?}"
@@ -2363,7 +2600,16 @@ mod tests {
     fn classifier_returns_serialization_error_on_bad_bytes() {
         let (peer_id, _, _, _, _) = good_quote_real();
         let garbage = b"this is not a valid msgpack PaymentQuote".to_vec();
-        let result = classify_quote_response(&peer_id, &[0u8; 32], &garbage, false, None);
+        let result = classify_quote_response(
+            &peer_id,
+            &[0u8; 32],
+            &garbage,
+            false,
+            None,
+            None,
+            &[0u8; 32],
+            &std::sync::Mutex::new(None),
+        );
         assert!(
             matches!(result, Err(Error::Serialization(_))),
             "garbage bytes must produce a Serialization error; got {result:?}"
@@ -2385,8 +2631,17 @@ mod tests {
         for (peer_id, quote) in &responders {
             let bytes = serialize_quote(quote);
             let storer_verdict = storer_binding_would_accept(peer_id, quote);
-            let classifier_verdict =
-                classify_quote_response(peer_id, &content, &bytes, false, None).is_ok();
+            let classifier_verdict = classify_quote_response(
+                peer_id,
+                &content,
+                &bytes,
+                false,
+                None,
+                None,
+                &[0u8; 32],
+                &std::sync::Mutex::new(None),
+            )
+            .is_ok();
             assert_eq!(
                 classifier_verdict, storer_verdict,
                 "classifier and storer-binding-spec must agree on every responder \
@@ -2642,7 +2897,16 @@ mod tests {
             .as_bytes()
             .to_vec();
         let bytes = serialize_quote(&quote);
-        let result = classify_quote_response(&kp.peer_id, &content, &bytes, false, None);
+        let result = classify_quote_response(
+            &kp.peer_id,
+            &content,
+            &bytes,
+            false,
+            None,
+            None,
+            &[0u8; 32],
+            &std::sync::Mutex::new(None),
+        );
         assert!(
             matches!(result, Err(Error::BadQuoteCommitment { .. })),
             "off-curve quote must be dropped as BadQuoteCommitment; got {result:?}"

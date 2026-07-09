@@ -24,6 +24,7 @@ use ant_node::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
 };
+use ant_node::replication::audit_tally::{AuditTally, TallyReportSource};
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 // Wire / transport / EVM types: route through ant-protocol so the test
@@ -97,6 +98,12 @@ pub fn test_client_config() -> ClientConfig {
 pub struct TestNode {
     pub p2p_node: Option<Arc<P2PNode>>,
     pub protocol: Option<Arc<AntProtocol>>,
+    /// ADR-0005: this node's audit tally (present when the testnet was
+    /// started with tallies). Tests seed it directly — MiniTestnet nodes run
+    /// no replication engine, so no real audits feed it — which makes the
+    /// tally -> signed report -> client verify -> eligibility gate path fully
+    /// deterministic.
+    pub audit_tally: Option<Arc<std::sync::RwLock<AuditTally>>>,
     _handler_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -115,7 +122,7 @@ impl MiniTestnet {
     /// Use `DEFAULT_NODE_COUNT` for standard tests, 35+ for merkle tests (need 16 peers per pool).
     /// Nodes emit baseline `(0, None)` quotes (no commitment source wired).
     pub async fn start(node_count: usize) -> Self {
-        Self::start_inner(node_count, None).await
+        Self::start_inner(node_count, None, false).await
     }
 
     /// ADR-0004: start a testnet where every node carries a live storage
@@ -124,10 +131,21 @@ impl MiniTestnet {
     /// in the quote response). Exercises the full node→client→storer binding
     /// handshake against real QUIC + Anvil.
     pub async fn start_with_commitments(node_count: usize, key_count: u32) -> Self {
-        Self::start_inner(node_count, Some(key_count)).await
+        Self::start_inner(node_count, Some(key_count), false).await
     }
 
-    async fn start_inner(node_count: usize, commitment_key_count: Option<u32>) -> Self {
+    /// ADR-0005: like [`Self::start_with_commitments`] but every node also
+    /// carries an (empty) audit tally wired as its quote generator's report
+    /// source. Tests seed the tallies and the nodes testify accordingly.
+    pub async fn start_with_commitments_and_tallies(node_count: usize, key_count: u32) -> Self {
+        Self::start_inner(node_count, Some(key_count), true).await
+    }
+
+    async fn start_inner(
+        node_count: usize,
+        commitment_key_count: Option<u32>,
+        with_tallies: bool,
+    ) -> Self {
         // Start Anvil EVM testnet FIRST
         let testnet = Testnet::new().await.expect("start Anvil testnet");
         let evm_network = testnet.to_network();
@@ -152,13 +170,14 @@ impl MiniTestnet {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
             let temp_dir = tempfile::TempDir::new().expect("create temp dir");
-            let (node, protocol, handler) = Self::spawn_node(
+            let (node, protocol, tally, handler) = Self::spawn_node(
                 addr,
                 &bootstrap_addrs,
                 temp_dir.path(),
                 &evm_network,
                 i,
                 commitment_key_count,
+                with_tallies,
             )
             .await;
 
@@ -166,6 +185,7 @@ impl MiniTestnet {
             nodes.push(TestNode {
                 p2p_node: Some(Arc::clone(&node)),
                 protocol: Some(protocol),
+                audit_tally: tally,
                 _handler_task: Some(handler),
             });
             temp_dirs.push(temp_dir);
@@ -178,19 +198,21 @@ impl MiniTestnet {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
             let temp_dir = tempfile::TempDir::new().expect("create temp dir");
-            let (node, protocol, handler) = Self::spawn_node(
+            let (node, protocol, tally, handler) = Self::spawn_node(
                 addr,
                 &bootstrap_addrs,
                 temp_dir.path(),
                 &evm_network,
                 i,
                 commitment_key_count,
+                with_tallies,
             )
             .await;
 
             nodes.push(TestNode {
                 p2p_node: Some(Arc::clone(&node)),
                 protocol: Some(protocol),
+                audit_tally: tally,
                 _handler_task: Some(handler),
             });
             temp_dirs.push(temp_dir);
@@ -284,7 +306,7 @@ impl MiniTestnet {
         &self.evm_network
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
     async fn spawn_node(
         listen_addr: SocketAddr,
         bootstrap_peers: &[SocketAddr],
@@ -292,7 +314,13 @@ impl MiniTestnet {
         evm_network: &EvmNetwork,
         node_index: usize,
         commitment_key_count: Option<u32>,
-    ) -> (Arc<P2PNode>, Arc<AntProtocol>, tokio::task::JoinHandle<()>) {
+        with_tally: bool,
+    ) -> (
+        Arc<P2PNode>,
+        Arc<AntProtocol>,
+        Option<Arc<std::sync::RwLock<AuditTally>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         // Generate ML-DSA-65 identity for this node
         let identity = Arc::new(NodeIdentity::generate().expect("generate node identity"));
 
@@ -383,6 +411,20 @@ impl MiniTestnet {
             protocol.attach_commitment_source(source);
         }
 
+        // ADR-0005: wire an (empty) audit tally as the report source so quote
+        // responses carry this node's signed testimony once a test seeds it.
+        let audit_tally = if with_tally {
+            let tally = Arc::new(std::sync::RwLock::new(AuditTally::default()));
+            let reporter_peer_id = *blake3::hash(identity.public_key().as_bytes()).as_bytes();
+            protocol.attach_report_source(Arc::new(TallyReportSource::new(
+                Arc::clone(&tally),
+                reporter_peer_id,
+            )));
+            Some(tally)
+        } else {
+            None
+        };
+
         // Start message handler loop
         let handler_node = Arc::clone(&node);
         let handler_protocol = Arc::clone(&protocol);
@@ -440,7 +482,114 @@ impl MiniTestnet {
             }
         });
 
-        (node, protocol, handler)
+        (node, protocol, audit_tally, handler)
+    }
+
+    /// ADR-0005: seed `observer`'s tally with a clean audited history for
+    /// `subject`: one pass per day for `days` distinct days ending now, each
+    /// at `key_count` committed keys. `days = 7` is a full week of dues.
+    pub fn seed_history(&self, observer: usize, subject: &[u8; 32], key_count: u32, days: u64) {
+        let tally = self.nodes[observer]
+            .audit_tally
+            .as_ref()
+            .expect("testnet started with tallies");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let mut guard = tally.write().expect("tally lock");
+        let subject = ant_protocol::transport::PeerId::from_bytes(*subject);
+        // Three passes per day: 7 days -> 21 passes, clearing the default
+        // ADR5_P_PASSES = 20.
+        for d in 0..days {
+            for p in 0..3u64 {
+                guard.record_pass(subject, key_count, now - d * 86_400 - p);
+            }
+        }
+    }
+
+    /// ADR-0005: every tally-bearing node except `subject_index` gets a clean
+    /// `days`-day history for node `subject_index`.
+    pub fn seed_history_for_all_observers(&self, subject_index: usize, key_count: u32, days: u64) {
+        let subject = *self.nodes[subject_index]
+            .p2p_node
+            .as_ref()
+            .expect("subject node running")
+            .peer_id()
+            .as_bytes();
+        for (i, node) in self.nodes.iter().enumerate() {
+            if i != subject_index && node.audit_tally.is_some() {
+                self.seed_history(i, &subject, key_count, days);
+            }
+        }
+    }
+
+    /// ADR-0005: record a deterministic conviction of `subject_index` at every
+    /// other tally-bearing node (what a real caught-deleting node would face),
+    /// `age_days` in the past (0 = now; v4 sticky convictions last
+    /// `CONVICTION_STICKY_DAYS`, so tests use an old conviction to model "the
+    /// sticky period has since elapsed").
+    pub fn convict_at_all_observers(&self, subject_index: usize, age_days: u64) {
+        let subject = *self.nodes[subject_index]
+            .p2p_node
+            .as_ref()
+            .expect("subject node running")
+            .peer_id()
+            .as_bytes();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+            - age_days * 86_400;
+        let subject = ant_protocol::transport::PeerId::from_bytes(subject);
+        for (i, node) in self.nodes.iter().enumerate() {
+            if i == subject_index {
+                continue;
+            }
+            if let Some(tally) = &node.audit_tally {
+                tally
+                    .write()
+                    .expect("tally lock")
+                    .record_conviction(subject, now);
+            }
+        }
+    }
+
+    /// ADR-0005: fence `subject_index` at every other tally-bearing node (what
+    /// a silent hopper faces after ignoring monetized-pin challenges).
+    pub fn fence_at_all_observers(&self, subject_index: usize) {
+        let subject = *self.nodes[subject_index]
+            .p2p_node
+            .as_ref()
+            .expect("subject node running")
+            .peer_id()
+            .as_bytes();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let subject = ant_protocol::transport::PeerId::from_bytes(subject);
+        for (i, node) in self.nodes.iter().enumerate() {
+            if i == subject_index {
+                continue;
+            }
+            if let Some(tally) = &node.audit_tally {
+                tally
+                    .write()
+                    .expect("tally lock")
+                    .record_unanswered_monetized_challenge(subject, now);
+            }
+        }
+    }
+
+    /// Peer id bytes of node `index`.
+    pub fn peer_id_bytes(&self, index: usize) -> [u8; 32] {
+        *self.nodes[index]
+            .p2p_node
+            .as_ref()
+            .expect("node running")
+            .peer_id()
+            .as_bytes()
     }
 
     /// Shut down a node by index, simulating a failure.
