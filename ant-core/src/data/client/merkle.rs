@@ -13,7 +13,13 @@ use ant_protocol::evm::{
     Amount, MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
     MidpointProof, PoolCommitment, CANDIDATES_PER_POOL, MAX_LEAVES,
 };
-use ant_protocol::payment::{serialize_merkle_proof, verify_merkle_candidate_signature};
+use ant_protocol::payment::commitment::{
+    commitment_hash, verify_commitment_signature, StorageCommitment, MAX_COMMITMENT_KEY_COUNT,
+    MAX_COMMITMENT_SIDECAR_BYTES,
+};
+use ant_protocol::payment::{
+    calculate_price, serialize_merkle_proof, verify_merkle_candidate_signature,
+};
 use ant_protocol::transport::PeerId;
 use ant_protocol::{
     compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
@@ -30,6 +36,80 @@ use xor_name::XorName;
 
 /// Default threshold: use merkle payments when chunk count >= this value.
 pub const DEFAULT_MERKLE_THRESHOLD: usize = 64;
+
+/// ADR-0004 resolve-before-pay gate for a merkle candidate — the merkle-path
+/// equivalent of the single-node `quote_commitment_binding_is_valid`. Runs the
+/// FULL binding check (shape, cap, exact price, and for bound candidates the
+/// commitment parse, peer-binding, signature, `hash == pin`, and
+/// `count == key_count`) before the candidate is allowed into a pool the client
+/// may pay. `peer_id` is derived from the candidate's `pub_key`
+/// (`BLAKE3(pub_key)`), matching the storer.
+///
+/// Returns `Ok(())` if the binding fully resolves, else `Err(detail)`.
+fn merkle_candidate_binding_is_valid(
+    peer_id: &PeerId,
+    candidate: &MerklePaymentCandidateNode,
+    commitment: &Option<Vec<u8>>,
+) -> std::result::Result<(), String> {
+    let count = candidate.committed_key_count;
+    let pin = candidate.commitment_pin;
+    match (count, pin.is_some()) {
+        (0, false) | (1.., true) => {}
+        (1.., false) => {
+            return Err(format!(
+                "committed_key_count={count} > 0 but commitment_pin is None (unauditable count)"
+            ));
+        }
+        (0, true) => {
+            return Err("committed_key_count=0 with a commitment_pin (incoherent baseline)".into());
+        }
+    }
+    if count > MAX_COMMITMENT_KEY_COUNT {
+        return Err(format!(
+            "committed_key_count={count} exceeds MAX_COMMITMENT_KEY_COUNT={MAX_COMMITMENT_KEY_COUNT}"
+        ));
+    }
+    let expected = calculate_price(count as usize);
+    if candidate.price != expected {
+        return Err(format!(
+            "price {} does not equal calculate_price(committed_key_count={count}) = {expected}",
+            candidate.price
+        ));
+    }
+
+    let Some(pin) = pin else {
+        return Ok(()); // baseline candidate pins nothing
+    };
+    let Some(blob) = commitment else {
+        return Err("bound candidate did not ship its commitment; pin is unresolvable".into());
+    };
+    if blob.len() > MAX_COMMITMENT_SIDECAR_BYTES {
+        return Err(format!(
+            "shipped commitment is {} bytes, exceeds MAX_COMMITMENT_SIDECAR_BYTES={MAX_COMMITMENT_SIDECAR_BYTES}",
+            blob.len()
+        ));
+    }
+    let commitment: StorageCommitment = rmp_serde::from_slice(blob)
+        .map_err(|e| format!("shipped commitment did not deserialize: {e}"))?;
+    if compute_address(&commitment.sender_public_key) != *peer_id.as_bytes()
+        || commitment.sender_peer_id != *peer_id.as_bytes()
+    {
+        return Err("shipped commitment is not bound to the candidate peer".into());
+    }
+    if !verify_commitment_signature(&commitment) {
+        return Err("shipped commitment has an invalid signature".into());
+    }
+    if commitment_hash(&commitment) != Some(pin) {
+        return Err("shipped commitment does not hash to the candidate's pin".into());
+    }
+    if commitment.key_count != count {
+        return Err(format!(
+            "shipped commitment attests key_count={} but the candidate claims {count}",
+            commitment.key_count
+        ));
+    }
+    Ok(())
+}
 
 /// Payment mode for uploads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -443,7 +523,11 @@ impl Client {
             midpoint_proofs.len()
         );
 
-        // 3. Collect candidate pools from the network (all pools in parallel)
+        // 3. Collect candidate pools from the network (all pools in parallel).
+        //    Each candidate's ADR-0004 binding is fully verified during
+        //    collection (shape, cap, exact price, commitment resolution); the
+        //    sidecars themselves are consumed by that validation and NOT
+        //    forwarded in the PUT bundles (see `finalize_merkle_batch`).
         let candidate_pools = self
             .build_candidate_pools(
                 &midpoint_proofs,
@@ -685,12 +769,15 @@ impl Client {
                     &addrs_clone,
                     |body| match body {
                         ChunkMessageBody::MerkleCandidateQuoteResponse(
-                            MerkleCandidateQuoteResponse::Success { candidate_node },
+                            MerkleCandidateQuoteResponse::Success {
+                                candidate_node,
+                                commitment,
+                            },
                         ) => {
                             match rmp_serde::from_slice::<MerklePaymentCandidateNode>(
                                 &candidate_node,
                             ) {
-                                Ok(node) => Some(Ok(node)),
+                                Ok(node) => Some(Ok((node, commitment))),
                                 Err(e) => Some(Err(Error::Serialization(format!(
                                     "Failed to deserialize candidate node from {peer_id_clone}: {e}"
                                 )))),
@@ -742,7 +829,7 @@ impl Client {
             impl std::future::Future<
                 Output = (
                     PeerId,
-                    std::result::Result<MerklePaymentCandidateNode, Error>,
+                    std::result::Result<(MerklePaymentCandidateNode, Option<Vec<u8>>), Error>,
                 ),
             >,
         >,
@@ -754,7 +841,7 @@ impl Client {
 
         while let Some((peer_id, result)) = futures.next().await {
             match result {
-                Ok(candidate) => {
+                Ok((candidate, commitment)) => {
                     if !verify_merkle_candidate_signature(&candidate) {
                         warn!("Invalid ML-DSA-65 signature from merkle candidate {peer_id}");
                         failures.push(format!("{peer_id}: invalid signature"));
@@ -765,7 +852,35 @@ impl Client {
                         failures.push(format!("{peer_id}: timestamp mismatch"));
                         continue;
                     }
-                    valid.push((peer_id, candidate));
+                    // The candidate's identity is `BLAKE3(candidate.pub_key)` —
+                    // this is what the storer derives (verifier.rs). Require it
+                    // to equal the network responder so a two-identity operator
+                    // cannot answer as B while shipping A's commitment.
+                    let candidate_peer = PeerId::from_bytes(compute_address(&candidate.pub_key));
+                    if candidate_peer != peer_id {
+                        warn!(
+                            "Dropping merkle candidate {peer_id} — pub_key derives {candidate_peer}, \
+                             not the responding peer"
+                        );
+                        failures.push(format!("{peer_id}: candidate pub_key/peer mismatch"));
+                        continue;
+                    }
+                    // ADR-0004: the FULL resolve-before-pay binding check, same as
+                    // the single-node path — a candidate priced off its committed
+                    // count, or shipping an unresolvable/forged commitment, is
+                    // dropped before it can enter a pool the client pays. Checked
+                    // against the CANDIDATE peer (the one the storer audits). The
+                    // shipped commitment is consumed here (resolution only) and
+                    // not forwarded in the PUT bundles (see
+                    // `finalize_merkle_batch`).
+                    if let Err(detail) =
+                        merkle_candidate_binding_is_valid(&candidate_peer, &candidate, &commitment)
+                    {
+                        warn!("Dropping merkle candidate {peer_id} — ADR-0004 binding invalid: {detail}");
+                        failures.push(format!("{peer_id}: bad commitment binding ({detail})"));
+                        continue;
+                    }
+                    valid.push((candidate_peer, candidate));
                 }
                 Err(e) => {
                     debug!("Failed to get merkle candidate from {peer_id}: {e}");
@@ -791,9 +906,11 @@ impl Client {
             .map(|(_, candidate)| candidate)
             .collect();
 
-        candidates
-            .try_into()
-            .map_err(|_| Error::Payment("Failed to convert candidates to fixed array".to_string()))
+        let array: [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] =
+            candidates.try_into().map_err(|_| {
+                Error::Payment("Failed to convert candidates to fixed array".to_string())
+            })?;
+        Ok(array)
     }
 
     /// Upload chunks using pre-computed merkle proofs from a batch payment.
@@ -1304,6 +1421,15 @@ pub fn finalize_merkle_batch(
             ))
         })?;
 
+    // ADR-0004: commitment sidecars are deliberately NOT forwarded in the
+    // per-chunk proofs. Sixteen sidecars are ~214 KB serialized, and copying
+    // them into every chunk's bundle pushed the proof past the storer's
+    // payment-proof size cap, rejecting every merkle PUT once nodes carried
+    // live commitments. The client still fully resolves every candidate's
+    // commitment before paying (during pool collection); the storer's
+    // cross-check is best-effort and resolves pins from its gossip cache or a
+    // `GetCommitmentByPin` fetch when no sidecar is shipped.
+
     // Generate proofs for each chunk
     info!("Generating merkle proofs for {chunk_count} chunks");
     let mut proofs = HashMap::with_capacity(chunk_count);
@@ -1611,6 +1737,8 @@ mod tests {
                 reward_address: RewardsAddress::new([i as u8; 20]),
                 merkle_payment_timestamp: timestamp,
                 signature: vec![i as u8; 64],
+                committed_key_count: 0,
+                commitment_pin: None,
             });
 
         let pool = MerklePaymentCandidatePool {
@@ -1649,6 +1777,8 @@ mod tests {
             reward_address: ant_protocol::evm::RewardsAddress::new([0u8; 20]),
             merkle_payment_timestamp: 1000,
             signature: vec![0u8; 64],
+            committed_key_count: 0,
+            commitment_pin: None,
         };
 
         // Timestamp check: 1000 != 2000
@@ -1668,6 +1798,8 @@ mod tests {
             reward_address: RewardsAddress::new([i as u8; 20]),
             merkle_payment_timestamp: timestamp,
             signature: vec![i as u8; 64],
+            committed_key_count: 0,
+            commitment_pin: None,
         })
     }
 
@@ -1724,6 +1856,39 @@ mod tests {
         // Every proof should be non-empty
         for proof_bytes in batch.proofs.values() {
             assert!(!proof_bytes.is_empty());
+        }
+    }
+
+    /// DEV-01 regression: per-chunk merkle proofs must never ship commitment
+    /// sidecars — all 16 winner-pool sidecars (~214 KB serialized) copied into
+    /// every chunk's proof pushed it past the storer's payment-proof size cap,
+    /// rejecting every merkle PUT once nodes carried live commitments. The
+    /// e2e (`adr0004_merkle_upload_against_bound_candidates`) proves the flow
+    /// end-to-end; this pins the wire invariant directly so it cannot slip
+    /// back in behind a raised node-side cap.
+    #[test]
+    fn test_finalize_merkle_batch_ships_no_commitment_sidecars() {
+        use ant_protocol::payment::deserialize_merkle_proof;
+
+        let mut prepared = make_prepared_merkle_batch(4);
+        // Bind every candidate to a pin, mirroring a network where all nodes
+        // carry live commitments (the DEV-01 trigger state).
+        for pool in &mut prepared.candidate_pools {
+            for candidate in &mut pool.candidate_nodes {
+                candidate.committed_key_count = 9_000;
+                candidate.commitment_pin = Some([7u8; 32]);
+            }
+        }
+        let winner_hash = prepared.candidate_pools[0].hash();
+
+        let batch = finalize_merkle_batch(prepared, winner_hash).unwrap();
+        assert_eq!(batch.proofs.len(), 4);
+        for proof_bytes in batch.proofs.values() {
+            let proof = deserialize_merkle_proof(proof_bytes).unwrap();
+            assert!(
+                proof.commitment_sidecars.is_empty(),
+                "per-chunk merkle proofs must not ship commitment sidecars"
+            );
         }
     }
 

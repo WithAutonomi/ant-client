@@ -19,10 +19,12 @@ use ant_core::data::ClientConfig;
 // Node-internal types (test harness needs to *be* a node) — direct
 // ant-node import is correct here. ant-node is a dev-dep so this is
 // only linked into test binaries.
+use ant_node::payment::quote::CommitmentSource;
 use ant_node::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
 };
+use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 // Wire / transport / EVM types: route through ant-protocol so the test
 // harness exercises the same surface the client does.
@@ -111,7 +113,21 @@ impl MiniTestnet {
     /// Start a testnet with the given number of nodes.
     ///
     /// Use `DEFAULT_NODE_COUNT` for standard tests, 35+ for merkle tests (need 16 peers per pool).
+    /// Nodes emit baseline `(0, None)` quotes (no commitment source wired).
     pub async fn start(node_count: usize) -> Self {
+        Self::start_inner(node_count, None).await
+    }
+
+    /// ADR-0004: start a testnet where every node carries a live storage
+    /// commitment over `key_count` synthetic keys, so they emit COMMITMENT-BOUND
+    /// quotes (price = `calculate_price(key_count)`, pinned, commitment shipped
+    /// in the quote response). Exercises the full node→client→storer binding
+    /// handshake against real QUIC + Anvil.
+    pub async fn start_with_commitments(node_count: usize, key_count: u32) -> Self {
+        Self::start_inner(node_count, Some(key_count)).await
+    }
+
+    async fn start_inner(node_count: usize, commitment_key_count: Option<u32>) -> Self {
         // Start Anvil EVM testnet FIRST
         let testnet = Testnet::new().await.expect("start Anvil testnet");
         let evm_network = testnet.to_network();
@@ -136,8 +152,15 @@ impl MiniTestnet {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
             let temp_dir = tempfile::TempDir::new().expect("create temp dir");
-            let (node, protocol, handler) =
-                Self::spawn_node(addr, &bootstrap_addrs, temp_dir.path(), &evm_network, i).await;
+            let (node, protocol, handler) = Self::spawn_node(
+                addr,
+                &bootstrap_addrs,
+                temp_dir.path(),
+                &evm_network,
+                i,
+                commitment_key_count,
+            )
+            .await;
 
             bootstrap_addrs.push(addr);
             nodes.push(TestNode {
@@ -155,8 +178,15 @@ impl MiniTestnet {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
             let temp_dir = tempfile::TempDir::new().expect("create temp dir");
-            let (node, protocol, handler) =
-                Self::spawn_node(addr, &bootstrap_addrs, temp_dir.path(), &evm_network, i).await;
+            let (node, protocol, handler) = Self::spawn_node(
+                addr,
+                &bootstrap_addrs,
+                temp_dir.path(),
+                &evm_network,
+                i,
+                commitment_key_count,
+            )
+            .await;
 
             nodes.push(TestNode {
                 p2p_node: Some(Arc::clone(&node)),
@@ -261,6 +291,7 @@ impl MiniTestnet {
         data_dir: &std::path::Path,
         evm_network: &EvmNetwork,
         node_index: usize,
+        commitment_key_count: Option<u32>,
     ) -> (Arc<P2PNode>, Arc<AntProtocol>, tokio::task::JoinHandle<()>) {
         // Generate ML-DSA-65 identity for this node
         let identity = Arc::new(NodeIdentity::generate().expect("generate node identity"));
@@ -341,6 +372,16 @@ impl MiniTestnet {
         // Wire the P2P node into the protocol so direct PUT storage-admission
         // and payment closeness checks use the node's live DHT view.
         protocol.attach_p2p_node(Arc::clone(&node));
+
+        // ADR-0004: optionally give this node a live storage commitment so it
+        // emits COMMITMENT-BOUND quotes (price = calculate_price(key_count),
+        // pinned, with the signed commitment shipped in the quote response).
+        // Without this the node has no commitment source and emits baseline
+        // `(0, None)` quotes — the path the rest of the suite exercises.
+        if let Some(key_count) = commitment_key_count {
+            let source = build_commitment_source(key_count, &identity);
+            protocol.attach_commitment_source(source);
+        }
 
         // Start message handler loop
         let handler_node = Arc::clone(&node);
@@ -440,4 +481,43 @@ impl MiniTestnet {
             }
         }
     }
+}
+
+/// ADR-0004: build a live `ResponderCommitmentState` holding one current
+/// commitment over `key_count` synthetic keys, signed by `identity`'s ML-DSA-65
+/// key and bound to its peer id (`BLAKE3(pub_key)`). Returned as the
+/// `CommitmentSource` the quote generator prices against — so the node emits a
+/// commitment-bound quote (`calculate_price(key_count)`, pinned) and ships the
+/// signed commitment in the quote response. The commitment is real: it passes
+/// the storer's signature, peer-binding, and hash==pin checks.
+fn build_commitment_source(key_count: u32, identity: &NodeIdentity) -> Arc<dyn CommitmentSource> {
+    // Use the SAME identity→commitment-key conversion the replication engine
+    // uses in production (`MlDsaSecretKey::from_bytes(MlDsa65, identity bytes)`),
+    // so the commitment is signed by the node's real key and binds to its real
+    // peer id — exactly what the storer's cross-check verifies.
+    use ant_protocol::pqc::api::{MlDsaSecretKey, MlDsaVariant};
+
+    let pub_key = identity.public_key().as_bytes().to_vec();
+    let peer_id = *blake3::hash(&pub_key).as_bytes();
+    let sk_bytes = identity.secret_key_bytes().to_vec();
+    let sk = MlDsaSecretKey::from_bytes(MlDsaVariant::MlDsa65, &sk_bytes)
+        .expect("deserialize ML-DSA-65 secret key");
+
+    // `key_count` distinct (key, bytes_hash) leaves — the commitment attests
+    // exactly this many keys, which becomes the quote's committed_key_count.
+    let entries: Vec<([u8; 32], [u8; 32])> = (0..key_count)
+        .map(|i| {
+            let mut k = [0u8; 32];
+            k[..4].copy_from_slice(&i.to_le_bytes());
+            let mut b = [1u8; 32];
+            b[..4].copy_from_slice(&i.to_le_bytes());
+            (k, b)
+        })
+        .collect();
+
+    let built =
+        BuiltCommitment::build(entries, &peer_id, &sk, &pub_key).expect("build storage commitment");
+    let state = ResponderCommitmentState::new();
+    state.rotate(built);
+    Arc::new(state)
 }

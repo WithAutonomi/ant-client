@@ -89,6 +89,7 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         | Error::CostEstimationInconclusive(_)
         | Error::Cancelled(_)
         | Error::BadQuoteBinding { .. }
+        | Error::BadQuoteCommitment { .. }
         // A remote node responded with a structured rejection — the
         // transport round-trip succeeded, so the node declined at the
         // application layer (payment/disk/quote/pool). Not a local
@@ -770,6 +771,7 @@ mod tests {
             | Error::Cancelled(_)
             | Error::PartialUpload { .. }
             | Error::BadQuoteBinding { .. }
+            | Error::BadQuoteCommitment { .. }
             | Error::RemotePut { .. }
             | Error::CloseGroupShortfall(_) => (),
         };

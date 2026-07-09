@@ -531,7 +531,7 @@ async fn bench_merkle_once(client: &Client, rep: usize, concurrency: usize) -> R
                         &addrs_clone,
                         |body| match body {
                             ChunkMessageBody::MerkleCandidateQuoteResponse(
-                                MerkleCandidateQuoteResponse::Success { candidate_node },
+                                MerkleCandidateQuoteResponse::Success { candidate_node, .. },
                             ) => match rmp_serde::from_slice::<MerklePaymentCandidateNode>(
                                 &candidate_node,
                             ) {

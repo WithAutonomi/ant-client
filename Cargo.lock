@@ -892,9 +892,9 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.14.2"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbbc1f23610ffb700cd85bbf7519ebe29c767ccffc85480c29277da627de41de"
+checksum = "3f7f5de9683a7ce865dbc34eb51356fc748a0ee5b274e4fb343aec4de5dc3c81"
 dependencies = [
  "ant-protocol",
  "blake3",
@@ -942,9 +942,9 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.2.2"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a35986649c5963ec808efb44621d8b94716cc2ef5a041ea9a1875487578097c"
+checksum = "5b665880152b4e124094acc1faaff5f20a275594e6364b8a729b50f3bc326674"
 dependencies = [
  "blake3",
  "bytes",
@@ -2010,9 +2010,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.20"
+version = "0.9.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2529,9 +2529,9 @@ dependencies = [
 
 [[package]]
 name = "evmlib"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebd96cf24017cd31cd422c80de3078a821b7884a5b1feb00087e98209326c676"
+checksum = "8da0d9ad5b5cab92cc92ddac9afb884f86b226340caf17f6e5c41d51175dcaa1"
 dependencies = [
  "alloy",
  "ant-merkle",
@@ -3261,7 +3261,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]

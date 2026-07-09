@@ -68,11 +68,20 @@ impl Client {
         // Use node-reported prices directly — no contract price fetch needed.
         let mut peer_quotes = Vec::with_capacity(quotes_with_peers.len());
         let mut quotes_for_payment = Vec::with_capacity(quotes_with_peers.len());
+        // ADR-0004: forward the signed commitment each bound quote shipped, so
+        // the storers can cross-check the quote's count against the original
+        // commitment synchronously ("the commitment arrived with the quote").
+        // A baseline quote ships none. `get_store_quotes` already verified each
+        // quote's forced-price binding, so anything here is payable.
+        let mut commitment_sidecars = Vec::new();
 
-        for (peer_id, _addrs, quote, price) in quotes_with_peers {
+        for (peer_id, _addrs, quote, price, commitment) in quotes_with_peers {
             let encoded = peer_id_to_encoded(&peer_id)?;
             peer_quotes.push((encoded, quote.clone()));
             quotes_for_payment.push((quote, price));
+            if let Some(sidecar) = commitment {
+                commitment_sidecars.push(sidecar);
+            }
         }
 
         // 3. Create SingleNodePayment (sorts by price, selects median)
@@ -102,6 +111,7 @@ impl Client {
         let proof = PaymentProof {
             proof_of_payment: ProofOfPayment { peer_quotes },
             tx_hashes,
+            commitment_sidecars,
         };
 
         let proof_bytes = serialize_single_node_proof(&proof)

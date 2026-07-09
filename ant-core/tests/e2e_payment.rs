@@ -262,7 +262,7 @@ async fn test_quote_collection() {
     );
 
     // All prices should be > 0
-    for (peer_id, _addrs, _quote, price) in &quotes {
+    for (peer_id, _addrs, _quote, price, _commitment) in &quotes {
         assert!(
             !price.is_zero(),
             "Quote price from peer {peer_id} should be > 0"
@@ -270,7 +270,8 @@ async fn test_quote_collection() {
     }
 
     // All peer IDs should be unique
-    let unique_peers: std::collections::HashSet<_> = quotes.iter().map(|(p, _, _, _)| *p).collect();
+    let unique_peers: std::collections::HashSet<_> =
+        quotes.iter().map(|(p, _, _, _, _)| *p).collect();
     assert_eq!(
         unique_peers.len(),
         quotes.len(),
