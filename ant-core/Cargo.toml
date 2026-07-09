@@ -62,10 +62,10 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # `ant-protocol` pin above — a version skew pulls a second copy of
 # `saorsa-core` into the graph and makes `ant_node`'s and `ant_protocol`'s
 # `MultiAddr` mutually incompatible in `node/devnet.rs`. While the runtime
-# `ant-protocol` pin above points at a git branch, this ant-node must point at
-# the matching ant-node branch carrying the same saorsa-core / ant-protocol
-# lineage rather than a released version.
-ant-node = { git = "https://github.com/grumbach/ant-node", branch = "adr-0003-commitment-bound-pricing", optional = true }
+# `ant-protocol` pin above points at a released version, this ant-node must
+# track the matching released version carrying the same saorsa-core /
+# ant-protocol lineage.
+ant-node = { version = "0.14.3", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -96,7 +96,7 @@ test-utils = []
 # always compile even without the `devnet` feature. Pinned to the same
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
-ant-node = { git = "https://github.com/grumbach/ant-node", branch = "adr-0003-commitment-bound-pricing", features = ["test-utils"] }
+ant-node = { version = "0.14.3", features = ["test-utils"] }
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }

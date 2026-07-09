@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy",
  "ant-node",
@@ -892,8 +892,9 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.14.2"
-source = "git+https://github.com/grumbach/ant-node?branch=adr-0003-commitment-bound-pricing#ff7a547b627f2a18e630802feb02adeedb34ec1c"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f7f5de9683a7ce865dbc34eb51356fc748a0ee5b274e4fb343aec4de5dc3c81"
 dependencies = [
  "ant-protocol",
  "blake3",
@@ -942,7 +943,8 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=adr-0003-commitment-bound-pricing#3a4eb638abbbec2ec88823f14bfe66e11d70d9b5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b665880152b4e124094acc1faaff5f20a275594e6364b8a729b50f3bc326674"
 dependencies = [
  "blake3",
  "bytes",
@@ -2528,7 +2530,8 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.9.0"
-source = "git+https://github.com/WithAutonomi/evmlib?branch=adr-0003-signed-quote-fields#a7ac7e2620cb6a50151dd0c619fd75e03b02f05c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8da0d9ad5b5cab92cc92ddac9afb884f86b226340caf17f6e5c41d51175dcaa1"
 dependencies = [
  "alloy",
  "ant-merkle",

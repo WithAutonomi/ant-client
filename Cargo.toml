@@ -1,21 +1,3 @@
 [workspace]
 members = ["ant-core", "ant-cli"]
 resolver = "2"
-
-# ─── TEMPORARY: STRIP BEFORE MERGE — ADR-0004 coordinated cutover ───
-# ant-protocol/evmlib's ADR-0004 commitment-bound-quote types (the signed
-# `committed_key_count`/`commitment_pin` fields, the commitment sidecar, and
-# `BadQuoteCommitment`) are not yet published to crates.io, so this workspace
-# cannot build against the published `ant-protocol`/`evmlib`. These git patches
-# point those deps at their PR branches so CI can build the coordinated change.
-#
-# AT RELEASE (once the ADR-0004 versions are published, in order
-# evmlib → ant-protocol):
-#   1. delete this entire [patch.crates-io] block, AND
-#   2. bump the `ant-protocol` pin in ant-core/Cargo.toml to the published
-#      version (evmlib is re-exported through ant-protocol, no direct pin):
-#        ant-protocol = "2.3.0"   # <- published ADR-0004 ant-protocol
-#        # (which in turn depends on the published evmlib = "0.9.0")
-[patch.crates-io]
-evmlib = { git = "https://github.com/WithAutonomi/evmlib", branch = "adr-0003-signed-quote-fields" }
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "adr-0003-commitment-bound-pricing" }
