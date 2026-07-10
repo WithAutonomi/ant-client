@@ -21,6 +21,7 @@ use crate::data::client::merkle::{
     merkle_store_with_retry, should_use_merkle, MerkleBatchPaymentResult, PaymentMode,
     PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
 };
+use crate::data::client::payment::SINGLE_NODE_PAYMENT_MULTIPLIER;
 use crate::data::client::Client;
 use crate::data::error::{Error, PartialUploadSpend, Result};
 use ant_protocol::evm::{Amount, PaymentQuote, QuoteHash, TxHash, MAX_LEAVES};
@@ -1350,7 +1351,7 @@ impl Client {
             .get(prices.len() / 2)
             .copied()
             .unwrap_or(Amount::ZERO);
-        let per_chunk_cost = median_price * Amount::from(3u64);
+        let per_chunk_cost = median_price * Amount::from(SINGLE_NODE_PAYMENT_MULTIPLIER);
 
         let chunk_count_u64 = u64::try_from(chunk_count).unwrap_or(u64::MAX);
         let total_storage = per_chunk_cost * Amount::from(chunk_count_u64);

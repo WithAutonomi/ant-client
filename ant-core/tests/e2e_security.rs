@@ -43,10 +43,10 @@ async fn collect_and_pay(client: &Client, content: &Bytes) -> (PaymentProof, Vec
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes.len());
     let mut commitment_sidecars = Vec::new();
-    for (peer_id, _addrs, quote, price, commitment) in quotes {
+    for (peer_id, _addrs, quote, _price, commitment) in quotes {
         let encoded = EncodedPeerId::new(*peer_id.as_bytes());
         peer_quotes.push((encoded, quote.clone()));
-        quotes_for_payment.push((quote, price));
+        quotes_for_payment.push(quote);
         if let Some(sidecar) = commitment {
             commitment_sidecars.push(sidecar);
         }
@@ -402,10 +402,10 @@ async fn test_attack_underpayment_single_node() {
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes.len());
     let mut commitment_sidecars = Vec::new();
-    for (peer_id, _addrs, quote, price, commitment) in quotes {
+    for (peer_id, _addrs, quote, _price, commitment) in quotes {
         let encoded = EncodedPeerId::new(*peer_id.as_bytes());
         peer_quotes.push((encoded, quote.clone()));
-        quotes_for_payment.push((quote, price));
+        quotes_for_payment.push(quote);
         if let Some(sidecar) = commitment {
             commitment_sidecars.push(sidecar);
         }
@@ -495,10 +495,10 @@ async fn test_attack_underpayment_half_price() {
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes.len());
     let mut commitment_sidecars = Vec::new();
-    for (peer_id, _addrs, quote, price, commitment) in quotes {
+    for (peer_id, _addrs, quote, _price, commitment) in quotes {
         let encoded = EncodedPeerId::new(*peer_id.as_bytes());
         peer_quotes.push((encoded, quote.clone()));
-        quotes_for_payment.push((quote, price));
+        quotes_for_payment.push(quote);
         if let Some(sidecar) = commitment {
             commitment_sidecars.push(sidecar);
         }

@@ -254,10 +254,11 @@ async fn test_quote_collection() {
         .await
         .expect("get_store_quotes should succeed");
 
-    // Single-node payment now needs only one valid witnessed quote.
+    // A healthy network should still return several quotes even though the
+    // degraded single-node path can proceed with only one.
     assert!(
-        !quotes.is_empty(),
-        "Should receive at least one quote, got {}",
+        quotes.len() >= 5,
+        "Should receive at least 5 quotes, got {}",
         quotes.len()
     );
 

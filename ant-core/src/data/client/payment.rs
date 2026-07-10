@@ -13,6 +13,9 @@ use ant_protocol::transport::{MultiAddr, PeerId};
 use std::sync::Arc;
 use tracing::{debug, info};
 
+/// Single-node payment pays the selected median quote at 3x its quoted price.
+pub(crate) const SINGLE_NODE_PAYMENT_MULTIPLIER: u64 = 3;
+
 impl Client {
     /// Get the wallet, returning an error if not configured.
     pub(crate) fn require_wallet(&self) -> Result<&Arc<Wallet>> {
@@ -76,10 +79,10 @@ impl Client {
         // quote's forced-price binding, so anything here is payable.
         let mut commitment_sidecars = Vec::new();
 
-        for (peer_id, _addrs, quote, price, commitment) in quotes_with_peers {
+        for (peer_id, _addrs, quote, _price, commitment) in quotes_with_peers {
             let encoded = peer_id_to_encoded(&peer_id)?;
             peer_quotes.push((encoded, quote.clone()));
-            quotes_for_payment.push((quote, price));
+            quotes_for_payment.push(quote);
             if let Some(sidecar) = commitment {
                 commitment_sidecars.push(sidecar);
             }
