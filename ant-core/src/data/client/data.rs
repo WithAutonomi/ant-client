@@ -555,7 +555,7 @@ impl Client {
 
         // The self-encryption fetcher may only yield `self_encryption::Error`.
         // Capture the underlying `ant-core` error out-of-band so a missing
-        // wrapper chunk surfaces as `Error::InvalidData` (matching the
+        // wrapper chunk surfaces as `Error::NotFound` (matching the
         // content-chunk path) and a network failure keeps its `Timeout` /
         // `Network` classification, instead of every resolution failure
         // flattening to `Error::Encryption`.
@@ -569,7 +569,7 @@ impl Client {
                             Ok(Some(chunk)) => Ok(chunk.content),
                             Ok(None) => Err(record_wrapper_fetch_error(
                                 &mut fetch_error,
-                                Error::InvalidData(format!(
+                                Error::NotFound(format!(
                                     "Missing wrapper chunk {} required to resolve root DataMap",
                                     hex::encode(address)
                                 )),

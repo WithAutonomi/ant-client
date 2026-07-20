@@ -130,6 +130,10 @@ impl PeerGetSummary {
                 self.not_found += 1;
                 "not_found".to_string()
             }
+            Err(DataError::NotFound(e)) => {
+                self.not_found += 1;
+                format!("not_found message={e}")
+            }
             Err(DataError::Timeout(e)) => {
                 self.timeout += 1;
                 format!("timeout message={e}")
@@ -360,6 +364,10 @@ mod tests {
         assert_eq!(summary.record(&Ok(Some(chunk))), "found bytes=3");
         assert_eq!(summary.record(&Ok(None)), "not_found");
         assert_eq!(
+            summary.record(&Err(DataError::NotFound("nothing at abcd".to_string()))),
+            "not_found message=nothing at abcd"
+        );
+        assert_eq!(
             summary.record(&Err(DataError::Timeout("slow".to_string()))),
             "timeout message=slow"
         );
@@ -373,7 +381,7 @@ mod tests {
         );
 
         assert_eq!(summary.found, 1);
-        assert_eq!(summary.not_found, 1);
+        assert_eq!(summary.not_found, 2);
         assert_eq!(summary.timeout, 1);
         assert_eq!(summary.network_error, 1);
         assert_eq!(summary.error, 1);
