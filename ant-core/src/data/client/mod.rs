@@ -55,11 +55,12 @@ pub(crate) const PUT_TARGET_WIDTH: usize = 20;
 /// - `PartialUpload` -> `NetworkError` (literal capacity signal: some
 ///   chunks could not be stored)
 /// - `AlreadyStored`, `Encryption`, `Crypto`, `Payment`,
-///   `Serialization`, `InvalidData`, `SignatureVerification`,
+///   `Serialization`, `InvalidData`, `NotFound`, `SignatureVerification`,
 ///   `Config`, `InsufficientDiskSpace`, `CostEstimationInconclusive`,
 ///   `Cancelled` -> `ApplicationError` (would happen on a perfectly
 ///   healthy link; `Cancelled` is caller-initiated and must not be retried
-///   as a transport failure)
+///   as a transport failure; `NotFound` is a definitively absent record
+///   reported over a working link, not a transport symptom)
 /// - `RemotePut` -> `ApplicationError` (the remote node responded with a
 ///   structured rejection — the transport succeeded, so the node declined
 ///   at the application layer; not a local capacity signal)
@@ -83,6 +84,10 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         | Error::Payment(_)
         | Error::Serialization(_)
         | Error::InvalidData(_)
+        // A definitively absent record, reported over a working link —
+        // the peers answered, there was just nothing stored there. Not a
+        // transport symptom, so it must not push the limiter down.
+        | Error::NotFound(_)
         | Error::SignatureVerification(_)
         | Error::Config(_)
         | Error::InsufficientDiskSpace(_)
@@ -623,6 +628,13 @@ mod tests {
                 Error::InvalidData("d".to_string()),
                 Outcome::ApplicationError,
             ),
+            // A definitively absent record over a working link — the peers
+            // answered, nothing was stored there. Must NOT register as a
+            // capacity signal.
+            (
+                Error::NotFound("missing".to_string()),
+                Outcome::ApplicationError,
+            ),
             (
                 Error::Serialization("s".to_string()),
                 Outcome::ApplicationError,
@@ -759,6 +771,7 @@ mod tests {
             | Error::Payment(_)
             | Error::Protocol(_)
             | Error::InvalidData(_)
+            | Error::NotFound(_)
             | Error::Serialization(_)
             | Error::Crypto(_)
             | Error::Io(_)

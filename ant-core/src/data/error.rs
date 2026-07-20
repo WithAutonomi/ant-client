@@ -64,6 +64,17 @@ pub enum Error {
     #[error("invalid data: {0}")]
     InvalidData(String),
 
+    /// The requested record does not exist on the network.
+    ///
+    /// A well-formed address with nothing stored at it — e.g. a `DataMap`
+    /// chunk lookup or a reconstruction fetch that came back empty from
+    /// every queried peer. Distinct from [`Error::InvalidData`], which means
+    /// content WAS retrieved but is malformed or fails integrity checks, so
+    /// callers can show "not found — check the address" instead of a
+    /// caller-bug message.
+    #[error("not found: {0}")]
+    NotFound(String),
+
     /// Serialization error.
     #[error("serialization error: {0}")]
     Serialization(String),
@@ -228,6 +239,15 @@ mod tests {
     fn test_display_invalid_data() {
         let err = Error::InvalidData("bad hash".to_string());
         assert_eq!(err.to_string(), "invalid data: bad hash");
+    }
+
+    #[test]
+    fn test_display_not_found() {
+        let err = Error::NotFound("DataMap chunk not found at abcd".to_string());
+        assert_eq!(
+            err.to_string(),
+            "not found: DataMap chunk not found at abcd"
+        );
     }
 
     #[test]

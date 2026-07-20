@@ -395,10 +395,11 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns an error if the chunk is not found or deserialization fails.
+    /// Returns [`Error::NotFound`] if no chunk exists at `address`; other
+    /// errors if retrieval or deserialization fails.
     pub async fn data_map_fetch(&self, address: &[u8; 32]) -> Result<DataMap> {
         let chunk = self.chunk_get(address).await?.ok_or_else(|| {
-            Error::InvalidData(format!(
+            Error::NotFound(format!(
                 "DataMap chunk not found at {}",
                 hex::encode(address)
             ))
@@ -412,7 +413,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns an error if the chunk is not found or deserialization fails.
+    /// Returns [`Error::NotFound`] if no chunk exists at `address`; other
+    /// errors if retrieval or deserialization fails.
     pub async fn data_map_fetch_from_closest_peers(
         &self,
         address: &[u8; 32],
@@ -422,7 +424,7 @@ impl Client {
             .chunk_get_from_closest_peers(address, peer_count.get())
             .await?
             .ok_or_else(|| {
-                Error::InvalidData(format!(
+                Error::NotFound(format!(
                     "DataMap chunk not found at {}",
                     hex::encode(address)
                 ))
@@ -451,8 +453,9 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns an error if any chunk cannot be retrieved, if decryption fails,
-    /// or if a shrunk map must be resolved on a current-thread runtime.
+    /// Returns an error if any chunk cannot be retrieved (a chunk absent from
+    /// every queried peer surfaces as [`Error::NotFound`]), if decryption
+    /// fails, or if a shrunk map must be resolved on a current-thread runtime.
     pub async fn data_download(&self, data_map: &DataMap) -> Result<Bytes> {
         let root_data_map = self.resolve_root_data_map(data_map).await?;
 
@@ -479,7 +482,7 @@ impl Client {
                     // (Ok(None) -> Timeout is the load-shedding
                     // signal for sustained close-group exhaustion).
                     let chunk = self.chunk_get_observed(&address).await?.ok_or_else(|| {
-                        Error::InvalidData(format!(
+                        Error::NotFound(format!(
                             "Missing chunk {} required for data reconstruction",
                             hex::encode(address)
                         ))
@@ -552,7 +555,7 @@ impl Client {
 
         // The self-encryption fetcher may only yield `self_encryption::Error`.
         // Capture the underlying `ant-core` error out-of-band so a missing
-        // wrapper chunk surfaces as `Error::InvalidData` (matching the
+        // wrapper chunk surfaces as `Error::NotFound` (matching the
         // content-chunk path) and a network failure keeps its `Timeout` /
         // `Network` classification, instead of every resolution failure
         // flattening to `Error::Encryption`.
@@ -566,7 +569,7 @@ impl Client {
                             Ok(Some(chunk)) => Ok(chunk.content),
                             Ok(None) => Err(record_wrapper_fetch_error(
                                 &mut fetch_error,
-                                Error::InvalidData(format!(
+                                Error::NotFound(format!(
                                     "Missing wrapper chunk {} required to resolve root DataMap",
                                     hex::encode(address)
                                 )),
