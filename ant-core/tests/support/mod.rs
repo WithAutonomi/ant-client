@@ -64,9 +64,6 @@ const STABILIZATION_TIMEOUT_SECS: u64 = 180;
 /// spawn delay) compared to a flaky suite.
 pub const DEFAULT_NODE_COUNT: usize = CLOSE_GROUP_SIZE * 2;
 
-/// Index of the median quote in a `SingleNodePayment` quotes array.
-pub const MEDIAN_QUOTE_INDEX: usize = CLOSE_GROUP_SIZE / 2;
-
 /// Test rewards address (20 bytes, all 0x01).
 const TEST_REWARDS_ADDRESS: [u8; 20] = [0x01; 20];
 /// Max records for quoting metrics.

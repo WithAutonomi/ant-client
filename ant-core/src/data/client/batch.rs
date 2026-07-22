@@ -7,18 +7,18 @@
 use crate::data::client::adaptive::observe_op;
 use crate::data::client::classify_error;
 use crate::data::client::file::UploadEvent;
-use crate::data::client::payment::peer_id_to_encoded;
+use crate::data::client::payment::{peer_id_to_encoded, SINGLE_NODE_PAYMENT_MULTIPLIER};
 use crate::data::client::Client;
 use crate::data::error::{Error, PartialUploadSpend, Result};
 use ant_protocol::evm::{
     Amount, EncodedPeerId, PayForQuotesError, PaymentQuote, ProofOfPayment, QuoteHash,
-    RewardsAddress, TxHash,
+    RewardsAddress, TxHash, Wallet,
 };
 use ant_protocol::payment::{
-    deserialize_proof, serialize_single_node_proof, PaymentProof, SingleNodePayment,
+    deserialize_proof, serialize_single_node_proof, PaymentProof, QuotePaymentInfo,
 };
 use ant_protocol::transport::{MultiAddr, PeerId};
-use ant_protocol::{compute_address, XorName, DATA_TYPE_CHUNK};
+use ant_protocol::{compute_address, XorName, CLOSE_GROUP_SIZE, DATA_TYPE_CHUNK};
 use bytes::Bytes;
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
@@ -36,6 +36,104 @@ const PAYMENT_WAVE_SIZE: usize = 64;
 /// / adaptive limits instead and are unaffected.
 const STORE_INFLIGHT_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
+/// Variable-size single-node payment plan for a chunk.
+///
+/// The shared `ant-protocol::payment::SingleNodePayment` helper still models
+/// the legacy fixed `CLOSE_GROUP_SIZE` quote set. Node-side verification now
+/// accepts any non-empty quote bundle up to `CLOSE_GROUP_SIZE`, so the client
+/// keeps the same 3x-median payment rule while allowing the single-node path to
+/// proceed with as few as one valid quote.
+#[derive(Debug, Clone)]
+pub struct SingleNodeQuotePayment {
+    /// Quotes sorted by price; the median-priced quote receives 3x payment and
+    /// the rest receive zero.
+    pub quotes: Vec<QuotePaymentInfo>,
+}
+
+impl SingleNodeQuotePayment {
+    /// Build a single-node payment from one or more quotes.
+    ///
+    /// The quotes are sorted by price, the median quote receives 3x its quoted
+    /// price, and every other quote is included with a zero amount so proof and
+    /// payment intent construction stay aligned.
+    pub fn from_quotes(mut quotes: Vec<PaymentQuote>) -> Result<Self> {
+        let quote_count = quotes.len();
+        if !(1..=CLOSE_GROUP_SIZE).contains(&quote_count) {
+            return Err(Error::Payment(format!(
+                "Single-node payment requires 1..={CLOSE_GROUP_SIZE} quotes, got {quote_count}"
+            )));
+        }
+
+        quotes.sort_by_key(|quote| quote.price);
+        let median_index = quote_count / 2;
+        let median_price = quotes[median_index].price;
+        let enhanced_price = median_price
+            .checked_mul(Amount::from(SINGLE_NODE_PAYMENT_MULTIPLIER))
+            .ok_or_else(|| {
+                Error::Payment("Price overflow when calculating 3x median".to_string())
+            })?;
+
+        let quotes = quotes
+            .into_iter()
+            .enumerate()
+            .map(|(idx, quote)| {
+                let quote_hash = quote.hash();
+                QuotePaymentInfo {
+                    quote_hash,
+                    rewards_address: quote.rewards_address,
+                    amount: if idx == median_index {
+                        enhanced_price
+                    } else {
+                        Amount::ZERO
+                    },
+                    price: quote.price,
+                }
+            })
+            .collect();
+
+        Ok(Self { quotes })
+    }
+
+    /// Total on-chain amount paid by this single-node payment.
+    #[must_use]
+    pub fn total_amount(&self) -> Amount {
+        self.quotes.iter().map(|q| q.amount).sum()
+    }
+
+    /// Pay the non-zero median quote on-chain, returning tx hashes for the
+    /// non-zero entries that must appear in the payment proof.
+    pub async fn pay(&self, wallet: &Wallet) -> Result<Vec<TxHash>> {
+        let quote_payments: Vec<_> = self
+            .quotes
+            .iter()
+            .map(|q| (q.quote_hash, q.rewards_address, q.amount))
+            .collect();
+
+        let (tx_hashes, _gas_info) =
+            wallet
+                .pay_for_quotes(quote_payments)
+                .await
+                .map_err(|PayForQuotesError(err, _)| {
+                    Error::Payment(format!("Failed to pay for quotes: {err}"))
+                })?;
+
+        let mut result_hashes = Vec::new();
+        for quote_info in &self.quotes {
+            if !quote_info.amount.is_zero() {
+                let tx_hash = tx_hashes.get(&quote_info.quote_hash).ok_or_else(|| {
+                    Error::Payment(format!(
+                        "Missing transaction hash for non-zero quote {}",
+                        quote_info.quote_hash
+                    ))
+                })?;
+                result_hashes.push(*tx_hash);
+            }
+        }
+
+        Ok(result_hashes)
+    }
+}
+
 /// Chunk quoted but not yet paid. Produced by [`Client::prepare_chunk_payment`].
 #[derive(Debug)]
 pub struct PreparedChunk {
@@ -50,7 +148,7 @@ pub struct PreparedChunk {
     /// group.
     pub quoted_peers: Vec<(PeerId, Vec<MultiAddr>)>,
     /// Payment structure (quotes sorted, median selected, not yet paid on-chain).
-    pub payment: SingleNodePayment,
+    pub payment: SingleNodeQuotePayment,
     /// Peer quotes for building `ProofOfPayment`.
     pub peer_quotes: Vec<(EncodedPeerId, PaymentQuote)>,
     /// ADR-0004: the signed commitments the bound quotes shipped, forwarded as
@@ -275,7 +373,7 @@ impl Client {
         // wider than the peers that supplied the paid quotes.
         let quoted_peers = quote_plan.put_peers;
 
-        // Build peer_quotes for ProofOfPayment + quotes for SingleNodePayment.
+        // Build peer_quotes for ProofOfPayment + quotes for single-node payment.
         // Use node-reported prices directly — no contract price fetch needed.
         let mut peer_quotes = Vec::with_capacity(quotes_with_peers.len());
         let mut quotes_for_payment = Vec::with_capacity(quotes_with_peers.len());
@@ -283,16 +381,16 @@ impl Client {
         // quotes ship none); `get_store_quotes` already verified the binding.
         let mut commitment_sidecars = Vec::new();
 
-        for (peer_id, _addrs, quote, price, commitment) in quotes_with_peers {
+        for (peer_id, _addrs, quote, _price, commitment) in quotes_with_peers {
             let encoded = peer_id_to_encoded(&peer_id)?;
             peer_quotes.push((encoded, quote.clone()));
-            quotes_for_payment.push((quote, price));
+            quotes_for_payment.push(quote);
             if let Some(sidecar) = commitment {
                 commitment_sidecars.push(sidecar);
             }
         }
 
-        let payment = SingleNodePayment::from_quotes(quotes_for_payment)
+        let payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment)
             .map_err(|e| Error::Payment(format!("Failed to create payment: {e}")))?;
 
         Ok(Some(PreparedChunk {
@@ -1083,8 +1181,7 @@ mod send_assertions {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use ant_protocol::payment::QuotePaymentInfo;
-    use ant_protocol::CLOSE_GROUP_SIZE;
+    use ant_protocol::payment::SingleNodePayment;
 
     /// Median index in the quotes array.
     const MEDIAN_INDEX: usize = CLOSE_GROUP_SIZE / 2;
@@ -1093,24 +1190,126 @@ mod tests {
     /// quote index and zero for all other quotes. Adapts automatically to
     /// `CLOSE_GROUP_SIZE` changes.
     fn make_prepared_chunk(median_amount: u64) -> PreparedChunk {
-        let quotes: [QuotePaymentInfo; CLOSE_GROUP_SIZE] = std::array::from_fn(|i| {
-            let amount = if i == MEDIAN_INDEX { median_amount } else { 0 };
-            QuotePaymentInfo {
-                quote_hash: QuoteHash::from([i as u8 + 1; 32]),
-                rewards_address: RewardsAddress::new([i as u8 + 10; 20]),
-                amount: Amount::from(amount),
-                price: Amount::from(amount),
-            }
-        });
+        let quotes: Vec<QuotePaymentInfo> = (0..CLOSE_GROUP_SIZE)
+            .map(|i| {
+                let amount = if i == MEDIAN_INDEX { median_amount } else { 0 };
+                QuotePaymentInfo {
+                    quote_hash: QuoteHash::from([i as u8 + 1; 32]),
+                    rewards_address: RewardsAddress::new([i as u8 + 10; 20]),
+                    amount: Amount::from(amount),
+                    price: Amount::from(amount),
+                }
+            })
+            .collect();
 
         PreparedChunk {
             content: Bytes::from(vec![0xAA; 32]),
             address: [0u8; 32],
             quoted_peers: Vec::new(),
-            payment: SingleNodePayment { quotes },
+            payment: SingleNodeQuotePayment { quotes },
             peer_quotes: Vec::new(),
             commitment_sidecars: Vec::new(),
         }
+    }
+
+    fn payment_quote(seed: u8, price: u64) -> PaymentQuote {
+        PaymentQuote {
+            content: xor_name::XorName([seed; 32]),
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            price: Amount::from(price),
+            rewards_address: RewardsAddress::new([seed; 20]),
+            pub_key: Vec::new(),
+            signature: Vec::new(),
+            committed_key_count: 0,
+            commitment_pin: None,
+        }
+    }
+
+    #[test]
+    fn single_node_quote_payment_accepts_every_supported_quote_count() {
+        for quote_count in 1..=CLOSE_GROUP_SIZE {
+            let quotes = (0..quote_count)
+                .rev()
+                .map(|i| payment_quote(i as u8, i as u64 + 1))
+                .collect();
+
+            let payment = SingleNodeQuotePayment::from_quotes(quotes)
+                .expect("every supported quote count should produce an SNP payment");
+            let median_index = quote_count / 2;
+            let enhanced_price =
+                payment.quotes[median_index].price * Amount::from(SINGLE_NODE_PAYMENT_MULTIPLIER);
+
+            assert_eq!(payment.quotes.len(), quote_count);
+            assert!(
+                payment
+                    .quotes
+                    .windows(2)
+                    .all(|pair| pair[0].price <= pair[1].price),
+                "quotes should be sorted by price"
+            );
+            for (index, quote) in payment.quotes.iter().enumerate() {
+                let expected = if index == median_index {
+                    enhanced_price
+                } else {
+                    Amount::ZERO
+                };
+                assert_eq!(quote.amount, expected);
+            }
+            assert_eq!(payment.total_amount(), enhanced_price);
+        }
+    }
+
+    #[test]
+    fn full_quote_payment_matches_protocol_implementation() {
+        let quotes = (0..CLOSE_GROUP_SIZE)
+            .rev()
+            .map(|i| payment_quote(i as u8, i as u64 + 1))
+            .collect::<Vec<_>>();
+
+        let local = SingleNodeQuotePayment::from_quotes(quotes.clone()).unwrap();
+        let protocol = SingleNodePayment::from_quotes(
+            quotes
+                .into_iter()
+                .map(|quote| {
+                    let price = quote.price;
+                    (quote, price)
+                })
+                .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(local.total_amount(), protocol.total_amount());
+        for (local, protocol) in local.quotes.iter().zip(&protocol.quotes) {
+            assert_eq!(local.quote_hash, protocol.quote_hash);
+            assert_eq!(local.rewards_address, protocol.rewards_address);
+            assert_eq!(local.amount, protocol.amount);
+            assert_eq!(local.price, protocol.price);
+        }
+    }
+
+    #[test]
+    fn single_node_quote_payment_rejects_zero_quotes() {
+        let err = SingleNodeQuotePayment::from_quotes(Vec::new())
+            .expect_err("empty SNP quote sets must remain invalid");
+        assert!(
+            err.to_string().contains("requires 1..="),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn single_node_quote_payment_rejects_too_many_quotes() {
+        let quotes = (0..=CLOSE_GROUP_SIZE)
+            .map(|i| payment_quote(i as u8, i as u64 + 1))
+            .collect();
+
+        let err = SingleNodeQuotePayment::from_quotes(quotes)
+            .expect_err("quote sets larger than the close group must remain invalid");
+        assert!(
+            err.to_string()
+                .contains(&format!("requires 1..={CLOSE_GROUP_SIZE}")),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

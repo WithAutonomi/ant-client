@@ -7,14 +7,14 @@
 
 mod support;
 
-use ant_core::data::{compute_address, Client};
+use ant_core::data::{compute_address, Client, SingleNodeQuotePayment};
 use ant_protocol::evm::{Amount, EncodedPeerId, ProofOfPayment, RewardsAddress, TxHash};
-use ant_protocol::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
+use ant_protocol::payment::{serialize_single_node_proof, PaymentProof};
 use ant_protocol::transport::PeerId;
 use bytes::Bytes;
 use serial_test::serial;
 use std::sync::Arc;
-use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT, MEDIAN_QUOTE_INDEX};
+use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 
 async fn setup() -> (Client, MiniTestnet) {
     let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
@@ -43,17 +43,18 @@ async fn collect_and_pay(client: &Client, content: &Bytes) -> (PaymentProof, Vec
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes.len());
     let mut commitment_sidecars = Vec::new();
-    for (peer_id, _addrs, quote, price, commitment) in quotes {
+    for (peer_id, _addrs, quote, _price, commitment) in quotes {
         let encoded = EncodedPeerId::new(*peer_id.as_bytes());
         peer_quotes.push((encoded, quote.clone()));
-        quotes_for_payment.push((quote, price));
+        quotes_for_payment.push(quote);
         if let Some(sidecar) = commitment {
             commitment_sidecars.push(sidecar);
         }
     }
 
     // Pay on-chain
-    let payment = SingleNodePayment::from_quotes(quotes_for_payment).expect("payment creation");
+    let payment =
+        SingleNodeQuotePayment::from_quotes(quotes_for_payment).expect("payment creation");
     let wallet = client.wallet().expect("wallet should be set");
     let tx_hashes = payment.pay(wallet).await.expect("on-chain payment");
 
@@ -370,7 +371,7 @@ async fn test_attack_client_without_wallet() {
 
 // ─── Test 9: Underpayment — Single Node ─────────────────────────────────────
 //
-// Collects real quotes, builds a valid SingleNodePayment, then tampers with
+// Collects real quotes, builds a valid single-node payment, then tampers with
 // the median quote's amount (reducing it to 1 atto). Pays on-chain with the
 // reduced amount. The node's on-chain verifyPayment check should detect that
 // the paid amount is far below the expected 3× median price and reject the PUT.
@@ -397,26 +398,27 @@ async fn test_attack_underpayment_single_node() {
         .map(|(pid, _, q, _, _)| (*pid, q.rewards_address))
         .collect();
 
-    // 2. Build SingleNodePayment normally (sorts by price, median gets 3×)
+    // 2. Build single-node payment normally (sorts by price, median gets 3×)
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes.len());
     let mut commitment_sidecars = Vec::new();
-    for (peer_id, _addrs, quote, price, commitment) in quotes {
+    for (peer_id, _addrs, quote, _price, commitment) in quotes {
         let encoded = EncodedPeerId::new(*peer_id.as_bytes());
         peer_quotes.push((encoded, quote.clone()));
-        quotes_for_payment.push((quote, price));
+        quotes_for_payment.push(quote);
         if let Some(sidecar) = commitment {
             commitment_sidecars.push(sidecar);
         }
     }
 
-    let mut payment = SingleNodePayment::from_quotes(quotes_for_payment)
+    let mut payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment)
         .expect("payment creation should succeed");
 
     // Target the median peer specifically — it's the only one that receives
     // payment, so only it will detect the amount mismatch in verifyPayment().
-    let original_amount = payment.quotes[MEDIAN_QUOTE_INDEX].amount;
-    let median_rewards = payment.quotes[MEDIAN_QUOTE_INDEX].rewards_address;
+    let median_quote_index = payment.quotes.len() / 2;
+    let original_amount = payment.quotes[median_quote_index].amount;
+    let median_rewards = payment.quotes[median_quote_index].rewards_address;
     let target_peer = peer_by_rewards
         .iter()
         .find(|(_, addr)| *addr == median_rewards)
@@ -428,7 +430,7 @@ async fn test_attack_underpayment_single_node() {
     );
 
     // 3. Tamper: reduce median payment to 1 atto (should be 3× median price)
-    payment.quotes[MEDIAN_QUOTE_INDEX].amount = Amount::from(1u64);
+    payment.quotes[median_quote_index].amount = Amount::from(1u64);
 
     // 4. Pay on-chain with the reduced amount — the contract records whatever
     //    amount is sent, it only validates amounts in verifyPayment()
@@ -493,22 +495,23 @@ async fn test_attack_underpayment_half_price() {
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes.len());
     let mut commitment_sidecars = Vec::new();
-    for (peer_id, _addrs, quote, price, commitment) in quotes {
+    for (peer_id, _addrs, quote, _price, commitment) in quotes {
         let encoded = EncodedPeerId::new(*peer_id.as_bytes());
         peer_quotes.push((encoded, quote.clone()));
-        quotes_for_payment.push((quote, price));
+        quotes_for_payment.push(quote);
         if let Some(sidecar) = commitment {
             commitment_sidecars.push(sidecar);
         }
     }
 
-    let mut payment = SingleNodePayment::from_quotes(quotes_for_payment)
+    let mut payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment)
         .expect("payment creation should succeed");
 
     // Halve the median payment (3× → ~1.5×).
     // Target the median peer — only it verifies the amount it received.
-    let original_amount = payment.quotes[MEDIAN_QUOTE_INDEX].amount;
-    let median_rewards = payment.quotes[MEDIAN_QUOTE_INDEX].rewards_address;
+    let median_quote_index = payment.quotes.len() / 2;
+    let original_amount = payment.quotes[median_quote_index].amount;
+    let median_rewards = payment.quotes[median_quote_index].rewards_address;
     let target_peer = peer_by_rewards
         .iter()
         .find(|(_, addr)| *addr == median_rewards)
@@ -519,7 +522,7 @@ async fn test_attack_underpayment_half_price() {
         !half_amount.is_zero(),
         "Half of original amount should still be non-zero"
     );
-    payment.quotes[MEDIAN_QUOTE_INDEX].amount = half_amount;
+    payment.quotes[median_quote_index].amount = half_amount;
 
     let wallet = client.wallet().expect("wallet should be set");
     let tx_hashes = payment

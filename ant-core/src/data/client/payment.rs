@@ -3,14 +3,18 @@
 //! Connects quote collection, on-chain EVM payment, and proof serialization.
 //! Every PUT to the network requires a valid payment proof.
 
+use crate::data::client::batch::SingleNodeQuotePayment;
 use crate::data::client::quote::median_paid_quote_issuer;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{EncodedPeerId, ProofOfPayment, Wallet};
-use ant_protocol::payment::{serialize_single_node_proof, PaymentProof, SingleNodePayment};
+use ant_protocol::payment::{serialize_single_node_proof, PaymentProof};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use std::sync::Arc;
 use tracing::{debug, info};
+
+/// Single-node payment pays the selected median quote at 3x its quoted price.
+pub(crate) const SINGLE_NODE_PAYMENT_MULTIPLIER: u64 = 3;
 
 impl Client {
     /// Get the wallet, returning an error if not configured.
@@ -23,8 +27,8 @@ impl Client {
     /// Pay for storage and return the serialized payment proof bytes.
     ///
     /// This orchestrates the full payment flow:
-    /// 1. Collect `CLOSE_GROUP_SIZE` quotes plus ordered PUT targets
-    /// 2. Build `SingleNodePayment` using node-reported prices (median 3x, others 0)
+    /// 1. Collect at least one witnessed quote plus ordered PUT targets
+    /// 2. Build single-node payment using node-reported prices (median 3x, others 0)
     /// 3. Pay on-chain via the wallet
     /// 4. Serialize `PaymentProof` with transaction hashes
     ///
@@ -48,7 +52,7 @@ impl Client {
 
         debug!("Collecting quotes for address {}", hex::encode(address));
 
-        // 1. Collect quotes from network
+        // 1. Collect at least one witnessed quote from the network
         let quote_plan = self
             .get_store_quote_plan(address, data_size, data_type)
             .await?;
@@ -64,7 +68,7 @@ impl Client {
         // This can be wider than the peers that supplied the paid quotes.
         let quoted_peers = quote_plan.put_peers;
 
-        // 2. Build peer_quotes for ProofOfPayment + quotes for SingleNodePayment.
+        // 2. Build peer_quotes for ProofOfPayment + quotes for single-node payment.
         // Use node-reported prices directly — no contract price fetch needed.
         let mut peer_quotes = Vec::with_capacity(quotes_with_peers.len());
         let mut quotes_for_payment = Vec::with_capacity(quotes_with_peers.len());
@@ -75,17 +79,17 @@ impl Client {
         // quote's forced-price binding, so anything here is payable.
         let mut commitment_sidecars = Vec::new();
 
-        for (peer_id, _addrs, quote, price, commitment) in quotes_with_peers {
+        for (peer_id, _addrs, quote, _price, commitment) in quotes_with_peers {
             let encoded = peer_id_to_encoded(&peer_id)?;
             peer_quotes.push((encoded, quote.clone()));
-            quotes_for_payment.push((quote, price));
+            quotes_for_payment.push(quote);
             if let Some(sidecar) = commitment {
                 commitment_sidecars.push(sidecar);
             }
         }
 
-        // 3. Create SingleNodePayment (sorts by price, selects median)
-        let payment = SingleNodePayment::from_quotes(quotes_for_payment)
+        // 3. Create single-node payment (sorts by price, selects median)
+        let payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment)
             .map_err(|e| Error::Payment(format!("Failed to create payment: {e}")))?;
 
         info!(

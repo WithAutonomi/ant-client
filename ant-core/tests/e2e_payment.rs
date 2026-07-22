@@ -254,7 +254,8 @@ async fn test_quote_collection() {
         .await
         .expect("get_store_quotes should succeed");
 
-    // At least 5 quotes required
+    // A healthy network should still return several quotes even though the
+    // degraded single-node path can proceed with only one.
     assert!(
         quotes.len() >= 5,
         "Should receive at least 5 quotes, got {}",
