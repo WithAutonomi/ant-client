@@ -103,7 +103,7 @@ impl AddArgs {
         // Check if daemon is running; if so, POST to API; otherwise call directly
         let config = DaemonConfig::default();
         let result = match client::status(&config).await {
-            Ok(status) if status.running => self.add_via_daemon(&config, &opts).await?,
+            Ok(status) if status.running => client::add_node(&config, &opts).await?,
             _ => self.add_directly(&config, &opts).await?,
         };
 
@@ -180,31 +180,6 @@ impl AddArgs {
             upgrade_channel: self.upgrade_channel.map(Into::into),
             evm_network: self.evm_network.into(),
         })
-    }
-
-    async fn add_via_daemon(
-        &self,
-        config: &DaemonConfig,
-        opts: &AddNodeOpts,
-    ) -> anyhow::Result<AddNodeResult> {
-        let info = client::info(config);
-        let api_base = info
-            .api_base
-            .ok_or_else(|| anyhow::anyhow!("Daemon is running but API base URL not available"))?;
-
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(format!("{api_base}/nodes"))
-            .json(opts)
-            .send()
-            .await?;
-
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let body = resp.text().await?;
-            anyhow::bail!("Daemon returned error: {body}");
-        }
     }
 
     async fn add_directly(

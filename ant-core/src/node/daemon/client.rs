@@ -5,8 +5,9 @@ use crate::error::{Error, Result};
 use crate::node::daemon::health::FleetHealth;
 use crate::node::process::detach;
 use crate::node::types::{
-    DaemonConfig, DaemonInfo, DaemonStartResult, DaemonStatus, DaemonStopResult, NodeStarted,
-    NodeStatusResult, NodeStopped, RemoveNodeResult, StartNodeResult, StopNodeResult,
+    AddNodeOpts, AddNodeResult, DaemonConfig, DaemonInfo, DaemonStartResult, DaemonStatus,
+    DaemonStopResult, NodeStarted, NodeStatusResult, NodeStopped, RemoveNodeResult, ResetResult,
+    StartNodeResult, StopNodeResult,
 };
 
 /// Get the daemon's current status by querying its REST API.
@@ -197,6 +198,50 @@ pub async fn stop_node(config: &DaemonConfig, node_id: u32) -> Result<NodeStoppe
 
     if resp.status().is_success() {
         resp.json::<NodeStopped>()
+            .await
+            .map_err(|e| Error::HttpRequest(e.to_string()))
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(Error::HttpRequest(body))
+    }
+}
+
+/// Add node(s) to the registry via the daemon REST API.
+pub async fn add_node(config: &DaemonConfig, opts: &AddNodeOpts) -> Result<AddNodeResult> {
+    let port = read_port_file(&config.port_file_path).ok_or(Error::DaemonNotRunning)?;
+
+    let url = format!("http://127.0.0.1:{port}/api/v1/nodes");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(opts)
+        .send()
+        .await
+        .map_err(|e| Error::HttpRequest(e.to_string()))?;
+
+    if resp.status().is_success() {
+        resp.json::<AddNodeResult>()
+            .await
+            .map_err(|e| Error::HttpRequest(e.to_string()))
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(Error::HttpRequest(body))
+    }
+}
+
+/// Reset all node state — clear the registry and remove node data/log
+/// directories — via the daemon REST API.
+pub async fn reset(config: &DaemonConfig) -> Result<ResetResult> {
+    let port = read_port_file(&config.port_file_path).ok_or(Error::DaemonNotRunning)?;
+
+    let url = format!("http://127.0.0.1:{port}/api/v1/reset");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| Error::HttpRequest(e.to_string()))?;
+
+    if resp.status().is_success() {
+        resp.json::<ResetResult>()
             .await
             .map_err(|e| Error::HttpRequest(e.to_string()))
     } else {
