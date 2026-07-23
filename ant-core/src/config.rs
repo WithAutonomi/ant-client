@@ -100,7 +100,11 @@ pub fn resolve_bootstrap_peers(
     }
 
     if let Some(m) = manifest {
-        return Ok(m.bootstrap.iter().filter_map(MultiAddr::socket_addr).collect());
+        return Ok(m
+            .bootstrap
+            .iter()
+            .filter_map(MultiAddr::socket_addr)
+            .collect());
     }
 
     if let Some(peers) = load_bootstrap_peers()? {
