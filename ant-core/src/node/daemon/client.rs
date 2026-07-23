@@ -312,6 +312,21 @@ pub async fn node_status(config: &DaemonConfig) -> Result<NodeStatusResult> {
     }
 }
 
+/// Resolve a node's ID from its service name via the daemon REST API.
+///
+/// Goes through the daemon — the registry's owner — rather than reading
+/// node_registry.json directly, so the lookup cannot observe a
+/// half-written registry or race a concurrent mutation by the daemon.
+pub async fn resolve_node_id_by_name(config: &DaemonConfig, service_name: &str) -> Result<u32> {
+    let status = node_status(config).await?;
+    status
+        .nodes
+        .iter()
+        .find(|n| n.name == service_name)
+        .map(|n| n.node_id)
+        .ok_or_else(|| Error::NodeNotFoundByName(service_name.to_string()))
+}
+
 /// Stop all running nodes via the daemon REST API.
 pub async fn stop_all_nodes(config: &DaemonConfig) -> Result<StopNodeResult> {
     let port = read_port_file(&config.port_file_path).ok_or(Error::DaemonNotRunning)?;
