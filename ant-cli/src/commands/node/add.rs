@@ -166,18 +166,7 @@ impl AddArgs {
             BinarySource::Latest
         };
 
-        let env_variables: Vec<(String, String)> = self
-            .env
-            .iter()
-            .map(|e| {
-                let parts: Vec<&str> = e.splitn(2, '=').collect();
-                if parts.len() == 2 {
-                    Ok((parts[0].to_string(), parts[1].to_string()))
-                } else {
-                    anyhow::bail!("Invalid env variable format: '{e}'. Expected KEY=VALUE")
-                }
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let env_variables = AddNodeOpts::parse_env_vars(&self.env)?;
 
         Ok(AddNodeOpts {
             count: self.count,

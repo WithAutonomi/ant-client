@@ -47,6 +47,9 @@ pub enum Error {
     #[error("Invalid port range: {0}")]
     InvalidPortRange(String),
 
+    #[error("Invalid env variable format: '{0}'. Expected KEY=VALUE")]
+    InvalidEnvVar(String),
+
     #[error("Binary not found at path: {0}")]
     BinaryNotFound(PathBuf),
 
