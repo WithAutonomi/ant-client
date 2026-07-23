@@ -150,7 +150,11 @@ impl AddArgs {
     }
 
     fn to_add_node_opts(&self) -> anyhow::Result<AddNodeOpts> {
-        let node_port = self.parse_port_range(&self.node_port)?;
+        let node_port = self
+            .node_port
+            .as_deref()
+            .map(str::parse::<PortRange>)
+            .transpose()?;
 
         let binary_source = if let Some(ref path) = self.path {
             BinarySource::LocalPath(path.clone())
@@ -187,31 +191,6 @@ impl AddArgs {
             upgrade_channel: self.upgrade_channel.map(Into::into),
             evm_network: self.evm_network.into(),
         })
-    }
-
-    fn parse_port_range(&self, input: &Option<String>) -> anyhow::Result<Option<PortRange>> {
-        match input {
-            None => Ok(None),
-            Some(s) => {
-                if let Some((start, end)) = s.split_once('-') {
-                    let start: u16 = start
-                        .parse()
-                        .map_err(|_| anyhow::anyhow!("Invalid port range start: '{start}'"))?;
-                    let end: u16 = end
-                        .parse()
-                        .map_err(|_| anyhow::anyhow!("Invalid port range end: '{end}'"))?;
-                    if end < start {
-                        anyhow::bail!("Port range end ({end}) must be >= start ({start})");
-                    }
-                    Ok(Some(PortRange::Range(start, end)))
-                } else {
-                    let port: u16 = s
-                        .parse()
-                        .map_err(|_| anyhow::anyhow!("Invalid port: '{s}'"))?;
-                    Ok(Some(PortRange::Single(port)))
-                }
-            }
-        }
     }
 
     async fn add_via_daemon(

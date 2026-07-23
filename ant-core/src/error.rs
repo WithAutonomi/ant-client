@@ -44,6 +44,9 @@ pub enum Error {
     #[error("Port range length ({range_len}) does not match node count ({count})")]
     PortRangeMismatch { range_len: u16, count: u16 },
 
+    #[error("Invalid port range: {0}")]
+    InvalidPortRange(String),
+
     #[error("Binary not found at path: {0}")]
     BinaryNotFound(PathBuf),
 

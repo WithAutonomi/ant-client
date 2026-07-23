@@ -279,6 +279,36 @@ impl PortRange {
     }
 }
 
+impl std::str::FromStr for PortRange {
+    type Err = crate::error::Error;
+
+    /// Parse `"12000"` into [`PortRange::Single`] or `"12000-12004"` into
+    /// [`PortRange::Range`].
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        use crate::error::Error;
+
+        if let Some((start, end)) = s.split_once('-') {
+            let start: u16 = start
+                .parse()
+                .map_err(|_| Error::InvalidPortRange(format!("invalid start port '{start}'")))?;
+            let end: u16 = end
+                .parse()
+                .map_err(|_| Error::InvalidPortRange(format!("invalid end port '{end}'")))?;
+            if end < start {
+                return Err(Error::InvalidPortRange(format!(
+                    "end ({end}) must be >= start ({start})"
+                )));
+            }
+            Ok(Self::Range(start, end))
+        } else {
+            let port: u16 = s
+                .parse()
+                .map_err(|_| Error::InvalidPortRange(format!("invalid port '{s}'")))?;
+            Ok(Self::Single(port))
+        }
+    }
+}
+
 /// Options for adding one or more nodes to the registry.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AddNodeOpts {
@@ -584,6 +614,33 @@ mod tests {
         assert_eq!(pr.port_at(1), Some(12001));
         assert_eq!(pr.port_at(2), Some(12002));
         assert_eq!(pr.port_at(3), None);
+    }
+
+    #[test]
+    fn port_range_parses_single() {
+        let pr: PortRange = "12000".parse().unwrap();
+        assert!(matches!(pr, PortRange::Single(12000)));
+    }
+
+    #[test]
+    fn port_range_parses_range() {
+        let pr: PortRange = "12000-12004".parse().unwrap();
+        assert!(matches!(pr, PortRange::Range(12000, 12004)));
+    }
+
+    #[test]
+    fn port_range_rejects_inverted_range() {
+        let err = "12004-12000".parse::<PortRange>().unwrap_err();
+        assert!(err.to_string().contains("must be >= start"));
+    }
+
+    #[test]
+    fn port_range_rejects_garbage() {
+        assert!("abc".parse::<PortRange>().is_err());
+        assert!("".parse::<PortRange>().is_err());
+        assert!("12000-abc".parse::<PortRange>().is_err());
+        assert!("-12000".parse::<PortRange>().is_err());
+        assert!("70000".parse::<PortRange>().is_err());
     }
 
     #[test]
