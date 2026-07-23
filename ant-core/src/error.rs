@@ -71,6 +71,11 @@ pub enum Error {
     #[error("Failed to parse bootstrap_peers.toml: {0}")]
     BootstrapConfigParse(String),
 
+    #[error(
+        "No bootstrap peers available: pass peers explicitly, use a devnet manifest, or install bootstrap_peers.toml in the config directory"
+    )]
+    NoBootstrapPeers,
+
     #[error("Node count {count} exceeds maximum of {max} per call")]
     InvalidNodeCount { count: u16, max: u16 },
 
