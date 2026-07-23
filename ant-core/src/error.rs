@@ -79,6 +79,20 @@ pub enum Error {
     )]
     NoBootstrapPeers,
 
+    #[error(
+        "No EVM network specified: choose 'arbitrum-one', 'arbitrum-sepolia', or 'local' (with a devnet manifest)"
+    )]
+    EvmNetworkNotSpecified,
+
+    #[error("Unsupported EVM network: {0}. Use 'arbitrum-one', 'arbitrum-sepolia', or 'local'.")]
+    UnsupportedEvmNetwork(String),
+
+    #[error("EVM network 'local' requires a devnet manifest with EVM info")]
+    EvmManifestRequired,
+
+    #[error("Invalid EVM info in devnet manifest: {0}")]
+    InvalidEvmManifest(String),
+
     #[error("Node count {count} exceeds maximum of {max} per call")]
     InvalidNodeCount { count: u16, max: u16 },
 
