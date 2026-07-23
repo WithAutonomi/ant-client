@@ -33,11 +33,9 @@ impl StopArgs {
         service_name: &str,
         json_output: bool,
     ) -> anyhow::Result<()> {
-        let registry = ant_core::node::registry::NodeRegistry::load(&config.registry_path)?;
-        let node = registry
-            .find_by_service_name(service_name)
-            .ok_or_else(|| anyhow::anyhow!("No node found with service name '{service_name}'"))?;
-        let node_id = node.id;
+        // Resolve the node ID through the daemon API — the daemon owns the
+        // registry, so the CLI must not read node_registry.json directly.
+        let node_id = client::resolve_node_id_by_name(config, service_name).await?;
 
         let result = client::stop_node(config, node_id).await?;
 

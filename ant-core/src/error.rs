@@ -11,6 +11,9 @@ pub enum Error {
     #[error("Node not found: {0}")]
     NodeNotFound(u32),
 
+    #[error("No node found with service name '{0}'")]
+    NodeNotFoundByName(String),
+
     #[error("Node already running: {0}")]
     NodeAlreadyRunning(u32),
 
