@@ -76,9 +76,13 @@ pub struct Cli {
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
 
-    /// EVM network for payment processing (arbitrum-one, arbitrum-sepolia, local).
-    #[arg(long, default_value = "arbitrum-one")]
-    pub evm_network: String,
+    /// EVM network for payment processing: arbitrum-one, arbitrum-sepolia,
+    /// or local (reads the devnet manifest's EVM config). Defaults to
+    /// arbitrum-one — except when a devnet manifest with EVM config is
+    /// loaded, where an explicit choice is required so an irreversible
+    /// on-chain payment never silently targets the wrong network.
+    #[arg(long)]
+    pub evm_network: Option<String>,
 
     #[command(subcommand)]
     pub command: Commands,
