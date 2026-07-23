@@ -85,12 +85,14 @@ pub fn load_bootstrap_peers() -> Result<Option<Vec<SocketAddr>>> {
 /// Priority: explicitly supplied peers (e.g. a frontend's `--bootstrap`
 /// flag) > devnet manifest peers > the platform `bootstrap_peers.toml`
 /// config file. Manifest peers without a resolvable socket address are
-/// filtered out.
+/// filtered out. A selected manifest is authoritative: if it yields no
+/// usable peers, resolution fails rather than falling back to the
+/// config file.
 ///
 /// # Errors
 ///
-/// Returns [`Error::NoBootstrapPeers`] when no source yields any peers,
-/// and propagates config-file read/parse failures.
+/// Returns [`Error::NoBootstrapPeers`] when the selected source yields
+/// no peers, and propagates config-file read/parse failures.
 pub fn resolve_bootstrap_peers(
     explicit: &[SocketAddr],
     manifest: Option<&DevnetManifest>,
@@ -100,11 +102,18 @@ pub fn resolve_bootstrap_peers(
     }
 
     if let Some(m) = manifest {
-        return Ok(m
+        let peers: Vec<SocketAddr> = m
             .bootstrap
             .iter()
             .filter_map(MultiAddr::socket_addr)
-            .collect());
+            .collect();
+        // An explicitly selected manifest never falls back to the public
+        // config: an empty (or fully filtered) manifest is an error here,
+        // not later when the first data operation fails.
+        if peers.is_empty() {
+            return Err(Error::NoBootstrapPeers);
+        }
+        return Ok(peers);
     }
 
     if let Some(peers) = load_bootstrap_peers()? {
@@ -178,6 +187,26 @@ mod tests {
         let manifest = test_manifest(vec![addr]);
         let peers = resolve_bootstrap_peers(&[], Some(&manifest)).unwrap();
         assert_eq!(peers, vec![addr]);
+    }
+
+    #[test]
+    fn resolve_bootstrap_errors_on_empty_manifest() {
+        let manifest = test_manifest(vec![]);
+        let err = resolve_bootstrap_peers(&[], Some(&manifest)).unwrap_err();
+        assert!(matches!(err, Error::NoBootstrapPeers));
+    }
+
+    #[test]
+    fn resolve_bootstrap_errors_when_all_manifest_peers_filtered() {
+        // A non-IP transport has no socket address, so the peer is
+        // filtered out and the manifest yields nothing usable.
+        let bt: MultiAddr = "/bt/00:11:22:33:44:55/rfcomm/1".parse().unwrap();
+        assert!(bt.socket_addr().is_none());
+        let mut manifest = test_manifest(vec![]);
+        manifest.bootstrap = vec![bt];
+        manifest.node_count = 1;
+        let err = resolve_bootstrap_peers(&[], Some(&manifest)).unwrap_err();
+        assert!(matches!(err, Error::NoBootstrapPeers));
     }
 
     #[test]
