@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Args;
 use colored::Colorize;
 
-use ant_core::node::binary::ProgressReporter;
+use ant_core::node::binary::{NoopProgress, ProgressReporter};
 use ant_core::node::daemon::client;
 use ant_core::node::types::DaemonConfig;
 use ant_core::node::types::{
@@ -104,7 +104,7 @@ impl AddArgs {
         let config = DaemonConfig::default();
         let result = match client::status(&config).await {
             Ok(status) if status.running => client::add_node(&config, &opts).await?,
-            _ => self.add_directly(&config, &opts).await?,
+            _ => self.add_directly(&config, &opts, json_output).await?,
         };
 
         if json_output {
@@ -186,38 +186,17 @@ impl AddArgs {
         &self,
         config: &DaemonConfig,
         opts: &AddNodeOpts,
+        json_output: bool,
     ) -> anyhow::Result<AddNodeResult> {
-        let progress = CliProgress;
+        // Suppress progress in JSON mode so stdout stays parseable.
+        let progress: Box<dyn ProgressReporter> = if json_output {
+            Box::new(NoopProgress)
+        } else {
+            Box::new(crate::progress::CliProgress)
+        };
         let result =
-            ant_core::node::add_nodes(opts.clone(), &config.registry_path, &progress).await?;
+            ant_core::node::add_nodes(opts.clone(), &config.registry_path, progress.as_ref())
+                .await?;
         Ok(result)
-    }
-}
-
-/// CLI progress reporter that prints to the terminal.
-struct CliProgress;
-
-impl ProgressReporter for CliProgress {
-    fn report_started(&self, message: &str) {
-        println!("{} {message}", "⟳".cyan());
-    }
-
-    fn report_progress(&self, bytes: u64, total: u64) {
-        if total > 0 {
-            let pct = (bytes as f64 / total as f64 * 100.0) as u32;
-            let bar_width = 30;
-            let filled = (pct as usize * bar_width) / 100;
-            let empty = bar_width - filled;
-            let bar = format!(
-                "{}{}",
-                "█".repeat(filled).cyan(),
-                "░".repeat(empty).dimmed()
-            );
-            print!("\r  {} {bar} {pct:>3}%", "Downloading".dimmed());
-        }
-    }
-
-    fn report_complete(&self, message: &str) {
-        println!("\r{} {message}", "✓".green().bold());
     }
 }

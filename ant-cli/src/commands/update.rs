@@ -4,25 +4,7 @@ use colored::Colorize;
 use ant_core::node::binary::NoopProgress;
 use ant_core::update;
 
-/// Progress reporter that prints to the terminal.
-struct CliUpdateProgress;
-
-impl ant_core::node::binary::ProgressReporter for CliUpdateProgress {
-    fn report_started(&self, message: &str) {
-        eprintln!("{}", message.dimmed());
-    }
-
-    fn report_progress(&self, bytes: u64, total: u64) {
-        if total > 0 {
-            let pct = (bytes as f64 / total as f64 * 100.0) as u64;
-            eprint!("\r{}", format!("  Downloading... {pct}%").dimmed());
-        }
-    }
-
-    fn report_complete(&self, message: &str) {
-        eprintln!("\r{}", message.green());
-    }
-}
+use crate::progress::CliProgress;
 
 #[derive(Args)]
 pub struct UpdateArgs {
@@ -72,7 +54,7 @@ impl UpdateArgs {
         let progress: Box<dyn ant_core::node::binary::ProgressReporter> = if json_output {
             Box::new(NoopProgress)
         } else {
-            Box::new(CliUpdateProgress)
+            Box::new(CliProgress)
         };
 
         let result = update::perform_update(&check, progress.as_ref()).await?;
