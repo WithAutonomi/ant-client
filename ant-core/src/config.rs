@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::data::{DevnetManifest, MultiAddr};
 use crate::error::{Error, Result};
 
 /// Returns the platform-appropriate data directory for ant.
@@ -79,6 +80,37 @@ pub fn load_bootstrap_peers() -> Result<Option<Vec<SocketAddr>>> {
     Ok(Some(addrs))
 }
 
+/// Resolve the bootstrap peers for a client connection.
+///
+/// Priority: explicitly supplied peers (e.g. a frontend's `--bootstrap`
+/// flag) > devnet manifest peers > the platform `bootstrap_peers.toml`
+/// config file. Manifest peers without a resolvable socket address are
+/// filtered out.
+///
+/// # Errors
+///
+/// Returns [`Error::NoBootstrapPeers`] when no source yields any peers,
+/// and propagates config-file read/parse failures.
+pub fn resolve_bootstrap_peers(
+    explicit: &[SocketAddr],
+    manifest: Option<&DevnetManifest>,
+) -> Result<Vec<SocketAddr>> {
+    if !explicit.is_empty() {
+        return Ok(explicit.to_vec());
+    }
+
+    if let Some(m) = manifest {
+        return Ok(m.bootstrap.iter().filter_map(MultiAddr::socket_addr).collect());
+    }
+
+    if let Some(peers) = load_bootstrap_peers()? {
+        tracing::info!("Loaded {} bootstrap peer(s) from config file", peers.len());
+        return Ok(peers);
+    }
+
+    Err(Error::NoBootstrapPeers)
+}
+
 #[derive(serde::Deserialize)]
 struct BootstrapConfig {
     peers: Vec<String>,
@@ -115,6 +147,33 @@ mod tests {
             "log_dir should contain 'ant' component: {:?}",
             dir
         );
+    }
+
+    fn test_manifest(addrs: Vec<SocketAddr>) -> DevnetManifest {
+        DevnetManifest {
+            base_port: 10000,
+            node_count: addrs.len(),
+            bootstrap: addrs.into_iter().map(MultiAddr::quic).collect(),
+            data_dir: PathBuf::new(),
+            created_at: String::new(),
+            evm: None,
+        }
+    }
+
+    #[test]
+    fn resolve_bootstrap_prefers_explicit_peers() {
+        let explicit: Vec<SocketAddr> = vec!["10.0.0.1:10000".parse().unwrap()];
+        let manifest = test_manifest(vec!["10.0.0.2:10000".parse().unwrap()]);
+        let peers = resolve_bootstrap_peers(&explicit, Some(&manifest)).unwrap();
+        assert_eq!(peers, explicit);
+    }
+
+    #[test]
+    fn resolve_bootstrap_uses_manifest_when_no_explicit_peers() {
+        let addr: SocketAddr = "10.0.0.2:10000".parse().unwrap();
+        let manifest = test_manifest(vec![addr]);
+        let peers = resolve_bootstrap_peers(&[], Some(&manifest)).unwrap();
+        assert_eq!(peers, vec![addr]);
     }
 
     #[test]
