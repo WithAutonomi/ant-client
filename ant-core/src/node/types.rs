@@ -340,6 +340,20 @@ pub struct AddNodeOpts {
     pub evm_network: EvmNetwork,
 }
 
+impl AddNodeOpts {
+    /// Parse `KEY=VALUE` strings (the format frontends accept for node env
+    /// vars) into the pair list `env_variables` expects.
+    pub fn parse_env_vars(vars: &[String]) -> crate::error::Result<Vec<(String, String)>> {
+        vars.iter()
+            .map(|e| {
+                e.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .ok_or_else(|| crate::error::Error::InvalidEnvVar(e.clone()))
+            })
+            .collect()
+    }
+}
+
 impl Default for AddNodeOpts {
     fn default() -> Self {
         Self {
@@ -653,6 +667,32 @@ mod tests {
         let json = serde_json::to_string(&src).unwrap();
         assert!(json.contains("\"type\":\"version\""));
         assert!(json.contains("1.0.0"));
+    }
+
+    #[test]
+    fn parse_env_vars_splits_on_first_equals() {
+        let parsed = AddNodeOpts::parse_env_vars(&[
+            "KEY=VALUE".to_string(),
+            "RUST_LOG=info,ant_node=debug".to_string(),
+            "EMPTY=".to_string(),
+            "URL=http://host?a=b".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("KEY".to_string(), "VALUE".to_string()),
+                ("RUST_LOG".to_string(), "info,ant_node=debug".to_string()),
+                ("EMPTY".to_string(), String::new()),
+                ("URL".to_string(), "http://host?a=b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_env_vars_rejects_missing_equals() {
+        let err = AddNodeOpts::parse_env_vars(&["NOVALUE".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("Expected KEY=VALUE"));
     }
 
     #[test]
