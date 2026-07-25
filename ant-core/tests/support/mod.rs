@@ -21,7 +21,7 @@ use ant_core::data::ClientConfig;
 // only linked into test binaries.
 use ant_node::payment::quote::CommitmentSource;
 use ant_node::payment::{
-    EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
+    EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig, QuoteGenerator,
     QuotingMetricsTracker,
 };
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
@@ -343,6 +343,10 @@ impl MiniTestnet {
             cache_capacity: 1000,
             close_group_size: CLOSE_GROUP_SIZE,
             local_rewards_address: rewards_address,
+            // Shadow mode (enforce: false) — the harness keeps the node's
+            // default price-floor policy so admissions behave as they did
+            // before ant-node #176 added the floor.
+            price_floor: PriceFloorConfig::default(),
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
         let metrics_tracker = QuotingMetricsTracker::new(TEST_MAX_RECORDS);
