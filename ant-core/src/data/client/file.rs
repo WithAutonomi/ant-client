@@ -346,6 +346,38 @@ const GAS_PER_WAVE_TX: u128 = 1_500_000;
 /// and posts a pool commitment, so budget higher than a plain transfer.
 const GAS_PER_MERKLE_TX: u128 = 500_000;
 
+/// Leaves a merkle upload of `chunk_count` chunks is actually billed for.
+///
+/// The vault charges `median16 × 2^depth` per batch and `MerkleTree` rounds its
+/// leaf count up to a power of two, so a batch of 65 chunks pays for 128
+/// leaves. Uploads longer than `MAX_LEAVES` split into full batches plus a
+/// remainder batch, and only the remainder is padded.
+///
+/// Rounding up matters in one direction only: a caller sizing its wallet from
+/// an under-quote runs dry mid-upload, so the padding is billed rather than
+/// hidden.
+fn merkle_billable_leaves(chunk_count: u64) -> u64 {
+    let per_batch = u64::try_from(MAX_LEAVES).unwrap_or(u64::MAX);
+    if per_batch == 0 {
+        return chunk_count;
+    }
+
+    let full_batches = chunk_count / per_batch;
+    let remainder = chunk_count % per_batch;
+
+    // A merkle tree needs at least two leaves, so a one-chunk remainder is
+    // still billed as a two-leaf tree.
+    let padded_remainder = match remainder {
+        0 => 0,
+        1 => 2,
+        n => n.checked_next_power_of_two().unwrap_or(u64::MAX),
+    };
+
+    full_batches
+        .saturating_mul(per_batch)
+        .saturating_add(padded_remainder)
+}
+
 /// Advisory gas price (wei/gas) used to turn the gas estimate into an ETH
 /// figure when no live gas oracle is consulted.
 ///
@@ -1343,8 +1375,8 @@ impl Client {
             }
         };
 
-        // Use the median price × 3 (matches the single-node payment builder
-        // which pays 3x the median to incentivize reliable storage).
+        // Use the median price × 3, matching the settlement multiplier both
+        // payment paths now apply.
         let mut prices: Vec<Amount> = quotes.iter().map(|(_, _, _, price, _)| *price).collect();
         prices.sort();
         let median_price = prices
@@ -1354,7 +1386,18 @@ impl Client {
         let per_chunk_cost = median_price * Amount::from(SINGLE_NODE_PAYMENT_MULTIPLIER);
 
         let chunk_count_u64 = u64::try_from(chunk_count).unwrap_or(u64::MAX);
-        let total_storage = per_chunk_cost * Amount::from(chunk_count_u64);
+        // Merkle settles per *padded* leaf, not per chunk: the contract charges
+        // `median16 × 2^depth` per batch and the tree rounds up to a power of
+        // two, so a 65-chunk batch pays for 128 leaves. Billing the raw chunk
+        // count here would under-quote a non-power-of-two batch by up to 2x —
+        // and an under-quote is the harmful direction, because a caller sizing
+        // its wallet from this estimate would run dry mid-upload.
+        let billable_units = if uses_merkle {
+            merkle_billable_leaves(chunk_count_u64)
+        } else {
+            chunk_count_u64
+        };
+        let total_storage = per_chunk_cost * Amount::from(billable_units);
 
         // Estimate gas cost from realistic per-transaction budgets rather
         // than a flat per-chunk or per-wave number.
@@ -3449,6 +3492,33 @@ mod tests {
         // "whole file sampled" detection in estimate_upload_cost.
         assert_eq!(distributed_sample_indices(3, 5), vec![0, 1, 2]);
         assert_eq!(distributed_sample_indices(5, 5), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn merkle_billable_leaves_bills_the_padded_tree() {
+        // Powers of two are billed exactly.
+        assert_eq!(merkle_billable_leaves(64), 64);
+        assert_eq!(merkle_billable_leaves(256), 256);
+        // Anything else pays for the padding the contract charges for.
+        assert_eq!(merkle_billable_leaves(65), 128);
+        assert_eq!(merkle_billable_leaves(100), 128);
+        assert_eq!(merkle_billable_leaves(129), 256);
+        // A tree needs two leaves minimum.
+        assert_eq!(merkle_billable_leaves(1), 2);
+        // Beyond MAX_LEAVES only the remainder batch is padded.
+        assert_eq!(merkle_billable_leaves(257), 256 + 2);
+        assert_eq!(merkle_billable_leaves(300), 256 + 64);
+        assert_eq!(merkle_billable_leaves(512), 512);
+    }
+
+    #[test]
+    fn merkle_billable_leaves_never_under_quotes() {
+        for chunks in 1..2000u64 {
+            assert!(
+                merkle_billable_leaves(chunks) >= chunks,
+                "{chunks} chunks must never be billed as fewer leaves"
+            );
+        }
     }
 
     #[test]

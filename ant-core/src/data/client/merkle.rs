@@ -39,25 +39,26 @@ pub const DEFAULT_MERKLE_THRESHOLD: usize = 64;
 
 /// Payment multiplier applied to a quoted price before settlement.
 ///
-/// The single-node path has always paid the median-priced issuer **3× its
-/// quoted price** (`SingleNodePayment::from_quotes`), so that the network
-/// receives the same revenue as paying three members of the close group while
-/// costing one transaction's gas. The merkle path never applied it: it
-/// submitted the raw quoted price as the on-chain payable amount, so the
-/// contract's `median16(amount) × 2^depth` came to exactly **1×** the median
-/// per chunk — a third of what the same chunk earns on the single-node path,
-/// for identical storage and replication.
+/// Deliberately the **same constant** the single-node path uses rather than a
+/// second copy of `3`: the whole defect this fixes was the two paths disagreeing
+/// about the multiplier, so they now read it from one place. (The storer's
+/// `PAID_QUOTE_PAYMENT_MULTIPLIER` and `ant_protocol`'s single-node builder are
+/// still separate literals; folding all of them into one `ant-protocol`
+/// constant is a follow-up.)
+///
+/// The single-node path pays the median-priced issuer 3× its quoted price, so
+/// the network receives the same revenue as paying three members of the close
+/// group while costing one transaction's gas. The merkle path never applied it:
+/// it submitted the raw quoted price as the on-chain payable amount, so the
+/// contract's `median16(amount) × 2^depth` came to **1×** the median per padded
+/// leaf — a third of what the same chunk earns on the single-node path, for
+/// identical storage and replication.
 ///
 /// The on-chain field is `CandidateNode.amount`, the sum the vault pays out,
 /// not the quote itself; the signed candidate keeps its 1× quoted `price` and
 /// the pool hash is unchanged, so every proof still verifies against the
 /// quotes the nodes actually signed.
-///
-/// Must stay equal to the single-node multiplier in
-/// `ant_protocol::payment::single_node` and to the storer's
-/// `PAID_QUOTE_PAYMENT_MULTIPLIER`. Consolidating all three into one
-/// `ant-protocol` constant is a follow-up.
-const MERKLE_PAYMENT_MULTIPLIER: u64 = 3;
+use crate::data::client::payment::SINGLE_NODE_PAYMENT_MULTIPLIER as MERKLE_PAYMENT_MULTIPLIER;
 
 /// ADR-0004 resolve-before-pay gate for a merkle candidate — the merkle-path
 /// equivalent of the single-node `quote_commitment_binding_is_valid`. Runs the
