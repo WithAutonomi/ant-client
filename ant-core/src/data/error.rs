@@ -147,6 +147,25 @@ pub enum Error {
     #[error("insufficient disk space: {0}")]
     InsufficientDiskSpace(String),
 
+    /// An external-signer merkle preparation was handed more addresses than a
+    /// single merkle tree can hold.
+    ///
+    /// The wallet path splits an oversized upload into several trees and pays
+    /// each in its own transaction. The external-signer contract is one
+    /// prepared batch → one signature → one payment, so that split has no
+    /// representation there. Raised before any candidate collection or
+    /// on-chain spend, rather than silently paying under a different model.
+    #[error(
+        "merkle batch of {addresses} addresses exceeds the {max_leaves}-leaf limit of a single \
+         merkle tree; external signing cannot span multiple payment transactions"
+    )]
+    MerkleBatchTooLarge {
+        /// Number of addresses the caller asked to prepare.
+        addresses: usize,
+        /// Maximum leaves one merkle tree can hold (`MAX_LEAVES`).
+        max_leaves: usize,
+    },
+
     /// Cost estimation could not reach a representative quote.
     ///
     /// Returned by [`crate::data::Client::estimate_upload_cost`] when every
@@ -326,6 +345,19 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "insufficient disk space: need 100 MB but only 10 MB available"
+        );
+    }
+
+    #[test]
+    fn test_display_merkle_batch_too_large() {
+        let err = Error::MerkleBatchTooLarge {
+            addresses: 257,
+            max_leaves: 256,
+        };
+        assert_eq!(
+            err.to_string(),
+            "merkle batch of 257 addresses exceeds the 256-leaf limit of a single merkle tree; \
+             external signing cannot span multiple payment transactions"
         );
     }
 

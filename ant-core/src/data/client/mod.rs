@@ -95,6 +95,10 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         | Error::Cancelled(_)
         | Error::BadQuoteBinding { .. }
         | Error::BadQuoteCommitment { .. }
+        // An external-signer merkle batch larger than one tree can hold —
+        // a caller-shape refusal raised before any network work, so it says
+        // nothing about link capacity.
+        | Error::MerkleBatchTooLarge { .. }
         // A remote node responded with a structured rejection — the
         // transport round-trip succeeded, so the node declined at the
         // application layer (payment/disk/quote/pool). Not a local
@@ -702,6 +706,15 @@ mod tests {
                 Error::CloseGroupShortfall("Stored on 3 peers, need 4".to_string()),
                 Outcome::ApplicationError,
             ),
+            // Refusing an oversized external-signer merkle batch happens
+            // before any network work, so it is not a capacity signal.
+            (
+                Error::MerkleBatchTooLarge {
+                    addresses: 257,
+                    max_leaves: 256,
+                },
+                Outcome::ApplicationError,
+            ),
         ];
         for (err, expected) in &cases {
             let got = classify_error(err);
@@ -785,6 +798,7 @@ mod tests {
             | Error::PartialUpload { .. }
             | Error::BadQuoteBinding { .. }
             | Error::BadQuoteCommitment { .. }
+            | Error::MerkleBatchTooLarge { .. }
             | Error::RemotePut { .. }
             | Error::CloseGroupShortfall(_) => (),
         };

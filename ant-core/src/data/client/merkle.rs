@@ -355,6 +355,118 @@ fn preflight_stored_status<T>(result: Result<T>) -> Result<bool> {
     }
 }
 
+/// Split `total` addresses into the merkle batches an upload is actually paid in.
+///
+/// Every batch becomes one `MerkleTree`, and a tree is only valid with
+/// `2..=MAX_LEAVES` leaves. The obvious `addresses.chunks(MAX_LEAVES)` split
+/// respects the upper bound but not the lower one: 257 addresses come out as
+/// `[256, 1]`, the 256-address batch is paid for on-chain, and the singleton
+/// remainder cannot build a tree — so the upload fails as a *paid* partial.
+/// Every count congruent to 1 modulo `MAX_LEAVES` (257, 513, 769, …) hits it,
+/// and the merkle preflight can leave an arbitrary count behind.
+///
+/// Borrowing one address from the preceding batch removes the case entirely:
+/// 257 splits as `[255, 2]` and 513 as `[256, 255, 2]`. Order is preserved and
+/// no address is duplicated or synthesised, so the partition is a plain
+/// in-order cover of the input.
+///
+/// Returns an empty vector for `total < 2`, which no merkle path may pay for —
+/// `pay_for_merkle_batch` rejects those counts up front.
+#[must_use]
+pub fn merkle_batch_sizes(total: usize) -> Vec<usize> {
+    if total < 2 {
+        return Vec::new();
+    }
+
+    let mut sizes = Vec::with_capacity(total.div_ceil(MAX_LEAVES));
+    let mut remaining = total;
+    while remaining > MAX_LEAVES {
+        // Taking a full MAX_LEAVES here would strand a single address as the
+        // final batch; take one fewer so the tail is a payable two-leaf tree.
+        let take = if remaining - MAX_LEAVES == 1 {
+            MAX_LEAVES - 1
+        } else {
+            MAX_LEAVES
+        };
+        sizes.push(take);
+        remaining -= take;
+    }
+    sizes.push(remaining);
+    sizes
+}
+
+/// Split `addresses` into the sub-batches [`merkle_batch_sizes`] describes.
+///
+/// The slices borrow `addresses` in order, so the partition cannot introduce a
+/// duplicate or a synthetic address.
+#[must_use]
+pub fn merkle_batch_partitions(addresses: &[[u8; 32]]) -> Vec<&[[u8; 32]]> {
+    let mut partitions = Vec::new();
+    let mut rest = addresses;
+    for size in merkle_batch_sizes(addresses.len()) {
+        let (batch, tail) = rest.split_at(size);
+        partitions.push(batch);
+        rest = tail;
+    }
+    partitions
+}
+
+/// Leaves one merkle batch of `batch_size` addresses is billed for.
+///
+/// `MerkleTree` pads its leaf count up to a power of two and the vault charges
+/// `median16 × 2^depth`, so a 65-address batch pays for 128 leaves.
+fn padded_leaf_count(batch_size: usize) -> u64 {
+    // Saturate rather than wrap: a batch is at most MAX_LEAVES, so the
+    // overflow arm is unreachable, and erring high never under-quotes.
+    let padded = batch_size
+        .max(2)
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX);
+    u64::try_from(padded).unwrap_or(u64::MAX)
+}
+
+/// Leaves a merkle upload of `chunk_count` chunks is actually billed for.
+///
+/// Summed over the batches [`merkle_batch_sizes`] will really pay for, so the
+/// estimate and the execution path share one batching model rather than two
+/// that can drift. Billing the raw chunk count would under-quote a
+/// non-power-of-two batch by up to 2×, and an under-quote is the harmful
+/// direction: a caller sizing its wallet from the estimate runs dry
+/// mid-upload.
+#[must_use]
+pub fn merkle_billable_leaves(chunk_count: u64) -> u64 {
+    let total = usize::try_from(chunk_count).unwrap_or(usize::MAX);
+    let batches = merkle_batch_sizes(total);
+    if batches.is_empty() {
+        // No payable partition exists below two chunks. Nothing costs nothing;
+        // a lone chunk is still quoted as the two-leaf minimum a tree needs.
+        return if total == 0 { 0 } else { 2 };
+    }
+
+    batches
+        .into_iter()
+        .map(padded_leaf_count)
+        .fold(0u64, u64::saturating_add)
+}
+
+/// Reject an address set that cannot be prepared as a single merkle tree.
+///
+/// The wallet path splits an oversized upload with [`merkle_batch_sizes`] and
+/// pays each batch in its own transaction. The external-signer contract is one
+/// prepared batch → one signature → one payment, so it has no way to express
+/// that split. Refusing before any candidate collection or on-chain spend is
+/// the honest answer; silently switching the caller to a different payment
+/// model is not.
+fn ensure_single_merkle_tree_batch(address_count: usize) -> Result<()> {
+    if address_count > MAX_LEAVES {
+        return Err(Error::MerkleBatchTooLarge {
+            addresses: address_count,
+            max_leaves: MAX_LEAVES,
+        });
+    }
+    Ok(())
+}
+
 /// Determine whether to use merkle payments for a given batch size.
 /// Free function — no Client needed.
 #[must_use]
@@ -376,7 +488,8 @@ impl Client {
     /// Pay for a batch of chunks using merkle batch payment.
     ///
     /// Builds a merkle tree, collects candidate pools, pays on-chain in one tx,
-    /// and returns per-chunk proofs. Splits into sub-batches if > `MAX_LEAVES`.
+    /// and returns per-chunk proofs. Anything longer than `MAX_LEAVES` is split
+    /// by [`merkle_batch_sizes`] and paid one transaction per sub-batch.
     ///
     /// This low-level helper assumes the caller has already selected the
     /// addresses that need payment. User-facing upload paths first run the
@@ -541,12 +654,22 @@ impl Client {
     /// Builds the merkle tree, collects candidate pools from the network,
     /// and returns the data needed for the on-chain payment call.
     /// Requires `EvmNetwork` but NOT a wallet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MerkleBatchTooLarge`] if `addresses` holds more than
+    /// `MAX_LEAVES` entries. One prepared batch is one signature and one
+    /// payment, so an oversized set has no valid external-signing form; the
+    /// wallet path splits it across transactions instead. The check runs
+    /// before any candidate collection, so nothing is spent.
     pub async fn prepare_merkle_batch_external(
         &self,
         addresses: &[[u8; 32]],
         data_type: u32,
         data_size: u64,
     ) -> Result<PreparedMerkleBatch> {
+        ensure_single_merkle_tree_batch(addresses.len())?;
+
         let chunk_count = addresses.len();
         let xornames: Vec<XorName> = addresses.iter().map(|a| XorName(*a)).collect();
 
@@ -650,7 +773,11 @@ impl Client {
         data_type: u32,
         data_size: u64,
     ) -> Result<MerkleBatchPaymentResult> {
-        let sub_batches: Vec<&[[u8; 32]]> = addresses.chunks(MAX_LEAVES).collect();
+        // Partition with the shared helper, NOT `chunks(MAX_LEAVES)`: the naive
+        // split leaves a one-address final batch for every count congruent to 1
+        // modulo MAX_LEAVES, which cannot build a tree and so turns a paid
+        // upload into a partial failure.
+        let sub_batches = merkle_batch_partitions(addresses);
         let total_sub_batches = sub_batches.len();
         let mut all_proofs = HashMap::with_capacity(addresses.len());
         let mut total_storage = Amount::ZERO;
@@ -1964,12 +2091,16 @@ mod tests {
         );
     }
 
-    /// The invariant the fix exists for: a chunk paid through the merkle path
-    /// settles for the same amount as a chunk paid through the single-node
-    /// path. Contract formula: `total = median16(amount) * 2^depth`, spread
-    /// over `2^depth` leaves, so per chunk it is exactly `median16(amount)`.
+    /// The invariant the fix exists for, stated at the level it actually
+    /// holds: the median payable amount over the winning pool is
+    /// `MERKLE_PAYMENT_MULTIPLIER x` the median *quoted* price. The contract
+    /// spends `median16(amount) * 2^depth` over `2^depth` **padded** leaves, so
+    /// this is the settlement per padded leaf — the same figure the single-node
+    /// path pays its median-priced issuer per chunk. It says nothing about cost
+    /// per *actual* chunk: a batch whose size is not a power of two pays for
+    /// padding leaves too (that is what `merkle_billable_leaves` bills for).
     #[test]
-    fn merkle_per_chunk_settlement_matches_single_node_multiplier() {
+    fn merkle_settlement_per_padded_leaf_is_the_multiplied_pool_median() {
         let pool = pool_with_varied_prices(1_700_000_000);
         let commitment = pool_commitment_with_payment_multiplier(&pool).unwrap();
 
@@ -2074,19 +2205,179 @@ mod tests {
     // Batch splitting edge cases
     // =========================================================================
 
+    /// Counts spanning every interesting case: the minimum tree, the merkle
+    /// threshold and just past it, either side of a full batch, and the
+    /// `1 mod MAX_LEAVES` counts the naive `chunks(MAX_LEAVES)` split turned
+    /// into an unpayable `[..., 1]` tail.
+    const PARTITION_CASES: [(usize, &[usize]); 10] = [
+        (2, &[2]),
+        (64, &[64]),
+        (65, &[65]),
+        (255, &[255]),
+        (256, &[256]),
+        (257, &[255, 2]),
+        (300, &[256, 44]),
+        (512, &[256, 256]),
+        (513, &[256, 255, 2]),
+        (769, &[256, 256, 255, 2]),
+    ];
+
     #[test]
-    fn test_batch_split_calculation() {
-        // MAX_LEAVES chunks should fit in 1 batch
-        let addrs = make_test_addresses(MAX_LEAVES);
-        assert_eq!(addrs.chunks(MAX_LEAVES).count(), 1);
+    fn merkle_batch_sizes_rebalance_singleton_remainders() {
+        for (total, expected) in PARTITION_CASES {
+            assert_eq!(
+                merkle_batch_sizes(total),
+                expected,
+                "{total} addresses must partition as {expected:?}"
+            );
+        }
+    }
 
-        // MAX_LEAVES + 1 should split into 2
-        let addrs = make_test_addresses(MAX_LEAVES + 1);
-        assert_eq!(addrs.chunks(MAX_LEAVES).count(), 2);
+    /// The defect: `[256, 1]` pays the first batch on-chain and then hands a
+    /// single address to a tree that needs two, so the upload fails *after*
+    /// spending. Every count must produce trees that can all be built.
+    #[test]
+    fn merkle_batch_sizes_are_always_buildable_trees() {
+        for total in 2..=(4 * MAX_LEAVES + 3) {
+            let sizes = merkle_batch_sizes(total);
+            assert!(!sizes.is_empty(), "{total} addresses must produce batches");
+            assert_eq!(
+                sizes.iter().sum::<usize>(),
+                total,
+                "{total} addresses: partition must cover every address"
+            );
+            for size in sizes {
+                assert!(
+                    (2..=MAX_LEAVES).contains(&size),
+                    "{total} addresses produced a batch of {size}, outside 2..={MAX_LEAVES}"
+                );
+            }
+        }
+    }
 
-        // 3 * MAX_LEAVES should split into 3
-        let addrs = make_test_addresses(3 * MAX_LEAVES);
-        assert_eq!(addrs.chunks(MAX_LEAVES).count(), 3);
+    #[test]
+    fn merkle_batch_sizes_below_two_have_no_payable_partition() {
+        assert!(merkle_batch_sizes(0).is_empty());
+        assert!(merkle_batch_sizes(1).is_empty());
+    }
+
+    #[test]
+    fn merkle_batch_partitions_preserve_order_and_use_each_address_once() {
+        for (total, _) in PARTITION_CASES {
+            let addrs = make_test_addresses(total);
+            let partitions = merkle_batch_partitions(&addrs);
+
+            let flattened: Vec<[u8; 32]> = partitions.concat();
+            assert_eq!(
+                flattened, addrs,
+                "{total} addresses: partitions must concatenate back to the input in order"
+            );
+
+            let unique: std::collections::HashSet<[u8; 32]> = flattened.iter().copied().collect();
+            assert_eq!(
+                unique.len(),
+                total,
+                "{total} addresses: no address may be duplicated or synthesised"
+            );
+        }
+    }
+
+    /// A merkle upload of 257 chunks — the count the old split could not pay —
+    /// is the shape preflight routinely leaves behind, since `to_upload` is
+    /// whatever the network did not already hold.
+    #[test]
+    fn post_preflight_plan_of_257_partitions_into_payable_batches() {
+        let plan = MerkleUploadPlan {
+            already_stored: make_test_addresses(3),
+            to_upload: make_test_addresses(257),
+            to_upload_total_bytes: 257 * 1024,
+        };
+        assert_eq!(plan.to_upload.len(), 257);
+
+        let partitions = merkle_batch_partitions(&plan.to_upload);
+        let sizes: Vec<usize> = partitions.iter().map(|batch| batch.len()).collect();
+        assert_eq!(sizes, vec![255, 2]);
+        for batch in partitions {
+            let xornames: Vec<XorName> = batch.iter().map(|a| XorName(*a)).collect();
+            assert!(
+                MerkleTree::from_xornames(xornames).is_ok(),
+                "every partition of a 257-chunk plan must build a tree"
+            );
+        }
+    }
+
+    /// No batch may be paid for and then fail to build its tree: the partition
+    /// is what payment iterates, so proving every batch builds proves no
+    /// on-chain payment can be followed by a singleton-tree failure.
+    #[test]
+    fn no_partition_pays_before_a_singleton_tree_failure() {
+        for total in [257usize, 513, 769] {
+            let addrs = make_test_addresses(total);
+            for batch in merkle_batch_partitions(&addrs) {
+                let xornames: Vec<XorName> = batch.iter().map(|a| XorName(*a)).collect();
+                assert!(
+                    MerkleTree::from_xornames(xornames).is_ok(),
+                    "{total} addresses: batch of {} is unpayable",
+                    batch.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merkle_billable_leaves_sum_the_padded_partitions() {
+        for (total, expected) in PARTITION_CASES {
+            let padded: u64 = expected
+                .iter()
+                .map(|size| size.next_power_of_two() as u64)
+                .sum();
+            assert_eq!(
+                merkle_billable_leaves(total as u64),
+                padded,
+                "{total} chunks must bill for the padded partition {expected:?}"
+            );
+        }
+
+        // Known figures, spelled out: padding is billed, never hidden.
+        assert_eq!(merkle_billable_leaves(65), 128);
+        assert_eq!(merkle_billable_leaves(257), 256 + 2);
+        assert_eq!(merkle_billable_leaves(300), 256 + 64);
+        // Nothing to upload costs nothing; a lone chunk still quotes the
+        // two-leaf minimum a tree needs.
+        assert_eq!(merkle_billable_leaves(0), 0);
+        assert_eq!(merkle_billable_leaves(1), 2);
+    }
+
+    #[test]
+    fn merkle_billable_leaves_never_under_quote() {
+        for chunks in 1..2000u64 {
+            assert!(
+                merkle_billable_leaves(chunks) >= chunks,
+                "{chunks} chunks must never be billed as fewer leaves"
+            );
+        }
+    }
+
+    /// The external signer prepares one tree, signs once, and pays once, so an
+    /// oversized set is refused up front rather than being quietly paid under a
+    /// different model.
+    #[test]
+    fn external_preparation_refuses_more_than_one_tree_of_addresses() {
+        assert!(ensure_single_merkle_tree_batch(2).is_ok());
+        assert!(ensure_single_merkle_tree_batch(MAX_LEAVES).is_ok());
+
+        for oversized in [MAX_LEAVES + 1, 300, 513] {
+            match ensure_single_merkle_tree_batch(oversized) {
+                Err(Error::MerkleBatchTooLarge {
+                    addresses,
+                    max_leaves,
+                }) => {
+                    assert_eq!(addresses, oversized);
+                    assert_eq!(max_leaves, MAX_LEAVES);
+                }
+                other => panic!("{oversized} addresses should be refused, got {other:?}"),
+            }
+        }
     }
 
     // =========================================================================

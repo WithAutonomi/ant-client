@@ -10,7 +10,7 @@
 
 mod support;
 
-use ant_core::data::client::merkle::PaymentMode;
+use ant_core::data::client::merkle::{merkle_billable_leaves, PaymentMode};
 use ant_core::data::{Client, ClientConfig, CostEstimateConfidence};
 use serial_test::serial;
 use std::io::Write;
@@ -339,5 +339,68 @@ async fn test_estimate_all_stored_full_sample_is_verified() {
     assert_eq!(
         estimate.confidence,
         CostEstimateConfidence::VerifiedAllAlreadyStored
+    );
+}
+
+/// Merkle estimate vs actual on a batch whose leaf count is padded.
+///
+/// The estimator bills `median x 3` per *padded* leaf, so a 9-chunk merkle
+/// batch must quote — and the contract must settle — 16 leaves. Sizing the
+/// file at `6 x MAX_CHUNK_SIZE` makes the count exact: self-encryption emits
+/// 6 data chunks, and `shrink_data_map` adds 3 more for any file above 3
+/// chunks, giving 9. `PaymentMode::Merkle` forces the merkle path at a chunk
+/// count small enough to upload in ~1 minute.
+///
+/// The 65- and 257-chunk batch-boundary cases are proved directly against
+/// on-chain payment in `e2e_merkle::test_merkle_payment_across_batch_boundary`,
+/// which needs no multi-hundred-megabyte file to reach those counts.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_merkle_estimate_vs_actual_pads_to_the_billed_tree() {
+    // 20+ nodes so merkle candidate pools (CANDIDATES_PER_POOL = 16) fill.
+    let testnet = MiniTestnet::start(20).await;
+    let node = testnet.node(3).expect("Node 3 should exist");
+    let client = Client::from_node(Arc::clone(&node), ClientConfig::default())
+        .with_wallet(testnet.wallet().clone());
+
+    let work_dir = TempDir::new().expect("create work dir");
+    let file_size = 6 * self_encryption::MAX_CHUNK_SIZE as u64;
+    let path = create_test_file(work_dir.path(), file_size, "merkle_padded.bin", 0xEE09_0001);
+
+    let (est_atto, act_atto, est_chunks, act_chunks) =
+        compare_estimate_vs_actual(&client, &path, PaymentMode::Merkle).await;
+
+    eprintln!(
+        "merkle padded batch: est_chunks={est_chunks}, act_chunks={act_chunks}, \
+         billable_leaves={}, est={est_atto} atto, actual={act_atto} atto",
+        merkle_billable_leaves(est_chunks as u64)
+    );
+
+    assert_eq!(
+        est_chunks, 9,
+        "6 data chunks + 3 shrunk DataMap chunks should give 9 chunks"
+    );
+    assert_eq!(
+        est_chunks, act_chunks,
+        "estimate and upload must agree on the chunk count"
+    );
+    assert_eq!(
+        merkle_billable_leaves(est_chunks as u64),
+        16,
+        "9 chunks must be billed as a padded 16-leaf tree"
+    );
+
+    assert!(
+        act_atto > 0,
+        "a merkle upload must settle a non-zero amount"
+    );
+    let ratio = if est_atto > act_atto {
+        est_atto as f64 / act_atto as f64
+    } else {
+        act_atto as f64 / est_atto as f64
+    };
+    assert!(
+        ratio < 1.15,
+        "merkle estimate too far from actual: est={est_atto}, actual={act_atto}, ratio={ratio:.2}"
     );
 }
