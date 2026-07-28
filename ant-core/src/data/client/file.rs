@@ -17,14 +17,14 @@ use crate::data::client::batch::{
 use crate::data::client::chunk::ChunkPeerGetResult;
 use crate::data::client::classify_error;
 use crate::data::client::merkle::{
-    chunk_contents_for_upload_addresses, finalize_merkle_batch, merkle_deferred_retry,
-    merkle_store_with_retry, should_use_merkle, MerkleBatchPaymentResult, PaymentMode,
-    PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
+    chunk_contents_for_upload_addresses, finalize_merkle_batch, merkle_batch_sizes,
+    merkle_billable_leaves, merkle_deferred_retry, merkle_store_with_retry, should_use_merkle,
+    MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
 };
 use crate::data::client::payment::SINGLE_NODE_PAYMENT_MULTIPLIER;
 use crate::data::client::Client;
 use crate::data::error::{Error, PartialUploadSpend, Result};
-use ant_protocol::evm::{Amount, PaymentQuote, QuoteHash, TxHash, MAX_LEAVES};
+use ant_protocol::evm::{Amount, PaymentQuote, QuoteHash, TxHash};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{compute_address, XorName as ChunkAddress, DATA_TYPE_CHUNK};
 use bytes::Bytes;
@@ -1343,8 +1343,8 @@ impl Client {
             }
         };
 
-        // Use the median price × 3 (matches the single-node payment builder
-        // which pays 3x the median to incentivize reliable storage).
+        // Use the median price × 3, matching the settlement multiplier both
+        // payment paths now apply.
         let mut prices: Vec<Amount> = quotes.iter().map(|(_, _, _, price, _)| *price).collect();
         prices.sort();
         let median_price = prices
@@ -1354,7 +1354,17 @@ impl Client {
         let per_chunk_cost = median_price * Amount::from(SINGLE_NODE_PAYMENT_MULTIPLIER);
 
         let chunk_count_u64 = u64::try_from(chunk_count).unwrap_or(u64::MAX);
-        let total_storage = per_chunk_cost * Amount::from(chunk_count_u64);
+        // Merkle settles per *padded* leaf, not per chunk: the contract charges
+        // `median16 × 2^depth` per batch and the tree rounds up to a power of
+        // two, so a 65-chunk batch pays for 128 leaves. The leaf total is
+        // summed over the batches the payment path really builds
+        // (`merkle_batch_sizes`), so the estimate cannot drift from execution.
+        let billable_units = if uses_merkle {
+            merkle_billable_leaves(chunk_count_u64)
+        } else {
+            chunk_count_u64
+        };
+        let total_storage = per_chunk_cost * Amount::from(billable_units);
 
         // Estimate gas cost from realistic per-transaction budgets rather
         // than a flat per-chunk or per-wave number.
@@ -1372,7 +1382,10 @@ impl Client {
         // Gas is priced at ARBITRUM_GAS_PRICE_WEI (~0.1 gwei, a typical
         // Arbitrum baseline). Treat the result as advisory, not a commitment.
         let waves = u128::try_from(chunk_count.div_ceil(UPLOAD_WAVE_SIZE)).unwrap_or(u128::MAX);
-        let merkle_batches = u128::try_from(chunk_count.div_ceil(MAX_LEAVES)).unwrap_or(u128::MAX);
+        // One tx per batch the payment path builds — same partition the leaf
+        // total above is derived from.
+        let merkle_batches =
+            u128::try_from(merkle_batch_sizes(chunk_count).len()).unwrap_or(u128::MAX);
         let estimated_gas: u128 = if uses_merkle {
             merkle_batches
                 .saturating_mul(GAS_PER_MERKLE_TX)
@@ -1567,6 +1580,11 @@ impl Client {
                     already_stored.append(&mut wave_already_stored);
                     (payment_info, already_stored)
                 } else {
+                    // One prepared batch is one signature and one payment, so
+                    // more than MAX_LEAVES addresses is refused with
+                    // `MerkleBatchTooLarge` before any candidate collection —
+                    // the wallet path's multi-transaction split has no
+                    // external-signing equivalent to fall back on.
                     match self
                         .prepare_merkle_batch_external(
                             &merkle_plan.to_upload,
@@ -3449,6 +3467,24 @@ mod tests {
         // "whole file sampled" detection in estimate_upload_cost.
         assert_eq!(distributed_sample_indices(3, 5), vec![0, 1, 2]);
         assert_eq!(distributed_sample_indices(5, 5), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// The estimator bills the padded tree, and the leaf total it bills comes
+    /// from the batches the payment path really builds — a `[255, 2]` split of
+    /// 257 chunks, not a `[256, 1]` one that could never be paid.
+    #[test]
+    fn estimator_leaf_total_is_the_padded_payment_partition() {
+        for chunks in [2u64, 64, 65, 100, 129, 255, 256, 257, 300, 512, 513, 769] {
+            let from_partition: u64 = merkle_batch_sizes(chunks as usize)
+                .into_iter()
+                .map(|size| size.next_power_of_two() as u64)
+                .sum();
+            assert_eq!(
+                merkle_billable_leaves(chunks),
+                from_partition,
+                "{chunks} chunks must be billed for the partition the payment path pays"
+            );
+        }
     }
 
     #[test]

@@ -12,7 +12,7 @@
 
 mod support;
 
-use ant_core::data::client::merkle::PaymentMode;
+use ant_core::data::client::merkle::{merkle_billable_leaves, PaymentMode};
 use ant_core::data::{compute_address, Client, ClientConfig};
 use serial_test::serial;
 use std::io::Write;
@@ -275,6 +275,130 @@ async fn test_attack_merkle_proof_swap_within_batch() {
     assert!(
         result.is_err(),
         "Swapping merkle proofs between chunks in the same batch should be rejected"
+    );
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// Merkle payment either side of the 256-leaf batch boundary, against a real
+/// on-chain settlement.
+///
+/// 257 is the count the old `addresses.chunks(MAX_LEAVES)` split partitioned
+/// as `[256, 1]`: the 256-address batch was paid for on-chain and the
+/// singleton remainder could not build a tree, so the call returned a *paid*
+/// partial result carrying 256 proofs. It now splits as `[255, 2]` and every
+/// address comes back with a proof.
+///
+/// Paying directly is what makes the boundary reachable: getting 257 chunks
+/// out of self-encryption needs a ~1 GB file, while `pay_for_merkle_batch`
+/// takes the address set straight.
+///
+/// Settlement is checked against the same padded-leaf model the estimator
+/// bills with — 65 addresses settle 128 leaves, 257 settle 256 + 2 — so the
+/// two counts must cost in that ratio.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_merkle_payment_across_batch_boundary() {
+    let (client, testnet) = setup_merkle_testnet().await;
+
+    // Distinct, deterministic addresses. Payment binds to addresses only; the
+    // chunks themselves are never stored by this test.
+    let addresses = |count: usize, tag: u8| -> Vec<[u8; 32]> {
+        (0..count)
+            .map(|i| {
+                let mut addr = [0u8; 32];
+                addr[0] = tag;
+                addr[1..9].copy_from_slice(&(i as u64).to_be_bytes());
+                addr
+            })
+            .collect()
+    };
+
+    let mut paid: Vec<(usize, u128)> = Vec::new();
+
+    for (count, tag) in [(65usize, 0xA1u8), (257usize, 0xB2u8)] {
+        let addrs = addresses(count, tag);
+
+        // A 65/257-address tree collects far more candidate pools than the
+        // small-tree tests above, and an in-process 35-node testnet on a loaded
+        // CI runner can leave one pool a candidate short ("Got 15 merkle
+        // candidates, need 16"). That shortfall is transient, so retry it.
+        // The bug this test guards is not: a `[256, 1]` partition fails to
+        // build its second tree on every attempt, so a short proof set
+        // survives all three and still fails the assertion below.
+        let mut result = None;
+        let mut last_shortfall = String::new();
+        for attempt in 1..=3 {
+            eprintln!("Paying for {count} addresses via merkle batch (attempt {attempt}/3)...");
+            match client
+                .pay_for_merkle_batch(&addrs, 0, TEST_CHUNK_SIZE as u64)
+                .await
+            {
+                Ok(full) if full.proofs.len() == count => {
+                    result = Some(full);
+                    break;
+                }
+                Ok(partial) => {
+                    last_shortfall = format!(
+                        "paid but returned {} of {count} proofs",
+                        partial.proofs.len()
+                    );
+                }
+                Err(e) => last_shortfall = e.to_string(),
+            }
+            eprintln!("  attempt {attempt}/3 fell short: {last_shortfall}");
+        }
+        let result = result.unwrap_or_else(|| {
+            panic!(
+                "merkle payment for {count} addresses never returned a full proof set \
+                 after 3 attempts: {last_shortfall}"
+            )
+        });
+
+        assert_eq!(
+            result.proofs.len(),
+            count,
+            "every one of the {count} addresses must come back with a proof, not just the \
+             sub-batches that fit a tree"
+        );
+        assert_eq!(result.chunk_count, count);
+        for addr in &addrs {
+            assert!(
+                result.proofs.contains_key(addr),
+                "missing proof for {}",
+                hex::encode(addr)
+            );
+        }
+
+        let settled: u128 = result
+            .storage_cost_atto
+            .parse()
+            .expect("settled amount should parse");
+        assert!(
+            settled > 0,
+            "{count} addresses must settle a non-zero amount"
+        );
+        eprintln!(
+            "  {count} addresses: {} leaves billed, settled {settled} atto",
+            merkle_billable_leaves(count as u64)
+        );
+        paid.push((count, settled));
+    }
+
+    // Prices are uniform across a freshly started local testnet and this test
+    // stores nothing, so the only thing separating the two settlements is the
+    // padded leaf count each partition pays for.
+    let [(small, small_atto), (large, large_atto)] = paid[..] else {
+        panic!("expected two payments");
+    };
+    let expected =
+        merkle_billable_leaves(large as u64) as f64 / merkle_billable_leaves(small as u64) as f64;
+    let observed = large_atto as f64 / small_atto as f64;
+    assert!(
+        (observed - expected).abs() / expected < 0.15,
+        "settlement should scale with padded leaves: expected ~{expected:.3}x \
+         ({small} -> {large} addresses), observed {observed:.3}x"
     );
 
     drop(client);
