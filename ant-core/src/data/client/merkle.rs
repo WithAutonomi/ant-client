@@ -37,6 +37,28 @@ use xor_name::XorName;
 /// Default threshold: use merkle payments when chunk count >= this value.
 pub const DEFAULT_MERKLE_THRESHOLD: usize = 64;
 
+/// Payment multiplier applied to a quoted price before settlement.
+///
+/// The single-node path has always paid the median-priced issuer **3× its
+/// quoted price** (`SingleNodePayment::from_quotes`), so that the network
+/// receives the same revenue as paying three members of the close group while
+/// costing one transaction's gas. The merkle path never applied it: it
+/// submitted the raw quoted price as the on-chain payable amount, so the
+/// contract's `median16(amount) × 2^depth` came to exactly **1×** the median
+/// per chunk — a third of what the same chunk earns on the single-node path,
+/// for identical storage and replication.
+///
+/// The on-chain field is `CandidateNode.amount`, the sum the vault pays out,
+/// not the quote itself; the signed candidate keeps its 1× quoted `price` and
+/// the pool hash is unchanged, so every proof still verifies against the
+/// quotes the nodes actually signed.
+///
+/// Must stay equal to the single-node multiplier in
+/// `ant_protocol::payment::single_node` and to the storer's
+/// `PAID_QUOTE_PAYMENT_MULTIPLIER`. Consolidating all three into one
+/// `ant-protocol` constant is a follow-up.
+const MERKLE_PAYMENT_MULTIPLIER: u64 = 3;
+
 /// ADR-0004 resolve-before-pay gate for a merkle candidate — the merkle-path
 /// equivalent of the single-node `quote_commitment_binding_is_valid`. Runs the
 /// FULL binding check (shape, cap, exact price, and for bound candidates the
@@ -109,6 +131,34 @@ fn merkle_candidate_binding_is_valid(
         ));
     }
     Ok(())
+}
+
+/// Build the on-chain [`PoolCommitment`] for a candidate pool, applying
+/// [`MERKLE_PAYMENT_MULTIPLIER`] to every candidate's payable amount.
+///
+/// The contract derives what it pays out from the amounts submitted here
+/// (`total = median16(amount) × 2^depth`, split evenly across `depth`
+/// winners), so multiplying here — and only here — brings the merkle path to
+/// the same per-chunk revenue as the single-node path.
+///
+/// The pool hash is deliberately left as `pool.hash()`, computed over the
+/// candidates' **signed** 1× prices. It is the key the storer resolves the
+/// on-chain payment record under, and it commits to the quotes the nodes
+/// actually signed; multiplying the payable amount must not disturb it.
+fn pool_commitment_with_payment_multiplier(
+    pool: &MerklePaymentCandidatePool,
+) -> Result<PoolCommitment> {
+    let mut commitment = pool.to_commitment();
+    let multiplier = Amount::from(MERKLE_PAYMENT_MULTIPLIER);
+    for candidate in &mut commitment.candidates {
+        candidate.price = candidate.price.checked_mul(multiplier).ok_or_else(|| {
+            Error::Payment(format!(
+                "Merkle candidate amount overflow applying {MERKLE_PAYMENT_MULTIPLIER}x to price {}",
+                candidate.price
+            ))
+        })?;
+    }
+    Ok(commitment)
 }
 
 /// Payment mode for uploads.
@@ -537,11 +587,14 @@ impl Client {
             )
             .await?;
 
-        // 4. Build pool commitments for on-chain payment
+        // 4. Build pool commitments for on-chain payment. Every candidate's
+        //    payable amount carries MERKLE_PAYMENT_MULTIPLIER so a merkle
+        //    chunk settles for the same amount a single-node chunk does; the
+        //    signed candidate prices and the pool hashes are untouched.
         let pool_commitments: Vec<PoolCommitment> = candidate_pools
             .iter()
-            .map(MerklePaymentCandidatePool::to_commitment)
-            .collect();
+            .map(pool_commitment_with_payment_multiplier)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(PreparedMerkleBatch {
             depth,
@@ -1825,8 +1878,9 @@ mod tests {
 
         let pool_commitments = candidate_pools
             .iter()
-            .map(MerklePaymentCandidatePool::to_commitment)
-            .collect();
+            .map(pool_commitment_with_payment_multiplier)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
 
         PreparedMerkleBatch {
             depth: tree.depth(),
@@ -1836,6 +1890,98 @@ mod tests {
             tree,
             addresses: addrs,
         }
+    }
+
+    /// Candidate pool with distinct prices, so the median is a specific
+    /// candidate rather than an artifact of every price being equal.
+    fn pool_with_varied_prices(timestamp: u64) -> MerklePaymentCandidatePool {
+        let addrs = make_test_addresses(4);
+        let xornames: Vec<XorName> = addrs.iter().map(|a| XorName(*a)).collect();
+        let tree = MerkleTree::from_xornames(xornames).unwrap();
+        let midpoint = tree
+            .reward_candidates(timestamp)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let candidate_nodes = std::array::from_fn(|i| MerklePaymentCandidateNode {
+            pub_key: vec![i as u8; 32],
+            // 100, 200, ... 1600 — upper median (index 8 of 16) is 900.
+            price: Amount::from((i as u64 + 1) * 100),
+            reward_address: RewardsAddress::new([i as u8; 20]),
+            merkle_payment_timestamp: timestamp,
+            signature: vec![i as u8; 64],
+            committed_key_count: 0,
+            commitment_pin: None,
+        });
+
+        MerklePaymentCandidatePool {
+            midpoint_proof: midpoint,
+            candidate_nodes,
+        }
+    }
+
+    /// The contract's `median16`: upper median, index 8 of 16 ascending.
+    fn median16(mut amounts: Vec<Amount>) -> Amount {
+        amounts.sort_unstable();
+        *amounts.get(amounts.len() / 2).unwrap()
+    }
+
+    #[test]
+    fn pool_commitment_applies_payment_multiplier_to_every_candidate() {
+        let pool = pool_with_varied_prices(1_700_000_000);
+        let commitment = pool_commitment_with_payment_multiplier(&pool).unwrap();
+
+        for (candidate, signed) in commitment
+            .candidates
+            .iter()
+            .zip(pool.candidate_nodes.iter())
+        {
+            assert_eq!(
+                candidate.price,
+                signed.price * Amount::from(MERKLE_PAYMENT_MULTIPLIER),
+                "on-chain payable amount must be {MERKLE_PAYMENT_MULTIPLIER}x the quoted price"
+            );
+        }
+    }
+
+    #[test]
+    fn pool_commitment_multiplier_leaves_signed_prices_and_pool_hash_untouched() {
+        let pool = pool_with_varied_prices(1_700_000_000);
+        let before: Vec<Amount> = pool.candidate_nodes.iter().map(|c| c.price).collect();
+
+        let commitment = pool_commitment_with_payment_multiplier(&pool).unwrap();
+
+        let after: Vec<Amount> = pool.candidate_nodes.iter().map(|c| c.price).collect();
+        assert_eq!(before, after, "signed candidate prices must not change");
+        assert_eq!(
+            commitment.pool_hash,
+            pool.hash(),
+            "pool hash is the storer's on-chain lookup key and must be \
+             computed over the signed 1x prices"
+        );
+    }
+
+    /// The invariant the fix exists for: a chunk paid through the merkle path
+    /// settles for the same amount as a chunk paid through the single-node
+    /// path. Contract formula: `total = median16(amount) * 2^depth`, spread
+    /// over `2^depth` leaves, so per chunk it is exactly `median16(amount)`.
+    #[test]
+    fn merkle_per_chunk_settlement_matches_single_node_multiplier() {
+        let pool = pool_with_varied_prices(1_700_000_000);
+        let commitment = pool_commitment_with_payment_multiplier(&pool).unwrap();
+
+        let quoted_median = median16(pool.candidate_nodes.iter().map(|c| c.price).collect());
+        let per_chunk = median16(commitment.candidates.iter().map(|c| c.price).collect());
+
+        assert_eq!(quoted_median, Amount::from(900u64));
+        assert_eq!(
+            per_chunk,
+            quoted_median * Amount::from(MERKLE_PAYMENT_MULTIPLIER),
+            "merkle per-chunk settlement must equal the single-node \
+             {MERKLE_PAYMENT_MULTIPLIER}x median, not the bare quoted price"
+        );
     }
 
     #[test]
