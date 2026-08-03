@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="ADR-0009 direct browser client interoperability proof"
+    />
+    <title>Autonomi WebTransport PoC</title>
+    <script type="module" src="/src/main.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">ADR-0009 · interoperability proof</p>
+        <h1>Direct browser client</h1>
+        <p>
+          Connect directly to an ant-node, query its local closest-node view,
+          reconstruct a complete public file, and save it from the browser.
+        </p>
+      </header>
+
+      <section aria-labelledby="testnet-heading">
+        <h2 id="testnet-heading">Local testnet</h2>
+        <label>
+          Browser manifest URL
+          <input
+            id="manifest-url"
+            type="url"
+            value="http://127.0.0.1:25000/api/browser-manifest.json"
+            spellcheck="false"
+          />
+        </label>
+        <div class="actions">
+          <button id="load-manifest" type="button">Load testnet</button>
+          <output id="manifest-state">Not loaded</output>
+        </div>
+        <dl id="public-file" class="file-card" hidden>
+          <div><dt>Published file</dt><dd id="public-file-name"></dd></div>
+          <div><dt>Address</dt><dd id="public-file-address"></dd></div>
+          <div><dt>File chunks</dt><dd id="public-file-chunks"></dd></div>
+          <div><dt>Stored on</dt><dd id="public-file-replicas"></dd></div>
+        </dl>
+      </section>
+
+      <section aria-labelledby="connection-heading">
+        <h2 id="connection-heading">Direct node endpoint</h2>
+        <p class="section-note">
+          Populated from the testnet manifest. It can also be entered manually.
+        </p>
+        <label>
+          WebTransport URL
+          <input
+            id="endpoint-url"
+            type="url"
+            value="https://127.0.0.1:24000/autonomi/webtransport/v1"
+            spellcheck="false"
+          />
+        </label>
+        <label>
+          SHA-256 certificate hash
+          <input
+            id="certificate-hash"
+            type="text"
+            placeholder="64 hexadecimal characters from the node log"
+            spellcheck="false"
+          />
+        </label>
+        <div class="actions">
+          <button id="connect" type="button">Connect</button>
+          <output id="connection-state">Disconnected</output>
+        </div>
+      </section>
+
+      <section aria-labelledby="lookup-heading">
+        <h2 id="lookup-heading">Browser-side closest lookup</h2>
+        <label>
+          32-byte target
+          <input id="lookup-target" type="text" spellcheck="false" />
+        </label>
+        <div class="actions">
+          <button id="random-target" type="button" class="secondary">
+            Random target
+          </button>
+          <button id="find-closest" type="button">Find closest</button>
+        </div>
+      </section>
+
+      <section aria-labelledby="download-heading">
+        <h2 id="download-heading">Direct public file download</h2>
+        <p class="section-note">
+          Fetches the public DataMap and every encrypted file chunk directly,
+          reconstructs and verifies the complete file, then opens the browser save flow.
+        </p>
+        <label>
+          Public DataMap address
+          <input id="file-address" type="text" spellcheck="false" />
+        </label>
+        <div class="actions">
+          <button id="download-file" type="button">Download and save file</button>
+          <output id="download-state"></output>
+          <span id="download-link"></span>
+        </div>
+      </section>
+
+      <section aria-labelledby="log-heading">
+        <h2 id="log-heading">Protocol log</h2>
+        <pre id="log" aria-live="polite"></pre>
+      </section>
+    </main>
+  </body>
+</html>

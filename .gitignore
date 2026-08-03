@@ -1,4 +1,6 @@
 /target
+/web/node_modules/
+/web/dist/
 .cargo/config.toml
 .cache/
 *.orig

@@ -1,0 +1,19 @@
+{
+  "name": "ant-client-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5173",
+    "build": "vite build",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@noble/ciphers": "2.2.0",
+    "@noble/hashes": "2.2.0",
+    "brotli-dec-wasm": "2.3.2"
+  },
+  "devDependencies": {
+    "vite": "8.2.0"
+  }
+}
