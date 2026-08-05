@@ -4,14 +4,12 @@ import { parseBrowserManifest } from "./manifest.js";
 
 test("browser manifest validates and normalizes endpoints and files", () => {
   const manifest = parseBrowserManifest({
-    version: 2,
+    version: 3,
     network_id: "local-test",
     created_at: "2026-08-03T00:00:00Z",
     endpoints: [
       {
-        peer_id: "AA".repeat(32),
-        url: "https://127.0.0.1:22000/autonomi/webtransport/v1",
-        certificate_sha256: "BB".repeat(32),
+        multiaddr: webtransportMultiaddr("AA".repeat(32), 0xbb),
       },
     ],
     files: [
@@ -32,7 +30,10 @@ test("browser manifest validates and normalizes endpoints and files", () => {
     ],
   });
 
-  assert.equal(manifest.endpoints[0].peer_id, "aa".repeat(32));
+  assert.equal(
+    manifest.endpoints[0].multiaddr,
+    webtransportMultiaddr("AA".repeat(32), 0xbb),
+  );
   assert.equal(manifest.files[0].address, "cc".repeat(32));
   assert.equal(manifest.files[0].blake3, "dd".repeat(32));
   assert.deepEqual(
@@ -42,24 +43,33 @@ test("browser manifest validates and normalizes endpoints and files", () => {
   assert.equal(manifest.files[0].replicas, 5);
 });
 
-test("browser manifest rejects missing endpoints and malformed hashes", () => {
+test("browser manifest rejects missing endpoints and malformed multiaddresses", () => {
   assert.throws(
-    () => parseBrowserManifest({ version: 2, network_id: "test", endpoints: [] }),
+    () => parseBrowserManifest({ version: 3, network_id: "test", endpoints: [] }),
     /no WebTransport endpoints/,
   );
   assert.throws(
     () =>
       parseBrowserManifest({
-        version: 2,
+        version: 3,
         network_id: "test",
         endpoints: [
           {
-            peer_id: "wrong",
-            url: "https://127.0.0.1:22000/path",
-            certificate_sha256: "bb".repeat(32),
+            multiaddr:
+              "/ip4/127.0.0.1/udp/22000/quic-v1/webtransport/certhash/uAA/p2p/wrong",
           },
         ],
       }),
-    /hexadecimal|Expected 32 bytes/,
+    /multihash|hexadecimal|Expected 32 bytes/,
   );
 });
+
+function webtransportMultiaddr(peerId, certificateByte) {
+  const multihash = Uint8Array.from([
+    0x12,
+    0x20,
+    ...Array(32).fill(certificateByte),
+  ]);
+  const certhash = `u${Buffer.from(multihash).toString("base64url")}`;
+  return `/ip4/127.0.0.1/udp/22000/quic-v1/webtransport/certhash/${certhash}/p2p/${peerId}`;
+}
