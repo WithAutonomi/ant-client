@@ -14,7 +14,11 @@ proxies file bytes.
 
 - Rust 1.88 or newer for the node's optional `wtransport` dependency.
 - Node.js 20.19+ or 22.12+.
-- A current browser implementing WebTransport certificate hashes.
+- A current browser implementing WebTransport certificate hashes. The client
+  extracts them from node multiaddresses; users do not enter hashes separately.
+
+Nodes serialize these addresses from the native `saorsa_core::MultiAddr`
+representation; the JavaScript parser consumes that canonical string form.
 
 ## Run the browser-enabled testnet
 
@@ -36,7 +40,8 @@ listeners on UDP 24000-24004. It also:
 - self-encrypts the built-in `autonomi-browser-testnet.txt` and publishes its
   encrypted chunks and public DataMap through the ordinary node PUT handler
   using devnet-prepaid cache entries;
-- exposes all direct node URLs and certificate pins at
+- exposes all direct node multiaddresses, including their certificate pins and
+  peer IDs, at
   `http://127.0.0.1:25000/api/browser-manifest.json`;
 - includes the public DataMap address, plaintext BLAKE3 hash, resolved chunk
   metadata, filename, size, and replica count in that manifest.
@@ -57,8 +62,9 @@ npm run dev
 Open `http://127.0.0.1:5173`. The page automatically loads the testnet
 manifest from port 25000 and fills in the default file:
 
-1. **Load testnet** refreshes the manifest and direct endpoint catalog.
-2. **Connect** performs a pinned WebTransport `HELLO` with the first node.
+1. **Load testnet** refreshes the manifest and direct multiaddress catalog.
+2. **Connect** parses the first node multiaddress and performs a pinned
+   WebTransport `HELLO`.
 3. **Find closest** runs the iterative lookup in the browser.
 4. **Download and save file** opens the browser save flow, fetches the public
    DataMap and encrypted chunks from direct closest storage nodes, reconstructs

@@ -17,8 +17,7 @@ const elements = {
   publicFileAddress: document.querySelector("#public-file-address"),
   publicFileChunks: document.querySelector("#public-file-chunks"),
   publicFileReplicas: document.querySelector("#public-file-replicas"),
-  endpointUrl: document.querySelector("#endpoint-url"),
-  certificateHash: document.querySelector("#certificate-hash"),
+  endpointMultiaddr: document.querySelector("#endpoint-multiaddr"),
   connect: document.querySelector("#connect"),
   connectionState: document.querySelector("#connection-state"),
   lookupTarget: document.querySelector("#lookup-target"),
@@ -46,10 +45,7 @@ function log(message, value) {
 }
 
 function endpointFromForm() {
-  return {
-    url: elements.endpointUrl.value.trim(),
-    certificateSha256: elements.certificateHash.value.trim(),
-  };
+  return elements.endpointMultiaddr.value.trim();
 }
 
 function seedEndpoints() {
@@ -65,8 +61,7 @@ async function loadManifest() {
   browserManifest = manifest;
 
   const first = manifest.endpoints[0];
-  elements.endpointUrl.value = first.url;
-  elements.certificateHash.value = first.certificate_sha256;
+  elements.endpointMultiaddr.value = first.multiaddr;
   client?.close();
   client = undefined;
   elements.connectionState.classList.remove("connected");

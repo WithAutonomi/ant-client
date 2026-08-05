@@ -47,23 +47,15 @@
       <section aria-labelledby="connection-heading">
         <h2 id="connection-heading">Direct node endpoint</h2>
         <p class="section-note">
-          Populated from the testnet manifest. It can also be entered manually.
+          The certificate pins and peer identity are embedded in this address.
+          It is populated from the testnet manifest and can also be pasted manually.
         </p>
         <label>
-          WebTransport URL
+          WebTransport multiaddress
           <input
-            id="endpoint-url"
-            type="url"
-            value="https://127.0.0.1:24000/autonomi/webtransport/v1"
-            spellcheck="false"
-          />
-        </label>
-        <label>
-          SHA-256 certificate hash
-          <input
-            id="certificate-hash"
+            id="endpoint-multiaddr"
             type="text"
-            placeholder="64 hexadecimal characters from the node log"
+            placeholder="/ip4/127.0.0.1/udp/24000/quic-v1/webtransport/certhash/.../p2p/..."
             spellcheck="false"
           />
         </label>

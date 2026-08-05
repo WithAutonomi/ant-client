@@ -2,6 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
+- **Last amended:** 2026-08-04
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -24,7 +25,8 @@ bootstrap-manifest production under ant-node ADR-0009.
 
 - File bytes must travel directly from a storage node to the browser.
 - The browser must own iterative XOR lookup rather than ask a gateway to do it.
-- Self-signed node certificates must be authenticated through explicit hashes.
+- Self-signed node certificates must be authenticated through hashes embedded
+  in self-contained node multiaddresses, without a separate client argument.
 - Downloaded immutable content must be verified before it is exposed to users.
 - Local testnets need a reproducible bootstrap and default-file workflow.
 
@@ -43,10 +45,12 @@ bootstrap-manifest production under ant-node ADR-0009.
 
 The `web/` package will implement the direct browser read client:
 
-- load a versioned browser bootstrap manifest containing node URLs,
-  certificate hashes, peer IDs, and published immutable-file metadata;
-- authenticate every seed and discovered endpoint by certificate hash and
-  verify its `HELLO` peer ID;
+- load a versioned browser bootstrap manifest containing WebTransport
+  multiaddresses and published immutable-file metadata;
+- accept a single multiaddress per seed, extract its one or two
+  `/certhash` SHA-256 multihashes internally, and pass them to WebTransport;
+- require `/p2p/<peer-id>` in every address, verify its `HELLO` peer ID, and
+  reject discovered endpoint/peer mismatches;
 - perform iterative `FIND_NODE` queries using 256-bit XOR ordering, `K = 20`,
   and `ALPHA = 3`;
 - query closest direct endpoints with `GET_CHUNK`, retrying `not_found` and
@@ -63,6 +67,20 @@ The local browser manifest is bootstrap metadata, not a gateway. Production
 clients will replace its unsigned endpoint list with the ML-DSA-signed records
 defined by ant-node ADR-0009.
 
+The JavaScript API and demo never accept a certificate hash separately from an
+endpoint. Their sole dialing input is a canonical address of the form
+`/.../quic-v1/webtransport/certhash/<multihash>/p2p/<peer-id>`. Repeated
+`/certhash` components permit current/next certificate overlap. Keeping the
+transport location, accepted TLS key, and expected peer identity in one value
+prevents callers from accidentally combining fields belonging to different
+nodes.
+
+Rust nodes construct and validate this syntax through
+`saorsa_transport::TransportAddr::WebTransport` wrapped by
+`saorsa_core::MultiAddr`; it is not a browser-specific string type. The
+JavaScript parser is the browser implementation of that same canonical wire
+format and is covered by matching current/next-pin fixtures.
+
 For the local vertical slice, the bootstrap manifest carries a resolved JSON
 view of the public root DataMap alongside its ordinary on-network DataMap
 address. The browser still fetches and verifies that public DataMap record and
@@ -76,7 +94,8 @@ metadata chain.
 
 - Lookup and data transfer remain decentralized at the application layer.
 - A local five-node testnet can validate multiple direct node connections,
-  certificate pins, lookup convergence, fallback, and content verification.
+  multiaddress-embedded certificate pins, lookup convergence, fallback, and
+  content verification.
 - The browser protocol is independent of native Rust serialization details.
 
 ### Negative / Trade-offs
@@ -102,7 +121,8 @@ metadata chain.
   KDF, authenticated decryption, Brotli reconstruction, and tamper rejection.
 - A live node integration test starts five WebTransport-enabled nodes,
   publishes a public DataMap and encrypted chunks, connects with the advertised
-  certificate hash, retrieves every record, and reconstructs the exact file.
+  self-contained multiaddress, retrieves every record, and reconstructs the
+  exact file.
 - Before acceptance, run interactive tests on current Chrome, Firefox, and
   Safari and add shared lookup convergence vectors with the native client.
 - Revisit this decision when streaming file reconstruction or production signed
