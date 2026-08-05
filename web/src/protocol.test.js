@@ -9,7 +9,6 @@ import {
   parseResponseFrame,
   parseWebTransportMultiaddr,
   verifyChunk,
-  xorDistance,
 } from "./protocol.js";
 
 test("hex conversion enforces fixed widths", () => {
@@ -17,12 +16,6 @@ test("hex conversion enforces fixed widths", () => {
   assert.equal(bytesToHex(hexToBytes(value, 32)), value);
   assert.throws(() => hexToBytes("abcd", 32), /Expected 32 bytes/);
   assert.throws(() => hexToBytes("zz", 1), /hexadecimal/);
-});
-
-test("XOR distance is an unsigned 256-bit ordering value", () => {
-  assert.equal(xorDistance("00".repeat(32), "00".repeat(32)), 0n);
-  assert.equal(xorDistance("00".repeat(31) + "01", "00".repeat(32)), 1n);
-  assert(xorDistance("80" + "00".repeat(31), "00".repeat(32)) > 1n);
 });
 
 test("response framing preserves a raw binary body", () => {

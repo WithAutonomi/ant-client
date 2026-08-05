@@ -57,6 +57,8 @@ exports browser-safe immutable-data operations through `wasm-bindgen`.
 
 The Rust/WASM core will:
 
+- run iterative closest-node lookup through Saorsa's transport-independent
+  `run_iterative_lookup` driver and `LookupQuery` interface;
 - self-encrypt complete public files with the same `self_encryption 0.36`
   implementation used by the Rust client;
 - encode and decode the native MessagePack `DataMap` representation;
@@ -72,8 +74,8 @@ The `web/` package will remain responsible for browser-specific orchestration:
   `/certhash` SHA-256 multihashes internally, and pass them to WebTransport;
 - require `/p2p/<peer-id>` in every address, verify its `HELLO` peer ID, and
   reject discovered endpoint/peer mismatches;
-- perform iterative `FIND_NODE` queries using 256-bit XOR ordering, `K = 20`,
-  and `ALPHA = 3`;
+- execute each WebTransport `FIND_NODE` request selected by the Rust/WASM
+  lookup engine and return its response or failure to that engine;
 - query closest direct endpoints with `GET_CHUNK`, retrying `not_found` and
   unavailable nodes without routing bytes through the manifest service;
 - call the Rust/WASM core to self-encrypt selected public files and generate
@@ -120,6 +122,14 @@ and ML-DSA verification types without enabling native networking. At that
 point those compatibility-sensitive operations should also move behind the
 Rust/WASM boundary.
 
+The shared lookup engine is intentionally a small Saorsa crate rather than a
+second implementation inside `ant-core`. Native `DhtNetworkManager` and the
+browser WASM adapter both drive the same candidate queue, peer-state, α-batch,
+and convergence implementation. Native QUIC retains transport authentication,
+address-report consensus, failure-cache integration, and trust updates; the
+browser adapter retains WebTransport session establishment and endpoint
+validation.
+
 For compatibility with the local launcher, the bootstrap manifest still
 carries a resolved JSON view of the public root DataMap alongside its ordinary
 on-network DataMap address. The download path does not use that copy to select
@@ -147,8 +157,8 @@ metadata chain.
 - The current client reconstructs files in memory and the local launcher caps
   public files at 64 MiB; upload encryption and reconstruction are not yet
   streaming.
-- JavaScript lookup and quote-verification behavior must remain aligned with
-  native Kademlia and protocol rules until transport-free Rust APIs exist.
+- JavaScript quote-verification behavior must remain aligned with native
+  protocol rules until transport-free `ant-protocol` APIs exist.
 - The initial WASM module is approximately 1.4 MiB uncompressed and browser
   file processing is still in memory.
 - Certificate and endpoint verification adds bootstrap-record lifecycle work.
@@ -164,7 +174,10 @@ metadata chain.
 
 - Rust unit tests cover an exact native `self_encryption 0.36` wire vector,
   public DataMap generation, round-trip reconstruction, and tamper rejection.
-- JavaScript unit tests cover fixed-width identifiers, XOR ordering,
+- Saorsa engine tests cover XOR ordering, α limits, final peer states, bounded
+  candidate eviction, multi-round discovery, and top-K convergence; the native
+  DHT manager and browser WASM adapter both invoke the same generic runner.
+- JavaScript unit tests cover fixed-width identifiers,
   bidirectional binary framing, manifest/payment validation, quote signatures,
   the native Keccak-256 EVM quote-hash vector, and the browser orchestration
   around the Rust/WASM boundary.

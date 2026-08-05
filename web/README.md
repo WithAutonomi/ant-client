@@ -2,11 +2,12 @@
 
 This web application is the browser-facing client for ADR-0009. It loads a
 local testnet bootstrap manifest, connects directly to storage nodes over
-WebTransport, and performs the XOR closest-node lookup in the browser. The
-portable part of the Rust `ant-core` library is compiled to WASM and performs
-native self-encryption, public DataMap serialization, reconstruction, and
-BLAKE3 content verification. The thin JavaScript layer retrieves and uploads
-records, uses the browser wallet/payment APIs, and drives the page.
+WebTransport, and performs closest-node lookup through Saorsa's shared Rust
+lookup engine. The portable part of `ant-core` is compiled to WASM and drives
+the Kademlia walk, native self-encryption, public DataMap serialization,
+reconstruction, and BLAKE3 content verification. The thin JavaScript layer
+executes WebTransport requests, retrieves and uploads records, uses the browser
+wallet/payment APIs, and drives the page.
 
 The node-side WebTransport listener and testnet manifest API live in the
 `ant-node-web-support` sibling repository. No HTTP gateway performs lookup or
@@ -88,7 +89,8 @@ manifest from port 25000 and fills in the default file:
 1. **Load testnet** refreshes the manifest and direct multiaddress catalog.
 2. **Connect** parses the first node multiaddress and performs a pinned
    WebTransport `HELLO`.
-3. **Find closest** runs the iterative lookup in the browser.
+3. **Find closest** runs Saorsa's iterative lookup engine in WASM, with
+   JavaScript executing its WebTransport query batches.
 4. Under **Paid public file upload**, choose a file, paste the funded private
    key printed by ant-devnet, then select **Pay and upload file**. Rust/WASM
    performs encryption and DataMap generation; quote/commitment verification,
@@ -124,10 +126,11 @@ cargo check -p ant-core --target wasm32-unknown-unknown \
 cargo test -p ant-core --lib browser::tests
 ```
 
-The tests cover fixed-width IDs, XOR ordering, bidirectional binary framing,
-browser manifest/payment validation, signed quote verification including the
-native Keccak-256 EVM quote hash, and a Rust `self_encryption 0.36` wire vector
-with native/WASM round-trip and tamper verification.
+The tests cover Saorsa's shared lookup engine and generic query driver, fixed-width IDs,
+bidirectional binary framing, browser manifest/payment validation, signed
+quote verification including the native Keccak-256 EVM quote hash, and a Rust
+`self_encryption 0.36` wire vector with native/WASM round-trip and tamper
+verification.
 Cross-repository live verification additionally starts the node testnet,
 downloads all public-file records through WebTransport, reconstructs the
 original bytes, pays a real quote on local Anvil, uploads a fresh record
@@ -135,8 +138,10 @@ through the ordinary node payment validator, and reads it back.
 
 ## Current boundary
 
-JavaScript currently owns WebTransport stream handling, iterative lookup,
-Ethers payment submission, ML-DSA quote verification, and DOM/save APIs.
+JavaScript currently owns WebTransport stream handling, Ethers payment
+submission, ML-DSA quote verification, and DOM/save APIs. Rust/WASM owns the
+complete iterative lookup loop; JavaScript implements only its transport batch
+callback.
 `ant-protocol 2.3.1` still enables native Saorsa/Tokio networking and cannot be
 linked into a browser WASM build; a future transport-free feature can move the
 remaining quote and multiaddress verification into Rust.

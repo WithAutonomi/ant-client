@@ -2,3 +2,6 @@
 members = ["ant-core", "ant-cli"]
 resolver = "2"
 
+[patch.crates-io]
+saorsa-core = { path = "../saorsa-core-web-support" }
+saorsa-transport = { path = "../saorsa-transport-web-support" }

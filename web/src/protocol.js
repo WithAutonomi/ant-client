@@ -1,5 +1,8 @@
 import { bytesToHex as nobleBytesToHex } from "@noble/hashes/utils.js";
-import { verifyRecord as verifyRecordNative } from "../pkg/ant_core.js";
+import {
+  BrowserIterativeLookup as BrowserIterativeLookupNative,
+  verifyRecord as verifyRecordNative,
+} from "../pkg/ant_core.js";
 
 export const PROTOCOL_VERSION = 3;
 export const PROTOCOL_NAME = "autonomi.web.poc.v3";
@@ -32,16 +35,6 @@ export function hexToBytes(value, expectedLength) {
 
 export function bytesToHex(bytes) {
   return nobleBytesToHex(bytes);
-}
-
-export function xorDistance(peerId, target) {
-  const peer = hexToBytes(peerId, 32);
-  const key = hexToBytes(target, 32);
-  let distance = 0n;
-  for (let index = 0; index < peer.length; index += 1) {
-    distance = (distance << 8n) | BigInt(peer[index] ^ key[index]);
-  }
-  return distance;
 }
 
 export function verifyChunk(address, content) {
@@ -455,9 +448,8 @@ export async function iterativeFindClosest(
   }
 
   const clients = new Map();
-  const known = new Map();
-  const queried = new Set();
   const failures = [];
+  const seedNodes = [];
 
   const clientFor = (endpoint) => {
     const key = endpointKey(endpoint);
@@ -476,7 +468,7 @@ export async function iterativeFindClosest(
       try {
         const client = clientFor(endpoint);
         const hello = await client.hello();
-        known.set(hello.peer_id, {
+        seedNodes.push({
           peer_id: hello.peer_id,
           native_addresses: [],
           reliability: 1,
@@ -489,70 +481,39 @@ export async function iterativeFindClosest(
       }
     }),
   );
-  if (known.size === 0) {
+  if (seedNodes.length === 0) {
     for (const client of clients.values()) client.close();
     const detail = failures.map(({ error }) => error.message).join("; ");
     throw new Error(`Could not connect to any WebTransport seed: ${detail}`);
   }
 
-  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
-    const ordered = [...known.values()].sort((left, right) => {
-      const a = xorDistance(left.peer_id, target);
-      const b = xorDistance(right.peer_id, target);
-      return a < b ? -1 : a > b ? 1 : 0;
-    });
-    const candidates = ordered
-      .filter((node) => node.webtransport && !queried.has(node.peer_id))
-      .slice(0, alpha);
-    if (candidates.length === 0) break;
-
-    let discovered = 0;
-    await Promise.all(
+  const lookup = new BrowserIterativeLookupNative(target, k, alpha, maxIterations);
+  lookup.addCandidates(seedNodes);
+  await lookup.run(async ({ target: lookupTarget, count, iteration, candidates }) =>
+    Promise.all(
       candidates.map(async (candidate) => {
-        queried.add(candidate.peer_id);
         try {
           const candidateClient = clientFor(candidate.webtransport);
           if (!candidateClient.peerId) await candidateClient.hello();
-          const nodes = await candidateClient.findNode(target, k);
+          const nodes = await candidateClient.findNode(lookupTarget, count);
           onProgress(
-            `Iteration ${iteration + 1}: ${candidate.peer_id} returned ${nodes.length} nodes`,
+            `Iteration ${iteration}: ${candidate.peer_id} returned ${nodes.length} nodes`,
           );
-          for (const node of nodes) {
-            const existing = known.get(node.peer_id);
-            if (!existing) discovered += 1;
-            known.set(node.peer_id, {
-              ...existing,
-              ...node,
-              webtransport: node.webtransport ?? existing?.webtransport,
-            });
-          }
+          return {
+            status: "succeeded",
+            responder: candidate.peer_id,
+            candidates: nodes,
+          };
         } catch (error) {
           failures.push({ peerId: candidate.peer_id, error });
           onProgress(`Query ${candidate.peer_id} failed: ${error.message}`);
+          return { status: "failed", responder: candidate.peer_id };
         }
       }),
-    );
+    ),
+  );
 
-    const remainingQueryable = [...known.values()]
-      .sort((left, right) => {
-        const a = xorDistance(left.peer_id, target);
-        const b = xorDistance(right.peer_id, target);
-        return a < b ? -1 : a > b ? 1 : 0;
-      })
-      .slice(0, k)
-      .some((node) => node.webtransport && !queried.has(node.peer_id));
-    if (discovered === 0 && !remainingQueryable) break;
-  }
-
-  const nodes = [...known.values()]
-    .sort((left, right) => {
-      const a = xorDistance(left.peer_id, target);
-      const b = xorDistance(right.peer_id, target);
-      return a < b ? -1 : a > b ? 1 : 0;
-    })
-    .slice(0, k);
-
-  return { nodes, queried: [...queried], failures, clients };
+  return { nodes: lookup.results(), queried: lookup.queriedPeers(), failures, clients };
 }
 
 export async function getChunkFromClosest(
