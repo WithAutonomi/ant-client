@@ -7,6 +7,7 @@ import {
 } from "./protocol.js";
 import { downloadPublicFile } from "./file.js";
 import { fetchBrowserManifest } from "./manifest.js";
+import { uploadPublicFile } from "./upload.js";
 
 const elements = {
   manifestUrl: document.querySelector("#manifest-url"),
@@ -23,6 +24,15 @@ const elements = {
   lookupTarget: document.querySelector("#lookup-target"),
   randomTarget: document.querySelector("#random-target"),
   findClosest: document.querySelector("#find-closest"),
+  uploadInput: document.querySelector("#upload-file-input"),
+  walletSecret: document.querySelector("#wallet-secret"),
+  uploadFile: document.querySelector("#upload-file"),
+  uploadState: document.querySelector("#upload-state"),
+  uploadResult: document.querySelector("#upload-result"),
+  uploadResultName: document.querySelector("#upload-result-name"),
+  uploadResultAddress: document.querySelector("#upload-result-address"),
+  uploadResultRecords: document.querySelector("#upload-result-records"),
+  uploadResultPayment: document.querySelector("#upload-result-payment"),
   fileAddress: document.querySelector("#file-address"),
   downloadFile: document.querySelector("#download-file"),
   downloadState: document.querySelector("#download-state"),
@@ -148,6 +158,60 @@ elements.findClosest.addEventListener("click", async () => {
     for (const lookupClient of result.clients.values()) lookupClient.close();
   } catch (error) {
     reportError("Lookup", error);
+  }
+});
+
+elements.uploadFile.addEventListener("click", async () => {
+  elements.uploadState.classList.remove("connected");
+  elements.uploadState.textContent = "Preparing upload…";
+  elements.uploadResult.hidden = true;
+  elements.uploadFile.disabled = true;
+  let walletSecret = elements.walletSecret.value.trim();
+  elements.walletSecret.value = "";
+  try {
+    if (!browserManifest) throw new Error("Load the browser testnet manifest first");
+    const file = elements.uploadInput.files?.[0];
+    if (!file) throw new Error("Choose a file to upload");
+    if (!walletSecret) throw new Error("Enter the paying wallet secret key");
+
+    log(`Starting paid public upload for ${file.name}`);
+    const result = await uploadPublicFile(
+      seedEndpoints(),
+      browserManifest.payment,
+      file,
+      walletSecret,
+      {
+        onProgress: (message) => {
+          elements.uploadState.textContent = message;
+          log(message);
+        },
+      },
+    );
+
+    browserManifest.files = [
+      ...browserManifest.files.filter(
+        (published) => published.address !== result.file.address,
+      ),
+      result.file,
+    ];
+    elements.fileAddress.value = result.file.address;
+    elements.uploadResultName.textContent = `${result.file.name} · ${result.file.size.toLocaleString()} bytes`;
+    elements.uploadResultAddress.textContent = result.file.address;
+    elements.uploadResultRecords.textContent = `${result.records} records · at least ${result.file.replicas} replica${result.file.replicas === 1 ? "" : "s"}`;
+    elements.uploadResultPayment.textContent = result.transactionHash
+      ? `${result.transactionHash} · ${result.storageCostAtto} atto tokens`
+      : "No new payment was required";
+    elements.uploadResult.hidden = false;
+    elements.uploadState.textContent = "Uploaded · ready to download";
+    elements.uploadState.classList.add("connected");
+    log(`Uploaded and registered ${result.file.name} for immediate download`, result);
+  } catch (error) {
+    elements.uploadState.textContent = "Upload failed";
+    log(`File upload failed: ${error.message}`);
+    console.error(error);
+  } finally {
+    walletSecret = "";
+    elements.uploadFile.disabled = false;
   }
 });
 

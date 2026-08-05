@@ -1,6 +1,6 @@
 import { hexToBytes, parseWebTransportMultiaddr } from "./protocol.js";
 
-export const BROWSER_MANIFEST_VERSION = 3;
+export const BROWSER_MANIFEST_VERSION = 4;
 const MAX_PUBLIC_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_DATA_MAP_BYTES = 4 * 1024 * 1024;
 const MAX_FILE_CHUNKS = 1024;
@@ -19,6 +19,7 @@ export function parseBrowserManifest(value) {
     const parsed = parseWebTransportMultiaddr(endpoint);
     return { multiaddr: parsed.multiaddr };
   });
+  const payment = parsePaymentNetwork(value.payment);
 
   const files = (value.files ?? []).map((file) => {
     if (!file || typeof file.name !== "string" || file.name.length === 0) {
@@ -93,7 +94,33 @@ export function parseBrowserManifest(value) {
     network_id: value.network_id,
     created_at: value.created_at,
     endpoints,
+    payment,
     files,
+  };
+}
+
+export function parsePaymentNetwork(value) {
+  if (!value || typeof value !== "object") {
+    throw new Error("Browser manifest contains no payment network");
+  }
+  let rpcUrl;
+  try {
+    rpcUrl = new URL(value.rpc_url);
+  } catch (error) {
+    throw new Error("Payment RPC URL is invalid", { cause: error });
+  }
+  if (!["http:", "https:"].includes(rpcUrl.protocol)) {
+    throw new Error("Payment RPC URL must use HTTP or HTTPS");
+  }
+  if (rpcUrl.username || rpcUrl.password) {
+    throw new Error("Payment RPC URL must not contain credentials");
+  }
+  hexToBytes(value.payment_token_address ?? "", 20);
+  hexToBytes(value.payment_vault_address ?? "", 20);
+  return {
+    rpc_url: rpcUrl.toString(),
+    payment_token_address: `0x${value.payment_token_address.replace(/^0x/i, "").toLowerCase()}`,
+    payment_vault_address: `0x${value.payment_vault_address.replace(/^0x/i, "").toLowerCase()}`,
   };
 }
 

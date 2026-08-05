@@ -4,7 +4,9 @@ This web application is the browser-facing client for ADR-0009. It loads a
 local testnet bootstrap manifest, connects directly to storage nodes over
 WebTransport, performs the XOR closest-node lookup in JavaScript, retrieves a
 public DataMap and every encrypted file chunk, reconstructs the complete file,
-and verifies its whole-file BLAKE3 hash before saving it.
+and verifies its whole-file BLAKE3 hash before saving it. It can also
+self-encrypt a file, pay signed node quotes with a wallet held only in the
+page, and upload the encrypted records directly to closest storage nodes.
 
 The node-side WebTransport listener and testnet manifest API live in the
 `ant-node-web-support` sibling repository. No HTTP gateway performs lookup or
@@ -31,6 +33,7 @@ cargo run --features webtransport-poc --bin ant-devnet -- \
   --webtransport \
   --webtransport-base-port 24000 \
   --serve-port 25000 \
+  --enable-evm \
   --enable-logging
 ```
 
@@ -45,6 +48,13 @@ listeners on UDP 24000-24004. It also:
   `http://127.0.0.1:25000/api/browser-manifest.json`;
 - includes the public DataMap address, plaintext BLAKE3 hash, resolved chunk
   metadata, filename, size, and replica count in that manifest.
+- starts local Anvil payment contracts and prints a disposable funded wallet
+  private key. The browser manifest contains only public RPC and contract
+  addresses, never the private key.
+
+Confirm that `HELLO.payment.rpc_url` is a loopback Anvil URL. An
+`https://arb1.arbitrum.io/rpc` value means an older devnet was started without
+`--enable-evm`; its disposable local key cannot fund uploads there.
 
 Pass `--public-file /path/to/file` to publish another file instead. The built-in
 file is generated as 5 MiB so the demo exercises whole-file reconstruction. A
@@ -66,7 +76,12 @@ manifest from port 25000 and fills in the default file:
 2. **Connect** parses the first node multiaddress and performs a pinned
    WebTransport `HELLO`.
 3. **Find closest** runs the iterative lookup in the browser.
-4. **Download and save file** opens the browser save flow, fetches the public
+4. Under **Paid public file upload**, choose a file, paste the funded private
+   key printed by ant-devnet, then select **Pay and upload file**. Encryption,
+   quote/commitment verification, approval, and payment happen locally. The
+   key field is cleared immediately and the resulting public DataMap address
+   is placed in the download field.
+5. **Download and save file** opens the browser save flow, fetches the public
    DataMap and encrypted chunks from direct closest storage nodes, reconstructs
    the whole file, verifies BLAKE3, and retains a **Save again** link.
 
@@ -86,11 +101,15 @@ npm test
 npm run build
 ```
 
-The tests cover fixed-width IDs, XOR ordering, response framing, browser
-manifest validation, and a native `self_encryption 0.36` compatibility vector.
+The tests cover fixed-width IDs, XOR ordering, bidirectional binary framing,
+browser manifest/payment validation, signed quote verification including the
+native Keccak-256 EVM quote hash, native
+encryption/DataMap generation, and a `self_encryption 0.36` compatibility
+vector.
 Cross-repository live verification additionally starts the node testnet,
-downloads all public-file records through WebTransport, and reconstructs the
-original bytes.
+downloads all public-file records through WebTransport, reconstructs the
+original bytes, pays a real quote on local Anvil, uploads a fresh record
+through the ordinary node payment validator, and reads it back.
 
 ## Current boundary
 
