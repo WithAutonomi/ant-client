@@ -1,4 +1,3 @@
-import { blake3 } from "@noble/hashes/blake3.js";
 import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { decode } from "@msgpack/msgpack";
 import {
@@ -9,6 +8,7 @@ import {
   NonceManager,
   Wallet,
 } from "ethers";
+import { contentAddress as contentAddressNative } from "../pkg/ant_core.js";
 import { bytesToHex, hexToBytes } from "./protocol.js";
 
 const U256_MAX = (1n << 256n) - 1n;
@@ -172,7 +172,7 @@ function verifyCommitment(commitment, quote) {
   if (!Number.isSafeInteger(keyCount) || keyCount !== quote.committed_key_count) {
     throw new Error("Storage commitment key count does not match quote");
   }
-  if (bytesToHex(blake3(publicKey)) !== quote.peer_id.toLowerCase()) {
+  if (contentAddressNative(publicKey) !== quote.peer_id.toLowerCase()) {
     throw new Error("Storage commitment public key is not bound to quote peer");
   }
   if (bytesToHex(peerId) !== quote.peer_id.toLowerCase()) {
@@ -209,7 +209,7 @@ function verifyCommitment(commitment, quote) {
     postcardVarint(signature.length),
     signature,
   );
-  const pin = bytesToHex(blake3(concatBytes(DOMAIN_COMMITMENT_HASH, postcard)));
+  const pin = contentAddressNative(concatBytes(DOMAIN_COMMITMENT_HASH, postcard));
   if (pin !== quote.commitment_pin.toLowerCase()) {
     throw new Error("Storage commitment does not resolve the quote pin");
   }
@@ -234,7 +234,7 @@ export function verifyStorageQuote(quote, expectedAddress, expectedPeerId) {
   if (signature.length !== ml_dsa65.lengths.signature) {
     throw new Error(`Storage quote has a ${signature.length}-byte signature`);
   }
-  if (bytesToHex(blake3(publicKey)) !== quote.peer_id.toLowerCase()) {
+  if (contentAddressNative(publicKey) !== quote.peer_id.toLowerCase()) {
     throw new Error("Storage quote public key is not bound to its peer ID");
   }
   const signedBytes = canonicalQuoteBytes(quote);
