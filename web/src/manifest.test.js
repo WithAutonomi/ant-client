@@ -4,9 +4,10 @@ import { parseBrowserManifest } from "./manifest.js";
 
 test("browser manifest validates and normalizes endpoints and files", () => {
   const manifest = parseBrowserManifest({
-    version: 3,
+    version: 4,
     network_id: "local-test",
     created_at: "2026-08-03T00:00:00Z",
+    payment: paymentNetwork(),
     endpoints: [
       {
         multiaddr: webtransportMultiaddr("AA".repeat(32), 0xbb),
@@ -41,18 +42,26 @@ test("browser manifest validates and normalizes endpoints and files", () => {
     [0, 1, 2],
   );
   assert.equal(manifest.files[0].replicas, 5);
+  assert.deepEqual(manifest.payment, paymentNetwork());
 });
 
 test("browser manifest rejects missing endpoints and malformed multiaddresses", () => {
   assert.throws(
-    () => parseBrowserManifest({ version: 3, network_id: "test", endpoints: [] }),
+    () =>
+      parseBrowserManifest({
+        version: 4,
+        network_id: "test",
+        payment: paymentNetwork(),
+        endpoints: [],
+      }),
     /no WebTransport endpoints/,
   );
   assert.throws(
     () =>
       parseBrowserManifest({
-        version: 3,
+        version: 4,
         network_id: "test",
+        payment: paymentNetwork(),
         endpoints: [
           {
             multiaddr:
@@ -63,6 +72,32 @@ test("browser manifest rejects missing endpoints and malformed multiaddresses", 
     /multihash|hexadecimal|Expected 32 bytes/,
   );
 });
+
+test("browser manifest requires public payment contract configuration", () => {
+  const endpoint = { multiaddr: webtransportMultiaddr("aa".repeat(32), 0xbb) };
+  assert.throws(
+    () => parseBrowserManifest({ version: 4, network_id: "test", endpoints: [endpoint] }),
+    /no payment network/,
+  );
+  assert.throws(
+    () =>
+      parseBrowserManifest({
+        version: 4,
+        network_id: "test",
+        endpoints: [endpoint],
+        payment: { ...paymentNetwork(), rpc_url: "file:///tmp/anvil" },
+      }),
+    /HTTP or HTTPS/,
+  );
+});
+
+function paymentNetwork() {
+  return {
+    rpc_url: "http://127.0.0.1:8545/",
+    payment_token_address: `0x${"11".repeat(20)}`,
+    payment_vault_address: `0x${"22".repeat(20)}`,
+  };
+}
 
 function webtransportMultiaddr(peerId, certificateByte) {
   const multihash = Uint8Array.from([
