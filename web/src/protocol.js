@@ -1,5 +1,5 @@
-import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex as nobleBytesToHex } from "@noble/hashes/utils.js";
+import { verifyRecord as verifyRecordNative } from "../pkg/ant_core.js";
 
 export const PROTOCOL_VERSION = 3;
 export const PROTOCOL_NAME = "autonomi.web.poc.v3";
@@ -47,11 +47,7 @@ export function xorDistance(peerId, target) {
 export function verifyChunk(address, content) {
   const expected = address.trim().replace(/^0x/i, "").toLowerCase();
   hexToBytes(expected, 32);
-  const actual = nobleBytesToHex(blake3(content));
-  if (actual !== expected) {
-    throw new Error(`BLAKE3 mismatch: expected ${expected}, received ${actual}`);
-  }
-  return actual;
+  return verifyRecordNative(expected, content);
 }
 
 export function parseResponseFrame(frame) {

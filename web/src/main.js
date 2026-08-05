@@ -1,4 +1,5 @@
 import "./style.css";
+import initAntCore from "../pkg/ant_core.js";
 import {
   BrowserNodeClient,
   bytesToHex,
@@ -8,6 +9,8 @@ import {
 import { downloadPublicFile } from "./file.js";
 import { fetchBrowserManifest } from "./manifest.js";
 import { uploadPublicFile } from "./upload.js";
+
+await initAntCore();
 
 const elements = {
   manifestUrl: document.querySelector("#manifest-url"),
