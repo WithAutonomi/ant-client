@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { blake3 } from "@noble/hashes/blake3.js";
 import {
+  BrowserNodeClient,
   bytesToHex,
   getChunkFromClosest,
   hexToBytes,
@@ -27,7 +28,7 @@ test("XOR distance is an unsigned 256-bit ordering value", () => {
 test("response framing preserves a raw binary body", () => {
   const header = new TextEncoder().encode(
     JSON.stringify({
-      version: 2,
+      version: 3,
       request_id: 9,
       status: "ok",
       content_length: 3,
@@ -143,6 +144,44 @@ test("browser lookup discovers a direct node and downloads a verified chunk", as
   ]);
 });
 
+test("paid PUT frames the encrypted chunk as a binary request body", async (t) => {
+  const content = new TextEncoder().encode("encrypted record");
+  const address = bytesToHex(blake3(content));
+  const node = endpoint("storage.test", "33".repeat(32), 0x44);
+  const transactionHash = "55".repeat(32);
+  const quote = { quote_hash: "66".repeat(32) };
+  let observed;
+  const routes = new Map([
+    [
+      node.url,
+      (request) => {
+        if (request.type === "put_chunk") {
+          observed = request;
+          return response(request, {
+            type: "chunk_stored",
+            address,
+            already_stored: false,
+          });
+        }
+        throw new Error(`Unexpected request ${request.type}`);
+      },
+    ],
+  ]);
+  const previousWebTransport = globalThis.WebTransport;
+  globalThis.WebTransport = mockWebTransport(routes);
+  t.after(() => {
+    globalThis.WebTransport = previousWebTransport;
+  });
+
+  const client = new BrowserNodeClient(node.multiaddr);
+  const stored = await client.putChunk(address, content, quote, transactionHash);
+  assert.deepEqual(stored, { address, alreadyStored: false });
+  assert.equal(observed.content_length, content.length);
+  assert.deepEqual(observed.content, content);
+  assert.deepEqual(observed.quote, quote);
+  assert.equal(observed.transaction_hash, transactionHash);
+});
+
 function browserNode(endpoint) {
   return {
     peer_id: endpoint.peer_id,
@@ -157,7 +196,7 @@ function browserNode(endpoint) {
 function helloResponse(request, endpoint) {
   return response(request, {
     type: "hello",
-    protocol: "autonomi.web.poc.v2",
+    protocol: "autonomi.web.poc.v3",
     peer_id: endpoint.peer_id,
     max_chunk_size: 4 * 1024 * 1024,
     endpoint: {
@@ -170,7 +209,7 @@ function helloResponse(request, endpoint) {
 function response(request, fields, content = new Uint8Array()) {
   return {
     header: {
-      version: 2,
+      version: 3,
       request_id: request.request_id,
       status: "ok",
       content_length: content.length,
@@ -240,7 +279,20 @@ function mockWebTransport(routes) {
               encoded.set(chunk, offset);
               offset += chunk.length;
             }
-            const request = JSON.parse(new TextDecoder().decode(encoded));
+            if (encoded.length < 4) throw new Error("Request omitted its frame prefix");
+            const headerLength = new DataView(
+              encoded.buffer,
+              encoded.byteOffset,
+              encoded.byteLength,
+            ).getUint32(0, false);
+            const contentOffset = 4 + headerLength;
+            const request = JSON.parse(
+              new TextDecoder().decode(encoded.subarray(4, contentOffset)),
+            );
+            request.content = encoded.slice(contentOffset);
+            if (request.content.length !== request.content_length) {
+              throw new Error("Request content length mismatch");
+            }
             const handler = routes.get(this.url);
             responseController.enqueue(encodeResponse(handler(request)));
             responseController.close();

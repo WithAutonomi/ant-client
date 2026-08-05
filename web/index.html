@@ -17,7 +17,7 @@
         <h1>Direct browser client</h1>
         <p>
           Connect directly to an ant-node, query its local closest-node view,
-          reconstruct a complete public file, and save it from the browser.
+          upload a paid public file, or reconstruct and save one from the browser.
         </p>
       </header>
 
@@ -77,6 +77,44 @@
           </button>
           <button id="find-closest" type="button">Find closest</button>
         </div>
+      </section>
+
+      <section aria-labelledby="upload-heading">
+        <h2 id="upload-heading">Paid public file upload</h2>
+        <p class="section-note">
+          Self-encrypts the file in this page, verifies signed storage quotes, pays
+          the testnet vault, and sends encrypted records directly to closest nodes.
+        </p>
+        <p class="secret-note">
+          The wallet key is used only by this page to sign the EVM transactions. It
+          is cleared from the form immediately and is never sent to a node or stored
+          in the manifest. Use the disposable funded key printed by ant-devnet.
+        </p>
+        <label>
+          File
+          <input id="upload-file-input" type="file" />
+        </label>
+        <label>
+          Paying wallet secret key
+          <input
+            id="wallet-secret"
+            type="password"
+            placeholder="0x…"
+            autocomplete="new-password"
+            autocapitalize="none"
+            spellcheck="false"
+          />
+        </label>
+        <div class="actions">
+          <button id="upload-file" type="button">Pay and upload file</button>
+          <output id="upload-state"></output>
+        </div>
+        <dl id="upload-result" class="file-card" hidden>
+          <div><dt>Uploaded file</dt><dd id="upload-result-name"></dd></div>
+          <div><dt>Address</dt><dd id="upload-result-address"></dd></div>
+          <div><dt>Storage</dt><dd id="upload-result-records"></dd></div>
+          <div><dt>Payment</dt><dd id="upload-result-payment"></dd></div>
+        </dl>
       </section>
 
       <section aria-labelledby="download-heading">

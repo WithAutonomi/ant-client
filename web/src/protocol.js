@@ -1,8 +1,8 @@
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex as nobleBytesToHex } from "@noble/hashes/utils.js";
 
-export const PROTOCOL_VERSION = 2;
-export const PROTOCOL_NAME = "autonomi.web.poc.v2";
+export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_NAME = "autonomi.web.poc.v3";
 export const WEBTRANSPORT_PATH = "/autonomi/webtransport/v1";
 export const MAX_CHUNK_SIZE = 4 * 1024 * 1024;
 export const MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
@@ -289,23 +289,33 @@ export class BrowserNodeClient {
     this.transport = transport;
   }
 
-  async request(type, fields = {}) {
+  async request(type, fields = {}, content = new Uint8Array()) {
     await this.connect();
+    if (!(content instanceof Uint8Array) || content.length > MAX_CHUNK_SIZE) {
+      throw new Error(`Request content must be at most ${MAX_CHUNK_SIZE} bytes`);
+    }
     const requestId = nextRequestId;
     nextRequestId += 1;
     const stream = await this.transport.createBidirectionalStream();
     const writer = stream.writable.getWriter();
     try {
-      await writer.write(
-        encoder.encode(
-          JSON.stringify({
-            version: PROTOCOL_VERSION,
-            request_id: requestId,
-            type,
-            ...fields,
-          }),
-        ),
+      const header = encoder.encode(
+        JSON.stringify({
+          version: PROTOCOL_VERSION,
+          request_id: requestId,
+          content_length: content.length,
+          type,
+          ...fields,
+        }),
       );
+      if (header.length === 0 || header.length > MAX_RESPONSE_HEADER_BYTES) {
+        throw new Error(`Request header is ${header.length} bytes`);
+      }
+      const prefix = new Uint8Array(4);
+      new DataView(prefix.buffer).setUint32(0, header.length, false);
+      await writer.write(prefix);
+      await writer.write(header);
+      if (content.length > 0) await writer.write(content);
       await writer.close();
     } finally {
       writer.releaseLock();
@@ -392,6 +402,39 @@ export class BrowserNodeClient {
     }
     const hash = verifyChunk(address, response.content);
     return { content: response.content, hash };
+  }
+
+  async quoteChunk(address, size) {
+    hexToBytes(address, 32);
+    if (!Number.isSafeInteger(size) || size < 0 || size > MAX_CHUNK_SIZE) {
+      throw new Error(`Invalid chunk size ${size}`);
+    }
+    const { header } = await this.request("quote_chunk", { address, size });
+    if (header.type !== "storage_quote") {
+      throw new Error("Expected a STORAGE_QUOTE response");
+    }
+    if (header.address.toLowerCase() !== address.toLowerCase()) {
+      throw new Error("Node returned a quote for a different chunk address");
+    }
+    return { quote: header.quote, alreadyStored: Boolean(header.already_stored) };
+  }
+
+  async putChunk(address, content, quote, transactionHash) {
+    hexToBytes(address, 32);
+    hexToBytes(transactionHash, 32);
+    verifyChunk(address, content);
+    const { header } = await this.request(
+      "put_chunk",
+      { address, quote, transaction_hash: transactionHash },
+      content,
+    );
+    if (header.type !== "chunk_stored") {
+      throw new Error("Expected a CHUNK_STORED response");
+    }
+    if (header.address.toLowerCase() !== address.toLowerCase()) {
+      throw new Error("Node stored a different chunk address");
+    }
+    return { address: header.address, alreadyStored: Boolean(header.already_stored) };
   }
 
   close() {
