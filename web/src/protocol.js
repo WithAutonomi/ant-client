@@ -1,11 +1,16 @@
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex as nobleBytesToHex } from "@noble/hashes/utils.js";
 
-export const PROTOCOL_VERSION = 1;
-export const PROTOCOL_NAME = "autonomi.web.poc.v1";
+export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_NAME = "autonomi.web.poc.v2";
+export const WEBTRANSPORT_PATH = "/autonomi/webtransport/v1";
 export const MAX_CHUNK_SIZE = 4 * 1024 * 1024;
 export const MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
 const MAX_RESPONSE_BYTES = 4 + MAX_RESPONSE_HEADER_BYTES + MAX_CHUNK_SIZE;
+const MAX_WEBTRANSPORT_MULTIADDR_LENGTH = 2048;
+const MAX_CERTIFICATE_HASHES = 2;
+const SHA2_256_MULTIHASH_CODE = 0x12;
+const SHA2_256_MULTIHASH_LENGTH = 32;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -118,19 +123,144 @@ async function readAll(readable, limit = MAX_RESPONSE_BYTES) {
   return result;
 }
 
-function normalizeEndpoint(endpoint) {
-  if (!endpoint || typeof endpoint.url !== "string") {
-    throw new Error("Endpoint URL is required");
+function decodeBase64Url(value) {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new Error("Certificate multihash is not valid unpadded base64url");
   }
-  const certificateSha256 =
-    endpoint.certificate_sha256 ?? endpoint.certificateSha256;
+  const padding = "=".repeat((4 - (value.length % 4)) % 4);
+  let binary;
+  try {
+    binary = atob(value.replaceAll("-", "+").replaceAll("_", "/") + padding);
+  } catch (error) {
+    throw new Error("Certificate multihash is not valid unpadded base64url", {
+      cause: error,
+    });
+  }
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function decodeCertificateMultihash(value) {
+  if (typeof value !== "string" || !value.startsWith("u")) {
+    throw new Error("Certificate multihash must use base64url multibase (`u`)");
+  }
+  const decoded = decodeBase64Url(value.slice(1));
+  if (
+    decoded.length !== 34 ||
+    decoded[0] !== SHA2_256_MULTIHASH_CODE ||
+    decoded[1] !== SHA2_256_MULTIHASH_LENGTH
+  ) {
+    throw new Error("Certificate multihash must contain a 32-byte SHA-256 digest");
+  }
+  return decoded.slice(2);
+}
+
+function validateIpv4(value) {
+  const octets = value.split(".");
+  if (
+    octets.length !== 4 ||
+    octets.some(
+      (octet) =>
+        !/^(0|[1-9][0-9]{0,2})$/.test(octet) || Number.parseInt(octet, 10) > 255,
+    )
+  ) {
+    throw new Error(`Invalid IPv4 address ${value}`);
+  }
+  return value;
+}
+
+function endpointMultiaddr(endpoint) {
+  if (typeof endpoint === "string") return endpoint;
+  if (endpoint && typeof endpoint.multiaddr === "string") return endpoint.multiaddr;
+  throw new Error("A WebTransport multiaddress is required");
+}
+
+export function parseWebTransportMultiaddr(endpoint) {
+  const multiaddr = endpointMultiaddr(endpoint).trim();
+  if (
+    multiaddr.length === 0 ||
+    multiaddr.length > MAX_WEBTRANSPORT_MULTIADDR_LENGTH ||
+    !multiaddr.startsWith("/")
+  ) {
+    throw new Error("Invalid WebTransport multiaddress length or prefix");
+  }
+  const segments = multiaddr.split("/");
+  if (segments.length < 9) {
+    throw new Error("WebTransport multiaddress is incomplete");
+  }
+
+  const hostProtocol = segments[1];
+  const hostValue = segments[2];
+  if (!hostValue) throw new Error("WebTransport multiaddress host is empty");
+  let urlHost;
+  if (hostProtocol === "ip4") {
+    urlHost = validateIpv4(hostValue);
+  } else if (hostProtocol === "ip6") {
+    urlHost = `[${hostValue}]`;
+  } else if (["dns", "dns4", "dns6"].includes(hostProtocol)) {
+    urlHost = hostValue.toLowerCase();
+  } else {
+    throw new Error(`Unsupported WebTransport host protocol ${hostProtocol}`);
+  }
+  if (segments[3] !== "udp") {
+    throw new Error("WebTransport multiaddress must use UDP");
+  }
+  if (!/^[0-9]{1,5}$/.test(segments[4])) {
+    throw new Error("WebTransport multiaddress has an invalid UDP port");
+  }
+  const port = Number.parseInt(segments[4], 10);
+  if (port < 1 || port > 65535) {
+    throw new Error("WebTransport multiaddress has an invalid UDP port");
+  }
+  if (segments[5] !== "quic-v1" || segments[6] !== "webtransport") {
+    throw new Error(
+      "WebTransport multiaddress must contain /quic-v1/webtransport",
+    );
+  }
+
+  let index = 7;
+  const certificateHashes = [];
+  const certificateHashMultihashes = [];
+  while (segments[index] === "certhash") {
+    const encoded = segments[index + 1];
+    if (!encoded) throw new Error("WebTransport multiaddress has an empty certhash");
+    certificateHashes.push(decodeCertificateMultihash(encoded));
+    certificateHashMultihashes.push(encoded);
+    index += 2;
+  }
+  if (
+    certificateHashes.length < 1 ||
+    certificateHashes.length > MAX_CERTIFICATE_HASHES
+  ) {
+    throw new Error(
+      `WebTransport multiaddress must contain between 1 and ${MAX_CERTIFICATE_HASHES} certificate hashes`,
+    );
+  }
+  if (new Set(certificateHashMultihashes).size !== certificateHashes.length) {
+    throw new Error("WebTransport multiaddress contains duplicate certificate hashes");
+  }
+  if (segments[index] !== "p2p" || index + 2 !== segments.length) {
+    throw new Error("WebTransport multiaddress must end with /p2p/<peer-id>");
+  }
+  const peerId = segments[index + 1]?.toLowerCase() ?? "";
+  hexToBytes(peerId, 32);
+
+  let url;
+  try {
+    url = new URL(`https://${urlHost}:${port}${WEBTRANSPORT_PATH}`).toString();
+  } catch (error) {
+    throw new Error("WebTransport multiaddress contains an invalid host", {
+      cause: error,
+    });
+  }
   return {
-    url: endpoint.url,
-    peerId: endpoint.peer_id ?? endpoint.peerId,
-    certificateSha256,
-    certificateBytes: hexToBytes(certificateSha256 ?? "", 32),
+    multiaddr,
+    url,
+    peerId,
+    certificateHashes,
   };
 }
+
+const normalizeEndpoint = parseWebTransportMultiaddr;
 
 export class BrowserNodeClient {
   constructor(endpoint) {
@@ -145,9 +275,10 @@ export class BrowserNodeClient {
       throw new Error("This browser does not expose the WebTransport API");
     }
     const transport = new WebTransport(this.endpoint.url, {
-      serverCertificateHashes: [
-        { algorithm: "sha-256", value: this.endpoint.certificateBytes },
-      ],
+      serverCertificateHashes: this.endpoint.certificateHashes.map((value) => ({
+        algorithm: "sha-256",
+        value,
+      })),
     });
     try {
       await transport.ready;
@@ -200,15 +331,14 @@ export class BrowserNodeClient {
     if (header.protocol !== PROTOCOL_NAME) {
       throw new Error(`Unsupported browser protocol ${header.protocol}`);
     }
+    hexToBytes(header.peer_id, 32);
     const advertisedEndpoint = normalizeEndpoint(header.endpoint);
     if (
-      advertisedEndpoint.url !== this.endpoint.url ||
-      advertisedEndpoint.certificateSha256.toLowerCase() !==
-        this.endpoint.certificateSha256.toLowerCase()
+      advertisedEndpoint.multiaddr !== this.endpoint.multiaddr ||
+      advertisedEndpoint.peerId !== header.peer_id.toLowerCase()
     ) {
       throw new Error("Node advertised a different WebTransport endpoint");
     }
-    hexToBytes(header.peer_id, 32);
     if (
       this.endpoint.peerId &&
       header.peer_id.toLowerCase() !== this.endpoint.peerId.toLowerCase()
@@ -231,7 +361,15 @@ export class BrowserNodeClient {
     if (!Array.isArray(header.nodes)) {
       throw new Error("Node returned an invalid node list");
     }
-    for (const node of header.nodes) hexToBytes(node.peer_id, 32);
+    for (const node of header.nodes) {
+      hexToBytes(node.peer_id, 32);
+      if (node.webtransport) {
+        const parsed = normalizeEndpoint(node.webtransport);
+        if (parsed.peerId !== node.peer_id.toLowerCase()) {
+          throw new Error(`Node ${node.peer_id} advertised another peer's endpoint`);
+        }
+      }
+    }
     return header.nodes;
   }
 
@@ -264,7 +402,7 @@ export class BrowserNodeClient {
 
 function endpointKey(endpoint) {
   const normalized = normalizeEndpoint(endpoint);
-  return `${normalized.url}|${normalized.certificateSha256}`;
+  return normalized.multiaddr;
 }
 
 export async function iterativeFindClosest(
@@ -294,7 +432,8 @@ export async function iterativeFindClosest(
 
   await Promise.all(
     seedEndpoints.map(async (endpoint) => {
-      const seedName = endpoint?.peer_id ?? endpoint?.peerId ?? endpoint?.url ?? "seed";
+      const seedName =
+        typeof endpoint === "string" ? endpoint : endpoint?.multiaddr ?? "seed";
       try {
         const client = clientFor(endpoint);
         const hello = await client.hello();
@@ -333,10 +472,7 @@ export async function iterativeFindClosest(
       candidates.map(async (candidate) => {
         queried.add(candidate.peer_id);
         try {
-          const candidateClient = clientFor({
-            ...candidate.webtransport,
-            peer_id: candidate.peer_id,
-          });
+          const candidateClient = clientFor(candidate.webtransport);
           if (!candidateClient.peerId) await candidateClient.hello();
           const nodes = await candidateClient.findNode(target, k);
           onProgress(
@@ -395,7 +531,7 @@ export async function getChunkFromClosest(
   try {
     for (const node of lookup.nodes) {
       if (!node.webtransport) continue;
-      const endpoint = { ...node.webtransport, peer_id: node.peer_id };
+      const endpoint = node.webtransport;
       const key = endpointKey(endpoint);
       let client = lookup.clients.get(key);
       if (!client) {

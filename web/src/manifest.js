@@ -1,6 +1,6 @@
-import { hexToBytes } from "./protocol.js";
+import { hexToBytes, parseWebTransportMultiaddr } from "./protocol.js";
 
-export const BROWSER_MANIFEST_VERSION = 2;
+export const BROWSER_MANIFEST_VERSION = 3;
 const MAX_PUBLIC_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_DATA_MAP_BYTES = 4 * 1024 * 1024;
 const MAX_FILE_CHUNKS = 1024;
@@ -16,19 +16,8 @@ export function parseBrowserManifest(value) {
     throw new Error("Browser manifest contains no WebTransport endpoints");
   }
   const endpoints = value.endpoints.map((endpoint) => {
-    if (!endpoint || typeof endpoint.url !== "string") {
-      throw new Error("Browser manifest endpoint has no URL");
-    }
-    if (!endpoint.url.startsWith("https://")) {
-      throw new Error(`WebTransport endpoint must use HTTPS: ${endpoint.url}`);
-    }
-    hexToBytes(endpoint.peer_id ?? "", 32);
-    hexToBytes(endpoint.certificate_sha256 ?? "", 32);
-    return {
-      peer_id: endpoint.peer_id.toLowerCase(),
-      url: endpoint.url,
-      certificate_sha256: endpoint.certificate_sha256.toLowerCase(),
-    };
+    const parsed = parseWebTransportMultiaddr(endpoint);
+    return { multiaddr: parsed.multiaddr };
   });
 
   const files = (value.files ?? []).map((file) => {
