@@ -21,6 +21,7 @@ rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 self_encryption = "0.36"
+saorsa-dht-lookup = { version = "0.1.0", path = "../../saorsa-core-web-support/crates/saorsa-dht-lookup" }
 thiserror = "2"
 
 # Node management
@@ -81,6 +82,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 js-sys = { version = "0.3", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # self_encryption/rand use getrandom 0.2. Browser entropy is supplied by the
@@ -136,6 +138,7 @@ browser-wasm = [
     "dep:js-sys",
     "dep:serde-wasm-bindgen",
     "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
 ]
 # Enable `LocalDevnet` (ant-core/src/node/devnet.rs) which wraps
 # `ant_node::devnet::Devnet` and an Anvil EVM testnet.

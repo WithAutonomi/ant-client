@@ -213,8 +213,280 @@ fn chunk_infos(data_map: &DataMap) -> Vec<BrowserChunkInfo> {
 #[cfg(all(target_arch = "wasm32", feature = "browser-wasm"))]
 mod wasm {
     use super::{content_address, decrypt_public_file, encrypt_public_file, verify_record};
-    use js_sys::{Array, Uint8Array};
+    use js_sys::{Array, Function, Promise, Uint8Array};
+    use saorsa_dht_lookup::{
+        run_iterative_lookup, IterativeLookup, LookupConfig, LookupKey, LookupNode, LookupQuery,
+        LookupQueryOutcome,
+    };
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
     use wasm_bindgen::prelude::*;
+    use wasm_bindgen_futures::JsFuture;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum BrowserLookupEndpoint {
+        Structured { multiaddr: String },
+        Multiaddr(String),
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct BrowserLookupNode {
+        peer_id: String,
+        #[serde(default)]
+        native_addresses: Vec<String>,
+        #[serde(default)]
+        reliability: f64,
+        #[serde(default)]
+        webtransport: Option<BrowserLookupEndpoint>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct BrowserLookupBatch {
+        target: String,
+        count: usize,
+        iteration: usize,
+        candidates: Vec<BrowserLookupNode>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "status", rename_all = "snake_case")]
+    enum BrowserLookupQueryOutcome {
+        Succeeded {
+            responder: String,
+            #[serde(default)]
+            candidates: Vec<BrowserLookupNode>,
+        },
+        Failed {
+            responder: String,
+        },
+        Unresponsive {
+            responder: String,
+        },
+    }
+
+    #[derive(Debug, Clone)]
+    struct BrowserLookupCandidate {
+        peer_id: LookupKey,
+        wire: BrowserLookupNode,
+    }
+
+    impl LookupNode for BrowserLookupCandidate {
+        fn lookup_peer_id(&self) -> LookupKey {
+            self.peer_id
+        }
+    }
+
+    impl BrowserLookupCandidate {
+        fn parse(mut wire: BrowserLookupNode) -> Result<Self, JsValue> {
+            let peer_id = parse_lookup_key(&wire.peer_id, "peer ID")?;
+            wire.peer_id = hex::encode(peer_id);
+            Ok(Self { peer_id, wire })
+        }
+    }
+
+    /// Shared Saorsa iterative lookup state driven by browser WebTransport.
+    #[wasm_bindgen(js_name = BrowserIterativeLookup)]
+    pub struct BrowserIterativeLookup {
+        lookup: IterativeLookup<BrowserLookupCandidate>,
+        known_endpoints: HashMap<LookupKey, BrowserLookupEndpoint>,
+    }
+
+    #[wasm_bindgen(js_class = BrowserIterativeLookup)]
+    impl BrowserIterativeLookup {
+        /// Construct a browser lookup using the same scheduler as native QUIC.
+        #[wasm_bindgen(constructor)]
+        pub fn new(
+            target: &str,
+            count: usize,
+            alpha: usize,
+            max_iterations: usize,
+        ) -> Result<Self, JsValue> {
+            let target = parse_lookup_key(target, "lookup target")?;
+            let config = LookupConfig {
+                count,
+                alpha,
+                max_iterations,
+                ..LookupConfig::saorsa(count)
+            };
+            let lookup = IterativeLookup::new(target, config)
+                .map_err(|error| JsValue::from_str(&error.to_string()))?;
+            Ok(Self {
+                lookup,
+                known_endpoints: HashMap::new(),
+            })
+        }
+
+        /// Add validated bootstrap or FIND_NODE candidates.
+        #[wasm_bindgen(js_name = addCandidates)]
+        pub fn add_candidates(&mut self, nodes: JsValue) -> Result<(), JsValue> {
+            for candidate in parse_lookup_nodes(nodes)? {
+                self.add_candidate(candidate);
+            }
+            Ok(())
+        }
+
+        /// Run the complete shared Saorsa walk through a WebTransport batch callback.
+        #[wasm_bindgen(js_name = run)]
+        pub async fn run(&mut self, query_batch: Function) -> Result<String, JsValue> {
+            let mut query = BrowserLookupQuery {
+                callback: query_batch,
+                known_endpoints: &mut self.known_endpoints,
+            };
+            run_iterative_lookup(&mut self.lookup, &mut query)
+                .await
+                .map(|termination| format!("{termination:?}"))
+                .map_err(|error| JsValue::from_str(&error.to_string()))
+        }
+
+        /// Successful responders in final closest-first order.
+        #[wasm_bindgen(js_name = results)]
+        pub fn results(&self) -> Result<JsValue, JsValue> {
+            let nodes = self
+                .lookup
+                .results()
+                .into_iter()
+                .map(|candidate| candidate.wire)
+                .collect::<Vec<_>>();
+            serde_wasm_bindgen::to_value(&nodes)
+                .map_err(|error| JsValue::from_str(&error.to_string()))
+        }
+
+        /// Peer IDs selected for network queries, in query order.
+        #[wasm_bindgen(js_name = queriedPeers)]
+        pub fn queried_peers(&self) -> Result<JsValue, JsValue> {
+            let peers = self
+                .lookup
+                .queried_peers()
+                .iter()
+                .map(hex::encode)
+                .collect::<Vec<_>>();
+            serde_wasm_bindgen::to_value(&peers)
+                .map_err(|error| JsValue::from_str(&error.to_string()))
+        }
+    }
+
+    impl BrowserIterativeLookup {
+        fn add_candidate(&mut self, candidate: BrowserLookupCandidate) {
+            if let Some(candidate) =
+                resolve_candidate_endpoint(&mut self.known_endpoints, candidate)
+            {
+                let _ = self.lookup.add_candidate(candidate);
+            }
+        }
+    }
+
+    struct BrowserLookupQuery<'a> {
+        callback: Function,
+        known_endpoints: &'a mut HashMap<LookupKey, BrowserLookupEndpoint>,
+    }
+
+    impl LookupQuery<BrowserLookupCandidate> for BrowserLookupQuery<'_> {
+        type Error = String;
+
+        async fn query_batch(
+            &mut self,
+            target: LookupKey,
+            count: usize,
+            iteration: usize,
+            batch: Vec<BrowserLookupCandidate>,
+        ) -> Result<Vec<LookupQueryOutcome<BrowserLookupCandidate>>, Self::Error> {
+            let request = BrowserLookupBatch {
+                target: hex::encode(target),
+                count,
+                iteration,
+                candidates: batch.into_iter().map(|candidate| candidate.wire).collect(),
+            };
+            let request = serde_wasm_bindgen::to_value(&request)
+                .map_err(|error| format!("could not encode lookup batch: {error}"))?;
+            let returned = self
+                .callback
+                .call1(&JsValue::NULL, &request)
+                .map_err(js_error_message)?;
+            let returned = JsFuture::from(Promise::resolve(&returned))
+                .await
+                .map_err(js_error_message)?;
+            let outcomes: Vec<BrowserLookupQueryOutcome> = serde_wasm_bindgen::from_value(returned)
+                .map_err(|error| format!("invalid lookup batch response: {error}"))?;
+
+            outcomes
+                .into_iter()
+                .map(|outcome| match outcome {
+                    BrowserLookupQueryOutcome::Succeeded {
+                        responder,
+                        candidates,
+                    } => {
+                        let responder = parse_lookup_key(&responder, "lookup responder")
+                            .map_err(js_error_message)?;
+                        let candidates = candidates
+                            .into_iter()
+                            .map(BrowserLookupCandidate::parse)
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(js_error_message)?
+                            .into_iter()
+                            .filter_map(|candidate| {
+                                resolve_candidate_endpoint(self.known_endpoints, candidate)
+                            })
+                            .collect();
+                        Ok(LookupQueryOutcome::Succeeded {
+                            responder,
+                            candidates,
+                        })
+                    }
+                    BrowserLookupQueryOutcome::Failed { responder } => {
+                        parse_lookup_key(&responder, "lookup responder")
+                            .map(|responder| LookupQueryOutcome::Failed { responder })
+                            .map_err(js_error_message)
+                    }
+                    BrowserLookupQueryOutcome::Unresponsive { responder } => {
+                        parse_lookup_key(&responder, "lookup responder")
+                            .map(|responder| LookupQueryOutcome::Unresponsive { responder })
+                            .map_err(js_error_message)
+                    }
+                })
+                .collect()
+        }
+    }
+
+    fn resolve_candidate_endpoint(
+        known_endpoints: &mut HashMap<LookupKey, BrowserLookupEndpoint>,
+        mut candidate: BrowserLookupCandidate,
+    ) -> Option<BrowserLookupCandidate> {
+        if let Some(endpoint) = candidate.wire.webtransport.clone() {
+            known_endpoints.insert(candidate.peer_id, endpoint);
+        } else if let Some(endpoint) = known_endpoints.get(&candidate.peer_id) {
+            candidate.wire.webtransport = Some(endpoint.clone());
+        }
+        candidate.wire.webtransport.as_ref()?;
+        Some(candidate)
+    }
+
+    fn js_error_message(value: JsValue) -> String {
+        value
+            .as_string()
+            .unwrap_or_else(|| format!("JavaScript lookup callback failed: {value:?}"))
+    }
+
+    fn parse_lookup_nodes(value: JsValue) -> Result<Vec<BrowserLookupCandidate>, JsValue> {
+        let nodes: Vec<BrowserLookupNode> = serde_wasm_bindgen::from_value(value)
+            .map_err(|error| JsValue::from_str(&format!("invalid lookup nodes: {error}")))?;
+        nodes
+            .into_iter()
+            .map(BrowserLookupCandidate::parse)
+            .collect()
+    }
+
+    fn parse_lookup_key(value: &str, label: &str) -> Result<LookupKey, JsValue> {
+        let value = value.strip_prefix("0x").unwrap_or(value);
+        let bytes = hex::decode(value)
+            .map_err(|error| JsValue::from_str(&format!("invalid {label}: {error}")))?;
+        bytes.try_into().map_err(|bytes: Vec<u8>| {
+            JsValue::from_str(&format!(
+                "invalid {label}: expected 32 bytes, received {}",
+                bytes.len()
+            ))
+        })
+    }
 
     /// Install a readable panic hook for browser developer tools.
     #[wasm_bindgen(start)]
