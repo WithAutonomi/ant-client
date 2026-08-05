@@ -2,7 +2,7 @@ use clap::{ArgAction, Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use crate::commands::data::{ChunkAction, FileAction, WalletAction};
+use crate::commands::data::{ChunkAction, FileAction, FolderAction, RecoveryAction, WalletAction};
 use crate::commands::node::NodeCommand;
 use crate::commands::update::UpdateArgs;
 
@@ -105,6 +105,16 @@ pub enum Commands {
     Chunk {
         #[command(subcommand)]
         action: ChunkAction,
+    },
+    /// Folder upload: walk directory, batch upload, manifest, optional recovery
+    Folder {
+        #[command(subcommand)]
+        action: FolderAction,
+    },
+    /// On-chain DataMap recovery: list and recover backups
+    Recovery {
+        #[command(subcommand)]
+        action: RecoveryAction,
     },
     /// Update the ant binary to the latest version
     Update(UpdateArgs),

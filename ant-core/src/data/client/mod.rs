@@ -11,9 +11,11 @@ pub(crate) mod cached_single;
 pub mod chunk;
 pub mod data;
 pub mod file;
+pub mod folder;
 pub mod merkle;
 pub mod payment;
 pub mod quote;
+pub mod recovery;
 
 use crate::data::client::adaptive::{AdaptiveConfig, AdaptiveController, ChannelStart, Outcome};
 use crate::data::client::cache::ChunkCache;

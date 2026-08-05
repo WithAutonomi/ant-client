@@ -173,6 +173,9 @@ pub enum PaymentMode {
     Merkle,
     /// Force single-node payment (one tx per chunk).
     Single,
+    /// Recovery mode: single-node payment with encrypted DataMap appended to calldata.
+    /// Enables on-chain backup of the recovery key for data retrieval.
+    Recovery,
 }
 
 /// Result of a merkle batch payment.
@@ -474,7 +477,7 @@ pub fn should_use_merkle(chunk_count: usize, mode: PaymentMode) -> bool {
     match mode {
         PaymentMode::Auto => chunk_count >= DEFAULT_MERKLE_THRESHOLD,
         PaymentMode::Merkle => chunk_count >= 2,
-        PaymentMode::Single => false,
+        PaymentMode::Single | PaymentMode::Recovery => false,
     }
 }
 

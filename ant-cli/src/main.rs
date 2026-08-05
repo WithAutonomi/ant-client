@@ -163,6 +163,18 @@ async fn run() -> anyhow::Result<()> {
             client.save_adaptive_snapshot();
             result?;
         }
+        Commands::Folder { action } => {
+            // Folder upload: build manifest, upload all files, optional recovery
+            let needs_wallet = true;
+            let client = build_data_client(&data_ctx, needs_wallet, json, None, None).await?;
+            action.execute().await?;
+            client.save_peer_cache().await;
+            client.save_adaptive_snapshot();
+        }
+        Commands::Recovery { action } => {
+            // Recovery: query Arbitrum for backup transactions
+            action.execute().await?;
+        }
         Commands::Update(args) => {
             args.execute(json).await?;
         }
