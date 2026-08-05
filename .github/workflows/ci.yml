@@ -33,6 +33,38 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  browser-wasm:
+    name: Browser WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Check the portable Rust library
+        run: >-
+          cargo check -p ant-core
+          --target wasm32-unknown-unknown
+          --no-default-features
+          --features browser-wasm
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.15.0 --locked
+      - name: Install browser dependencies
+        working-directory: web
+        run: npm ci
+      - name: Test browser client against Rust WASM
+        working-directory: web
+        run: npm test
+      - name: Build browser bundle
+        working-directory: web
+        run: npm run build
+
   test-unit:
     name: Unit Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

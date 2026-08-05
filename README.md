@@ -6,11 +6,11 @@ A unified CLI and Rust library for storing data on the Autonomi decentralized ne
 
 This project provides two Rust crates and a browser client:
 
-- **ant-core** — A headless Rust library containing all business logic: data storage/retrieval with self-encryption and EVM payments, node lifecycle management, and local devnet tooling. Designed to be consumed by any frontend (CLI, GUI, AI agents, REST clients).
+- **ant-core** — A headless Rust library containing all business logic: data storage/retrieval with self-encryption and EVM payments, node lifecycle management, and local devnet tooling. Its portable immutable-data core also builds for browsers with the `browser-wasm` feature.
 - **ant-cli** — A thin CLI binary (`ant`) built on `ant-core`.
 - **web** — A direct WebTransport client and test site. It performs browser-side
-  closest-node lookup, reconstructs complete public self-encrypted files, and
-  saves them without a data gateway.
+  closest-node lookup and uses `ant-core` through WASM to self-encrypt and
+  reconstruct complete public files without a data gateway.
 
 Data on Autonomi is **content-addressed**. Files are split into encrypted chunks (via [self-encryption](https://en.wikipedia.org/wiki/Convergent_encryption)), each stored at an XOR address derived from its content. A `DataMap` tracks which chunks belong to a file. Payments for storage are made on an EVM-compatible blockchain (Arbitrum).
 
@@ -24,7 +24,7 @@ the browser-enabled node devnet, then run the site:
 cargo run --features webtransport-poc --bin ant-devnet -- \
   --preset minimal --base-port 23000 \
   --webtransport --webtransport-base-port 24000 \
-  --serve-port 25000 --enable-logging
+  --serve-port 25000 --enable-evm --enable-logging
 
 # In ant-client-web-support/web
 npm ci
@@ -33,7 +33,7 @@ npm run dev
 
 Open `http://127.0.0.1:5173`; the default public test file and direct node
 endpoints are loaded from the local browser manifest. See [web/README.md](web/README.md)
-for the protocol flow and LAN configuration.
+for the one-time `wasm-pack` setup, protocol flow, and LAN configuration.
 
 ## Installation
 

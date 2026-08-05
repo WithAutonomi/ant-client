@@ -32,21 +32,39 @@ records, and testnet bootstrap-manifest production under ant-node ADR-0009.
 - The wallet secret must be provided at runtime, used only by the local EVM
   signer, and never sent to a node or persisted in bootstrap metadata.
 - Local testnets need a reproducible bootstrap and default-file workflow.
+- Compatibility-sensitive file processing should be shared with the Rust
+  client instead of being independently reimplemented in JavaScript.
 
 ## Considered Options
 
 1. **Use the daemon REST API as a data gateway.** Rejected for lookup and file
    bytes because it would not exercise a full browser client.
 2. **Compile the complete native Rust client to WebAssembly.** Deferred because
-   the native transport, EVM, and filesystem dependency graph is not currently
-   browser-compatible.
-3. **Implement a narrow JavaScript WebTransport immutable-data client
-   (chosen).** It maps directly to the versioned browser node protocol and
-   keeps the application boundary small enough to audit.
+   the native transport, EVM provider, Tokio, and filesystem dependency graph
+   is not currently browser-compatible.
+3. **Use a Rust/WASM data core with thin JavaScript browser adapters
+   (chosen).** Compile the portable immutable-data part of `ant-core` to WASM
+   while retaining JavaScript only where browser APIs or currently
+   native-only dependencies require it.
 
 ## Decision
 
-The `web/` package will implement the direct browser client:
+`ant-core` has two build surfaces. Its default `native` feature preserves the
+existing native library. A `wasm32-unknown-unknown` build with
+`--no-default-features --features browser-wasm` excludes node management,
+native transport, Tokio, filesystem, and native EVM-provider dependencies and
+exports browser-safe immutable-data operations through `wasm-bindgen`.
+
+The Rust/WASM core will:
+
+- self-encrypt complete public files with the same `self_encryption 0.36`
+  implementation used by the Rust client;
+- encode and decode the native MessagePack `DataMap` representation;
+- calculate and verify BLAKE3 content addresses;
+- verify every encrypted record against its DataMap destination address; and
+- authenticate, decompress, and reconstruct complete public files.
+
+The `web/` package will remain responsible for browser-specific orchestration:
 
 - load a versioned browser bootstrap manifest containing WebTransport
   multiaddresses and published immutable-file metadata;
@@ -58,8 +76,8 @@ The `web/` package will implement the direct browser client:
   and `ALPHA = 3`;
 - query closest direct endpoints with `GET_CHUNK`, retrying `not_found` and
   unavailable nodes without routing bytes through the manifest service;
-- self-encrypt selected public files with the native `self_encryption 0.36`
-  format and generate the public MessagePack DataMap;
+- call the Rust/WASM core to self-encrypt selected public files and generate
+  their public MessagePack DataMaps;
 - request ordinary node storage quotes, verify their ML-DSA peer/content
   binding, forced price, and signed storage commitment before payment;
 - construct an EVM wallet only from the runtime secret field, approve the
@@ -67,14 +85,13 @@ The `web/` package will implement the direct browser client:
 - upload each content-addressed encrypted record with the signed quote and
   transaction hash through paid `PUT_CHUNK`; the wallet key never crosses the
   WebTransport session;
-- fetch the public MessagePack DataMap and every resolved encrypted data chunk;
-- reconstruct the file with the native `self_encryption 0.36` BLAKE3 KDF,
-  ChaCha20-Poly1305 authentication, and Brotli decompression;
-- verify encrypted-record addresses, per-chunk plaintext hashes and sizes, and
-  the final whole-file BLAKE3 hash before allowing a save;
+- fetch the public MessagePack DataMap and every resolved encrypted data chunk,
+  then pass those records to the Rust/WASM reconstruction API;
+- verify the final file size and use the Rust/WASM BLAKE3 verifier before
+  allowing a save;
 - expose a small test site that loads the local testnet manifest, displays the
-  startup-published file, uploads paid files, and downloads either through the
-  browser save flow.
+  startup-published file, uploads paid files, and downloads through the browser
+  save flow.
 
 The local browser manifest is bootstrap metadata, not a gateway. Production
 clients will replace its unsigned endpoint list with the ML-DSA-signed records
@@ -94,11 +111,21 @@ Rust nodes construct and validate this syntax through
 JavaScript parser is the browser implementation of that same canonical wire
 format and is covered by matching current/next-pin fixtures.
 
-For the local vertical slice, the bootstrap manifest carries a resolved JSON
-view of the public root DataMap alongside its ordinary on-network DataMap
-address. The browser still fetches and verifies that public DataMap record and
-all file bytes directly from nodes. Production discovery must replace this
-unsigned resolved view with parsing and validation of the signed/on-network
+Quote and storage-commitment verification remains JavaScript for now.
+`ant-protocol 2.3.1` unconditionally reaches the native Saorsa transport and
+EVM dependency graph, including Tokio networking and `mio`, and therefore
+cannot be linked into a browser WASM target. A future transport-free
+`ant-protocol` feature should expose the pure multiaddress, quote, commitment,
+and ML-DSA verification types without enabling native networking. At that
+point those compatibility-sensitive operations should also move behind the
+Rust/WASM boundary.
+
+For compatibility with the local launcher, the bootstrap manifest still
+carries a resolved JSON view of the public root DataMap alongside its ordinary
+on-network DataMap address. The download path does not use that copy to select
+records: it fetches the public DataMap from a node and uses the Rust/WASM
+decoder to derive the encrypted-record addresses. Production discovery must
+still replace the unsigned manifest with validation of the signed/on-network
 metadata chain.
 
 ## Consequences
@@ -110,14 +137,20 @@ metadata chain.
 - A local five-node testnet can validate multiple direct node connections,
   multiaddress-embedded certificate pins, lookup convergence, fallback, and
   content verification.
-- The browser protocol is independent of native Rust serialization details.
+- Self-encryption, DataMap serialization, reconstruction, and content
+  addressing have one Rust implementation across native and browser clients.
+- The browser application keeps direct control of WebTransport, wallet, and
+  DOM APIs without pulling native runtime dependencies into WASM.
 
 ### Negative / Trade-offs
 
 - The current client reconstructs files in memory and the local launcher caps
   public files at 64 MiB; upload encryption and reconstruction are not yet
   streaming.
-- JavaScript lookup behavior must remain aligned with native Kademlia rules.
+- JavaScript lookup and quote-verification behavior must remain aligned with
+  native Kademlia and protocol rules until transport-free Rust APIs exist.
+- The initial WASM module is approximately 1.4 MiB uncompressed and browser
+  file processing is still in memory.
 - Certificate and endpoint verification adds bootstrap-record lifecycle work.
 
 ### Neutral / Operational
@@ -129,13 +162,19 @@ metadata chain.
 
 ## Validation
 
-- Unit tests cover fixed-width identifiers, XOR ordering, bidirectional binary
-  framing, manifest/payment validation, quote signatures and the native
-  Keccak-256 EVM quote-hash vector, native-format
-  encryption/DataMap generation, and BLAKE3 mismatch rejection.
+- Rust unit tests cover an exact native `self_encryption 0.36` wire vector,
+  public DataMap generation, round-trip reconstruction, and tamper rejection.
+- JavaScript unit tests cover fixed-width identifiers, XOR ordering,
+  bidirectional binary framing, manifest/payment validation, quote signatures,
+  the native Keccak-256 EVM quote-hash vector, and the browser orchestration
+  around the Rust/WASM boundary.
+- CI compiles `ant-core` for `wasm32-unknown-unknown` with native features
+  disabled, builds the generated `wasm-pack` package, runs browser-client
+  tests against it, and produces the Vite bundle.
 - The browser production bundle builds without Node-specific runtime APIs.
-- A fixed vector generated by native `self_encryption 0.36` verifies browser
-  KDF, authenticated decryption, Brotli reconstruction, and tamper rejection.
+- The generated WASM package encrypts and reconstructs the same fixed vector
+  as the native Rust test, covering the native KDF, authenticated decryption,
+  Brotli reconstruction, MessagePack DataMap, and BLAKE3 addresses.
 - A live node integration test starts five WebTransport-enabled nodes,
   publishes a public DataMap and encrypted chunks, connects with the advertised
   self-contained multiaddress, retrieves every record, and reconstructs the

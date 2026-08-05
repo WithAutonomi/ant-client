@@ -2,11 +2,11 @@
 
 This web application is the browser-facing client for ADR-0009. It loads a
 local testnet bootstrap manifest, connects directly to storage nodes over
-WebTransport, performs the XOR closest-node lookup in JavaScript, retrieves a
-public DataMap and every encrypted file chunk, reconstructs the complete file,
-and verifies its whole-file BLAKE3 hash before saving it. It can also
-self-encrypt a file, pay signed node quotes with a wallet held only in the
-page, and upload the encrypted records directly to closest storage nodes.
+WebTransport, and performs the XOR closest-node lookup in the browser. The
+portable part of the Rust `ant-core` library is compiled to WASM and performs
+native self-encryption, public DataMap serialization, reconstruction, and
+BLAKE3 content verification. The thin JavaScript layer retrieves and uploads
+records, uses the browser wallet/payment APIs, and drives the page.
 
 The node-side WebTransport listener and testnet manifest API live in the
 `ant-node-web-support` sibling repository. No HTTP gateway performs lookup or
@@ -15,12 +15,21 @@ proxies file bytes.
 ## Requirements
 
 - Rust 1.88 or newer for the node's optional `wtransport` dependency.
+- The `wasm32-unknown-unknown` Rust target.
+- `wasm-pack` 0.15.
 - Node.js 20.19+ or 22.12+.
 - A current browser implementing WebTransport certificate hashes. The client
   extracts them from node multiaddresses; users do not enter hashes separately.
 
 Nodes serialize these addresses from the native `saorsa_core::MultiAddr`
 representation; the JavaScript parser consumes that canonical string form.
+
+Install the WASM build tools once if needed:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack --version 0.15.0 --locked
+```
 
 ## Run the browser-enabled testnet
 
@@ -69,6 +78,10 @@ npm ci
 npm run dev
 ```
 
+The `predev` hook builds `ant-core` with `--no-default-features --features
+browser-wasm` into the ignored `web/pkg/` directory before Vite starts. No
+published or hand-maintained JavaScript copy of the Rust algorithms is used.
+
 Open `http://127.0.0.1:5173`. The page automatically loads the testnet
 manifest from port 25000 and fills in the default file:
 
@@ -77,10 +90,11 @@ manifest from port 25000 and fills in the default file:
    WebTransport `HELLO`.
 3. **Find closest** runs the iterative lookup in the browser.
 4. Under **Paid public file upload**, choose a file, paste the funded private
-   key printed by ant-devnet, then select **Pay and upload file**. Encryption,
-   quote/commitment verification, approval, and payment happen locally. The
-   key field is cleared immediately and the resulting public DataMap address
-   is placed in the download field.
+   key printed by ant-devnet, then select **Pay and upload file**. Rust/WASM
+   performs encryption and DataMap generation; quote/commitment verification,
+   approval, and payment happen locally in the browser. The key field is
+   cleared immediately and the resulting public DataMap address is placed in
+   the download field.
 5. **Download and save file** opens the browser save flow, fetches the public
    DataMap and encrypted chunks from direct closest storage nodes, reconstructs
    the whole file, verifies BLAKE3, and retains a **Save again** link.
@@ -101,17 +115,31 @@ npm test
 npm run build
 ```
 
+Both commands build the WASM package automatically. To validate the Rust
+boundary directly:
+
+```bash
+cargo check -p ant-core --target wasm32-unknown-unknown \
+  --no-default-features --features browser-wasm
+cargo test -p ant-core --lib browser::tests
+```
+
 The tests cover fixed-width IDs, XOR ordering, bidirectional binary framing,
 browser manifest/payment validation, signed quote verification including the
-native Keccak-256 EVM quote hash, native
-encryption/DataMap generation, and a `self_encryption 0.36` compatibility
-vector.
+native Keccak-256 EVM quote hash, and a Rust `self_encryption 0.36` wire vector
+with native/WASM round-trip and tamper verification.
 Cross-repository live verification additionally starts the node testnet,
 downloads all public-file records through WebTransport, reconstructs the
 original bytes, pays a real quote on local Anvil, uploads a fresh record
 through the ordinary node payment validator, and reads it back.
 
 ## Current boundary
+
+JavaScript currently owns WebTransport stream handling, iterative lookup,
+Ethers payment submission, ML-DSA quote verification, and DOM/save APIs.
+`ant-protocol 2.3.1` still enables native Saorsa/Tokio networking and cannot be
+linked into a browser WASM build; a future transport-free feature can move the
+remaining quote and multiaddress verification into Rust.
 
 The local testnet manifest is intentionally unsigned bootstrap material. A
 production deployment still needs ML-DSA-signed endpoint records, certificate

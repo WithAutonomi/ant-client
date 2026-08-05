@@ -1,6 +1,7 @@
 /target
 /web/node_modules/
 /web/dist/
+/web/pkg/
 .cargo/config.toml
 .claude/plans/
 .claude/scheduled_tasks.lock

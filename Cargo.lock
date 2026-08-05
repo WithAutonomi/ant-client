@@ -845,12 +845,15 @@ dependencies = [
  "axum",
  "blake3",
  "bytes",
+ "console_error_panic_hook",
  "flate2",
  "fs2",
  "futures",
  "futures-core",
  "futures-util",
+ "getrandom 0.2.17",
  "hex",
+ "js-sys",
  "libc",
  "lru",
  "openssl",
@@ -862,6 +865,8 @@ dependencies = [
  "self_encryption",
  "semver 1.0.28",
  "serde",
+ "serde-wasm-bindgen",
+ "serde_bytes",
  "serde_json",
  "serial_test",
  "sysinfo",
@@ -876,6 +881,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "utoipa",
+ "wasm-bindgen",
  "windows-sys 0.61.2",
  "xor_name",
  "zip",
@@ -1847,6 +1853,16 @@ dependencies = [
  "once_cell",
  "unicode-width",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3255,7 +3271,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -5554,6 +5570,27 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

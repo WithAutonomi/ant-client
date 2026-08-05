@@ -7,29 +7,41 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/WithAutonomi/ant-client"
 readme = "../README.md"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
-# Node management
-async-stream = "0.3"
-axum = "0.8"
-flate2 = "1"
+# Cross-platform data primitives. These are the only dependencies compiled for
+# the browser-WASM target; native networking and node management stay behind
+# the `native` feature below.
 blake3 = "1"
-fs2 = "0.4"
-futures-core = "0.3"
-futures-util = "0.3"
-self-replace = "1"
-semver = "1"
+bytes = "1"
+hex = "0.4"
+rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-reqwest = { version = "0.12", features = ["json", "stream"] }
-tar = "0.4"
-tempfile = "3"
-toml = "0.8"
+serde_bytes = "0.11"
+self_encryption = "0.36"
 thiserror = "2"
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-utoipa = { version = "5", features = ["axum_extras"] }
-zip = "2"
-tower-http = { version = "0.6.8", features = ["cors"] }
+
+# Node management
+async-stream = { version = "0.3", optional = true }
+axum = { version = "0.8", optional = true }
+flate2 = { version = "1", optional = true }
+fs2 = { version = "0.4", optional = true }
+futures-core = { version = "0.3", optional = true }
+futures-util = { version = "0.3", optional = true }
+self-replace = { version = "1", optional = true }
+semver = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+reqwest = { version = "0.12", features = ["json", "stream"], optional = true }
+tar = { version = "0.4", optional = true }
+tempfile = { version = "3", optional = true }
+toml = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
+utoipa = { version = "5", features = ["axum_extras"], optional = true }
+zip = { version = "2", optional = true }
+tower-http = { version = "0.6.8", features = ["cors"], optional = true }
 
 # Data operations
 # Wire protocol crate: gives us `ant_protocol::{chunk, payment, …}` plus
@@ -37,23 +49,19 @@ tower-http = { version = "0.6.8", features = ["cors"] }
 # under `ant_protocol::{evm, transport, pqc}`. This is the ONE pin for
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
-ant-protocol = "2.3.1"
-xor_name = "5"
-self_encryption = "0.36"
-futures = "0.3"
-postcard = { version = "1.1.3", features = ["use-std"] }
-rmp-serde = "1"
-hex = "0.4"
-tracing = "0.1"
-bytes = "1"
-lru = "0.16"
-rand = "0.8"
+ant-protocol = { version = "2.3.1", optional = true }
+xor_name = { version = "5", optional = true }
+futures = { version = "0.3", optional = true }
+postcard = { version = "1.1.3", features = ["use-std"], optional = true }
+tracing = { version = "0.1", optional = true }
+lru = { version = "0.16", optional = true }
+rand = { version = "0.8", optional = true }
 # Used by the daemon supervisor to scan the OS process table when adopting
 # running nodes whose pid file is missing (e.g. nodes spawned by a pre-adoption
 # daemon). Happy-path adoption reads the pid file directly and doesn't touch
 # sysinfo, so the crate is loaded lazily and the cost is bounded to first-time
 # upgrade scenarios.
-sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+sysinfo = { version = "0.32", default-features = false, features = ["system"], optional = true }
 # ant-node is optional. It is only linked for the `LocalDevnet` wrapper
 # that spawns a local in-process network for development and testing.
 # Enable with `--features devnet`.
@@ -66,7 +74,19 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # track the matching released version carrying the same saorsa-core /
 # ant-protocol lineage.
 ant-node = { version = "0.16.0", optional = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+# Browser bindings are optional so ordinary native consumers do not pull the
+# wasm-bindgen toolchain into their dependency graph.
+js-sys = { version = "0.3", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# self_encryption/rand use getrandom 0.2. Browser entropy is supplied by the
+# Web Crypto API through its `js` feature.
+getrandom = { version = "0.2", features = ["js"] }
+console_error_panic_hook = { version = "0.1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -79,12 +99,47 @@ openssl = { version = "0.10", features = ["vendored"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
 
 [features]
-# No features enabled by default — consumers that want to spawn a local
-# devnet opt in with `features = ["devnet"]`.
-default = []
+# Preserve the existing native ant-core API for ordinary consumers. WASM
+# consumers build with `--no-default-features --features browser-wasm`.
+default = ["native"]
+native = [
+    "dep:ant-protocol",
+    "dep:async-stream",
+    "dep:axum",
+    "dep:flate2",
+    "dep:fs2",
+    "dep:futures",
+    "dep:futures-core",
+    "dep:futures-util",
+    "dep:lru",
+    "dep:postcard",
+    "dep:rand",
+    "dep:reqwest",
+    "dep:self-replace",
+    "dep:semver",
+    "dep:serde_json",
+    "dep:sysinfo",
+    "dep:tar",
+    "dep:tempfile",
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:toml",
+    "dep:tower-http",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:utoipa",
+    "dep:xor_name",
+    "dep:zip",
+]
+browser-wasm = [
+    "dep:console_error_panic_hook",
+    "dep:js-sys",
+    "dep:serde-wasm-bindgen",
+    "dep:wasm-bindgen",
+]
 # Enable `LocalDevnet` (ant-core/src/node/devnet.rs) which wraps
 # `ant_node::devnet::Devnet` and an Anvil EVM testnet.
-devnet = ["dep:ant-node"]
+devnet = ["native", "dep:ant-node"]
 # Expose test-only client seams (e.g. forcing the ADR-0002 extended PUT
 # fallback) used by the e2e/integration test suite.
 test-utils = []
