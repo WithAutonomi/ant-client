@@ -112,6 +112,13 @@ path = "examples/start-local-devnet.rs"
 required-features = ["devnet"]
 
 [[example]]
+name = "external-merkle-large"
+path = "examples/external-merkle-large.rs"
+# Real-size ADR-0003 proof: >1 GiB external multi-batch upload against a
+# LocalDevnet at the default batch cap. Manual harness, not run in CI.
+required-features = ["devnet"]
+
+[[example]]
 name = "start-devnet-sepolia"
 path = "examples/start-devnet-sepolia.rs"
 
