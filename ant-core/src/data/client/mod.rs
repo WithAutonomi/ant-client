@@ -256,6 +256,19 @@ pub struct ClientConfig {
     /// (which causes slow connects and junk DHT address records). This
     /// mirrors the `--ipv4-only` flag in `ant-cli`.
     pub ipv6: bool,
+    /// Per-batch leaf cap for **external-signer** merkle preparation,
+    /// clamped to `3..=MAX_LEAVES` when set (a cap of 2 cannot partition odd
+    /// totals — parts of 3 and 2 compose any count, so 3 is the smallest
+    /// safe cap). `None` (the default) uses the contract maximum
+    /// (`MAX_LEAVES` = 256).
+    ///
+    /// This is a test seam (ADR-0003): a small cap makes
+    /// `file_prepare_upload_with_mode` produce a genuine multi-batch
+    /// prepared upload from a kilobyte file, so the N-signature external
+    /// flow is exercisable in E2E without a multi-GiB fixture. Production
+    /// callers should leave it `None` — a lower cap only means more payment
+    /// transactions for the same chunks.
+    pub merkle_external_batch_cap: Option<usize>,
 }
 
 impl Default for ClientConfig {
@@ -271,6 +284,7 @@ impl Default for ClientConfig {
             adaptive: AdaptiveConfig::default(),
             allow_loopback: false,
             ipv6: true,
+            merkle_external_batch_cap: None,
         }
     }
 }

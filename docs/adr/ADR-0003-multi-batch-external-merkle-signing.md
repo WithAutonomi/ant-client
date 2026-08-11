@@ -104,7 +104,9 @@ keep chunk bodies on disk:
    the one-batch special case and errors if the upload was prepared as
    multiple batches.
 4. **Test seams:** the per-batch leaf cap becomes clamped client
-   configuration (`2..=MAX_LEAVES`, default `MAX_LEAVES`) so E2E tests can
+   configuration (`3..=MAX_LEAVES`, default `MAX_LEAVES` — 3 is the floor
+   because a cap of 2 cannot partition odd totals into payable ≥2-leaf
+   trees) so E2E tests can
    exercise real multi-batch signing with kilobyte files, and
    `file_prepare_upload_with_mode` exposes the payment-mode override the
    wallet path already has, so the external merkle path is testable below
@@ -156,7 +158,7 @@ and desktop (V2-948) updates.
 - Unit: partition sizes under injected caps (incl. singleton-remainder
   cases); per-batch proof folding (paid/unpaid mixes); winner-hash count
   validation; single-hash wrapper refusing multi-batch uploads.
-- E2E (Merkle E2E job, small files, batch cap 2): full multi-batch round
+- E2E (Merkle E2E job, small files, batch cap 3): full multi-batch round
   trip — prepare with forced merkle → N `Wallet::pay_for_merkle_tree` calls
   as the simulated signer → `finalize_upload_merkle_multi` → download →
   byte equality; and a partial-payment run (first batch paid only) asserting

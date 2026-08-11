@@ -13,7 +13,7 @@
 mod support;
 
 use ant_core::data::client::merkle::{merkle_billable_leaves, PaymentMode};
-use ant_core::data::{compute_address, Client, ClientConfig};
+use ant_core::data::{compute_address, Client, ClientConfig, ExternalPaymentInfo, Visibility};
 use serial_test::serial;
 use std::io::Write;
 use std::sync::Arc;
@@ -409,3 +409,185 @@ async fn test_merkle_payment_across_batch_boundary() {
 // The 35-node testnet's DHT can have sparse XOR regions where single-node
 // quotes can't find 5 peers for a random chunk address, making that test
 // unreliable here. Merkle tests are the focus of this file.
+
+// ─── External-Signer Multi-Batch Tests (ADR-0003) ──────────────────────────
+//
+// The external-signer merkle flow partitions the to-upload set into
+// `MerkleTree`-sized sub-batches, the signer pays one transaction per batch,
+// and finalize takes one winner hash per batch. The per-batch leaf cap is a
+// clamped test seam (`ClientConfig::merkle_external_batch_cap`): pinning it
+// to 3 makes a ~500 KB public upload (3 data chunks + the bundled DataMap
+// chunk) partition as [2, 2] — a genuine multi-batch flow without a
+// multi-GiB fixture.
+
+/// Like [`setup_merkle_testnet`] but with the external per-batch leaf cap
+/// pinned to 3 so small uploads prepare as multiple payable sub-batches.
+async fn setup_external_merkle_testnet() -> (Client, MiniTestnet) {
+    let (mut client, testnet) = setup_merkle_testnet().await;
+    client.config_mut().merkle_external_batch_cap = Some(3);
+    (client, testnet)
+}
+
+/// Write ~500 KB of patterned content and prepare it as a public forced-merkle
+/// external upload; returns the prepared upload, the per-batch payment
+/// payloads, and the source bytes.
+async fn prepare_external_multi_batch(
+    client: &Client,
+    input_file: &NamedTempFile,
+) -> (
+    ant_core::data::PreparedUpload,
+    Vec<(u8, Vec<ant_protocol::evm::PoolCommitment>, u64)>,
+) {
+    let prepared = client
+        .file_prepare_upload_with_mode(
+            input_file.path(),
+            Visibility::Public,
+            PaymentMode::Merkle,
+            None,
+        )
+        .await
+        .expect("external merkle prepare should succeed");
+
+    let batch_payloads: Vec<(u8, Vec<ant_protocol::evm::PoolCommitment>, u64)> =
+        match &prepared.payment_info {
+            ExternalPaymentInfo::Merkle {
+                prepared_batches, ..
+            } => prepared_batches
+                .iter()
+                .map(|b| {
+                    (
+                        b.depth,
+                        b.pool_commitments.clone(),
+                        b.merkle_payment_timestamp,
+                    )
+                })
+                .collect(),
+            other => panic!("expected merkle payment info, got {other:?}"),
+        };
+
+    (prepared, batch_payloads)
+}
+
+/// External-signer multi-batch merkle round trip: prepare (forced merkle,
+/// cap 3, public) → pay each sub-batch with the testnet wallet exactly as an
+/// external signer would → finalize with one winner hash per batch →
+/// retrieve via the public DataMap address → byte equality.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_external_merkle_multi_batch_round_trip() {
+    let (client, testnet) = setup_external_merkle_testnet().await;
+
+    let data: Vec<u8> = (0u8..=255).cycle().take(500_000).collect();
+    let mut input_file = NamedTempFile::new().expect("create temp file");
+    input_file.write_all(&data).expect("write temp file");
+    input_file.flush().expect("flush temp file");
+
+    let (prepared, batch_payloads) = prepare_external_multi_batch(&client, &input_file).await;
+    let public_address = prepared
+        .data_map_address
+        .expect("public prepare must record the DataMap address");
+    assert!(
+        batch_payloads.len() >= 2,
+        "the cap-3 partition must force a multi-batch prepare, got {} batch(es)",
+        batch_payloads.len()
+    );
+
+    eprintln!(
+        "Paying {} merkle sub-batches as an external signer...",
+        batch_payloads.len()
+    );
+    let mut winner_hashes = Vec::with_capacity(batch_payloads.len());
+    for (depth, commitments, ts) in batch_payloads {
+        let (winner, _amount, _gas) = testnet
+            .wallet()
+            .pay_for_merkle_tree(depth, commitments, ts)
+            .await
+            .expect("testnet wallet should pay the merkle sub-batch");
+        winner_hashes.push(Some(winner));
+    }
+
+    let result = client
+        .finalize_upload_merkle_multi(prepared, winner_hashes)
+        .await
+        .expect("multi-batch finalize should succeed");
+    assert_eq!(result.payment_mode_used, PaymentMode::Merkle);
+    assert_eq!(result.chunks_failed, 0);
+    assert_eq!(
+        result.chunks_stored, result.total_chunks,
+        "every chunk must reach quorum"
+    );
+
+    // Retrieve via the public address only — proves the DataMap chunk was
+    // paid for and stored by one of the sub-batches.
+    let fetched_map = client
+        .data_map_fetch(&public_address)
+        .await
+        .expect("public DataMap chunk should be retrievable");
+    let output_dir = TempDir::new().expect("create temp dir");
+    let output_path = output_dir.path().join("multi_batch.bin");
+    client
+        .file_download(&fetched_map, &output_path)
+        .await
+        .expect("download should succeed");
+    let downloaded = std::fs::read(&output_path).expect("read downloaded file");
+    assert_eq!(downloaded, data, "downloaded content must match original");
+
+    eprintln!("External multi-batch merkle round-trip verified.");
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// A k-of-N external payment makes forward progress: pay only the first
+/// sub-batch, finalize with `None` for the second, and the paid chunks store
+/// while the unpaid ones surface through `PartialUpload` — neither silent
+/// success (#166) nor a fatal abort discarding the paid batch's progress.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_external_merkle_partial_payment_is_partial_upload() {
+    let (client, testnet) = setup_external_merkle_testnet().await;
+
+    // Different pattern than the round-trip test so content never collides.
+    let data: Vec<u8> = (0u8..=255).rev().cycle().take(500_000).collect();
+    let mut input_file = NamedTempFile::new().expect("create temp file");
+    input_file.write_all(&data).expect("write temp file");
+    input_file.flush().expect("flush temp file");
+
+    let (prepared, batch_payloads) = prepare_external_multi_batch(&client, &input_file).await;
+    assert_eq!(
+        batch_payloads.len(),
+        2,
+        "4 chunks under cap 3 must partition as [2, 2]"
+    );
+
+    eprintln!("Paying only the first of 2 merkle sub-batches...");
+    let (depth, commitments, ts) = batch_payloads[0].clone();
+    let (winner, _amount, _gas) = testnet
+        .wallet()
+        .pay_for_merkle_tree(depth, commitments, ts)
+        .await
+        .expect("testnet wallet should pay the first sub-batch");
+
+    let err = client
+        .finalize_upload_merkle_multi(prepared, vec![Some(winner), None])
+        .await
+        .expect_err("finalize with an unpaid batch must not report success");
+    match err {
+        ant_core::data::Error::PartialUpload {
+            stored_count,
+            failed_count,
+            total_chunks,
+            ..
+        } => {
+            assert_eq!(stored_count, 2, "the paid batch's chunks must store");
+            assert_eq!(failed_count, 2, "the unpaid batch's chunks must fail");
+            assert_eq!(total_chunks, 4);
+        }
+        other => panic!("expected PartialUpload, got: {other}"),
+    }
+
+    eprintln!("External partial payment correctly surfaced as PartialUpload.");
+
+    drop(client);
+    testnet.teardown().await;
+}
