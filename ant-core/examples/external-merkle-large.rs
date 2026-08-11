@@ -20,7 +20,9 @@
 //! # env overrides: FILE_MB (default 1228), NODES (default 25)
 //! ```
 
-use ant_core::data::{ExternalPaymentInfo, LocalDevnet, PaymentMode, Visibility};
+use ant_core::data::{
+    Client, ClientConfig, ExternalPaymentInfo, LocalDevnet, PaymentMode, Visibility,
+};
 use ant_node::devnet::DevnetConfig;
 use ant_protocol::evm::Wallet;
 use std::io::Write;
@@ -93,12 +95,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Funded client: connectivity + one-time token approval for the same
         // key the standalone signer wallet below uses. The external
-        // prepare/finalize path never touches the client's wallet.
-        let client = devnet.create_funded_client().await?;
+        // prepare/finalize path never touches the client's wallet. Built by
+        // hand (rather than `create_funded_client`) so the signer wallet is
+        // shared with the payment loop below; `allow_loopback` is required
+        // for a 127.0.0.1 devnet — the default config filters loopback peers.
+        let client_config = ClientConfig {
+            allow_loopback: true,
+            ..ClientConfig::default()
+        };
+        let client = Client::connect(&devnet.bootstrap_addrs(), client_config).await?;
         let signer = Wallet::new_from_private_key(
             devnet.evm_network().clone(),
             devnet.wallet_private_key().trim_start_matches("0x"),
         )?;
+        let client = client.with_wallet(signer.clone());
+        client.approve_token_spend().await?;
 
         println!("[2/7] Writing {file_mb} MiB incompressible file...");
         let tmp = tempfile::TempDir::new()?;
@@ -216,8 +227,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let peak = mb(peak_rss.load(Ordering::Relaxed));
         println!("[7/7] DONE in {:?} total.", started.elapsed());
         println!(
-            "      Peak client RSS: {peak} MiB for a {file_mb} MiB file \
-             (spill-backed prepare: RSS must stay well under file size)"
+            "      Peak client RSS across ALL phases: {peak} MiB for a {file_mb} MiB file.\n\
+             ADR-0003's claim covers prepare + signing window + store (the\n\
+             phases this change touches) — read those phases' RSS prints\n\
+             above; the download/verify phase is pre-existing behavior and\n\
+             usually dominates the overall peak."
         );
 
         devnet.shutdown().await?;

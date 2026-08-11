@@ -158,14 +158,22 @@ impl LocalDevnet {
     /// Create a funded client connected to this devnet, ready for uploads.
     ///
     /// Connects to bootstrap peers, creates a wallet from the funded key,
-    /// and approves token spend.
+    /// and approves token spend. The client is configured with
+    /// `allow_loopback: true` — this devnet's peers live on `127.0.0.1`, and
+    /// the default config filters loopback candidates, which left the
+    /// routing table empty and failed the first witnessed close-group
+    /// lookup with `InsufficientPeers`.
     ///
     /// # Errors
     ///
     /// Returns an error if connection, wallet creation, or approval fails.
     pub async fn create_funded_client(&self) -> Result<Client> {
         let addrs = self.bootstrap_addrs();
-        let client = Client::connect(&addrs, ClientConfig::default()).await?;
+        let config = ClientConfig {
+            allow_loopback: true,
+            ..ClientConfig::default()
+        };
+        let client = Client::connect(&addrs, config).await?;
 
         let key = self.wallet_private_key.trim_start_matches("0x").to_string();
         let wallet = Wallet::new_from_private_key(self.evm_network.clone(), &key)
