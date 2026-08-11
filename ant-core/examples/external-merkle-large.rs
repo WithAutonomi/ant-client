@@ -16,15 +16,30 @@
 //! # Usage
 //!
 //! ```bash
+//! # Self-contained: spawns a LocalDevnet on this machine.
 //! cargo run --release --features devnet --example external-merkle-large
 //! # env overrides: FILE_MB (default 1228), NODES (default 25)
+//!
+//! # Against an existing devnet (e.g. a LAN devnet started with
+//! # `ant-devnet --host <ip> --serve-port 8088`):
+//! #   curl http://<ip>:8088/api/devnet-manifest.json > manifest.json
+//! MANIFEST=manifest.json cargo run --release --features devnet \
+//!     --example external-merkle-large
+//!
+//! # Download-only verification from a second machine (the PRNG content is
+//! # deterministic, so any box can regenerate the expected stream):
+//! MANIFEST=manifest.json MODE=download ADDRESS=<hex> FILE_MB=2200 \
+//!     cargo run --release --features devnet --example external-merkle-large
 //! ```
 
 use ant_core::data::{
-    Client, ClientConfig, ExternalPaymentInfo, LocalDevnet, PaymentMode, Visibility,
+    Client, ClientConfig, CustomNetwork, EvmNetwork, ExternalPaymentInfo, LocalDevnet, PaymentMode,
+    Visibility,
 };
 use ant_node::devnet::DevnetConfig;
 use ant_protocol::evm::Wallet;
+use ant_protocol::transport::MultiAddr;
+use ant_protocol::DevnetManifest;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -85,30 +100,88 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (peak_rss, stop_rss) = spawn_rss_sampler();
         let started = Instant::now();
 
-        println!("[1/7] Starting {nodes}-node local devnet + Anvil...");
-        let config = DevnetConfig {
-            node_count: nodes,
-            ..DevnetConfig::default()
-        };
-        let mut devnet = LocalDevnet::start(config).await?;
-        println!("      up in {:?}", started.elapsed());
+        // Either spawn a LocalDevnet here, or join an existing devnet via a
+        // manifest file (`MANIFEST=path`, e.g. fetched from a LAN host's
+        // `ant-devnet --serve-port` endpoint).
+        let (bootstrap_addrs, evm_network, funded_key, mut local_devnet) =
+            if let Ok(manifest_path) = std::env::var("MANIFEST") {
+                println!("[1/7] Joining devnet from manifest {manifest_path}...");
+                let manifest: DevnetManifest =
+                    serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+                let evm = manifest
+                    .evm
+                    .as_ref()
+                    .expect("manifest must carry EVM info for the paid flow");
+                let network = EvmNetwork::Custom(CustomNetwork::new(
+                    &evm.rpc_url,
+                    &evm.payment_token_address,
+                    &evm.payment_vault_address,
+                ));
+                let addrs: Vec<std::net::SocketAddr> = manifest
+                    .bootstrap
+                    .iter()
+                    .filter_map(MultiAddr::socket_addr)
+                    .collect();
+                println!(
+                    "      {} nodes, bootstrap {:?}, EVM at {}",
+                    manifest.node_count, addrs, evm.rpc_url
+                );
+                (addrs, network, evm.wallet_private_key.clone(), None)
+            } else {
+                println!("[1/7] Starting {nodes}-node local devnet + Anvil...");
+                let config = DevnetConfig {
+                    node_count: nodes,
+                    ..DevnetConfig::default()
+                };
+                let devnet = LocalDevnet::start(config).await?;
+                println!("      up in {:?}", started.elapsed());
+                (
+                    devnet.bootstrap_addrs(),
+                    devnet.evm_network().clone(),
+                    devnet.wallet_private_key().to_string(),
+                    Some(devnet),
+                )
+            };
 
         // Funded client: connectivity + one-time token approval for the same
         // key the standalone signer wallet below uses. The external
         // prepare/finalize path never touches the client's wallet. Built by
         // hand (rather than `create_funded_client`) so the signer wallet is
         // shared with the payment loop below; `allow_loopback` is required
-        // for a 127.0.0.1 devnet — the default config filters loopback peers.
+        // for a 127.0.0.1 devnet (the default config filters loopback peers)
+        // and harmless for a LAN one.
         let client_config = ClientConfig {
-            allow_loopback: true,
+            allow_loopback: bootstrap_addrs.iter().any(|a| a.ip().is_loopback()),
             ..ClientConfig::default()
         };
-        let client = Client::connect(&devnet.bootstrap_addrs(), client_config).await?;
-        let signer = Wallet::new_from_private_key(
-            devnet.evm_network().clone(),
-            devnet.wallet_private_key().trim_start_matches("0x"),
-        )?;
+        let client = Client::connect(&bootstrap_addrs, client_config).await?;
+        let signer =
+            Wallet::new_from_private_key(evm_network, funded_key.trim_start_matches("0x"))?;
         let client = client.with_wallet(signer.clone());
+
+        // Download-only mode: verify a previously uploaded PRNG file from
+        // this (possibly different) machine, then exit.
+        if std::env::var("MODE").as_deref() == Ok("download") {
+            let address_hex = std::env::var("ADDRESS")
+                .expect("MODE=download needs ADDRESS=<public DataMap address hex>");
+            let address: [u8; 32] = hex_to_addr(&address_hex);
+            println!("[download] Fetching DataMap {address_hex} and verifying {file_mb} MiB...");
+            let t = Instant::now();
+            let data_map = client.data_map_fetch(&address).await?;
+            let tmp = tempfile::TempDir::new()?;
+            let out_path = tmp.path().join("fetched.bin");
+            let written = client.file_download(&data_map, &out_path).await?;
+            assert_eq!(written as usize, file_mb * 1024 * 1024, "size mismatch");
+            verify_prng_file(&out_path, file_mb)?;
+            stop_rss.store(true, Ordering::Relaxed);
+            println!(
+                "[download] verified byte-identical in {:?}; peak RSS {} MiB",
+                t.elapsed(),
+                mb(peak_rss.load(Ordering::Relaxed))
+            );
+            return Ok(());
+        }
+
         client.approve_token_spend().await?;
 
         println!("[2/7] Writing {file_mb} MiB incompressible file...");
@@ -202,30 +275,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let out_path = tmp.path().join("roundtrip.bin");
         let written = client.file_download(&fetched_map, &out_path).await?;
         assert_eq!(written as usize, file_mb * 1024 * 1024, "size mismatch");
-        // Stream-compare against the regenerated PRNG stream to avoid
-        // holding either copy in memory.
-        {
-            use std::io::Read;
-            let mut f = std::io::BufReader::new(std::fs::File::open(&out_path)?);
-            let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-            let mut expected = vec![0u8; 1024 * 1024];
-            let mut actual = vec![0u8; 1024 * 1024];
-            for mib in 0..file_mb {
-                for chunk in expected.chunks_mut(8) {
-                    state ^= state << 13;
-                    state ^= state >> 7;
-                    state ^= state << 17;
-                    chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
-                }
-                f.read_exact(&mut actual)?;
-                assert_eq!(actual, expected, "content mismatch in MiB {mib}");
-            }
-        }
+        verify_prng_file(&out_path, file_mb)?;
         println!("      verified byte-identical in {:?}", t.elapsed());
 
         stop_rss.store(true, Ordering::Relaxed);
         let peak = mb(peak_rss.load(Ordering::Relaxed));
         println!("[7/7] DONE in {:?} total.", started.elapsed());
+        println!(
+            "      Public address (for MODE=download from another machine): 0x{}",
+            hex_encode(&public_address)
+        );
         println!(
             "      Peak client RSS across ALL phases: {peak} MiB for a {file_mb} MiB file.\n\
              ADR-0003's claim covers prepare + signing window + store (the\n\
@@ -234,7 +293,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              usually dominates the overall peak."
         );
 
-        devnet.shutdown().await?;
+        if let Some(devnet) = local_devnet.as_mut() {
+            devnet.shutdown().await?;
+        }
         Ok::<(), Box<dyn std::error::Error>>(())
     })
+}
+
+/// Parse a 32-byte hex address (with or without `0x`).
+fn hex_to_addr(hex: &str) -> [u8; 32] {
+    let hex = hex.trim_start_matches("0x");
+    assert_eq!(hex.len(), 64, "address must be 32 bytes of hex");
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("valid hex");
+    }
+    out
+}
+
+fn hex_encode(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Stream-compare `path` against the regenerated deterministic PRNG stream
+/// (same xorshift + seed as the writer) without holding either copy in
+/// memory.
+fn verify_prng_file(path: &std::path::Path, file_mb: usize) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut f = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut expected = vec![0u8; 1024 * 1024];
+    let mut actual = vec![0u8; 1024 * 1024];
+    for mib in 0..file_mb {
+        for chunk in expected.chunks_mut(8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+        }
+        f.read_exact(&mut actual)?;
+        assert_eq!(actual, expected, "content mismatch in MiB {mib}");
+    }
+    Ok(())
 }
