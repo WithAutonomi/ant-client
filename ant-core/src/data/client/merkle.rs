@@ -1188,11 +1188,13 @@ impl Client {
         )
         .await?;
 
-        // The external-signer path treats a non-quorum error as terminal (it
-        // returns a single all-or-nothing `FileUploadResult`), so re-raise the
-        // fatal that `merkle_store_with_retry` now carries in the outcome. The
-        // CLI/spill paths, which can surface `PartialUpload`, read `fatal`
-        // directly instead.
+        // The external-signer path treats a non-quorum error as terminal (its
+        // finalize has no further waves to fold progress into), so re-raise
+        // the fatal that `merkle_store_with_retry` now carries in the outcome.
+        // The CLI/spill paths, which fold progress across waves before
+        // surfacing `PartialUpload`, read `fatal` directly instead. Quorum
+        // shortfalls stay in `failed`/`failed_addresses`; the external-signer
+        // finalize turns those into `PartialUpload` too (issue #166).
         if let Some(e) = outcome.fatal {
             return Err(e);
         }
@@ -1241,9 +1243,9 @@ pub(crate) struct MerkleStoreOutcome {
     /// Chunks still short of quorum after [`MERKLE_STORE_MAX_ATTEMPTS`].
     pub failed: usize,
     /// Addresses (and the last error message) of chunks still short of quorum
-    /// after all retries. Empty when `failed == 0`. Used by the CLI path to
-    /// build [`crate::data::Error::PartialUpload`]; the external-signer path
-    /// only reads the counts.
+    /// after all retries. Empty when `failed == 0`. Both the CLI path and the
+    /// external-signer finalize build
+    /// [`crate::data::Error::PartialUpload`] from this set.
     pub failed_addresses: Vec<([u8; 32], String)>,
     /// Set when a non-quorum (fatal) store error aborted the pass. Successes
     /// completed before the abort are still recorded in `stored`/
