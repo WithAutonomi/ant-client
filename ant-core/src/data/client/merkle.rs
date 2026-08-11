@@ -715,9 +715,10 @@ impl Client {
     /// (ADR-0003). Batch order matches address order; the caller's finalize
     /// supplies one winner hash per batch in the same order.
     ///
-    /// `cap` is clamped to `2..=MAX_LEAVES`; production callers pass
-    /// `MAX_LEAVES`, tests pass small caps to get real multi-batch flows
-    /// from kilobyte files.
+    /// `cap` is clamped to `3..=MAX_LEAVES` (see
+    /// [`merkle_batch_sizes_with_cap`] for why 3 is the floor); production
+    /// callers pass `MAX_LEAVES`, tests pass small caps to get real
+    /// multi-batch flows from kilobyte files.
     ///
     /// # Errors
     ///
@@ -2605,6 +2606,77 @@ mod tests {
         // Single attempt → all successes recorded in round 0.
         assert_eq!(outcome.stats.retries_histogram[0], 4);
         assert_eq!(outcome.stats.chunk_attempts_total, 6);
+    }
+
+    /// #167 regression, preserved at the engine seam the spill path composes
+    /// (`upload_merkle_from_spill` runs one single-attempt pass and then the
+    /// deferred rounds): a genuine quorum shortfall — every batch PAID, the
+    /// store short — survives all deferred retries with
+    /// `stored + failed == total` and the exact shortfall set in
+    /// `failed_addresses`, which is precisely what the spill path folds into
+    /// `Error::PartialUpload` instead of reporting success (#166).
+    #[tokio::test]
+    async fn quorum_shortfall_survives_deferred_retries_with_exact_accounting() {
+        let chunks = make_addrs(5);
+        let short: std::collections::HashSet<[u8; 32]> = chunks.iter().take(2).copied().collect();
+        let short_for_closure = short.clone();
+        let store_one = move |addr: [u8; 32]| {
+            let fail = short_for_closure.contains(&addr);
+            async move {
+                if fail {
+                    Err(Error::InsufficientPeers("still short of quorum".into()))
+                } else {
+                    Ok(std::time::Instant::now())
+                }
+            }
+        };
+
+        // Initial pass exactly as the spill path runs it: one attempt,
+        // shortfalls deferred rather than retried inline.
+        let pass = merkle_store_with_retry(
+            chunks.clone(),
+            || 8,
+            1,
+            Duration::ZERO,
+            None,
+            0,
+            5,
+            &store_one,
+        )
+        .await
+        .expect("quorum shortfalls must not abort the pass");
+        assert!(pass.fatal.is_none());
+        assert_eq!(pass.stored, 3);
+        assert_eq!(pass.failed, 2);
+
+        // Deferred rounds (zero delays for the test): the same chunks stay
+        // short through every round.
+        let dr = merkle_deferred_retry(
+            pass.failed_addresses.clone(),
+            &[0, 0, 0],
+            |n: usize| n.max(1),
+            None,
+            pass.stored,
+            5,
+            &store_one,
+        )
+        .await
+        .expect("deferred shortfalls must not abort");
+
+        assert!(dr.fatal.is_none());
+        assert_eq!(
+            dr.stored + dr.failed,
+            5,
+            "stored + failed must account for every chunk"
+        );
+        assert_eq!(dr.stored, 3, "paid-and-stored chunks must stay counted");
+        assert_eq!(dr.failed, 2);
+        let failed_set: std::collections::HashSet<[u8; 32]> =
+            dr.failed_addresses.iter().map(|(a, _)| *a).collect();
+        assert_eq!(
+            failed_set, short,
+            "failed set must be exactly the shortfall chunks"
+        );
     }
 
     /// V2-554: the store scheduler must RE-READ the cap as each slot frees
