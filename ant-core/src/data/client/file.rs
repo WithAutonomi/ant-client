@@ -1071,8 +1071,8 @@ pub enum ExternalPaymentInfo {
 /// Opaque on-disk store of the chunk bodies carried by a prepared external
 /// merkle upload.
 ///
-/// Wraps the encryption [`ChunkSpill`]: bodies stay on disk from prepare
-/// until finalize reads them back ≤ store-cap at a time, so peak RAM for the
+/// Wraps the encryption spill: bodies stay on disk from prepare until
+/// finalize reads them back ≤ store-cap at a time, so peak RAM for the
 /// external path matches the wallet path's ~256 MB bound instead of the file
 /// size (ADR-0003). The spill directory lives exactly as long as this value:
 /// dropping the `PreparedUpload` (e.g. a consumer's session TTL expiring or
