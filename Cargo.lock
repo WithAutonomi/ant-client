@@ -5199,8 +5199,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.26.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "454529f8a72b4cf22f7d9c3b009ad9d4ba78520e11f6444ae460795d55c002da"
+source = "git+https://github.com/WithAutonomi/saorsa-core.git?branch=diagnostics%2Fv2-903-peer-route-classification#008e8c020b8de773e165c99a83ec50a34fbcc5ad"
 dependencies = [
  "anyhow",
  "async-trait",

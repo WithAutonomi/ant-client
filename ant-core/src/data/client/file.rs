@@ -14,8 +14,9 @@ use crate::data::client::adaptive::{observe_op, rebucketed_unordered};
 use crate::data::client::batch::{
     finalize_batch_payment, PaymentIntent, PreparedChunk, WaveAggregateStats,
 };
-use crate::data::client::chunk::ChunkPeerGetResult;
+use crate::data::client::chunk::{ChunkFetchDiagnostics, ChunkPeerGetResult};
 use crate::data::client::classify_error;
+use crate::data::client::diagnostics::DownloadDiagnosticsSender;
 use crate::data::client::merkle::{
     chunk_contents_for_upload_addresses, finalize_merkle_batch, merkle_batch_sizes,
     merkle_billable_leaves, merkle_deferred_retry, merkle_store_with_retry, should_use_merkle,
@@ -166,6 +167,10 @@ struct FileDownloadFetchContext {
     fetched_ref: Arc<std::sync::atomic::AtomicUsize>,
     progress_ref: Option<mpsc::Sender<DownloadEvent>>,
     peer_reports: Option<Arc<Mutex<Vec<RecordedFileChunkPeerSweep>>>>,
+    /// Optional runtime-gated download diagnostics sender. `None` when
+    /// `--download-diagnostics` was not passed, so the chunk-fetch path
+    /// skips all record construction and allocation.
+    diagnostics: Option<DownloadDiagnosticsSender>,
 }
 
 /// Number of chunks per upload wave (matches batch.rs PAYMENT_WAVE_SIZE).
@@ -208,7 +213,7 @@ const DOWNLOAD_STREAM_BATCH_BYTES_PER_CHUNK_MULTIPLIER: u64 = 3;
 /// of a file already live on the network.
 const ESTIMATE_SAMPLE_CAP: usize = 5;
 
-/// First diagnostic all-peer fetch attempt for a file chunk.
+/// First normal-path diagnostic fetch attempt.
 const FIRST_DIAGNOSTIC_FETCH_ATTEMPT: usize = 1;
 
 /// Deferred retry attempt number for retry round 0.
@@ -2828,7 +2833,7 @@ impl Client {
         output: &Path,
         peer_count: NonZeroUsize,
     ) -> Result<u64> {
-        self.file_download_with_progress_using_peer_count(data_map, output, None, peer_count.get())
+        self.file_download_with_progress_from_closest_peers(data_map, output, None, peer_count)
             .await
     }
 
@@ -2854,6 +2859,28 @@ impl Client {
             output,
             progress,
             peer_count.get(),
+            None,
+        )
+        .await
+    }
+
+    /// Download a file with progress and optional per-attempt JSONL diagnostics.
+    ///
+    /// Passing `None` preserves the standard path without diagnostic records.
+    pub async fn file_download_with_progress_and_diagnostics_from_closest_peers(
+        &self,
+        data_map: &DataMap,
+        output: &Path,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
+        peer_count: NonZeroUsize,
+        diagnostics: Option<DownloadDiagnosticsSender>,
+    ) -> Result<u64> {
+        self.file_download_with_progress_using_peer_count(
+            data_map,
+            output,
+            progress,
+            peer_count.get(),
+            diagnostics,
         )
         .await
     }
@@ -2885,6 +2912,7 @@ impl Client {
                 progress,
                 peer_count.get(),
                 Some(chunk_reports.clone()),
+                None,
             )
             .await?;
 
@@ -2964,8 +2992,16 @@ impl Client {
                 }
             }
         } else {
+            // Normal path: early-return after the first peer that has the
+            // chunk. When diagnostics are enabled we thread a per-chunk
+            // diagnostics context through so each peer attempt in the sweep
+            // is recorded; when disabled (`None`) this is a zero-cost pass.
+            let diag = context
+                .diagnostics
+                .as_ref()
+                .map(|sender| ChunkFetchDiagnostics::new(sender, attempt, idx + 1, addr));
             match self
-                .chunk_get_observed_from_closest_peers(&addr, context.peer_count)
+                .chunk_get_observed_from_closest_peers(&addr, context.peer_count, diag.as_ref())
                 .await
             {
                 Ok(Some(chunk)) => Some(chunk.content),
@@ -3032,6 +3068,7 @@ impl Client {
         progress: Option<mpsc::Sender<DownloadEvent>>,
         peer_count: usize,
         peer_reports: Option<Arc<Mutex<Vec<RecordedFileChunkPeerSweep>>>>,
+        diagnostics: Option<DownloadDiagnosticsSender>,
         mut on_chunk: F,
     ) -> Result<u64>
     where
@@ -3085,7 +3122,9 @@ impl Client {
                                     // load-shedding signal for
                                     // sustained close-group exhaustion).
                                     let chunk = self
-                                        .chunk_get_observed_from_closest_peers(&addr, peer_count)
+                                        .chunk_get_observed_from_closest_peers(
+                                            &addr, peer_count, None,
+                                        )
                                         .await
                                         .map_err(|e| {
                                             self_encryption::Error::Generic(format!(
@@ -3144,6 +3183,7 @@ impl Client {
         let fetched_for_closure = fetched_counter.clone();
         let progress_for_closure = progress.clone();
         let peer_reports_for_closure = peer_reports.clone();
+        let diagnostics_for_closure = diagnostics.clone();
 
         let fetch_limiter_outer = self.controller().fetch.clone();
         let usable_memory = usable_memory_bytes();
@@ -3174,15 +3214,16 @@ impl Client {
                     fetched_ref: fetched_for_closure.clone(),
                     progress_ref: progress_for_closure.clone(),
                     peer_reports: peer_reports_for_closure.clone(),
+                    diagnostics: diagnostics_for_closure.clone(),
                 };
                 let fetch_limiter = fetch_limiter_outer.clone();
 
                 tokio::task::block_in_place(|| {
                     handle.block_on(async {
-                        // First pass: try every chunk in the batch. Normal mode
-                        // uses chunk_get_observed (early-return after a found
-                        // peer); diagnostic mode asks every selected closest
-                        // peer and records that sweep before returning bytes.
+                        // First pass: try every chunk in the batch. Both normal
+                        // and diagnostic modes preserve the closest-peer
+                        // early-return path; diagnostics only records the peers
+                        // actually attempted before a chunk is found.
                         // Any missing chunk or transient fetch error is encoded
                         // as Err(hash), so one noisy chunk does not abort the
                         // whole batch before the deferred retry rounds run.
@@ -3339,6 +3380,7 @@ impl Client {
             output,
             progress,
             self.config().close_group_size,
+            None,
         )
         .await
     }
@@ -3354,9 +3396,15 @@ impl Client {
         output: &Path,
         progress: Option<mpsc::Sender<DownloadEvent>>,
         peer_count: usize,
+        diagnostics: Option<DownloadDiagnosticsSender>,
     ) -> Result<u64> {
         self.file_download_with_progress_using_peer_count_and_reports(
-            data_map, output, progress, peer_count, None,
+            data_map,
+            output,
+            progress,
+            peer_count,
+            None,
+            diagnostics,
         )
         .await
     }
@@ -3368,6 +3416,7 @@ impl Client {
         progress: Option<mpsc::Sender<DownloadEvent>>,
         peer_count: usize,
         peer_reports: Option<Arc<Mutex<Vec<RecordedFileChunkPeerSweep>>>>,
+        diagnostics: Option<DownloadDiagnosticsSender>,
     ) -> Result<u64> {
         debug!("Downloading file to {}", output.display());
 
@@ -3383,10 +3432,17 @@ impl Client {
         let mut file = std::fs::File::create(tmp.path())?;
 
         let bytes_written = self
-            .download_decrypted_chunks(data_map, progress, peer_count, peer_reports, |bytes| {
-                let r = file.write_all(&bytes).map_err(Error::from);
-                std::future::ready(r)
-            })
+            .download_decrypted_chunks(
+                data_map,
+                progress,
+                peer_count,
+                peer_reports,
+                diagnostics,
+                |bytes| {
+                    let r = file.write_all(&bytes).map_err(Error::from);
+                    std::future::ready(r)
+                },
+            )
             .await?;
         file.flush()?;
         drop(file); // close the handle before rename (Windows won't rename an open file)
@@ -3425,7 +3481,7 @@ impl Client {
         progress: Option<mpsc::Sender<DownloadEvent>>,
     ) -> Result<u64> {
         let peer_count = self.config().close_group_size;
-        self.download_decrypted_chunks(data_map, progress, peer_count, None, |bytes| {
+        self.download_decrypted_chunks(data_map, progress, peer_count, None, None, |bytes| {
             let sink = sink.clone();
             async move {
                 sink.send(Ok(bytes))

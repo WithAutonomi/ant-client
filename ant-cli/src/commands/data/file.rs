@@ -9,9 +9,9 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use ant_core::data::{
-    Client, CollisionPolicy, CostEstimateConfidence, DownloadEvent, Error as DataError,
-    FileChunkPeerReport, FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport,
-    PaymentMode, UploadEvent,
+    spawn_download_diagnostics_writer, Client, CollisionPolicy, CostEstimateConfidence,
+    DownloadEvent, Error as DataError, FileChunkPeerReport, FileChunkPeerReportPeer,
+    FileChunkPeerStatus, FileChunkPeerSweepReport, PaymentMode, UploadEvent,
 };
 use ant_core::datamap_file::{original_name_from_datamap, read_datamap, write_datamap};
 
@@ -78,6 +78,9 @@ pub enum FileAction {
         /// ranked per-peer results after a successful download.
         #[arg(long, alias = "try-all-peers")]
         all_peers: bool,
+        /// Write one JSONL record per normal-path chunk fetch attempt.
+        #[arg(long, value_name = "PATH", conflicts_with = "all_peers")]
+        download_diagnostics: Option<PathBuf>,
     },
     /// Estimate the cost of uploading a file without uploading.
     ///
@@ -165,6 +168,7 @@ impl FileAction {
                 output,
                 peers,
                 all_peers,
+                download_diagnostics,
             } => {
                 let resolved_output = resolve_download_output(output, datamap.as_deref())?;
                 handle_file_download(
@@ -175,6 +179,7 @@ impl FileAction {
                     json,
                     peers,
                     all_peers,
+                    download_diagnostics.as_deref(),
                 )
                 .await
             }
@@ -432,6 +437,7 @@ async fn drive_upload_progress(
     pb.finish_and_clear();
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_file_download(
     client: &Client,
     address: Option<&str>,
@@ -440,9 +446,22 @@ async fn handle_file_download(
     json_output: bool,
     peer_count: Option<NonZeroUsize>,
     all_peers: bool,
+    download_diagnostics: Option<&Path>,
 ) -> anyhow::Result<()> {
     let output_path = output;
     let start = Instant::now();
+    let (diagnostics, diagnostics_writer) = match download_diagnostics {
+        Some(path) => {
+            let (sender, writer) = spawn_download_diagnostics_writer(path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to open download diagnostics sidecar {}: {e}",
+                    path.display()
+                )
+            })?;
+            (Some(sender), Some(writer))
+        }
+        None => (None, None),
+    };
 
     let data_map = if let Some(addr_hex) = address {
         info!("Downloading public file from address {addr_hex}");
@@ -489,7 +508,18 @@ async fn handle_file_download(
                 .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
             Some(file_peer_check_from_reports(report.chunk_reports))
         } else {
-            let download_result = if let Some(peer_count) = peer_count {
+            let download_result = if let Some(diagnostics) = diagnostics.clone() {
+                let peer_count = download_peer_check_count(client, peer_count)?;
+                client
+                    .file_download_with_progress_and_diagnostics_from_closest_peers(
+                        &data_map,
+                        &output_path,
+                        None,
+                        peer_count,
+                        Some(diagnostics),
+                    )
+                    .await
+            } else if let Some(peer_count) = peer_count {
                 client
                     .file_download_from_closest_peers(&data_map, &output_path, peer_count)
                     .await
@@ -551,7 +581,18 @@ async fn handle_file_download(
                 .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
             Some(file_peer_check_from_reports(report.chunk_reports))
         } else {
-            let download_result = if let Some(peer_count) = peer_count {
+            let download_result = if let Some(diagnostics) = diagnostics.clone() {
+                let peer_count = download_peer_check_count(client, peer_count)?;
+                client
+                    .file_download_with_progress_and_diagnostics_from_closest_peers(
+                        &data_map,
+                        &output_path,
+                        Some(tx),
+                        peer_count,
+                        Some(diagnostics),
+                    )
+                    .await
+            } else if let Some(peer_count) = peer_count {
                 client
                     .file_download_with_progress_from_closest_peers(
                         &data_map,
@@ -574,6 +615,13 @@ async fn handle_file_download(
 
         chunk_peer_check
     };
+
+    drop(diagnostics);
+    if let Some(writer) = diagnostics_writer {
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("Download diagnostics writer thread panicked"))?;
+    }
 
     let file_size = std::fs::metadata(&output_path)?.len();
     let elapsed = start.elapsed();
