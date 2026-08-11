@@ -374,20 +374,31 @@ fn preflight_stored_status<T>(result: Result<T>) -> Result<bool> {
 /// `pay_for_merkle_batch` rejects those counts up front.
 #[must_use]
 pub fn merkle_batch_sizes(total: usize) -> Vec<usize> {
+    merkle_batch_sizes_with_cap(total, MAX_LEAVES)
+}
+
+/// [`merkle_batch_sizes`] with an explicit per-batch leaf cap.
+///
+/// `cap` is clamped to `3..=MAX_LEAVES`: above `MAX_LEAVES` the contract's
+/// depth bound rejects the tree, and below 3 the partition is unsound — with
+/// a cap of 2 every odd total needs a 1-leaf part, which cannot build a
+/// tree (parts of 3 and 2 compose any total ≥ 2, so 3 is the smallest safe
+/// cap). Production callers use [`merkle_batch_sizes`]
+/// (cap = `MAX_LEAVES`); a smaller cap lets tests exercise real multi-batch
+/// signing with kilobyte files (ADR-0003).
+#[must_use]
+pub fn merkle_batch_sizes_with_cap(total: usize, cap: usize) -> Vec<usize> {
     if total < 2 {
         return Vec::new();
     }
+    let cap = cap.clamp(3, MAX_LEAVES);
 
-    let mut sizes = Vec::with_capacity(total.div_ceil(MAX_LEAVES));
+    let mut sizes = Vec::with_capacity(total.div_ceil(cap));
     let mut remaining = total;
-    while remaining > MAX_LEAVES {
-        // Taking a full MAX_LEAVES here would strand a single address as the
+    while remaining > cap {
+        // Taking a full cap here would strand a single address as the
         // final batch; take one fewer so the tail is a payable two-leaf tree.
-        let take = if remaining - MAX_LEAVES == 1 {
-            MAX_LEAVES - 1
-        } else {
-            MAX_LEAVES
-        };
+        let take = if remaining - cap == 1 { cap - 1 } else { cap };
         sizes.push(take);
         remaining -= take;
     }
@@ -401,14 +412,59 @@ pub fn merkle_batch_sizes(total: usize) -> Vec<usize> {
 /// duplicate or a synthetic address.
 #[must_use]
 pub fn merkle_batch_partitions(addresses: &[[u8; 32]]) -> Vec<&[[u8; 32]]> {
+    merkle_batch_partitions_with_cap(addresses, MAX_LEAVES)
+}
+
+/// [`merkle_batch_partitions`] under an explicit per-batch leaf cap
+/// (see [`merkle_batch_sizes_with_cap`] for the clamping rules).
+#[must_use]
+pub fn merkle_batch_partitions_with_cap(addresses: &[[u8; 32]], cap: usize) -> Vec<&[[u8; 32]]> {
     let mut partitions = Vec::new();
     let mut rest = addresses;
-    for size in merkle_batch_sizes(addresses.len()) {
+    for size in merkle_batch_sizes_with_cap(addresses.len(), cap) {
         let (batch, tail) = rest.split_at(size);
         partitions.push(batch);
         rest = tail;
     }
     partitions
+}
+
+/// Fold per-batch [`MerkleBatchPaymentResult`]s into one combined receipt.
+///
+/// Mirrors the fold `pay_for_merkle_multi_batch` performs on the wallet path:
+/// proofs merge by extension, costs sum, and the combined
+/// `merkle_payment_timestamp` is the **oldest** sub-batch timestamp so expiry
+/// checks use the worst case. Batches the external signer never paid simply
+/// do not appear in `results` — their chunks end up with no proof, which the
+/// store path reports through `PartialUpload` (ADR-0003).
+#[must_use]
+pub(crate) fn merge_merkle_batch_results(
+    results: Vec<MerkleBatchPaymentResult>,
+) -> MerkleBatchPaymentResult {
+    let mut merged = MerkleBatchPaymentResult {
+        proofs: HashMap::new(),
+        chunk_count: 0,
+        storage_cost_atto: "0".to_string(),
+        gas_cost_wei: 0,
+        merkle_payment_timestamp: 0,
+    };
+    let mut total_storage = Amount::ZERO;
+    for result in results {
+        merged.proofs.extend(result.proofs);
+        merged.chunk_count += result.chunk_count;
+        if let Ok(cost) = result.storage_cost_atto.parse::<Amount>() {
+            total_storage += cost;
+        }
+        merged.gas_cost_wei = merged.gas_cost_wei.saturating_add(result.gas_cost_wei);
+        if merged.merkle_payment_timestamp == 0
+            || (result.merkle_payment_timestamp > 0
+                && result.merkle_payment_timestamp < merged.merkle_payment_timestamp)
+        {
+            merged.merkle_payment_timestamp = result.merkle_payment_timestamp;
+        }
+    }
+    merged.storage_cost_atto = total_storage.to_string();
+    merged
 }
 
 /// Leaves one merkle batch of `batch_size` addresses is billed for.
@@ -649,6 +705,55 @@ impl Client {
         preflight_stored_status(result)
     }
 
+    /// Phase 1 of external-signer merkle payment for an address set of any
+    /// size: partition into `MerkleTree`-sized sub-batches and prepare each.
+    ///
+    /// The partition follows [`merkle_batch_partitions_with_cap`] (≤ `cap`
+    /// leaves per batch, singleton-remainder rebalanced), so the external
+    /// signer pays one transaction per returned batch — the same shape the
+    /// wallet path's `pay_for_merkle_multi_batch` signs internally
+    /// (ADR-0003). Batch order matches address order; the caller's finalize
+    /// supplies one winner hash per batch in the same order.
+    ///
+    /// `cap` is clamped to `3..=MAX_LEAVES` (see
+    /// [`merkle_batch_sizes_with_cap`] for why 3 is the floor); production
+    /// callers pass `MAX_LEAVES`, tests pass small caps to get real
+    /// multi-batch flows from kilobyte files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any sub-batch's candidate collection fails.
+    /// Nothing is spent in either case — payment happens externally after
+    /// this returns.
+    pub async fn prepare_merkle_batches_external(
+        &self,
+        addresses: &[[u8; 32]],
+        data_type: u32,
+        data_size: u64,
+        cap: usize,
+    ) -> Result<Vec<PreparedMerkleBatch>> {
+        if addresses.len() < 2 {
+            return Err(Error::Payment(
+                "Merkle batch payment requires at least 2 chunks".to_string(),
+            ));
+        }
+        let partitions = merkle_batch_partitions_with_cap(addresses, cap);
+        let total = partitions.len();
+        let mut batches = Vec::with_capacity(total);
+        for (i, partition) in partitions.into_iter().enumerate() {
+            debug!(
+                "Preparing external merkle sub-batch {}/{total} ({} chunks)",
+                i + 1,
+                partition.len()
+            );
+            batches.push(
+                self.prepare_merkle_batch_external(partition, data_type, data_size)
+                    .await?,
+            );
+        }
+        Ok(batches)
+    }
+
     /// Phase 1 of external-signer merkle payment: prepare batch without paying.
     ///
     /// Builds the merkle tree, collects candidate pools from the network,
@@ -660,8 +765,10 @@ impl Client {
     /// Returns [`Error::MerkleBatchTooLarge`] if `addresses` holds more than
     /// `MAX_LEAVES` entries. One prepared batch is one signature and one
     /// payment, so an oversized set has no valid external-signing form; the
-    /// wallet path splits it across transactions instead. The check runs
-    /// before any candidate collection, so nothing is spent.
+    /// wallet path splits it across transactions instead
+    /// ([`Client::prepare_merkle_batches_external`] is the partitioned
+    /// equivalent for external signing). The check runs before any candidate
+    /// collection, so nothing is spent.
     pub async fn prepare_merkle_batch_external(
         &self,
         addresses: &[[u8; 32]],
@@ -1667,9 +1774,86 @@ mod send_assertions {
     }
 }
 
+/// Test-only builders shared by this module's tests and the external-finalize
+/// tests in `file.rs` (ADR-0003).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+pub(crate) mod test_support {
+    use super::*;
+    use ant_protocol::evm::RewardsAddress;
+
+    pub(crate) fn make_test_addresses(count: usize) -> Vec<[u8; 32]> {
+        (0..count)
+            .map(|i| {
+                let xn = XorName::from_content(&i.to_le_bytes());
+                xn.0
+            })
+            .collect()
+    }
+
+    pub(crate) fn make_dummy_candidate_nodes(
+        timestamp: u64,
+    ) -> [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] {
+        std::array::from_fn(|i| MerklePaymentCandidateNode {
+            pub_key: vec![i as u8; 32],
+            price: Amount::from(1024u64),
+            reward_address: RewardsAddress::new([i as u8; 20]),
+            merkle_payment_timestamp: timestamp,
+            signature: vec![i as u8; 64],
+            committed_key_count: 0,
+            commitment_pin: None,
+        })
+    }
+
+    pub(crate) fn make_prepared_merkle_batch(count: usize) -> PreparedMerkleBatch {
+        let addrs = make_test_addresses(count);
+        let xornames: Vec<XorName> = addrs.iter().map(|a| XorName(*a)).collect();
+        let tree = MerkleTree::from_xornames(xornames).unwrap();
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let midpoints = tree.reward_candidates(timestamp).unwrap();
+
+        let candidate_pools: Vec<MerklePaymentCandidatePool> = midpoints
+            .into_iter()
+            .map(|mp| MerklePaymentCandidatePool {
+                midpoint_proof: mp,
+                candidate_nodes: make_dummy_candidate_nodes(timestamp),
+            })
+            .collect();
+
+        let pool_commitments = candidate_pools
+            .iter()
+            .map(pool_commitment_with_payment_multiplier)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        PreparedMerkleBatch {
+            depth: tree.depth(),
+            pool_commitments,
+            merkle_payment_timestamp: timestamp,
+            candidate_pools,
+            tree,
+            addresses: addrs,
+        }
+    }
+
+    /// A winner pool hash `finalize_merkle_batch` will accept for `batch`
+    /// (the first candidate pool's) — the same selection the existing
+    /// finalize tests use. Lives here because `candidate_pools` is private
+    /// outside this module.
+    pub(crate) fn winner_hash_for(batch: &PreparedMerkleBatch) -> [u8; 32] {
+        batch.candidate_pools[0].hash()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use super::test_support::*;
     use super::*;
     use ant_protocol::evm::{Amount, MerkleTree, RewardsAddress, CANDIDATES_PER_POOL};
 
@@ -1827,15 +2011,6 @@ mod tests {
     // MerkleTree construction and proof generation (pure, no network)
     // =========================================================================
 
-    fn make_test_addresses(count: usize) -> Vec<[u8; 32]> {
-        (0..count)
-            .map(|i| {
-                let xn = XorName::from_content(&i.to_le_bytes());
-                xn.0
-            })
-            .collect()
-    }
-
     #[test]
     fn test_tree_depth_for_known_sizes() {
         let cases = [(2, 1), (4, 2), (16, 4), (100, 7), (256, 8)];
@@ -1971,56 +2146,6 @@ mod tests {
     // =========================================================================
     // finalize_merkle_batch (external signer)
     // =========================================================================
-
-    fn make_dummy_candidate_nodes(
-        timestamp: u64,
-    ) -> [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] {
-        std::array::from_fn(|i| MerklePaymentCandidateNode {
-            pub_key: vec![i as u8; 32],
-            price: Amount::from(1024u64),
-            reward_address: RewardsAddress::new([i as u8; 20]),
-            merkle_payment_timestamp: timestamp,
-            signature: vec![i as u8; 64],
-            committed_key_count: 0,
-            commitment_pin: None,
-        })
-    }
-
-    fn make_prepared_merkle_batch(count: usize) -> PreparedMerkleBatch {
-        let addrs = make_test_addresses(count);
-        let xornames: Vec<XorName> = addrs.iter().map(|a| XorName(*a)).collect();
-        let tree = MerkleTree::from_xornames(xornames).unwrap();
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let midpoints = tree.reward_candidates(timestamp).unwrap();
-
-        let candidate_pools: Vec<MerklePaymentCandidatePool> = midpoints
-            .into_iter()
-            .map(|mp| MerklePaymentCandidatePool {
-                midpoint_proof: mp,
-                candidate_nodes: make_dummy_candidate_nodes(timestamp),
-            })
-            .collect();
-
-        let pool_commitments = candidate_pools
-            .iter()
-            .map(pool_commitment_with_payment_multiplier)
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-
-        PreparedMerkleBatch {
-            depth: tree.depth(),
-            pool_commitments,
-            merkle_payment_timestamp: timestamp,
-            candidate_pools,
-            tree,
-            addresses: addrs,
-        }
-    }
 
     /// Candidate pool with distinct prices, so the median is a specific
     /// candidate rather than an artifact of every price being equal.
@@ -2235,6 +2360,63 @@ mod tests {
         }
     }
 
+    /// The test-seam cap partitions like the production cap, floored at 3 —
+    /// a cap of 2 cannot partition odd totals into payable ≥2-leaf trees
+    /// (ADR-0003).
+    #[test]
+    fn merkle_batch_sizes_with_cap_partitions_and_clamps() {
+        // Small caps: rebalanced, every part payable (2..=cap), sums correct.
+        assert_eq!(merkle_batch_sizes_with_cap(6, 3), vec![3, 3]);
+        assert_eq!(merkle_batch_sizes_with_cap(7, 3), vec![3, 2, 2]);
+        assert_eq!(merkle_batch_sizes_with_cap(4, 3), vec![2, 2]);
+        // A cap below the floor clamps to 3 instead of emitting a 1-leaf part.
+        assert_eq!(merkle_batch_sizes_with_cap(5, 2), vec![3, 2]);
+        // A cap above MAX_LEAVES clamps down to the contract bound.
+        assert_eq!(
+            merkle_batch_sizes_with_cap(MAX_LEAVES + 1, MAX_LEAVES * 4),
+            vec![MAX_LEAVES - 1, 2]
+        );
+        // Exhaustive soundness under the smallest cap: parts within bounds,
+        // no 1-leaf part, exact cover.
+        for total in 2..200usize {
+            let sizes = merkle_batch_sizes_with_cap(total, 3);
+            assert_eq!(sizes.iter().sum::<usize>(), total, "cover for {total}");
+            assert!(
+                sizes.iter().all(|&s| (2..=3).contains(&s)),
+                "unpayable part for {total}: {sizes:?}"
+            );
+        }
+    }
+
+    /// The external multi-batch fold mirrors the wallet path: proofs union,
+    /// costs sum, and the merged timestamp is the OLDEST sub-batch's (worst
+    /// case for the expiry window).
+    #[test]
+    fn merge_merkle_batch_results_unions_proofs_and_keeps_oldest_timestamp() {
+        let a = MerkleBatchPaymentResult {
+            proofs: [([1u8; 32], vec![1u8])].into_iter().collect(),
+            chunk_count: 1,
+            storage_cost_atto: "100".into(),
+            gas_cost_wei: 7,
+            merkle_payment_timestamp: 2_000,
+        };
+        let b = MerkleBatchPaymentResult {
+            proofs: [([2u8; 32], vec![2u8]), ([3u8; 32], vec![3u8])]
+                .into_iter()
+                .collect(),
+            chunk_count: 2,
+            storage_cost_atto: "50".into(),
+            gas_cost_wei: 5,
+            merkle_payment_timestamp: 1_500,
+        };
+        let merged = merge_merkle_batch_results(vec![a, b]);
+        assert_eq!(merged.proofs.len(), 3);
+        assert_eq!(merged.chunk_count, 3);
+        assert_eq!(merged.storage_cost_atto, "150");
+        assert_eq!(merged.gas_cost_wei, 12);
+        assert_eq!(merged.merkle_payment_timestamp, 1_500);
+    }
+
     /// The defect: `[256, 1]` pays the first batch on-chain and then hands a
     /// single address to a tree that needs two, so the upload fails *after*
     /// spending. Every count must produce trees that can all be built.
@@ -2424,6 +2606,77 @@ mod tests {
         // Single attempt → all successes recorded in round 0.
         assert_eq!(outcome.stats.retries_histogram[0], 4);
         assert_eq!(outcome.stats.chunk_attempts_total, 6);
+    }
+
+    /// #167 regression, preserved at the engine seam the spill path composes
+    /// (`upload_merkle_from_spill` runs one single-attempt pass and then the
+    /// deferred rounds): a genuine quorum shortfall — every batch PAID, the
+    /// store short — survives all deferred retries with
+    /// `stored + failed == total` and the exact shortfall set in
+    /// `failed_addresses`, which is precisely what the spill path folds into
+    /// `Error::PartialUpload` instead of reporting success (#166).
+    #[tokio::test]
+    async fn quorum_shortfall_survives_deferred_retries_with_exact_accounting() {
+        let chunks = make_addrs(5);
+        let short: std::collections::HashSet<[u8; 32]> = chunks.iter().take(2).copied().collect();
+        let short_for_closure = short.clone();
+        let store_one = move |addr: [u8; 32]| {
+            let fail = short_for_closure.contains(&addr);
+            async move {
+                if fail {
+                    Err(Error::InsufficientPeers("still short of quorum".into()))
+                } else {
+                    Ok(std::time::Instant::now())
+                }
+            }
+        };
+
+        // Initial pass exactly as the spill path runs it: one attempt,
+        // shortfalls deferred rather than retried inline.
+        let pass = merkle_store_with_retry(
+            chunks.clone(),
+            || 8,
+            1,
+            Duration::ZERO,
+            None,
+            0,
+            5,
+            &store_one,
+        )
+        .await
+        .expect("quorum shortfalls must not abort the pass");
+        assert!(pass.fatal.is_none());
+        assert_eq!(pass.stored, 3);
+        assert_eq!(pass.failed, 2);
+
+        // Deferred rounds (zero delays for the test): the same chunks stay
+        // short through every round.
+        let dr = merkle_deferred_retry(
+            pass.failed_addresses.clone(),
+            &[0, 0, 0],
+            |n: usize| n.max(1),
+            None,
+            pass.stored,
+            5,
+            &store_one,
+        )
+        .await
+        .expect("deferred shortfalls must not abort");
+
+        assert!(dr.fatal.is_none());
+        assert_eq!(
+            dr.stored + dr.failed,
+            5,
+            "stored + failed must account for every chunk"
+        );
+        assert_eq!(dr.stored, 3, "paid-and-stored chunks must stay counted");
+        assert_eq!(dr.failed, 2);
+        let failed_set: std::collections::HashSet<[u8; 32]> =
+            dr.failed_addresses.iter().map(|(a, _)| *a).collect();
+        assert_eq!(
+            failed_set, short,
+            "failed set must be exactly the shortfall chunks"
+        );
     }
 
     /// V2-554: the store scheduler must RE-READ the cap as each slot frees
