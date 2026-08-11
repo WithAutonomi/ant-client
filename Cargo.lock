@@ -7644,3 +7644,8 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "saorsa-core"
+version = "0.26.4"
+source = "git+https://github.com/WithAutonomi/saorsa-core.git?branch=diagnostics%2Fv2-903-peer-route-classification#6be87a81f91a119d0761f9ce6f8ee69dec19edcc"
