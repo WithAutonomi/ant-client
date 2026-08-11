@@ -19,7 +19,8 @@ use crate::data::client::classify_error;
 use crate::data::client::merkle::{
     chunk_contents_for_upload_addresses, finalize_merkle_batch, merkle_batch_sizes,
     merkle_billable_leaves, merkle_deferred_retry, merkle_store_with_retry, should_use_merkle,
-    MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
+    MerkleBatchPaymentResult, MerkleStoreOutcome, PaymentMode, PreparedMerkleBatch,
+    DEFERRED_ROUND_DELAYS_SECS,
 };
 use crate::data::client::payment::SINGLE_NODE_PAYMENT_MULTIPLIER;
 use crate::data::client::Client;
@@ -699,6 +700,54 @@ fn partial_upload_after_fatal(
         spend: Box::new(spend),
         reason,
     }
+}
+
+/// Fold the external-signer merkle store outcome into the finalize result.
+///
+/// Chunks short of quorum after all retries surface as
+/// [`Error::PartialUpload`] — the same contract as the wave-batch finalize —
+/// never as an `Ok` whose `chunks_failed` the caller must remember to check
+/// (issue #166: every known caller took that `Ok` as success, reporting a
+/// paid but unretrievable file as complete). The external signer pays
+/// on-chain out-of-band, so the spend is unknown to the library on both the
+/// `Ok` and the `PartialUpload` arm ("0").
+fn merkle_finalize_result(
+    outcome: MerkleStoreOutcome,
+    already_stored_addresses: Vec<[u8; 32]>,
+    total_chunks: usize,
+    data_map: DataMap,
+    data_map_address: Option<[u8; 32]>,
+) -> Result<FileUploadResult> {
+    if outcome.failed > 0 {
+        let stored_count = outcome.stored;
+        let mut stored = already_stored_addresses;
+        stored.extend(outcome.stored_addresses);
+        return Err(Error::PartialUpload {
+            stored,
+            stored_count,
+            failed_count: outcome.failed,
+            failed: outcome.failed_addresses,
+            total_chunks,
+            spend: Box::new(PartialUploadSpend {
+                storage_cost_atto: "0".into(),
+                gas_cost_wei: 0,
+            }),
+            reason: "finalize_upload_merkle: chunk storage failed after retries".into(),
+        });
+    }
+    Ok(FileUploadResult {
+        data_map,
+        chunks_stored: outcome.stored,
+        chunks_failed: 0,
+        total_chunks,
+        payment_mode_used: PaymentMode::Merkle,
+        storage_cost_atto: "0".into(),
+        gas_cost_wei: 0,
+        data_map_address,
+        chunk_attempts_total: outcome.stats.chunk_attempts_total,
+        store_durations_ms: outcome.stats.store_durations_ms,
+        retries_histogram: outcome.stats.retries_histogram,
+    })
 }
 
 /// One wave's contribution to a single-node upload, distilled from its
@@ -1849,8 +1898,11 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if the prepared upload used wave-batch payment (use
-    /// [`Client::finalize_upload`] instead), proof generation fails,
-    /// or any chunk cannot be stored.
+    /// [`Client::finalize_upload`] instead) or proof generation fails.
+    /// Chunks still short of quorum after all retries surface as
+    /// [`Error::PartialUpload`] carrying the stored and failed addresses —
+    /// the same contract as [`Client::finalize_upload`]. Re-preparing the
+    /// same file skips chunks that are already stored.
     pub async fn finalize_upload_merkle(
         &self,
         prepared: PreparedUpload,
@@ -1900,19 +1952,13 @@ impl Client {
                     outcome.stored, outcome.failed
                 );
 
-                Ok(FileUploadResult {
-                    data_map: prepared.data_map,
-                    chunks_stored: outcome.stored,
-                    chunks_failed: outcome.failed,
+                merkle_finalize_result(
+                    outcome,
+                    prepared.already_stored_addresses,
                     total_chunks,
-                    payment_mode_used: PaymentMode::Merkle,
-                    storage_cost_atto: "0".into(),
-                    gas_cost_wei: 0,
+                    prepared.data_map,
                     data_map_address,
-                    chunk_attempts_total: outcome.stats.chunk_attempts_total,
-                    store_durations_ms: outcome.stats.store_durations_ms,
-                    retries_histogram: outcome.stats.retries_histogram,
-                })
+                )
             }
             ExternalPaymentInfo::WaveBatch { .. } => Err(Error::Payment(
                 "Cannot finalize wave-batch upload with merkle winner hash. \
@@ -3516,6 +3562,62 @@ mod tests {
             matches!(err, Error::InsufficientDiskSpace(_)),
             "expected InsufficientDiskSpace, got: {err}"
         );
+    }
+
+    /// Quorum shortfalls in the external-signer merkle finalize must surface
+    /// as `PartialUpload`, matching the wave-batch finalize — never as an `Ok`
+    /// whose `chunks_failed` the caller has to remember to check (issue #166).
+    #[test]
+    fn external_merkle_finalize_shortfall_is_partial_upload() {
+        let outcome = MerkleStoreOutcome {
+            // 3 includes one preflight carry-in, which has no address below.
+            stored: 3,
+            stored_addresses: vec![[2u8; 32], [3u8; 32]],
+            failed: 2,
+            failed_addresses: vec![
+                ([4u8; 32], "quorum shortfall".into()),
+                ([5u8; 32], "quorum shortfall".into()),
+            ],
+            ..Default::default()
+        };
+        let err = merkle_finalize_result(outcome, vec![[1u8; 32]], 5, DataMap::new(vec![]), None)
+            .unwrap_err();
+        match err {
+            Error::PartialUpload {
+                stored,
+                stored_count,
+                failed,
+                failed_count,
+                total_chunks,
+                ..
+            } => {
+                // Stored set = preflight carry-in + this pass's confirmations.
+                assert_eq!(stored, vec![[1u8; 32], [2u8; 32], [3u8; 32]]);
+                assert_eq!(stored_count, 3);
+                assert_eq!(failed_count, 2);
+                let failed_addrs: Vec<[u8; 32]> = failed.iter().map(|(a, _)| *a).collect();
+                assert_eq!(failed_addrs, vec![[4u8; 32], [5u8; 32]]);
+                assert_eq!(total_chunks, 5);
+            }
+            other => panic!("expected PartialUpload, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn external_merkle_finalize_full_success_is_ok() {
+        let outcome = MerkleStoreOutcome {
+            stored: 2,
+            stored_addresses: vec![[1u8; 32], [2u8; 32]],
+            ..Default::default()
+        };
+        let result =
+            merkle_finalize_result(outcome, vec![], 2, DataMap::new(vec![]), Some([9u8; 32]))
+                .unwrap();
+        assert_eq!(result.chunks_stored, 2);
+        assert_eq!(result.chunks_failed, 0);
+        assert_eq!(result.total_chunks, 2);
+        assert!(matches!(result.payment_mode_used, PaymentMode::Merkle));
+        assert_eq!(result.data_map_address, Some([9u8; 32]));
     }
 
     #[test]
