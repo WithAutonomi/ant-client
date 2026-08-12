@@ -11,22 +11,22 @@
 //! threaded through the file/chunk download path is `None`, so record
 //! construction is skipped entirely (no allocation, no I/O).
 //!
-//! # Transport route honesty
+//! # Schema v2: transport route classification
 //!
-//! `ant-protocol`'s `send_and_await_chunk_response` matches the response
-//! `P2PEvent::Message` on `topic` and `source` peer but discards the event's
-//! `transport_source` (the match arm uses `..`). That field is therefore not
-//! surfaced to the client's chunk-fetch path, so this branch cannot classify
-//! the route of an *observed* response against the peer's typed DHT
-//! addresses. Per the design doc, we record `route: "unknown"` with an
-//! explicit `route_note` rather than fabricate a route from the *expected*
-//! peer addresses as if it were observed. True route classification requires
-//! `send_and_await_chunk_response` (or a sibling helper) to surface
-//! `transport_source`, which is a larger `ant-protocol` change left for a
-//! follow-up. The pure classifier lives in `saorsa-core`
-//! (`classify_peer_route_from_typed`) and is already unit-tested there; it is
-//! not re-exported by `ant-protocol` 2.3.1, so `ant-core` cannot name it
-//! without breaking the ONE-pin policy.
+//! The `ant-protocol` diagnostic branch
+//! `diagnostics/v2-903-response-transport-metadata` exposes
+//! `send_and_await_chunk_response_with_metadata`, which returns a
+//! `ChunkProtocolResponse { result, source_peer, transport_source }`. The
+//! `saorsa-core` branch `diagnostics/v2-903-peer-route-classification`
+//! exposes `P2PNode::classify_peer_transport_route(expected_peer,
+//! transport_source)` returning a `PeerRouteKind`
+//! (`direct`/`relay`/`lan`/`unverified`/`unknown`). Schema v2 records the
+//! *actual* `source_peer` and `transport_source` from the observed response,
+//! classifies the route from the actual transport source against the peer's
+//! typed DHT addresses, and attaches a `route_note` only when the route is
+//! `unknown`. A `peer_connected_before_request` sample
+//! (`node.is_peer_connected(peer)` called before the send) and an adaptive
+//! `fetch_cap` snapshot are included on every record.
 //!
 //! # TTFB limitation
 //!
@@ -48,7 +48,7 @@ use serde::Serialize;
 use tracing::{error, warn};
 
 /// Current diagnostic record schema discriminator.
-pub const DIAGNOSTICS_SCHEMA_VERSION: u8 = 1;
+pub const DIAGNOSTICS_SCHEMA_VERSION: u8 = 2;
 
 /// Bounded capacity of the diagnostics channel. A slow writer must not create
 /// unbounded memory growth: when full, further records are dropped (counted
@@ -127,10 +127,17 @@ impl Serialize for DownloadDiagnosticsOutcome {
 /// `null` for a cache hit, which has no peer).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct DownloadDiagnosticsRecord {
-    /// Stable schema discriminator, currently `1`.
+    /// Stable schema discriminator, currently `2`.
     pub schema_version: u8,
     /// UTC time the attempt completed, RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
     pub timestamp: String,
+    /// Wall-clock Unix time immediately before the peer request, in
+    /// milliseconds. Together with `request_completed_unix_ms`, this permits
+    /// request overlap to be reconstructed against fleet telemetry.
+    pub request_started_unix_ms: Option<u64>,
+    /// Wall-clock Unix time immediately after the peer request completed, in
+    /// milliseconds. `None` for chunk-level records.
+    pub request_completed_unix_ms: Option<u64>,
     /// Outer file / deferred-retry attempt number (1 = first pass).
     pub file_attempt: usize,
     /// Chunk index within the file (1-based, matching the progress reports).
@@ -148,21 +155,31 @@ pub struct DownloadDiagnosticsRecord {
     /// Peer selected by the DHT lookup for this attempt; `None` for chunk-level
     /// records.
     pub expected_peer: Option<String>,
-    /// Peer identified by the received protocol response; `None` when no
-    /// response was received (timeout / send failure) or for chunk-level
-    /// records.
+    /// Authenticated peer that supplied the matching response, from the
+    /// `ChunkProtocolResponse` metadata; `None` when no response was received
+    /// (timeout / send failure) or for chunk-level records.
     pub source_peer: Option<String>,
-    /// Actual response event transport `MultiAddr`. Not surfaced by
-    /// `send_and_await_chunk_response` in `ant-protocol` 2.3.1, so always
-    /// `null` in this branch.
+    /// Transport address that delivered the response, from the
+    /// `ChunkProtocolResponse` metadata; `None` when no response was received
+    /// or for chunk-level records.
     pub transport_source: Option<String>,
-    /// `direct`, `relay`, `lan`, `unverified`, or `unknown`. Always `unknown`
-    /// in this branch because `transport_source` is not surfaced; see
-    /// [`DownloadDiagnosticsRecord::route_note`].
+    /// `direct`, `relay`, `lan`, `unverified`, or `unknown`, classified from
+    /// the actual transport source via
+    /// `P2PNode::classify_peer_transport_route`. `unknown` for chunk-level
+    /// records with no peer.
     pub route: String,
     /// Why `route` is `unknown` when that is the case; `None` once a real
-    /// transport source is classified.
+    /// transport source is classified, and for chunk-level records.
     pub route_note: Option<String>,
+    /// Whether `node.is_peer_connected(peer)` returned `true` when sampled
+    /// before the send; `None` for chunk-level records.
+    pub peer_connected_before_request: Option<bool>,
+    /// Number of diagnostics-enabled peer requests active in this process
+    /// immediately after this request entered the active set.
+    pub active_requests_at_start: Option<usize>,
+    /// Adaptive fetch concurrency cap snapshot at the time of this record;
+    /// `None` when diagnostics are disabled (never emitted in that case).
+    pub fetch_cap: Option<usize>,
     /// Elapsed time until the complete response was reassembled and
     /// delivered; `None` for chunk-level records with no peer attempt.
     pub response_elapsed_ms: Option<u64>,
@@ -188,15 +205,16 @@ impl DownloadDiagnosticsRecord {
         "protocol exposes only a complete-response event; first-byte/first-frame \
          timing is not available";
 
-    /// The shared route-unknown note used by every peer-attempt record in this
-    /// branch.
+    /// The shared route-unknown note used when `classify_peer_transport_route`
+    /// returns `Unknown`: the transport source was absent (no response) or did
+    /// not match any known typed peer dial address.
     pub const ROUTE_UNKNOWN_NOTE: &'static str =
-        "transport_source is not surfaced by ant-protocol \
-         send_and_await_chunk_response; route cannot be classified from an \
-         observed response and is not inferred from expected peer addresses";
+        "transport_source absent or did not match any known typed peer dial address; \
+         route could not be classified from the observed response";
 
     /// Build a peer-attempt record. `lookup_duration_ms` is attached only when
     /// this is the first peer attempt of the sweep (`peer_attempt == 1`).
+    /// `route_note` should be `Some` only when `route` is `"unknown"`.
     #[allow(clippy::too_many_arguments)]
     pub fn peer_attempt(
         file_attempt: usize,
@@ -207,6 +225,14 @@ impl DownloadDiagnosticsRecord {
         lookup_duration_ms: Option<u64>,
         expected_peer: &str,
         source_peer: Option<&str>,
+        transport_source: Option<&str>,
+        route: &str,
+        route_note: Option<&str>,
+        peer_connected_before_request: Option<bool>,
+        active_requests_at_start: Option<usize>,
+        fetch_cap: Option<usize>,
+        request_started_unix_ms: u64,
+        request_completed_unix_ms: u64,
         response_elapsed_ms: u64,
         bytes: u64,
         outcome: DownloadDiagnosticsOutcome,
@@ -220,6 +246,8 @@ impl DownloadDiagnosticsRecord {
         Self {
             schema_version: DIAGNOSTICS_SCHEMA_VERSION,
             timestamp: utc_now_rfc3339(),
+            request_started_unix_ms: Some(request_started_unix_ms),
+            request_completed_unix_ms: Some(request_completed_unix_ms),
             file_attempt,
             chunk_index,
             chunk_address: hex::encode(chunk_address),
@@ -228,9 +256,12 @@ impl DownloadDiagnosticsRecord {
             lookup_duration_ms: lookup,
             expected_peer: Some(expected_peer.to_string()),
             source_peer: source_peer.map(str::to_string),
-            transport_source: None,
-            route: "unknown".to_string(),
-            route_note: Some(Self::ROUTE_UNKNOWN_NOTE.to_string()),
+            transport_source: transport_source.map(str::to_string),
+            route: route.to_string(),
+            route_note: route_note.map(str::to_string),
+            peer_connected_before_request,
+            active_requests_at_start,
+            fetch_cap,
             response_elapsed_ms: Some(response_elapsed_ms),
             ttfb_ms: None,
             ttfb_available: false,
@@ -243,11 +274,13 @@ impl DownloadDiagnosticsRecord {
 
     /// Build a chunk-level record (no peer attempt): cache hit, lookup error,
     /// or exhausted peer set.
+    #[allow(clippy::too_many_arguments)]
     pub fn chunk_level(
         file_attempt: usize,
         chunk_index: usize,
         chunk_address: &[u8; 32],
         sweep: &'static str,
+        fetch_cap: Option<usize>,
         bytes: u64,
         outcome: DownloadDiagnosticsOutcome,
         error: Option<String>,
@@ -255,6 +288,8 @@ impl DownloadDiagnosticsRecord {
         Self {
             schema_version: DIAGNOSTICS_SCHEMA_VERSION,
             timestamp: utc_now_rfc3339(),
+            request_started_unix_ms: None,
+            request_completed_unix_ms: None,
             file_attempt,
             chunk_index,
             chunk_address: hex::encode(chunk_address),
@@ -266,6 +301,9 @@ impl DownloadDiagnosticsRecord {
             transport_source: None,
             route: "unknown".to_string(),
             route_note: None,
+            peer_connected_before_request: None,
+            active_requests_at_start: None,
+            fetch_cap,
             response_elapsed_ms: None,
             ttfb_ms: None,
             ttfb_available: false,
@@ -387,6 +425,17 @@ fn utc_now_rfc3339() -> String {
     rfc3339_from_unix_secs(now.as_secs())
 }
 
+/// Current wall-clock Unix time in milliseconds for joining request windows
+/// to external fleet telemetry. Saturates if the platform clock representation
+/// exceeds `u64`.
+pub(crate) fn unix_now_ms() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
 /// Convert Unix epoch seconds to an RFC 3339 UTC string.
 ///
 /// Uses the well-known civil-from-days algorithm (Howard Hinnant). No leap
@@ -456,17 +505,27 @@ mod tests {
             Some(42),
             "peer-abc",
             Some("peer-abc"),
+            Some("/ip4/1.2.3.4/udp/9000/quic"),
+            "direct",
+            None,
+            Some(true),
+            Some(8),
+            Some(8),
             120,
+            1024,
+            904,
             1024,
             DownloadDiagnosticsOutcome::Found,
             None,
         );
         let json = serde_json::to_value(&record).unwrap();
         let obj = json.as_object().unwrap();
-        // Pin field names.
+        // Pin field names — schema v2.
         for field in [
             "schema_version",
             "timestamp",
+            "request_started_unix_ms",
+            "request_completed_unix_ms",
             "file_attempt",
             "chunk_index",
             "chunk_address",
@@ -478,6 +537,9 @@ mod tests {
             "transport_source",
             "route",
             "route_note",
+            "peer_connected_before_request",
+            "active_requests_at_start",
+            "fetch_cap",
             "response_elapsed_ms",
             "ttfb_ms",
             "ttfb_available",
@@ -498,19 +560,29 @@ mod tests {
                 .contains("first-byte"),
             "ttfb reason must mention first-byte"
         );
-        // Route honesty.
-        assert_eq!(obj["route"], serde_json::Value::String("unknown".into()));
-        assert!(
-            obj["route_note"].as_str().is_some(),
-            "first peer attempt must carry a route_note"
+        // Route classified from actual transport source.
+        assert_eq!(obj["route"], serde_json::Value::String("direct".into()));
+        assert_eq!(obj["route_note"], serde_json::Value::Null);
+        // Actual source_peer and transport_source from response metadata.
+        assert_eq!(obj["source_peer"], serde_json::json!("peer-abc"));
+        assert_eq!(
+            obj["transport_source"],
+            serde_json::json!("/ip4/1.2.3.4/udp/9000/quic")
         );
+        // Request bounds, active count, peer state, and fetch cap sampled.
+        assert_eq!(obj["request_started_unix_ms"], serde_json::json!(120u64));
+        assert_eq!(obj["request_completed_unix_ms"], serde_json::json!(1024u64));
+        assert_eq!(obj["active_requests_at_start"], serde_json::json!(8usize));
+        assert_eq!(
+            obj["peer_connected_before_request"],
+            serde_json::json!(true)
+        );
+        assert_eq!(obj["fetch_cap"], serde_json::json!(8usize));
         // First peer attempt carries the lookup duration.
         assert_eq!(obj["lookup_duration_ms"], serde_json::json!(42u64));
         assert_eq!(obj["bytes"], serde_json::json!(1024u64));
         assert_eq!(obj["outcome"], serde_json::json!("found"));
-        // transport_source is null (not surfaced).
-        assert_eq!(obj["transport_source"], serde_json::Value::Null);
-        assert_eq!(obj["schema_version"], serde_json::json!(1u8));
+        assert_eq!(obj["schema_version"], serde_json::json!(2u8));
         assert_eq!(
             obj["chunk_address"],
             serde_json::Value::String(hex::encode(addr))
@@ -518,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn later_peer_attempt_omits_lookup_duration_but_explains_unknown_route() {
+    fn later_peer_attempt_omits_lookup_duration_and_carries_route_note_when_unknown() {
         let addr = [9u8; 32];
         let record = DownloadDiagnosticsRecord::peer_attempt(
             1,
@@ -528,7 +600,16 @@ mod tests {
             3,
             Some(10),
             "peer-x",
+            // No response → no source_peer, no transport_source.
             None,
+            None,
+            "unknown",
+            Some(DownloadDiagnosticsRecord::ROUTE_UNKNOWN_NOTE),
+            Some(false),
+            Some(4),
+            Some(4),
+            500,
+            1_000,
             500,
             0,
             DownloadDiagnosticsOutcome::Timeout,
@@ -542,6 +623,14 @@ mod tests {
             serde_json::json!(DownloadDiagnosticsRecord::ROUTE_UNKNOWN_NOTE)
         );
         assert_eq!(obj["source_peer"], serde_json::Value::Null);
+        assert_eq!(obj["transport_source"], serde_json::Value::Null);
+        assert_eq!(obj["route"], serde_json::json!("unknown"));
+        assert_eq!(
+            obj["peer_connected_before_request"],
+            serde_json::json!(false)
+        );
+        assert_eq!(obj["active_requests_at_start"], serde_json::json!(4usize));
+        assert_eq!(obj["fetch_cap"], serde_json::json!(4usize));
         assert_eq!(obj["outcome"], serde_json::json!("timeout"));
         assert_eq!(obj["bytes"], serde_json::json!(0u64));
         assert!(obj["error"].as_str().unwrap().starts_with("timeout: "));
@@ -555,6 +644,7 @@ mod tests {
             2,
             &addr,
             "initial",
+            Some(8),
             4096,
             DownloadDiagnosticsOutcome::CacheHit,
             None,
@@ -564,8 +654,19 @@ mod tests {
         assert_eq!(obj["peer_attempt"], serde_json::Value::Null);
         assert_eq!(obj["expected_peer"], serde_json::Value::Null);
         assert_eq!(obj["source_peer"], serde_json::Value::Null);
+        assert_eq!(obj["transport_source"], serde_json::Value::Null);
         assert_eq!(obj["lookup_duration_ms"], serde_json::Value::Null);
         assert_eq!(obj["response_elapsed_ms"], serde_json::Value::Null);
+        assert_eq!(
+            obj["peer_connected_before_request"],
+            serde_json::Value::Null
+        );
+        assert_eq!(obj["request_started_unix_ms"], serde_json::Value::Null);
+        assert_eq!(obj["request_completed_unix_ms"], serde_json::Value::Null);
+        assert_eq!(obj["active_requests_at_start"], serde_json::Value::Null);
+        assert_eq!(obj["fetch_cap"], serde_json::json!(8usize));
+        assert_eq!(obj["route"], serde_json::json!("unknown"));
+        assert_eq!(obj["route_note"], serde_json::Value::Null);
         assert_eq!(obj["outcome"], serde_json::json!("cache_hit"));
         assert_eq!(obj["bytes"], serde_json::json!(4096u64));
     }
@@ -578,6 +679,7 @@ mod tests {
             5,
             &addr,
             "retry",
+            Some(2),
             0,
             DownloadDiagnosticsOutcome::Exhausted,
             None,
@@ -592,6 +694,7 @@ mod tests {
             5,
             &addr,
             "initial",
+            Some(2),
             0,
             DownloadDiagnosticsOutcome::LookupError,
             Some(bounded_error("lookup", "DHT returned no peers")),
@@ -659,6 +762,7 @@ mod tests {
             1,
             &addr,
             "initial",
+            Some(8),
             128,
             DownloadDiagnosticsOutcome::CacheHit,
             None,
@@ -672,6 +776,14 @@ mod tests {
             Some(5),
             "peer-z",
             Some("peer-z"),
+            Some("/ip4/1.2.3.4/udp/9000/quic"),
+            "direct",
+            None,
+            Some(true),
+            Some(8),
+            Some(8),
+            30,
+            60,
             30,
             128,
             DownloadDiagnosticsOutcome::Found,
@@ -689,9 +801,15 @@ mod tests {
         );
         let first = serde_json::from_str::<serde_json::Value>(lines[0]).unwrap();
         assert_eq!(first["outcome"], serde_json::json!("cache_hit"));
+        assert_eq!(first["schema_version"], serde_json::json!(2u8));
         let second = serde_json::from_str::<serde_json::Value>(lines[1]).unwrap();
         assert_eq!(second["outcome"], serde_json::json!("found"));
-        assert_eq!(second["route"], serde_json::json!("unknown"));
+        assert_eq!(second["route"], serde_json::json!("direct"));
+        assert_eq!(second["route_note"], serde_json::Value::Null);
+        assert_eq!(
+            second["transport_source"],
+            serde_json::json!("/ip4/1.2.3.4/udp/9000/quic")
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

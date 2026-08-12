@@ -2996,10 +2996,15 @@ impl Client {
             // chunk. When diagnostics are enabled we thread a per-chunk
             // diagnostics context through so each peer attempt in the sweep
             // is recorded; when disabled (`None`) this is a zero-cost pass.
-            let diag = context
-                .diagnostics
-                .as_ref()
-                .map(|sender| ChunkFetchDiagnostics::new(sender, attempt, idx + 1, addr));
+            let diag = context.diagnostics.as_ref().map(|sender| {
+                ChunkFetchDiagnostics::new(
+                    sender,
+                    attempt,
+                    idx + 1,
+                    addr,
+                    self.controller().fetch.current(),
+                )
+            });
             match self
                 .chunk_get_observed_from_closest_peers(&addr, context.peer_count, diag.as_ref())
                 .await
