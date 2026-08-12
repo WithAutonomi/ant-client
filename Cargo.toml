@@ -2,7 +2,10 @@
 members = ["ant-core", "ant-cli"]
 resolver = "2"
 
-# Temporary V2-903 diagnostic override. ant-core retains its ONE-pin policy and
-# does not depend on saorsa-core directly; ant-protocol resolves this transitively.
+# Temporary stacked V2-903 diagnostic overrides. Remove these after
+# WithAutonomi/saorsa-core#162 and WithAutonomi/ant-protocol#32 are released.
+# ant-core retains its ONE-pin policy and does not depend on saorsa-core
+# directly; ant-protocol resolves it transitively.
 [patch.crates-io]
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core.git", branch = "diagnostics/v2-903-peer-route-classification" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol.git", branch = "feat/v2-903-response-transport-metadata" }
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core.git", branch = "feat/v2-903-download-route-diagnostics" }

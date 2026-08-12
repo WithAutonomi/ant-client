@@ -25,8 +25,9 @@ Each record contains:
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | Stable schema discriminator, initially `1` |
+| `schema_version` | Stable schema discriminator; `2` for transport metadata and correlation timestamps |
 | `timestamp` | UTC time when the attempt completed |
+| `request_started_unix_ms` / `request_completed_unix_ms` | Exact peer-request wall-clock bounds for joining to retained fleet telemetry and reconstructing overlap |
 | `file_attempt` | Outer file/deferred-retry attempt number |
 | `chunk_index` / `chunk_address` | Chunk identity within the file |
 | `sweep` | Initial or internal retry sweep |
@@ -36,6 +37,10 @@ Each record contains:
 | `source_peer` | Peer identified by the received protocol response |
 | `transport_source` | Actual response event transport MultiAddr, when available |
 | `route` | `direct`, `relay`, `lan`, `unverified`, or `unknown`, classified from the actual transport source against typed DHT addresses |
+| `route_note` | Explanation only when the route is `unknown` |
+| `peer_connected_before_request` | Connection-state sample immediately before the send |
+| `active_requests_at_start` | Process-local diagnostics-enabled peer requests active when this request entered the active set |
+| `fetch_cap` | Adaptive fetch-concurrency cap snapshot for the chunk fetch |
 | `response_elapsed_ms` | Elapsed time until the complete response was reassembled and delivered |
 | `ttfb_ms` | `null` until the protocol exposes a first-byte/first-frame event |
 | `ttfb_available` / `ttfb_unavailable_reason` | Explicitly prevents complete-response latency being presented as TTFB |
@@ -47,7 +52,11 @@ A cache hit is a chunk-level record without a source peer or transport route. Lo
 
 ## Transport classification
 
-`saorsa-core` supplies a small public route-classification API on `P2PNode`. It classifies the actual `P2PEvent::Message.transport_source` against the peer's typed DHT addresses. It must not infer route type from address-list position or from the expected destination address.
+`ant-protocol` supplies the authenticated response peer and actual
+`P2PEvent::Message.transport_source`. `saorsa-core` supplies a small public
+route-classification API on `P2PNode`. The client classifies the actual source
+against that response peer's typed DHT addresses. It must not infer route type
+from address-list position or from the expected destination address.
 
 ## TTFB limitation
 

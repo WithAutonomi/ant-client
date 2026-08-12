@@ -6,26 +6,48 @@
 use crate::data::client::adaptive::Outcome;
 use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
 use crate::data::client::diagnostics::{
-    bounded_error, DownloadDiagnosticsOutcome, DownloadDiagnosticsRecord, DownloadDiagnosticsSender,
+    bounded_error, unix_now_ms, DownloadDiagnosticsOutcome, DownloadDiagnosticsRecord,
+    DownloadDiagnosticsSender,
 };
 use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{QuoteHash, TxHash};
-use ant_protocol::transport::{MultiAddr, PeerId};
+use ant_protocol::transport::{MultiAddr, PeerId, PeerRouteKind};
 use ant_protocol::{
-    compute_address, detect_proof_type, send_and_await_chunk_response, ChunkGetRequest,
-    ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, DataChunk,
+    compute_address, detect_proof_type, send_and_await_chunk_response,
+    send_and_await_chunk_response_with_metadata, ChunkGetRequest, ChunkGetResponse, ChunkMessage,
+    ChunkMessageBody, ChunkProtocolResponse, ChunkPutRequest, ChunkPutResponse, DataChunk,
     ProofType, ProtocolError, XorName, CLOSE_GROUP_MAJORITY,
 };
 use bytes::Bytes;
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Data type identifier for chunks (used in quote requests).
 const CHUNK_DATA_TYPE: u32 = 0;
+
+/// Number of diagnostics-enabled peer requests currently in flight in this
+/// process. The counter is untouched when runtime diagnostics are disabled.
+static ACTIVE_DIAGNOSTIC_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+struct ActiveDiagnosticRequestGuard;
+
+impl ActiveDiagnosticRequestGuard {
+    fn enter() -> (Self, usize) {
+        let active = ACTIVE_DIAGNOSTIC_REQUESTS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        (Self, active)
+    }
+}
+
+impl Drop for ActiveDiagnosticRequestGuard {
+    fn drop(&mut self) {
+        ACTIVE_DIAGNOSTIC_REQUESTS.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+}
 
 /// Why a single-peer PUT was declined. Drives the surfaced aggregate error
 /// and keeps the store AIMD limiter honest — only genuine local backpressure
@@ -210,6 +232,7 @@ pub(crate) struct ChunkFetchDiagnostics<'a> {
     file_attempt: usize,
     chunk_index: usize,
     chunk_address: [u8; 32],
+    fetch_cap: usize,
 }
 
 impl<'a> ChunkFetchDiagnostics<'a> {
@@ -218,12 +241,14 @@ impl<'a> ChunkFetchDiagnostics<'a> {
         file_attempt: usize,
         chunk_index: usize,
         chunk_address: [u8; 32],
+        fetch_cap: usize,
     ) -> Self {
         Self {
             sender,
             file_attempt,
             chunk_index,
             chunk_address,
+            fetch_cap,
         }
     }
 
@@ -237,6 +262,12 @@ impl<'a> ChunkFetchDiagnostics<'a> {
         lookup_duration_ms: Option<u64>,
         expected_peer: &PeerId,
         source_peer: Option<&PeerId>,
+        transport_source: Option<&MultiAddr>,
+        route: PeerRouteKind,
+        peer_connected_before_request: bool,
+        active_requests_at_start: usize,
+        request_started_unix_ms: u64,
+        request_completed_unix_ms: u64,
         response_elapsed_ms: u64,
         bytes: u64,
         outcome: DownloadDiagnosticsOutcome,
@@ -251,7 +282,16 @@ impl<'a> ChunkFetchDiagnostics<'a> {
                 peer_attempt,
                 lookup_duration_ms,
                 &expected_peer.to_string(),
-                source_peer.map(|p| p.to_string()).as_deref(),
+                source_peer.map(ToString::to_string).as_deref(),
+                transport_source.map(ToString::to_string).as_deref(),
+                route.as_str(),
+                (route == PeerRouteKind::Unknown)
+                    .then_some(DownloadDiagnosticsRecord::ROUTE_UNKNOWN_NOTE),
+                Some(peer_connected_before_request),
+                Some(active_requests_at_start),
+                Some(self.fetch_cap),
+                request_started_unix_ms,
+                request_completed_unix_ms,
                 response_elapsed_ms,
                 bytes,
                 outcome,
@@ -272,6 +312,7 @@ impl<'a> ChunkFetchDiagnostics<'a> {
             self.chunk_index,
             &self.chunk_address,
             sweep,
+            Some(self.fetch_cap),
             bytes,
             outcome,
             error,
@@ -976,30 +1017,69 @@ impl Client {
 
         for (peer_attempt, (peer, addrs)) in peers.iter().enumerate() {
             let peer_attempt_no = peer_attempt + 1;
-            let resp_start = Instant::now();
-            let result = self.chunk_get_from_peer(address, peer, addrs).await;
-            let response_elapsed_ms =
-                u64::try_from(resp_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            if let Some(diag) = diag {
-                let (outcome, bytes, got_response, error) = classify_peer_attempt(&result);
+            let result = if let Some(diag) = diag {
+                let node = self.network().node();
+                let peer_connected_before_request = node.is_peer_connected(peer).await;
+                let (active_guard, active_requests_at_start) =
+                    ActiveDiagnosticRequestGuard::enter();
+                let request_started_unix_ms = unix_now_ms();
+                let resp_start = Instant::now();
+                let observed = self
+                    .chunk_get_from_peer_with_metadata(address, peer, addrs)
+                    .await;
+                let response_elapsed_ms =
+                    u64::try_from(resp_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let request_completed_unix_ms = unix_now_ms();
+                // Count only the network request itself; route classification
+                // and sidecar emission are diagnostic bookkeeping.
+                drop(active_guard);
+
+                let (result, source_peer, transport_source, route) = match observed {
+                    Ok(response) => {
+                        let route = node
+                            .classify_peer_transport_route(
+                                &response.source_peer,
+                                response.transport_source.as_ref(),
+                            )
+                            .await;
+                        (
+                            response.result,
+                            Some(response.source_peer),
+                            response.transport_source,
+                            route,
+                        )
+                    }
+                    Err(error) => (Err(error), None, None, PeerRouteKind::Unknown),
+                };
+                let (outcome, bytes, _got_response, error) = classify_peer_attempt(&result);
                 let lookup = if peer_attempt_no == 1 {
                     lookup_duration_opt
                 } else {
                     None
                 };
-                let source_peer = if got_response { Some(peer) } else { None };
                 diag.emit_peer_attempt(
                     sweep,
                     peer_attempt_no,
                     lookup,
                     peer,
-                    source_peer,
+                    source_peer.as_ref(),
+                    transport_source.as_ref(),
+                    route,
+                    peer_connected_before_request,
+                    active_requests_at_start,
+                    request_started_unix_ms,
+                    request_completed_unix_ms,
                     response_elapsed_ms,
                     bytes,
                     outcome,
                     error,
                 );
-            }
+                result
+            } else {
+                // Preserve the existing request path exactly when diagnostics
+                // are disabled: no metadata lookup, clock read, or counter.
+                self.chunk_get_from_peer(address, peer, addrs).await
+            };
             match result {
                 Ok(Some(chunk)) => {
                     return Ok(CloseGroupOutcome {
@@ -1220,6 +1300,79 @@ impl Client {
         .await;
 
         result
+    }
+
+    /// Diagnostics-only variant of [`Self::chunk_get_from_peer`] that retains
+    /// the authenticated response peer and observed transport source. Request
+    /// construction, validation, timeouts, and error mapping mirror the normal
+    /// helper exactly.
+    async fn chunk_get_from_peer_with_metadata(
+        &self,
+        address: &XorName,
+        peer: &PeerId,
+        peer_addrs: &[MultiAddr],
+    ) -> Result<ChunkProtocolResponse<Option<DataChunk>, Error>> {
+        let node = self.network().node();
+        let request_id = self.next_request_id();
+        let request = ChunkGetRequest::new(*address);
+        let message = ChunkMessage {
+            request_id,
+            body: ChunkMessageBody::GetRequest(request),
+        };
+        let message_bytes = message
+            .encode()
+            .map_err(|e| Error::Protocol(format!("Failed to encode GET request: {e}")))?;
+
+        let timeout = Duration::from_secs(self.config().chunk_get_timeout_secs);
+        let addr_hex = hex::encode(address);
+        let timeout_secs = self.config().chunk_get_timeout_secs;
+
+        send_and_await_chunk_response_with_metadata(
+            node,
+            peer,
+            message_bytes,
+            request_id,
+            timeout,
+            peer_addrs,
+            |body| match body {
+                ChunkMessageBody::GetResponse(ChunkGetResponse::Success {
+                    address: addr,
+                    content,
+                }) => {
+                    if addr != *address {
+                        return Some(Err(Error::InvalidData(format!(
+                            "Mismatched chunk address: expected {addr_hex}, got {}",
+                            hex::encode(addr)
+                        ))));
+                    }
+                    let computed = compute_address(&content);
+                    if computed != addr {
+                        return Some(Err(Error::InvalidData(format!(
+                            "Invalid chunk content: expected hash {addr_hex}, got {}",
+                            hex::encode(computed)
+                        ))));
+                    }
+                    debug!(
+                        "Retrieved chunk {} ({} bytes) from peer {peer}",
+                        hex::encode(addr),
+                        content.len()
+                    );
+                    Some(Ok(Some(DataChunk::new(addr, Bytes::from(content)))))
+                }
+                ChunkMessageBody::GetResponse(ChunkGetResponse::NotFound { .. }) => Some(Ok(None)),
+                ChunkMessageBody::GetResponse(ChunkGetResponse::Error(e)) => Some(Err(
+                    Error::Protocol(format!("Remote GET error for {addr_hex}: {e}")),
+                )),
+                _ => None,
+            },
+            |e| Error::Network(format!("Failed to send GET to peer {peer}: {e}")),
+            || {
+                Error::Timeout(format!(
+                    "Timeout waiting for chunk {addr_hex} from {peer} after {timeout_secs}s"
+                ))
+            },
+        )
+        .await
     }
 
     /// Check if a chunk exists on the network.

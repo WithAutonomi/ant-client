@@ -944,8 +944,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd13dd1f51e3e9b3e871673b7d52a65054c9431b0656f4fa9589098126c3dafd"
+source = "git+https://github.com/WithAutonomi/ant-protocol.git?branch=feat%2Fv2-903-response-transport-metadata#92ef6bcff04c98988f59c183dba39fe99d3492ca"
 dependencies = [
  "blake3",
  "bytes",
@@ -1908,7 +1907,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -3305,7 +3304,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -5250,8 +5249,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.27.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5929d77d38c0ffb422393a2420f9d2f9ecd92deaa9859b3bfbbe58bada68e40a"
+source = "git+https://github.com/WithAutonomi/saorsa-core.git?branch=feat%2Fv2-903-download-route-diagnostics#53ec4ba02144c142c666aed0e2e59cf82c4295f2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6872,7 +6870,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -7644,8 +7642,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "saorsa-core"
-version = "0.26.4"
-source = "git+https://github.com/WithAutonomi/saorsa-core.git?branch=diagnostics%2Fv2-903-peer-route-classification#6be87a81f91a119d0761f9ce6f8ee69dec19edcc"
