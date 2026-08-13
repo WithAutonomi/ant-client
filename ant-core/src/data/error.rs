@@ -99,6 +99,18 @@ pub enum Error {
     #[error("insufficient peers: {0}")]
     InsufficientPeers(String),
 
+    /// The network refused to quote this client because it settles payments
+    /// under superseded rules.
+    ///
+    /// Deliberately terminal. A client that reaches this would pay an amount
+    /// every storer rejects, and merkle payments are not refundable, so
+    /// retrying or falling back to an older request shape would convert a
+    /// clean refusal into destroyed money. The message is the storer's own
+    /// wording, which already tells the user how to upgrade and that nothing
+    /// has been charged.
+    #[error("{0}")]
+    ClientUpdateRequired(String),
+
     /// BLS signature verification failed.
     #[error("signature verification failed: {0}")]
     SignatureVerification(String),

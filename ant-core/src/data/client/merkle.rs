@@ -23,7 +23,8 @@ use ant_protocol::payment::{
 use ant_protocol::transport::PeerId;
 use ant_protocol::{
     compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
-    MerkleCandidateQuoteRequest, MerkleCandidateQuoteResponse,
+    MerkleCandidateQuoteRequest, MerkleCandidateQuoteRequestV2, MerkleCandidateQuoteResponse,
+    ProtocolError,
 };
 use bytes::Bytes;
 use futures::stream::{self, FuturesUnordered, StreamExt};
@@ -160,6 +161,54 @@ fn pool_commitment_with_payment_multiplier(
         })?;
     }
     Ok(commitment)
+}
+
+/// Turn a merkle candidate quote response into the candidate it carries, or
+/// the error that explains why there is none.
+///
+/// Shared by the versioned request and its legacy retry so the two cannot
+/// interpret the same response differently.
+///
+/// `ClientUpdateRequired` is lifted out of the generic protocol-error case
+/// deliberately. It is the one rejection that is about this client rather than
+/// about this request, it already carries wording aimed at the person running
+/// the upload, and it must not be retried in a shape that would get a quote
+/// anyway.
+fn map_merkle_candidate_response(
+    peer_id: PeerId,
+    body: ChunkMessageBody,
+) -> Option<Result<(MerklePaymentCandidateNode, Option<Vec<u8>>)>> {
+    match body {
+        ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Success {
+            candidate_node,
+            commitment,
+        }) => match rmp_serde::from_slice::<MerklePaymentCandidateNode>(&candidate_node) {
+            Ok(node) => Some(Ok((node, commitment))),
+            Err(e) => Some(Err(Error::Serialization(format!(
+                "Failed to deserialize candidate node from {peer_id}: {e}"
+            )))),
+        },
+        ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(
+            refusal @ ProtocolError::ClientUpdateRequired { .. },
+        )) => Some(Err(Error::ClientUpdateRequired(refusal.to_string()))),
+        ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(e)) => {
+            Some(Err(Error::Protocol(format!(
+                "Merkle quote error from {peer_id}: {e}"
+            ))))
+        }
+        _ => None,
+    }
+}
+
+/// Did this failure look like a storer that cannot parse a versioned request,
+/// as opposed to one that parsed it and refused?
+///
+/// A storer built before the settlement version existed cannot decode the
+/// request at all, so it never replies and the send fails at the transport
+/// layer. Any structured response, refusal included, means the storer
+/// understood us, and retrying that in an older shape would defeat the gate.
+const fn is_version_unaware(error: &Error) -> bool {
+    matches!(error, Error::Network(_) | Error::Timeout(_))
 }
 
 /// Payment mode for uploads.
@@ -1024,21 +1073,50 @@ impl Client {
 
         for (peer_id, peer_addrs) in &remote_peers {
             let request_id = self.next_request_id();
-            let request = MerkleCandidateQuoteRequest {
-                address: *address,
-                data_type,
-                data_size,
-                merkle_payment_timestamp,
-            };
+            // Declare the settlement version so a storer can turn us away
+            // before we pay, rather than refusing the payment afterwards.
             let message = ChunkMessage {
                 request_id,
-                body: ChunkMessageBody::MerkleCandidateQuoteRequest(request),
+                body: ChunkMessageBody::MerkleCandidateQuoteRequestV2(
+                    MerkleCandidateQuoteRequestV2::new(
+                        *address,
+                        data_size,
+                        merkle_payment_timestamp,
+                    ),
+                ),
             };
 
             let message_bytes = match message.encode() {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     warn!("Failed to encode merkle candidate request for {peer_id}: {e}");
+                    continue;
+                }
+            };
+
+            // Fallback for the mixed fleet. A storer that predates the
+            // versioned request cannot decode it and simply never answers, so
+            // without this every quote would fail until the whole network had
+            // upgraded. Retried only on a transport-level failure, never on a
+            // refusal: see `is_version_unaware` below.
+            //
+            // Delete this, and the second request id, once the fleet is known
+            // to answer V2.
+            let legacy_request_id = self.next_request_id();
+            let legacy_message_bytes = match (ChunkMessage {
+                request_id: legacy_request_id,
+                body: ChunkMessageBody::MerkleCandidateQuoteRequest(MerkleCandidateQuoteRequest {
+                    address: *address,
+                    data_type,
+                    data_size,
+                    merkle_payment_timestamp,
+                }),
+            })
+            .encode()
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!("Failed to encode legacy merkle candidate request for {peer_id}: {e}");
                     continue;
                 }
             };
@@ -1055,29 +1133,7 @@ impl Client {
                     request_id,
                     timeout,
                     &addrs_clone,
-                    |body| match body {
-                        ChunkMessageBody::MerkleCandidateQuoteResponse(
-                            MerkleCandidateQuoteResponse::Success {
-                                candidate_node,
-                                commitment,
-                            },
-                        ) => {
-                            match rmp_serde::from_slice::<MerklePaymentCandidateNode>(
-                                &candidate_node,
-                            ) {
-                                Ok(node) => Some(Ok((node, commitment))),
-                                Err(e) => Some(Err(Error::Serialization(format!(
-                                    "Failed to deserialize candidate node from {peer_id_clone}: {e}"
-                                )))),
-                            }
-                        }
-                        ChunkMessageBody::MerkleCandidateQuoteResponse(
-                            MerkleCandidateQuoteResponse::Error(e),
-                        ) => Some(Err(Error::Protocol(format!(
-                            "Merkle quote error from {peer_id_clone}: {e}"
-                        )))),
-                        _ => None,
-                    },
+                    |body| map_merkle_candidate_response(peer_id_clone, body),
                     |e| {
                         Error::Network(format!(
                             "Failed to send merkle candidate request to {peer_id_clone}: {e}"
@@ -1090,6 +1146,41 @@ impl Client {
                     },
                 )
                 .await;
+
+                // Silence from a storer means it could not decode the
+                // versioned request, so ask again in the shape it understands.
+                // A storer that answered with a refusal is NOT retried: it
+                // understood us and said no, and asking again without the
+                // version would talk it into quoting a client that cannot pay.
+                let result = match result {
+                    Err(ref e) if is_version_unaware(e) => {
+                        debug!(
+                            "Peer {peer_id_clone} did not answer a versioned merkle quote; \
+                             retrying in the legacy shape"
+                        );
+                        send_and_await_chunk_response(
+                            &node_clone,
+                            &peer_id_clone,
+                            legacy_message_bytes,
+                            legacy_request_id,
+                            timeout,
+                            &addrs_clone,
+                            |body| map_merkle_candidate_response(peer_id_clone, body),
+                            |e| {
+                                Error::Network(format!(
+                                    "Failed to send merkle candidate request to {peer_id_clone}: {e}"
+                                ))
+                            },
+                            || {
+                                Error::Timeout(format!(
+                                    "Timeout waiting for merkle candidate from {peer_id_clone}"
+                                ))
+                            },
+                        )
+                        .await
+                    }
+                    other => other,
+                };
 
                 (peer_id_clone, result)
             };

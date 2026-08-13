@@ -19,7 +19,8 @@ use ant_protocol::transport::{
 };
 use ant_protocol::{
     compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
-    ChunkQuoteRequest, ChunkQuoteResponse, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
+    ChunkQuoteRequest, ChunkQuoteRequestV2, ChunkQuoteResponse, ProtocolError,
+    CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
@@ -229,13 +230,17 @@ fn quote_commitment_binding_is_valid(
 /// On success the returned commitment is the opaque signed-commitment blob the
 /// node shipped with the quote (`None` for a baseline quote), to be forwarded
 /// as a sidecar in the PUT bundle.
+///
+/// A quote as this module hands it on: the quote itself, the price to settle,
+/// and the opaque signed commitment it was priced against.
+type ClassifiedQuote = std::result::Result<(PaymentQuote, Amount, Option<Vec<u8>>), Error>;
 fn classify_quote_response(
     peer_id: &PeerId,
     expected_content: &[u8; 32],
     quote_bytes: &[u8],
     already_stored: bool,
     commitment: Option<Vec<u8>>,
-) -> std::result::Result<(PaymentQuote, Amount, Option<Vec<u8>>), Error> {
+) -> ClassifiedQuote {
     let payment_quote = rmp_serde::from_slice::<PaymentQuote>(quote_bytes).map_err(|e| {
         Error::Serialization(format!("Failed to deserialize quote from {peer_id}: {e}"))
     })?;
@@ -331,14 +336,14 @@ async fn request_store_quote_from_peer(
     data_type: u32,
     per_peer_timeout: Duration,
 ) -> StoreQuoteRequestResult {
-    let request = ChunkQuoteRequest {
-        address,
-        data_size,
-        data_type,
-    };
+    // Declare the settlement version so a storer can turn us away before we
+    // pay. See `merkle.rs` for why the legacy retry below exists and when it
+    // can be deleted.
+    let mut versioned_request = ChunkQuoteRequestV2::new(address, data_size);
+    versioned_request.data_type = data_type;
     let message = ChunkMessage {
         request_id,
-        body: ChunkMessageBody::QuoteRequest(request),
+        body: ChunkMessageBody::QuoteRequestV2(versioned_request),
     };
 
     let message_bytes = match message.encode() {
@@ -361,29 +366,93 @@ async fn request_store_quote_from_peer(
         request_id,
         per_peer_timeout,
         &peer_addrs,
-        |body| match body {
-            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
-                quote,
-                already_stored,
-                commitment,
-            }) => Some(classify_quote_response(
-                &peer_id,
-                &address,
-                &quote,
-                already_stored,
-                commitment,
-            )),
-            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => Some(Err(
-                Error::Protocol(format!("Quote error from {peer_id}: {e}")),
-            )),
-            _ => None,
-        },
+        |body| map_quote_response(&peer_id, &address, body),
         |e| Error::Network(format!("Failed to send quote request to {peer_id}: {e}")),
         || Error::Timeout(format!("Timeout waiting for quote from {peer_id}")),
     )
     .await;
 
+    // Only a storer that could not decode the versioned request is asked
+    // again in the legacy shape. One that answered has understood us, and a
+    // refusal must stay a refusal.
+    let result = match result {
+        Err(ref e) if is_version_unaware(e) => {
+            let legacy = ChunkMessage {
+                request_id,
+                body: ChunkMessageBody::QuoteRequest(ChunkQuoteRequest {
+                    address,
+                    data_size,
+                    data_type,
+                }),
+            };
+            match legacy.encode() {
+                Ok(legacy_bytes) => {
+                    send_and_await_chunk_response(
+                        &node,
+                        &peer_id,
+                        legacy_bytes,
+                        request_id,
+                        per_peer_timeout,
+                        &peer_addrs,
+                        |body| map_quote_response(&peer_id, &address, body),
+                        |e| {
+                            Error::Network(format!(
+                                "Failed to send quote request to {peer_id}: {e}"
+                            ))
+                        },
+                        || Error::Timeout(format!("Timeout waiting for quote from {peer_id}")),
+                    )
+                    .await
+                }
+                Err(e) => Err(Error::Protocol(format!(
+                    "Failed to encode quote request for {peer_id}: {e}"
+                ))),
+            }
+        }
+        other => other,
+    };
+
     (peer_id, peer_addrs, result)
+}
+
+/// Turn a quote response into the quote it carries, or the error explaining
+/// why there is none. Shared by the versioned request and its legacy retry.
+///
+/// `ClientUpdateRequired` is separated from the generic protocol error because
+/// it is terminal: it must reach the user with its own wording rather than
+/// being counted as one more peer that failed to quote.
+fn map_quote_response(
+    peer_id: &PeerId,
+    address: &[u8; 32],
+    body: ChunkMessageBody,
+) -> Option<ClassifiedQuote> {
+    match body {
+        ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+            quote,
+            already_stored,
+            commitment,
+        }) => Some(classify_quote_response(
+            peer_id,
+            address,
+            &quote,
+            already_stored,
+            commitment,
+        )),
+        ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(
+            refusal @ ProtocolError::ClientUpdateRequired { .. },
+        )) => Some(Err(Error::ClientUpdateRequired(refusal.to_string()))),
+        ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => Some(Err(
+            Error::Protocol(format!("Quote error from {peer_id}: {e}")),
+        )),
+        _ => None,
+    }
+}
+
+/// Did this failure look like a storer that cannot parse a versioned request,
+/// as opposed to one that parsed it and refused? See the merkle path for the
+/// full reasoning.
+const fn is_version_unaware(error: &Error) -> bool {
+    matches!(error, Error::Network(_) | Error::Timeout(_))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2733,5 +2802,50 @@ mod tests {
             matches!(result, Err(Error::BadQuoteCommitment { .. })),
             "off-curve quote must be dropped as BadQuoteCommitment; got {result:?}"
         );
+    }
+
+    /// A storer's refusal must arrive as its own terminal error, carrying the
+    /// storer's wording. Folding it into the generic protocol error would bury
+    /// the upgrade instruction among ordinary per-peer quote failures, which
+    /// is the outcome this whole change exists to avoid.
+    #[test]
+    fn an_update_refusal_is_surfaced_with_its_upgrade_instruction() {
+        let peer_id = PeerId::from_bytes([0x42; 32]);
+        let refusal = ProtocolError::ClientUpdateRequired {
+            client_settlement_version: 0,
+            min_settlement_version: 1,
+        };
+
+        let mapped = map_quote_response(
+            &peer_id,
+            &[0x11; 32],
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(refusal)),
+        );
+
+        match mapped {
+            Some(Err(Error::ClientUpdateRequired(msg))) => {
+                assert!(msg.contains("ant update"), "{msg}");
+                assert!(msg.contains("nothing was charged"), "{msg}");
+            }
+            other => panic!("expected ClientUpdateRequired, got: {other:?}"),
+        }
+    }
+
+    /// The legacy retry exists for storers that cannot parse a versioned
+    /// request, which are silent. A storer that answered has understood us, so
+    /// retrying its refusal without the version would talk it into quoting a
+    /// client that cannot pay. That is the exact failure this change removes,
+    /// so the predicate deciding it is pinned.
+    #[test]
+    fn only_silence_triggers_the_legacy_retry() {
+        assert!(is_version_unaware(&Error::Timeout("no answer".into())));
+        assert!(is_version_unaware(&Error::Network("send failed".into())));
+
+        assert!(!is_version_unaware(&Error::ClientUpdateRequired(
+            "too old".into()
+        )));
+        assert!(!is_version_unaware(&Error::Protocol(
+            "quote error from peer".into()
+        )));
     }
 }
