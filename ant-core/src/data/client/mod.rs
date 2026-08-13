@@ -37,6 +37,31 @@ use tracing::debug;
 /// so trying peers past this width is pointless.
 pub(crate) const PUT_TARGET_WIDTH: usize = 20;
 
+/// Compile-time cutover guard shared by **every** unversioned quote retry.
+///
+/// Both quote paths fall back to an unversioned request when a peer stays
+/// silent, because a storer built before the settlement version existed cannot
+/// decode the versioned one. Silence is not proof of that, though: a dropped
+/// response, packet loss, an overloaded peer, or one deliberately discarding
+/// versioned requests are indistinguishable from the client side. So the
+/// fallback is a downgrade path and can be provoked.
+///
+/// It is safe only while no client can be refused on version grounds, which
+/// holds exactly while `MIN_SUPPORTED_SETTLEMENT_VERSION` is the first
+/// declarable version. Raising the minimum without first deleting both
+/// fallbacks would let a refused client route around the gate and burn a
+/// payment.
+///
+/// Each fallback site references this constant so the guard cannot be orphaned
+/// by deleting one path and forgetting the other. Retiring the fallbacks means
+/// deleting this constant and every reference to it, which the compiler then
+/// points at one by one.
+pub(crate) const UNVERSIONED_RETRY_REQUIRES_MIN_V1: () = assert!(
+    ant_protocol::MIN_SUPPORTED_SETTLEMENT_VERSION == 1,
+    "an unversioned quote retry is still compiled in: it is a downgrade path, so \
+     delete every fallback site before raising MIN_SUPPORTED_SETTLEMENT_VERSION"
+);
+
 /// Classify a `data::error::Error` into a controller `Outcome`.
 ///
 /// Capacity signals (Timeout / NetworkError) drive the controller

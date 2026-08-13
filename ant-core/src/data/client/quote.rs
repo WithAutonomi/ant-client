@@ -454,6 +454,13 @@ fn map_quote_response(
 /// Did this failure look like a storer that cannot parse a versioned request,
 /// as opposed to one that parsed it and refused? See the merkle path for the
 /// full reasoning.
+///
+/// This is the single-node fallback, independent of the merkle one, so it
+/// carries its own reference to the shared cutover guard. Without it, deleting
+/// the merkle fallback would take the only build-time check with it and leave
+/// this downgrade path live.
+const _: () = crate::data::client::UNVERSIONED_RETRY_REQUIRES_MIN_V1;
+
 const fn is_version_unaware(error: &Error) -> bool {
     matches!(error, Error::Network(_) | Error::Timeout(_))
 }
@@ -473,6 +480,7 @@ fn record_store_quote_result(
     already_stored_peers: &mut Vec<(PeerId, [u8; 32])>,
     failures: &mut Vec<String>,
     bad_quote_count: &mut usize,
+    settlement_refusal: &mut Option<Error>,
 ) -> Result<()> {
     match quote_result {
         Ok((quote, price, commitment)) => {
@@ -488,7 +496,17 @@ fn record_store_quote_result(
         // let the remaining peers supply a quorum and go on to pay, which is
         // the burn this mechanism exists to prevent, and would bury the
         // upgrade instruction among ordinary per-peer failures.
-        Err(e @ Error::ClientUpdateRequired(_)) => return Err(e),
+        // Recorded as well as returned. The caller runs this inside an overall
+        // timeout, and if that timeout fires the returned error is thrown away
+        // with the rest of the collection state. The verdict must outlive it:
+        // a client told it cannot settle must not pay, whatever else happened
+        // during collection.
+        Err(e @ Error::ClientUpdateRequired(_)) => {
+            if settlement_refusal.is_none() {
+                *settlement_refusal = Some(Error::ClientUpdateRequired(e.to_string()));
+            }
+            return Err(e);
+        }
         Err(e) => {
             if matches!(&e, Error::BadQuoteBinding { .. }) {
                 *bad_quote_count += 1;
@@ -1244,17 +1262,32 @@ impl Client {
         // network-broken) and the user benefits from seeing them called out.
         let mut bad_quote_count = 0usize;
 
+        // A storer's verdict that this client cannot settle, kept outside the
+        // collection loops so neither the overall timeout nor an early exit
+        // can discard it. Checked before any quote plan is built.
+        let mut settlement_refusal: Option<Error> = None;
+
         if staged_witnessed_collection {
             let mut quote_futures = FuturesUnordered::new();
             let mut next_peer_index = 0usize;
             let collect_result: std::result::Result<std::result::Result<(), Error>, _> =
                 tokio::time::timeout(overall_timeout, async {
                     loop {
-                        let launch_count = witnessed_quote_launch_budget(
-                            quotes.len(),
-                            quote_futures.len(),
-                            remote_peers.len().saturating_sub(next_peer_index),
-                        );
+                        // Stop launching once the target is met, but keep
+                        // draining below. Peers already in flight may yet
+                        // declare this client unable to settle, and dropping
+                        // that verdict because faster peers filled the quota
+                        // would make it depend on response order. The surplus
+                        // quotes are discarded; a refusal among them is not.
+                        let launch_count = if quotes.len() >= target_quote_count {
+                            0
+                        } else {
+                            witnessed_quote_launch_budget(
+                                quotes.len(),
+                                quote_futures.len(),
+                                remote_peers.len().saturating_sub(next_peer_index),
+                            )
+                        };
                         for _ in 0..launch_count {
                             let (peer_id, peer_addrs) = &remote_peers[next_peer_index];
                             next_peer_index += 1;
@@ -1270,7 +1303,7 @@ impl Client {
                             ));
                         }
 
-                        if quotes.len() >= target_quote_count || quote_futures.is_empty() {
+                        if quote_futures.is_empty() {
                             break;
                         }
 
@@ -1287,6 +1320,7 @@ impl Client {
                             &mut already_stored_peers,
                             &mut failures,
                             &mut bad_quote_count,
+                            &mut settlement_refusal,
                         )?;
                     }
                     Ok(())
@@ -1302,6 +1336,11 @@ impl Client {
                 }
                 Ok(Err(e)) => return Err(e),
                 Ok(Ok(())) => {}
+            }
+            // Outranks the timeout: a refusal says paying is unsafe no matter
+            // how many quotes were gathered before the clock ran out.
+            if let Some(refusal) = settlement_refusal.take() {
+                return Err(refusal);
             }
         } else {
             // Merkle preflight keeps the previous behaviour: query the full
@@ -1334,6 +1373,7 @@ impl Client {
                             &mut already_stored_peers,
                             &mut failures,
                             &mut bad_quote_count,
+                            &mut settlement_refusal,
                         )?;
                     }
                     Ok(())
@@ -1352,6 +1392,11 @@ impl Client {
                 }
                 Ok(Err(e)) => return Err(e),
                 Ok(Ok(())) => {}
+            }
+            // Outranks the timeout: a refusal says paying is unsafe no matter
+            // how many quotes were gathered before the clock ran out.
+            if let Some(refusal) = settlement_refusal.take() {
+                return Err(refusal);
             }
         }
 
@@ -2907,6 +2952,7 @@ mod tests {
         let mut already_stored = Vec::new();
         let mut failures = Vec::new();
         let mut bad_quotes = 0usize;
+        let mut refusal_slot: Option<Error> = None;
 
         let outcome = record_store_quote_result(
             PeerId::from_bytes([0x44; 32]),
@@ -2919,6 +2965,7 @@ mod tests {
             &mut already_stored,
             &mut failures,
             &mut bad_quotes,
+            &mut refusal_slot,
         );
 
         assert!(
@@ -2939,6 +2986,7 @@ mod tests {
         let mut already_stored = Vec::new();
         let mut failures = Vec::new();
         let mut bad_quotes = 0usize;
+        let mut refusal_slot: Option<Error> = None;
 
         let outcome = record_store_quote_result(
             PeerId::from_bytes([0x45; 32]),
@@ -2949,6 +2997,7 @@ mod tests {
             &mut already_stored,
             &mut failures,
             &mut bad_quotes,
+            &mut refusal_slot,
         );
 
         assert!(
@@ -2956,5 +3005,69 @@ mod tests {
             "a lagging storer must be skipped, not fatal"
         );
         assert_eq!(failures.len(), 1, "and it should be recorded as a skip");
+        assert!(
+            refusal_slot.is_none(),
+            "a node being behind is not a verdict about this client"
+        );
+    }
+
+    /// The refusal must survive the overall collection timeout.
+    ///
+    /// The collector runs inside `tokio::time::timeout`, and its elapsed arm
+    /// deliberately falls through so quotes gathered from fast peers stay
+    /// usable. That arm would otherwise discard a refusal observed just before
+    /// the clock ran out, and the upload would pay anyway. Recording the
+    /// verdict in a slot that outlives the timeout is what prevents it, so the
+    /// slot is what gets tested.
+    #[test]
+    fn a_refusal_is_recorded_where_the_collection_timeout_cannot_discard_it() {
+        let mut quotes = Vec::new();
+        let mut already_stored = Vec::new();
+        let mut failures = Vec::new();
+        let mut bad_quotes = 0usize;
+        let mut refusal_slot: Option<Error> = None;
+
+        let _ = record_store_quote_result(
+            PeerId::from_bytes([0x46; 32]),
+            Vec::new(),
+            Err(Error::ClientUpdateRequired(
+                "too old, run ant update".into(),
+            )),
+            &[0x11; 32],
+            &mut quotes,
+            &mut already_stored,
+            &mut failures,
+            &mut bad_quotes,
+            &mut refusal_slot,
+        );
+
+        match refusal_slot {
+            Some(Error::ClientUpdateRequired(msg)) => {
+                assert!(msg.contains("ant update"), "{msg}");
+            }
+            other => panic!("refusal must outlive the collection state, got {other:?}"),
+        }
+    }
+
+    /// Once the quote target is met the collector stops launching new peers
+    /// but keeps draining those already in flight, so a refusal cannot be
+    /// missed merely because faster peers filled the quota first.
+    ///
+    /// The launch budget enforces the first half, and the drain relies on it
+    /// reaching zero to terminate rather than recruiting forever.
+    #[test]
+    fn meeting_the_target_stops_launching_without_stopping_collection() {
+        assert!(
+            witnessed_quote_launch_budget(0, 0, 32) > 0,
+            "collection must start"
+        );
+        assert_eq!(witnessed_quote_launch_budget(CLOSE_GROUP_SIZE, 0, 32), 0);
+        assert_eq!(
+            witnessed_quote_launch_budget(CLOSE_GROUP_SIZE.saturating_add(1), 0, 32),
+            0
+        );
+        // In-flight peers count against the budget, so draining them does not
+        // pull in replacements.
+        assert_eq!(witnessed_quote_launch_budget(0, CLOSE_GROUP_SIZE, 32), 0);
     }
 }

@@ -224,15 +224,12 @@ fn map_merkle_candidate_response(
 /// way to obtain a quote the gate meant to withhold, and then to burn a
 /// payment against it.
 ///
-/// The assertion below turns "remember to delete the fallback before raising
-/// the minimum" from a comment into a build failure. Removing the fallback
-/// means deleting this function, both legacy encode sites, and the retry arms
-/// that call them.
-const _: () = assert!(
-    ant_protocol::MIN_SUPPORTED_SETTLEMENT_VERSION == 1,
-    "the unversioned quote retry is a downgrade path: delete it before raising \
-     MIN_SUPPORTED_SETTLEMENT_VERSION, or a refused client can route around the gate"
-);
+/// The guard below turns "remember to delete the fallback before raising the
+/// minimum" from a comment into a build failure. It lives in
+/// [`crate::data::client::UNVERSIONED_RETRY_REQUIRES_MIN_V1`] and is referenced
+/// from every fallback site, including the independent single-node one in
+/// `quote.rs`, so deleting one path cannot silently leave the other unguarded.
+const _: () = crate::data::client::UNVERSIONED_RETRY_REQUIRES_MIN_V1;
 
 const fn is_version_unaware(error: &Error) -> bool {
     matches!(error, Error::Network(_) | Error::Timeout(_))
