@@ -111,6 +111,18 @@ pub enum Error {
     #[error("{0}")]
     ClientUpdateRequired(String),
 
+    /// A storer declined to quote because *it* settles under older rules than
+    /// this client.
+    ///
+    /// The opposite of [`Self::ClientUpdateRequired`] and deliberately not
+    /// terminal. Nothing is wrong with this client, so the upload should use a
+    /// different peer and say nothing to the user. During a client-first
+    /// rollout most of the fleet is briefly in this state. If too few peers
+    /// remain the operation fails for lack of quotes, which is the correct
+    /// outcome: it fails before any payment rather than after.
+    #[error("{0}")]
+    StorerUpdateRequired(String),
+
     /// BLS signature verification failed.
     #[error("signature verification failed: {0}")]
     SignatureVerification(String),

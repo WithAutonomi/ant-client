@@ -441,6 +441,9 @@ fn map_quote_response(
         ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(
             refusal @ ProtocolError::ClientUpdateRequired { .. },
         )) => Some(Err(Error::ClientUpdateRequired(refusal.to_string()))),
+        ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(
+            behind @ ProtocolError::StorerUpdateRequired { .. },
+        )) => Some(Err(Error::StorerUpdateRequired(behind.to_string()))),
         ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => Some(Err(
             Error::Protocol(format!("Quote error from {peer_id}: {e}")),
         )),
@@ -455,6 +458,11 @@ const fn is_version_unaware(error: &Error) -> bool {
     matches!(error, Error::Network(_) | Error::Timeout(_))
 }
 
+/// Fold one peer's quote result into the collection state.
+///
+/// Returns `Err` only when collection must stop outright: a storer has said
+/// this client cannot settle, and no number of further quotes makes paying
+/// safe.
 #[allow(clippy::too_many_arguments)]
 fn record_store_quote_result(
     peer_id: PeerId,
@@ -465,7 +473,7 @@ fn record_store_quote_result(
     already_stored_peers: &mut Vec<(PeerId, [u8; 32])>,
     failures: &mut Vec<String>,
     bad_quote_count: &mut usize,
-) {
+) -> Result<()> {
     match quote_result {
         Ok((quote, price, commitment)) => {
             quotes.push((peer_id, addrs, quote, price, commitment));
@@ -475,6 +483,12 @@ fn record_store_quote_result(
             let dist = peer_xor_distance(&peer_id, address);
             already_stored_peers.push((peer_id, dist));
         }
+        // A storer that has explicitly declared this client incompatible ends
+        // quote collection here. Recording it as one more failed peer would
+        // let the remaining peers supply a quorum and go on to pay, which is
+        // the burn this mechanism exists to prevent, and would bury the
+        // upgrade instruction among ordinary per-peer failures.
+        Err(e @ Error::ClientUpdateRequired(_)) => return Err(e),
         Err(e) => {
             if matches!(&e, Error::BadQuoteBinding { .. }) {
                 *bad_quote_count += 1;
@@ -483,6 +497,7 @@ fn record_store_quote_result(
             failures.push(format!("{peer_id}: {e}"));
         }
     }
+    Ok(())
 }
 
 fn witnessed_quote_launch_budget(
@@ -1272,7 +1287,7 @@ impl Client {
                             &mut already_stored_peers,
                             &mut failures,
                             &mut bad_quote_count,
-                        );
+                        )?;
                     }
                     Ok(())
                 })
@@ -1319,7 +1334,7 @@ impl Client {
                             &mut already_stored_peers,
                             &mut failures,
                             &mut bad_quote_count,
-                        );
+                        )?;
                     }
                     Ok(())
                 })
@@ -2844,8 +2859,102 @@ mod tests {
         assert!(!is_version_unaware(&Error::ClientUpdateRequired(
             "too old".into()
         )));
+        // A storer that says it is the old side has understood the request.
+        // Retrying it unversioned would obtain a quote from a peer that cannot
+        // verify the resulting payment, which is a burn.
+        assert!(!is_version_unaware(&Error::StorerUpdateRequired(
+            "node behind".into()
+        )));
         assert!(!is_version_unaware(&Error::Protocol(
             "quote error from peer".into()
         )));
+    }
+
+    /// A storer declaring itself the old side is an ordinary skippable peer,
+    /// not a client fault. Surfacing it as `ClientUpdateRequired` would tell an
+    /// up-to-date user to upgrade, and during a client-first rollout it would
+    /// tell that to nearly everyone.
+    #[test]
+    fn a_storer_that_is_behind_is_not_reported_as_the_clients_fault() {
+        let peer_id = PeerId::from_bytes([0x43; 32]);
+        let mapped = map_quote_response(
+            &peer_id,
+            &[0x11; 32],
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(
+                ProtocolError::StorerUpdateRequired {
+                    client_settlement_version: 2,
+                    node_settlement_version: 1,
+                },
+            )),
+        );
+
+        match mapped {
+            Some(Err(Error::StorerUpdateRequired(msg))) => {
+                assert!(msg.contains("use a different storer"), "{msg}");
+                assert!(!msg.contains("ant update"), "{msg}");
+            }
+            other => panic!("expected StorerUpdateRequired, got: {other:?}"),
+        }
+    }
+
+    /// The refusal has to stop quote collection, not join the failure list.
+    /// If it is merely recorded, the remaining peers can still form a quorum
+    /// and the upload proceeds to pay, which is exactly the burn the gate is
+    /// meant to prevent.
+    #[test]
+    fn a_refusal_aborts_quote_collection_instead_of_counting_as_one_bad_peer() {
+        let mut quotes = Vec::new();
+        let mut already_stored = Vec::new();
+        let mut failures = Vec::new();
+        let mut bad_quotes = 0usize;
+
+        let outcome = record_store_quote_result(
+            PeerId::from_bytes([0x44; 32]),
+            Vec::new(),
+            Err(Error::ClientUpdateRequired(
+                "too old, run ant update".into(),
+            )),
+            &[0x11; 32],
+            &mut quotes,
+            &mut already_stored,
+            &mut failures,
+            &mut bad_quotes,
+        );
+
+        assert!(
+            matches!(outcome, Err(Error::ClientUpdateRequired(_))),
+            "refusal must propagate, got {outcome:?}"
+        );
+        assert!(
+            failures.is_empty(),
+            "refusal must not be flattened into the per-peer failure list"
+        );
+    }
+
+    /// A storer being behind must NOT abort. Otherwise one lagging peer in the
+    /// close group fails an upload that the rest of the group could serve.
+    #[test]
+    fn a_storer_that_is_behind_does_not_abort_collection() {
+        let mut quotes = Vec::new();
+        let mut already_stored = Vec::new();
+        let mut failures = Vec::new();
+        let mut bad_quotes = 0usize;
+
+        let outcome = record_store_quote_result(
+            PeerId::from_bytes([0x45; 32]),
+            Vec::new(),
+            Err(Error::StorerUpdateRequired("node behind".into())),
+            &[0x11; 32],
+            &mut quotes,
+            &mut already_stored,
+            &mut failures,
+            &mut bad_quotes,
+        );
+
+        assert!(
+            outcome.is_ok(),
+            "a lagging storer must be skipped, not fatal"
+        );
+        assert_eq!(failures.len(), 1, "and it should be recorded as a skip");
     }
 }

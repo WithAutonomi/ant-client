@@ -191,6 +191,9 @@ fn map_merkle_candidate_response(
         ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(
             refusal @ ProtocolError::ClientUpdateRequired { .. },
         )) => Some(Err(Error::ClientUpdateRequired(refusal.to_string()))),
+        ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(
+            behind @ ProtocolError::StorerUpdateRequired { .. },
+        )) => Some(Err(Error::StorerUpdateRequired(behind.to_string()))),
         ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(e)) => {
             Some(Err(Error::Protocol(format!(
                 "Merkle quote error from {peer_id}: {e}"
@@ -200,13 +203,37 @@ fn map_merkle_candidate_response(
     }
 }
 
-/// Did this failure look like a storer that cannot parse a versioned request,
-/// as opposed to one that parsed it and refused?
+/// Should this failure be retried as an unversioned request?
 ///
 /// A storer built before the settlement version existed cannot decode the
-/// request at all, so it never replies and the send fails at the transport
+/// versioned request, so it never replies and the send fails at the transport
 /// layer. Any structured response, refusal included, means the storer
 /// understood us, and retrying that in an older shape would defeat the gate.
+///
+/// # This is a downgrade path, and it is only safe because nothing can be
+/// refused yet
+///
+/// Silence is **not** proof that a peer cannot parse the request. A dropped
+/// response, packet loss, an overloaded peer, or one deliberately discarding
+/// versioned requests all look identical from here. So this predicate can be
+/// provoked, and a peer that provokes it gets asked again without a version.
+///
+/// That is harmless only while no client can be refused on version grounds,
+/// which is exactly the case while `MIN_SUPPORTED_SETTLEMENT_VERSION` is the
+/// first declarable version. The moment the minimum is raised, this becomes a
+/// way to obtain a quote the gate meant to withhold, and then to burn a
+/// payment against it.
+///
+/// The assertion below turns "remember to delete the fallback before raising
+/// the minimum" from a comment into a build failure. Removing the fallback
+/// means deleting this function, both legacy encode sites, and the retry arms
+/// that call them.
+const _: () = assert!(
+    ant_protocol::MIN_SUPPORTED_SETTLEMENT_VERSION == 1,
+    "the unversioned quote retry is a downgrade path: delete it before raising \
+     MIN_SUPPORTED_SETTLEMENT_VERSION, or a refused client can route around the gate"
+);
+
 const fn is_version_unaware(error: &Error) -> bool {
     matches!(error, Error::Network(_) | Error::Timeout(_))
 }
@@ -1261,6 +1288,13 @@ impl Client {
                     }
                     valid.push((candidate_peer, candidate));
                 }
+                // A storer that has explicitly declared this client
+                // incompatible ends the batch here. Collecting it as one more
+                // failed peer would let the pool fill from the remaining
+                // sixteen and go on to pay, which is the burn this whole
+                // mechanism exists to prevent. It also buries the upgrade
+                // instruction inside an InsufficientPeers diagnostic string.
+                Err(e @ Error::ClientUpdateRequired(_)) => return Err(e),
                 Err(e) => {
                     debug!("Failed to get merkle candidate from {peer_id}: {e}");
                     failures.push(format!("{peer_id}: {e}"));

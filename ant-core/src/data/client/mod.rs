@@ -101,6 +101,7 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         // as congestion would quietly shrink the limiter for the rest of the
         // run on the basis of a fault no retry can clear.
         | Error::ClientUpdateRequired(_)
+        | Error::StorerUpdateRequired(_)
         | Error::BadQuoteBinding { .. }
         | Error::BadQuoteCommitment { .. }
         // An external-signer merkle batch larger than one tree can hold —
@@ -832,6 +833,7 @@ mod tests {
             | Error::MerkleBatchTooLarge { .. }
             | Error::RemotePut { .. }
             | Error::ClientUpdateRequired(_)
+            | Error::StorerUpdateRequired(_)
             | Error::CloseGroupShortfall(_) => (),
         };
     }
