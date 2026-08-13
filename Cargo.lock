@@ -5198,7 +5198,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.26.4"
-source = "git+https://github.com/WithAutonomi/saorsa-core.git?branch=diagnostics%2Fv2-903-peer-route-classification#008e8c020b8de773e165c99a83ec50a34fbcc5ad"
+source = "git+https://github.com/WithAutonomi/saorsa-core.git?branch=diagnostics%2Fv2-903-peer-route-classification#6be87a81f91a119d0761f9ce6f8ee69dec19edcc"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -12,6 +12,7 @@ use crate::data::client::diagnostics::{
 use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
+use crate::data::network::ClosestPeerDiagnostics;
 use ant_protocol::evm::{QuoteHash, TxHash};
 use ant_protocol::transport::{MultiAddr, PeerId, PeerRouteKind};
 use ant_protocol::{
@@ -33,6 +34,7 @@ const CHUNK_DATA_TYPE: u32 = 0;
 /// Number of diagnostics-enabled peer requests currently in flight in this
 /// process. The counter is untouched when runtime diagnostics are disabled.
 static ACTIVE_DIAGNOSTIC_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static NEXT_DIAGNOSTIC_LOOKUP_ID: AtomicUsize = AtomicUsize::new(1);
 
 struct ActiveDiagnosticRequestGuard;
 
@@ -260,6 +262,8 @@ impl<'a> ChunkFetchDiagnostics<'a> {
         sweep: &'static str,
         peer_attempt: usize,
         lookup_duration_ms: Option<u64>,
+        lookup_correlation_id: &str,
+        peer_context: &ClosestPeerDiagnostics,
         expected_peer: &PeerId,
         source_peer: Option<&PeerId>,
         transport_source: Option<&MultiAddr>,
@@ -281,7 +285,17 @@ impl<'a> ChunkFetchDiagnostics<'a> {
                 sweep,
                 peer_attempt,
                 lookup_duration_ms,
+                lookup_correlation_id,
                 &expected_peer.to_string(),
+                peer_context
+                    .addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                peer_context.address_types.clone(),
+                peer_context.local_last_seen_age_ms,
+                peer_context.publisher_address_set_age_ms,
+                peer_context.publisher_address_set_unix_ns,
                 source_peer.map(ToString::to_string).as_deref(),
                 transport_source.map(ToString::to_string).as_deref(),
                 route.as_str(),
@@ -991,24 +1005,50 @@ impl Client {
         sweep: &'static str,
     ) -> Result<CloseGroupOutcome> {
         let lookup_start = Instant::now();
-        let peers = match self.closest_peers(address, peer_count).await {
-            Ok(peers) => peers,
-            Err(e) => {
-                if let Some(diag) = diag {
-                    diag.emit_chunk_level(
-                        sweep,
-                        0,
-                        DownloadDiagnosticsOutcome::LookupError,
-                        Some(bounded_error("lookup", &e.to_string())),
-                    );
+        let (peers, peer_contexts) = if diag.is_some() {
+            match self
+                .network()
+                .find_closest_peers_with_diagnostics(address, peer_count)
+                .await
+            {
+                Ok(contexts) => {
+                    let peers = contexts
+                        .iter()
+                        .map(|context| (context.peer_id, context.addresses.clone()))
+                        .collect();
+                    (peers, Some(contexts))
                 }
-                return Err(e);
+                Err(e) => {
+                    if let Some(diag) = diag {
+                        diag.emit_chunk_level(
+                            sweep,
+                            0,
+                            DownloadDiagnosticsOutcome::LookupError,
+                            Some(bounded_error("lookup", &e.to_string())),
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            // Preserve the pre-instrumentation lookup path exactly when
+            // diagnostics are disabled.
+            match self.closest_peers(address, peer_count).await {
+                Ok(peers) => (peers, None),
+                Err(e) => return Err(e),
             }
         };
         let lookup_duration_ms =
             u64::try_from(lookup_start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let lookup_duration_opt = Some(lookup_duration_ms);
         let addr_hex = hex::encode(address);
+        let lookup_correlation_id = diag.map(|diag| {
+            let sequence = NEXT_DIAGNOSTIC_LOOKUP_ID.fetch_add(1, AtomicOrdering::Relaxed);
+            format!(
+                "{}-{}-{}-{}-{sequence}",
+                diag.file_attempt, diag.chunk_index, sweep, addr_hex
+            )
+        });
         let queried = peers.len();
         let mut not_found = 0usize;
         let mut timeout = 0usize;
@@ -1018,6 +1058,19 @@ impl Client {
         for (peer_attempt, (peer, addrs)) in peers.iter().enumerate() {
             let peer_attempt_no = peer_attempt + 1;
             let result = if let Some(diag) = diag {
+                let Some(peer_context) = peer_contexts
+                    .as_ref()
+                    .and_then(|contexts| contexts.get(peer_attempt))
+                else {
+                    return Err(Error::Network(
+                        "diagnostics peer context missing for selected peer".to_string(),
+                    ));
+                };
+                let Some(lookup_correlation_id) = lookup_correlation_id.as_deref() else {
+                    return Err(Error::Network(
+                        "diagnostics lookup correlation ID missing".to_string(),
+                    ));
+                };
                 let node = self.network().node();
                 let peer_connected_before_request = node.is_peer_connected(peer).await;
                 let (active_guard, active_requests_at_start) =
@@ -1061,6 +1114,8 @@ impl Client {
                     sweep,
                     peer_attempt_no,
                     lookup,
+                    lookup_correlation_id,
+                    peer_context,
                     peer,
                     source_peer.as_ref(),
                     transport_source.as_ref(),
