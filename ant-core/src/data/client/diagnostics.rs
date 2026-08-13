@@ -11,7 +11,7 @@
 //! threaded through the file/chunk download path is `None`, so record
 //! construction is skipped entirely (no allocation, no I/O).
 //!
-//! # Schema v2: transport route classification
+//! # Schema v3: transport route and selected DHT-record context
 //!
 //! The `ant-protocol` diagnostic branch
 //! `diagnostics/v2-903-response-transport-metadata` exposes
@@ -48,7 +48,7 @@ use serde::Serialize;
 use tracing::{error, warn};
 
 /// Current diagnostic record schema discriminator.
-pub const DIAGNOSTICS_SCHEMA_VERSION: u8 = 2;
+pub const DIAGNOSTICS_SCHEMA_VERSION: u8 = 3;
 
 /// Bounded capacity of the diagnostics channel. A slow writer must not create
 /// unbounded memory growth: when full, further records are dropped (counted
@@ -127,7 +127,7 @@ impl Serialize for DownloadDiagnosticsOutcome {
 /// `null` for a cache hit, which has no peer).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct DownloadDiagnosticsRecord {
-    /// Stable schema discriminator, currently `2`.
+    /// Stable schema discriminator, currently `3`.
     pub schema_version: u8,
     /// UTC time the attempt completed, RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
     pub timestamp: String,
@@ -152,9 +152,25 @@ pub struct DownloadDiagnosticsRecord {
     /// Closest-peer DHT lookup duration, emitted on the first peer attempt
     /// associated with that lookup; `None` otherwise.
     pub lookup_duration_ms: Option<u64>,
+    /// Process-local identifier shared by attempts from one closest-peer lookup.
+    pub lookup_correlation_id: Option<String>,
+    /// One-based ordinal in the DHT-selected peer order.
+    pub selected_peer_ordinal: Option<usize>,
     /// Peer selected by the DHT lookup for this attempt; `None` for chunk-level
     /// records.
     pub expected_peer: Option<String>,
+    /// Dial addresses selected from the DHT record, in priority order.
+    pub selected_peer_addresses: Option<Vec<String>>,
+    /// Address-type labels parallel to `selected_peer_addresses`.
+    pub selected_peer_address_types: Option<Vec<String>>,
+    /// This client's monotonic last-successful-DHT-interaction age. This is
+    /// local knowledge, not proof of remote uptime.
+    pub local_last_seen_age_ms: Option<u64>,
+    /// Publisher-clock-derived address-set age. The timestamp is untrusted and
+    /// is not proof of remote uptime.
+    pub publisher_address_set_age_ms: Option<u64>,
+    /// Raw publisher wall-clock address-set sequence, when present.
+    pub publisher_address_set_unix_ns: Option<u64>,
     /// Authenticated peer that supplied the matching response, from the
     /// `ChunkProtocolResponse` metadata; `None` when no response was received
     /// (timeout / send failure) or for chunk-level records.
@@ -223,7 +239,13 @@ impl DownloadDiagnosticsRecord {
         sweep: &'static str,
         peer_attempt: usize,
         lookup_duration_ms: Option<u64>,
+        lookup_correlation_id: &str,
         expected_peer: &str,
+        selected_peer_addresses: Vec<String>,
+        selected_peer_address_types: Vec<String>,
+        local_last_seen_age_ms: Option<u64>,
+        publisher_address_set_age_ms: Option<u64>,
+        publisher_address_set_unix_ns: Option<u64>,
         source_peer: Option<&str>,
         transport_source: Option<&str>,
         route: &str,
@@ -254,7 +276,14 @@ impl DownloadDiagnosticsRecord {
             sweep: sweep.to_string(),
             peer_attempt: Some(peer_attempt),
             lookup_duration_ms: lookup,
+            lookup_correlation_id: Some(lookup_correlation_id.to_string()),
+            selected_peer_ordinal: Some(peer_attempt),
             expected_peer: Some(expected_peer.to_string()),
+            selected_peer_addresses: Some(selected_peer_addresses),
+            selected_peer_address_types: Some(selected_peer_address_types),
+            local_last_seen_age_ms,
+            publisher_address_set_age_ms,
+            publisher_address_set_unix_ns,
             source_peer: source_peer.map(str::to_string),
             transport_source: transport_source.map(str::to_string),
             route: route.to_string(),
@@ -296,7 +325,14 @@ impl DownloadDiagnosticsRecord {
             sweep: sweep.to_string(),
             peer_attempt: None,
             lookup_duration_ms: None,
+            lookup_correlation_id: None,
+            selected_peer_ordinal: None,
             expected_peer: None,
+            selected_peer_addresses: None,
+            selected_peer_address_types: None,
+            local_last_seen_age_ms: None,
+            publisher_address_set_age_ms: None,
+            publisher_address_set_unix_ns: None,
             source_peer: None,
             transport_source: None,
             route: "unknown".to_string(),
@@ -503,7 +539,13 @@ mod tests {
             "initial",
             1,
             Some(42),
+            "lookup-1",
             "peer-abc",
+            vec!["/ip4/1.2.3.4/udp/9000/quic".to_string()],
+            vec!["direct".to_string()],
+            Some(1_500),
+            Some(2_000),
+            Some(1_234_000_000),
             Some("peer-abc"),
             Some("/ip4/1.2.3.4/udp/9000/quic"),
             "direct",
@@ -520,7 +562,7 @@ mod tests {
         );
         let json = serde_json::to_value(&record).unwrap();
         let obj = json.as_object().unwrap();
-        // Pin field names — schema v2.
+        // Pin field names — schema v3.
         for field in [
             "schema_version",
             "timestamp",
@@ -532,7 +574,14 @@ mod tests {
             "sweep",
             "peer_attempt",
             "lookup_duration_ms",
+            "lookup_correlation_id",
+            "selected_peer_ordinal",
             "expected_peer",
+            "selected_peer_addresses",
+            "selected_peer_address_types",
+            "local_last_seen_age_ms",
+            "publisher_address_set_age_ms",
+            "publisher_address_set_unix_ns",
             "source_peer",
             "transport_source",
             "route",
@@ -582,7 +631,14 @@ mod tests {
         assert_eq!(obj["lookup_duration_ms"], serde_json::json!(42u64));
         assert_eq!(obj["bytes"], serde_json::json!(1024u64));
         assert_eq!(obj["outcome"], serde_json::json!("found"));
-        assert_eq!(obj["schema_version"], serde_json::json!(2u8));
+        assert_eq!(obj["schema_version"], serde_json::json!(3u8));
+        assert_eq!(obj["lookup_correlation_id"], serde_json::json!("lookup-1"));
+        assert_eq!(obj["selected_peer_ordinal"], serde_json::json!(1usize));
+        assert_eq!(obj["local_last_seen_age_ms"], serde_json::json!(1_500u64));
+        assert_eq!(
+            obj["publisher_address_set_age_ms"],
+            serde_json::json!(2_000u64)
+        );
         assert_eq!(
             obj["chunk_address"],
             serde_json::Value::String(hex::encode(addr))
@@ -599,7 +655,13 @@ mod tests {
             "retry",
             3,
             Some(10),
+            "lookup-2",
             "peer-x",
+            vec!["/ip6/2001:db8::1/udp/9000/quic".to_string()],
+            vec!["unverified".to_string()],
+            None,
+            None,
+            None,
             // No response → no source_peer, no transport_source.
             None,
             None,
@@ -618,6 +680,8 @@ mod tests {
         let json = serde_json::to_value(&record).unwrap();
         let obj = json.as_object().unwrap();
         assert_eq!(obj["lookup_duration_ms"], serde_json::Value::Null);
+        assert_eq!(obj["lookup_correlation_id"], serde_json::json!("lookup-2"));
+        assert_eq!(obj["selected_peer_ordinal"], serde_json::json!(3usize));
         assert_eq!(
             obj["route_note"],
             serde_json::json!(DownloadDiagnosticsRecord::ROUTE_UNKNOWN_NOTE)
@@ -656,6 +720,8 @@ mod tests {
         assert_eq!(obj["source_peer"], serde_json::Value::Null);
         assert_eq!(obj["transport_source"], serde_json::Value::Null);
         assert_eq!(obj["lookup_duration_ms"], serde_json::Value::Null);
+        assert_eq!(obj["lookup_correlation_id"], serde_json::Value::Null);
+        assert_eq!(obj["selected_peer_addresses"], serde_json::Value::Null);
         assert_eq!(obj["response_elapsed_ms"], serde_json::Value::Null);
         assert_eq!(
             obj["peer_connected_before_request"],
@@ -774,7 +840,13 @@ mod tests {
             "initial",
             1,
             Some(5),
+            "lookup-writer",
             "peer-z",
+            vec!["/ip4/1.2.3.4/udp/9000/quic".to_string()],
+            vec!["direct".to_string()],
+            Some(50),
+            Some(100),
+            Some(1_234_000_000),
             Some("peer-z"),
             Some("/ip4/1.2.3.4/udp/9000/quic"),
             "direct",
@@ -801,7 +873,7 @@ mod tests {
         );
         let first = serde_json::from_str::<serde_json::Value>(lines[0]).unwrap();
         assert_eq!(first["outcome"], serde_json::json!("cache_hit"));
-        assert_eq!(first["schema_version"], serde_json::json!(2u8));
+        assert_eq!(first["schema_version"], serde_json::json!(3u8));
         let second = serde_json::from_str::<serde_json::Value>(lines[1]).unwrap();
         assert_eq!(second["outcome"], serde_json::json!("found"));
         assert_eq!(second["route"], serde_json::json!("direct"));

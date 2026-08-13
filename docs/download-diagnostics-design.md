@@ -25,7 +25,7 @@ Each record contains:
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | Stable schema discriminator; `2` for transport metadata and correlation timestamps |
+| `schema_version` | Stable schema discriminator; `3` adds selected DHT-record context |
 | `timestamp` | UTC time when the attempt completed |
 | `request_started_unix_ms` / `request_completed_unix_ms` | Exact peer-request wall-clock bounds for joining to retained fleet telemetry and reconstructing overlap |
 | `file_attempt` | Outer file/deferred-retry attempt number |
@@ -33,7 +33,12 @@ Each record contains:
 | `sweep` | Initial or internal retry sweep |
 | `peer_attempt` | Peer attempt number within the sweep |
 | `lookup_duration_ms` | Closest-peer DHT lookup duration; emitted on the first attempt associated with that lookup |
+| `lookup_correlation_id` | Process-local ID shared by attempts produced by one closest-peer lookup |
+| `selected_peer_ordinal` | One-based position in the unchanged DHT-selected peer order |
 | `expected_peer` | Peer selected by the DHT lookup |
+| `selected_peer_addresses` / `selected_peer_address_types` | Parallel, priority-ordered advertised addresses and their DHT type labels |
+| `local_last_seen_age_ms` | This client's monotonic age since its latest successful DHT interaction with the peer; local knowledge, not remote uptime |
+| `publisher_address_set_unix_ns` / `publisher_address_set_age_ms` | Untrusted publisher-clock address-set timestamp and derived age; age is `null` for future-skewed clocks |
 | `source_peer` | Peer identified by the received protocol response |
 | `transport_source` | Actual response event transport MultiAddr, when available |
 | `route` | `direct`, `relay`, `lan`, `unverified`, or `unknown`, classified from the actual transport source against typed DHT addresses |
