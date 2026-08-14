@@ -3202,14 +3202,19 @@ mod tests {
         assert_eq!(witnessed_quote_launch_budget(0, CLOSE_GROUP_SIZE, 32), 0);
     }
 
-    /// The probe must be paid once per peer, not once per request.
+    /// The probe must be paid per peer, not per request.
     ///
     /// A storer that predates the versioned request never answers it, so the
-    /// client eats a full `quote_timeout_secs` before falling back. Without
-    /// remembering the answer that cost lands on every quote, and a merkle
-    /// pool asks sixteen candidates. Measured on the merkle E2E suite against
-    /// a fleet on published ant-node, re-probing took the run from ~24 minutes
-    /// to past the 60-minute CI cap.
+    /// client eats the probe wait before falling back. Without remembering the
+    /// answer that cost lands on every quote, and a merkle pool asks sixteen
+    /// candidates. Measured on the merkle E2E suite against a fleet on
+    /// published ant-node, re-probing took the run from ~24 minutes to past
+    /// the 60-minute CI cap.
+    ///
+    /// The cache is consulted, not enforced: concurrent first contacts are not
+    /// single-flighted, so the same peer can be probed by a few in-flight
+    /// requests before any of them records the answer. What the cache
+    /// guarantees is that later rounds do not re-probe.
     #[test]
     fn a_peer_that_cannot_answer_a_versioned_quote_is_only_probed_once() {
         let peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));

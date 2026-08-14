@@ -43,22 +43,48 @@ pub(crate) const PUT_TARGET_WIDTH: usize = 20;
 /// quote request before falling back to the unversioned shape.
 ///
 /// A storer that predates the versioned request cannot decode it and never
-/// replies, so the only way to find out is to wait. Waiting the full quote
-/// timeout is far more patience than the question needs: this asks "can you
-/// parse this shape", and a peer that can will answer as fast as it answers
-/// anything.
+/// replies, so the only way to find out is to wait.
+///
+/// Note what is being waited for. This is **not** a cheap parse check: a peer
+/// that understands the request runs the whole quote handler, queueing,
+/// storage reads, pricing and signing, so the answer takes as long as any
+/// quote takes. Abandoning the wait does not cancel that work either, it just
+/// stops listening and adds a duplicate legacy request on top. So the wait has
+/// to be sized for a real quote, not for a ping.
 ///
 /// The full timeout is what made this expensive. The merkle E2E suite runs
 /// with `quote_timeout_secs = 120`, so every probe against a fleet on the
-/// published node cost two minutes, and the suite went from ~24 minutes to
-/// past the 60-minute CI cap. Production runs 10s, where this ceiling does not
-/// bind at all.
+/// published node cost two minutes and the suite blew the 60-minute CI cap.
 ///
-/// Cutting the probe short can misjudge a slow but upgraded peer as legacy.
-/// The cost of that is only a lost version declaration to that peer, because
-/// the fallback still gets a quote, and it cannot matter while no client can
-/// be refused on version grounds. By the time it could, the fallback must
-/// already be gone (see [`UNVERSIONED_RETRY_REQUIRES_MIN_V1`]).
+/// # It must never bind in production
+///
+/// **Keep this at or above the largest production `quote_timeout_secs`**,
+/// currently 10s. That is not a tuning preference, it is the safety property.
+///
+/// This wait is the only window in which a peer can refuse. Abandoning it
+/// early does not merely mislabel a slow peer: the fallback then sends an
+/// unversioned request under a *new* request id, so a refusal arriving after
+/// the ceiling is answering a request nobody is listening to. It never counts
+/// toward corroboration, never sets the latch, and the legacy request it
+/// raced can return a perfectly good quote the client then pays against.
+///
+/// A shorter ceiling was tried, at 5s, to bring the slower CI runner under the
+/// cap. It would have turned every legitimate 5-to-10 second refusal in
+/// production into exactly that silent downgrade. The never-demote rule does
+/// not help: it stops a peer being *cached* as legacy after it has answered
+/// once, but it does not stop the request in flight from falling back. And the
+/// compile-time guard does not help either, because it binds future builds
+/// while the clients at risk are the ones already released.
+///
+/// So the ceiling exists solely to bound configurations that set a timeout far
+/// above any real answer time, which in practice means test harnesses. Above
+/// 10s it never binds on a production client, and nothing real is truncated.
+///
+/// The cost of leaving it here is roughly two minutes per merkle E2E test
+/// while the suite's devnet still speaks the pre-versioned dialect. That is a
+/// consequence of the temporary fork-branch protocol pin, not of the design:
+/// once the fleet under test can answer a versioned request there are no
+/// probes to pay for, and the suite returns to its baseline.
 pub(crate) const VERSIONED_QUOTE_PROBE_CEILING: std::time::Duration =
     std::time::Duration::from_secs(15);
 
@@ -519,10 +545,18 @@ pub struct Client {
     /// therefore asked in the legacy shape from now on.
     ///
     /// Without this the probe cost is paid on **every** request rather than
-    /// once per peer. Measured on the merkle E2E suite against a fleet that
-    /// predates the versioned requests, re-probing took the run from ~24
+    /// roughly once per peer. Measured on the merkle E2E suite against a fleet
+    /// that predates the versioned requests, re-probing took the run from ~24
     /// minutes to over 60, because each of the sixteen candidates per pool sat
     /// out a full `quote_timeout_secs` before the fallback.
+    ///
+    /// Roughly, not exactly: concurrent first contacts are not coalesced, so
+    /// several in-flight requests can all miss the cache for the same peer and
+    /// each probe it once before any of them records the answer. Observed at
+    /// about two probes per peer on a 35-node devnet. Single-flighting them
+    /// would remove the duplicates but not the wall-clock cost, which is set
+    /// by how many *sequential* quote rounds an upload performs rather than by
+    /// how many probes each round contains.
     ///
     /// Process-local and never persisted. A peer that upgrades mid-run keeps
     /// being asked in the legacy shape until the next start, which is
