@@ -62,6 +62,21 @@ pub(crate) const PUT_TARGET_WIDTH: usize = 20;
 pub(crate) const VERSIONED_QUOTE_PROBE_CEILING: std::time::Duration =
     std::time::Duration::from_secs(15);
 
+/// How many distinct peers must refuse this client's settlement version before
+/// the refusal is believed and uploads stop.
+///
+/// Nothing authenticates a refusal, so one peer's word cannot be enough: a
+/// single hostile or misconfigured storer answering `ClientUpdateRequired` to
+/// everything would otherwise deny every upload, turning an over-query design
+/// that tolerates many bad peers into one that tolerates none.
+///
+/// Two is deliberately low. A genuine incompatibility reaches it instantly,
+/// because every peer enforcing the newer rule refuses, and a client queries
+/// far more than two. An attacker has to control two of the peers a given
+/// request happens to reach, which is a materially different proposition from
+/// controlling one.
+pub(crate) const SETTLEMENT_REFUSAL_QUORUM: usize = 2;
+
 /// Compile-time cutover guard shared by **every** unversioned quote retry.
 ///
 /// Both quote paths fall back to an unversioned request when a peer stays
@@ -108,6 +123,42 @@ pub(crate) const UNVERSIONED_RETRY_REQUIRES_MIN_V1: () = assert!(
      both the too-old and the node-behind refusals, so delete every fallback site \
      before raising MIN_SUPPORTED_SETTLEMENT_VERSION or CURRENT_SETTLEMENT_VERSION"
 );
+
+/// Distinct peers that have refused this client's settlement version, plus the
+/// wording of the first refusal.
+///
+/// A separate type rather than a field so the corroboration rule can be tested
+/// on its own: it is the piece that decides whether an upload stops, and it
+/// has to hold against both a lone lying peer and a genuine incompatibility.
+#[derive(Clone, Default)]
+pub(crate) struct SettlementRefusals {
+    inner: Arc<Mutex<(HashSet<PeerId>, Option<String>)>>,
+}
+
+impl SettlementRefusals {
+    /// Record a refusal from `peer_id`, returning the wording once
+    /// [`SETTLEMENT_REFUSAL_QUORUM`] distinct peers agree and `None` below it.
+    pub(crate) fn note(&self, peer_id: PeerId, message: &str) -> Option<String> {
+        let mut guard = self.inner.lock().ok()?;
+        let (peers, wording) = &mut *guard;
+        peers.insert(peer_id);
+        if wording.is_none() {
+            *wording = Some(message.to_string());
+        }
+        (peers.len() >= SETTLEMENT_REFUSAL_QUORUM)
+            .then(|| wording.clone())
+            .flatten()
+    }
+
+    /// The corroborated refusal, if one has been established.
+    pub(crate) fn corroborated(&self) -> Option<String> {
+        let guard = self.inner.lock().ok()?;
+        let (peers, wording) = &*guard;
+        (peers.len() >= SETTLEMENT_REFUSAL_QUORUM)
+            .then(|| wording.clone())
+            .flatten()
+    }
+}
 
 /// Classify a `data::error::Error` into a controller `Outcome`.
 ///
@@ -494,6 +545,26 @@ pub struct Client {
     /// Peers observed answering a settlement-versioned request. Never
     /// downgraded, however they behave later.
     versioned_capable_peers: Arc<Mutex<HashSet<PeerId>>>,
+    /// Distinct peers that have refused this client on settlement-version
+    /// grounds, and the wording of the first such refusal.
+    ///
+    /// Client-wide and sticky, for two reasons that pull in opposite
+    /// directions and are both real.
+    ///
+    /// It must outlive one operation, because the verdict is about this
+    /// **build**, not this upload. Held in a single collector's local state, a
+    /// refusal observed by one in-flight upload says nothing to another that
+    /// is about to submit a payment, and merkle payments cannot be undone.
+    ///
+    /// It must not fire on one peer's say-so, because nothing authenticates a
+    /// refusal. A single hostile or confused peer answering
+    /// `ClientUpdateRequired` to every query would otherwise abort every
+    /// upload the client attempts, converting an over-query design that
+    /// tolerates many bad peers into one that tolerates none. So a refusal
+    /// becomes terminal only once [`SETTLEMENT_REFUSAL_QUORUM`] distinct peers
+    /// agree, which a genuine incompatibility reaches immediately (every
+    /// upgraded peer refuses) and a lone attacker cannot reach at all.
+    settlement_refusals: SettlementRefusals,
 }
 
 impl Client {
@@ -522,6 +593,7 @@ impl Client {
             next_request_id: AtomicU64::new(1),
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
             versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
+            settlement_refusals: SettlementRefusals::default(),
             controller,
             persist_path,
             peer_cache_path,
@@ -559,6 +631,7 @@ impl Client {
             next_request_id: AtomicU64::new(1),
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
             versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
+            settlement_refusals: SettlementRefusals::default(),
             controller,
             persist_path,
             peer_cache_path: None,
@@ -694,6 +767,32 @@ impl Client {
     /// upgraded peer in the legacy shape.
     pub(crate) fn versioned_quote_capable_handle(&self) -> Arc<Mutex<HashSet<PeerId>>> {
         Arc::clone(&self.versioned_capable_peers)
+    }
+
+    /// Record that `peer_id` refused this client's settlement version, and
+    /// report whether enough distinct peers now agree for it to be believed.
+    ///
+    /// Returns the refusal wording once [`SETTLEMENT_REFUSAL_QUORUM`] is met,
+    /// and `None` below it, so a lone peer is treated as a peer fault rather
+    /// than a verdict about this build.
+    pub(crate) fn note_settlement_refusal(&self, peer_id: PeerId, message: &str) -> Option<String> {
+        self.settlement_refusals.note(peer_id, message)
+    }
+
+    /// The corroborated refusal, if this client has already been told by
+    /// enough peers that it cannot settle.
+    ///
+    /// Checked before spending money. The verdict concerns this build rather
+    /// than any one upload, so an upload that starts after another has already
+    /// established it must not proceed to pay.
+    pub(crate) fn corroborated_settlement_refusal(&self) -> Option<String> {
+        self.settlement_refusals.corroborated()
+    }
+
+    /// Handle to the shared refusal tracker, for collectors that run outside
+    /// `&self`.
+    pub(crate) fn settlement_refusals(&self) -> SettlementRefusals {
+        self.settlement_refusals.clone()
     }
 
     /// Return the chunk PUT-target set: the closest [`PUT_TARGET_WIDTH`] peers

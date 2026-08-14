@@ -642,6 +642,13 @@ impl Client {
         data_type: u32,
         data_size: u64,
     ) -> Result<MerkleBatchPaymentResult> {
+        // A refusal established by any earlier upload on this client stops
+        // this one before it spends. The verdict is about this build, not
+        // about one operation, so an upload that started after another had
+        // already been told the settlement rules are wrong must not pay.
+        if let Some(refusal) = self.corroborated_settlement_refusal() {
+            return Err(Error::ClientUpdateRequired(refusal));
+        }
         let chunk_count = addresses.len();
         if chunk_count < 2 {
             return Err(Error::Payment(
@@ -856,6 +863,13 @@ impl Client {
         data_type: u32,
         data_size: u64,
     ) -> Result<PreparedMerkleBatch> {
+        // A refusal established by any earlier upload on this client stops
+        // this one before it spends. The verdict is about this build, not
+        // about one operation, so an upload that started after another had
+        // already been told the settlement rules are wrong must not pay.
+        if let Some(refusal) = self.corroborated_settlement_refusal() {
+            return Err(Error::ClientUpdateRequired(refusal));
+        }
         ensure_single_merkle_tree_batch(addresses.len())?;
 
         let chunk_count = addresses.len();
@@ -1005,15 +1019,25 @@ impl Client {
                     // upload. Every remaining sub-batch would be refused the
                     // same way, so there is nothing to salvage by continuing.
                     if matches!(e, Error::ClientUpdateRequired(_)) {
+                        // Do NOT return Err here. The caller writes the receipt
+                        // cache only on the Ok path, so failing the call would
+                        // discard proofs for sub-batches whose payment has
+                        // already settled on-chain and cannot be undone. That is
+                        // the very destruction this work exists to stop.
+                        //
+                        // The verdict is not lost by returning the partial
+                        // result: it was latched client-wide when it was
+                        // corroborated, so the next quote collection refuses
+                        // before spending anything and the upgrade instruction
+                        // reaches the user from there.
                         warn!(
-                            "Merkle sub-batch {}/{total_sub_batches}: storer refused this \
-                             client's settlement version. {} proofs from earlier sub-batches \
-                             were paid for and are recoverable from the cached receipt; \
-                             surfacing the refusal rather than a partial success",
+                            "Merkle sub-batch {}/{total_sub_batches}: storers refused this \
+                             client's settlement version. Returning {} proofs from \
+                             already-paid sub-batches so that spend is not stranded; the \
+                             refusal is latched and will stop the next payment.",
                             i + 1,
                             all_proofs.len()
                         );
-                        return Err(e);
                     }
                     // Return partial result so caller can still store already-paid chunks.
                     warn!(
@@ -1131,9 +1155,17 @@ impl Client {
             // candidates per pool, so against a fleet that predates the
             // versioned requests the probes dominate the run: measured on this
             // suite it went from ~24 minutes to past the 60-minute CI cap.
-            let known_legacy = unversioned_peers
+            // The capable set wins. The two sets are updated under separate
+            // locks, so a slow probe can insert into the legacy set after a
+            // concurrent request has already proved the peer capable; letting
+            // capability win makes that interleaving harmless instead of
+            // permanently preferring the legacy shape.
+            let known_legacy = !versioned_capable
                 .lock()
-                .is_ok_and(|peers| peers.contains(peer_id));
+                .is_ok_and(|peers| peers.contains(peer_id))
+                && unversioned_peers
+                    .lock()
+                    .is_ok_and(|peers| peers.contains(peer_id));
 
             let legacy_request = MerkleCandidateQuoteRequest {
                 address: *address,
@@ -1229,7 +1261,14 @@ impl Client {
 
                 // Any answer at all to the versioned shape proves the peer
                 // can parse it, so it can never later be demoted.
-                if !known_legacy && result.is_ok() {
+                // Any recognised answer proves the peer parsed the versioned
+                // shape, including a structured error. Only silence and send
+                // failures leave the question open.
+                let answered = match &result {
+                    Ok(_) => true,
+                    Err(e) => !is_version_unaware(e),
+                };
+                if !known_legacy && answered {
                     if let Ok(mut peers) = capable_handle.lock() {
                         peers.insert(peer_id_clone);
                     }
@@ -1364,12 +1403,22 @@ impl Client {
                     valid.push((candidate_peer, candidate));
                 }
                 // A storer that has explicitly declared this client
-                // incompatible ends the batch here. Collecting it as one more
+                // incompatible ends the batch, but only once enough distinct
+                // peers agree. Collecting a corroborated refusal as one more
                 // failed peer would let the pool fill from the remaining
-                // sixteen and go on to pay, which is the burn this whole
-                // mechanism exists to prevent. It also buries the upgrade
-                // instruction inside an InsufficientPeers diagnostic string.
-                Err(e @ Error::ClientUpdateRequired(_)) => return Err(e),
+                // sixteen and go on to pay, which is the burn this mechanism
+                // exists to prevent; acting on a single peer's unauthenticated
+                // word would instead let one hostile responder deny every
+                // upload.
+                Err(e @ Error::ClientUpdateRequired(_)) => {
+                    if let Some(corroborated) =
+                        self.note_settlement_refusal(peer_id, &e.to_string())
+                    {
+                        return Err(Error::ClientUpdateRequired(corroborated));
+                    }
+                    warn!("Merkle candidate {peer_id} refused this client's settlement version; awaiting corroboration");
+                    failures.push(format!("{peer_id}: {e}"));
+                }
                 Err(e) => {
                     debug!("Failed to get merkle candidate from {peer_id}: {e}");
                     failures.push(format!("{peer_id}: {e}"));

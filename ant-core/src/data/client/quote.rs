@@ -5,6 +5,7 @@
 
 use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
+use crate::data::client::SettlementRefusals;
 use crate::data::client::PUT_TARGET_WIDTH;
 use crate::data::client::VERSIONED_QUOTE_PROBE_CEILING;
 use crate::data::error::{Error, Result};
@@ -19,9 +20,9 @@ use ant_protocol::transport::{
     DHTNode, MultiAddr, P2PNode, PeerId, ResponderView, WitnessedCloseGroup,
 };
 use ant_protocol::{
-    compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
-    ChunkQuoteRequest, ChunkQuoteRequestV2, ChunkQuoteResponse, ProtocolError,
-    CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
+    client_update_required_message, compute_address, send_and_await_chunk_response, ChunkMessage,
+    ChunkMessageBody, ChunkQuoteRequest, ChunkQuoteRequestV2, ChunkQuoteResponse, ProtocolError,
+    CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE, CURRENT_SETTLEMENT_VERSION,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
@@ -350,9 +351,16 @@ async fn request_store_quote_from_peer(
     // time, and against a fleet that predates the versioned requests that is
     // paid on every quote: measured on the merkle E2E suite it took the run
     // from ~24 minutes to past the 60-minute cap.
-    let known_legacy = unversioned_peers
+    // The capable set wins. The two sets are updated under separate locks, so
+    // a slow probe can insert into the legacy set after a concurrent request
+    // has already proved the peer capable; letting capability win makes that
+    // interleaving harmless instead of permanently preferring the legacy shape.
+    let known_legacy = !versioned_capable
         .lock()
-        .is_ok_and(|peers| peers.contains(&peer_id));
+        .is_ok_and(|peers| peers.contains(&peer_id))
+        && unversioned_peers
+            .lock()
+            .is_ok_and(|peers| peers.contains(&peer_id));
 
     // Declare the settlement version so a storer can turn us away before we
     // pay. See `merkle.rs` for why the legacy retry below exists and when it
@@ -401,8 +409,14 @@ async fn request_store_quote_from_peer(
     )
     .await;
 
-    // Any answer at all to the versioned shape proves the peer can parse it.
-    if !known_legacy && result.is_ok() {
+    // Any recognised answer proves the peer parsed the versioned shape,
+    // including a structured error. Only silence and send failures leave the
+    // question open.
+    let answered = match &result {
+        Ok(_) => true,
+        Err(e) => !is_version_unaware(e),
+    };
+    if !known_legacy && answered {
         if let Ok(mut peers) = versioned_capable.lock() {
             peers.insert(peer_id);
         }
@@ -487,8 +501,15 @@ fn map_quote_response(
             commitment,
         )),
         ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(
-            refusal @ ProtocolError::ClientUpdateRequired { .. },
-        )) => Some(Err(Error::ClientUpdateRequired(refusal.to_string()))),
+            ProtocolError::ClientUpdateRequired {
+                client_settlement_version,
+                min_settlement_version,
+            },
+        )) => Some(Err(settlement_refusal_error(
+            peer_id,
+            client_settlement_version,
+            min_settlement_version,
+        ))),
         ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(
             behind @ ProtocolError::StorerUpdateRequired { .. },
         )) => Some(Err(Error::StorerUpdateRequired(behind.to_string()))),
@@ -497,6 +518,34 @@ fn map_quote_response(
         )),
         _ => None,
     }
+}
+
+/// Turn a peer's `ClientUpdateRequired` into an error, rejecting one that does
+/// not describe this client.
+///
+/// A refusal is unauthenticated, so the least this client can do is check that
+/// the peer is talking about the request it actually sent: the echoed version
+/// must be ours, and the stated minimum must genuinely exceed it. A peer that
+/// fails either is confused or lying, and is treated as an ordinary bad peer
+/// rather than as evidence about this build.
+fn settlement_refusal_error(
+    peer_id: &PeerId,
+    client_settlement_version: u32,
+    min_settlement_version: u32,
+) -> Error {
+    if client_settlement_version != CURRENT_SETTLEMENT_VERSION
+        || min_settlement_version <= client_settlement_version
+    {
+        return Error::Protocol(format!(
+            "Peer {peer_id} sent an incoherent settlement refusal (claimed this client is at \
+             version {client_settlement_version} needing {min_settlement_version}, but this \
+             client is at {CURRENT_SETTLEMENT_VERSION}); ignoring it"
+        ));
+    }
+    Error::ClientUpdateRequired(client_update_required_message(
+        client_settlement_version,
+        min_settlement_version,
+    ))
 }
 
 /// Did this failure look like a storer that cannot parse a versioned request,
@@ -529,6 +578,7 @@ fn record_store_quote_result(
     failures: &mut Vec<String>,
     bad_quote_count: &mut usize,
     settlement_refusal: &mut Option<Error>,
+    refusals: &SettlementRefusals,
 ) -> Result<()> {
     match quote_result {
         Ok((quote, price, commitment)) => {
@@ -550,10 +600,21 @@ fn record_store_quote_result(
         // a client told it cannot settle must not pay, whatever else happened
         // during collection.
         Err(e @ Error::ClientUpdateRequired(_)) => {
+            // One peer's word is not a verdict about this build: nothing
+            // authenticates a refusal, so a single hostile peer answering this
+            // to everything would deny every upload. Believe it once enough
+            // distinct peers agree, which a genuine incompatibility reaches at
+            // once because every enforcing peer refuses.
+            let Some(corroborated) = refusals.note(peer_id, &e.to_string()) else {
+                warn!("Peer {peer_id} refused this client's settlement version; awaiting corroboration");
+                failures.push(format!("{peer_id}: {e}"));
+                return Ok(());
+            };
+            let verdict = Error::ClientUpdateRequired(corroborated);
             if settlement_refusal.is_none() {
-                *settlement_refusal = Some(Error::ClientUpdateRequired(e.to_string()));
+                *settlement_refusal = Some(Error::ClientUpdateRequired(verdict.to_string()));
             }
-            return Err(e);
+            return Err(verdict);
         }
         Err(e) => {
             if matches!(&e, Error::BadQuoteBinding { .. }) {
@@ -1314,6 +1375,7 @@ impl Client {
         // collection loops so neither the overall timeout nor an early exit
         // can discard it. Checked before any quote plan is built.
         let mut settlement_refusal: Option<Error> = None;
+        let refusals = self.settlement_refusals();
 
         if staged_witnessed_collection {
             let mut quote_futures = FuturesUnordered::new();
@@ -1371,6 +1433,7 @@ impl Client {
                             &mut failures,
                             &mut bad_quote_count,
                             &mut settlement_refusal,
+                            &refusals,
                         )?;
                     }
                     Ok(())
@@ -1426,6 +1489,7 @@ impl Client {
                             &mut failures,
                             &mut bad_quote_count,
                             &mut settlement_refusal,
+                            &refusals,
                         )?;
                     }
                     Ok(())
@@ -2924,8 +2988,8 @@ mod tests {
     fn an_update_refusal_is_surfaced_with_its_upgrade_instruction() {
         let peer_id = PeerId::from_bytes([0x42; 32]);
         let refusal = ProtocolError::ClientUpdateRequired {
-            client_settlement_version: 0,
-            min_settlement_version: 1,
+            client_settlement_version: CURRENT_SETTLEMENT_VERSION,
+            min_settlement_version: CURRENT_SETTLEMENT_VERSION.saturating_add(1),
         };
 
         let mapped = map_quote_response(
@@ -3006,27 +3070,37 @@ mod tests {
         let mut bad_quotes = 0usize;
         let mut refusal_slot: Option<Error> = None;
 
-        let outcome = record_store_quote_result(
-            PeerId::from_bytes([0x44; 32]),
-            Vec::new(),
-            Err(Error::ClientUpdateRequired(
-                "too old, run ant update".into(),
-            )),
-            &[0x11; 32],
-            &mut quotes,
-            &mut already_stored,
-            &mut failures,
-            &mut bad_quotes,
-            &mut refusal_slot,
-        );
+        let refusals = SettlementRefusals::default();
+        let mut refuse =
+            |peer: u8, failures: &mut Vec<String>, slot: &mut Option<Error>| -> Result<()> {
+                record_store_quote_result(
+                    PeerId::from_bytes([peer; 32]),
+                    Vec::new(),
+                    Err(Error::ClientUpdateRequired(
+                        "too old, run ant update".into(),
+                    )),
+                    &[0x11; 32],
+                    &mut quotes,
+                    &mut already_stored,
+                    failures,
+                    &mut bad_quotes,
+                    slot,
+                    &refusals,
+                )
+            };
 
+        // One peer is not corroboration: recorded as an ordinary bad peer, so a
+        // single hostile responder cannot deny every upload.
+        let first = refuse(0x44, &mut failures, &mut refusal_slot);
+        assert!(first.is_ok(), "one peer must not abort, got {first:?}");
+        assert_eq!(failures.len(), 1);
+        assert!(refusal_slot.is_none());
+
+        // A second, distinct peer makes it a verdict about this build.
+        let second = refuse(0x45, &mut failures, &mut refusal_slot);
         assert!(
-            matches!(outcome, Err(Error::ClientUpdateRequired(_))),
-            "refusal must propagate, got {outcome:?}"
-        );
-        assert!(
-            failures.is_empty(),
-            "refusal must not be flattened into the per-peer failure list"
+            matches!(second, Err(Error::ClientUpdateRequired(_))),
+            "a corroborated refusal must propagate, got {second:?}"
         );
     }
 
@@ -3050,6 +3124,7 @@ mod tests {
             &mut failures,
             &mut bad_quotes,
             &mut refusal_slot,
+            &SettlementRefusals::default(),
         );
 
         assert!(
@@ -3079,19 +3154,23 @@ mod tests {
         let mut bad_quotes = 0usize;
         let mut refusal_slot: Option<Error> = None;
 
-        let _ = record_store_quote_result(
-            PeerId::from_bytes([0x46; 32]),
-            Vec::new(),
-            Err(Error::ClientUpdateRequired(
-                "too old, run ant update".into(),
-            )),
-            &[0x11; 32],
-            &mut quotes,
-            &mut already_stored,
-            &mut failures,
-            &mut bad_quotes,
-            &mut refusal_slot,
-        );
+        let refusals = SettlementRefusals::default();
+        for peer in [0x46u8, 0x47u8] {
+            let _ = record_store_quote_result(
+                PeerId::from_bytes([peer; 32]),
+                Vec::new(),
+                Err(Error::ClientUpdateRequired(
+                    "too old, run ant update".into(),
+                )),
+                &[0x11; 32],
+                &mut quotes,
+                &mut already_stored,
+                &mut failures,
+                &mut bad_quotes,
+                &mut refusal_slot,
+                &refusals,
+            );
+        }
 
         match refusal_slot {
             Some(Error::ClientUpdateRequired(msg)) => {
@@ -3172,5 +3251,80 @@ mod tests {
         // than left to fail outright.
         assert!(is_version_unaware(&Error::Network("send failed".into())));
         assert!(is_version_unaware(&Error::Timeout("no answer".into())));
+    }
+
+    /// One peer cannot condemn the client.
+    ///
+    /// Nothing authenticates a refusal, so a single hostile or misconfigured
+    /// storer answering `ClientUpdateRequired` to everything would otherwise
+    /// abort every upload. That turns an over-query design which tolerates
+    /// many bad peers into one that tolerates none.
+    #[test]
+    fn a_lone_peer_cannot_condemn_the_client() {
+        let refusals = SettlementRefusals::default();
+        assert!(
+            refusals
+                .note(PeerId::from_bytes([0x61; 32]), "too old")
+                .is_none(),
+            "one peer is not corroboration"
+        );
+        assert!(refusals.corroborated().is_none());
+        // The same peer repeating itself is still one peer.
+        assert!(refusals
+            .note(PeerId::from_bytes([0x61; 32]), "too old")
+            .is_none());
+        assert!(refusals.corroborated().is_none());
+    }
+
+    /// A genuine incompatibility reaches the threshold at once, because every
+    /// peer enforcing the newer rule refuses.
+    #[test]
+    fn a_second_peer_makes_the_refusal_terminal_and_it_stays_latched() {
+        let refusals = SettlementRefusals::default();
+        refusals.note(PeerId::from_bytes([0x62; 32]), "run ant update");
+        let verdict = refusals.note(PeerId::from_bytes([0x63; 32]), "run ant update");
+
+        assert!(verdict.is_some_and(|m| m.contains("ant update")));
+        // Latched: an upload starting later must see it before it spends,
+        // which is the whole point of holding it on the client rather than in
+        // one collector's local state.
+        assert!(refusals
+            .corroborated()
+            .is_some_and(|m| m.contains("ant update")));
+    }
+
+    /// A refusal that does not describe this client is a confused or lying
+    /// peer, not evidence about this build, and must not count toward the
+    /// threshold.
+    #[test]
+    fn an_incoherent_refusal_is_treated_as_a_bad_peer() {
+        let peer_id = PeerId::from_bytes([0x64; 32]);
+
+        // Claims to be about some other client version.
+        let wrong_echo = settlement_refusal_error(
+            &peer_id,
+            CURRENT_SETTLEMENT_VERSION.saturating_add(7),
+            CURRENT_SETTLEMENT_VERSION.saturating_add(8),
+        );
+        assert!(matches!(wrong_echo, Error::Protocol(_)), "{wrong_echo:?}");
+
+        // Claims a minimum that our version already satisfies.
+        let no_gap = settlement_refusal_error(
+            &peer_id,
+            CURRENT_SETTLEMENT_VERSION,
+            CURRENT_SETTLEMENT_VERSION,
+        );
+        assert!(matches!(no_gap, Error::Protocol(_)), "{no_gap:?}");
+
+        // A coherent one is believed, and carries the upgrade instruction.
+        let real = settlement_refusal_error(
+            &peer_id,
+            CURRENT_SETTLEMENT_VERSION,
+            CURRENT_SETTLEMENT_VERSION.saturating_add(1),
+        );
+        match real {
+            Error::ClientUpdateRequired(msg) => assert!(msg.contains("ant update"), "{msg}"),
+            other => panic!("expected ClientUpdateRequired, got {other:?}"),
+        }
     }
 }
