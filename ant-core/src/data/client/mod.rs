@@ -23,9 +23,11 @@ use crate::data::peer_cache;
 use ant_protocol::evm::Wallet;
 use ant_protocol::transport::{MultiAddr, P2PNode, PeerId};
 use ant_protocol::{XorName, CLOSE_GROUP_SIZE};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use tracing::debug;
 
 /// Width of the chunk PUT-target set (initial writes plus fallback): the
@@ -37,6 +39,29 @@ use tracing::debug;
 /// so trying peers past this width is pointless.
 pub(crate) const PUT_TARGET_WIDTH: usize = 20;
 
+/// Ceiling on how long to wait for a peer to answer a settlement-versioned
+/// quote request before falling back to the unversioned shape.
+///
+/// A storer that predates the versioned request cannot decode it and never
+/// replies, so the only way to find out is to wait. Waiting the full quote
+/// timeout is far more patience than the question needs: this asks "can you
+/// parse this shape", and a peer that can will answer as fast as it answers
+/// anything.
+///
+/// The full timeout is what made this expensive. The merkle E2E suite runs
+/// with `quote_timeout_secs = 120`, so every probe against a fleet on the
+/// published node cost two minutes, and the suite went from ~24 minutes to
+/// past the 60-minute CI cap. Production runs 10s, where this ceiling does not
+/// bind at all.
+///
+/// Cutting the probe short can misjudge a slow but upgraded peer as legacy.
+/// The cost of that is only a lost version declaration to that peer, because
+/// the fallback still gets a quote, and it cannot matter while no client can
+/// be refused on version grounds. By the time it could, the fallback must
+/// already be gone (see [`UNVERSIONED_RETRY_REQUIRES_MIN_V1`]).
+pub(crate) const VERSIONED_QUOTE_PROBE_CEILING: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
 /// Compile-time cutover guard shared by **every** unversioned quote retry.
 ///
 /// Both quote paths fall back to an unversioned request when a peer stays
@@ -46,20 +71,42 @@ pub(crate) const PUT_TARGET_WIDTH: usize = 20;
 /// versioned requests are indistinguishable from the client side. So the
 /// fallback is a downgrade path and can be provoked.
 ///
-/// It is safe only while no client can be refused on version grounds, which
-/// holds exactly while `MIN_SUPPORTED_SETTLEMENT_VERSION` is the first
-/// declarable version. Raising the minimum without first deleting both
-/// fallbacks would let a refused client route around the gate and burn a
-/// payment.
+/// It is not only literal silence, either. `send_and_await_chunk_response`
+/// keeps waiting when a reply decodes but carries a body the mapper does not
+/// recognise, so a peer answering with an unexpected variant also lands on the
+/// timeout and takes this path. That grants no capability beyond staying
+/// silent, which is why it is bounded rather than special-cased, but a comment
+/// claiming "any structured response prevents the retry" would be wrong.
+///
+/// It is safe only while **no refusal of either kind is possible**, and that
+/// means bounding both constants, not just the minimum.
+///
+/// Raising `MIN` is the obvious hazard: a client below it would be refused,
+/// and the retry hands it a quote anyway. Raising `CURRENT` is the subtler
+/// one. As soon as some node runs a newer `CURRENT` than another, the older
+/// node refuses newer clients with `StorerUpdateRequired` precisely because it
+/// cannot promise to honour their payment. A client that retries such a peer
+/// unversioned gets that unhonourable quote, and for a settlement change that
+/// is not a pure increase the payment is then rejected after it has settled.
+/// Guarding only `MIN` would leave that route open.
+///
+/// So the guard requires both to still be at the first declarable version.
+///
+/// This bounds **future builds** only. A client binary already in the field
+/// carries whatever fallback it shipped with, and no source change reaches it;
+/// that is inherent to shipping software and is why the storer still verifies
+/// every payment it is actually offered.
 ///
 /// Each fallback site references this constant so the guard cannot be orphaned
 /// by deleting one path and forgetting the other. Retiring the fallbacks means
 /// deleting this constant and every reference to it, which the compiler then
 /// points at one by one.
 pub(crate) const UNVERSIONED_RETRY_REQUIRES_MIN_V1: () = assert!(
-    ant_protocol::MIN_SUPPORTED_SETTLEMENT_VERSION == 1,
-    "an unversioned quote retry is still compiled in: it is a downgrade path, so \
-     delete every fallback site before raising MIN_SUPPORTED_SETTLEMENT_VERSION"
+    ant_protocol::MIN_SUPPORTED_SETTLEMENT_VERSION == 1
+        && ant_protocol::CURRENT_SETTLEMENT_VERSION == 1,
+    "an unversioned quote retry is still compiled in: it is a downgrade path around \
+     both the too-old and the node-behind refusals, so delete every fallback site \
+     before raising MIN_SUPPORTED_SETTLEMENT_VERSION or CURRENT_SETTLEMENT_VERSION"
 );
 
 /// Classify a `data::error::Error` into a controller `Outcome`.
@@ -417,6 +464,36 @@ pub struct Client {
     persist_path: Option<PathBuf>,
     /// Path for the persistent client peer cache. `None` disables the cache.
     peer_cache_path: Option<PathBuf>,
+    /// Peers that did not answer a settlement-versioned quote request, and are
+    /// therefore asked in the legacy shape from now on.
+    ///
+    /// Without this the probe cost is paid on **every** request rather than
+    /// once per peer. Measured on the merkle E2E suite against a fleet that
+    /// predates the versioned requests, re-probing took the run from ~24
+    /// minutes to over 60, because each of the sixteen candidates per pool sat
+    /// out a full `quote_timeout_secs` before the fallback.
+    ///
+    /// Process-local and never persisted. A peer that upgrades mid-run keeps
+    /// being asked in the legacy shape until the next start, which is
+    /// acceptable while the legacy shape still gets a quote, and stops
+    /// mattering when the fallback is deleted (see
+    /// [`UNVERSIONED_RETRY_REQUIRES_MIN_V1`]).
+    ///
+    /// Entries are only ever added for a peer that has **never** answered a
+    /// versioned request. Without that condition a single lost response would
+    /// pin an upgraded peer to the legacy shape for the rest of the session,
+    /// turning one dropped packet into a standing downgrade; with it, a peer
+    /// that has shown it understands the versioned shape can never be demoted.
+    ///
+    /// A peer that has never answered can still get itself asked without a
+    /// version by staying silent, exactly as it could through the fallback
+    /// alone. Remembering the answer makes that cheaper to sustain, so it is
+    /// not a new capability but it is a wider one, and the compile-time guard
+    /// requires the whole path to be gone before any refusal is possible.
+    unversioned_quote_peers: Arc<Mutex<HashSet<PeerId>>>,
+    /// Peers observed answering a settlement-versioned request. Never
+    /// downgraded, however they behave later.
+    versioned_capable_peers: Arc<Mutex<HashSet<PeerId>>>,
 }
 
 impl Client {
@@ -443,6 +520,8 @@ impl Client {
             evm_network: None,
             chunk_cache: ChunkCache::default(),
             next_request_id: AtomicU64::new(1),
+            unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
+            versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
             controller,
             persist_path,
             peer_cache_path,
@@ -478,6 +557,8 @@ impl Client {
             evm_network: None,
             chunk_cache: ChunkCache::default(),
             next_request_id: AtomicU64::new(1),
+            unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
+            versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
             controller,
             persist_path,
             peer_cache_path: None,
@@ -594,6 +675,25 @@ impl Client {
     /// Get the next request ID for protocol messages.
     pub(crate) fn next_request_id(&self) -> u64 {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Handle to the set of peers that cannot answer a settlement-versioned
+    /// quote request, shared with the per-peer request futures on both quote
+    /// paths.
+    ///
+    /// Callers read it before choosing a request shape and insert into it when
+    /// a peer stays silent. A poisoned lock is treated as "nothing known", so
+    /// the worst case is a wasted probe rather than a silently skipped version
+    /// declaration.
+    pub(crate) fn unversioned_quote_peers(&self) -> Arc<Mutex<HashSet<PeerId>>> {
+        Arc::clone(&self.unversioned_quote_peers)
+    }
+
+    /// Handle to the set of peers already seen answering a versioned request.
+    /// Consulted before demoting a peer, so a lost response cannot strand an
+    /// upgraded peer in the legacy shape.
+    pub(crate) fn versioned_quote_capable_handle(&self) -> Arc<Mutex<HashSet<PeerId>>> {
+        Arc::clone(&self.versioned_capable_peers)
     }
 
     /// Return the chunk PUT-target set: the closest [`PUT_TARGET_WIDTH`] peers

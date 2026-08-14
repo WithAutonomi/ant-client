@@ -30,6 +30,7 @@ use bytes::Bytes;
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use rand::Rng;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -207,8 +208,15 @@ fn map_merkle_candidate_response(
 ///
 /// A storer built before the settlement version existed cannot decode the
 /// versioned request, so it never replies and the send fails at the transport
-/// layer. Any structured response, refusal included, means the storer
-/// understood us, and retrying that in an older shape would defeat the gate.
+/// layer. Any response this client *recognises*, refusal included, means the
+/// storer understood us, and retrying that in an older shape would defeat the
+/// gate.
+///
+/// A reply that decodes but carries a body the mapper does not recognise is
+/// not distinguished: the wait continues and ends in a timeout, so it takes
+/// the fallback too. That is no more than a peer could achieve by saying
+/// nothing, which is why it is bounded by the cutover guard rather than
+/// special-cased here.
 ///
 /// # This is a downgrade path, and it is only safe because nothing can be
 /// refused yet
@@ -990,6 +998,23 @@ impl Client {
                         // First sub-batch failed, nothing paid yet -- propagate directly.
                         return Err(e);
                     }
+                    // A storer saying this client cannot settle is terminal
+                    // even mid-batch. Folding it into a partial result would
+                    // report success, hide the upgrade instruction, and leave
+                    // the caller to rediscover the same refusal on its next
+                    // upload. Every remaining sub-batch would be refused the
+                    // same way, so there is nothing to salvage by continuing.
+                    if matches!(e, Error::ClientUpdateRequired(_)) {
+                        warn!(
+                            "Merkle sub-batch {}/{total_sub_batches}: storer refused this \
+                             client's settlement version. {} proofs from earlier sub-batches \
+                             were paid for and are recoverable from the cached receipt; \
+                             surfacing the refusal rather than a partial success",
+                            i + 1,
+                            all_proofs.len()
+                        );
+                        return Err(e);
+                    }
                     // Return partial result so caller can still store already-paid chunks.
                     warn!(
                         "Merkle sub-batch {}/{total_sub_batches} failed: {e}. \
@@ -1095,19 +1120,43 @@ impl Client {
 
         let mut candidate_futures = FuturesUnordered::new();
 
+        let unversioned_peers = self.unversioned_quote_peers();
+        let versioned_capable = self.versioned_quote_capable_handle();
+
         for (peer_id, peer_addrs) in &remote_peers {
             let request_id = self.next_request_id();
+            // A peer that already failed to answer a versioned request is
+            // asked in the legacy shape directly. Re-probing costs a full
+            // per-peer timeout every time, and a merkle pool asks sixteen
+            // candidates per pool, so against a fleet that predates the
+            // versioned requests the probes dominate the run: measured on this
+            // suite it went from ~24 minutes to past the 60-minute CI cap.
+            let known_legacy = unversioned_peers
+                .lock()
+                .is_ok_and(|peers| peers.contains(peer_id));
+
+            let legacy_request = MerkleCandidateQuoteRequest {
+                address: *address,
+                data_type,
+                data_size,
+                merkle_payment_timestamp,
+            };
+
             // Declare the settlement version so a storer can turn us away
             // before we pay, rather than refusing the payment afterwards.
             let message = ChunkMessage {
                 request_id,
-                body: ChunkMessageBody::MerkleCandidateQuoteRequestV2(
-                    MerkleCandidateQuoteRequestV2::new(
-                        *address,
-                        data_size,
-                        merkle_payment_timestamp,
-                    ),
-                ),
+                body: if known_legacy {
+                    ChunkMessageBody::MerkleCandidateQuoteRequest(legacy_request.clone())
+                } else {
+                    ChunkMessageBody::MerkleCandidateQuoteRequestV2(
+                        MerkleCandidateQuoteRequestV2::new(
+                            *address,
+                            data_size,
+                            merkle_payment_timestamp,
+                        ),
+                    )
+                },
             };
 
             let message_bytes = match message.encode() {
@@ -1129,12 +1178,7 @@ impl Client {
             let legacy_request_id = self.next_request_id();
             let legacy_message_bytes = match (ChunkMessage {
                 request_id: legacy_request_id,
-                body: ChunkMessageBody::MerkleCandidateQuoteRequest(MerkleCandidateQuoteRequest {
-                    address: *address,
-                    data_type,
-                    data_size,
-                    merkle_payment_timestamp,
-                }),
+                body: ChunkMessageBody::MerkleCandidateQuoteRequest(legacy_request),
             })
             .encode()
             {
@@ -1148,14 +1192,26 @@ impl Client {
             let peer_id_clone = *peer_id;
             let addrs_clone = peer_addrs.clone();
             let node_clone = node.clone();
+            let peers_handle = Arc::clone(&unversioned_peers);
+            let capable_handle = Arc::clone(&versioned_capable);
 
             let fut = async move {
+                // First contact waits only long enough to learn whether the
+                // peer can parse the shape. A peer already known to be legacy
+                // gets the caller's full patience, because that request is the
+                // real one rather than a probe.
+                let attempt_timeout = if known_legacy {
+                    timeout
+                } else {
+                    timeout.min(crate::data::client::VERSIONED_QUOTE_PROBE_CEILING)
+                };
+
                 let result = send_and_await_chunk_response(
                     &node_clone,
                     &peer_id_clone,
                     message_bytes,
                     request_id,
-                    timeout,
+                    attempt_timeout,
                     &addrs_clone,
                     |body| map_merkle_candidate_response(peer_id_clone, body),
                     |e| {
@@ -1171,13 +1227,35 @@ impl Client {
                 )
                 .await;
 
+                // Any answer at all to the versioned shape proves the peer
+                // can parse it, so it can never later be demoted.
+                if !known_legacy && result.is_ok() {
+                    if let Ok(mut peers) = capable_handle.lock() {
+                        peers.insert(peer_id_clone);
+                    }
+                }
+
                 // Silence from a storer means it could not decode the
                 // versioned request, so ask again in the shape it understands.
                 // A storer that answered with a refusal is NOT retried: it
                 // understood us and said no, and asking again without the
                 // version would talk it into quoting a client that cannot pay.
                 let result = match result {
-                    Err(ref e) if is_version_unaware(e) => {
+                    Err(ref e) if is_version_unaware(e) && !known_legacy => {
+                        // Only silence is evidence the peer cannot parse the
+                        // shape. A send failure means the request never
+                        // arrived and teaches nothing, so it must not strand
+                        // the peer in the legacy shape for the whole session.
+                        // Nor may a peer that has answered a versioned request
+                        // before be demoted by one lost response.
+                        let ever_answered = capable_handle
+                            .lock()
+                            .is_ok_and(|peers| peers.contains(&peer_id_clone));
+                        if matches!(e, Error::Timeout(_)) && !ever_answered {
+                            if let Ok(mut peers) = peers_handle.lock() {
+                                peers.insert(peer_id_clone);
+                            }
+                        }
                         debug!(
                             "Peer {peer_id_clone} did not answer a versioned merkle quote; \
                              retrying in the legacy shape"
