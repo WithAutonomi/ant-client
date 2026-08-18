@@ -62,11 +62,20 @@ pub(crate) const PUT_TARGET_WIDTH: usize = 20;
 /// currently 10s. That is not a tuning preference, it is the safety property.
 ///
 /// This wait is the only window in which a peer can refuse. Abandoning it
-/// early does not merely mislabel a slow peer: the fallback then sends an
-/// unversioned request under a *new* request id, so a refusal arriving after
-/// the ceiling is answering a request nobody is listening to. It never counts
-/// toward corroboration, never sets the latch, and the legacy request it
-/// raced can return a perfectly good quote the client then pays against.
+/// early does not merely mislabel a slow peer: it drops the refusal, so it
+/// never counts toward corroboration, never sets the latch, and the legacy
+/// request it raced can return a perfectly good quote the client then pays
+/// against.
+///
+/// The two fallbacks lose it by different mechanisms. The merkle path sends
+/// its legacy request under a *new* request id (`merkle.rs`), so a refusal
+/// arriving after the ceiling is answering a request nobody is listening to
+/// and is discarded on the id mismatch. The single-node path reuses the same
+/// id (`quote.rs`), so a late refusal is seen only if it happens to arrive
+/// after the retry has resubscribed; the await that would have matched it is
+/// already gone, and anything landing in the gap between the two waits is
+/// lost. Neither path observes a late refusal reliably, which is what the
+/// ceiling exists to prevent.
 ///
 /// A shorter ceiling was tried, at 5s, to bring the slower CI runner under the
 /// cap. It would have turned every legitimate 5-to-10 second refusal in
