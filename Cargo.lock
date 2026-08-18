@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.3.3"
+version = "0.3.4-rc.1"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.6.0"
+version = "0.7.0-rc.1"
 dependencies = [
  "alloy",
  "ant-node",
@@ -892,9 +892,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a5fed17358e6e12b2802506c01eea647eab6c0390f8a6a4d7e9b5d3e3151f2f"
+version = "0.17.2-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.8.3#f127f4adb96ac4bd981b938d8a94fa7723a0d4ea"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -943,9 +942,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83f2b55e89a468584cfc91dc2f596583e089c17107de6f2f386f8339b665d1f0"
+version = "2.3.3-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.8.3#d7e994ead6a8be716436313c4b3655a256433045"
 dependencies = [
  "blake3",
  "bytes",
@@ -3340,7 +3338,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -5284,9 +5282,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3858333d71ea51750129693fdffc2962ad9ef95094c2ad76713dc7d5bb949c41"
+version = "0.27.1-rc.1"
+source = "git+https://github.com/WithAutonomi/saorsa-core?branch=rc-2026.8.3#b6fb91d0ca2300c1458ce384a21fac199cb3ecb5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5296,6 +5293,7 @@ dependencies = [
  "dirs 6.0.0",
  "futures",
  "hex",
+ "libc",
  "lru",
  "once_cell",
  "parking_lot",
@@ -5399,9 +5397,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.36.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8dbc21ea8af08c30a0d7d66289b987f14eb22e9ff1ed32e12c4e0a07c6d49d8"
+version = "0.36.1-rc.1"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?branch=rc-2026.8.3#0fc30febc4fc00bb9e36cf9fc228d79429b5dfc9"
 dependencies = [
  "anyhow",
  "async-trait",

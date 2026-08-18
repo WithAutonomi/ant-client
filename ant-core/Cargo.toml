@@ -1,6 +1,6 @@
 [package]
 name = "ant-core"
-version = "0.6.0"
+version = "0.7.0-rc.1"
 edition = "2021"
 description = "Headless Rust library for the Autonomi network: data storage and retrieval with self-encryption and EVM payments, plus node lifecycle management."
 license = "MIT OR Apache-2.0"
@@ -37,7 +37,7 @@ tower-http = { version = "0.6.8", features = ["cors"] }
 # under `ant_protocol::{evm, transport, pqc}`. This is the ONE pin for
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
-ant-protocol = "2.3.2"
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "rc-2026.8.3" }
 xor_name = "5"
 self_encryption = "0.36"
 futures = "0.3"
@@ -65,7 +65,7 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # `ant-protocol` pin above points at a released version, this ant-node must
 # track the matching released version carrying the same saorsa-core /
 # ant-protocol lineage.
-ant-node = { version = "0.17.1", optional = true }
+ant-node = { git = "https://github.com/WithAutonomi/ant-node", branch = "rc-2026.8.3", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -96,7 +96,7 @@ test-utils = []
 # always compile even without the `devnet` feature. Pinned to the same
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
-ant-node = { version = "0.17.1", features = ["test-utils"] }
+ant-node = { git = "https://github.com/WithAutonomi/ant-node", branch = "rc-2026.8.3", features = ["test-utils"] }
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
