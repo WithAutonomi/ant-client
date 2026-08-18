@@ -2,8 +2,9 @@ use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt;
 
+use crate::channel::version_matches_channel;
 use crate::error::{Error, Result};
-use crate::node::types::BinarySource;
+use crate::node::types::{BinarySource, UpgradeChannel};
 
 const GITHUB_REPO: &str = "WithAutonomi/ant-node";
 pub const BINARY_NAME: &str = "ant-node";
@@ -44,14 +45,20 @@ impl ProgressReporter for NoopProgress {
 /// For `LocalPath`, validates the binary exists and extracts version.
 /// For download variants (`Latest`, `Version`, `Url`), downloads and caches the binary
 /// in `install_dir`.
+///
+/// `channel` is the upgrade channel the resulting node will track. It only affects
+/// `Latest`: a node destined for the beta channel must not be installed from a stable
+/// release it would immediately upgrade away from, nor from a release candidate it would
+/// never accept. `None` is treated as `Stable`, matching the node's own default.
 pub async fn resolve_binary(
     source: &BinarySource,
+    channel: Option<UpgradeChannel>,
     install_dir: &Path,
     progress: &dyn ProgressReporter,
 ) -> Result<ResolvedBinary> {
     match source {
         BinarySource::LocalPath(path) => resolve_local(path).await,
-        BinarySource::Latest => resolve_latest(install_dir, progress).await,
+        BinarySource::Latest => resolve_latest(channel, install_dir, progress).await,
         BinarySource::Version(version) => resolve_version(version, install_dir, progress).await,
         BinarySource::Url(url) => resolve_url(url, install_dir, progress).await,
     }
@@ -80,12 +87,16 @@ async fn resolve_local(path: &Path) -> Result<ResolvedBinary> {
     })
 }
 
-/// Download the latest release binary from GitHub.
+/// Download the latest release binary from GitHub for the given channel.
 async fn resolve_latest(
+    channel: Option<UpgradeChannel>,
     install_dir: &Path,
     progress: &dyn ProgressReporter,
 ) -> Result<ResolvedBinary> {
-    let version = fetch_latest_version().await?;
+    let version = match channel.unwrap_or(UpgradeChannel::Stable) {
+        UpgradeChannel::Stable => fetch_latest_version().await?,
+        UpgradeChannel::Beta => fetch_latest_channel_version(UpgradeChannel::Beta).await?,
+    };
     resolve_version(&version, install_dir, progress).await
 }
 
@@ -156,6 +167,93 @@ async fn fetch_latest_version() -> Result<String> {
         .ok_or_else(|| Error::BinaryResolution("no tag_name in release response".to_string()))?;
 
     Ok(tag.strip_prefix('v').unwrap_or(tag).to_string())
+}
+
+/// Fetch the highest release version eligible for `channel` from the GitHub API.
+///
+/// `/releases/latest` cannot be used here: GitHub never returns a pre-release from that
+/// endpoint, so it can only ever serve the stable channel. This walks the full release
+/// list and applies the same rule and the same asset requirements that the node itself
+/// uses when it picks an upgrade — a release is only a candidate if it carries both the
+/// platform archive and its detached `.sig`, so a half-uploaded release is skipped rather
+/// than downloaded.
+async fn fetch_latest_channel_version(channel: UpgradeChannel) -> Result<String> {
+    // per_page=100 is the GitHub API maximum; covers repos with many release tags.
+    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=100");
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "ant-cli")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| Error::BinaryResolution(format!("failed to fetch releases: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(Error::BinaryResolution(format!(
+            "GitHub API returned status {} when fetching releases",
+            resp.status()
+        )));
+    }
+
+    let releases: Vec<serde_json::Value> = resp
+        .json()
+        .await
+        .map_err(|e| Error::BinaryResolution(format!("failed to parse releases JSON: {e}")))?;
+
+    let asset_name = platform_asset_name()?;
+    select_channel_version(&releases, channel, &asset_name).ok_or_else(|| {
+        Error::BinaryResolution(format!(
+            "no {BINARY_NAME} release with a {asset_name} asset found for the {channel} channel"
+        ))
+    })
+}
+
+/// Pick the highest version from a GitHub releases payload that is eligible for `channel`
+/// and carries both `asset_name` and `{asset_name}.sig`.
+///
+/// Draft releases are skipped. The GitHub `prerelease` flag is deliberately ignored: the
+/// tag's own semver pre-release component is the authority, exactly as on the node side.
+fn select_channel_version(
+    releases: &[serde_json::Value],
+    channel: UpgradeChannel,
+    asset_name: &str,
+) -> Option<String> {
+    let sig_name = format!("{asset_name}.sig");
+    let mut best: Option<semver::Version> = None;
+
+    for release in releases {
+        if release["draft"].as_bool().unwrap_or(false) {
+            continue;
+        }
+
+        let tag = release["tag_name"].as_str().unwrap_or_default();
+        let Ok(version) = semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag)) else {
+            continue;
+        };
+
+        if !version_matches_channel(&version, channel) {
+            continue;
+        }
+
+        let assets = release["assets"]
+            .as_array()
+            .map_or(&[][..], |a| a.as_slice());
+        let has = |name: &str| {
+            assets
+                .iter()
+                .any(|asset| asset["name"].as_str() == Some(name))
+        };
+        if !has(asset_name) || !has(&sig_name) {
+            continue;
+        }
+
+        if best.as_ref().is_none_or(|b| version > *b) {
+            best = Some(version);
+        }
+    }
+
+    best.map(|v| v.to_string())
 }
 
 /// Download an archive from a URL, extract the binary, and cache it.
@@ -487,6 +585,7 @@ mod tests {
     async fn local_path_not_found() {
         let result = resolve_binary(
             &BinarySource::LocalPath("/nonexistent/binary".into()),
+            None,
             Path::new("/tmp"),
             &NoopProgress,
         )
@@ -662,5 +761,121 @@ mod tests {
         assert!(result.is_ok());
         let resolved = result.unwrap();
         assert_eq!(resolved.version, "0.3.4");
+    }
+
+    /// Build a minimal GitHub releases payload entry.
+    fn release(tag: &str, assets: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "tag_name": tag,
+            "draft": false,
+            "assets": assets
+                .iter()
+                .map(|name| serde_json::json!({ "name": name }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// A release carrying both the platform archive and its signature.
+    fn full_release(tag: &str) -> serde_json::Value {
+        release(tag, &[ASSET, SIG])
+    }
+
+    const ASSET: &str = "ant-node-cli-linux-x64.tar.gz";
+    const SIG: &str = "ant-node-cli-linux-x64.tar.gz.sig";
+
+    #[test]
+    fn beta_selects_the_beta_over_the_rc() {
+        let releases = [
+            full_release("v0.16.0"),
+            full_release("v0.17.0-beta.1"),
+            full_release("v0.17.0-rc.1"),
+        ];
+
+        assert_eq!(
+            select_channel_version(&releases, UpgradeChannel::Beta, ASSET),
+            Some("0.17.0-beta.1".to_string())
+        );
+        assert_eq!(
+            select_channel_version(&releases, UpgradeChannel::Stable, ASSET),
+            Some("0.16.0".to_string())
+        );
+    }
+
+    #[test]
+    fn releases_missing_the_signature_are_skipped() {
+        let releases = [
+            full_release("v0.17.0-beta.1"),
+            release("v0.18.0-beta.1", &[ASSET]),
+        ];
+
+        assert_eq!(
+            select_channel_version(&releases, UpgradeChannel::Beta, ASSET),
+            Some("0.17.0-beta.1".to_string())
+        );
+    }
+
+    #[test]
+    fn releases_missing_the_platform_asset_are_skipped() {
+        let releases = [
+            full_release("v0.17.0-beta.1"),
+            release(
+                "v0.18.0-beta.1",
+                &[
+                    "ant-node-cli-windows-x64.zip",
+                    "ant-node-cli-windows-x64.zip.sig",
+                ],
+            ),
+        ];
+
+        assert_eq!(
+            select_channel_version(&releases, UpgradeChannel::Beta, ASSET),
+            Some("0.17.0-beta.1".to_string())
+        );
+    }
+
+    #[test]
+    fn drafts_are_skipped() {
+        let mut draft = full_release("v0.18.0-beta.1");
+        draft["draft"] = serde_json::Value::Bool(true);
+        let releases = [full_release("v0.17.0-beta.1"), draft];
+
+        assert_eq!(
+            select_channel_version(&releases, UpgradeChannel::Beta, ASSET),
+            Some("0.17.0-beta.1".to_string())
+        );
+    }
+
+    /// The tag's semver is the authority, not GitHub's `prerelease` flag — a final release
+    /// mistakenly flagged as a prerelease is still a stable candidate.
+    #[test]
+    fn the_github_prerelease_flag_is_ignored() {
+        let mut flagged = full_release("v0.17.0");
+        flagged["prerelease"] = serde_json::Value::Bool(true);
+        let releases = [full_release("v0.16.0"), flagged];
+
+        assert_eq!(
+            select_channel_version(&releases, UpgradeChannel::Stable, ASSET),
+            Some("0.17.0".to_string())
+        );
+    }
+
+    #[test]
+    fn unparseable_tags_are_skipped() {
+        let releases = [full_release("nightly"), full_release("v0.16.0")];
+
+        assert_eq!(
+            select_channel_version(&releases, UpgradeChannel::Stable, ASSET),
+            Some("0.16.0".to_string())
+        );
+    }
+
+    #[test]
+    fn no_eligible_release_yields_none() {
+        let releases = [full_release("v0.17.0-rc.1")];
+
+        assert_eq!(
+            select_channel_version(&releases, UpgradeChannel::Beta, ASSET),
+            None
+        );
     }
 }

@@ -4,8 +4,10 @@ use ant_protocol::pqc::api::{ml_dsa_65, MlDsaPublicKey, MlDsaSignature, MlDsaVar
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
+use crate::channel::version_matches_channel;
 use crate::error::{Error, Result};
 use crate::node::binary::{extract_tar_gz, extract_zip, ProgressReporter};
+use crate::node::types::UpgradeChannel;
 
 const GITHUB_REPO: &str = "WithAutonomi/ant-client";
 const CLI_BINARY_NAME: &str = "ant";
@@ -154,6 +156,30 @@ pub struct UpdateCheck {
     pub latest_version: String,
     pub update_available: bool,
     pub download_url: Option<String>,
+    /// Release channel the check was performed against.
+    ///
+    /// `#[serde(default)]` keeps `--json` output from pre-channel versions deserializing.
+    #[serde(default = "default_channel")]
+    pub channel: UpgradeChannel,
+}
+
+/// Channel assumed when deserializing an `UpdateCheck` written before channels existed.
+fn default_channel() -> UpgradeChannel {
+    UpgradeChannel::Stable
+}
+
+/// Infer the release channel a running binary belongs to from its own version.
+///
+/// A build whose version carries a `beta` pre-release identifier is a beta build and stays
+/// on the beta channel unless told otherwise; everything else is stable. This keeps a beta
+/// user on beta with no stored configuration — the alternative, defaulting to stable, would
+/// self-update a beta build straight back onto the stable train.
+#[must_use]
+pub fn channel_for_version(version: &str) -> UpgradeChannel {
+    match parse_version(version) {
+        Ok(v) if v.pre.as_str().split('.').next() == Some("beta") => UpgradeChannel::Beta,
+        _ => UpgradeChannel::Stable,
+    }
 }
 
 impl UpdateCheck {
@@ -176,9 +202,14 @@ pub struct UpdateResult {
 
 /// Check whether a newer version is available on GitHub Releases.
 ///
-/// Compares `current_version` against the latest release tag using semantic versioning.
-pub async fn check_for_update(current_version: &str) -> Result<UpdateCheck> {
-    let latest = fetch_latest_cli_version().await?;
+/// Compares `current_version` against the highest release tag eligible for `channel`,
+/// using semantic versioning. See [`crate::channel::version_matches_channel`] for which
+/// tags each channel accepts.
+pub async fn check_for_update(
+    current_version: &str,
+    channel: UpgradeChannel,
+) -> Result<UpdateCheck> {
+    let latest = fetch_latest_cli_version(channel).await?;
     let current = parse_version(current_version)?;
     let latest_parsed = parse_version(&latest)?;
     let update_available = latest_parsed > current;
@@ -194,6 +225,7 @@ pub async fn check_for_update(current_version: &str) -> Result<UpdateCheck> {
         latest_version: latest,
         update_available,
         download_url,
+        channel,
     })
 }
 
@@ -255,11 +287,11 @@ pub async fn perform_update(
     })
 }
 
-/// Fetch the latest stable CLI release version from GitHub.
+/// Fetch the highest CLI release version eligible for `channel` from GitHub.
 ///
-/// Lists all releases and finds the newest non-draft, non-prerelease one whose
-/// tag starts with `ant-cli-v`.
-async fn fetch_latest_cli_version() -> Result<String> {
+/// Lists all releases and finds the newest non-draft one whose tag starts with
+/// `ant-cli-v` and whose version is eligible for `channel`.
+async fn fetch_latest_cli_version(channel: UpgradeChannel) -> Result<String> {
     // per_page=100 is the GitHub API maximum; covers repos with many release tags.
     let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=100");
     let client = reqwest::Client::new();
@@ -283,26 +315,49 @@ async fn fetch_latest_cli_version() -> Result<String> {
         .await
         .map_err(|e| Error::UpdateFailed(format!("failed to parse releases JSON: {e}")))?;
 
-    // Find the newest stable ant-cli release by semver (skip drafts and pre-releases).
+    select_channel_version(&releases, channel).ok_or_else(|| {
+        Error::UpdateFailed(format!(
+            "no ant-cli release found on GitHub for the {channel} channel"
+        ))
+    })
+}
+
+/// Pick the highest `ant-cli-v*` version from a GitHub releases payload that is eligible
+/// for `channel`.
+///
+/// Draft releases are skipped. GitHub's `prerelease` flag is deliberately not consulted:
+/// the tag's own semver pre-release component is the authority, so the rule here is the
+/// same one the node applies to its own upgrades. Filtering on the flag instead is what
+/// made a beta `ant` self-update back onto stable.
+fn select_channel_version(
+    releases: &[serde_json::Value],
+    channel: UpgradeChannel,
+) -> Option<String> {
     let mut best: Option<semver::Version> = None;
-    for release in &releases {
-        if release["draft"].as_bool().unwrap_or(false)
-            || release["prerelease"].as_bool().unwrap_or(false)
-        {
+
+    for release in releases {
+        if release["draft"].as_bool().unwrap_or(false) {
             continue;
         }
+
         let tag = release["tag_name"].as_str().unwrap_or_default();
-        if let Some(version_str) = tag.strip_prefix(TAG_PREFIX) {
-            if let Ok(v) = semver::Version::parse(version_str) {
-                if best.as_ref().is_none_or(|b| v > *b) {
-                    best = Some(v);
-                }
-            }
+        let Some(version_str) = tag.strip_prefix(TAG_PREFIX) else {
+            continue;
+        };
+        let Ok(version) = semver::Version::parse(version_str) else {
+            continue;
+        };
+
+        if !version_matches_channel(&version, channel) {
+            continue;
+        }
+
+        if best.as_ref().is_none_or(|b| version > *b) {
+            best = Some(version);
         }
     }
 
     best.map(|v| v.to_string())
-        .ok_or_else(|| Error::UpdateFailed("no ant-cli release found on GitHub".to_string()))
 }
 
 /// Download a release archive to a temp directory, streaming to disk.
@@ -584,6 +639,7 @@ mod tests {
             latest_version: "1.0.0".to_string(),
             update_available: false,
             download_url: None,
+            channel: UpgradeChannel::Stable,
         };
         assert!(!check.update_available);
         assert!(check.download_url.is_none());
@@ -596,6 +652,7 @@ mod tests {
             latest_version: "0.2.0".to_string(),
             update_available: true,
             download_url: Some("https://example.com/ant.tar.gz".to_string()),
+            channel: UpgradeChannel::Stable,
         };
         assert!(check.update_available);
         assert!(check.download_url.is_some());
@@ -608,6 +665,7 @@ mod tests {
             latest_version: "1.0.0".to_string(),
             update_available: false,
             download_url: None,
+            channel: UpgradeChannel::Stable,
         };
         check.force().unwrap();
         assert!(check.update_available);
@@ -640,6 +698,7 @@ mod tests {
             latest_version: "0.2.0".to_string(),
             update_available: true,
             download_url: Some("https://example.com/ant.tar.gz".to_string()),
+            channel: UpgradeChannel::Stable,
         };
         let json = serde_json::to_string(&check).unwrap();
         let deserialized: UpdateCheck = serde_json::from_str(&json).unwrap();
@@ -679,5 +738,102 @@ mod tests {
             .verify_with_context(&public_key, archive, &parsed_sig, SIGNING_CONTEXT)
             .unwrap();
         assert!(valid);
+    }
+
+    fn release(tag: &str) -> serde_json::Value {
+        serde_json::json!({ "tag_name": tag, "draft": false })
+    }
+
+    #[test]
+    fn stable_selects_the_highest_final_release() {
+        let releases = [
+            release("ant-cli-v0.3.3"),
+            release("ant-cli-v0.3.4-beta.1"),
+            release("ant-cli-v0.3.4-rc.1"),
+        ];
+
+        assert_eq!(
+            select_channel_version(&releases, UpgradeChannel::Stable),
+            Some("0.3.3".to_string())
+        );
+    }
+
+    #[test]
+    fn beta_selects_the_beta_over_the_rc() {
+        let releases = [
+            release("ant-cli-v0.3.3"),
+            release("ant-cli-v0.3.4-beta.1"),
+            release("ant-cli-v0.3.4-rc.1"),
+        ];
+
+        assert_eq!(
+            select_channel_version(&releases, UpgradeChannel::Beta),
+            Some("0.3.4-beta.1".to_string())
+        );
+    }
+
+    /// The `prerelease` flag is not consulted: a beta release carries it, and skipping on it
+    /// is exactly what dragged a beta `ant` back onto stable.
+    #[test]
+    fn the_github_prerelease_flag_does_not_hide_a_beta() {
+        let mut beta = release("ant-cli-v0.3.4-beta.1");
+        beta["prerelease"] = serde_json::Value::Bool(true);
+        let releases = [release("ant-cli-v0.3.3"), beta];
+
+        assert_eq!(
+            select_channel_version(&releases, UpgradeChannel::Beta),
+            Some("0.3.4-beta.1".to_string())
+        );
+    }
+
+    #[test]
+    fn drafts_and_foreign_tags_are_skipped() {
+        let mut draft = release("ant-cli-v0.4.0");
+        draft["draft"] = serde_json::Value::Bool(true);
+        let releases = [
+            release("ant-core-v0.9.0"),
+            release("v0.5.0"),
+            draft,
+            release("ant-cli-v0.3.3"),
+        ];
+
+        assert_eq!(
+            select_channel_version(&releases, UpgradeChannel::Stable),
+            Some("0.3.3".to_string())
+        );
+    }
+
+    #[test]
+    fn no_eligible_release_yields_none() {
+        let releases = [release("ant-cli-v0.3.4-rc.1")];
+
+        assert_eq!(
+            select_channel_version(&releases, UpgradeChannel::Beta),
+            None
+        );
+    }
+
+    #[test]
+    fn channel_is_inferred_from_the_running_version() {
+        assert_eq!(channel_for_version("0.3.4-beta.1"), UpgradeChannel::Beta);
+        assert_eq!(channel_for_version("0.3.4-beta"), UpgradeChannel::Beta);
+        assert_eq!(channel_for_version("0.3.3"), UpgradeChannel::Stable);
+        assert_eq!(channel_for_version("0.3.4-rc.1"), UpgradeChannel::Stable);
+        assert_eq!(channel_for_version("0.3.4-alpha.1"), UpgradeChannel::Stable);
+        // `betamax` must not be inferred as beta by a prefix match.
+        assert_eq!(
+            channel_for_version("0.3.4-betamax.1"),
+            UpgradeChannel::Stable
+        );
+        assert_eq!(channel_for_version("not-a-version"), UpgradeChannel::Stable);
+    }
+
+    /// A `--json` payload written before the channel field existed still deserializes.
+    #[test]
+    fn update_check_deserializes_without_a_channel_field() {
+        let json = r#"{"current_version":"0.1.0","latest_version":"0.2.0",
+            "update_available":true,"download_url":null}"#;
+        let check: UpdateCheck = serde_json::from_str(json).unwrap();
+        assert_eq!(check.channel, UpgradeChannel::Stable);
     }
 }

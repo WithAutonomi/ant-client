@@ -62,7 +62,13 @@ pub async fn add_nodes(
 
     // Resolve the binary (downloads to cache if needed)
     let install_dir = binary::binary_install_dir()?;
-    let resolved = binary::resolve_binary(&opts.binary_source, &install_dir, progress).await?;
+    let resolved = binary::resolve_binary(
+        &opts.binary_source,
+        opts.upgrade_channel,
+        &install_dir,
+        progress,
+    )
+    .await?;
     let cached_binary = resolved.path;
     let version = resolved.version;
 

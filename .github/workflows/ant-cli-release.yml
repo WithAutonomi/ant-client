@@ -294,7 +294,12 @@ jobs:
           version="${tag#ant-cli-v}"
           echo "tag=${tag}" >> $GITHUB_OUTPUT
           echo "version=${version}" >> $GITHUB_OUTPUT
-          if [[ "$version" == *"-rc."* ]]; then
+          # Any semver pre-release component makes this a GitHub prerelease. `-beta.N` builds
+          # ship to the beta channel and `-rc.N` builds are cut before the release gates have
+          # given a verdict, so neither may be published as a full release. The test is the
+          # general one rather than an `alpha|beta|rc` list so an unanticipated suffix fails
+          # closed, as a prerelease, instead of silently going out as "Latest".
+          if [[ "$version" == *-* ]]; then
             echo "prerelease=true" >> $GITHUB_OUTPUT
           else
             echo "prerelease=false" >> $GITHUB_OUTPUT
@@ -318,7 +323,28 @@ jobs:
         shell: bash
         run: |
           version="${{ steps.meta.outputs.version }}"
-          cat > /tmp/release_body.md << 'HEADER'
+
+          # The quick-start installers always fetch the latest stable release, so a
+          # pre-release page must not offer them as the way to get *this* build.
+          if [[ "${{ steps.meta.outputs.prerelease }}" == "true" ]]; then
+            cat > /tmp/release_body.md << 'PRERELEASE'
+          > **This is a pre-release.** The quick-start installers below are not used for it —
+          > they always install the latest stable `ant`. Install this build from the assets below.
+
+          `-beta.N` builds are the beta channel of the `ant` client. Once a beta build is on your
+          `PATH`, `ant update` keeps you on beta: a beta build tracks the beta channel by default,
+          accepting later `-beta.N` and stable releases but never a release candidate. To leave the
+          beta channel, install a stable build manually.
+
+          `-rc.N` builds are cut before the release gates have given a verdict and are not installed
+          by `ant update` on any channel.
+
+          ## Installation
+
+          ### Manual download
+          PRERELEASE
+          else
+            cat > /tmp/release_body.md << 'HEADER'
           ## Installation
 
           ### Linux / macOS (quick-start)
@@ -334,6 +360,10 @@ jobs:
           ```
 
           ### Manual download
+          HEADER
+          fi
+
+          cat >> /tmp/release_body.md << 'BODY'
 
           Download the archive for your platform from the assets below, extract it, and place the `ant` binary on your `PATH`. Copy `bootstrap_peers.toml` to the appropriate config directory:
 
@@ -355,7 +385,7 @@ jobs:
 
           SHA256 checksums provided in `SHA256SUMS.txt`.
 
-          HEADER
+          BODY
 
           echo "## Detailed Changes" >> /tmp/release_body.md
           echo "" >> /tmp/release_body.md
@@ -366,15 +396,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          prerelease_flag=""
+          # `--latest=false` on a pre-release is redundant with GitHub's own rule that a
+          # prerelease can never be "Latest", but stating it keeps the guarantee independent
+          # of gh and API defaults.
+          release_flags="--latest"
           if [[ "${{ steps.meta.outputs.prerelease }}" == "true" ]]; then
-            prerelease_flag="--prerelease"
+            release_flags="--prerelease --latest=false"
           fi
 
           gh release create "${{ steps.meta.outputs.tag }}" \
             --title "ant ${{ steps.meta.outputs.version }}" \
             --notes-file /tmp/release_body.md \
-            $prerelease_flag \
+            $release_flags \
             assets/*.tar.gz \
             assets/*.zip \
             assets/*.sig \
