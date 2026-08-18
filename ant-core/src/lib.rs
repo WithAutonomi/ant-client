@@ -1,3 +1,4 @@
+pub mod channel;
 pub mod config;
 pub mod data;
 pub mod datamap_file;

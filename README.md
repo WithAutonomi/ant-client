@@ -313,11 +313,17 @@ If the daemon is running, the command routes through its REST API. Otherwise, it
 | `--data-dir-path <PATH>` | Custom data directory prefix. |
 | `--log-dir-path <PATH>` | Custom log directory prefix. |
 | `--path <PATH>` | Path to a local `antnode` binary. |
-| `--version <X.Y.Z>` | Download a specific version (not yet available). |
-| `--url <URL>` | Download binary from a URL archive (not yet available). |
+| `--version <X.Y.Z>` | Download a specific version (accepts pre-releases, e.g. `0.17.0-beta.1`). |
+| `--url <URL>` | Download binary from a URL archive. |
 | `--bootstrap <IP:PORT>` | Bootstrap peer(s), comma-separated. |
 | `--evm-network <NET>` | EVM network for storage payments: `arbitrum-one` (default) or `arbitrum-sepolia`. |
+| `--upgrade-channel <CHAN>` | Release channel the node tracks for automatic upgrades: `stable` (default) or `beta`. Also selects which release the binary is downloaded from when no `--path`/`--version`/`--url` is given. |
 | `--env <K=V>` | Environment variables, comma-separated. |
+
+With none of `--path`, `--version` or `--url`, the binary is downloaded from the newest release
+eligible for the chosen channel: the latest stable release on `stable`, and the highest of the
+`-beta.N` and stable releases on `beta`. Release candidates (`-rc.N`) are never installed on
+either channel — they are cut before the release gates have given a verdict.
 
 #### `ant node start`
 
@@ -348,6 +354,57 @@ Remove all node data, log directories, and clear the registry. All nodes must be
 ```
 $ ant node reset --force
 ```
+
+### `ant update` — Self-Update
+
+Replace the running `ant` binary with the newest release from GitHub. The downloaded archive's
+ML-DSA-65 signature is verified against the embedded release signing key before anything is
+installed, and the extracted binary must report the expected version.
+
+```
+$ ant update
+Current version: 0.3.3
+Checking for updates on the stable channel...
+Update available: v0.3.3 -> v0.3.4
+Updated successfully: v0.3.3 -> v0.3.4
+```
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `--channel <CHAN>` | Release channel to update along: `stable` or `beta`. Defaults to the channel the running binary belongs to. |
+| `--force` | Re-download and reinstall even when already on the newest release. |
+
+The default channel is inferred from the running binary's own version, so there is nothing to
+configure: a `-beta.N` build tracks `beta` and every other build tracks `stable`. On `beta`,
+both `-beta.N` and stable releases are accepted and the highest wins; `-rc.N` releases are
+rejected on both channels.
+
+Because a beta version outranks the stable release it was cut from, `--channel stable` cannot
+walk a beta build backwards — it will report that you are already up to date. Leaving the beta
+channel means installing a stable build manually.
+
+### Beta channel
+
+The beta channel carries the week's build ahead of the stable train, for people who want to soak
+it. Both the client and the nodes have one, and they are opted into separately.
+
+```bash
+# 1. Install the beta client. First install is manual: download the ant-cli-v<X.Y.Z>-beta.N
+#    archive for your platform from the releases page, extract it, and put `ant` on your PATH.
+#    The quick-start installers always fetch the latest stable build, so they cannot do this.
+
+# 2. From then on, self-update stays on beta with no flag needed.
+$ ant update
+
+# 3. Add nodes that track the beta channel. The binary is downloaded from the newest
+#    beta-eligible ant-node release.
+$ ant node add --rewards-address 0xYourWallet --count 3 --upgrade-channel beta
+```
+
+Existing nodes are not switched to the beta channel by any of this — `--upgrade-channel` applies
+to nodes at the point they are added, so opting in means adding new nodes.
 
 ---
 

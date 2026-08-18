@@ -2,6 +2,7 @@ use clap::Args;
 use colored::Colorize;
 
 use ant_core::node::binary::NoopProgress;
+use ant_core::node::types::UpgradeChannel;
 use ant_core::update;
 
 /// Progress reporter that prints to the terminal.
@@ -29,18 +30,47 @@ pub struct UpdateArgs {
     /// Force re-download even if already on the latest version.
     #[arg(long)]
     pub force: bool,
+
+    /// Release channel to update along.
+    ///
+    /// Defaults to the channel the running binary belongs to: a `-beta.N` build stays on
+    /// beta, anything else tracks stable.
+    #[arg(long, value_enum)]
+    pub channel: Option<UpdateChannelArg>,
+}
+
+/// CLI value for the update channel. Mirrors `ant node add --upgrade-channel`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum UpdateChannelArg {
+    Stable,
+    Beta,
+}
+
+impl From<UpdateChannelArg> for UpgradeChannel {
+    fn from(arg: UpdateChannelArg) -> Self {
+        match arg {
+            UpdateChannelArg::Stable => Self::Stable,
+            UpdateChannelArg::Beta => Self::Beta,
+        }
+    }
 }
 
 impl UpdateArgs {
     pub async fn execute(self, json_output: bool) -> anyhow::Result<()> {
         let current_version = env!("CARGO_PKG_VERSION");
+        let channel = self
+            .channel
+            .map_or_else(|| update::channel_for_version(current_version), Into::into);
 
         if !json_output {
             eprintln!("{}", format!("Current version: {current_version}").dimmed());
-            eprintln!("{}", "Checking for updates...".dimmed());
+            eprintln!(
+                "{}",
+                format!("Checking for updates on the {channel} channel...").dimmed()
+            );
         }
 
-        let mut check = update::check_for_update(current_version).await?;
+        let mut check = update::check_for_update(current_version, channel).await?;
 
         if !check.update_available && self.force {
             check.force()?;

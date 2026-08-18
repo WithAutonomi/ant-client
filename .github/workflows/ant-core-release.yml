@@ -17,7 +17,30 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: determine whether this is a pre-release
+        id: meta
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#ant-core-v}"
+          # Any semver pre-release component keeps the tag off crates.io. `-beta.N` builds exist
+          # only to ship the beta channel and `-rc.N` builds are cut before the release gates
+          # have given a verdict; publishing either would burn a permanent crates.io version.
+          # The test is the general one rather than an `alpha|beta|rc` list so an unanticipated
+          # suffix fails closed, skipping the publish, rather than burning a version.
+          if [[ "$version" == *-* ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: skip publish for pre-release tags
+        if: steps.meta.outputs.prerelease == 'true'
+        shell: bash
+        run: echo "Pre-release tag ${GITHUB_REF#refs/tags/} — not publishing to crates.io."
+
       - name: publish ant-core
+        if: steps.meta.outputs.prerelease != 'true'
         working-directory: ant-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
