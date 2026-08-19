@@ -85,7 +85,17 @@ ant-core/src/
     │   ├── mod.rs
     │   ├── client.rs         # Daemon client API (start/stop/status via HTTP)
     │   ├── server.rs         # HTTP server (axum), REST API handlers
-    │   └── supervisor.rs     # Process supervision with backoff
+    │   ├── supervisor.rs     # Process supervision with backoff
+    │   └── forward/          # Opt-in beta log forwarding (V2-1021)
+    │       ├── mod.rs        # Status/result types, enable-request merging
+    │       ├── config.rs     # Persisted opt-in + token (0600), LogLevel
+    │       ├── parse.rs      # Log line -> LogEvent (text and JSON layouts)
+    │       ├── tail.rs       # Rotation-aware tailing, multi-line events
+    │       ├── offsets.rs    # Persisted tail positions
+    │       ├── document.rs   # Tagging into the beta index's field names
+    │       ├── sink.rs       # LogSink trait, bounded queue, batching, retry
+    │       ├── es.rs         # Elasticsearch _bulk sink
+    │       └── runner.rs     # The background forwarding task
     └── process/
         ├── mod.rs
         ├── spawn.rs          # Spawning node processes
@@ -103,6 +113,7 @@ ant-cli/src/
         ├── mod.rs
         ├── add.rs            # ant node add command
         ├── daemon.rs         # daemon start/stop/status/info/run commands
+        ├── logs.rs           # ant node logs forward enable/disable/status
         ├── start.rs          # ant node start
         ├── stop.rs           # ant node stop
         ├── status.rs         # ant node status
@@ -132,6 +143,12 @@ cargo run --bin ant -- --help  # Run the CLI
 - **Registry file locking**: Use `NodeRegistry::load_locked()` for read-modify-write operations to prevent concurrent CLI invocations from corrupting the registry. The returned `File` handle holds the lock until dropped.
 - **Dual-path CLI commands**: Commands that modify the registry (like `ant node add`) check if the daemon is running. If so, they route through the REST API; otherwise, they operate directly on the registry file.
 - **Binary source resolution**: Node binary sources are represented by the `BinarySource` enum (Latest, Version, Url, LocalPath). Download variants are stubbed until release infrastructure is available.
+- **Log forwarding is opt-in and node-logging-dependent**: `ant node logs forward enable` is the
+  consent act. It only forwards nodes whose `NodeConfig.log_dir` is `Some` — node file logging is
+  off unless the node was added with `--log-dir-path` — and reports the nodes it is skipping.
+  Enabling never restarts a node or changes its arguments. See
+  `ant-core/src/node/daemon/forward/` and the V2-1016 ingest contract documented at the top of
+  `forward/es.rs` (`create` actions, per-position `items[].status`, deterministic `_id`s).
 
 ## E2E Test Skill
 

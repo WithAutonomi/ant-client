@@ -15,6 +15,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
 use crate::node::binary::NoopProgress;
+use crate::node::daemon::forward::runner::{ForwarderHandle, DEFAULT_POLL_INTERVAL};
+use crate::node::daemon::forward::{
+    apply_enable, classify_nodes, spawn_log_forwarder, ElasticsearchSink, LogForwardConfig,
+    LogForwardEnableRequest, LogForwardResult, LogForwardStatus, LogSink,
+};
 use crate::node::daemon::health::{DiskThresholds, FleetHealth};
 use crate::node::daemon::supervisor::{
     spawn_eviction_monitor, spawn_liveness_monitor, Supervisor, EVICTION_POLL_INTERVAL,
@@ -40,6 +45,11 @@ pub struct AppState {
     /// Latest fleet health snapshot, refreshed by the eviction monitor and served at
     /// `GET /api/v1/health`.
     pub health: Arc<RwLock<FleetHealth>>,
+    /// The running log forwarder, if the user has opted in. `None` while forwarding is disabled.
+    pub forwarder: Arc<RwLock<Option<ForwarderHandle>>>,
+    /// The daemon's shutdown token, kept so a forwarder started later by `enable` still stops when
+    /// the daemon does.
+    pub shutdown: CancellationToken,
 }
 
 /// Start the daemon HTTP server.
@@ -96,7 +106,14 @@ pub async fn start(
         config: config.clone(),
         bound_port: bound_addr.port(),
         health: health.clone(),
+        forwarder: Arc::new(RwLock::new(None)),
+        shutdown: shutdown.clone(),
     });
+
+    // Background task: if the user has opted into beta log forwarding, resume it. The opt-in is
+    // persisted rather than held in daemon memory, so restarting the daemon does not silently stop
+    // shipping logs the user asked for.
+    start_forwarder_if_enabled(&state).await;
 
     // Background task: monitor free disk space at node data directories. Refreshes the fleet health
     // snapshot every tick and auto-evicts a node (smallest data dir) on any partition that has
@@ -175,6 +192,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/nodes/{id}/stop", post(post_stop_node))
         .route("/api/v1/nodes/stop-all", post(post_stop_all))
         .route("/api/v1/reset", post(post_reset))
+        .route("/api/v1/logs/forward", get(get_log_forward))
+        .route("/api/v1/logs/forward/enable", post(post_log_forward_enable))
+        .route(
+            "/api/v1/logs/forward/disable",
+            post(post_log_forward_disable),
+        )
         .route("/api/v1/openapi.json", get(get_openapi))
         .layer(cors)
         .with_state(state)
@@ -644,6 +667,164 @@ async fn post_reset(
     }
 }
 
+/// Load the persisted forwarding config, treating an unreadable one as disabled.
+///
+/// The daemon must come up whatever state that file is in; a broken config is reported through the
+/// status endpoint rather than by refusing to start.
+fn load_forward_config() -> LogForwardConfig {
+    LogForwardConfig::default_path()
+        .and_then(|path| LogForwardConfig::load(&path))
+        .unwrap_or_else(|error| {
+            tracing::warn!("log forwarding: could not read the saved config: {error}");
+            LogForwardConfig::disabled()
+        })
+}
+
+/// Build the sink a config describes.
+fn build_sink(config: &LogForwardConfig) -> Result<Arc<dyn LogSink>> {
+    let sink = ElasticsearchSink::new(config.endpoint_base(), &config.token)?;
+    Ok(Arc::new(sink))
+}
+
+/// Start a forwarder for the persisted config, if forwarding is enabled.
+async fn start_forwarder_if_enabled(state: &Arc<AppState>) {
+    let config = load_forward_config();
+    if !config.enabled {
+        return;
+    }
+    if let Err(error) = start_forwarder(state, config).await {
+        tracing::warn!("log forwarding: could not start: {error}");
+    }
+}
+
+/// Replace any running forwarder with one for `config`.
+async fn start_forwarder(state: &Arc<AppState>, config: LogForwardConfig) -> Result<()> {
+    let sink = build_sink(&config)?;
+    let offsets_path = crate::node::daemon::forward::OffsetStore::default_path()?;
+    let endpoint = sink.describe();
+
+    let handle = spawn_log_forwarder(
+        state.registry.clone(),
+        config,
+        sink,
+        offsets_path,
+        DEFAULT_POLL_INTERVAL,
+        state.shutdown.clone(),
+    );
+
+    let mut slot = state.forwarder.write().await;
+    if let Some(previous) = slot.replace(handle) {
+        previous.stop();
+    }
+    tracing::info!("log forwarding: shipping node logs to {endpoint}");
+    Ok(())
+}
+
+/// Build the status response, merging persisted config with the live forwarder's counters.
+///
+/// The node lists always come from the registry rather than the forwarder's snapshot. They are
+/// derived from registry state, not runtime state, and reading them live keeps `status` consistent
+/// with what `enable` just reported — a snapshot taken before the forwarder's first poll would
+/// otherwise show no nodes at all a moment after `enable` listed them.
+async fn forward_status(state: &Arc<AppState>) -> LogForwardStatus {
+    let config = load_forward_config();
+    let mut status = LogForwardStatus::inactive(&config);
+
+    {
+        let registry = state.registry.read().await;
+        let (forwarding, skipped) = classify_nodes(&registry);
+        status.nodes_forwarding = forwarding;
+        status.nodes_skipped = skipped;
+    }
+
+    let slot = state.forwarder.read().await;
+    if let Some(handle) = slot.as_ref().filter(|handle| !handle.is_stopped()) {
+        status.active = true;
+        status.stats = handle.snapshot().await.stats;
+    }
+
+    status
+}
+
+/// GET /api/v1/logs/forward — Whether beta log forwarding is on, and what it is doing.
+async fn get_log_forward(State(state): State<Arc<AppState>>) -> Json<LogForwardStatus> {
+    Json(forward_status(&state).await)
+}
+
+/// POST /api/v1/logs/forward/enable — Opt into forwarding node logs to the beta endpoint.
+///
+/// Running this is the consent act. It is idempotent: enabling while already enabled re-reads the
+/// request, restarts the forwarder against it, and reports `already_in_state`.
+async fn post_log_forward_enable(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<LogForwardEnableRequest>,
+) -> std::result::Result<Json<LogForwardResult>, (StatusCode, Json<serde_json::Value>)> {
+    let stored = load_forward_config();
+    let was_enabled = stored.enabled;
+
+    let config = apply_enable(&stored, &request).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+    })?;
+
+    let path = LogForwardConfig::default_path().map_err(internal_error)?;
+    config.save(&path).map_err(internal_error)?;
+
+    start_forwarder(&state, config.clone())
+        .await
+        .map_err(internal_error)?;
+
+    let registry = state.registry.read().await;
+    let (nodes_forwarding, nodes_skipped) = classify_nodes(&registry);
+
+    Ok(Json(LogForwardResult {
+        enabled: true,
+        already_in_state: was_enabled,
+        endpoint: config.endpoint.clone(),
+        min_level: config.min_level,
+        nodes_forwarding,
+        nodes_skipped,
+        pending_daemon_start: false,
+    }))
+}
+
+/// POST /api/v1/logs/forward/disable — Stop forwarding.
+///
+/// Nothing else about any node changes: no restart, no argument change, no data touched.
+async fn post_log_forward_disable(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<LogForwardResult>, (StatusCode, Json<serde_json::Value>)> {
+    let mut config = load_forward_config();
+    let was_enabled = config.enabled;
+
+    config.enabled = false;
+    let path = LogForwardConfig::default_path().map_err(internal_error)?;
+    config.save(&path).map_err(internal_error)?;
+
+    if let Some(handle) = state.forwarder.write().await.take() {
+        handle.stop();
+    }
+
+    Ok(Json(LogForwardResult {
+        enabled: false,
+        already_in_state: !was_enabled,
+        endpoint: config.endpoint.clone(),
+        min_level: config.min_level,
+        nodes_forwarding: Vec::new(),
+        nodes_skipped: Vec::new(),
+        pending_daemon_start: false,
+    }))
+}
+
+fn internal_error(error: crate::error::Error) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+}
+
 async fn get_openapi() -> impl IntoResponse {
     // TODO: Migrate to utoipa-generated OpenAPI spec. Types already derive
     // utoipa::ToSchema but this spec is still hand-written JSON.
@@ -846,10 +1027,137 @@ async fn get_openapi() -> impl IntoResponse {
                         }
                     }
                 }
+            },
+            "/api/v1/logs/forward": {
+                "get": {
+                    "summary": "Log forwarding status",
+                    "description": "Whether beta log forwarding is enabled, which nodes are being tailed, which are skipped for having no log directory, and delivery counters. Never returns the write token, only a fingerprint of it.",
+                    "responses": {
+                        "200": {
+                            "description": "Forwarding status",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/LogForwardStatus" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/logs/forward/enable": {
+                "post": {
+                    "summary": "Enable log forwarding",
+                    "description": "Opt into forwarding managed nodes' logs to the beta endpoint. This call is the consent act. Omitted fields reuse the stored configuration, so re-enabling after a disable needs no arguments. Idempotent.",
+                    "requestBody": {
+                        "required": false,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/LogForwardEnableRequest" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Forwarding enabled",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/LogForwardResult" }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "No token has ever been supplied, or the endpoint is not an http(s) URL"
+                        }
+                    }
+                }
+            },
+            "/api/v1/logs/forward/disable": {
+                "post": {
+                    "summary": "Disable log forwarding",
+                    "description": "Stop forwarding. Nothing else about any node changes: no restart, no argument change, no data touched. Idempotent.",
+                    "responses": {
+                        "200": {
+                            "description": "Forwarding disabled",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/LogForwardResult" }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         },
         "components": {
             "schemas": {
+                "LogLevel": {
+                    "type": "string",
+                    "enum": ["trace", "debug", "info", "warn", "error"]
+                },
+                "ForwardingNode": {
+                    "type": "object",
+                    "properties": {
+                        "node_id": { "type": "integer" },
+                        "service": { "type": "string" },
+                        "log_dir": { "type": "string" }
+                    }
+                },
+                "SkippedNode": {
+                    "type": "object",
+                    "description": "A node that cannot be forwarded, with the reason. Almost always a node added without --log-dir-path, which writes no log files at all.",
+                    "properties": {
+                        "node_id": { "type": "integer" },
+                        "service": { "type": "string" },
+                        "reason": { "type": "string" }
+                    }
+                },
+                "ForwardStats": {
+                    "type": "object",
+                    "description": "Counters since the daemon started; reset on restart.",
+                    "properties": {
+                        "events_forwarded": { "type": "integer" },
+                        "events_dropped_by_level": { "type": "integer" },
+                        "events_dropped_by_overflow": { "type": "integer" },
+                        "batches_sent": { "type": "integer" },
+                        "batches_failed": { "type": "integer" },
+                        "last_success_unix": { "type": "integer", "nullable": true },
+                        "last_error": { "type": "string", "nullable": true }
+                    }
+                },
+                "LogForwardStatus": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": { "type": "boolean" },
+                        "endpoint": { "type": "string" },
+                        "index_prefix": { "type": "string" },
+                        "min_level": { "$ref": "#/components/schemas/LogLevel" },
+                        "token_fingerprint": { "type": "string", "nullable": true, "description": "Short non-reversible identifier for the configured token. The token itself is never returned." },
+                        "active": { "type": "boolean", "description": "Whether the background forwarder is currently running." },
+                        "nodes_forwarding": { "type": "array", "items": { "$ref": "#/components/schemas/ForwardingNode" } },
+                        "nodes_skipped": { "type": "array", "items": { "$ref": "#/components/schemas/SkippedNode" } },
+                        "stats": { "$ref": "#/components/schemas/ForwardStats" }
+                    }
+                },
+                "LogForwardEnableRequest": {
+                    "type": "object",
+                    "properties": {
+                        "token": { "type": "string", "nullable": true, "description": "Write-only Elasticsearch API key. Reuses the stored one when omitted." },
+                        "endpoint": { "type": "string", "nullable": true },
+                        "min_level": { "$ref": "#/components/schemas/LogLevel", "nullable": true }
+                    }
+                },
+                "LogForwardResult": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": { "type": "boolean" },
+                        "already_in_state": { "type": "boolean" },
+                        "endpoint": { "type": "string" },
+                        "min_level": { "$ref": "#/components/schemas/LogLevel" },
+                        "nodes_forwarding": { "type": "array", "items": { "$ref": "#/components/schemas/ForwardingNode" } },
+                        "nodes_skipped": { "type": "array", "items": { "$ref": "#/components/schemas/SkippedNode" } },
+                        "pending_daemon_start": { "type": "boolean", "description": "Set when the config was saved but no forwarder could be started because the daemon is not running." }
+                    }
+                },
                 "DaemonStatus": {
                     "type": "object",
                     "properties": {
