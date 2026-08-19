@@ -456,6 +456,80 @@ mod tests {
         assert_eq!(outcome.events[0].event.message, "during downtime");
     }
 
+    /// Enabling forwarding *before* the node starts captures its whole first log file, including
+    /// the startup line carrying version, commit and peer id.
+    ///
+    /// The end-join rule only applies to files that already existed when forwarding was switched
+    /// on. A node that has not run yet has no files, so nothing is joined at the end, and the file
+    /// it later creates is read from byte zero like any other new file.
+    #[tokio::test]
+    async fn a_node_started_after_enabling_is_captured_from_its_first_line() {
+        let fixture = Fixture::new();
+
+        // Forwarding is enabled while the node has never run: the log directory is empty.
+        let mut tailer = fixture.tailer();
+        let mut offsets = fixture.offsets();
+        let outcome = tailer.poll(&mut offsets, LogLevel::Info).await.unwrap();
+        assert!(outcome.events.is_empty());
+
+        // The node now starts and writes its startup line.
+        fixture.append(
+            "ant-node.2026-08-19.log",
+            &format!(
+                "{}{}",
+                line("INFO", "starting version=0.17.2 commit=abc1234"),
+                line("INFO", "listening for connections"),
+            ),
+        );
+        let outcome = drain(&mut tailer, &mut offsets, LogLevel::Info).await;
+
+        let messages: Vec<&str> = outcome
+            .events
+            .iter()
+            .map(|e| e.event.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                "starting version=0.17.2 commit=abc1234",
+                "listening for connections"
+            ],
+            "the node's first line must not be skipped"
+        );
+        assert_eq!(outcome.events[0].byte_offset, 0);
+        assert_eq!(outcome.events[0].event.version.as_deref(), Some("0.17.2"));
+        assert_eq!(outcome.events[0].event.commit.as_deref(), Some("abc1234"));
+    }
+
+    /// The converse: enabling *after* the node is already running skips whatever it logged before
+    /// consent — including its startup line, and so the version/commit fields that come with it.
+    #[tokio::test]
+    async fn enabling_after_the_node_started_skips_its_startup_line() {
+        let fixture = Fixture::new();
+        fixture.append(
+            "ant-node.2026-08-19.log",
+            &line("INFO", "starting version=0.17.2 commit=abc1234"),
+        );
+
+        let mut tailer = fixture.tailer();
+        let mut offsets = fixture.offsets();
+        let outcome = drain(&mut tailer, &mut offsets, LogLevel::Info).await;
+        assert!(
+            outcome.events.is_empty(),
+            "pre-consent lines are not uploaded"
+        );
+
+        fixture.append("ant-node.2026-08-19.log", &line("INFO", "later activity"));
+        let outcome = drain(&mut tailer, &mut offsets, LogLevel::Info).await;
+
+        let messages: Vec<&str> = outcome
+            .events
+            .iter()
+            .map(|e| e.event.message.as_str())
+            .collect();
+        assert_eq!(messages, vec!["later activity"]);
+    }
+
     #[tokio::test]
     async fn a_new_days_file_is_read_from_the_beginning() {
         let fixture = Fixture::new();
