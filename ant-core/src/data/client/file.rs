@@ -711,6 +711,32 @@ fn partial_upload_after_fatal(
     }
 }
 
+/// Require every sub-batch of a *resumable* merkle finalize to be paid.
+///
+/// A [`MerkleFinalizeResume`] re-drives storage against the proofs folded at
+/// finalize time and accepts no new payment material, so a chunk whose
+/// sub-batch was never paid could never acquire a proof on resume: every
+/// [`Client::finalize_resume`] call would report it as missing-proof again and
+/// the handle would never drain to [`FinalizeOutcome::Complete`]. Rejecting
+/// partial payment up front keeps resume handles always drainable. A caller
+/// that intends to pay only some sub-batches must use the non-resumable
+/// [`Client::finalize_upload_merkle_multi`], which surfaces the unpaid chunks
+/// through [`Error::PartialUpload`] (ADR-0003).
+fn require_fully_paid_for_resumable(winner_pool_hashes: &[Option<[u8; 32]>]) -> Result<()> {
+    let unpaid = winner_pool_hashes.iter().filter(|h| h.is_none()).count();
+    if unpaid > 0 {
+        return Err(Error::Payment(format!(
+            "{unpaid}/{} sub-batch(es) unpaid: the resumable finalize requires every \
+             sub-batch to be paid, because a resume handle cannot acquire proofs for \
+             unpaid chunks and would never drain to Complete. Pay every sub-batch, or \
+             use finalize_upload_merkle_multi() to finalize a partial payment (its \
+             unpaid chunks are reported through PartialUpload).",
+            winner_pool_hashes.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Fold the per-batch winner hashes of an external merkle upload into one
 /// combined payment receipt.
 ///
@@ -719,7 +745,8 @@ fn partial_upload_after_fatal(
 /// each paid batch, and merges the receipts the way the wallet path folds
 /// its sub-batch payments. Unpaid (`None`) batches contribute no proofs, so
 /// the store phase reports their chunks through [`Error::PartialUpload`]
-/// (ADR-0003).
+/// (ADR-0003) — the resumable path rejects them up front instead
+/// ([`require_fully_paid_for_resumable`]).
 fn fold_external_merkle_payments(
     prepared_batches: Vec<PreparedMerkleBatch>,
     winner_pool_hashes: Vec<Option<[u8; 32]>>,
@@ -1300,9 +1327,12 @@ pub struct PreparedUpload {
 /// [`Client::finalize_resume`]).
 ///
 /// `Complete` means every chunk is stored. `Partial` means some chunks are
-/// still short of quorum after retries; its [`FinalizeResume`] handle owns the
-/// retained payment material, so the caller can store the remainder against the
-/// **same** on-chain payment without re-quoting or re-signing (issue #140).
+/// still unstored after retries — short of quorum, or cut off by a store
+/// abort; its [`FinalizeResume`] handle owns the retained payment material, so
+/// the caller can store the remainder against the **same** on-chain payment
+/// without re-quoting or re-signing (issue #140). Persistent store failures
+/// also surface as `Partial`, so loops that retry a handle must bound their
+/// attempts (see [`Client::finalize_resume`]).
 #[derive(Debug)]
 pub enum FinalizeOutcome {
     /// All chunks stored; the file is fully retrievable.
@@ -2380,13 +2410,20 @@ impl Client {
     /// against the **same** on-chain payment — no re-quoting, no second
     /// signature, no double payment (#140).
     ///
+    /// Unlike the non-resumable method, **every sub-batch must be paid**
+    /// (`winner_pool_hashes` all `Some`). A resume handle cannot acquire proofs
+    /// for unpaid chunks, so a partially-paid finalize could never drain to
+    /// [`FinalizeOutcome::Complete`]; partial payment is rejected up front. To
+    /// finalize a partial payment, use [`Client::finalize_upload_merkle_multi`],
+    /// which reports the unpaid chunks through [`Error::PartialUpload`].
+    ///
     /// # Errors
     ///
-    /// Returns an error if no sub-batch was paid, the winner-hash count does
+    /// Returns an error if any sub-batch is unpaid, the winner-hash count does
     /// not match the prepared batches, the payment info is wave-batch rather
-    /// than merkle, or a non-recoverable store failure occurs. A plain quorum
-    /// shortfall is **not** an error here — it comes back as
-    /// [`FinalizeOutcome::Partial`].
+    /// than merkle, or payment finalization fails. Store failures are **not**
+    /// errors here: a quorum shortfall — and a fatal store abort, which keeps
+    /// its progress the same way — comes back as [`FinalizeOutcome::Partial`].
     pub async fn finalize_upload_merkle_multi_resumable(
         &self,
         prepared: PreparedUpload,
@@ -2423,6 +2460,7 @@ impl Client {
                 chunk_store,
                 chunk_addresses,
             } => {
+                require_fully_paid_for_resumable(&winner_pool_hashes)?;
                 let batch_result =
                     fold_external_merkle_payments(prepared_batches, winner_pool_hashes)?;
                 self.drive_merkle_finalize(
@@ -2521,15 +2559,26 @@ impl Client {
     /// handle.
     ///
     /// No re-quoting and no new signature: the handle owns the retained chunk
-    /// bodies (wave path) or the spill + merkle proofs (merkle path). Safe to
-    /// call repeatedly — each call either completes the upload
-    /// ([`FinalizeOutcome::Complete`]) or returns a reduced handle, so a caller
-    /// can loop until it drains or gives up (#140).
+    /// bodies (wave path) or the spill + merkle proofs (merkle path). Every
+    /// chunk in the handle has its payment material, so the upload always
+    /// *can* complete once the network cooperates. Safe to call repeatedly —
+    /// each call stores what it can and either completes the upload
+    /// ([`FinalizeOutcome::Complete`]) or hands back the remainder, so a
+    /// caller can loop until it drains or gives up (#140).
+    ///
+    /// **Bound that loop.** Store failures — including persistent ones, such
+    /// as a chunk whose close group stays unreachable — surface as
+    /// [`FinalizeOutcome::Partial`] on every call, never as `Err`, so an
+    /// unbounded `while let Partial` loop will spin for as long as the
+    /// failure persists. Cap the attempts (or apply backoff between them) and
+    /// treat a handle that stops shrinking as stuck.
     ///
     /// # Errors
     ///
-    /// Returns an error only on a non-recoverable store failure; a plain
-    /// shortfall comes back as [`FinalizeOutcome::Partial`].
+    /// Store failures are not errors — every store-side outcome, fatal aborts
+    /// included, comes back as [`FinalizeOutcome::Partial`] with the payment
+    /// material retained for retry. `Err` is reserved for failures outside
+    /// the chunk store itself.
     pub async fn finalize_resume(&self, resume: FinalizeResume) -> Result<FinalizeOutcome> {
         self.finalize_resume_with_progress(resume, None).await
     }
@@ -2596,11 +2645,13 @@ impl Client {
     /// spill on demand and re-attaching proofs from `batch_result`), shared by
     /// the initial resumable finalize and [`Client::finalize_resume`].
     ///
-    /// On a quorum shortfall it captures the retained spill, proofs, and the
+    /// On a quorum shortfall — or a fatal store abort, which
+    /// `upload_merkle_from_spill` folds into [`Error::PartialUpload`] with its
+    /// progress preserved — it captures the retained spill, proofs, and the
     /// cumulative stored/unstored sets into a [`MerkleFinalizeResume`] and
-    /// returns [`FinalizeOutcome::Partial`] instead of propagating
-    /// [`Error::PartialUpload`], so the same on-chain payment can be retried
-    /// without re-signing. Genuinely fatal errors still propagate via `Err`.
+    /// returns [`FinalizeOutcome::Partial`], so the same on-chain payment can
+    /// be retried without re-signing. `Err` is reserved for failures outside
+    /// the store fan-out (e.g. invalid payment material).
     #[allow(clippy::too_many_arguments)]
     async fn drive_merkle_finalize(
         &self,
@@ -4289,6 +4340,98 @@ mod tests {
                 assert_eq!(m.data_map_address, Some([9u8; 32]));
             }
             FinalizeOutcome::Complete(_) => panic!("expected Partial"),
+        }
+    }
+
+    #[test]
+    fn resumable_guard_rejects_partial_payment() {
+        // Regression for the PR #172 review: a Some/None mix must not reach the
+        // resumable path — its resume handle could never acquire proofs for the
+        // unpaid chunks, so repeated finalize_resume calls would return Partial
+        // forever instead of draining to Complete.
+        let err = require_fully_paid_for_resumable(&[Some([1u8; 32]), None, Some([2u8; 32])])
+            .expect_err("a mix of paid and unpaid sub-batches must be rejected");
+        match err {
+            Error::Payment(msg) => {
+                assert!(msg.contains("1/3"), "counts unpaid batches: {msg}");
+                assert!(
+                    msg.contains("finalize_upload_merkle_multi()"),
+                    "points at the non-resumable path: {msg}"
+                );
+            }
+            other => panic!("expected Error::Payment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resumable_guard_accepts_fully_paid() {
+        require_fully_paid_for_resumable(&[Some([1u8; 32]), Some([2u8; 32])])
+            .expect("fully-paid winner hashes pass the guard");
+        require_fully_paid_for_resumable(&[]).expect(
+            "an empty set has no unpaid batch — fold_external_merkle_payments \
+             rejects it as nothing-to-finalize",
+        );
+    }
+
+    #[test]
+    fn merkle_resume_handle_drains_to_complete() {
+        // Regression for the PR #172 review: drive the resume-handoff contract
+        // through two passes and prove the handle drains. Pass 1 stores one of
+        // three chunks; the Partial handle carries the unstored set plus the
+        // original payment. Pass 2 re-drives exactly that handle's material and
+        // stores the rest, reaching Complete with whole-file counts.
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
+        let first_pass = Err(Error::PartialUpload {
+            stored: vec![a],
+            stored_count: 1,
+            failed: vec![(b, "quorum".into()), (c, "quorum".into())],
+            failed_count: 2,
+            total_chunks: 3,
+            spend: Box::new(PartialUploadSpend {
+                storage_cost_atto: "777".into(),
+                gas_cost_wei: 0,
+            }),
+            reason: "quorum shortfall".into(),
+        });
+        let outcome = assemble_merkle_finalize_outcome(
+            first_pass,
+            DataMap::new(vec![]),
+            Some([9u8; 32]),
+            3,
+            empty_chunk_store(),
+            dummy_batch_result(),
+        )
+        .expect("a quorum shortfall is Ok(Partial), never Err");
+        let FinalizeOutcome::Partial { resume, .. } = outcome else {
+            panic!("expected Partial after a shortfall pass");
+        };
+        let FinalizeResume::Merkle(m) = resume else {
+            panic!("expected a merkle resume handle");
+        };
+        assert_eq!(m.unstored_addresses, vec![b, c]);
+
+        // Second pass: finalize_resume feeds the handle's own fields back into
+        // the drive; simulate its store pass succeeding for the remainder.
+        let second_pass = Ok((3, "0".into(), 0, WaveAggregateStats::default()));
+        let outcome = assemble_merkle_finalize_outcome(
+            second_pass,
+            m.data_map,
+            m.data_map_address,
+            m.total_chunks,
+            m.chunk_store,
+            m.batch_result,
+        )
+        .expect("a fully-stored resume pass is not an error");
+        match outcome {
+            FinalizeOutcome::Complete(result) => {
+                assert_eq!(result.chunks_stored, 3);
+                assert_eq!(result.chunks_failed, 0);
+                assert_eq!(result.total_chunks, 3);
+                assert_eq!(result.data_map_address, Some([9u8; 32]));
+            }
+            FinalizeOutcome::Partial { .. } => panic!("expected Complete after the drain pass"),
         }
     }
 
