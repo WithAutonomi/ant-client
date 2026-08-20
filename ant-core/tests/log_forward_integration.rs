@@ -249,12 +249,17 @@ impl Fixture {
     }
 
     fn config(&self, endpoint: &str) -> LogForwardConfig {
+        self.config_for_installation(endpoint, "0123456789abcdef")
+    }
+
+    fn config_for_installation(&self, endpoint: &str, installation_id: &str) -> LogForwardConfig {
         LogForwardConfig {
             enabled: true,
             token: "beta-write-key".to_string(),
             endpoint: endpoint.to_string(),
             index_prefix: "beta-nodes".to_string(),
             min_level: LogLevel::Info,
+            installation_id: installation_id.to_string(),
         }
     }
 }
@@ -273,7 +278,26 @@ async fn forward_for(
     write: impl FnOnce(),
     settle: Duration,
 ) {
-    let config = fixture.config(endpoint_base);
+    forward_for_installation(
+        fixture,
+        endpoint_base,
+        offsets_path,
+        "0123456789abcdef",
+        write,
+        settle,
+    )
+    .await;
+}
+
+async fn forward_for_installation(
+    fixture: &Fixture,
+    endpoint_base: &str,
+    offsets_path: &Path,
+    installation_id: &str,
+    write: impl FnOnce(),
+    settle: Duration,
+) {
+    let config = fixture.config_for_installation(endpoint_base, installation_id);
     let sink = Arc::new(ElasticsearchSink::new(config.endpoint_base(), &config.token).unwrap());
 
     let handle = spawn_log_forwarder(
@@ -325,7 +349,11 @@ async fn node_logs_reach_the_endpoint_correctly_framed_and_tagged() {
         document.action
     );
     assert_eq!(document.index(), "beta-nodes-2026.08.19");
-    assert_eq!(document.id(), "1-ant-node.2026-08-19.log-0");
+    assert_eq!(
+        document.id(),
+        "0123456789abcdef-1-ant-node.2026-08-19.log-0",
+        "the id is namespaced by installation, then node, file and byte offset"
+    );
 
     // Tagging, using the index's own field names.
     assert_eq!(document.source["@timestamp"], "2026-08-19T20:50:00.000000Z");
@@ -642,6 +670,67 @@ async fn enabling_does_not_upload_the_existing_backlog() {
 
     let messages: Vec<String> = endpoint.documents().iter().map(|d| d.message()).collect();
     assert_eq!(messages, vec!["logged after consent"]);
+
+    endpoint.stop();
+}
+
+/// Two participants, each running a node `1` whose daily log file has the same name and whose first
+/// line sits at byte offset 0, writing into the same shared daily index.
+///
+/// Without an installation namespace in the document id these two events share an `_id`. The second
+/// one would come back as a 409, which the sink counts as delivered, so it would be dropped rather
+/// than stored — and because it is the node's *first* line, the loss falls precisely on the startup
+/// event carrying version, commit and peer id.
+#[tokio::test]
+async fn identical_events_from_two_installations_are_both_stored() {
+    let endpoint = MockEndpoint::start(Vec::new()).await;
+
+    let first = Fixture::new();
+    let second = Fixture::new();
+
+    // Byte-for-byte identical content, at the same offset, in the same filename, for node 1.
+    let startup = line("2026-08-19", "20:50:00", "INFO", "starting version=0.17.2");
+
+    forward_for_installation(
+        &first,
+        &endpoint.base_url(),
+        &first.offsets_path(),
+        "aaaaaaaaaaaaaaaa",
+        || first.append("2026-08-19", &startup),
+        Duration::from_millis(400),
+    )
+    .await;
+
+    forward_for_installation(
+        &second,
+        &endpoint.base_url(),
+        &second.offsets_path(),
+        "bbbbbbbbbbbbbbbb",
+        || second.append("2026-08-19", &startup),
+        Duration::from_millis(400),
+    )
+    .await;
+
+    let documents = endpoint.documents();
+    assert_eq!(
+        documents.len(),
+        2,
+        "both installations' events must be stored, got ids {:?}",
+        documents
+            .iter()
+            .map(ReceivedDocument::id)
+            .collect::<Vec<_>>()
+    );
+
+    let ids: Vec<String> = documents.iter().map(ReceivedDocument::id).collect();
+    assert_ne!(ids[0], ids[1]);
+    assert!(ids.iter().any(|id| id.starts_with("aaaaaaaaaaaaaaaa-")));
+    assert!(ids.iter().any(|id| id.starts_with("bbbbbbbbbbbbbbbb-")));
+
+    // Both are still the same local position — which is the point.
+    assert!(ids
+        .iter()
+        .all(|id| id.ends_with("-1-ant-node.2026-08-19.log-0")));
 
     endpoint.stop();
 }

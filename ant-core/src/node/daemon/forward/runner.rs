@@ -54,12 +54,31 @@ pub struct ForwarderHandle {
     cancel: CancellationToken,
     shared: Arc<RwLock<ForwarderSnapshot>>,
     endpoint: String,
+    /// Retained so that stopping can be *awaited*. Without this there is no way to tell a caller
+    /// that the last request has actually finished, which is what `disable` needs to promise.
+    task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ForwarderHandle {
-    /// Stop forwarding. Idempotent.
+    /// Signal the forwarder to stop, without waiting for it. Idempotent.
+    ///
+    /// Prefer [`Self::stop_and_wait`] where the caller is about to tell a user that forwarding has
+    /// stopped.
     pub fn stop(&self) {
         self.cancel.cancel();
+    }
+
+    /// Stop forwarding and wait until the task has actually exited.
+    ///
+    /// This is what makes `disable` a real revocation boundary rather than a request. Cancellation
+    /// is observed inside the delivery loop, and dropping the in-flight future cancels the HTTP
+    /// request with it, so this returns promptly rather than after the retry ladder plays out.
+    pub async fn stop_and_wait(&self) {
+        self.cancel.cancel();
+        let task = self.task.lock().await.take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
     }
 
     #[must_use]
@@ -91,13 +110,11 @@ pub fn spawn_log_forwarder(
     let cancel = CancellationToken::new();
     let shared = Arc::new(RwLock::new(ForwarderSnapshot::default()));
 
-    let handle = ForwarderHandle {
-        cancel: cancel.clone(),
-        shared: shared.clone(),
-        endpoint: sink.describe(),
-    };
+    let endpoint = sink.describe();
+    let task_cancel = cancel.clone();
+    let task_shared = shared.clone();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut state = ForwarderRun {
             registry,
             config,
@@ -107,17 +124,18 @@ pub fn spawn_log_forwarder(
             queue: DocumentQueue::new(DEFAULT_QUEUE_CAPACITY),
             stats: ForwardStats::default(),
             retry: RetryPolicy::default(),
+            cancel: task_cancel.clone(),
         };
 
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
-                () = cancel.cancelled() => break,
+                () = task_cancel.cancelled() => break,
                 () = tokio::time::sleep(poll_interval) => {}
             }
 
             let snapshot = state.run_cycle().await;
-            *shared.write().await = snapshot;
+            *task_shared.write().await = snapshot;
         }
 
         // A clean shutdown persists what was read, so the next start resumes rather than replays.
@@ -127,7 +145,12 @@ pub fn spawn_log_forwarder(
         tracing::info!("log forwarding: stopped");
     });
 
-    handle
+    ForwarderHandle {
+        cancel,
+        shared,
+        endpoint,
+        task: tokio::sync::Mutex::new(Some(task)),
+    }
 }
 
 /// Everything one running forwarder owns.
@@ -140,6 +163,9 @@ struct ForwarderRun {
     queue: DocumentQueue,
     stats: ForwardStats,
     retry: RetryPolicy,
+    /// Cancelled by `disable` or by daemon shutdown. Checked between batches and raced against each
+    /// delivery, so neither an in-flight request nor a retry backoff outlives it.
+    cancel: CancellationToken,
 }
 
 impl ForwarderRun {
@@ -148,6 +174,9 @@ impl ForwarderRun {
         self.refresh_tailers().await;
 
         for (tailer, tags) in self.tailers.values_mut() {
+            if self.cancel.is_cancelled() {
+                break;
+            }
             let outcome = match tailer.poll(&mut self.offsets, self.config.min_level).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -162,7 +191,12 @@ impl ForwarderRun {
             self.stats.events_dropped_by_level += outcome.dropped_by_level;
 
             for event in &outcome.events {
-                match ForwardDocument::build(event, tags, &self.config.index_prefix) {
+                match ForwardDocument::build(
+                    event,
+                    tags,
+                    &self.config.index_prefix,
+                    &self.config.installation_id,
+                ) {
                     Some(document) => self.queue.push(document),
                     // Parsing rejects unusable timestamps, so this is defensive rather than
                     // expected; counting it keeps the totals honest either way.
@@ -222,9 +256,19 @@ impl ForwarderRun {
         self.offsets.keys().any(|key| key.starts_with(&prefix))
     }
 
-    /// Ship everything currently queued.
+    /// Ship everything currently queued, abandoning the moment forwarding is revoked.
+    ///
+    /// Both checks matter. The loop check stops a full queue from taking further batches after
+    /// `disable`, and the `select!` drops the delivery future mid-flight — which cancels the HTTP
+    /// request with it, since a dropped `reqwest` future cancels the request, and discards any
+    /// pending retry backoff along with it. Without the second, a `disable` issued at the wrong
+    /// moment would keep uploading for the length of the retry ladder.
     async fn flush_queue(&mut self) {
         while !self.queue.is_empty() {
+            if self.cancel.is_cancelled() {
+                return;
+            }
+
             let batch = self
                 .queue
                 .take_batch(DEFAULT_BATCH_DOCUMENTS, DEFAULT_BATCH_BYTES);
@@ -233,10 +277,20 @@ impl ForwarderRun {
             }
 
             let count = batch.len() as u64;
-            let report = deliver(self.sink.as_ref(), batch, self.retry, |delay| {
+            let delivery = deliver(self.sink.as_ref(), batch, self.retry, |delay| {
                 Box::pin(tokio::time::sleep(delay))
-            })
-            .await;
+            });
+
+            let report = tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => {
+                    tracing::debug!(
+                        "log forwarding: revoked mid-delivery; abandoning {count} document(s)"
+                    );
+                    return;
+                }
+                report = delivery => report,
+            };
 
             self.stats.events_forwarded += report.delivered;
 
@@ -456,6 +510,64 @@ mod tests {
             sink.batch_count(),
             batches_after_stop,
             "disable must stop the flow entirely"
+        );
+    }
+
+    /// `disable` must be a revocation boundary, not a request: once `stop_and_wait` returns, no
+    /// request may still be in flight.
+    ///
+    /// The sink here hangs mid-send, standing in for a slow endpoint. Before cancellation reached
+    /// the delivery loop, `disable` returned immediately and that send carried on through the whole
+    /// retry ladder — up to three 30s request timeouts plus backoff — while the CLI had already
+    /// told the user forwarding had stopped.
+    #[tokio::test]
+    async fn stopping_returns_only_once_delivery_has_actually_stopped() {
+        let harness = Harness::new(&[true]).await;
+        let release = Arc::new(tokio::sync::Notify::new());
+        let sink = Arc::new(MockSink::blocking(release.clone()));
+
+        let handle = spawn_log_forwarder(
+            harness.registry.clone(),
+            harness.config(),
+            sink.clone(),
+            harness.offsets_path(),
+            Duration::from_millis(30),
+            CancellationToken::new(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        harness.append(1, &line("INFO", "caught mid-flight"));
+
+        // Wait until a send is genuinely in flight and stuck.
+        let mut waited = 0;
+        while sink.batch_count() == 0 && waited < 60 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += 1;
+        }
+        assert_eq!(sink.batch_count(), 1, "a send should be in flight");
+        assert_eq!(sink.completed_count(), 0, "and still blocked");
+
+        // The blocked send is never released; this must still return promptly.
+        let stopped = tokio::time::timeout(Duration::from_secs(5), handle.stop_and_wait()).await;
+        assert!(
+            stopped.is_ok(),
+            "stop_and_wait must not sit through the retry ladder"
+        );
+
+        assert_eq!(
+            sink.completed_count(),
+            0,
+            "the in-flight request must have been dropped, not allowed to finish"
+        );
+
+        // And nothing new may be sent afterwards.
+        let batches_at_stop = sink.batch_count();
+        harness.append(1, &line("INFO", "written after disable"));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            sink.batch_count(),
+            batches_at_stop,
+            "no request may start after disable has returned"
         );
     }
 

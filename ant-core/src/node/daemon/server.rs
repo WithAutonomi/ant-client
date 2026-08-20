@@ -714,7 +714,9 @@ async fn start_forwarder(state: &Arc<AppState>, config: LogForwardConfig) -> Res
 
     let mut slot = state.forwarder.write().await;
     if let Some(previous) = slot.replace(handle) {
-        previous.stop();
+        // Awaited, not merely signalled: two forwarders tailing the same files and shipping to the
+        // same endpoint would otherwise overlap for the length of the old one's retry ladder.
+        previous.stop_and_wait().await;
     }
     tracing::info!("log forwarding: shipping node logs to {endpoint}");
     Ok(())
@@ -803,8 +805,10 @@ async fn post_log_forward_disable(
     let path = LogForwardConfig::default_path().map_err(internal_error)?;
     config.save(&path).map_err(internal_error)?;
 
+    // Awaited rather than signalled. `disable` is a revocation of consent, so it must not return
+    // — and the CLI must not print "Log forwarding stopped" — while a request is still in flight.
     if let Some(handle) = state.forwarder.write().await.take() {
-        handle.stop();
+        handle.stop_and_wait().await;
     }
 
     Ok(Json(LogForwardResult {

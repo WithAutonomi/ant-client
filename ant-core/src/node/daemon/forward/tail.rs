@@ -46,12 +46,21 @@ pub struct TailedEvent {
 impl TailedEvent {
     /// The document `_id` this event will be written under.
     ///
-    /// Deterministic in the three things that identify the event's position in the world — which
-    /// node, which file, which byte — so that replaying a batch after a transport failure lands on
-    /// the same `_id` and is rejected as a duplicate instead of writing a second copy.
+    /// Deterministic in the four things that identify the event uniquely — which installation,
+    /// which node, which file, which byte — so that replaying a batch after a transport failure
+    /// lands on the same `_id` and is rejected as a duplicate instead of writing a second copy.
+    ///
+    /// `installation_id` is not optional padding. Node id, filename and byte offset are all local
+    /// values: every participant has a node `1`, writing the same daily filename, whose first line
+    /// starts at offset 0. Since all of them write into one shared daily index and a 409 counts as
+    /// delivered, omitting the installation namespace would make the first event of each day from
+    /// each node collide across the whole cohort, and every loser would be silently discarded.
     #[must_use]
-    pub fn document_id(&self) -> String {
-        format!("{}-{}-{}", self.node_id, self.file_name, self.byte_offset)
+    pub fn document_id(&self, installation_id: &str) -> String {
+        format!(
+            "{}-{}-{}-{}",
+            installation_id, self.node_id, self.file_name, self.byte_offset
+        )
     }
 }
 
@@ -688,6 +697,9 @@ mod tests {
         assert_eq!(offsets.len(), 1);
     }
 
+    const INSTALL_A: &str = "0123456789abcdef";
+    const INSTALL_B: &str = "fedcba9876543210";
+
     #[test]
     fn the_document_id_is_stable_and_position_derived() {
         let event = TailedEvent {
@@ -697,11 +709,38 @@ mod tests {
             event: parse_line(&line("INFO", "hello")).unwrap(),
         };
 
-        assert_eq!(event.document_id(), "7-ant-node.2026-08-19.log-104857");
-        assert_eq!(event.document_id(), event.clone().document_id());
+        assert_eq!(
+            event.document_id(INSTALL_A),
+            "0123456789abcdef-7-ant-node.2026-08-19.log-104857"
+        );
+        assert_eq!(
+            event.document_id(INSTALL_A),
+            event.clone().document_id(INSTALL_A)
+        );
         assert!(
-            event.document_id().len() <= 512,
+            event.document_id(INSTALL_A).len() <= 512,
             "Elasticsearch caps _id at 512 bytes"
+        );
+    }
+
+    /// The collision this namespace exists to prevent. Two participants each run a node `1` whose
+    /// daily log file has the same name and whose first line is at offset 0; without the
+    /// installation prefix both produce the same `_id`, and because every participant writes into
+    /// one shared daily index and the sink counts a 409 as delivered, the second one's event would
+    /// be dropped on the floor rather than stored.
+    #[test]
+    fn identical_positions_on_two_installations_do_not_collide() {
+        let same_event = || TailedEvent {
+            node_id: 1,
+            file_name: "ant-node.2026-08-19.log".to_string(),
+            byte_offset: 0,
+            event: parse_line(&line("INFO", "starting version=0.17.2")).unwrap(),
+        };
+
+        assert_ne!(
+            same_event().document_id(INSTALL_A),
+            same_event().document_id(INSTALL_B),
+            "the same local position on two machines must not share a document id"
         );
     }
 
@@ -727,10 +766,10 @@ mod tests {
         };
 
         let ids = [
-            base.document_id(),
-            other_node.document_id(),
-            other_file.document_id(),
-            other_offset.document_id(),
+            base.document_id(INSTALL_A),
+            other_node.document_id(INSTALL_A),
+            other_file.document_id(INSTALL_A),
+            other_offset.document_id(INSTALL_A),
         ];
         let unique: std::collections::HashSet<&String> = ids.iter().collect();
         assert_eq!(unique.len(), 4);

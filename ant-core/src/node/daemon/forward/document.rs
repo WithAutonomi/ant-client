@@ -90,12 +90,20 @@ impl ForwardDocument {
     ///
     /// Parsing already rejects unusable timestamps in both layouts, so `None` here is a
     /// belt-and-braces case rather than an expected one.
+    ///
+    /// `installation_id` namespaces the document id; see [`TailedEvent::document_id`] for why the
+    /// local position alone is not unique across the beta cohort.
     #[must_use]
-    pub fn build(tailed: &TailedEvent, tags: &NodeTags, index_prefix: &str) -> Option<Self> {
+    pub fn build(
+        tailed: &TailedEvent,
+        tags: &NodeTags,
+        index_prefix: &str,
+        installation_id: &str,
+    ) -> Option<Self> {
         let index = format!("{index_prefix}-{}", tailed.event.index_date()?);
 
         Some(Self {
-            id: tailed.document_id(),
+            id: tailed.document_id(installation_id),
             index,
             source: DocumentSource {
                 timestamp: tailed.event.timestamp.clone(),
@@ -158,15 +166,20 @@ mod tests {
         }
     }
 
+    const INSTALL: &str = "0123456789abcdef";
+
     const LINE: &str =
         "2026-08-19T20:50:00.123456Z  INFO ant_node::node: connected peer_id=12D3KooWabc";
 
     #[test]
     fn builds_a_document_with_the_mapped_field_names() {
         let tags = NodeTags::from_config(&node_config(Some(UpgradeChannel::Beta)));
-        let document = ForwardDocument::build(&tailed(LINE), &tags, "beta-nodes").unwrap();
+        let document = ForwardDocument::build(&tailed(LINE), &tags, "beta-nodes", INSTALL).unwrap();
 
-        assert_eq!(document.id, "7-ant-node.2026-08-19.log-4096");
+        assert_eq!(
+            document.id,
+            "0123456789abcdef-7-ant-node.2026-08-19.log-4096"
+        );
         assert_eq!(document.index, "beta-nodes-2026.08.19");
 
         let json: serde_json::Value = serde_json::to_value(&document.source).unwrap();
@@ -186,7 +199,7 @@ mod tests {
     #[test]
     fn the_time_field_is_at_timestamp_and_nothing_else() {
         let tags = NodeTags::from_config(&node_config(None));
-        let document = ForwardDocument::build(&tailed(LINE), &tags, "beta-nodes").unwrap();
+        let document = ForwardDocument::build(&tailed(LINE), &tags, "beta-nodes", INSTALL).unwrap();
         let json = serde_json::to_value(&document.source).unwrap();
 
         assert!(json.get("@timestamp").is_some());
@@ -197,7 +210,7 @@ mod tests {
     #[test]
     fn host_and_beta_user_are_never_sent() {
         let tags = NodeTags::from_config(&node_config(Some(UpgradeChannel::Beta)));
-        let document = ForwardDocument::build(&tailed(LINE), &tags, "beta-nodes").unwrap();
+        let document = ForwardDocument::build(&tailed(LINE), &tags, "beta-nodes", INSTALL).unwrap();
         let json = serde_json::to_value(&document.source).unwrap();
 
         assert!(json.get("host").is_none());
@@ -221,12 +234,14 @@ mod tests {
             &tailed("2026-08-19T23:59:59.000000Z  INFO ant_node: late"),
             &tags,
             "beta-nodes",
+            INSTALL,
         )
         .unwrap();
         let today = ForwardDocument::build(
             &tailed("2026-08-20T00:00:01.000000Z  INFO ant_node: early"),
             &tags,
             "beta-nodes",
+            INSTALL,
         )
         .unwrap();
 
@@ -239,8 +254,8 @@ mod tests {
     #[test]
     fn rebuilding_the_same_event_yields_the_same_id_and_index() {
         let tags = NodeTags::from_config(&node_config(Some(UpgradeChannel::Beta)));
-        let first = ForwardDocument::build(&tailed(LINE), &tags, "beta-nodes").unwrap();
-        let second = ForwardDocument::build(&tailed(LINE), &tags, "beta-nodes").unwrap();
+        let first = ForwardDocument::build(&tailed(LINE), &tags, "beta-nodes", INSTALL).unwrap();
+        let second = ForwardDocument::build(&tailed(LINE), &tags, "beta-nodes", INSTALL).unwrap();
 
         assert_eq!(first.id, second.id);
         assert_eq!(first.index, second.index);
@@ -253,6 +268,7 @@ mod tests {
             &tailed("2026-08-19T20:50:00.123456Z  INFO plain message with no fields"),
             &tags,
             "beta-nodes",
+            INSTALL,
         )
         .unwrap();
         let json = serde_json::to_value(&document.source).unwrap();
@@ -266,7 +282,8 @@ mod tests {
     #[test]
     fn a_custom_index_prefix_is_honoured() {
         let tags = NodeTags::from_config(&node_config(None));
-        let document = ForwardDocument::build(&tailed(LINE), &tags, "my-test-index").unwrap();
+        let document =
+            ForwardDocument::build(&tailed(LINE), &tags, "my-test-index", INSTALL).unwrap();
         assert_eq!(document.index, "my-test-index-2026.08.19");
     }
 }

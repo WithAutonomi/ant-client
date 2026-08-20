@@ -174,6 +174,10 @@ pub fn apply_enable(
         config.min_level = level;
     }
 
+    // Generated on the first enable and stable thereafter. Document ids are namespaced by it, so a
+    // machine that has never opted in needs one before it can ship anything.
+    config.ensure_installation_id();
+
     config.validate()?;
     Ok(config)
 }
@@ -204,6 +208,7 @@ mod tests {
         LogForwardConfig {
             enabled: false,
             token: "stored-key".to_string(),
+            installation_id: "0123456789abcdef".to_string(),
             ..LogForwardConfig::disabled()
         }
     }
@@ -234,6 +239,35 @@ mod tests {
         assert_eq!(config.token, "stored-key");
         assert_eq!(config.endpoint, "http://127.0.0.1:9999");
         assert_eq!(config.min_level, LogLevel::Warn);
+    }
+
+    /// The namespace is minted on the first enable, and never changes afterwards — regenerating it
+    /// would make a replayed batch look like new documents and duplicate them.
+    #[test]
+    fn enabling_mints_an_installation_id_and_later_enables_keep_it() {
+        let config = apply_enable(
+            &LogForwardConfig::disabled(),
+            &LogForwardEnableRequest {
+                token: Some("first-key".to_string()),
+                ..LogForwardEnableRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(config.installation_id.len(), 16);
+
+        let re_enabled = apply_enable(&config, &LogForwardEnableRequest::default()).unwrap();
+        assert_eq!(re_enabled.installation_id, config.installation_id);
+
+        // Even rotating the token must not change it.
+        let rotated = apply_enable(
+            &config,
+            &LogForwardEnableRequest {
+                token: Some("rotated-key".to_string()),
+                ..LogForwardEnableRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rotated.installation_id, config.installation_id);
     }
 
     #[test]

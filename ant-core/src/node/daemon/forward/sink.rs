@@ -273,12 +273,17 @@ where
 #[cfg(test)]
 pub mod mock {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     /// Records every batch and replies from a script of prepared outcomes.
     pub struct MockSink {
         pub batches: Mutex<Vec<Vec<ForwardDocument>>>,
         responses: Mutex<VecDeque<BatchOutcome>>,
+        /// When set, `send` records the batch and then blocks until the notifier fires, standing in
+        /// for a request that is in flight when forwarding is revoked.
+        block_until: Option<Arc<tokio::sync::Notify>>,
+        /// Batches whose `send` actually returned, as opposed to being dropped mid-flight.
+        pub completed: Mutex<usize>,
     }
 
     impl MockSink {
@@ -288,6 +293,8 @@ pub mod mock {
             Self {
                 batches: Mutex::new(Vec::new()),
                 responses: Mutex::new(VecDeque::new()),
+                block_until: None,
+                completed: Mutex::new(0),
             }
         }
 
@@ -297,7 +304,26 @@ pub mod mock {
             Self {
                 batches: Mutex::new(Vec::new()),
                 responses: Mutex::new(responses.into()),
+                block_until: None,
+                completed: Mutex::new(0),
             }
+        }
+
+        /// A sink whose sends hang until `release` is notified.
+        #[must_use]
+        pub fn blocking(release: Arc<tokio::sync::Notify>) -> Self {
+            Self {
+                batches: Mutex::new(Vec::new()),
+                responses: Mutex::new(VecDeque::new()),
+                block_until: Some(release),
+                completed: Mutex::new(0),
+            }
+        }
+
+        /// How many sends ran to completion rather than being dropped mid-flight.
+        #[must_use]
+        pub fn completed_count(&self) -> usize {
+            *self.completed.lock().unwrap()
         }
 
         /// Ids of every document submitted, in submission order, across all batches.
@@ -321,6 +347,14 @@ pub mod mock {
         fn send<'a>(&'a self, batch: &'a [ForwardDocument]) -> BoxFuture<'a, BatchOutcome> {
             Box::pin(async move {
                 self.batches.lock().unwrap().push(batch.to_vec());
+
+                if let Some(release) = &self.block_until {
+                    // Dropping this future here is what a cancelled delivery looks like: the
+                    // completion counter below is never reached.
+                    release.notified().await;
+                }
+
+                *self.completed.lock().unwrap() += 1;
                 self.responses
                     .lock()
                     .unwrap()

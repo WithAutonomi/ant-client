@@ -133,6 +133,24 @@ pub struct LogForwardConfig {
     /// Drop events below this level before batching. Defaults to [`LogLevel::Info`].
     #[serde(default = "default_min_level")]
     pub min_level: LogLevel,
+
+    /// Stable, randomly generated namespace for this installation's document ids.
+    ///
+    /// Every participant writes into the same shared `beta-nodes-YYYY.MM.DD` indices, so a document
+    /// id built only from node id, filename and byte offset is not unique across machines: node 1's
+    /// first log line sits at offset 0 of the same daily filename on *every* installation. Since a
+    /// duplicate id is answered with a 409 that the sink counts as delivered, the second machine's
+    /// event would be silently discarded rather than stored.
+    ///
+    /// Prefixing the id with this value removes that collision. It is random rather than derived
+    /// from anything about the machine — not the hostname, MAC or username — so it identifies an
+    /// installation only in the sense of separating it from other installations.
+    ///
+    /// It must stay stable for the lifetime of the install: the deterministic id is what makes a
+    /// replayed batch idempotent, and regenerating this would make a replay look like a new
+    /// document and duplicate it.
+    #[serde(default)]
+    pub installation_id: String,
 }
 
 impl Default for LogForwardConfig {
@@ -151,6 +169,17 @@ impl LogForwardConfig {
             endpoint: default_endpoint(),
             index_prefix: default_index_prefix(),
             min_level: default_min_level(),
+            installation_id: String::new(),
+        }
+    }
+
+    /// Generate the installation namespace if this config does not have one yet.
+    ///
+    /// Called when forwarding is enabled. Configs written before this field existed load with an
+    /// empty value and are filled in on their next enable.
+    pub fn ensure_installation_id(&mut self) {
+        if self.installation_id.is_empty() {
+            self.installation_id = generate_installation_id();
         }
     }
 
@@ -191,6 +220,11 @@ impl LogForwardConfig {
 
     /// Reject a configuration that cannot possibly ship anything.
     pub fn validate(&self) -> Result<()> {
+        if self.installation_id.is_empty() {
+            return Err(Error::LogForward(
+                "internal: installation id was not generated before enabling".into(),
+            ));
+        }
         if self.token.trim().is_empty() {
             return Err(Error::LogForward(
                 "a write token is required: ant node logs forward enable --token <token>".into(),
@@ -229,6 +263,20 @@ impl LogForwardConfig {
     }
 }
 
+/// 64 bits of randomness, rendered as hex.
+///
+/// Ample for separating a beta cohort — collisions become likely somewhere around a billion
+/// installations — while keeping the document id short and readable.
+fn generate_installation_id() -> String {
+    use rand::Rng;
+    let bytes: [u8; 8] = rand::thread_rng().gen();
+    bytes.iter().fold(String::with_capacity(16), |mut acc, b| {
+        use std::fmt::Write;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
 #[cfg(unix)]
 fn restrict_to_owner(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -251,6 +299,7 @@ mod tests {
         LogForwardConfig {
             enabled: true,
             token: "test-api-key".to_string(),
+            installation_id: "0123456789abcdef".to_string(),
             ..LogForwardConfig::disabled()
         }
     }
@@ -349,11 +398,46 @@ mod tests {
     #[test]
     fn validate_rejects_a_missing_token() {
         let config = LogForwardConfig {
-            enabled: true,
             token: "   ".to_string(),
-            ..LogForwardConfig::disabled()
+            ..enabled_config()
         };
         assert!(config.validate().unwrap_err().to_string().contains("token"));
+    }
+
+    #[test]
+    fn an_installation_id_is_generated_once_and_then_left_alone() {
+        let mut config = LogForwardConfig::disabled();
+        assert!(config.installation_id.is_empty());
+
+        config.ensure_installation_id();
+        let first = config.installation_id.clone();
+        assert_eq!(first.len(), 16, "64 bits rendered as hex");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Stability is what keeps a replayed batch idempotent.
+        config.ensure_installation_id();
+        assert_eq!(config.installation_id, first);
+    }
+
+    #[test]
+    fn separate_installations_get_different_ids() {
+        let mut a = LogForwardConfig::disabled();
+        let mut b = LogForwardConfig::disabled();
+        a.ensure_installation_id();
+        b.ensure_installation_id();
+        assert_ne!(a.installation_id, b.installation_id);
+    }
+
+    #[test]
+    fn the_installation_id_survives_a_save_and_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("log_forward.json");
+        let config = enabled_config();
+        config.save(&path).unwrap();
+        assert_eq!(
+            LogForwardConfig::load(&path).unwrap().installation_id,
+            config.installation_id
+        );
     }
 
     #[test]

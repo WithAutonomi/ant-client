@@ -528,8 +528,15 @@ from the new run's first line.
 
 #### What gets sent
 
-Worth knowing before you decide. Only events at `INFO` and above, from nodes with logging enabled. Every event is tagged with the
-node ID, service name, binary version, release channel, and the OS and architecture of the machine.
+Worth knowing before you decide. Only events at `INFO` and above, from nodes with logging enabled.
+Every event is tagged with the node ID, service name, binary version, release channel, and the OS
+and architecture of the machine.
+
+Each event also carries a random identifier generated when you first enable forwarding, stored in
+`~/.config/ant/log_forward.json`. Because every participant writes into the same daily index, it is
+there to stop two machines' events colliding and overwriting one another. It is generated from
+random bytes — not from your hostname, MAC address or username — so it distinguishes your
+installation from others without describing it.
 
 Your machine's hostname is **not** sent. Your wallet and rewards address are not part of what the
 daemon adds. Beyond those tags, the content is whatever `ant-node` itself wrote to its log at `INFO`
@@ -541,6 +548,10 @@ or above — the same lines you can read yourself in the node's log directory.
 underneath means the endpoint is unreachable or rejecting the token. Delivery is best-effort by
 design: it is bounded in memory, it retries a few times and then gives up on a batch, and it never
 blocks or slows a node. Losing some log lines is an acceptable outcome; a stalled node is not.
+
+`disable` takes effect immediately: it waits for any request already in flight to be abandoned
+before reporting that forwarding has stopped, so nothing is still being uploaded once the command
+returns.
 
 Forwarding survives a daemon restart, picking up where it left off without re-sending what it had
 already delivered. If you want a genuinely clean slate, `disable` first, then delete
