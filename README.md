@@ -25,6 +25,14 @@ curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/instal
 irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex
 ```
 
+Both installers take the same environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `ANT_CHANNEL` | Release channel: `stable` (default) or `beta`. See [Beta Programme](#beta-programme). |
+| `ANT_VERSION` | Install one specific version, e.g. `0.3.3`. Overrides `ANT_CHANNEL`. |
+| `INSTALL_DIR` | Where to put the binary. Defaults to `~/.local/bin` on Linux, `/usr/local/bin` on macOS, `%LOCALAPPDATA%\ant\bin` on Windows. |
+
 ## Quick Start
 
 ### Store and retrieve a file (production)
@@ -450,9 +458,12 @@ turn it on costs you nothing.
 The client and the nodes have separate beta channels, opted into separately.
 
 ```bash
-# 1. Install the beta client. First install is manual: download the ant-cli-v<X.Y.Z>-beta.N
-#    archive for your platform from the releases page, extract it, and put `ant` on your PATH.
-#    The quick-start installers always fetch the latest stable build, so they cannot do this.
+# 1. Install the beta client. Pass ANT_CHANNEL=beta to the quick-start installer:
+$ curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh \
+      | ANT_CHANNEL=beta bash
+
+#    On Windows:
+#      $env:ANT_CHANNEL="beta"; irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex
 
 # 2. From then on, self-update stays on beta with no flag needed.
 $ ant update
