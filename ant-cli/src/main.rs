@@ -113,6 +113,9 @@ async fn run() -> anyhow::Result<()> {
                 commands::node::NodeCommand::Dismiss(args) => {
                     args.execute(json).await?;
                 }
+                commands::node::NodeCommand::Logs { command } => {
+                    command.execute(json).await?;
+                }
                 commands::node::NodeCommand::Reset(args) => {
                     args.execute(json).await?;
                 }

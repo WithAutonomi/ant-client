@@ -25,6 +25,14 @@ curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/instal
 irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex
 ```
 
+Both installers take the same environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `ANT_CHANNEL` | Release channel: `stable` (default) or `beta`. See [Beta Programme](#beta-programme). |
+| `ANT_VERSION` | Install one specific version, e.g. `0.3.3`. Overrides `ANT_CHANNEL`. |
+| `INSTALL_DIR` | Where to put the binary. Defaults to `~/.local/bin` on Linux, `/usr/local/bin` on macOS, `%LOCALAPPDATA%\ant\bin` on Windows. |
+
 ## Quick Start
 
 ### Store and retrieve a file (production)
@@ -355,6 +363,53 @@ Remove all node data, log directories, and clear the registry. All nodes must be
 $ ant node reset --force
 ```
 
+#### `ant node logs forward`
+
+Optionally ship this machine's node logs to the Autonomi beta log endpoint, to help judge a beta
+build. Off by default and never enabled for you — running `enable` yourself is the whole of the
+consent, and `disable` stops it. See
+[Forwarding your node logs](#forwarding-your-node-logs-optional) for the walkthrough.
+
+```
+$ ant node logs forward enable --token <token>
+$ ant node logs forward status
+$ ant node logs forward disable
+```
+
+**`enable` options:**
+
+| Flag | Description |
+|------|-------------|
+| `--token <TOKEN>` | The write-only token issued with your beta enrolment. Only needed the first time; re-enabling after a `disable` reuses the stored one. |
+| `--endpoint <URL>` | Send somewhere other than the default endpoint. Intended for testing against a local sink. |
+| `--level <LEVEL>` | Lowest level to forward: `trace`, `debug`, `info`, `warn`, `error`. Defaults to `info`. |
+
+`status` reports whether forwarding is on, which nodes are being tailed, which are being skipped and
+why, and how many events have been delivered:
+
+```
+$ ant node logs forward status
+Log forwarding: on
+  Endpoint: https://logs.autonomi.com   Level: INFO and above
+  Token:    75f57160d2c2
+
+  Forwarding (1)
+    ● node1 (1)
+
+  Not forwarding (2)
+    ○ node2 (2) — logging is not enabled for this node — re-add it with --log-dir-path to forward its logs
+    ○ node3 (3) — logging is not enabled for this node — re-add it with --log-dir-path to forward its logs
+
+  Node logging is off unless a node was added with --log-dir-path.
+
+  Delivery
+    Forwarded: 1284   Batches: 7 sent, 0 failed
+```
+
+The token is stored at `~/.config/ant/log_forward.json` with owner-only permissions and is never
+printed back or returned by the API — `status` shows a short fingerprint of it instead, enough to
+tell which token is in use.
+
 ### `ant update` — Self-Update
 
 Replace the running `ant` binary with the newest release from GitHub. The downloaded archive's
@@ -385,15 +440,30 @@ Because a beta version outranks the stable release it was cut from, `--channel s
 walk a beta build backwards — it will report that you are already up to date. Leaving the beta
 channel means installing a stable build manually.
 
-### Beta channel
+---
 
-The beta channel carries the week's build ahead of the stable train, for people who want to soak
-it. Both the client and the nodes have one, and they are opted into separately.
+## Beta Programme
+
+The beta channel carries the week's build ahead of the stable train, for people who want to soak it
+and report back.
+
+Taking part means [running beta builds](#running-beta-builds). That is the whole requirement.
+
+Separately, and entirely optionally, you can [forward your node logs](#forwarding-your-node-logs-optional)
+to us. It is off by default, it is not a condition of being on the beta channel, and choosing not to
+turn it on costs you nothing.
+
+### Running beta builds
+
+The client and the nodes have separate beta channels, opted into separately.
 
 ```bash
-# 1. Install the beta client. First install is manual: download the ant-cli-v<X.Y.Z>-beta.N
-#    archive for your platform from the releases page, extract it, and put `ant` on your PATH.
-#    The quick-start installers always fetch the latest stable build, so they cannot do this.
+# 1. Install the beta client. Pass ANT_CHANNEL=beta to the quick-start installer:
+$ curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh \
+      | ANT_CHANNEL=beta bash
+
+#    On Windows:
+#      $env:ANT_CHANNEL="beta"; irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex
 
 # 2. From then on, self-update stays on beta with no flag needed.
 $ ant update
@@ -405,6 +475,104 @@ $ ant node add --rewards-address 0xYourWallet --count 3 --upgrade-channel beta
 
 Existing nodes are not switched to the beta channel by any of this — `--upgrade-channel` applies
 to nodes at the point they are added, so opting in means adding new nodes.
+
+### Forwarding your node logs (optional)
+
+**This is opt-in and stays off until you ask for it.** Nothing leaves your machine unless you run
+`ant node logs forward enable` yourself, and running it is the whole of the consent. You can skip
+this section entirely and still run beta builds.
+
+If you do want to help: beta enrolment comes with a write-only token, and handing it to that command
+makes the daemon tail your nodes' log files and ship them to the Autonomi beta log endpoint. It is
+the difference between us judging a build on a handful of self-reported problems and judging it on
+what the nodes actually did, so it is genuinely useful — but it is your call, and `disable` stops it
+at any point.
+
+**If you do turn it on, the order of these three steps matters:**
+
+```bash
+# 1. Add nodes WITH LOGGING ENABLED. Node file logging is off by default; without
+#    --log-dir-path a node writes no log files at all and there is nothing to forward.
+$ ant node add --rewards-address 0xYourWallet --count 3 \
+      --upgrade-channel beta --log-dir-path ~/.local/share/ant
+
+# 2. Enable forwarding BEFORE starting the nodes.
+$ ant node logs forward enable --token <your-token>
+
+# 3. Now start them.
+$ ant node start
+```
+
+#### Why the order matters
+
+**`--log-dir-path` has to be set when the node is added.** The value is a prefix — each node gets
+`<prefix>/node-<id>/logs` — and there is no way to turn logging on for an existing node short of
+removing it and adding it again. If you forget, `enable` will tell you —
+those nodes appear under "Not forwarding" in `ant node logs forward status` — but the node has to be
+re-added to fix it.
+
+**Enable before you start, not after.** Enabling forwarding is forward-looking consent: for any log
+file that *already exists*, the daemon starts reading from the end of it, so nothing written before
+you opted in is ever uploaded. A node that has not run yet has no log file, so the one it creates
+when it starts is read from its first line.
+
+The practical difference is the node's startup line, which is where its version, commit and peer ID
+are recorded, along with the bootstrap and listen-address lines that show whether it actually joined
+the network. Enable first and those are captured. Enable afterwards and they are skipped, so every
+event forwarded from that run is missing the fields that identify which build produced it — which is
+most of what makes the logs useful.
+
+If you have already started a node, restarting it does not necessarily help: the node appends to the
+same daily file, so a restart on the same day resumes from where the daemon had got to rather than
+from the new run's first line.
+
+#### What gets sent
+
+Worth knowing before you decide. Only events at `INFO` and above, from nodes with logging enabled.
+Every event is tagged with the node ID, service name, binary version, release channel, and the OS
+and architecture of the machine.
+
+Each event also carries a random identifier generated when you first enable forwarding, stored in
+`~/.config/ant/log_forward.json`. Because every participant writes into the same daily index, it is
+there to stop two machines' events colliding and overwriting one another. It is generated from
+random bytes — not from your hostname, MAC address or username — so it distinguishes your
+installation from others without describing it.
+
+Your machine's hostname is **not** sent. Your wallet and rewards address are not part of what the
+daemon adds. Beyond those tags, the content is whatever `ant-node` itself wrote to its log at `INFO`
+or above — the same lines you can read yourself in the node's log directory.
+
+#### If something looks wrong
+
+`ant node logs forward status` is the place to look. `Batches: N sent, M failed` with an error line
+underneath means the endpoint is unreachable or rejecting the token. Delivery is best-effort by
+design: it is bounded in memory, it retries a few times and then gives up on a batch, and it never
+blocks or slows a node. Losing some log lines is an acceptable outcome; a stalled node is not.
+
+`disable` takes effect immediately: it waits for any request already in flight to be abandoned
+before reporting that forwarding has stopped, so nothing is still being uploaded once the command
+returns.
+
+Forwarding survives a daemon restart, picking up where it left off without re-sending what it had
+already delivered. If you want a genuinely clean slate, `disable` first, then delete
+`~/.local/share/ant/log_forward_offsets.json`.
+
+### Turning forwarding off
+
+You can stop forwarding at any time, without leaving the beta channel and without giving a reason:
+
+```bash
+$ ant node logs forward disable
+```
+
+Nothing else about your nodes changes — no restart, no change to how they run, no data touched. They
+keep writing their own logs to disk exactly as before; the daemon just stops reading them.
+
+### Leaving the beta channel
+
+Separate from the above, and manual. Because a beta version outranks the stable release it was cut
+from, `ant update --channel stable` cannot walk a beta build backwards — installing a stable build
+means downloading it yourself. Nodes already on `--upgrade-channel beta` stay on it.
 
 ---
 
@@ -424,6 +592,9 @@ When the daemon is running, it exposes a REST API on `127.0.0.1:<port>`. Discove
 | POST | `/api/v1/nodes/{id}/stop` | Stop a specific node |
 | POST | `/api/v1/nodes/stop-all` | Stop all running nodes |
 | POST | `/api/v1/reset` | Reset all node state (fails if nodes running) |
+| GET | `/api/v1/logs/forward` | Beta log-forwarding status, tailed nodes, delivery counters |
+| POST | `/api/v1/logs/forward/enable` | Enable beta log forwarding |
+| POST | `/api/v1/logs/forward/disable` | Disable beta log forwarding |
 | GET | `/api/v1/openapi.json` | OpenAPI 3.1 specification |
 | GET | `/console` | Web status console (HTML) |
 
@@ -699,6 +870,7 @@ Data operations (upload/download) go directly to the P2P network — they do not
 │           └── node/
 │               ├── add.rs       # ant node add
 │               ├── daemon.rs    # ant node daemon start/stop/status/info/run
+│               ├── logs.rs      # ant node logs forward enable/disable/status
 │               ├── start.rs     # ant node start
 │               ├── stop.rs      # ant node stop
 │               ├── status.rs    # ant node status
