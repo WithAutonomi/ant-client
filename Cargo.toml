@@ -1,3 +1,12 @@
 [workspace]
 members = ["ant-core", "ant-cli"]
 resolver = "2"
+
+# DRAFT-ONLY: compile against the unreleased batched-payment surface --
+# evmlib `payForMerkleTrees` (WithAutonomi/evmlib#15) re-exported by
+# ant-protocol (WithAutonomi/ant-protocol#26). Before this PR leaves draft:
+# drop both pins and bump ant-core's `ant-protocol` dependency to the
+# released version carrying them.
+[patch.crates-io]
+evmlib = { git = "https://github.com/WithAutonomi/evmlib", branch = "feat/pay-for-merkle-trees" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "feat/batched-merkle-reexports" }

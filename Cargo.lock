@@ -943,9 +943,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83f2b55e89a468584cfc91dc2f596583e089c17107de6f2f386f8339b665d1f0"
+version = "2.4.0"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=feat%2Fbatched-merkle-reexports#f4f18560c5f9425907aa11830fb7ccfc39cf249e"
 dependencies = [
  "blake3",
  "bytes",
@@ -2609,8 +2608,7 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83822a94669e50793b583817ed2681b67d2e7059bae652784d34a6ee40fbfd37"
+source = "git+https://github.com/WithAutonomi/evmlib?branch=feat%2Fpay-for-merkle-trees#36d1bd4dfb81b919efa67ee740cdce117a1c9442"
 dependencies = [
  "alloy",
  "ant-merkle",
@@ -3340,7 +3338,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]

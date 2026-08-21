@@ -294,9 +294,16 @@ async fn test_attack_merkle_proof_swap_within_batch() {
 /// out of self-encryption needs a ~1 GB file, while `pay_for_merkle_batch`
 /// takes the address set straight.
 ///
+/// 1025 stretches the multi-batch path across the `MERKLE_TREES_PER_PAYMENT`
+/// group boundary: it partitions as five trees (`[256, 256, 256, 255, 2]`),
+/// which the wallet path settles as TWO batched `payForMerkleTrees`
+/// transactions — a full group of 4 and a singleton group — so both the
+/// grouped and the single-tree shape of the batched entry point settle
+/// against the real contract.
+///
 /// Settlement is checked against the same padded-leaf model the estimator
-/// bills with — 65 addresses settle 128 leaves, 257 settle 256 + 2 — so the
-/// two counts must cost in that ratio.
+/// bills with — 65 addresses settle 128 leaves, 257 settle 256 + 2, 1025
+/// settles 4×256 + 2 — so consecutive counts must cost in that ratio.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_merkle_payment_across_batch_boundary() {
@@ -317,7 +324,7 @@ async fn test_merkle_payment_across_batch_boundary() {
 
     let mut paid: Vec<(usize, u128)> = Vec::new();
 
-    for (count, tag) in [(65usize, 0xA1u8), (257usize, 0xB2u8)] {
+    for (count, tag) in [(65usize, 0xA1u8), (257usize, 0xB2u8), (1025usize, 0xC3u8)] {
         let addrs = addresses(count, tag);
 
         // A 65/257-address tree collects far more candidate pools than the
@@ -387,19 +394,21 @@ async fn test_merkle_payment_across_batch_boundary() {
     }
 
     // Prices are uniform across a freshly started local testnet and this test
-    // stores nothing, so the only thing separating the two settlements is the
+    // stores nothing, so the only thing separating the settlements is the
     // padded leaf count each partition pays for.
-    let [(small, small_atto), (large, large_atto)] = paid[..] else {
-        panic!("expected two payments");
-    };
-    let expected =
-        merkle_billable_leaves(large as u64) as f64 / merkle_billable_leaves(small as u64) as f64;
-    let observed = large_atto as f64 / small_atto as f64;
-    assert!(
-        (observed - expected).abs() / expected < 0.15,
-        "settlement should scale with padded leaves: expected ~{expected:.3}x \
-         ({small} -> {large} addresses), observed {observed:.3}x"
-    );
+    for pair in paid.windows(2) {
+        let [(small, small_atto), (large, large_atto)] = pair else {
+            panic!("expected consecutive payments");
+        };
+        let expected = merkle_billable_leaves(*large as u64) as f64
+            / merkle_billable_leaves(*small as u64) as f64;
+        let observed = *large_atto as f64 / *small_atto as f64;
+        assert!(
+            (observed - expected).abs() / expected < 0.15,
+            "settlement should scale with padded leaves: expected ~{expected:.3}x \
+             ({small} -> {large} addresses), observed {observed:.3}x"
+        );
+    }
 
     drop(client);
     testnet.teardown().await;

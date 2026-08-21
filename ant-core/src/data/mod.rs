@@ -34,7 +34,7 @@ pub use client::file::{
 };
 pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
-    DEFAULT_MERKLE_THRESHOLD,
+    DEFAULT_MERKLE_THRESHOLD, MERKLE_TREES_PER_PAYMENT,
 };
 
 // Re-export self-encryption types

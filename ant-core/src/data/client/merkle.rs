@@ -11,7 +11,7 @@ use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{
     Amount, MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
-    MidpointProof, PoolCommitment, CANDIDATES_PER_POOL, MAX_LEAVES,
+    MerkleTreePayment, MidpointProof, PoolCommitment, CANDIDATES_PER_POOL, MAX_LEAVES,
 };
 use ant_protocol::payment::commitment::{
     commitment_hash, verify_commitment_signature, StorageCommitment, MAX_COMMITMENT_KEY_COUNT,
@@ -36,6 +36,16 @@ use xor_name::XorName;
 
 /// Default threshold: use merkle payments when chunk count >= this value.
 pub const DEFAULT_MERKLE_THRESHOLD: usize = 64;
+
+/// Number of merkle trees the wallet path packs into a single on-chain
+/// `payForMerkleTrees` transaction. Re-exported from `evmlib` (via
+/// `ant-protocol`) so consumers (desktop app, FFI) size their batches from
+/// the shared constant instead of hardcoding it.
+pub use ant_protocol::evm::MERKLE_TREES_PER_PAYMENT;
+
+// `chunks()` panics on zero; the evmlib constant is static-asserted against
+// the on-chain upper bound but not against zero, so pin that here.
+const _: () = assert!(MERKLE_TREES_PER_PAYMENT > 0);
 
 /// Payment multiplier applied to a quoted price before settlement.
 ///
@@ -874,6 +884,14 @@ impl Client {
     }
 
     /// Handle batches larger than `MAX_LEAVES` by splitting into sub-batches.
+    ///
+    /// Sub-batches settle in groups of [`MERKLE_TREES_PER_PAYMENT`] trees:
+    /// each group is ONE atomic `payForMerkleTrees` transaction, so a large
+    /// upload needs one signature per group instead of one per tree. Partial
+    /// semantics are preserved at group granularity: a failing group returns
+    /// the proofs of prior groups so the caller can still store already-paid
+    /// chunks, and the group's own trees are untouched on-chain (the batched
+    /// entry point is all-or-nothing).
     async fn pay_for_merkle_multi_batch(
         &self,
         addresses: &[[u8; 32]],
@@ -886,62 +904,102 @@ impl Client {
         // upload into a partial failure.
         let sub_batches = merkle_batch_partitions(addresses);
         let total_sub_batches = sub_batches.len();
-        let mut all_proofs = HashMap::with_capacity(addresses.len());
-        let mut total_storage = Amount::ZERO;
-        let mut total_gas: u128 = 0;
-        // Track the oldest sub-batch timestamp so the overall receipt
-        // expires when the *first* sub-batch's on-chain payment ages
-        // out (worst case for resume).
-        let mut oldest_ts: u64 = 0;
+        let group_count = total_sub_batches.div_ceil(MERKLE_TREES_PER_PAYMENT);
+        info!(
+            "Paying {total_sub_batches} merkle sub-batches in {group_count} batched \
+             transaction(s) of up to {MERKLE_TREES_PER_PAYMENT} trees"
+        );
 
-        for (i, chunk) in sub_batches.into_iter().enumerate() {
+        let mut group_results: Vec<MerkleBatchPaymentResult> = Vec::with_capacity(group_count);
+        for (i, group) in sub_batches.chunks(MERKLE_TREES_PER_PAYMENT).enumerate() {
             match self
-                .pay_for_merkle_single_batch(chunk, data_type, data_size)
+                .pay_for_merkle_tree_group(group, data_type, data_size)
                 .await
             {
-                Ok(sub_result) => {
-                    if let Ok(cost) = sub_result.storage_cost_atto.parse::<Amount>() {
-                        total_storage += cost;
-                    }
-                    total_gas = total_gas.saturating_add(sub_result.gas_cost_wei);
-                    if oldest_ts == 0
-                        || (sub_result.merkle_payment_timestamp > 0
-                            && sub_result.merkle_payment_timestamp < oldest_ts)
-                    {
-                        oldest_ts = sub_result.merkle_payment_timestamp;
-                    }
-                    all_proofs.extend(sub_result.proofs);
-                }
+                Ok(group_result) => group_results.push(group_result),
                 Err(e) => {
-                    if all_proofs.is_empty() {
-                        // First sub-batch failed, nothing paid yet -- propagate directly.
+                    if group_results.is_empty() {
+                        // First group failed, nothing paid yet -- propagate directly.
                         return Err(e);
                     }
                     // Return partial result so caller can still store already-paid chunks.
                     warn!(
-                        "Merkle sub-batch {}/{total_sub_batches} failed: {e}. \
-                         Returning {} proofs from prior sub-batches",
+                        "Merkle payment group {}/{group_count} ({} of {total_sub_batches} \
+                         sub-batches) failed: {e}. Returning proofs from prior groups",
                         i + 1,
-                        all_proofs.len()
+                        group.len()
                     );
-                    return Ok(MerkleBatchPaymentResult {
-                        chunk_count: all_proofs.len(),
-                        proofs: all_proofs,
-                        storage_cost_atto: total_storage.to_string(),
-                        gas_cost_wei: total_gas,
-                        merkle_payment_timestamp: oldest_ts,
-                    });
+                    break;
                 }
             }
         }
 
-        Ok(MerkleBatchPaymentResult {
-            chunk_count: addresses.len(),
-            proofs: all_proofs,
-            storage_cost_atto: total_storage.to_string(),
-            gas_cost_wei: total_gas,
-            merkle_payment_timestamp: oldest_ts,
-        })
+        Ok(merge_merkle_batch_results(group_results))
+    }
+
+    /// Pay one group of up to [`MERKLE_TREES_PER_PAYMENT`] sub-batches
+    /// atomically: prepare every tree, submit a single `payForMerkleTrees`
+    /// transaction, then generate proofs per tree from the per-tree winner
+    /// pools the contract returned (aligned to input order).
+    async fn pay_for_merkle_tree_group(
+        &self,
+        group: &[&[[u8; 32]]],
+        data_type: u32,
+        data_size: u64,
+    ) -> Result<MerkleBatchPaymentResult> {
+        let wallet = self.require_wallet()?;
+
+        let mut prepared_group = Vec::with_capacity(group.len());
+        for chunk in group {
+            prepared_group.push(
+                self.prepare_merkle_batch_external(chunk, data_type, data_size)
+                    .await?,
+            );
+        }
+
+        let trees: Vec<MerkleTreePayment> = prepared_group
+            .iter()
+            .map(|prepared| MerkleTreePayment {
+                depth: prepared.depth,
+                merkle_payment_timestamp: prepared.merkle_payment_timestamp,
+                pool_commitments: prepared.pool_commitments.clone(),
+            })
+            .collect();
+
+        info!(
+            "Submitting batched merkle payment on-chain ({} tree(s), depths {:?})",
+            trees.len(),
+            trees.iter().map(|t| t.depth).collect::<Vec<_>>()
+        );
+        let (payments, gas_info) = wallet
+            .pay_for_merkle_trees(trees)
+            .await
+            .map_err(|e| Error::Payment(format!("Batched merkle payment failed: {e}")))?;
+
+        if payments.len() != prepared_group.len() {
+            return Err(Error::Payment(format!(
+                "Batched merkle payment returned {} result(s) for {} trees",
+                payments.len(),
+                prepared_group.len()
+            )));
+        }
+
+        let mut per_tree = Vec::with_capacity(prepared_group.len());
+        for (prepared, (winner_pool_hash, amount)) in prepared_group.into_iter().zip(payments) {
+            info!(
+                "Merkle payment succeeded: winner pool {}",
+                hex::encode(winner_pool_hash)
+            );
+            let mut result = finalize_merkle_batch(prepared, winner_pool_hash)?;
+            result.storage_cost_atto = amount.to_string();
+            per_tree.push(result);
+        }
+
+        // One transaction paid for the whole group: fold the per-tree results
+        // and attach the group's single gas cost.
+        let mut merged = merge_merkle_batch_results(per_tree);
+        merged.gas_cost_wei = gas_info.gas_cost_wei;
+        Ok(merged)
     }
 
     /// Build candidate pools by querying the network for each midpoint (concurrently).
