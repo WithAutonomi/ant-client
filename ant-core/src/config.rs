@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use crate::data::{DevnetManifest, MultiAddr};
+use crate::data::{CustomNetwork, DevnetManifest, EvmAddress, EvmNetwork, MultiAddr};
 use crate::error::{Error, Result};
 
 /// Returns the platform-appropriate data directory for ant.
@@ -124,6 +124,60 @@ pub fn resolve_bootstrap_peers(
     Err(Error::NoBootstrapPeers)
 }
 
+/// Resolve the EVM network for payment operations.
+///
+/// `name` is the frontend's network selector (e.g. the CLI's
+/// `--evm-network` flag): `arbitrum-one`, `arbitrum-sepolia`, or `local`,
+/// which reads the RPC URL and contract addresses from the devnet
+/// manifest's `evm` block.
+///
+/// With no selector, the default is Arbitrum One (mainnet) — **unless**
+/// the devnet manifest carries an `evm` block. Defaulting to mainnet
+/// used to silently discard that config: the mainnet vault address
+/// doesn't exist on other chains, so payments "succeeded" as no-op
+/// transactions and every subsequent chunk PUT failed verification
+/// (V2-471). In that one ambiguous case the caller must choose
+/// explicitly or get [`Error::EvmNetworkAmbiguous`].
+pub fn resolve_evm_network(
+    name: Option<&str>,
+    manifest: Option<&DevnetManifest>,
+) -> Result<EvmNetwork> {
+    match name {
+        None => {
+            if manifest.is_some_and(|m| m.evm.is_some()) {
+                Err(Error::EvmNetworkAmbiguous)
+            } else {
+                Ok(EvmNetwork::ArbitrumOne)
+            }
+        }
+        Some("arbitrum-one") => Ok(EvmNetwork::ArbitrumOne),
+        Some("arbitrum-sepolia") => Ok(EvmNetwork::ArbitrumSepoliaTest),
+        Some("local") => {
+            let evm = manifest
+                .and_then(|m| m.evm.as_ref())
+                .ok_or(Error::EvmManifestRequired)?;
+            let rpc_url: reqwest::Url = evm
+                .rpc_url
+                .parse()
+                .map_err(|e| Error::InvalidEvmManifest(format!("invalid RPC URL: {e}")))?;
+            let payment_token_address: EvmAddress =
+                evm.payment_token_address.parse().map_err(|e| {
+                    Error::InvalidEvmManifest(format!("invalid payment token address: {e}"))
+                })?;
+            let payment_vault_address: EvmAddress =
+                evm.payment_vault_address.parse().map_err(|e| {
+                    Error::InvalidEvmManifest(format!("invalid payment vault address: {e}"))
+                })?;
+            Ok(EvmNetwork::Custom(CustomNetwork {
+                rpc_url_http: rpc_url,
+                payment_token_address,
+                payment_vault_address,
+            }))
+        }
+        Some(other) => Err(Error::UnsupportedEvmNetwork(other.to_string())),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct BootstrapConfig {
     peers: Vec<String>,
@@ -187,6 +241,97 @@ mod tests {
         let manifest = test_manifest(vec![addr]);
         let peers = resolve_bootstrap_peers(&[], Some(&manifest)).unwrap();
         assert_eq!(peers, vec![addr]);
+    }
+
+    fn manifest_with_evm() -> DevnetManifest {
+        let mut m = test_manifest(vec!["10.0.0.2:10000".parse().unwrap()]);
+        m.evm = Some(ant_protocol::DevnetEvmInfo {
+            rpc_url: "http://127.0.0.1:8545".to_string(),
+            wallet_private_key:
+                "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string(),
+            payment_token_address: "0x5FbDB2315678afecb367f032d93F642f64180aa3".to_string(),
+            payment_vault_address: "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512".to_string(),
+        });
+        m
+    }
+
+    #[test]
+    fn resolve_evm_network_defaults_to_mainnet_without_manifest_evm() {
+        assert!(matches!(
+            resolve_evm_network(None, None),
+            Ok(EvmNetwork::ArbitrumOne)
+        ));
+        let no_evm = test_manifest(vec![]);
+        assert!(matches!(
+            resolve_evm_network(None, Some(&no_evm)),
+            Ok(EvmNetwork::ArbitrumOne)
+        ));
+    }
+
+    #[test]
+    fn resolve_evm_network_requires_choice_when_manifest_has_evm() {
+        // A manifest with an EVM block plus no explicit selection is the
+        // V2-471 trap: refuse rather than silently pay against mainnet.
+        assert!(matches!(
+            resolve_evm_network(None, Some(&manifest_with_evm())),
+            Err(Error::EvmNetworkAmbiguous)
+        ));
+    }
+
+    #[test]
+    fn resolve_evm_network_maps_presets() {
+        assert!(matches!(
+            resolve_evm_network(Some("arbitrum-one"), None),
+            Ok(EvmNetwork::ArbitrumOne)
+        ));
+        assert!(matches!(
+            resolve_evm_network(Some("arbitrum-sepolia"), None),
+            Ok(EvmNetwork::ArbitrumSepoliaTest)
+        ));
+    }
+
+    #[test]
+    fn resolve_evm_network_local_reads_manifest() {
+        let manifest = manifest_with_evm();
+        let network = resolve_evm_network(Some("local"), Some(&manifest)).unwrap();
+        match network {
+            EvmNetwork::Custom(custom) => {
+                assert_eq!(custom.rpc_url_http.as_str(), "http://127.0.0.1:8545/");
+                assert_eq!(
+                    format!("{:?}", custom.payment_token_address).to_lowercase(),
+                    "0x5fbdb2315678afecb367f032d93f642f64180aa3"
+                );
+            }
+            other => panic!("expected Custom network, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_evm_network_local_requires_manifest_evm_block() {
+        // No manifest at all, and a manifest without an evm block.
+        assert!(matches!(
+            resolve_evm_network(Some("local"), None),
+            Err(Error::EvmManifestRequired)
+        ));
+        let no_evm = test_manifest(vec![]);
+        assert!(matches!(
+            resolve_evm_network(Some("local"), Some(&no_evm)),
+            Err(Error::EvmManifestRequired)
+        ));
+    }
+
+    #[test]
+    fn resolve_evm_network_rejects_unknown_and_bad_manifest_values() {
+        assert!(matches!(
+            resolve_evm_network(Some("mainnet"), None),
+            Err(Error::UnsupportedEvmNetwork(_))
+        ));
+        let mut bad = manifest_with_evm();
+        bad.evm.as_mut().unwrap().payment_vault_address = "not-an-address".to_string();
+        assert!(matches!(
+            resolve_evm_network(Some("local"), Some(&bad)),
+            Err(Error::InvalidEvmManifest(_))
+        ));
     }
 
     #[test]
