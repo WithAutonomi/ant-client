@@ -29,8 +29,9 @@ pub use client::data::DataUploadResult;
 pub use client::file::{
     CostEstimateConfidence, DownloadEvent, ExternalChunkStore, ExternalPaymentInfo,
     FileChunkPeerReport, FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport,
-    FileDownloadWithPeerReport, FileUploadResult, PreparedUpload, UploadCostEstimate, UploadEvent,
-    Visibility,
+    FileDownloadWithPeerReport, FileUploadResult, FinalizeOutcome, FinalizeResume,
+    MerkleFinalizeResume, PreparedUpload, UploadCostEstimate, UploadEvent, Visibility,
+    WaveFinalizeResume,
 };
 pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
