@@ -209,7 +209,7 @@ async fn build_data_client(
     }
 
     let manifest = load_manifest(ctx)?;
-    let bootstrap = resolve_bootstrap_from(ctx, manifest.as_ref())?;
+    let bootstrap = ant_core::config::resolve_bootstrap_peers(&ctx.bootstrap, manifest.as_ref())?;
     // Explicit network selectors should be isolated from the general client
     // peer cache. `--bootstrap` and `--devnet-manifest` both mean "use exactly
     // this network entrypoint", so cached public-network peers must not be
@@ -452,39 +452,6 @@ fn resolve_evm_network(
             )
         }
     }
-}
-
-/// Resolve bootstrap peers from a pre-loaded manifest.
-///
-/// Priority: CLI `--bootstrap` > devnet manifest > `bootstrap_peers.toml` config file.
-fn resolve_bootstrap_from(
-    ctx: &DataCliContext,
-    manifest: Option<&DevnetManifest>,
-) -> anyhow::Result<Vec<SocketAddr>> {
-    if !ctx.bootstrap.is_empty() {
-        return Ok(ctx.bootstrap.clone());
-    }
-
-    if let Some(m) = manifest {
-        let bootstrap: Vec<SocketAddr> = m
-            .bootstrap
-            .iter()
-            .filter_map(MultiAddr::socket_addr)
-            .collect();
-        return Ok(bootstrap);
-    }
-
-    if let Some(peers) = ant_core::config::load_bootstrap_peers()
-        .map_err(|e| anyhow::anyhow!("Failed to load bootstrap config: {e}"))?
-    {
-        info!("Loaded {} bootstrap peer(s) from config file", peers.len());
-        return Ok(peers);
-    }
-
-    anyhow::bail!(
-        "No bootstrap peers provided. Use --bootstrap, --devnet-manifest, \
-         or install bootstrap_peers.toml to your config directory."
-    )
 }
 
 async fn create_client_node(
