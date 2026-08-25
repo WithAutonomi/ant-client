@@ -8,8 +8,55 @@ use ant_protocol::transport::{
     CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode, PeerId, WitnessedCloseGroup,
 };
 use ant_protocol::MAX_WIRE_MESSAGE_SIZE;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+/// Mirror of saorsa-core's private `AUTO_REBOOTSTRAP_THRESHOLD`
+/// (dht_network_manager.rs): the routing-table size below which the DHT
+/// auto-re-bootstraps. saorsa-core PR #153 makes the real const public;
+/// once a release carries it, consume that instead of this mirror.
+pub const REBOOTSTRAP_THRESHOLD: usize = 3;
+
+/// Live network-participation snapshot.
+///
+/// One implementation of the write-readiness formula for every embedded-client
+/// consumer (antd, ant-gui, ant-ffi, ant-tui) — see [`Network::health`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkHealth {
+    /// Best-effort write-path floor:
+    /// `max(routing_table_size, connected_peers) >= rebootstrap_threshold`.
+    pub write_ready: bool,
+    /// Identity-verified peer connections currently held by the node.
+    pub connected_peers: u32,
+    /// Entries in the DHT routing table.
+    pub routing_table_size: u32,
+    /// Routing-table size below which the DHT auto-re-bootstraps.
+    pub rebootstrap_threshold: u32,
+}
+
+impl NetworkHealth {
+    /// Build a snapshot from raw peer counts.
+    ///
+    /// `write_ready` is keyed on `max(routing_table_size, connected_peers)`:
+    /// in client mode the DHT routing table can sit below the re-bootstrap
+    /// threshold while plenty of live connections exist and stores succeed
+    /// (observed on a LAN devnet: rt=2, connected=10, paid upload fine), so
+    /// the routing table alone would under-report; the connected count alone
+    /// misses the inverse case (~1 reachable peer, rt=0, stores failing).
+    /// Neither signal guarantees a store will fully succeed (stores proceed
+    /// with as little as one reachable node), but when both are below the
+    /// threshold the node is known-degraded.
+    #[must_use]
+    pub fn from_counts(connected_peers: usize, routing_table_size: usize) -> Self {
+        Self {
+            write_ready: routing_table_size.max(connected_peers) >= REBOOTSTRAP_THRESHOLD,
+            connected_peers: connected_peers.try_into().unwrap_or(u32::MAX),
+            routing_table_size: routing_table_size.try_into().unwrap_or(u32::MAX),
+            rebootstrap_threshold: REBOOTSTRAP_THRESHOLD as u32,
+        }
+    }
+}
 
 /// Network abstraction for the Autonomi client.
 ///
@@ -175,5 +222,68 @@ impl Network {
     /// Get all currently connected peers.
     pub async fn connected_peers(&self) -> Vec<PeerId> {
         self.node.connected_peers().await
+    }
+
+    /// Compute the live network-participation snapshot.
+    ///
+    /// Both node reads are in-memory, so this is cheap enough to call per
+    /// request — no caching or background worker needed. See
+    /// [`NetworkHealth::from_counts`] for the `write_ready` semantics.
+    ///
+    /// Do not substitute `is_bootstrapped()` (sticky true — it stays true
+    /// through a total outage) or saorsa's `health_check()` (an
+    /// over-connection guard, despite the name) for this.
+    pub async fn health(&self) -> NetworkHealth {
+        let connected_peers = self.node.peer_count().await;
+        let routing_table_size = self.node.dht_manager().get_routing_table_size().await;
+        NetworkHealth::from_counts(connected_peers, routing_table_size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_ready_false_with_no_peers() {
+        let h = NetworkHealth::from_counts(0, 0);
+        assert!(!h.write_ready);
+        assert_eq!(h.connected_peers, 0);
+        assert_eq!(h.routing_table_size, 0);
+        assert_eq!(h.rebootstrap_threshold, REBOOTSTRAP_THRESHOLD as u32);
+    }
+
+    #[test]
+    fn write_ready_false_below_threshold_on_both_signals() {
+        // The reporter's incident shape (ant-sdk#232): ~1 reachable peer,
+        // empty routing table, stores failing.
+        assert!(!NetworkHealth::from_counts(1, 0).write_ready);
+        assert!(!NetworkHealth::from_counts(2, 2).write_ready);
+    }
+
+    #[test]
+    fn write_ready_true_via_connections_despite_low_routing_table() {
+        // Client-mode under-reporting observed live on a LAN devnet:
+        // rt pinned at 2 with 10 verified connections and stores succeeding.
+        // The max() in the formula exists for exactly this state.
+        assert!(NetworkHealth::from_counts(10, 2).write_ready);
+    }
+
+    #[test]
+    fn write_ready_true_via_routing_table_alone() {
+        assert!(NetworkHealth::from_counts(0, REBOOTSTRAP_THRESHOLD).write_ready);
+    }
+
+    #[test]
+    fn write_ready_true_at_exact_threshold_on_connections() {
+        assert!(NetworkHealth::from_counts(REBOOTSTRAP_THRESHOLD, 0).write_ready);
+    }
+
+    #[test]
+    fn counts_saturate_at_u32_max() {
+        let h = NetworkHealth::from_counts(usize::MAX, usize::MAX);
+        assert_eq!(h.connected_peers, u32::MAX);
+        assert_eq!(h.routing_table_size, u32::MAX);
+        assert!(h.write_ready);
     }
 }

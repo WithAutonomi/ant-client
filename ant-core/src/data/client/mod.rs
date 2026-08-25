@@ -18,7 +18,7 @@ pub mod quote;
 use crate::data::client::adaptive::{AdaptiveConfig, AdaptiveController, ChannelStart, Outcome};
 use crate::data::client::cache::ChunkCache;
 use crate::data::error::{Error, Result};
-use crate::data::network::Network;
+use crate::data::network::{Network, NetworkHealth};
 use crate::data::peer_cache;
 use ant_protocol::evm::Wallet;
 use ant_protocol::transport::{MultiAddr, P2PNode, PeerId};
@@ -504,6 +504,15 @@ impl Client {
     #[must_use]
     pub fn network(&self) -> &Network {
         &self.network
+    }
+
+    /// Compute the live network-participation snapshot.
+    ///
+    /// Convenience pass-through to [`Network::health`] — the single
+    /// write-readiness implementation shared by all embedded-client
+    /// consumers (antd, ant-gui, ant-ffi, ant-tui).
+    pub async fn network_health(&self) -> NetworkHealth {
+        self.network.health().await
     }
 
     /// Get the wallet, if configured.
