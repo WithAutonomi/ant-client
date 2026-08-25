@@ -48,6 +48,10 @@ detect_target() {
         *)       err "unsupported macOS architecture: $arch" ;;
       esac
       ;;
+    MINGW*|MSYS*|CYGWIN*)
+      err "this installer is for Linux/macOS. On Windows, run in PowerShell:
+  irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex"
+      ;;
     *) err "unsupported OS: $os" ;;
   esac
 }

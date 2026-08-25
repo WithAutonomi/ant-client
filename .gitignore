@@ -1,5 +1,7 @@
 /target
 .cargo/config.toml
+.cache/
+*.orig
 .claude/plans/
 .claude/scheduled_tasks.lock
 .claude/settings.local.json

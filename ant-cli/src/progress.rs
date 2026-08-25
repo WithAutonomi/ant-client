@@ -13,8 +13,11 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tracing_subscriber::fmt::MakeWriter;
+
+use ant_core::node::binary::ProgressReporter;
 
 static MULTI: OnceLock<MultiProgress> = OnceLock::new();
 
@@ -48,6 +51,36 @@ pub fn attach(pb: ProgressBar) -> ProgressBar {
         multi().add(pb)
     } else {
         ProgressBar::hidden()
+    }
+}
+
+/// Terminal implementation of ant-core's `ProgressReporter` (binary
+/// downloads during `node add` and self-update). Writes to stderr so
+/// stdout stays clean for command output.
+pub struct CliProgress;
+
+impl ProgressReporter for CliProgress {
+    fn report_started(&self, message: &str) {
+        eprintln!("{} {message}", "⟳".cyan());
+    }
+
+    fn report_progress(&self, bytes: u64, total: u64) {
+        if total > 0 {
+            let pct = (bytes as f64 / total as f64 * 100.0) as u32;
+            let bar_width = 30;
+            let filled = (pct as usize * bar_width) / 100;
+            let empty = bar_width - filled;
+            let bar = format!(
+                "{}{}",
+                "█".repeat(filled).cyan(),
+                "░".repeat(empty).dimmed()
+            );
+            eprint!("\r  {} {bar} {pct:>3}%", "Downloading".dimmed());
+        }
+    }
+
+    fn report_complete(&self, message: &str) {
+        eprintln!("\r{} {message}", "✓".green().bold());
     }
 }
 

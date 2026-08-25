@@ -279,6 +279,36 @@ impl PortRange {
     }
 }
 
+impl std::str::FromStr for PortRange {
+    type Err = crate::error::Error;
+
+    /// Parse `"12000"` into [`PortRange::Single`] or `"12000-12004"` into
+    /// [`PortRange::Range`].
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        use crate::error::Error;
+
+        if let Some((start, end)) = s.split_once('-') {
+            let start: u16 = start
+                .parse()
+                .map_err(|_| Error::InvalidPortRange(format!("invalid start port '{start}'")))?;
+            let end: u16 = end
+                .parse()
+                .map_err(|_| Error::InvalidPortRange(format!("invalid end port '{end}'")))?;
+            if end < start {
+                return Err(Error::InvalidPortRange(format!(
+                    "end ({end}) must be >= start ({start})"
+                )));
+            }
+            Ok(Self::Range(start, end))
+        } else {
+            let port: u16 = s
+                .parse()
+                .map_err(|_| Error::InvalidPortRange(format!("invalid port '{s}'")))?;
+            Ok(Self::Single(port))
+        }
+    }
+}
+
 /// Options for adding one or more nodes to the registry.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AddNodeOpts {
@@ -308,6 +338,20 @@ pub struct AddNodeOpts {
     /// back to mainnet) rather than failing with `missing field evm_network`.
     #[serde(default)]
     pub evm_network: EvmNetwork,
+}
+
+impl AddNodeOpts {
+    /// Parse `KEY=VALUE` strings (the format frontends accept for node env
+    /// vars) into the pair list `env_variables` expects.
+    pub fn parse_env_vars(vars: &[String]) -> crate::error::Result<Vec<(String, String)>> {
+        vars.iter()
+            .map(|e| {
+                e.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .ok_or_else(|| crate::error::Error::InvalidEnvVar(e.clone()))
+            })
+            .collect()
+    }
 }
 
 impl Default for AddNodeOpts {
@@ -587,6 +631,33 @@ mod tests {
     }
 
     #[test]
+    fn port_range_parses_single() {
+        let pr: PortRange = "12000".parse().unwrap();
+        assert!(matches!(pr, PortRange::Single(12000)));
+    }
+
+    #[test]
+    fn port_range_parses_range() {
+        let pr: PortRange = "12000-12004".parse().unwrap();
+        assert!(matches!(pr, PortRange::Range(12000, 12004)));
+    }
+
+    #[test]
+    fn port_range_rejects_inverted_range() {
+        let err = "12004-12000".parse::<PortRange>().unwrap_err();
+        assert!(err.to_string().contains("must be >= start"));
+    }
+
+    #[test]
+    fn port_range_rejects_garbage() {
+        assert!("abc".parse::<PortRange>().is_err());
+        assert!("".parse::<PortRange>().is_err());
+        assert!("12000-abc".parse::<PortRange>().is_err());
+        assert!("-12000".parse::<PortRange>().is_err());
+        assert!("70000".parse::<PortRange>().is_err());
+    }
+
+    #[test]
     fn binary_source_serializes_with_tag() {
         let src = BinarySource::Latest;
         let json = serde_json::to_string(&src).unwrap();
@@ -596,6 +667,32 @@ mod tests {
         let json = serde_json::to_string(&src).unwrap();
         assert!(json.contains("\"type\":\"version\""));
         assert!(json.contains("1.0.0"));
+    }
+
+    #[test]
+    fn parse_env_vars_splits_on_first_equals() {
+        let parsed = AddNodeOpts::parse_env_vars(&[
+            "KEY=VALUE".to_string(),
+            "RUST_LOG=info,ant_node=debug".to_string(),
+            "EMPTY=".to_string(),
+            "URL=http://host?a=b".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("KEY".to_string(), "VALUE".to_string()),
+                ("RUST_LOG".to_string(), "info,ant_node=debug".to_string()),
+                ("EMPTY".to_string(), String::new()),
+                ("URL".to_string(), "http://host?a=b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_env_vars_rejects_missing_equals() {
+        let err = AddNodeOpts::parse_env_vars(&["NOVALUE".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("Expected KEY=VALUE"));
     }
 
     #[test]

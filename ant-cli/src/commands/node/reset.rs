@@ -48,7 +48,7 @@ impl ResetArgs {
         }
 
         let result = if daemon_running {
-            self.reset_via_daemon(&config).await?
+            client::reset(&config).await?
         } else {
             self.reset_directly(&config)?
         };
@@ -83,23 +83,6 @@ impl ResetArgs {
         }
 
         Ok(())
-    }
-
-    async fn reset_via_daemon(&self, config: &DaemonConfig) -> anyhow::Result<ResetResult> {
-        let info = client::info(config);
-        let api_base = info
-            .api_base
-            .ok_or_else(|| anyhow::anyhow!("Daemon is running but API base URL not available"))?;
-
-        let client = reqwest::Client::new();
-        let resp = client.post(format!("{api_base}/reset")).send().await?;
-
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let body = resp.text().await?;
-            anyhow::bail!("Daemon returned error: {body}");
-        }
     }
 
     fn reset_directly(&self, config: &DaemonConfig) -> anyhow::Result<ResetResult> {
