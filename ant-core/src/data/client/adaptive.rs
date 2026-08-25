@@ -2805,10 +2805,13 @@ mod tests {
     /// quiet no-op: best-effort, no panic, no error propagation.
     #[test]
     fn save_snapshot_to_unwritable_dir_does_not_panic() {
-        // A path under a non-existent absolute root that the process
-        // also cannot create. On macOS/Linux a write under "/" requires
-        // root; create_dir_all will fail on this path.
-        let path = PathBuf::from("/nonexistent_root_dir_xyz_for_test/sub/dir/client_adaptive.json");
+        // A path routed through an existing regular file: create_dir_all
+        // fails on every platform because a parent component is a file.
+        // (A path under "/" is NOT impossible everywhere — on Windows it
+        // resolves to a creatable C:\ directory and littered the drive
+        // root — V2-1043.)
+        let blocker = tempfile::NamedTempFile::new().unwrap();
+        let path = blocker.path().join("sub").join("client_adaptive.json");
         let snap = ChannelStart {
             quote: 1,
             store: 1,
@@ -4196,14 +4199,16 @@ mod tests {
 
     /// Round-5 follow-up: `save_snapshot_with_timeout` returns
     /// promptly even when the underlying write would otherwise hang.
-    /// Use a path under a non-existent root that mkdir cannot create
-    /// to simulate a slow/failing filesystem (mkdir returns Err
-    /// quickly so this isn't a real hang test, but it confirms the
-    /// timeout wrapper does not block longer than the deadline on a
-    /// fast-failing operation either).
+    /// Use a path mkdir cannot create — routed through an existing
+    /// regular file, which fails on every platform (a Unix-root path
+    /// is creatable on Windows — V2-1043) — to simulate a slow/failing
+    /// filesystem (mkdir returns Err quickly so this isn't a real hang
+    /// test, but it confirms the timeout wrapper does not block longer
+    /// than the deadline on a fast-failing operation either).
     #[test]
     fn save_with_timeout_returns_promptly_on_fast_failure() {
-        let path = std::path::PathBuf::from("/nonexistent_root_xyz_test/snap.json");
+        let blocker = tempfile::NamedTempFile::new().unwrap();
+        let path = blocker.path().join("snap.json");
         let snap = ChannelStart {
             quote: 1,
             store: 1,
