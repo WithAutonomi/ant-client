@@ -25,6 +25,8 @@ curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/instal
 irm https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.ps1 | iex
 ```
 
+> **Note:** the `curl ... | bash` installer is for Linux/macOS only. Running it inside WSL installs a Linux binary that is only usable from within WSL — to use `ant` from PowerShell or cmd, install with the PowerShell command above.
+
 ## Quick Start
 
 ### Store and retrieve a file (production)
