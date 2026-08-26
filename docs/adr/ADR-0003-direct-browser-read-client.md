@@ -167,8 +167,9 @@ metadata chain.
 ### Negative / Trade-offs
 
 - The current client reconstructs files in memory and the local launcher caps
-  public files at 64 MiB; upload encryption and reconstruction are not yet
-  streaming.
+  public files at 1 GB (1,000,000,000 bytes); upload encryption and
+  reconstruction are not yet streaming, so the practical limit depends on
+  available browser memory.
 - JavaScript quote-verification behavior must remain aligned with native
   protocol rules until transport-free `ant-protocol` APIs exist.
 - The initial WASM module is approximately 1.4 MiB uncompressed and browser
