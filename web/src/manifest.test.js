@@ -77,7 +77,7 @@ test("browser manifest requires public payment contract configuration", () => {
   const endpoint = { multiaddr: webrtc_directMultiaddr("aa".repeat(32), 0xbb) };
   assert.throws(
     () => parseBrowserManifest({ version: 5, network_id: "test", endpoints: [endpoint] }),
-    /no payment network/,
+    /missing field.*payment|payment network/i,
   );
   assert.throws(
     () =>

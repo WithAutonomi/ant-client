@@ -1,6 +1,6 @@
 #[cfg(feature = "native")]
 pub mod channel;
-/// Browser-safe immutable-data primitives shared by native and WASM clients.
+/// Cross-platform Autonomi client logic and browser WASM bindings.
 pub mod browser;
 
 #[cfg(feature = "native")]

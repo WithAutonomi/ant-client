@@ -1,9 +1,30 @@
-//! Browser-safe immutable-data primitives.
+//! Cross-platform Autonomi client logic and browser bindings.
 //!
-//! This module deliberately contains no transport, filesystem, Tokio runtime,
-//! or EVM provider. It is the shared compatibility-sensitive core used by the
-//! native client and by the browser WASM package: native self-encryption,
-//! public DataMap encoding, content addressing, and reconstruction.
+//! The manifest, protocol, payment, and immutable-data modules are portable
+//! Rust shared by native clients and the browser WASM package. The
+//! `browser-wasm` feature additionally provides the `web-sys` WebRTC Direct
+//! host adapter; only DOM, file-save, and wallet transaction submission remain
+//! in JavaScript.
+
+mod crypto;
+pub mod manifest;
+pub mod payment;
+pub mod protocol;
+
+pub use manifest::{
+    parse_browser_manifest, validate_browser_payment_network, BrowserManifest,
+    BrowserManifestEndpoint, BrowserPaymentNetwork, PublicFileDescriptor, BROWSER_MANIFEST_VERSION,
+};
+pub use payment::{
+    storage_payment_total, verify_storage_quote, BrowserQuoteArtifact, VerifiedStorageQuote,
+};
+pub use protocol::{
+    parse_webrtc_direct_multiaddr, WebRtcDirectEndpoint, BROWSER_PROTOCOL_NAME,
+    BROWSER_PROTOCOL_VERSION, WEBRTC_DIRECT_DATA_CHANNEL,
+};
+
+#[cfg(all(target_arch = "wasm32", feature = "browser-wasm"))]
+mod wasm_transport;
 
 use bytes::Bytes;
 use self_encryption::{DataMap, EncryptedChunk};
@@ -212,6 +233,12 @@ fn chunk_infos(data_map: &DataMap) -> Vec<BrowserChunkInfo> {
 
 #[cfg(all(target_arch = "wasm32", feature = "browser-wasm"))]
 mod wasm {
+    use super::manifest::parse_browser_manifest;
+    use super::payment::{payment_quote_hash, verify_storage_quote, BrowserQuoteArtifact};
+    use super::protocol::{
+        munge_offer_ice_credentials, parse_response_frame, parse_webrtc_direct_multiaddr,
+        server_answer_sdp, verify_hello_identity, BrowserEndpointInput, BrowserHello,
+    };
     use super::{content_address, decrypt_public_file, encrypt_public_file, verify_record};
     use js_sys::{Array, Function, Promise, Uint8Array};
     use saorsa_dht_lookup::{
@@ -222,6 +249,18 @@ mod wasm {
     use std::collections::HashMap;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_futures::JsFuture;
+
+    #[derive(Debug, Deserialize)]
+    struct BrowserOffer {
+        sdp: String,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct BrowserSessionDescription {
+        #[serde(rename = "type")]
+        description_type: &'static str,
+        sdp: String,
+    }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(untagged)]
@@ -492,6 +531,119 @@ mod wasm {
     #[wasm_bindgen(start)]
     pub fn start() {
         console_error_panic_hook::set_once();
+    }
+
+    /// Validate and normalize a WebRTC Direct multiaddress in shared Rust.
+    #[wasm_bindgen(js_name = parseWebRtcDirectMultiaddr)]
+    pub fn parse_webrtc_direct_multiaddr_wasm(endpoint: JsValue) -> Result<JsValue, JsValue> {
+        let input: BrowserEndpointInput = serde_wasm_bindgen::from_value(endpoint)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let parsed = parse_webrtc_direct_multiaddr(input.multiaddr())
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        serde_wasm_bindgen::to_value(&parsed).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Decode and bound-check a complete WebRTC browser response frame.
+    #[wasm_bindgen(js_name = parseResponseFrame)]
+    pub fn parse_response_frame_wasm(frame: &[u8]) -> Result<JsValue, JsValue> {
+        let parsed =
+            parse_response_frame(frame).map_err(|error| JsValue::from_str(&error.to_string()))?;
+        parsed
+            .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Build the ICE-lite answer pinned by a WebRTC Direct endpoint.
+    #[wasm_bindgen(js_name = serverAnswerFromEndpoint)]
+    pub fn server_answer_from_endpoint_wasm(
+        endpoint: JsValue,
+        ice_credential: &str,
+    ) -> Result<JsValue, JsValue> {
+        let input: BrowserEndpointInput = serde_wasm_bindgen::from_value(endpoint)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let endpoint = parse_webrtc_direct_multiaddr(input.multiaddr())
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let sdp = server_answer_sdp(&endpoint, ice_credential)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        serde_wasm_bindgen::to_value(&BrowserSessionDescription {
+            description_type: "answer",
+            sdp,
+        })
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Replace a browser offer's generated ICE credentials with Saorsa's profile.
+    #[wasm_bindgen(js_name = mungeOfferIceCredentials)]
+    pub fn munge_offer_ice_credentials_wasm(
+        offer: JsValue,
+        ice_credential: &str,
+    ) -> Result<JsValue, JsValue> {
+        let offer: BrowserOffer = serde_wasm_bindgen::from_value(offer)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let sdp = munge_offer_ice_credentials(&offer.sdp, ice_credential)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        serde_wasm_bindgen::to_value(&BrowserSessionDescription {
+            description_type: "offer",
+            sdp,
+        })
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Authenticate a node HELLO against its expected endpoint and challenge.
+    #[wasm_bindgen(js_name = verifyHelloIdentity)]
+    pub fn verify_hello_identity_wasm(
+        hello: JsValue,
+        endpoint: JsValue,
+        challenge: &[u8],
+    ) -> Result<String, JsValue> {
+        let hello: BrowserHello = serde_wasm_bindgen::from_value(hello)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let input: BrowserEndpointInput = serde_wasm_bindgen::from_value(endpoint)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let endpoint = parse_webrtc_direct_multiaddr(input.multiaddr())
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let challenge: [u8; 32] = challenge
+            .try_into()
+            .map_err(|_| JsValue::from_str("HELLO verification requires a 32-byte challenge"))?;
+        verify_hello_identity(&hello, &endpoint, &challenge)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Validate and normalize browser bootstrap and public-file metadata.
+    #[wasm_bindgen(js_name = parseBrowserManifest)]
+    pub fn parse_browser_manifest_wasm(value: JsValue) -> Result<JsValue, JsValue> {
+        let value: serde_json::Value = serde_wasm_bindgen::from_value(value)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let manifest =
+            parse_browser_manifest(value).map_err(|error| JsValue::from_str(&error.to_string()))?;
+        serde_wasm_bindgen::to_value(&manifest)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Compute the native EVM `PaymentQuote` hash.
+    #[wasm_bindgen(js_name = paymentQuoteHash)]
+    #[must_use]
+    pub fn payment_quote_hash_wasm(
+        signed_bytes: &[u8],
+        public_key: &[u8],
+        signature: &[u8],
+    ) -> String {
+        hex::encode(payment_quote_hash(signed_bytes, public_key, signature))
+    }
+
+    /// Fully verify a storage quote before exposing it to a wallet signer.
+    #[wasm_bindgen(js_name = verifyStorageQuote)]
+    pub fn verify_storage_quote_wasm(
+        quote: JsValue,
+        expected_address: &str,
+        expected_peer_id: &str,
+    ) -> Result<JsValue, JsValue> {
+        let quote: BrowserQuoteArtifact = serde_wasm_bindgen::from_value(quote)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let verified = verify_storage_quote(quote, expected_address, expected_peer_id)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        serde_wasm_bindgen::to_value(&verified)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Native `self_encryption` plus public DataMap generation.

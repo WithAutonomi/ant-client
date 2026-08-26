@@ -6,11 +6,11 @@ A unified CLI and Rust library for storing data on the Autonomi decentralized ne
 
 This project provides two Rust crates and a browser client:
 
-- **ant-core** — A headless Rust library containing all business logic: data storage/retrieval with self-encryption and EVM payments, node lifecycle management, and local devnet tooling. Its portable immutable-data core also builds for browsers with the `browser-wasm` feature.
+- **ant-core** — A headless Rust library containing the Autonomi business logic: data storage/retrieval with self-encryption and EVM payments, node lifecycle management, and local devnet tooling. Its `browser` module shares manifest validation, protocol framing, authenticated WebRTC Direct access, lookup, quote verification, and complete public-file workflows with browser applications through the `browser-wasm` feature.
 - **ant-cli** — A thin CLI binary (`ant`) built on `ant-core`.
-- **web** — A direct WebRTC Direct client and test site. It drives Saorsa's
-  shared iterative lookup engine and uses `ant-core` through WASM to
-  self-encrypt and reconstruct complete public files without a data gateway.
+- **web** — A thin browser UI around `ant-core`'s Rust/WASM client. JavaScript
+  is limited to DOM/file-save integration and submitting the already-verified
+  payment plan with Ethers; no gateway proxies Autonomi data.
 
 Data on Autonomi is **content-addressed**. Files are split into encrypted chunks (via [self-encryption](https://en.wikipedia.org/wiki/Convergent_encryption)), each stored at an XOR address derived from its content. A `DataMap` tracks which chunks belong to a file. Payments for storage are made on an EVM-compatible blockchain (Arbitrum).
 
