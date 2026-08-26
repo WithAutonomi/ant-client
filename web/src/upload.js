@@ -1,5 +1,5 @@
 import { encryptPublicFile as encryptPublicFileNative } from "../pkg/ant_core.js";
-import { BrowserNodeClient, iterativeFindClosest } from "./protocol.js";
+import { BrowserNodeClientPool, iterativeFindClosest } from "./protocol.js";
 import { payForStorageQuotes, verifyStorageQuote } from "./payment.js";
 
 export const MAX_BROWSER_UPLOAD_BYTES = 64 * 1024 * 1024;
@@ -13,10 +13,14 @@ export async function encryptPublicFile(
     encrypt = encryptPublicFileNative,
   } = {},
 ) {
-  if (!(content instanceof Uint8Array)) throw new Error("Upload content must be bytes");
-  if (content.length < 3) throw new Error("Self-encryption requires a file of at least 3 bytes");
+  if (!(content instanceof Uint8Array))
+    throw new Error("Upload content must be bytes");
+  if (content.length < 3)
+    throw new Error("Self-encryption requires a file of at least 3 bytes");
   if (content.length > MAX_BROWSER_UPLOAD_BYTES) {
-    throw new Error(`Browser uploads are limited to ${MAX_BROWSER_UPLOAD_BYTES} bytes`);
+    throw new Error(
+      `Browser uploads are limited to ${MAX_BROWSER_UPLOAD_BYTES} bytes`,
+    );
   }
   const encrypted = encrypt(content);
   return {
@@ -34,10 +38,6 @@ export async function encryptPublicFile(
   };
 }
 
-function closeClients(clients) {
-  for (const client of clients.values()) client.close();
-}
-
 function assertUploadNode(hello, paymentNetwork) {
   if (
     !Array.isArray(hello.capabilities) ||
@@ -49,64 +49,92 @@ function assertUploadNode(hello, paymentNetwork) {
   const advertised = hello.payment;
   if (
     !advertised ||
-    new URL(advertised.rpc_url).toString() !== new URL(paymentNetwork.rpc_url).toString() ||
+    new URL(advertised.rpc_url).toString() !==
+      new URL(paymentNetwork.rpc_url).toString() ||
     advertised.payment_token_address?.toLowerCase() !==
       paymentNetwork.payment_token_address.toLowerCase() ||
     advertised.payment_vault_address?.toLowerCase() !==
       paymentNetwork.payment_vault_address.toLowerCase()
   ) {
-    throw new Error("Node advertises a different payment network than the manifest");
+    throw new Error(
+      "Node advertises a different payment network than the manifest",
+    );
   }
 }
 
-async function prepareRecord(seedEndpoints, paymentNetwork, record, onProgress) {
+async function prepareRecord(
+  seedEndpoints,
+  paymentNetwork,
+  record,
+  clientPool,
+  onProgress,
+) {
   onProgress(`Finding closest nodes for ${record.address}`);
-  const lookup = await iterativeFindClosest(seedEndpoints, record.address, { onProgress });
+  const lookup = await iterativeFindClosest(seedEndpoints, record.address, {
+    onProgress,
+    clientPool,
+  });
   const endpoints = lookup.nodes
-    .filter((node) => node.webtransport)
+    .filter((node) => node.webrtc_direct)
     .slice(0, MAX_STORE_TARGETS)
-    .map((node) => ({ peerId: node.peer_id, endpoint: node.webtransport }));
-  try {
-    const failures = [];
-    for (const target of endpoints) {
-      const client = new BrowserNodeClient(target.endpoint);
-      try {
-        assertUploadNode(await client.hello(), paymentNetwork);
-        const response = await client.quoteChunk(record.address, record.content.length);
-        const verified = verifyStorageQuote(
-          response.quote,
-          record.address,
-          target.peerId,
-        );
-        if (response.alreadyStored) {
-          onProgress(`Chunk ${record.address} is already stored; skipping payment`);
-          return { record, alreadyStored: true, targets: endpoints };
-        }
-        onProgress(`Verified storage quote ${verified.quoteHash} from ${target.peerId}`);
-        return {
-          record,
-          alreadyStored: false,
-          targets: [target, ...endpoints.filter((candidate) => candidate !== target)],
-          verified,
-        };
-      } catch (error) {
-        failures.push(`${target.peerId}: ${error.message}`);
-      } finally {
-        client.close();
-      }
+    .map((node) => ({ peerId: node.peer_id, endpoint: node.webrtc_direct }));
+  const failures = [];
+  for (const target of endpoints) {
+    try {
+      const prepared = await clientPool.withClient(
+        target.endpoint,
+        async (client) => {
+          assertUploadNode(await client.hello(), paymentNetwork);
+          const response = await client.quoteChunk(
+            record.address,
+            record.content.length,
+          );
+          const verified = verifyStorageQuote(
+            response.quote,
+            record.address,
+            target.peerId,
+          );
+          if (response.alreadyStored) {
+            onProgress(
+              `Chunk ${record.address} is already stored; skipping payment`,
+            );
+            return { record, alreadyStored: true, targets: endpoints };
+          }
+          onProgress(
+            `Verified storage quote ${verified.quoteHash} from ${target.peerId}`,
+          );
+          return {
+            record,
+            alreadyStored: false,
+            targets: [
+              target,
+              ...endpoints.filter((candidate) => candidate !== target),
+            ],
+            verified,
+          };
+        },
+      );
+      return prepared;
+    } catch (error) {
+      failures.push(`${target.peerId}: ${error.message}`);
     }
-    throw new Error(`No closest node supplied a valid quote (${failures.join("; ")})`);
-  } finally {
-    closeClients(lookup.clients);
   }
+  throw new Error(
+    `No closest node supplied a valid quote (${failures.join("; ")})`,
+  );
 }
 
-async function storePrepared(prepared, paymentNetwork, transactionHash, onProgress) {
+async function storePrepared(
+  prepared,
+  paymentNetwork,
+  transactionHash,
+  clientPool,
+  onProgress,
+) {
   if (prepared.alreadyStored) return 1;
   const attempts = await Promise.allSettled(
     prepared.targets.map(async (target) => {
-      const client = new BrowserNodeClient(target.endpoint);
-      try {
+      return clientPool.withClient(target.endpoint, async (client) => {
         assertUploadNode(await client.hello(), paymentNetwork);
         const result = await client.putChunk(
           prepared.record.address,
@@ -118,17 +146,19 @@ async function storePrepared(prepared, paymentNetwork, transactionHash, onProgre
           `${result.alreadyStored ? "Confirmed" : "Stored"} ${prepared.record.address} on ${target.peerId}`,
         );
         return result;
-      } finally {
-        client.close();
-      }
+      });
     }),
   );
-  const stored = attempts.filter((attempt) => attempt.status === "fulfilled").length;
+  const stored = attempts.filter(
+    (attempt) => attempt.status === "fulfilled",
+  ).length;
   if (stored === 0) {
     const failures = attempts
       .filter((attempt) => attempt.status === "rejected")
       .map((attempt) => attempt.reason?.message ?? String(attempt.reason));
-    throw new Error(`Paid chunk was rejected by every closest node: ${failures.join("; ")}`);
+    throw new Error(
+      `Paid chunk was rejected by every closest node: ${failures.join("; ")}`,
+    );
   }
   return stored;
 }
@@ -141,48 +171,62 @@ export async function uploadPublicFile(
   { onProgress = () => {}, encrypt = encryptPublicFileNative } = {},
 ) {
   const content = new Uint8Array(await file.arrayBuffer());
-  onProgress(`Self-encrypting ${file.name} with native ant-core WASM (${content.length.toLocaleString()} bytes)`);
+  onProgress(
+    `Self-encrypting ${file.name} with native ant-core WASM (${content.length.toLocaleString()} bytes)`,
+  );
   const encrypted = await encryptPublicFile(content, {
     name: file.name,
     contentType: file.type,
     encrypt,
   });
-  const prepared = [];
-  for (let index = 0; index < encrypted.records.length; index += 1) {
-    onProgress(`Preparing record ${index + 1}/${encrypted.records.length}`);
-    prepared.push(
-      await prepareRecord(seedEndpoints, paymentNetwork, encrypted.records[index], onProgress),
-    );
-  }
-  const payable = prepared.filter((record) => !record.alreadyStored);
-  let transactionHash;
-  let totalAmount = 0n;
-  if (payable.length > 0) {
-    const payment = await payForStorageQuotes(
-      paymentNetwork,
-      payable.map((record) => record.verified),
-      walletSecret,
-      { onProgress },
-    );
-    transactionHash = payment.transactionHash;
-    totalAmount = payment.totalAmount;
-  }
-  let replicas = Number.POSITIVE_INFINITY;
-  for (let index = 0; index < prepared.length; index += 1) {
-    onProgress(`Storing record ${index + 1}/${prepared.length}`);
-    const stored = await storePrepared(
-      prepared[index],
-      paymentNetwork,
+  const clientPool = new BrowserNodeClientPool();
+  try {
+    const prepared = [];
+    for (let index = 0; index < encrypted.records.length; index += 1) {
+      onProgress(`Preparing record ${index + 1}/${encrypted.records.length}`);
+      prepared.push(
+        await prepareRecord(
+          seedEndpoints,
+          paymentNetwork,
+          encrypted.records[index],
+          clientPool,
+          onProgress,
+        ),
+      );
+    }
+    const payable = prepared.filter((record) => !record.alreadyStored);
+    let transactionHash;
+    let totalAmount = 0n;
+    if (payable.length > 0) {
+      const payment = await payForStorageQuotes(
+        paymentNetwork,
+        payable.map((record) => record.verified),
+        walletSecret,
+        { onProgress },
+      );
+      transactionHash = payment.transactionHash;
+      totalAmount = payment.totalAmount;
+    }
+    let replicas = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < prepared.length; index += 1) {
+      onProgress(`Storing record ${index + 1}/${prepared.length}`);
+      const stored = await storePrepared(
+        prepared[index],
+        paymentNetwork,
+        transactionHash,
+        clientPool,
+        onProgress,
+      );
+      replicas = Math.min(replicas, stored);
+    }
+    encrypted.descriptor.replicas = Number.isFinite(replicas) ? replicas : 0;
+    return {
+      file: encrypted.descriptor,
       transactionHash,
-      onProgress,
-    );
-    replicas = Math.min(replicas, stored);
+      storageCostAtto: totalAmount.toString(),
+      records: encrypted.records.length,
+    };
+  } finally {
+    clientPool.close();
   }
-  encrypted.descriptor.replicas = Number.isFinite(replicas) ? replicas : 0;
-  return {
-    file: encrypted.descriptor,
-    transactionHash,
-    storageCostAtto: totalAmount.toString(),
-    records: encrypted.records.length,
-  };
 }

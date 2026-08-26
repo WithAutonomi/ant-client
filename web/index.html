@@ -7,7 +7,7 @@
       name="description"
       content="ADR-0009 direct browser client interoperability proof"
     />
-    <title>Autonomi WebTransport PoC</title>
+    <title>Autonomi WebRTC Direct PoC</title>
     <script type="module" src="/src/main.js"></script>
   </head>
   <body>
@@ -51,11 +51,11 @@
           It is populated from the testnet manifest and can also be pasted manually.
         </p>
         <label>
-          WebTransport multiaddress
+          WebRTC Direct multiaddress
           <input
             id="endpoint-multiaddr"
             type="text"
-            placeholder="/ip4/127.0.0.1/udp/24000/quic-v1/webtransport/certhash/.../p2p/..."
+            placeholder="/ip4/127.0.0.1/udp/24000/webrtc-direct/certhash/.../p2p/..."
             spellcheck="false"
           />
         </label>
@@ -99,6 +99,7 @@
           <input
             id="wallet-secret"
             type="password"
+            value="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
             placeholder="0x…"
             autocomplete="new-password"
             autocapitalize="none"

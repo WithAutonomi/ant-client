@@ -191,7 +191,7 @@ test("rejects quote field tampering before any payment", () => {
   );
   assert.throws(
     () => verifyStorageQuote(fixture.quote, fixture.address, "ff".repeat(32)),
-    /different WebTransport peer/,
+    /different WebRtcDirect peer/,
   );
   const signature = Uint8Array.from(Buffer.from(fixture.quote.signature, "hex"));
   signature[100] ^= 1;
