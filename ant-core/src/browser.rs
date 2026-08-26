@@ -28,9 +28,14 @@ mod wasm_transport;
 use bytes::Bytes;
 use self_encryption::{DataMap, EncryptedChunk};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
-/// Maximum file size accepted by the in-memory browser demo.
-pub const MAX_BROWSER_FILE_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum file size accepted by the in-memory browser demo (1 GB decimal).
+///
+/// The current browser path retains the complete plaintext and encrypted
+/// records in memory, so reaching this protocol limit still depends on the
+/// browser's available memory.
+pub const MAX_BROWSER_FILE_BYTES: usize = 1_000_000_000;
 
 /// One native self-encryption chunk descriptor exposed to the browser.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,32 +131,39 @@ pub fn encrypt_public_file(content: &[u8]) -> Result<BrowserEncryptedFile, Brows
     }
 
     let whole_file_hash = content_address(content);
-    let (data_map, encrypted_chunks) = self_encryption::encrypt(Bytes::copy_from_slice(content))
-        .map_err(|error| BrowserError::SelfEncryption(error.to_string()))?;
-    if data_map.is_child() {
-        return Err(BrowserError::Invalid(
-            "nested DataMaps are not supported by the browser client".to_string(),
-        ));
-    }
-    let chunks = chunk_infos(&data_map);
-    if encrypted_chunks.len() != chunks.len() {
-        return Err(BrowserError::SelfEncryption(format!(
-            "native encryptor returned {} records for {} DataMap entries",
-            encrypted_chunks.len(),
-            chunks.len()
-        )));
-    }
+    let (published_data_map, encrypted_chunks) =
+        self_encryption::encrypt(Bytes::copy_from_slice(content))
+            .map_err(|error| BrowserError::SelfEncryption(error.to_string()))?;
+    let root_data_map = {
+        let encrypted_by_address = encrypted_chunks
+            .iter()
+            .map(|chunk| (*blake3::hash(&chunk.content).as_bytes(), &chunk.content))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut get_local_chunk = |address: self_encryption::XorName| {
+            encrypted_by_address
+                .get(&address.0)
+                .map(|content| (*content).clone())
+                .ok_or_else(|| {
+                    self_encryption::Error::Generic(format!(
+                        "self-encryption output omitted DataMap chunk {}",
+                        hex::encode(address.0)
+                    ))
+                })
+        };
+        self_encryption::get_root_data_map(published_data_map.clone(), &mut get_local_chunk)
+            .map_err(|error| BrowserError::SelfEncryption(error.to_string()))?
+    };
+    let chunks = chunk_infos(&root_data_map);
 
     let mut records: Vec<BrowserRecord> = encrypted_chunks
         .into_iter()
-        .zip(&chunks)
-        .map(|(chunk, info)| BrowserRecord {
-            address: info.dst_hash.clone(),
+        .map(|chunk| BrowserRecord {
+            address: content_address(&chunk.content),
             content: chunk.content.to_vec(),
         })
         .collect();
-    let encoded_data_map =
-        rmp_serde::to_vec(&data_map).map_err(|error| BrowserError::DataMap(error.to_string()))?;
+    let encoded_data_map = rmp_serde::to_vec(&published_data_map)
+        .map_err(|error| BrowserError::DataMap(error.to_string()))?;
     let address = content_address(&encoded_data_map);
     let data_map_size = encoded_data_map.len();
     records.push(BrowserRecord {
@@ -172,11 +184,6 @@ pub fn encrypt_public_file(content: &[u8]) -> Result<BrowserEncryptedFile, Brows
 pub fn decode_public_data_map(content: &[u8]) -> Result<Vec<BrowserChunkInfo>, BrowserError> {
     let data_map: DataMap =
         rmp_serde::from_slice(content).map_err(|error| BrowserError::DataMap(error.to_string()))?;
-    if data_map.is_child() {
-        return Err(BrowserError::Invalid(
-            "nested DataMaps are not supported by the browser client".to_string(),
-        ));
-    }
     Ok(chunk_infos(&data_map))
 }
 
@@ -188,30 +195,24 @@ pub fn decrypt_public_file(
 ) -> Result<Vec<u8>, BrowserError> {
     let data_map: DataMap = rmp_serde::from_slice(data_map_content)
         .map_err(|error| BrowserError::DataMap(error.to_string()))?;
-    if data_map.is_child() {
-        return Err(BrowserError::Invalid(
-            "nested DataMaps are not supported by the browser client".to_string(),
-        ));
-    }
-    if encrypted_contents.len() != data_map.infos().len() {
-        return Err(BrowserError::Invalid(format!(
-            "received {} encrypted records for {} DataMap entries",
-            encrypted_contents.len(),
-            data_map.infos().len()
-        )));
-    }
-
-    let encrypted_chunks = data_map
-        .infos()
+    let available = encrypted_contents
         .iter()
-        .zip(encrypted_contents)
-        .map(|(info, content)| {
-            verify_record(&hex::encode(info.dst_hash.0), content)?;
-            Ok(EncryptedChunk {
-                content: Bytes::copy_from_slice(content),
-            })
+        .map(|content| *blake3::hash(content).as_bytes())
+        .collect::<HashSet<_>>();
+    for info in data_map.infos() {
+        if !available.contains(&info.dst_hash.0) {
+            return Err(BrowserError::Invalid(format!(
+                "record set does not contain DataMap chunk {}; a record may be missing or corrupt",
+                hex::encode(info.dst_hash.0)
+            )));
+        }
+    }
+    let encrypted_chunks = encrypted_contents
+        .iter()
+        .map(|content| EncryptedChunk {
+            content: Bytes::copy_from_slice(content),
         })
-        .collect::<Result<Vec<_>, BrowserError>>()?;
+        .collect::<Vec<_>>();
     self_encryption::decrypt(&data_map, &encrypted_chunks)
         .map(|bytes| bytes.to_vec())
         .map_err(|error| BrowserError::SelfEncryption(error.to_string()))
@@ -742,5 +743,35 @@ mod tests {
         let mut tampered = chunks;
         tampered[0][0] ^= 1;
         assert!(decrypt_public_file(data_map, &tampered).is_err());
+    }
+
+    #[test]
+    fn nested_data_map_round_trip() {
+        let size = 3 * self_encryption::MAX_CHUNK_SIZE + 1;
+        let content = (0..size).map(|index| index as u8).collect::<Vec<_>>();
+        let encrypted = encrypt_public_file(&content).expect("encrypt nested fixture");
+        assert_eq!(encrypted.chunks.len(), 4);
+        assert!(encrypted.records.len() > encrypted.chunks.len() + 1);
+
+        let data_map = &encrypted.records.last().expect("DataMap record").content;
+        let published: DataMap = rmp_serde::from_slice(data_map).expect("decode published map");
+        assert!(published.is_child());
+
+        let mut required_addresses = decode_public_data_map(data_map)
+            .expect("decode child map")
+            .into_iter()
+            .map(|chunk| chunk.dst_hash)
+            .collect::<HashSet<_>>();
+        required_addresses.extend(encrypted.chunks.iter().map(|chunk| chunk.dst_hash.clone()));
+        let records = encrypted.records[..encrypted.records.len() - 1]
+            .iter()
+            .filter(|record| required_addresses.contains(&record.address))
+            .map(|record| record.content.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), encrypted.records.len() - 1);
+        assert_eq!(
+            decrypt_public_file(data_map, &records).expect("decrypt nested fixture"),
+            content
+        );
     }
 }

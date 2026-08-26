@@ -70,7 +70,9 @@ Confirm that `HELLO.payment.rpc_url` is a loopback Anvil URL. An
 
 Pass `--public-file /path/to/file` to publish another file instead. The built-in
 file is generated as 5 MiB so the demo exercises whole-file reconstruction. A
-custom file may be up to 64 MiB in this local launcher.
+custom file may be up to 1 GB (1,000,000,000 bytes) in this local launcher.
+Uploads and downloads are currently processed in memory, so large files still
+depend on the browser having sufficient available memory.
 
 ## Run the site
 
@@ -150,8 +152,9 @@ quote verification including the native Keccak-256 EVM quote hash, and a Rust
 verification.
 Cross-repository live verification additionally starts the node testnet,
 downloads all public-file records through WebRTC Direct, reconstructs the
-original bytes, pays a real quote on local Anvil, uploads a fresh record
-through the ordinary node payment validator, and reads it back.
+original bytes, pays real quotes on local Anvil, uploads an incompressible file
+large enough to require a nested DataMap through the ordinary node payment
+validator, and downloads and verifies it again.
 
 ## Library boundary
 

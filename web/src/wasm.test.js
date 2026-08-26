@@ -97,5 +97,28 @@ test("generated ant-core WASM matches the native self-encryption vector", () => 
 
   const tampered = chunks.map((chunk) => chunk.slice());
   tampered[0][0] ^= 1;
-  assert.throws(() => decryptPublicFile(dataMap, tampered), /BLAKE3 mismatch/);
+  assert.throws(
+    () => decryptPublicFile(dataMap, tampered),
+    /record may be missing or corrupt/,
+  );
+});
+
+test("generated ant-core WASM supports nested DataMaps", () => {
+  const maxChunkSize = 4_190_208;
+  const content = new Uint8Array(3 * maxChunkSize + 1);
+  for (let index = 0; index < content.length; index += 1) {
+    content[index] = index;
+  }
+
+  const encrypted = encryptPublicFile(content);
+  assert.equal(encrypted.chunks.length, 4);
+  assert.equal(decodePublicDataMap(encrypted.records.at(-1).content).length, 3);
+  assert(encrypted.records.length > encrypted.chunks.length + 1);
+
+  const decrypted = decryptPublicFile(
+    encrypted.records.at(-1).content,
+    encrypted.records.slice(0, -1).map((record) => record.content),
+  );
+  assert.equal(decrypted.length, content.length);
+  assert.equal(verifyRecord(encrypted.blake3, decrypted), encrypted.blake3);
 });
