@@ -1,4 +1,6 @@
 import { bytesToHex as nobleBytesToHex } from "@noble/hashes/utils.js";
+import { blake3 } from "@noble/hashes/blake3.js";
+import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import {
   BrowserIterativeLookup as BrowserIterativeLookupNative,
   verifyRecord as verifyRecordNative,
@@ -6,16 +8,23 @@ import {
 
 export const PROTOCOL_VERSION = 3;
 export const PROTOCOL_NAME = "autonomi.web.poc.v3";
-export const WEBTRANSPORT_PATH = "/autonomi/webtransport/v1";
+export const WEBRTC_DIRECT_DATA_CHANNEL = "autonomi.web.v3";
 export const MAX_CHUNK_SIZE = 4 * 1024 * 1024;
 export const MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
 const MAX_RESPONSE_BYTES = 4 + MAX_RESPONSE_HEADER_BYTES + MAX_CHUNK_SIZE;
-const MAX_WEBTRANSPORT_MULTIADDR_LENGTH = 2048;
-const MAX_CERTIFICATE_HASHES = 2;
+const MAX_WEBRTC_DIRECT_MULTIADDR_LENGTH = 2048;
+const WEBRTC_WRITE_CHUNK_BYTES = 16 * 1024;
+const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024;
+const REQUEST_TIMEOUT_MS = 10_000;
+const ICE_CREDENTIAL_PREFIX = "saorsa+webrtc+v1/";
+const ICE_RANDOM_LENGTH = 32;
+const ICE_ALPHABET =
+  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const SHA2_256_MULTIHASH_CODE = 0x12;
 const SHA2_256_MULTIHASH_LENGTH = 32;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
+const HELLO_DOMAIN = encoder.encode("autonomi-webrtc-direct-hello-v1\0");
 
 let nextRequestId = 1;
 
@@ -28,13 +37,27 @@ export function hexToBytes(value, expectedLength) {
     normalized.match(/.{2}/g)?.map((pair) => Number.parseInt(pair, 16)) ?? [],
   );
   if (expectedLength !== undefined && bytes.length !== expectedLength) {
-    throw new Error(`Expected ${expectedLength} bytes, received ${bytes.length}`);
+    throw new Error(
+      `Expected ${expectedLength} bytes, received ${bytes.length}`,
+    );
   }
   return bytes;
 }
 
 export function bytesToHex(bytes) {
   return nobleBytesToHex(bytes);
+}
+
+function concatBytes(...parts) {
+  const result = new Uint8Array(
+    parts.reduce((total, part) => total + part.length, 0),
+  );
+  let offset = 0;
+  for (const part of parts) {
+    result.set(part, offset);
+    offset += part.length;
+  }
+  return result;
 }
 
 export function verifyChunk(address, content) {
@@ -44,6 +67,16 @@ export function verifyChunk(address, content) {
 }
 
 export function parseResponseFrame(frame) {
+  const { header, contentOffset, frameLength } = parseResponseHeader(frame);
+  if (frame.length !== frameLength) {
+    throw new Error(
+      `Response length mismatch: declared ${header.content_length} content bytes`,
+    );
+  }
+  return { header, content: frame.slice(contentOffset) };
+}
+
+function parseResponseHeader(frame) {
   if (!(frame instanceof Uint8Array) || frame.length < 4) {
     throw new Error("Response ended before its four-byte header length");
   }
@@ -61,7 +94,9 @@ export function parseResponseFrame(frame) {
   try {
     header = JSON.parse(decoder.decode(frame.subarray(4, contentOffset)));
   } catch (error) {
-    throw new Error(`Invalid response JSON: ${error.message}`, { cause: error });
+    throw new Error(`Invalid response JSON: ${error.message}`, {
+      cause: error,
+    });
   }
   if (header.version !== PROTOCOL_VERSION) {
     throw new Error(`Unsupported response version ${header.version}`);
@@ -73,43 +108,63 @@ export function parseResponseFrame(frame) {
   ) {
     throw new Error(`Invalid response content length ${header.content_length}`);
   }
-  if (frame.length !== contentOffset + header.content_length) {
-    throw new Error(
-      `Response length mismatch: declared ${header.content_length} content bytes`,
-    );
-  }
-  return { header, content: frame.slice(contentOffset) };
+  return {
+    header,
+    contentOffset,
+    frameLength: contentOffset + header.content_length,
+  };
 }
 
-async function readAll(readable, limit = MAX_RESPONSE_BYTES) {
-  const reader = readable.getReader();
-  const chunks = [];
+export async function readResponseFrame(stream, limit = MAX_RESPONSE_BYTES) {
+  if (!Number.isSafeInteger(limit) || limit < 4) {
+    throw new Error(`Invalid response limit ${limit}`);
+  }
+  let frame = new Uint8Array(Math.min(limit, 8 * 1024));
   let total = 0;
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (!(value instanceof Uint8Array)) {
-        throw new Error("WebTransport returned a non-byte stream chunk");
-      }
-      total += value.length;
-      if (total > limit) {
-        await reader.cancel("response exceeded client limit");
-        throw new Error(`Response exceeded the ${limit}-byte client limit`);
-      }
-      chunks.push(value);
+  let expectedLength;
+  for await (const value of stream) {
+    const chunk = value instanceof Uint8Array ? value : value.subarray();
+    const nextTotal = total + chunk.length;
+    if (nextTotal > limit) {
+      throw new Error(`Response exceeded the ${limit}-byte client limit`);
     }
-  } finally {
-    reader.releaseLock();
-  }
+    if (nextTotal > frame.length) {
+      let capacity = frame.length;
+      while (capacity < nextTotal) capacity = Math.min(limit, capacity * 2);
+      const grown = new Uint8Array(capacity);
+      grown.set(frame.subarray(0, total));
+      frame = grown;
+    }
+    frame.set(chunk, total);
+    total = nextTotal;
 
-  const result = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
+    if (expectedLength === undefined && total >= 4) {
+      const headerLength = new DataView(
+        frame.buffer,
+        frame.byteOffset,
+        total,
+      ).getUint32(0, false);
+      if (headerLength === 0 || headerLength > MAX_RESPONSE_HEADER_BYTES) {
+        throw new Error(`Invalid response header length ${headerLength}`);
+      }
+      if (total >= 4 + headerLength) {
+        expectedLength = parseResponseHeader(
+          frame.subarray(0, total),
+        ).frameLength;
+        if (expectedLength > limit) {
+          throw new Error(`Response exceeded the ${limit}-byte client limit`);
+        }
+      }
+    }
+
+    if (expectedLength !== undefined && total >= expectedLength) {
+      if (total !== expectedLength) {
+        throw new Error("Response contains bytes after its declared frame");
+      }
+      return frame.slice(0, total);
+    }
   }
-  return result;
+  throw new Error("Response ended before its declared frame was complete");
 }
 
 function decodeBase64Url(value) {
@@ -138,7 +193,9 @@ function decodeCertificateMultihash(value) {
     decoded[0] !== SHA2_256_MULTIHASH_CODE ||
     decoded[1] !== SHA2_256_MULTIHASH_LENGTH
   ) {
-    throw new Error("Certificate multihash must contain a 32-byte SHA-256 digest");
+    throw new Error(
+      "Certificate multihash must contain a 32-byte SHA-256 digest",
+    );
   }
   return decoded.slice(2);
 }
@@ -149,7 +206,8 @@ function validateIpv4(value) {
     octets.length !== 4 ||
     octets.some(
       (octet) =>
-        !/^(0|[1-9][0-9]{0,2})$/.test(octet) || Number.parseInt(octet, 10) > 255,
+        !/^(0|[1-9][0-9]{0,2})$/.test(octet) ||
+        Number.parseInt(octet, 10) > 255,
     )
   ) {
     throw new Error(`Invalid IPv4 address ${value}`);
@@ -159,165 +217,438 @@ function validateIpv4(value) {
 
 function endpointMultiaddr(endpoint) {
   if (typeof endpoint === "string") return endpoint;
-  if (endpoint && typeof endpoint.multiaddr === "string") return endpoint.multiaddr;
-  throw new Error("A WebTransport multiaddress is required");
+  if (endpoint && typeof endpoint.multiaddr === "string")
+    return endpoint.multiaddr;
+  throw new Error("A WebRtcDirect multiaddress is required");
 }
 
-export function parseWebTransportMultiaddr(endpoint) {
+export function parseWebRtcDirectMultiaddr(endpoint) {
   const multiaddr = endpointMultiaddr(endpoint).trim();
   if (
     multiaddr.length === 0 ||
-    multiaddr.length > MAX_WEBTRANSPORT_MULTIADDR_LENGTH ||
+    multiaddr.length > MAX_WEBRTC_DIRECT_MULTIADDR_LENGTH ||
     !multiaddr.startsWith("/")
   ) {
-    throw new Error("Invalid WebTransport multiaddress length or prefix");
+    throw new Error("Invalid WebRtcDirect multiaddress length or prefix");
   }
   const segments = multiaddr.split("/");
-  if (segments.length < 9) {
-    throw new Error("WebTransport multiaddress is incomplete");
+  if (segments.length !== 10) {
+    throw new Error("WebRtcDirect multiaddress is incomplete");
   }
 
   const hostProtocol = segments[1];
   const hostValue = segments[2];
-  if (!hostValue) throw new Error("WebTransport multiaddress host is empty");
-  let urlHost;
+  if (!hostValue) throw new Error("WebRtcDirect multiaddress host is empty");
   if (hostProtocol === "ip4") {
-    urlHost = validateIpv4(hostValue);
+    validateIpv4(hostValue);
   } else if (hostProtocol === "ip6") {
-    urlHost = `[${hostValue}]`;
-  } else if (["dns", "dns4", "dns6"].includes(hostProtocol)) {
-    urlHost = hostValue.toLowerCase();
+    if (!hostValue.includes(":"))
+      throw new Error(`Invalid IPv6 address ${hostValue}`);
   } else {
-    throw new Error(`Unsupported WebTransport host protocol ${hostProtocol}`);
+    throw new Error(
+      "WebRTC Direct multiaddresses must use a literal IP address",
+    );
   }
   if (segments[3] !== "udp") {
-    throw new Error("WebTransport multiaddress must use UDP");
+    throw new Error("WebRtcDirect multiaddress must use UDP");
   }
   if (!/^[0-9]{1,5}$/.test(segments[4])) {
-    throw new Error("WebTransport multiaddress has an invalid UDP port");
+    throw new Error("WebRtcDirect multiaddress has an invalid UDP port");
   }
   const port = Number.parseInt(segments[4], 10);
   if (port < 1 || port > 65535) {
-    throw new Error("WebTransport multiaddress has an invalid UDP port");
+    throw new Error("WebRtcDirect multiaddress has an invalid UDP port");
   }
-  if (segments[5] !== "quic-v1" || segments[6] !== "webtransport") {
+  if (segments[5] !== "webrtc-direct") {
+    throw new Error("WebRTC Direct multiaddress must contain /webrtc-direct");
+  }
+  if (segments[6] !== "certhash" || !segments[7]) {
     throw new Error(
-      "WebTransport multiaddress must contain /quic-v1/webtransport",
+      "WebRTC Direct multiaddress must contain exactly one certhash",
     );
   }
-
-  let index = 7;
-  const certificateHashes = [];
-  const certificateHashMultihashes = [];
-  while (segments[index] === "certhash") {
-    const encoded = segments[index + 1];
-    if (!encoded) throw new Error("WebTransport multiaddress has an empty certhash");
-    certificateHashes.push(decodeCertificateMultihash(encoded));
-    certificateHashMultihashes.push(encoded);
-    index += 2;
+  const certificateHash = decodeCertificateMultihash(segments[7]);
+  if (segments[8] !== "p2p") {
+    throw new Error("WebRtcDirect multiaddress must end with /p2p/<peer-id>");
   }
-  if (
-    certificateHashes.length < 1 ||
-    certificateHashes.length > MAX_CERTIFICATE_HASHES
-  ) {
-    throw new Error(
-      `WebTransport multiaddress must contain between 1 and ${MAX_CERTIFICATE_HASHES} certificate hashes`,
-    );
-  }
-  if (new Set(certificateHashMultihashes).size !== certificateHashes.length) {
-    throw new Error("WebTransport multiaddress contains duplicate certificate hashes");
-  }
-  if (segments[index] !== "p2p" || index + 2 !== segments.length) {
-    throw new Error("WebTransport multiaddress must end with /p2p/<peer-id>");
-  }
-  const peerId = segments[index + 1]?.toLowerCase() ?? "";
+  const peerId = segments[9]?.toLowerCase() ?? "";
   hexToBytes(peerId, 32);
-
-  let url;
-  try {
-    url = new URL(`https://${urlHost}:${port}${WEBTRANSPORT_PATH}`).toString();
-  } catch (error) {
-    throw new Error("WebTransport multiaddress contains an invalid host", {
-      cause: error,
-    });
-  }
   return {
     multiaddr,
-    url,
+    hostProtocol,
+    host: hostValue,
+    port,
     peerId,
-    certificateHashes,
+    certificateHash,
   };
 }
 
-const normalizeEndpoint = parseWebTransportMultiaddr;
+const normalizeEndpoint = parseWebRtcDirectMultiaddr;
+
+export function verifyHelloIdentity(header, expectedEndpoint, challengeBytes) {
+  const endpoint = normalizeEndpoint(expectedEndpoint);
+  if (!(challengeBytes instanceof Uint8Array) || challengeBytes.length !== 32) {
+    throw new Error("HELLO verification requires a 32-byte challenge");
+  }
+  if (header.type !== "hello") throw new Error("Expected a HELLO response");
+  if (header.protocol !== PROTOCOL_NAME) {
+    throw new Error(`Unsupported browser protocol ${header.protocol}`);
+  }
+  hexToBytes(header.peer_id, 32);
+  if (header.challenge?.toLowerCase() !== bytesToHex(challengeBytes)) {
+    throw new Error("Node signed a different HELLO challenge");
+  }
+  const advertisedEndpoint = normalizeEndpoint(header.endpoint);
+  if (
+    advertisedEndpoint.multiaddr !== endpoint.multiaddr ||
+    advertisedEndpoint.peerId !== header.peer_id.toLowerCase()
+  ) {
+    throw new Error("Node advertised a different WebRTC Direct endpoint");
+  }
+  if (header.peer_id.toLowerCase() !== endpoint.peerId.toLowerCase()) {
+    throw new Error(
+      `Endpoint identity mismatch: expected ${endpoint.peerId}, received ${header.peer_id}`,
+    );
+  }
+  const publicKey = hexToBytes(header.public_key);
+  const signature = hexToBytes(header.signature);
+  if (publicKey.length !== ml_dsa65.lengths.publicKey) {
+    throw new Error(`HELLO has a ${publicKey.length}-byte public key`);
+  }
+  if (signature.length !== ml_dsa65.lengths.signature) {
+    throw new Error(`HELLO has a ${signature.length}-byte signature`);
+  }
+  if (bytesToHex(blake3(publicKey)) !== header.peer_id.toLowerCase()) {
+    throw new Error("HELLO public key is not bound to the ANT peer ID");
+  }
+  const transcript = concatBytes(
+    HELLO_DOMAIN,
+    challengeBytes,
+    encoder.encode(header.peer_id.toLowerCase()),
+    encoder.encode(advertisedEndpoint.multiaddr),
+  );
+  if (!ml_dsa65.verify(signature, transcript, publicKey)) {
+    throw new Error("HELLO has an invalid ML-DSA-65 signature");
+  }
+  return header.peer_id.toLowerCase();
+}
+
+function randomIceCredential() {
+  const random = crypto.getRandomValues(new Uint8Array(ICE_RANDOM_LENGTH));
+  let suffix = "";
+  for (const byte of random) suffix += ICE_ALPHABET[byte % ICE_ALPHABET.length];
+  return ICE_CREDENTIAL_PREFIX + suffix;
+}
+
+function certificateFingerprint(certificateHash) {
+  return Array.from(certificateHash, (byte) =>
+    byte.toString(16).padStart(2, "0").toUpperCase(),
+  ).join(":");
+}
+
+export function serverAnswerFromEndpoint(endpoint, iceCredential) {
+  const normalized = normalizeEndpoint(endpoint);
+  if (
+    typeof iceCredential !== "string" ||
+    !iceCredential.startsWith(ICE_CREDENTIAL_PREFIX) ||
+    !/^[a-zA-Z0-9+/]{22,256}$/.test(iceCredential)
+  ) {
+    throw new Error("Invalid Saorsa WebRTC Direct ICE credential");
+  }
+  const ipVersion = normalized.hostProtocol === "ip4" ? "IP4" : "IP6";
+  return {
+    type: "answer",
+    sdp: `v=0\r
+o=- 0 0 IN ${ipVersion} ${normalized.host}\r
+s=-\r
+t=0 0\r
+a=ice-lite\r
+m=application ${normalized.port} UDP/DTLS/SCTP webrtc-datachannel\r
+c=IN ${ipVersion} ${normalized.host}\r
+a=mid:0\r
+a=ice-options:ice2\r
+a=ice-ufrag:${iceCredential}\r
+a=ice-pwd:${iceCredential}\r
+a=fingerprint:sha-256 ${certificateFingerprint(normalized.certificateHash)}\r
+a=setup:passive\r
+a=sctp-port:5000\r
+a=max-message-size:${WEBRTC_WRITE_CHUNK_BYTES}\r
+a=candidate:1467250027 1 UDP 1467250027 ${normalized.host} ${normalized.port} typ host\r
+a=end-of-candidates\r
+`,
+  };
+}
+
+export function mungeOfferIceCredentials(offer, iceCredential) {
+  if (!offer?.sdp) throw new Error("Browser created an empty WebRTC offer");
+  const sdp = offer.sdp
+    .replace(/a=ice-ufrag:[^\r\n]+/, `a=ice-ufrag:${iceCredential}`)
+    .replace(/a=ice-pwd:[^\r\n]+/, `a=ice-pwd:${iceCredential}`);
+  if (
+    !sdp.includes(`a=ice-ufrag:${iceCredential}`) ||
+    !sdp.includes(`a=ice-pwd:${iceCredential}`)
+  ) {
+    throw new Error("Browser offer did not contain ICE credentials");
+  }
+  return { type: "offer", sdp };
+}
+
+class DataChannelInbox {
+  constructor(channel) {
+    this.queue = [];
+    this.waiters = [];
+    this.closed = false;
+    this.error = undefined;
+    channel.binaryType = "arraybuffer";
+    channel.addEventListener("message", ({ data }) => {
+      try {
+        let message;
+        if (data instanceof ArrayBuffer) {
+          message = new Uint8Array(data);
+        } else if (ArrayBuffer.isView(data)) {
+          message = new Uint8Array(
+            data.buffer,
+            data.byteOffset,
+            data.byteLength,
+          );
+        } else {
+          throw new Error("Node sent a non-binary DataChannel message");
+        }
+        this.push(message);
+      } catch (error) {
+        this.fail(error);
+      }
+    });
+    channel.addEventListener("error", (event) => {
+      this.fail(event.error ?? new Error("WebRTC DataChannel failed"));
+    });
+    channel.addEventListener("close", () => this.finish());
+  }
+
+  push(message) {
+    const waiter = this.waiters.shift();
+    if (waiter) waiter.resolve({ value: message, done: false });
+    else this.queue.push(message);
+  }
+
+  finish() {
+    this.closed = true;
+    for (const waiter of this.waiters.splice(0)) waiter.resolve({ done: true });
+  }
+
+  fail(error) {
+    this.error = error;
+    for (const waiter of this.waiters.splice(0)) waiter.reject(error);
+  }
+
+  next() {
+    if (this.queue.length > 0) {
+      return Promise.resolve({ value: this.queue.shift(), done: false });
+    }
+    if (this.error) return Promise.reject(this.error);
+    if (this.closed) return Promise.resolve({ done: true });
+    return new Promise((resolve, reject) =>
+      this.waiters.push({ resolve, reject }),
+    );
+  }
+
+  [Symbol.asyncIterator]() {
+    return this;
+  }
+}
+
+function waitForDataChannelOpen(channel, timeoutMs = REQUEST_TIMEOUT_MS) {
+  if (channel.readyState === "open") return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("WebRTC DataChannel opening timed out"));
+    }, timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      channel.removeEventListener("open", opened);
+      channel.removeEventListener("close", closed);
+      channel.removeEventListener("error", failed);
+    };
+    const opened = () => {
+      cleanup();
+      resolve();
+    };
+    const closed = () => {
+      cleanup();
+      reject(new Error("WebRTC DataChannel closed before opening"));
+    };
+    const failed = (event) => {
+      cleanup();
+      reject(
+        event.error ?? new Error("WebRTC DataChannel failed while opening"),
+      );
+    };
+    channel.addEventListener("open", opened, { once: true });
+    channel.addEventListener("close", closed, { once: true });
+    channel.addEventListener("error", failed, { once: true });
+  });
+}
+
+async function waitForDataChannelCapacity(channel) {
+  if (channel.bufferedAmount <= MAX_BUFFERED_AMOUNT) return;
+  channel.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT / 2;
+  await new Promise((resolve, reject) => {
+    const drained = () => {
+      cleanup();
+      resolve();
+    };
+    const closed = () => {
+      cleanup();
+      reject(new Error("WebRTC DataChannel closed while draining"));
+    };
+    const cleanup = () => {
+      channel.removeEventListener("bufferedamountlow", drained);
+      channel.removeEventListener("close", closed);
+    };
+    channel.addEventListener("bufferedamountlow", drained, { once: true });
+    channel.addEventListener("close", closed, { once: true });
+  });
+}
 
 export class BrowserNodeClient {
   constructor(endpoint) {
     this.endpoint = normalizeEndpoint(endpoint);
-    this.transport = undefined;
+    this.peerConnection = undefined;
+    this.dataChannel = undefined;
+    this.inbox = undefined;
+    this.connectPromise = undefined;
+    this.requestTail = Promise.resolve();
     this.peerId = undefined;
+    this.helloResponse = undefined;
+    this.helloPromise = undefined;
   }
 
   async connect() {
-    if (this.transport) return;
-    if (typeof WebTransport === "undefined") {
-      throw new Error("This browser does not expose the WebTransport API");
+    if (this.dataChannel?.readyState === "open") return;
+    if (this.connectPromise) return this.connectPromise;
+    if (typeof RTCPeerConnection === "undefined") {
+      throw new Error("This browser does not expose the RTCPeerConnection API");
     }
-    const transport = new WebTransport(this.endpoint.url, {
-      serverCertificateHashes: this.endpoint.certificateHashes.map((value) => ({
-        algorithm: "sha-256",
-        value,
-      })),
-    });
+    this.connectPromise = this.openDirectConnection();
     try {
-      await transport.ready;
+      await this.connectPromise;
     } catch (error) {
-      transport.close();
+      this.close();
       throw error;
+    } finally {
+      this.connectPromise = undefined;
     }
-    this.transport = transport;
   }
 
   async request(type, fields = {}, content = new Uint8Array()) {
+    const operation = this.requestTail.then(() =>
+      this.requestDirect(type, fields, content),
+    );
+    this.requestTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
+  async openDirectConnection() {
+    const configuration = { iceServers: [] };
+    if (typeof RTCPeerConnection.generateCertificate === "function") {
+      configuration.certificates = [
+        await RTCPeerConnection.generateCertificate({
+          name: "ECDSA",
+          namedCurve: "P-256",
+        }),
+      ];
+    }
+    const peerConnection = new RTCPeerConnection(configuration);
+    const dataChannel = peerConnection.createDataChannel(
+      WEBRTC_DIRECT_DATA_CHANNEL,
+      {
+        ordered: true,
+      },
+    );
+    const inbox = new DataChannelInbox(dataChannel);
+    this.peerConnection = peerConnection;
+    this.dataChannel = dataChannel;
+    this.inbox = inbox;
+    const iceCredential = randomIceCredential();
+    const offer = mungeOfferIceCredentials(
+      await peerConnection.createOffer(),
+      iceCredential,
+    );
+    await peerConnection.setLocalDescription(offer);
+    await peerConnection.setRemoteDescription(
+      serverAnswerFromEndpoint(this.endpoint, iceCredential),
+    );
+    await waitForDataChannelOpen(dataChannel);
+  }
+
+  async requestDirect(type, fields, content) {
     await this.connect();
     if (!(content instanceof Uint8Array) || content.length > MAX_CHUNK_SIZE) {
-      throw new Error(`Request content must be at most ${MAX_CHUNK_SIZE} bytes`);
+      throw new Error(
+        `Request content must be at most ${MAX_CHUNK_SIZE} bytes`,
+      );
     }
     const requestId = nextRequestId;
     nextRequestId += 1;
-    const stream = await this.transport.createBidirectionalStream();
-    const writer = stream.writable.getWriter();
-    try {
-      const header = encoder.encode(
-        JSON.stringify({
-          version: PROTOCOL_VERSION,
-          request_id: requestId,
-          content_length: content.length,
-          type,
-          ...fields,
-        }),
+    const header = encoder.encode(
+      JSON.stringify({
+        version: PROTOCOL_VERSION,
+        request_id: requestId,
+        content_length: content.length,
+        type,
+        ...fields,
+      }),
+    );
+    if (header.length === 0 || header.length > MAX_RESPONSE_HEADER_BYTES) {
+      throw new Error(`Request header is ${header.length} bytes`);
+    }
+    const frame = new Uint8Array(4 + header.length + content.length);
+    new DataView(frame.buffer).setUint32(0, header.length, false);
+    frame.set(header, 4);
+    frame.set(content, 4 + header.length);
+    for (
+      let offset = 0;
+      offset < frame.length;
+      offset += WEBRTC_WRITE_CHUNK_BYTES
+    ) {
+      await waitForDataChannelCapacity(this.dataChannel);
+      this.dataChannel.send(
+        frame.subarray(offset, offset + WEBRTC_WRITE_CHUNK_BYTES),
       );
-      if (header.length === 0 || header.length > MAX_RESPONSE_HEADER_BYTES) {
-        throw new Error(`Request header is ${header.length} bytes`);
-      }
-      const prefix = new Uint8Array(4);
-      new DataView(prefix.buffer).setUint32(0, header.length, false);
-      await writer.write(prefix);
-      await writer.write(header);
-      if (content.length > 0) await writer.write(content);
-      await writer.close();
+    }
+    let timeout;
+    let responseFrame;
+    try {
+      responseFrame = await Promise.race([
+        readResponseFrame(this.inbox),
+        new Promise((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("WebRTC request timed out")),
+            REQUEST_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } catch (error) {
+      this.close();
+      throw error;
     } finally {
-      writer.releaseLock();
+      clearTimeout(timeout);
     }
 
-    const response = parseResponseFrame(await readAll(stream.readable));
+    const response = parseResponseFrame(responseFrame);
     if (response.header.request_id !== requestId) {
       throw new Error(
         `Response ID ${response.header.request_id} does not match request ${requestId}`,
       );
     }
     if (response.header.status === "error") {
-      const error = new Error(response.header.message ?? "Node returned an error");
+      const error = new Error(
+        response.header.message ?? "Node returned an error",
+      );
       error.code = response.header.code;
       throw error;
     }
@@ -325,29 +656,23 @@ export class BrowserNodeClient {
   }
 
   async hello() {
-    const { header } = await this.request("hello");
-    if (header.type !== "hello") throw new Error("Expected a HELLO response");
-    if (header.protocol !== PROTOCOL_NAME) {
-      throw new Error(`Unsupported browser protocol ${header.protocol}`);
+    if (this.helloResponse && this.dataChannel?.readyState === "open") {
+      return this.helloResponse;
     }
-    hexToBytes(header.peer_id, 32);
-    const advertisedEndpoint = normalizeEndpoint(header.endpoint);
-    if (
-      advertisedEndpoint.multiaddr !== this.endpoint.multiaddr ||
-      advertisedEndpoint.peerId !== header.peer_id.toLowerCase()
-    ) {
-      throw new Error("Node advertised a different WebTransport endpoint");
+    if (this.helloPromise) return this.helloPromise;
+    this.helloPromise = (async () => {
+      const challengeBytes = crypto.getRandomValues(new Uint8Array(32));
+      const challenge = bytesToHex(challengeBytes);
+      const { header } = await this.request("hello", { challenge });
+      this.peerId = verifyHelloIdentity(header, this.endpoint, challengeBytes);
+      this.helloResponse = header;
+      return header;
+    })();
+    try {
+      return await this.helloPromise;
+    } finally {
+      this.helloPromise = undefined;
     }
-    if (
-      this.endpoint.peerId &&
-      header.peer_id.toLowerCase() !== this.endpoint.peerId.toLowerCase()
-    ) {
-      throw new Error(
-        `Endpoint identity mismatch: expected ${this.endpoint.peerId}, received ${header.peer_id}`,
-      );
-    }
-    this.peerId = header.peer_id;
-    return header;
   }
 
   async findNode(target, count = 20) {
@@ -362,10 +687,12 @@ export class BrowserNodeClient {
     }
     for (const node of header.nodes) {
       hexToBytes(node.peer_id, 32);
-      if (node.webtransport) {
-        const parsed = normalizeEndpoint(node.webtransport);
+      if (node.webrtc_direct) {
+        const parsed = normalizeEndpoint(node.webrtc_direct);
         if (parsed.peerId !== node.peer_id.toLowerCase()) {
-          throw new Error(`Node ${node.peer_id} advertised another peer's endpoint`);
+          throw new Error(
+            `Node ${node.peer_id} advertised another peer's endpoint`,
+          );
         }
       }
     }
@@ -405,7 +732,10 @@ export class BrowserNodeClient {
     if (header.address.toLowerCase() !== address.toLowerCase()) {
       throw new Error("Node returned a quote for a different chunk address");
     }
-    return { quote: header.quote, alreadyStored: Boolean(header.already_stored) };
+    return {
+      quote: header.quote,
+      alreadyStored: Boolean(header.already_stored),
+    };
   }
 
   async putChunk(address, content, quote, transactionHash) {
@@ -423,12 +753,22 @@ export class BrowserNodeClient {
     if (header.address.toLowerCase() !== address.toLowerCase()) {
       throw new Error("Node stored a different chunk address");
     }
-    return { address: header.address, alreadyStored: Boolean(header.already_stored) };
+    return {
+      address: header.address,
+      alreadyStored: Boolean(header.already_stored),
+    };
   }
 
   close() {
-    this.transport?.close({ closeCode: 0, reason: "client closed" });
-    this.transport = undefined;
+    this.dataChannel?.close();
+    this.peerConnection?.close();
+    this.dataChannel = undefined;
+    this.peerConnection = undefined;
+    this.inbox = undefined;
+    this.connectPromise = undefined;
+    this.peerId = undefined;
+    this.helloResponse = undefined;
+    this.helloPromise = undefined;
   }
 }
 
@@ -437,42 +777,145 @@ function endpointKey(endpoint) {
   return normalized.multiaddr;
 }
 
+const DEFAULT_MAX_POOLED_CLIENTS = 10;
+
+/**
+ * A bounded set of reusable browser-to-node WebRTC associations.
+ *
+ * In Safari, the PoC exhausted WebRTC resources when it rapidly replaced every
+ * seed connection for each chunk, even though callers invoked `close()`.
+ * Keeping authenticated, persistent DataChannels avoids relying on prompt
+ * reclamation and avoids repeating ICE, DTLS, SCTP, and HELLO for each lookup
+ * and record.
+ */
+export class BrowserNodeClientPool {
+  constructor({
+    maxClients = DEFAULT_MAX_POOLED_CLIENTS,
+    clientFactory = (endpoint) => new BrowserNodeClient(endpoint),
+  } = {}) {
+    if (!Number.isSafeInteger(maxClients) || maxClients < 1) {
+      throw new Error("WebRTC client pool size must be a positive integer");
+    }
+    if (typeof clientFactory !== "function") {
+      throw new Error("WebRTC client pool factory must be a function");
+    }
+    this.maxClients = maxClients;
+    this.clientFactory = clientFactory;
+    this.entries = new Map();
+    this.waiters = [];
+    this.clock = 0;
+    this.closed = false;
+  }
+
+  get size() {
+    return this.entries.size;
+  }
+
+  async withClient(endpoint, operation) {
+    if (typeof operation !== "function") {
+      throw new Error("WebRTC client pool operation must be a function");
+    }
+    const entry = await this.acquire(endpoint);
+    try {
+      return await operation(entry.client);
+    } finally {
+      this.release(entry);
+    }
+  }
+
+  async acquire(endpoint) {
+    const key = endpointKey(endpoint);
+    for (;;) {
+      if (this.closed) throw new Error("WebRTC client pool is closed");
+
+      const existing = this.entries.get(key);
+      if (existing) {
+        existing.active += 1;
+        existing.lastUsed = ++this.clock;
+        return existing;
+      }
+
+      if (this.entries.size < this.maxClients) {
+        const entry = {
+          key,
+          client: this.clientFactory(endpoint),
+          active: 1,
+          lastUsed: ++this.clock,
+        };
+        this.entries.set(key, entry);
+        return entry;
+      }
+
+      let oldestIdle;
+      for (const candidate of this.entries.values()) {
+        if (
+          candidate.active === 0 &&
+          (!oldestIdle || candidate.lastUsed < oldestIdle.lastUsed)
+        ) {
+          oldestIdle = candidate;
+        }
+      }
+      if (oldestIdle) {
+        this.entries.delete(oldestIdle.key);
+        oldestIdle.client.close();
+        continue;
+      }
+
+      await new Promise((resolve) => this.waiters.push(resolve));
+    }
+  }
+
+  release(entry) {
+    entry.active = Math.max(0, entry.active - 1);
+    entry.lastUsed = ++this.clock;
+    this.waiters.shift()?.();
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    for (const entry of this.entries.values()) entry.client.close();
+    this.entries.clear();
+    for (const wake of this.waiters.splice(0)) wake();
+  }
+}
+
 export async function iterativeFindClosest(
   seedEndpoints,
   target,
-  { k = 20, alpha = 3, maxIterations = 20, onProgress = () => {} } = {},
+  {
+    k = 20,
+    alpha = 3,
+    maxIterations = 20,
+    onProgress = () => {},
+    clientPool,
+  } = {},
 ) {
   hexToBytes(target, 32);
   if (!Array.isArray(seedEndpoints) || seedEndpoints.length === 0) {
     throw new Error("At least one seed endpoint is required");
   }
 
-  const clients = new Map();
+  const ownsClientPool = clientPool === undefined;
+  const pool = clientPool ?? new BrowserNodeClientPool();
   const failures = [];
   const seedNodes = [];
-
-  const clientFor = (endpoint) => {
-    const key = endpointKey(endpoint);
-    let client = clients.get(key);
-    if (!client) {
-      client = new BrowserNodeClient(endpoint);
-      clients.set(key, client);
-    }
-    return client;
-  };
 
   await Promise.all(
     seedEndpoints.map(async (endpoint) => {
       const seedName =
-        typeof endpoint === "string" ? endpoint : endpoint?.multiaddr ?? "seed";
+        typeof endpoint === "string"
+          ? endpoint
+          : (endpoint?.multiaddr ?? "seed");
       try {
-        const client = clientFor(endpoint);
-        const hello = await client.hello();
+        const hello = await pool.withClient(endpoint, (client) =>
+          client.hello(),
+        );
         seedNodes.push({
           peer_id: hello.peer_id,
           native_addresses: [],
           reliability: 1,
-          webtransport: hello.endpoint,
+          webrtc_direct: hello.endpoint,
         });
         onProgress(`Connected seed ${hello.peer_id}`);
       } catch (error) {
@@ -482,38 +925,59 @@ export async function iterativeFindClosest(
     }),
   );
   if (seedNodes.length === 0) {
-    for (const client of clients.values()) client.close();
+    if (ownsClientPool) pool.close();
     const detail = failures.map(({ error }) => error.message).join("; ");
-    throw new Error(`Could not connect to any WebTransport seed: ${detail}`);
+    throw new Error(`Could not connect to any WebRtcDirect seed: ${detail}`);
   }
 
-  const lookup = new BrowserIterativeLookupNative(target, k, alpha, maxIterations);
-  lookup.addCandidates(seedNodes);
-  await lookup.run(async ({ target: lookupTarget, count, iteration, candidates }) =>
-    Promise.all(
-      candidates.map(async (candidate) => {
-        try {
-          const candidateClient = clientFor(candidate.webtransport);
-          if (!candidateClient.peerId) await candidateClient.hello();
-          const nodes = await candidateClient.findNode(lookupTarget, count);
-          onProgress(
-            `Iteration ${iteration}: ${candidate.peer_id} returned ${nodes.length} nodes`,
-          );
-          return {
-            status: "succeeded",
-            responder: candidate.peer_id,
-            candidates: nodes,
-          };
-        } catch (error) {
-          failures.push({ peerId: candidate.peer_id, error });
-          onProgress(`Query ${candidate.peer_id} failed: ${error.message}`);
-          return { status: "failed", responder: candidate.peer_id };
-        }
-      }),
-    ),
+  const lookup = new BrowserIterativeLookupNative(
+    target,
+    k,
+    alpha,
+    maxIterations,
   );
+  lookup.addCandidates(seedNodes);
+  try {
+    await lookup.run(
+      async ({ target: lookupTarget, count, iteration, candidates }) =>
+        Promise.all(
+          candidates.map(async (candidate) => {
+            try {
+              const nodes = await pool.withClient(
+                candidate.webrtc_direct,
+                async (client) => {
+                  if (!client.peerId) await client.hello();
+                  return client.findNode(lookupTarget, count);
+                },
+              );
+              onProgress(
+                `Iteration ${iteration}: ${candidate.peer_id} returned ${nodes.length} nodes`,
+              );
+              return {
+                status: "succeeded",
+                responder: candidate.peer_id,
+                candidates: nodes,
+              };
+            } catch (error) {
+              failures.push({ peerId: candidate.peer_id, error });
+              onProgress(`Query ${candidate.peer_id} failed: ${error.message}`);
+              return { status: "failed", responder: candidate.peer_id };
+            }
+          }),
+        ),
+    );
 
-  return { nodes: lookup.results(), queried: lookup.queriedPeers(), failures, clients };
+    return {
+      nodes: lookup.results(),
+      queried: lookup.queriedPeers(),
+      failures,
+      clientPool: pool,
+      ownsClientPool,
+    };
+  } catch (error) {
+    if (ownsClientPool) pool.close();
+    throw error;
+  }
 }
 
 export async function getChunkFromClosest(
@@ -530,33 +994,32 @@ export async function getChunkFromClosest(
 
   try {
     for (const node of lookup.nodes) {
-      if (!node.webtransport) continue;
-      const endpoint = node.webtransport;
-      const key = endpointKey(endpoint);
-      let client = lookup.clients.get(key);
-      if (!client) {
-        client = new BrowserNodeClient(endpoint);
-        lookup.clients.set(key, client);
-      }
-
+      if (!node.webrtc_direct) continue;
       try {
-        if (!client.peerId) await client.hello();
         onProgress(`Requesting ${address} from ${node.peer_id}`);
-        const chunk = await client.getChunk(address);
+        const chunk = await lookup.clientPool.withClient(
+          node.webrtc_direct,
+          async (client) => {
+            if (!client.peerId) await client.hello();
+            return client.getChunk(address);
+          },
+        );
         return { ...chunk, node, lookup };
       } catch (error) {
         attempted.push({ peerId: node.peer_id, error });
-        onProgress(`Node ${node.peer_id} did not return the file: ${error.message}`);
+        onProgress(
+          `Node ${node.peer_id} did not return the file: ${error.message}`,
+        );
       }
     }
   } finally {
-    for (const client of lookup.clients.values()) client.close();
+    if (lookup.ownsClientPool) lookup.clientPool.close();
   }
 
   const detail = attempted
     .map(({ peerId, error }) => `${peerId}: ${error.message}`)
     .join("; ");
   throw new Error(
-    `No closest WebTransport node returned chunk ${address}${detail ? ` (${detail})` : ""}`,
+    `No closest WebRtcDirect node returned chunk ${address}${detail ? ` (${detail})` : ""}`,
   );
 }

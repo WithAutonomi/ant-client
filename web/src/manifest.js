@@ -1,6 +1,6 @@
-import { hexToBytes, parseWebTransportMultiaddr } from "./protocol.js";
+import { hexToBytes, parseWebRtcDirectMultiaddr } from "./protocol.js";
 
-export const BROWSER_MANIFEST_VERSION = 4;
+export const BROWSER_MANIFEST_VERSION = 5;
 const MAX_PUBLIC_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_DATA_MAP_BYTES = 4 * 1024 * 1024;
 const MAX_FILE_CHUNKS = 1024;
@@ -13,10 +13,10 @@ export function parseBrowserManifest(value) {
     throw new Error("Browser manifest has no network ID");
   }
   if (!Array.isArray(value.endpoints) || value.endpoints.length === 0) {
-    throw new Error("Browser manifest contains no WebTransport endpoints");
+    throw new Error("Browser manifest contains no WebRtcDirect endpoints");
   }
   const endpoints = value.endpoints.map((endpoint) => {
-    const parsed = parseWebTransportMultiaddr(endpoint);
+    const parsed = parseWebRtcDirectMultiaddr(endpoint);
     return { multiaddr: parsed.multiaddr };
   });
   const payment = parsePaymentNetwork(value.payment);

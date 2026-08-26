@@ -224,7 +224,7 @@ export function verifyStorageQuote(quote, expectedAddress, expectedPeerId) {
     throw new Error("Storage quote is for a different chunk");
   }
   if (quote.peer_id?.toLowerCase() !== expectedPeerId.toLowerCase()) {
-    throw new Error("Storage quote belongs to a different WebTransport peer");
+    throw new Error("Storage quote belongs to a different WebRtcDirect peer");
   }
   const publicKey = hexToBytes(quote.public_key);
   const signature = hexToBytes(quote.signature);
