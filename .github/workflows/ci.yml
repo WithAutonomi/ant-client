@@ -99,14 +99,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Ubuntu runner is consistently slower than macOS for the 35-node
     # merkle testnet (each test spins up a fresh testnet, ~5 min each
-    # on Ubuntu vs ~3 min on macOS). The previous 20-min cap was
-    # hitting timeout on Ubuntu before the 4th test could run (also
-    # affecting main — see runs prior to 2026-04-30), and the 40-min
-    # cap that replaced it was grazed at 4 tests (a timeout flake on
-    # PR #167's first run). ADR-0003 added two external multi-batch
-    # tests (6 total), so the bound is sized for 6 × ~5 min plus
-    # build/setup headroom.
-    timeout-minutes: 60
+    # on Ubuntu vs ~3 min on macOS). This cap has been outgrown three
+    # times: 20 min timed out on Ubuntu before the 4th test (runs prior
+    # to 2026-04-30), 40 min was grazed at 4 tests (PR #167), and 60 min
+    # was breached with the ADR-0003 six-test suite (PR #174: macOS
+    # passed at 57m09s, Ubuntu canceled at 60m20s mid-run with no test
+    # failure — V2-1046). 90 min gives the observed ~60-min runtime real
+    # headroom while still catching genuine hangs (the neighboring E2E
+    # job has no explicit cap at all, so 90 remains the tighter bound).
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

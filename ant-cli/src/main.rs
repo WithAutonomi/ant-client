@@ -13,8 +13,8 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 use ant_core::data::{
     peer_cache::{self, BootstrapAddressFilter},
-    Client, ClientConfig, CoreNodeConfig, CustomNetwork, DevnetManifest, EvmAddress, EvmNetwork,
-    IPDiversityConfig, MultiAddr, NodeMode, P2PNode, Wallet, MAX_WIRE_MESSAGE_SIZE,
+    Client, ClientConfig, CoreNodeConfig, DevnetManifest, EvmNetwork, IPDiversityConfig, MultiAddr,
+    NodeMode, P2PNode, Wallet, MAX_WIRE_MESSAGE_SIZE,
 };
 use cli::{Cli, Commands};
 
@@ -183,7 +183,7 @@ struct DataCliContext {
     quote_timeout_secs: u64,
     store_timeout_secs: Option<u64>,
     chunk_get_timeout_secs: Option<u64>,
-    evm_network: String,
+    evm_network: Option<String>,
     quote_concurrency: Option<usize>,
     store_concurrency: Option<usize>,
 }
@@ -212,7 +212,7 @@ async fn build_data_client(
     }
 
     let manifest = load_manifest(ctx)?;
-    let bootstrap = resolve_bootstrap_from(ctx, manifest.as_ref())?;
+    let bootstrap = ant_core::config::resolve_bootstrap_peers(&ctx.bootstrap, manifest.as_ref())?;
     // Explicit network selectors should be isolated from the general client
     // peer cache. `--bootstrap` and `--devnet-manifest` both mean "use exactly
     // this network entrypoint", so cached public-network peers must not be
@@ -360,7 +360,7 @@ async fn build_data_client(
         let key = private_key
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("SECRET_KEY environment variable required"))?;
-        let network = resolve_evm_network(&ctx.evm_network, manifest.as_ref())?;
+        let network = resolve_evm_network(ctx.evm_network.as_deref(), manifest.as_ref())?;
         let wallet = create_wallet(key, network)?;
         info!("Wallet configured for EVM payments");
         client = client.with_wallet(wallet);
@@ -414,80 +414,30 @@ fn resolve_evm_network_and_manifest(
     ctx: &DataCliContext,
 ) -> anyhow::Result<(EvmNetwork, Option<DevnetManifest>)> {
     let manifest = load_manifest(ctx)?;
-    let network = resolve_evm_network(&ctx.evm_network, manifest.as_ref())?;
+    let network = resolve_evm_network(ctx.evm_network.as_deref(), manifest.as_ref())?;
     Ok((network, manifest))
 }
 
+/// Resolve the EVM network through ant-core, with a CLI-side warning for
+/// the one remaining silent-discard path: a devnet manifest that carries
+/// an EVM block while a preset network is selected (V2-471).
 fn resolve_evm_network(
-    evm_network: &str,
+    evm_network: Option<&str>,
     manifest: Option<&DevnetManifest>,
 ) -> anyhow::Result<EvmNetwork> {
-    match evm_network {
-        "arbitrum-one" => Ok(EvmNetwork::ArbitrumOne),
-        "arbitrum-sepolia" => Ok(EvmNetwork::ArbitrumSepoliaTest),
-        "local" => {
-            if let Some(m) = manifest {
-                if let Some(ref evm) = m.evm {
-                    let rpc_url: reqwest::Url = evm
-                        .rpc_url
-                        .parse()
-                        .map_err(|e| anyhow::anyhow!("Invalid RPC URL: {e}"))?;
-                    let token_addr: EvmAddress = evm
-                        .payment_token_address
-                        .parse()
-                        .map_err(|e| anyhow::anyhow!("Invalid token address: {e}"))?;
-                    let vault_addr: EvmAddress = evm
-                        .payment_vault_address
-                        .parse()
-                        .map_err(|e| anyhow::anyhow!("Invalid payment vault address: {e}"))?;
-                    return Ok(EvmNetwork::Custom(CustomNetwork {
-                        rpc_url_http: rpc_url,
-                        payment_token_address: token_addr,
-                        payment_vault_address: vault_addr,
-                    }));
-                }
-            }
-            anyhow::bail!("EVM network 'local' requires --devnet-manifest with EVM info")
-        }
-        other => {
-            anyhow::bail!(
-                "Unsupported EVM network: {other}. Use 'arbitrum-one', 'arbitrum-sepolia', or 'local'."
-            )
+    if let (Some(m), Some(name)) = (manifest, evm_network) {
+        if m.evm.is_some() && name != "local" {
+            eprintln!(
+                "warning: the devnet manifest contains an EVM block, but \
+                 --evm-network={name} selects a preset; the manifest's EVM \
+                 config is ignored. Pass --evm-network local to use it."
+            );
         }
     }
-}
-
-/// Resolve bootstrap peers from a pre-loaded manifest.
-///
-/// Priority: CLI `--bootstrap` > devnet manifest > `bootstrap_peers.toml` config file.
-fn resolve_bootstrap_from(
-    ctx: &DataCliContext,
-    manifest: Option<&DevnetManifest>,
-) -> anyhow::Result<Vec<SocketAddr>> {
-    if !ctx.bootstrap.is_empty() {
-        return Ok(ctx.bootstrap.clone());
-    }
-
-    if let Some(m) = manifest {
-        let bootstrap: Vec<SocketAddr> = m
-            .bootstrap
-            .iter()
-            .filter_map(MultiAddr::socket_addr)
-            .collect();
-        return Ok(bootstrap);
-    }
-
-    if let Some(peers) = ant_core::config::load_bootstrap_peers()
-        .map_err(|e| anyhow::anyhow!("Failed to load bootstrap config: {e}"))?
-    {
-        info!("Loaded {} bootstrap peer(s) from config file", peers.len());
-        return Ok(peers);
-    }
-
-    anyhow::bail!(
-        "No bootstrap peers provided. Use --bootstrap, --devnet-manifest, \
-         or install bootstrap_peers.toml to your config directory."
-    )
+    Ok(ant_core::config::resolve_evm_network(
+        evm_network,
+        manifest,
+    )?)
 }
 
 async fn create_client_node(

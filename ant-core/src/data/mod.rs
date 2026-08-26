@@ -11,7 +11,7 @@ pub mod peer_cache;
 pub use client::cache::ChunkCache;
 pub use client::{Client, ClientConfig};
 pub use error::{Error, Result};
-pub use network::Network;
+pub use network::{Network, NetworkHealth, REBOOTSTRAP_THRESHOLD};
 
 // LocalDevnet (and the optional node-side dep it pulls in) is gated behind
 // the `devnet` feature. Default builds of ant-core do not link ant-node.
@@ -29,8 +29,9 @@ pub use client::data::DataUploadResult;
 pub use client::file::{
     CostEstimateConfidence, DownloadEvent, ExternalChunkStore, ExternalPaymentInfo,
     FileChunkPeerReport, FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport,
-    FileDownloadWithPeerReport, FileUploadResult, PreparedUpload, UploadCostEstimate, UploadEvent,
-    Visibility,
+    FileDownloadWithPeerReport, FileUploadResult, FinalizeOutcome, FinalizeResume,
+    MerkleFinalizeResume, PreparedUpload, UploadCostEstimate, UploadEvent, Visibility,
+    WaveFinalizeResume,
 };
 pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
