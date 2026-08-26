@@ -528,7 +528,7 @@ fn map_quote_response(
 /// must be ours, and the stated minimum must genuinely exceed it. A peer that
 /// fails either is confused or lying, and is treated as an ordinary bad peer
 /// rather than as evidence about this build.
-fn settlement_refusal_error(
+pub(super) fn settlement_refusal_error(
     peer_id: &PeerId,
     client_settlement_version: u32,
     min_settlement_version: u32,

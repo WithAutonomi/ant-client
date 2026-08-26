@@ -7,6 +7,7 @@
 use crate::data::client::adaptive::{observe_op, Outcome};
 use crate::data::client::classify_error;
 use crate::data::client::file::UploadEvent;
+use crate::data::client::quote::settlement_refusal_error;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{
@@ -175,6 +176,39 @@ fn pool_commitment_with_payment_multiplier(
 /// about this request, it already carries wording aimed at the person running
 /// the upload, and it must not be retried in a shape that would get a quote
 /// anyway.
+/// Which failure a fully drained set of candidate pools should report.
+///
+/// Pools are drained rather than short-circuited, so more than one can fail.
+/// A refusal outranks an ordinary failure: if one pool runs out of peers while
+/// another declares this client unable to settle, the second is the answer that
+/// keeps the caller from falling back to a payment path and spending.
+#[derive(Default)]
+struct PoolVerdict {
+    refusal: Option<Error>,
+    first_failure: Option<Error>,
+}
+
+impl PoolVerdict {
+    fn note(&mut self, e: Error) {
+        match e {
+            e @ Error::ClientUpdateRequired(_) => {
+                if self.refusal.is_none() {
+                    self.refusal = Some(e);
+                }
+            }
+            e => {
+                if self.first_failure.is_none() {
+                    self.first_failure = Some(e);
+                }
+            }
+        }
+    }
+
+    fn into_error(self) -> Option<Error> {
+        self.refusal.or(self.first_failure)
+    }
+}
+
 fn map_merkle_candidate_response(
     peer_id: PeerId,
     body: ChunkMessageBody,
@@ -189,9 +223,22 @@ fn map_merkle_candidate_response(
                 "Failed to deserialize candidate node from {peer_id}: {e}"
             )))),
         },
+        // Validated, not taken at face value. A refusal is unauthenticated and
+        // two of them latch this client for its whole run, so the merkle path
+        // applies the same coherence check as the single-node one: the echoed
+        // version must be ours and the stated minimum must genuinely exceed it.
+        // Without it, two faulty or hostile candidates could deny every upload
+        // with a refusal that does not describe this client at all.
         ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(
-            refusal @ ProtocolError::ClientUpdateRequired { .. },
-        )) => Some(Err(Error::ClientUpdateRequired(refusal.to_string()))),
+            ProtocolError::ClientUpdateRequired {
+                client_settlement_version,
+                min_settlement_version,
+            },
+        )) => Some(Err(settlement_refusal_error(
+            &peer_id,
+            client_settlement_version,
+            min_settlement_version,
+        ))),
         ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(
             behind @ ProtocolError::StorerUpdateRequired { .. },
         )) => Some(Err(Error::StorerUpdateRequired(behind.to_string()))),
@@ -1095,9 +1142,27 @@ impl Client {
             });
         }
 
+        // Drained rather than short-circuited. Returning on the first error
+        // would drop `pool_futures`, cancelling every pool still in flight, and
+        // one of those may be carrying the second refusal that corroborates a
+        // verdict about this client. A refusal lost that way is a refusal the
+        // latch never sees, and the caller can fall back to wave payment and
+        // spend. This is the same rule the single-node collector follows: stop
+        // making progress, but never drop a verdict that is already in flight.
+        //
+        // A refusal outranks an ordinary failure for the same reason. If one
+        // pool runs out of peers while another declares this client unable to
+        // settle, the second is the answer worth returning.
         let mut pools = Vec::with_capacity(midpoint_proofs.len());
+        let mut verdict = PoolVerdict::default();
         while let Some(result) = pool_futures.next().await {
-            pools.push(result?);
+            match result {
+                Ok(pool) => pools.push(pool),
+                Err(e) => verdict.note(e),
+            }
+        }
+        if let Some(e) = verdict.into_error() {
+            return Err(e);
         }
 
         Ok(pools)
@@ -3515,5 +3580,102 @@ mod tests {
         assert!(outcome.stored_addresses.is_empty());
         assert!(outcome.failed_addresses.is_empty());
         assert!(outcome.fatal.is_none());
+    }
+
+    // =========================================================================
+    // Settlement refusals on the merkle path
+    // =========================================================================
+
+    /// A refusal is unauthenticated and two of them latch this client for the
+    /// rest of its run, so the merkle path must apply the same coherence check
+    /// the single-node path applies. Without it, two faulty or hostile
+    /// candidates could deny every upload with a refusal that is not about this
+    /// client at all.
+    #[test]
+    fn a_merkle_refusal_that_does_not_describe_this_client_is_ignored() {
+        use ant_protocol::CURRENT_SETTLEMENT_VERSION;
+
+        let peer_id = PeerId::from_bytes([0x71; 32]);
+        let refusal = |client: u32, min: u32| {
+            map_merkle_candidate_response(
+                peer_id,
+                ChunkMessageBody::MerkleCandidateQuoteResponse(
+                    MerkleCandidateQuoteResponse::Error(ProtocolError::ClientUpdateRequired {
+                        client_settlement_version: client,
+                        min_settlement_version: min,
+                    }),
+                ),
+            )
+        };
+
+        // Echoes a version that is not ours: the peer is talking about someone
+        // else's request.
+        let wrong_echo = refusal(
+            CURRENT_SETTLEMENT_VERSION.saturating_add(7),
+            CURRENT_SETTLEMENT_VERSION.saturating_add(8),
+        );
+        assert!(
+            matches!(wrong_echo, Some(Err(Error::Protocol(_)))),
+            "{wrong_echo:?}"
+        );
+
+        // States a minimum this client already meets, so there is nothing to
+        // refuse.
+        let no_gap = refusal(CURRENT_SETTLEMENT_VERSION, CURRENT_SETTLEMENT_VERSION);
+        assert!(
+            matches!(no_gap, Some(Err(Error::Protocol(_)))),
+            "{no_gap:?}"
+        );
+
+        // A coherent one is believed, and still carries the upgrade wording.
+        match refusal(
+            CURRENT_SETTLEMENT_VERSION,
+            CURRENT_SETTLEMENT_VERSION.saturating_add(1),
+        ) {
+            Some(Err(Error::ClientUpdateRequired(msg))) => {
+                assert!(msg.contains("ant update"), "{msg}");
+            }
+            other => panic!("expected ClientUpdateRequired, got {other:?}"),
+        }
+    }
+
+    /// Pools are drained rather than cancelled on the first error, so more than
+    /// one can fail. A refusal has to win: reporting the ordinary failure
+    /// instead would hide the one verdict that stops the caller falling back to
+    /// another payment path and spending.
+    #[test]
+    fn a_refusal_outranks_an_ordinary_pool_failure() {
+        let refusal = || Error::ClientUpdateRequired("run ant update".to_string());
+        let ordinary = || Error::InsufficientPeers("need 16, got 2".to_string());
+
+        // Ordinary failure first, refusal second.
+        let mut verdict = PoolVerdict::default();
+        verdict.note(ordinary());
+        verdict.note(refusal());
+        assert!(
+            matches!(verdict.into_error(), Some(Error::ClientUpdateRequired(_))),
+            "a later refusal must still outrank an earlier failure"
+        );
+
+        // Refusal first, ordinary failure second. Order must not matter.
+        let mut verdict = PoolVerdict::default();
+        verdict.note(refusal());
+        verdict.note(ordinary());
+        assert!(
+            matches!(verdict.into_error(), Some(Error::ClientUpdateRequired(_))),
+            "an earlier refusal must not be displaced by a later failure"
+        );
+
+        // With no refusal, the first ordinary failure is what the caller sees.
+        let mut verdict = PoolVerdict::default();
+        verdict.note(ordinary());
+        verdict.note(Error::Protocol("second".to_string()));
+        assert!(
+            matches!(verdict.into_error(), Some(Error::InsufficientPeers(_))),
+            "the first ordinary failure is the one reported"
+        );
+
+        // Every pool succeeded, so there is nothing to report.
+        assert!(PoolVerdict::default().into_error().is_none());
     }
 }
