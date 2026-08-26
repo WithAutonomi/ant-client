@@ -339,9 +339,14 @@ impl Connection {
         let offer = JsFuture::from(connection.peer_connection.create_offer())
             .await
             .map_err(js_error_message)?;
-        let offer: RtcSessionDescriptionInit = offer.dyn_into().map_err(js_error_message)?;
-        let offer_sdp = offer
-            .get_sdp()
+        // `RTCSessionDescriptionInit` is a Web IDL dictionary, not a branded
+        // interface. Chromium returns a plain object here, so `dyn_into` can
+        // reject a perfectly valid offer because there is no `instanceof`
+        // identity to test. Read the dictionary member structurally instead.
+        let offer_sdp = js_sys::Reflect::get(&offer, &JsValue::from_str("sdp"))
+            .map_err(js_error_message)?
+            .as_string()
+            .filter(|sdp| !sdp.is_empty())
             .ok_or_else(|| "browser created an empty WebRTC offer".to_string())?;
         let munged_sdp = munge_offer_ice_credentials(&offer_sdp, &credential)
             .map_err(|error| error.to_string())?;

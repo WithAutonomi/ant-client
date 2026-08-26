@@ -11,12 +11,16 @@
     "prebuild": "npm run wasm:release",
     "build": "vite build",
     "pretest": "npm run wasm:dev",
-    "test": "node --import ./setup-wasm.js --test"
+    "test": "node --import ./setup-wasm.js --test",
+    "test:browser:install": "playwright install chromium",
+    "pretest:browser": "playwright install chromium",
+    "test:browser": "playwright test"
   },
   "dependencies": {
     "ethers": "^6.17.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "vite": "8.2.0"
   }
 }
