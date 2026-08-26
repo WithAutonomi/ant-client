@@ -15,14 +15,19 @@ crate-type = ["rlib", "cdylib"]
 # the browser-WASM target; native networking and node management stay behind
 # the `native` feature below.
 blake3 = "1"
+base64 = "0.22"
 bytes = "1"
 hex = "0.4"
+postcard = { version = "1.1.3", features = ["use-std"] }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
+serde_json = "1"
 self_encryption = "0.36"
 saorsa-dht-lookup = { version = "0.1.0", path = "../../saorsa-core-web-support/crates/saorsa-dht-lookup" }
 thiserror = "2"
+tiny-keccak = { version = "2", features = ["keccak"] }
+url = "2"
 
 # Node management
 async-stream = { version = "0.3", optional = true }
@@ -30,10 +35,10 @@ axum = { version = "0.8", optional = true }
 flate2 = { version = "1", optional = true }
 fs2 = { version = "0.4", optional = true }
 futures-core = { version = "0.3", optional = true }
+futures-channel = { version = "0.3", optional = true }
 futures-util = { version = "0.3", optional = true }
 self-replace = { version = "1", optional = true }
 semver = { version = "1", optional = true }
-serde_json = { version = "1", optional = true }
 reqwest = { version = "0.12", features = ["json", "stream"], optional = true }
 tar = { version = "0.4", optional = true }
 tempfile = { version = "3", optional = true }
@@ -53,7 +58,6 @@ tower-http = { version = "0.6.8", features = ["cors"], optional = true }
 ant-protocol = { version = "2.3.1", optional = true }
 xor_name = { version = "5", optional = true }
 futures = { version = "0.3", optional = true }
-postcard = { version = "1.1.3", features = ["use-std"], optional = true }
 tracing = { version = "0.1", optional = true }
 lru = { version = "0.16", optional = true }
 rand = { version = "0.8", optional = true }
@@ -83,6 +87,23 @@ js-sys = { version = "0.3", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "Event",
+    "MessageEvent",
+    "RtcConfiguration",
+    "RtcDataChannel",
+    "RtcDataChannelInit",
+    "RtcDataChannelState",
+    "RtcDataChannelType",
+    "RtcPeerConnection",
+    "RtcSdpType",
+    "RtcSessionDescriptionInit",
+] }
+gloo-timers = { version = "0.3", features = ["futures"], optional = true }
+# `ant-protocol` currently pulls native Tokio networking on wasm32. Use the
+# same FIPS-204 primitive as `saorsa-pqc` for verification-only browser builds
+# until ant-protocol's pure wire layer can be built independently of transport.
+fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-65"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # self_encryption/rand use getrandom 0.2. Browser entropy is supplied by the
@@ -114,12 +135,10 @@ native = [
     "dep:futures-core",
     "dep:futures-util",
     "dep:lru",
-    "dep:postcard",
     "dep:rand",
     "dep:reqwest",
     "dep:self-replace",
     "dep:semver",
-    "dep:serde_json",
     "dep:sysinfo",
     "dep:tar",
     "dep:tempfile",
@@ -135,10 +154,15 @@ native = [
 ]
 browser-wasm = [
     "dep:console_error_panic_hook",
+    "dep:futures-channel",
+    "dep:futures-util",
+    "dep:gloo-timers",
     "dep:js-sys",
+    "dep:fips204",
     "dep:serde-wasm-bindgen",
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
+    "dep:web-sys",
 ]
 # Enable `LocalDevnet` (ant-core/src/node/devnet.rs) which wraps
 # `ant_node::devnet::Devnet` and an Anvil EVM testnet.

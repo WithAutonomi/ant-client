@@ -1,14 +1,11 @@
 import "./style.css";
-import initAntCore from "../pkg/ant_core.js";
 import {
+  BrowserNetworkClient,
   BrowserNodeClient,
-  bytesToHex,
-  hexToBytes,
-  iterativeFindClosest,
-} from "./protocol.js";
-import { downloadPublicFile } from "./file.js";
+  default as initAntCore,
+} from "../pkg/ant_core.js";
 import { fetchBrowserManifest } from "./manifest.js";
-import { uploadPublicFile } from "./upload.js";
+import { payForStorageQuotes } from "./payment.js";
 
 await initAntCore();
 
@@ -44,6 +41,7 @@ const elements = {
 };
 
 let client;
+let networkClient;
 let browserManifest;
 let downloadObjectUrl;
 
@@ -62,12 +60,6 @@ function endpointFromForm() {
   return elements.endpointMultiaddr.value.trim();
 }
 
-function seedEndpoints() {
-  return browserManifest?.endpoints?.length
-    ? browserManifest.endpoints
-    : [endpointFromForm()];
-}
-
 async function loadManifest() {
   elements.manifestState.classList.remove("connected");
   elements.manifestState.textContent = "Loading…";
@@ -75,6 +67,8 @@ async function loadManifest() {
     elements.manifestUrl.value.trim(),
   );
   browserManifest = manifest;
+  networkClient?.close();
+  networkClient = new BrowserNetworkClient(manifest.endpoints);
 
   const first = manifest.endpoints[0];
   elements.endpointMultiaddr.value = first.multiaddr;
@@ -150,18 +144,9 @@ elements.findClosest.addEventListener("click", async () => {
     const target = elements.lookupTarget.value.trim();
     hexToBytes(target, 32);
     log(`Starting iterative lookup for ${target}`);
-    const result = await iterativeFindClosest(seedEndpoints(), target, {
-      onProgress: (message) => log(message),
-    });
-    log("Closest nodes", {
-      nodes: result.nodes,
-      queried: result.queried,
-      failures: result.failures.map(({ peerId, error }) => ({
-        peerId,
-        message: error.message,
-      })),
-    });
-    if (result.ownsClientPool) result.clientPool.close();
+    if (!networkClient) throw new Error("Load the browser testnet manifest first");
+    const result = await networkClient.findClosest(target, (message) => log(message));
+    log("Closest nodes", result);
   } catch (error) {
     reportError("Lookup", error);
   }
@@ -182,17 +167,20 @@ elements.uploadFile.addEventListener("click", async () => {
     if (!walletSecret) throw new Error("Enter the paying wallet secret key");
 
     log(`Starting paid public upload for ${file.name}`);
-    const result = await uploadPublicFile(
-      seedEndpoints(),
+    if (!networkClient) throw new Error("Browser network client is not ready");
+    const content = new Uint8Array(await file.arrayBuffer());
+    const onProgress = (message) => {
+      elements.uploadState.textContent = message;
+      log(message);
+    };
+    const result = await networkClient.uploadPublicFile(
+      content,
+      file.name,
+      file.type,
       browserManifest.payment,
-      file,
-      walletSecret,
-      {
-        onProgress: (message) => {
-          elements.uploadState.textContent = message;
-          log(message);
-        },
-      },
+      (paymentNetwork, quotes) =>
+        payForStorageQuotes(paymentNetwork, quotes, walletSecret, { onProgress }),
+      onProgress,
     );
 
     browserManifest.files = [
@@ -245,12 +233,11 @@ elements.downloadFile.addEventListener("click", async () => {
     log(
       `Downloading complete public file ${published.name} (${published.size.toLocaleString()} bytes)`,
     );
-    const { content, hash, dataMapNode } = await downloadPublicFile(
-      seedEndpoints(),
+    if (!networkClient) throw new Error("Browser network client is not ready");
+    const { content, hash, dataMapNode } = await networkClient.downloadPublicFile(
       published,
-      {
-        onProgress: (message) => log(message),
-      },
+      3,
+      (message) => log(message),
     );
     const savedDirectly = await exposeSavedFile(published, content, saveHandle);
     elements.downloadState.textContent = `${
@@ -313,7 +300,27 @@ async function exposeSavedFile(file, content, saveHandle) {
 
 window.addEventListener("beforeunload", () => {
   if (downloadObjectUrl) URL.revokeObjectURL(downloadObjectUrl);
+  client?.close();
+  networkClient?.close();
 });
+
+function bytesToHex(bytes) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function hexToBytes(value, expectedLength) {
+  const normalized = value.trim().replace(/^0x/i, "").replaceAll(":", "");
+  if (!/^[0-9a-f]*$/i.test(normalized) || normalized.length % 2 !== 0) {
+    throw new Error("Expected an even-length hexadecimal value");
+  }
+  const bytes = Uint8Array.from(
+    normalized.match(/.{2}/g)?.map((pair) => Number.parseInt(pair, 16)) ?? [],
+  );
+  if (expectedLength !== undefined && bytes.length !== expectedLength) {
+    throw new Error(`Expected ${expectedLength} bytes, received ${bytes.length}`);
+  }
+  return bytes;
+}
 
 elements.randomTarget.click();
 log("Ready. Loading the local browser testnet manifest…");
