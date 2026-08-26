@@ -3,11 +3,12 @@
 This web application is the browser-facing client for ADR-0009. It loads a
 local testnet bootstrap manifest, connects directly to storage nodes over
 WebRTC Direct, and performs closest-node lookup through Saorsa's shared Rust
-lookup engine. The portable part of `ant-core` is compiled to WASM and drives
-the Kademlia walk, native self-encryption, public DataMap serialization,
-reconstruction, and BLAKE3 content verification. The thin JavaScript layer
-executes WebRTC Direct requests, retrieves and uploads records, uses the browser
-wallet/payment APIs, and drives the page.
+lookup engine. `ant-core` is compiled to WASM and owns the WebRTC peer
+connections and data channels, wire framing, authenticated HELLO, connection
+pool, Kademlia walk, native self-encryption, quote and commitment verification,
+payment planning, record upload/download, public DataMap serialization,
+reconstruction, and BLAKE3 content verification. JavaScript drives the page,
+browser file/save APIs, and Ethers transaction submission.
 
 The node-side WebRTC Direct listener and testnet manifest API live in the
 `ant-node-web-support` sibling repository. No HTTP gateway performs lookup or
@@ -23,7 +24,8 @@ proxies file bytes.
   extracts the stable certificate fingerprint from each node multiaddress.
 
 Nodes serialize these addresses from the native `saorsa_core::MultiAddr`
-representation; the JavaScript parser consumes that canonical string form.
+representation; the shared Rust client parser consumes that canonical string
+form in WASM.
 
 Install the WASM build tools once if needed:
 
@@ -89,14 +91,16 @@ manifest from port 25000 and fills in the default file:
 1. **Load testnet** refreshes the manifest and direct multiaddress catalog.
 2. **Connect** parses the first node multiaddress and performs a pinned
    WebRTC Direct `HELLO` and verifies its ML-DSA identity signature.
-3. **Find closest** runs Saorsa's iterative lookup engine in WASM, with
-   JavaScript executing its WebRTC Direct query batches.
+3. **Find closest** runs Saorsa's iterative lookup engine and WebRTC Direct
+   query batches entirely in Rust/WASM.
 4. Under **Paid public file upload**, choose a file, paste the funded private
    key printed by ant-devnet, then select **Pay and upload file**. Rust/WASM
-   performs encryption and DataMap generation; quote/commitment verification,
-   approval, and payment happen locally in the browser. The key field is
-   cleared immediately and the resulting public DataMap address is placed in
-   the download field.
+   performs encryption, DataMap generation, closest-node selection,
+   quote/commitment verification, payment-total calculation, and storage. A
+   narrow JavaScript callback uses Ethers for token approval and the wallet
+   transaction; Rust verifies the callback's reported total before continuing.
+   The key field is cleared immediately and the resulting public DataMap
+   address is placed in the download field.
 5. **Download and save file** opens the browser save flow, fetches the public
    DataMap and encrypted chunks from direct closest storage nodes, reconstructs
    the whole file, verifies BLAKE3, and retains a **Save again** link.
@@ -122,7 +126,7 @@ boundary directly:
 ```bash
 cargo check -p ant-core --target wasm32-unknown-unknown \
   --no-default-features --features browser-wasm
-cargo test -p ant-core --lib browser::tests
+cargo test -p ant-core --lib browser::
 ```
 
 The tests cover Saorsa's shared lookup engine and generic query driver, fixed-width IDs,
@@ -135,15 +139,30 @@ downloads all public-file records through WebRTC Direct, reconstructs the
 original bytes, pays a real quote on local Anvil, uploads a fresh record
 through the ordinary node payment validator, and reads it back.
 
-## Current boundary
+## Library boundary
 
-JavaScript currently owns native `RTCPeerConnection`/`RTCDataChannel` handling, Ethers payment
-submission, ML-DSA quote verification, and DOM/save APIs. Rust/WASM owns the
-complete iterative lookup loop; JavaScript implements only its transport batch
-callback.
-`ant-protocol 2.3.1` still enables native Saorsa/Tokio networking and cannot be
-linked into a browser WASM build; a future transport-free feature can move the
-remaining quote and multiaddress verification into Rust.
+The reusable Autonomi behavior belongs to `ant-core`, the library crate in this
+repository. Its cross-platform `browser` modules own bootstrap manifest and
+public-file types, WebRTC Direct addresses and framing, HELLO identity
+authentication, BLAKE3/self-encryption, Saorsa lookup, storage quote and native
+commitment verification, pricing and payment planning, and complete public
+upload/download workflows. The `browser-wasm` host adapter owns
+`RTCPeerConnection` and `RTCDataChannel` through `web-sys`, allowing any web
+application to use `BrowserNetworkClient` without copying the Autonomi protocol
+into JavaScript.
+
+The application JavaScript owns only capabilities tied to the page or the
+selected wallet stack: DOM events, browser `File`/save-picker APIs, and Ethers
+contract calls. This is also the deliberate extension seam: another web app can
+provide its own UI and wallet callback while sharing all network and Autonomi
+logic from the Rust library.
+
+`ant-protocol 2.3.1` still couples its wire types to native Saorsa/Tokio
+networking, so it cannot be linked into this WASM build. The browser verifier
+therefore uses the same FIPS-204 ML-DSA-65 primitive directly. Splitting a
+transport-free wire/crypto feature from `ant-protocol` would remove that final
+dependency-level duplication and let native and WASM builds import the exact
+same protocol types.
 
 The local testnet manifest is intentionally unsigned bootstrap material. A
 production deployment still needs ML-DSA-signed endpoint records, exceptional

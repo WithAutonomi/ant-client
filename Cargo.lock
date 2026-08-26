@@ -843,15 +843,19 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum",
+ "base64",
  "blake3",
  "bytes",
  "console_error_panic_hook",
+ "fips204",
  "flate2",
  "fs2",
  "futures",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "getrandom 0.2.17",
+ "gloo-timers",
  "hex",
  "js-sys",
  "libc",
@@ -874,6 +878,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.18",
+ "tiny-keccak",
  "tokio",
  "tokio-test",
  "tokio-util",
@@ -881,9 +886,11 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "utoipa",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
  "windows-sys 0.61.2",
  "xor_name",
  "zip",
@@ -2928,6 +2935,18 @@ name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
+name = "gloo-timers"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "group"
