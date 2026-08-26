@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (wallet path — batched merkle payments, V2-990)
+- Wallet-path merkle uploads larger than one tree (`MAX_LEAVES` = 256 chunks ≈ 1 GiB)
+  now settle in batched `payForMerkleTrees` transactions: sub-batches are paid in
+  groups of `MERKLE_TREES_PER_PAYMENT` (4) trees per on-chain transaction instead of
+  one transaction per tree. Partial-payment semantics are preserved at group
+  granularity — a failed group still returns the proofs of previously-paid groups,
+  and the failed group itself pays nothing (the batched entry point is atomic).
+  Requires a payment vault deployment carrying the batched entry point (V2-992);
+  the cap is re-exported as `ant_core::data::MERKLE_TREES_PER_PAYMENT` so
+  consumers don't hardcode it.
+
 ### Changed (breaking — external-signer merkle API, ADR-0003)
 - External-signer merkle uploads are no longer capped at one payment batch (`MAX_LEAVES` = 256 chunks ≈ 1 GiB): `file_prepare_upload*` now partitions the to-upload set into `MerkleTree`-sized sub-batches (`ExternalPaymentInfo::Merkle` carries `prepared_batches: Vec<PreparedMerkleBatch>`), the signer pays one transaction per batch, and the new `Client::finalize_upload_merkle_multi` takes one winner hash per batch. `finalize_upload_merkle` remains as the single-batch special case. A batch the signer never paid (`None` hash) no longer aborts the upload: paid batches store and the unpaid chunks surface via `Error::PartialUpload`.
 - External-signer merkle prepared uploads no longer hold the encrypted file in memory: chunk bodies stay in the on-disk encryption spill (opaque `ExternalChunkStore` inside `ExternalPaymentInfo::Merkle`, replacing the resident `chunk_contents: Vec<Bytes>`), and finalize stores them via the wallet path's bounded spill fan-out — peak RAM ~256 MB regardless of file size, plus deferred-retry rounds the external path previously lacked.
