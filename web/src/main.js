@@ -61,6 +61,17 @@ function log(message, value) {
   elements.log.scrollTop = elements.log.scrollHeight;
 }
 
+function errorMessage(error) {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  if (error === undefined) return "unknown error";
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
 function endpointFromForm() {
   return elements.endpointMultiaddr.value.trim();
 }
@@ -113,7 +124,7 @@ async function connectedClient() {
 
 function reportError(context, error) {
   elements.connectionState.textContent = `${context} failed`;
-  log(`${context} failed: ${error.message}`);
+  log(`${context} failed: ${errorMessage(error)}`);
   console.error(error);
 }
 
@@ -127,7 +138,7 @@ elements.loadManifest.addEventListener("click", async () => {
     await loadManifest();
   } catch (error) {
     elements.manifestState.textContent = "Load failed";
-    log(`Manifest load failed: ${error.message}`);
+    log(`Manifest load failed: ${errorMessage(error)}`);
     console.error(error);
   }
 });
@@ -210,7 +221,7 @@ elements.uploadFile.addEventListener("click", async () => {
     );
   } catch (error) {
     elements.uploadState.textContent = "Upload failed";
-    log(`File upload failed: ${error.message}`);
+    log(`File upload failed: ${errorMessage(error)}`);
     console.error(error);
   } finally {
     walletSecret = "";
@@ -258,7 +269,7 @@ elements.downloadFile.addEventListener("click", async () => {
   } catch (error) {
     elements.downloadState.textContent =
       error.name === "AbortError" ? "Save cancelled" : "Failed";
-    log(`File download failed: ${error.message}`);
+    log(`File download failed: ${errorMessage(error)}`);
     console.error(error);
   } finally {
     elements.downloadFile.disabled = false;
@@ -331,5 +342,5 @@ elements.randomTarget.click();
 log("Ready. Loading the local browser testnet manifest…");
 loadManifest().catch((error) => {
   elements.manifestState.textContent = "Not running";
-  log(`Local manifest not available yet: ${error.message}`);
+  log(`Local manifest not available yet: ${errorMessage(error)}`);
 });

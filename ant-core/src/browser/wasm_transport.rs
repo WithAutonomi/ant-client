@@ -1071,7 +1071,11 @@ impl BrowserNetworkClient {
             "Verified public DataMap ({} bytes)",
             data_map.len()
         ));
-        let chunks = super::decode_public_data_map(&data_map).map_err(|error| error.to_string())?;
+        let mut chunks =
+            super::decode_public_data_map(&data_map).map_err(|error| error.to_string())?;
+        chunks.extend(file.chunks.iter().cloned());
+        let mut seen = std::collections::HashSet::new();
+        chunks.retain(|chunk| seen.insert(chunk.dst_hash.clone()));
         if chunks.len() < 3 {
             return Err("ant-core returned an invalid public DataMap".to_string());
         }
@@ -1083,7 +1087,7 @@ impl BrowserNetworkClient {
                 async move {
                     progress.report(&format!(
                         "Fetching encrypted file chunk {}/{} ({})",
-                        chunk.index + 1,
+                        position + 1,
                         total,
                         chunk.dst_hash
                     ));
