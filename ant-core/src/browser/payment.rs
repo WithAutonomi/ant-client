@@ -1,17 +1,19 @@
 //! Verification and payment planning shared by native and browser clients.
 
-use super::crypto::{keccak256, verify_ml_dsa_65};
 use super::protocol::normalize_hex;
+use ant_protocol::crypto::verify_ml_dsa_65;
+use ant_protocol::payment::{
+    calculate_price_wei, commitment_hash, payment_quote_bytes_for_signing,
+    verify_commitment_signature, StorageCommitment, MAX_COMMITMENT_KEY_COUNT,
+    MAX_COMMITMENT_SIDECAR_BYTES,
+};
 use serde::{Deserialize, Serialize};
 
+pub use ant_protocol::payment::payment_quote_hash;
+
 const PAYMENT_MULTIPLIER: u128 = 3;
+#[cfg(test)]
 const PRICE_BASELINE_WEI: u128 = 3_906_250_000_000_000;
-const PRICE_COEFFICIENT_WEI: u128 = 35_156_250_000_000_000;
-const PRICE_DIVISOR_SQUARED: u128 = 6_000 * 6_000;
-const MAX_COMMITMENT_KEY_COUNT: u32 = 1_000_000;
-const MAX_COMMITMENT_SIDECAR_BYTES: usize = 8 * 1024;
-const DOMAIN_COMMITMENT: &[u8] = b"autonomi.ant.replication.storage_commitment.v1";
-const DOMAIN_COMMITMENT_HASH: &[u8] = b"autonomi.ant.replication.commitment_hash.v1";
 
 /// JSON-safe form of a node's signed storage commitment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,21 +79,6 @@ pub struct VerifiedStorageQuote {
 #[error("invalid storage quote: {0}")]
 pub struct StorageQuoteError(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct NativeStorageCommitment {
-    root: [u8; 32],
-    key_count: u32,
-    sender_peer_id: [u8; 32],
-    sender_public_key: Vec<u8>,
-    signature: Vec<u8>,
-}
-
-/// Compute the EVM-facing `PaymentQuote` Keccak-256 hash.
-#[must_use]
-pub fn payment_quote_hash(signed_bytes: &[u8], public_key: &[u8], signature: &[u8]) -> [u8; 32] {
-    keccak256(&[signed_bytes, public_key, signature])
-}
-
 /// Sum verified decimal quote amounts without exposing integer arithmetic to
 /// JavaScript or a wallet adapter.
 pub fn storage_payment_total(quotes: &[VerifiedStorageQuote]) -> Result<String, StorageQuoteError> {
@@ -140,7 +127,7 @@ pub fn verify_storage_quote(
         ));
     }
     let price = parse_decimal_u128(&quote.price, "quote price")?;
-    let expected_price = calculate_price(quote.committed_key_count);
+    let expected_price = calculate_price_wei(quote.committed_key_count);
     if price != expected_price {
         return Err(StorageQuoteError(
             "storage quote price is not bound to its committed key count".to_string(),
@@ -204,23 +191,19 @@ fn canonical_quote_bytes(
     rewards: &str,
     commitment_pin: Option<&str>,
 ) -> Result<Vec<u8>, StorageQuoteError> {
-    let content =
-        hex::decode(&quote.content).map_err(|error| StorageQuoteError(error.to_string()))?;
-    let rewards = hex::decode(rewards).map_err(|error| StorageQuoteError(error.to_string()))?;
-    let mut bytes = Vec::with_capacity(32 + 8 + 32 + 20 + 4 + 33);
-    bytes.extend_from_slice(&content);
-    bytes.extend_from_slice(&quote.timestamp_secs.to_le_bytes());
-    bytes.extend_from_slice(&price.to_le_bytes());
-    bytes.extend_from_slice(&[0u8; 16]);
-    bytes.extend_from_slice(&rewards);
-    bytes.extend_from_slice(&quote.committed_key_count.to_le_bytes());
-    if let Some(pin) = commitment_pin {
-        bytes.push(1);
-        bytes.extend(hex::decode(pin).map_err(|error| StorageQuoteError(error.to_string()))?);
-    } else {
-        bytes.push(0);
-    }
-    Ok(bytes)
+    let content = decode_hex_array::<32>(&quote.content, "quote content")?;
+    let rewards = decode_hex_array::<20>(rewards, "quote rewards address")?;
+    let commitment_pin = commitment_pin
+        .map(|pin| decode_hex_array::<32>(pin, "storage commitment pin"))
+        .transpose()?;
+    Ok(payment_quote_bytes_for_signing(
+        &content,
+        quote.timestamp_secs,
+        price,
+        &rewards,
+        quote.committed_key_count,
+        commitment_pin.as_ref(),
+    ))
 }
 
 fn verify_commitment(
@@ -235,7 +218,7 @@ fn verify_commitment(
             "storage commitment sidecar exceeds the protocol limit".to_string(),
         ));
     }
-    let commitment: NativeStorageCommitment = rmp_serde::from_slice(&encoded).map_err(|error| {
+    let commitment: StorageCommitment = rmp_serde::from_slice(&encoded).map_err(|error| {
         StorageQuoteError(format!(
             "storage commitment sidecar is not valid MessagePack: {error}"
         ))
@@ -245,9 +228,10 @@ fn verify_commitment(
     let public_key =
         decode_unbounded_hex(&artifact.sender_public_key, "storage commitment public key")?;
     let signature = decode_unbounded_hex(&artifact.signature, "storage commitment signature")?;
-    if commitment.root != decode_array_32(&root)?
+    if commitment.root != decode_hex_array::<32>(&root, "storage commitment root")?
         || commitment.key_count != artifact.key_count
-        || commitment.sender_peer_id != decode_array_32(&peer_id)?
+        || commitment.sender_peer_id
+            != decode_hex_array::<32>(&peer_id, "storage commitment peer ID")?
         || commitment.sender_public_key != public_key
         || commitment.signature != signature
     {
@@ -272,46 +256,17 @@ fn verify_commitment(
             "storage commitment belongs to a different peer".to_string(),
         ));
     }
-    let signed_payload = commitment_signed_payload(&commitment)?;
-    if !verify_ml_dsa_65(&public_key, &signature, &signed_payload, DOMAIN_COMMITMENT) {
+    if !verify_commitment_signature(&commitment) {
         return Err(StorageQuoteError(
             "storage commitment has an invalid ML-DSA-65 signature".to_string(),
         ));
     }
-    let postcard =
-        postcard::to_allocvec(&commitment).map_err(|error| StorageQuoteError(error.to_string()))?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(DOMAIN_COMMITMENT_HASH);
-    hasher.update(&postcard);
-    if hasher.finalize().to_hex().as_str() != expected_pin {
+    if commitment_hash(&commitment).map(hex::encode).as_deref() != Some(expected_pin) {
         return Err(StorageQuoteError(
             "storage commitment does not resolve the quote pin".to_string(),
         ));
     }
     Ok(())
-}
-
-fn commitment_signed_payload(
-    commitment: &NativeStorageCommitment,
-) -> Result<Vec<u8>, StorageQuoteError> {
-    let key_length = u32::try_from(commitment.sender_public_key.len())
-        .map_err(|_| StorageQuoteError("storage commitment public key is too large".to_string()))?;
-    let mut payload = Vec::with_capacity(32 + 4 + 32 + 4 + commitment.sender_public_key.len());
-    payload.extend_from_slice(&commitment.root);
-    payload.extend_from_slice(&commitment.key_count.to_le_bytes());
-    payload.extend_from_slice(&commitment.sender_peer_id);
-    payload.extend_from_slice(&key_length.to_le_bytes());
-    payload.extend_from_slice(&commitment.sender_public_key);
-    Ok(payload)
-}
-
-fn calculate_price(key_count: u32) -> u128 {
-    let count = u128::from(key_count);
-    PRICE_BASELINE_WEI
-        + count
-            .saturating_mul(count)
-            .saturating_mul(PRICE_COEFFICIENT_WEI)
-            / PRICE_DIVISOR_SQUARED
 }
 
 fn parse_decimal_u128(value: &str, label: &str) -> Result<u128, StorageQuoteError> {
@@ -334,16 +289,23 @@ fn decode_unbounded_hex(value: &str, label: &str) -> Result<Vec<u8>, StorageQuot
     hex::decode(value).map_err(|error| StorageQuoteError(format!("invalid {label}: {error}")))
 }
 
-fn decode_array_32(value: &str) -> Result<[u8; 32], StorageQuoteError> {
+fn decode_hex_array<const LENGTH: usize>(
+    value: &str,
+    label: &str,
+) -> Result<[u8; LENGTH], StorageQuoteError> {
     let decoded = hex::decode(value).map_err(|error| StorageQuoteError(error.to_string()))?;
     decoded.try_into().map_err(|bytes: Vec<u8>| {
-        StorageQuoteError(format!("expected 32 bytes, received {}", bytes.len()))
+        StorageQuoteError(format!(
+            "expected {LENGTH} bytes for {label}, received {}",
+            bytes.len()
+        ))
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ant_protocol::payment::{storage_commitment_bytes_for_signing, DOMAIN_COMMITMENT};
     use ant_protocol::pqc::api::ml_dsa_65;
 
     fn baseline_quote() -> (BrowserQuoteArtifact, String, String) {
@@ -387,26 +349,27 @@ mod tests {
         let (public_key, secret_key) = ml_dsa_65().generate_keypair().expect("keypair");
         let public_key = public_key.to_bytes();
         let peer_id = blake3::hash(&public_key).into();
-        let mut commitment = NativeStorageCommitment {
+        let mut commitment = StorageCommitment {
             root,
             key_count,
             sender_peer_id: peer_id,
             sender_public_key: public_key.clone(),
             signature: Vec::new(),
         };
-        let commitment_payload = commitment_signed_payload(&commitment).expect("payload");
+        let commitment_payload = storage_commitment_bytes_for_signing(
+            &commitment.root,
+            commitment.key_count,
+            &commitment.sender_peer_id,
+            &commitment.sender_public_key,
+        );
         commitment.signature = ml_dsa_65()
             .sign_with_context(&secret_key, &commitment_payload, DOMAIN_COMMITMENT)
             .expect("commitment signature")
             .to_bytes();
         let encoded = rmp_serde::to_vec(&commitment).expect("MessagePack commitment");
-        let postcard = postcard::to_allocvec(&commitment).expect("postcard commitment");
-        let mut pin_hasher = blake3::Hasher::new();
-        pin_hasher.update(DOMAIN_COMMITMENT_HASH);
-        pin_hasher.update(&postcard);
-        let pin = pin_hasher.finalize().to_hex().to_string();
+        let pin = hex::encode(commitment_hash(&commitment).expect("commitment hash"));
         let peer_id = hex::encode(peer_id);
-        let price = calculate_price(key_count);
+        let price = calculate_price_wei(key_count);
         let mut quote = BrowserQuoteArtifact {
             peer_id: peer_id.clone(),
             content: hex::encode(content),
@@ -464,7 +427,7 @@ mod tests {
             verify_storage_quote(quote.clone(), &content, &peer_id).expect("valid bound quote");
         assert_eq!(
             storage_payment_total(&[verified]).expect("payment total"),
-            (calculate_price(23) * PAYMENT_MULTIPLIER).to_string()
+            (calculate_price_wei(23) * PAYMENT_MULTIPLIER).to_string()
         );
 
         let mut tampered = quote;

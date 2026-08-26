@@ -1,6 +1,6 @@
 //! Browser-facing WebRTC Direct wire profile.
 
-use super::crypto::verify_ml_dsa_65;
+use ant_protocol::crypto::verify_ml_dsa_65;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};

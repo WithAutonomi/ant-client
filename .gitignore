@@ -2,6 +2,9 @@
 /web/node_modules/
 /web/dist/
 /web/pkg/
+/web/test-results/
+/web/playwright-report/
+/web/.playwright-devnet/
 .cargo/config.toml
 .claude/plans/
 .claude/scheduled_tasks.lock

@@ -6,7 +6,6 @@
 //! host adapter; only DOM, file-save, and wallet transaction submission remain
 //! in JavaScript.
 
-mod crypto;
 pub mod manifest;
 pub mod payment;
 pub mod protocol;

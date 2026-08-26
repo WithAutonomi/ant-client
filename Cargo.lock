@@ -847,7 +847,6 @@ dependencies = [
  "blake3",
  "bytes",
  "console_error_panic_hook",
- "fips204",
  "flate2",
  "fs2",
  "futures",
@@ -861,7 +860,6 @@ dependencies = [
  "libc",
  "lru",
  "openssl",
- "postcard",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rmp-serde",
@@ -878,7 +876,6 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.18",
- "tiny-keccak",
  "tokio",
  "tokio-test",
  "tokio-util",
@@ -958,18 +955,18 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3081ee130dd45e8166bc8ac4d789aac17d143e2e7f54f1c3006503dc63cf3edb"
 dependencies = [
  "blake3",
  "bytes",
  "evmlib",
+ "fips204",
  "hex",
  "postcard",
  "rmp-serde",
  "saorsa-core",
  "saorsa-pqc 0.5.1",
  "serde",
+ "tiny-keccak",
  "tokio",
  "tracing",
 ]
