@@ -52,7 +52,8 @@ function timestamp() {
 }
 
 function log(message, value) {
-  const suffix = value === undefined ? "" : `\n${JSON.stringify(value, null, 2)}`;
+  const suffix =
+    value === undefined ? "" : `\n${JSON.stringify(value, null, 2)}`;
   elements.log.textContent += `[${timestamp()}] ${message}${suffix}\n`;
   elements.log.scrollTop = elements.log.scrollHeight;
 }
@@ -70,7 +71,9 @@ function seedEndpoints() {
 async function loadManifest() {
   elements.manifestState.classList.remove("connected");
   elements.manifestState.textContent = "Loading…";
-  const manifest = await fetchBrowserManifest(elements.manifestUrl.value.trim());
+  const manifest = await fetchBrowserManifest(
+    elements.manifestUrl.value.trim(),
+  );
   browserManifest = manifest;
 
   const first = manifest.endpoints[0];
@@ -158,7 +161,7 @@ elements.findClosest.addEventListener("click", async () => {
         message: error.message,
       })),
     });
-    for (const lookupClient of result.clients.values()) lookupClient.close();
+    if (result.ownsClientPool) result.clientPool.close();
   } catch (error) {
     reportError("Lookup", error);
   }
@@ -172,7 +175,8 @@ elements.uploadFile.addEventListener("click", async () => {
   let walletSecret = elements.walletSecret.value.trim();
   elements.walletSecret.value = "";
   try {
-    if (!browserManifest) throw new Error("Load the browser testnet manifest first");
+    if (!browserManifest)
+      throw new Error("Load the browser testnet manifest first");
     const file = elements.uploadInput.files?.[0];
     if (!file) throw new Error("Choose a file to upload");
     if (!walletSecret) throw new Error("Enter the paying wallet secret key");
@@ -207,7 +211,10 @@ elements.uploadFile.addEventListener("click", async () => {
     elements.uploadResult.hidden = false;
     elements.uploadState.textContent = "Uploaded · ready to download";
     elements.uploadState.classList.add("connected");
-    log(`Uploaded and registered ${result.file.name} for immediate download`, result);
+    log(
+      `Uploaded and registered ${result.file.name} for immediate download`,
+      result,
+    );
   } catch (error) {
     elements.uploadState.textContent = "Upload failed";
     log(`File upload failed: ${error.message}`);
@@ -225,9 +232,13 @@ elements.downloadFile.addEventListener("click", async () => {
   try {
     const address = elements.fileAddress.value.trim().toLowerCase();
     hexToBytes(address, 32);
-    const published = browserManifest?.files.find((file) => file.address === address);
+    const published = browserManifest?.files.find(
+      (file) => file.address === address,
+    );
     if (!published) {
-      throw new Error("That public file address is not described by the loaded testnet manifest");
+      throw new Error(
+        "That public file address is not described by the loaded testnet manifest",
+      );
     }
     const saveHandle = await chooseSaveHandle(published.name);
     elements.downloadState.textContent = "Downloading…";
@@ -253,7 +264,8 @@ elements.downloadFile.addEventListener("click", async () => {
       { data_map_node: dataMapNode.peer_id, chunks: published.chunks.length },
     );
   } catch (error) {
-    elements.downloadState.textContent = error.name === "AbortError" ? "Save cancelled" : "Failed";
+    elements.downloadState.textContent =
+      error.name === "AbortError" ? "Save cancelled" : "Failed";
     log(`File download failed: ${error.message}`);
     console.error(error);
   } finally {
@@ -284,7 +296,9 @@ async function exposeSavedFile(file, content, saveHandle) {
 
   if (downloadObjectUrl) URL.revokeObjectURL(downloadObjectUrl);
   downloadObjectUrl = URL.createObjectURL(
-    new Blob([content], { type: file.content_type ?? "application/octet-stream" }),
+    new Blob([content], {
+      type: file.content_type ?? "application/octet-stream",
+    }),
   );
   const anchor = document.createElement("a");
   anchor.href = downloadObjectUrl;

@@ -4,13 +4,13 @@ import { parseBrowserManifest } from "./manifest.js";
 
 test("browser manifest validates and normalizes endpoints and files", () => {
   const manifest = parseBrowserManifest({
-    version: 4,
+    version: 5,
     network_id: "local-test",
     created_at: "2026-08-03T00:00:00Z",
     payment: paymentNetwork(),
     endpoints: [
       {
-        multiaddr: webtransportMultiaddr("AA".repeat(32), 0xbb),
+        multiaddr: webrtc_directMultiaddr("AA".repeat(32), 0xbb),
       },
     ],
     files: [
@@ -33,7 +33,7 @@ test("browser manifest validates and normalizes endpoints and files", () => {
 
   assert.equal(
     manifest.endpoints[0].multiaddr,
-    webtransportMultiaddr("AA".repeat(32), 0xbb),
+    webrtc_directMultiaddr("AA".repeat(32), 0xbb),
   );
   assert.equal(manifest.files[0].address, "cc".repeat(32));
   assert.equal(manifest.files[0].blake3, "dd".repeat(32));
@@ -49,23 +49,23 @@ test("browser manifest rejects missing endpoints and malformed multiaddresses", 
   assert.throws(
     () =>
       parseBrowserManifest({
-        version: 4,
+        version: 5,
         network_id: "test",
         payment: paymentNetwork(),
         endpoints: [],
       }),
-    /no WebTransport endpoints/,
+    /no WebRtcDirect endpoints/,
   );
   assert.throws(
     () =>
       parseBrowserManifest({
-        version: 4,
+        version: 5,
         network_id: "test",
         payment: paymentNetwork(),
         endpoints: [
           {
             multiaddr:
-              "/ip4/127.0.0.1/udp/22000/quic-v1/webtransport/certhash/uAA/p2p/wrong",
+              "/ip4/127.0.0.1/udp/22000/webrtc-direct/certhash/uAA/p2p/wrong",
           },
         ],
       }),
@@ -74,15 +74,15 @@ test("browser manifest rejects missing endpoints and malformed multiaddresses", 
 });
 
 test("browser manifest requires public payment contract configuration", () => {
-  const endpoint = { multiaddr: webtransportMultiaddr("aa".repeat(32), 0xbb) };
+  const endpoint = { multiaddr: webrtc_directMultiaddr("aa".repeat(32), 0xbb) };
   assert.throws(
-    () => parseBrowserManifest({ version: 4, network_id: "test", endpoints: [endpoint] }),
+    () => parseBrowserManifest({ version: 5, network_id: "test", endpoints: [endpoint] }),
     /no payment network/,
   );
   assert.throws(
     () =>
       parseBrowserManifest({
-        version: 4,
+        version: 5,
         network_id: "test",
         endpoints: [endpoint],
         payment: { ...paymentNetwork(), rpc_url: "file:///tmp/anvil" },
@@ -99,12 +99,12 @@ function paymentNetwork() {
   };
 }
 
-function webtransportMultiaddr(peerId, certificateByte) {
+function webrtc_directMultiaddr(peerId, certificateByte) {
   const multihash = Uint8Array.from([
     0x12,
     0x20,
     ...Array(32).fill(certificateByte),
   ]);
   const certhash = `u${Buffer.from(multihash).toString("base64url")}`;
-  return `/ip4/127.0.0.1/udp/22000/quic-v1/webtransport/certhash/${certhash}/p2p/${peerId}`;
+  return `/ip4/127.0.0.1/udp/22000/webrtc-direct/certhash/${certhash}/p2p/${peerId}`;
 }

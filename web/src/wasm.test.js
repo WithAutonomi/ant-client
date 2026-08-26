@@ -19,7 +19,7 @@ function lookupNode(lastByte, stringEndpoint = false) {
     peer_id: `${"00".repeat(31)}${lastByte.toString(16).padStart(2, "0")}`,
     native_addresses: [],
     reliability: 1,
-    webtransport: stringEndpoint ? `/test/${lastByte}` : { multiaddr: `/test/${lastByte}` },
+    webrtc_direct: stringEndpoint ? `/test/${lastByte}` : { multiaddr: `/test/${lastByte}` },
   };
 }
 
@@ -30,7 +30,7 @@ test("generated WASM drives Saorsa's complete shared iterative lookup", async ()
   const termination = await lookup.run(async ({ iteration, candidates }) => {
     batches.push(candidates.map((node) => node.peer_id));
     if (iteration === 1) {
-      assert.equal(candidates[1].webtransport, "/test/2");
+      assert.equal(candidates[1].webrtc_direct, "/test/2");
       return [
         {
           status: "succeeded",

@@ -8,7 +8,7 @@ This project provides two Rust crates and a browser client:
 
 - **ant-core** — A headless Rust library containing all business logic: data storage/retrieval with self-encryption and EVM payments, node lifecycle management, and local devnet tooling. Its portable immutable-data core also builds for browsers with the `browser-wasm` feature.
 - **ant-cli** — A thin CLI binary (`ant`) built on `ant-core`.
-- **web** — A direct WebTransport client and test site. It drives Saorsa's
+- **web** — A direct WebRTC Direct client and test site. It drives Saorsa's
   shared iterative lookup engine and uses `ant-core` through WASM to
   self-encrypt and reconstruct complete public files without a data gateway.
 
@@ -21,9 +21,9 @@ the browser-enabled node devnet, then run the site:
 
 ```bash
 # In ant-node-web-support
-cargo run --features webtransport-poc --bin ant-devnet -- \
+cargo run --features webrtc-direct --bin ant-devnet -- \
   --preset minimal --base-port 23000 \
-  --webtransport --webtransport-base-port 24000 \
+  --webrtc-direct --webrtc-direct-base-port 24000 \
   --serve-port 25000 --enable-evm --enable-logging
 
 # In ant-client-web-support/web

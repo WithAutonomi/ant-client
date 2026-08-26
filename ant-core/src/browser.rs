@@ -238,7 +238,7 @@ mod wasm {
         #[serde(default)]
         reliability: f64,
         #[serde(default)]
-        webtransport: Option<BrowserLookupEndpoint>,
+        webrtc_direct: Option<BrowserLookupEndpoint>,
     }
 
     #[derive(Debug, Serialize)]
@@ -285,7 +285,7 @@ mod wasm {
         }
     }
 
-    /// Shared Saorsa iterative lookup state driven by browser WebTransport.
+    /// Shared Saorsa iterative lookup state driven by browser WebRtcDirect.
     #[wasm_bindgen(js_name = BrowserIterativeLookup)]
     pub struct BrowserIterativeLookup {
         lookup: IterativeLookup<BrowserLookupCandidate>,
@@ -326,7 +326,7 @@ mod wasm {
             Ok(())
         }
 
-        /// Run the complete shared Saorsa walk through a WebTransport batch callback.
+        /// Run the complete shared Saorsa walk through a WebRtcDirect batch callback.
         #[wasm_bindgen(js_name = run)]
         pub async fn run(&mut self, query_batch: Function) -> Result<String, JsValue> {
             let mut query = BrowserLookupQuery {
@@ -452,12 +452,12 @@ mod wasm {
         known_endpoints: &mut HashMap<LookupKey, BrowserLookupEndpoint>,
         mut candidate: BrowserLookupCandidate,
     ) -> Option<BrowserLookupCandidate> {
-        if let Some(endpoint) = candidate.wire.webtransport.clone() {
+        if let Some(endpoint) = candidate.wire.webrtc_direct.clone() {
             known_endpoints.insert(candidate.peer_id, endpoint);
         } else if let Some(endpoint) = known_endpoints.get(&candidate.peer_id) {
-            candidate.wire.webtransport = Some(endpoint.clone());
+            candidate.wire.webrtc_direct = Some(endpoint.clone());
         }
-        candidate.wire.webtransport.as_ref()?;
+        candidate.wire.webrtc_direct.as_ref()?;
         Some(candidate)
     }
 
