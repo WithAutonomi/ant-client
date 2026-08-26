@@ -120,6 +120,20 @@ npm test
 npm run build
 ```
 
+Run the real-browser WebRTC Direct smoke test with:
+
+```bash
+npm run test:browser
+```
+
+The first run downloads Playwright's pinned headless Chromium build. The test
+then starts the sibling `ant-node-web-support` minimal devnet and local Anvil on
+dedicated test ports, serves this application, loads its real manifest, and
+requires an authenticated HELLO over a browser `RTCDataChannel`. Set
+`ANT_NODE_DIR` when the patched node checkout is not at the default sibling
+path. Set `ANT_WEBRTC_SMOKE_LOG=warn` (or another tracing level) to include
+native devnet diagnostics while troubleshooting a failure.
+
 Both commands build the WASM package automatically. To validate the Rust
 boundary directly:
 
@@ -157,12 +171,11 @@ contract calls. This is also the deliberate extension seam: another web app can
 provide its own UI and wallet callback while sharing all network and Autonomi
 logic from the Rust library.
 
-`ant-protocol 2.3.1` still couples its wire types to native Saorsa/Tokio
-networking, so it cannot be linked into this WASM build. The browser verifier
-therefore uses the same FIPS-204 ML-DSA-65 primitive directly. Splitting a
-transport-free wire/crypto feature from `ant-protocol` would remove that final
-dependency-level duplication and let native and WASM builds import the exact
-same protocol types.
+The patched `ant-protocol 2.3.1` exposes a `portable` feature that omits Tokio,
+EVM, Saorsa transport, and `saorsa-pqc`. Both native and WASM clients now import
+the same storage commitment type, signing encodings, quote hash, price curve,
+and ML-DSA-65 verifier from `ant-protocol`; only that crate selects the native
+or FIPS-204 verification backend.
 
 The local testnet manifest is intentionally unsigned bootstrap material. A
 production deployment still needs ML-DSA-signed endpoint records, exceptional

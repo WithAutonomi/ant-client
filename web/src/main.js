@@ -40,6 +40,11 @@ const elements = {
   log: document.querySelector("#log"),
 };
 
+const manifestOverride = new URLSearchParams(window.location.search).get(
+  "manifest",
+);
+if (manifestOverride) elements.manifestUrl.value = manifestOverride;
+
 let client;
 let networkClient;
 let browserManifest;
