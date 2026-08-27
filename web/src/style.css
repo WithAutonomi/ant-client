@@ -191,6 +191,19 @@ a {
   font-weight: 700;
 }
 
+video {
+  display: block;
+  width: 100%;
+  max-height: 70vh;
+  margin-top: 1rem;
+  border-radius: 10px;
+  background: #000;
+}
+
+video[hidden] {
+  display: none;
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     color: #e8eee9;
