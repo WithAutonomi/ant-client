@@ -37,18 +37,24 @@ const elements = {
   downloadFile: document.querySelector("#download-file"),
   downloadState: document.querySelector("#download-state"),
   downloadLink: document.querySelector("#download-link"),
+  streamFile: document.querySelector("#stream-file"),
+  streamState: document.querySelector("#stream-state"),
+  streamVideo: document.querySelector("#stream-video"),
   log: document.querySelector("#log"),
 };
 
-const manifestOverride = new URLSearchParams(window.location.search).get(
-  "manifest",
-);
+const pageParameters = new URLSearchParams(window.location.search);
+const manifestOverride = pageParameters.get("manifest");
 if (manifestOverride) elements.manifestUrl.value = manifestOverride;
+const endpointOverride = pageParameters.get("endpoint");
+if (endpointOverride) elements.endpointMultiaddr.value = endpointOverride;
 
 let client;
 let networkClient;
 let browserManifest;
 let downloadObjectUrl;
+const videoReaders = new Map();
+let activeVideoSession;
 
 function timestamp() {
   return new Date().toLocaleTimeString();
@@ -76,6 +82,103 @@ function endpointFromForm() {
   return elements.endpointMultiaddr.value.trim();
 }
 
+function useEndpointAsBootstrap(multiaddr, hello) {
+  const endpointWasInManifest = browserManifest?.endpoints.some(
+    (endpoint) => endpoint.multiaddr === multiaddr,
+  );
+  const files = endpointWasInManifest ? browserManifest.files : [];
+  if (!endpointWasInManifest) {
+    stopVideoStream();
+    elements.fileAddress.value = "";
+    elements.publicFile.hidden = true;
+  }
+  networkClient?.close();
+  networkClient = new BrowserNetworkClient([{ multiaddr }]);
+  browserManifest = {
+    version: browserManifest?.version ?? 5,
+    network_id: endpointWasInManifest
+      ? browserManifest.network_id
+      : `manual-seed-${hello.peer_id}`,
+    created_at: endpointWasInManifest
+      ? browserManifest.created_at
+      : new Date().toISOString(),
+    endpoints: [{ multiaddr }],
+    payment: hello.payment,
+    files,
+  };
+  elements.manifestState.textContent = "Manual bootstrap · 1 direct node";
+  elements.manifestState.classList.add("connected");
+  log(`Using ${hello.peer_id} as the Rust network bootstrap seed`);
+}
+
+async function ensureVideoStreamWorker() {
+  if (!("serviceWorker" in navigator)) {
+    throw new Error("This browser does not support service workers");
+  }
+  await navigator.serviceWorker.register("/video-stream-sw.js", { scope: "/" });
+  await navigator.serviceWorker.ready;
+  if (navigator.serviceWorker.controller) return;
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error("The video streaming service worker did not take control")),
+      10_000,
+    );
+    navigator.serviceWorker.addEventListener(
+      "controllerchange",
+      () => {
+        clearTimeout(timeout);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
+function stopVideoStream() {
+  elements.streamVideo.pause();
+  elements.streamVideo.removeAttribute("src");
+  elements.streamVideo.load();
+  elements.streamVideo.hidden = true;
+  if (!activeVideoSession) return;
+  videoReaders.get(activeVideoSession)?.close();
+  videoReaders.delete(activeVideoSession);
+  activeVideoSession = undefined;
+}
+
+function streamingUrl(sessionId, file) {
+  const url = new URL(`/__autonomi_stream/${sessionId}/video`, location.origin);
+  url.searchParams.set("size", String(file.size));
+  url.searchParams.set("type", file.content_type || "application/octet-stream");
+  url.searchParams.set("name", file.name);
+  return url.href;
+}
+
+navigator.serviceWorker?.addEventListener("message", async (event) => {
+  if (event.data?.type !== "autonomi-video-range") return;
+  const port = event.ports[0];
+  if (!port) return;
+  try {
+    const { sessionId, start, length } = event.data;
+    const reader = videoReaders.get(sessionId);
+    if (!reader) throw new Error("The requested video stream is no longer open");
+    if (
+      !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(length) ||
+      start < 0 ||
+      length < 0
+    ) {
+      throw new Error("The service worker requested an invalid video range");
+    }
+    const bytes = await reader.readRange(start, length);
+    const owned = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+      ? bytes
+      : bytes.slice();
+    port.postMessage({ ok: true, bytes: owned.buffer }, [owned.buffer]);
+  } catch (error) {
+    port.postMessage({ ok: false, error: errorMessage(error) });
+  }
+});
+
 async function loadManifest() {
   elements.manifestState.classList.remove("connected");
   elements.manifestState.textContent = "Loading…";
@@ -83,6 +186,7 @@ async function loadManifest() {
     elements.manifestUrl.value.trim(),
   );
   browserManifest = manifest;
+  stopVideoStream();
   networkClient?.close();
   networkClient = new BrowserNetworkClient(manifest.endpoints);
 
@@ -113,9 +217,11 @@ async function loadManifest() {
 
 async function connectedClient() {
   if (client) return client;
-  const next = new BrowserNodeClient(endpointFromForm());
+  const multiaddr = endpointFromForm();
+  const next = new BrowserNodeClient(multiaddr);
   const hello = await next.hello();
   client = next;
+  useEndpointAsBootstrap(multiaddr, hello);
   elements.connectionState.textContent = `Connected · ${hello.peer_id.slice(0, 16)}…`;
   elements.connectionState.classList.add("connected");
   log("HELLO", hello);
@@ -276,6 +382,57 @@ elements.downloadFile.addEventListener("click", async () => {
   }
 });
 
+elements.streamFile.addEventListener("click", async () => {
+  elements.streamState.classList.remove("connected");
+  elements.streamState.textContent = "Opening stream…";
+  elements.streamFile.disabled = true;
+  try {
+    const address = elements.fileAddress.value.trim().toLowerCase();
+    hexToBytes(address, 32);
+    const published = browserManifest?.files.find(
+      (file) => file.address === address,
+    );
+    if (!published) {
+      throw new Error(
+        "That public file address is not described by the loaded testnet manifest",
+      );
+    }
+    if (!networkClient) throw new Error("Browser network client is not ready");
+    stopVideoStream();
+    await ensureVideoStreamWorker();
+    const reader = await networkClient.openPublicFile(published, (message) => {
+      elements.streamState.textContent = message;
+      log(message);
+    });
+    const sessionId = bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
+    videoReaders.set(sessionId, reader);
+    activeVideoSession = sessionId;
+    elements.streamVideo.src = streamingUrl(sessionId, published);
+    elements.streamVideo.hidden = false;
+    elements.streamState.textContent = "Ready · press play to stream";
+    elements.streamState.classList.add("connected");
+    log(`Prepared random-access video stream for ${published.name}`, {
+      size: published.size,
+      content_type: published.content_type,
+      session_id: sessionId,
+    });
+  } catch (error) {
+    stopVideoStream();
+    elements.streamState.textContent = "Stream failed";
+    log(`Video stream failed: ${errorMessage(error)}`);
+    console.error(error);
+  } finally {
+    elements.streamFile.disabled = false;
+  }
+});
+
+elements.streamVideo.addEventListener("error", () => {
+  const mediaError = elements.streamVideo.error;
+  if (!mediaError || !activeVideoSession) return;
+  elements.streamState.textContent = `Playback error (${mediaError.code})`;
+  log(`Video element could not decode the selected file (media error ${mediaError.code})`);
+});
+
 async function chooseSaveHandle(name) {
   if (typeof window.showSaveFilePicker !== "function") return undefined;
   return window.showSaveFilePicker({ suggestedName: name });
@@ -316,6 +473,7 @@ async function exposeSavedFile(file, content, saveHandle) {
 
 window.addEventListener("beforeunload", () => {
   if (downloadObjectUrl) URL.revokeObjectURL(downloadObjectUrl);
+  stopVideoStream();
   client?.close();
   networkClient?.close();
 });
@@ -339,8 +497,13 @@ function hexToBytes(value, expectedLength) {
 }
 
 elements.randomTarget.click();
-log("Ready. Loading the local browser testnet manifest…");
-loadManifest().catch((error) => {
-  elements.manifestState.textContent = "Not running";
-  log(`Local manifest not available yet: ${errorMessage(error)}`);
-});
+if (endpointOverride) {
+  elements.manifestState.textContent = "Manual endpoint · manifest skipped";
+  log("Ready. Using the WebRTC Direct endpoint from the page URL.");
+} else {
+  log("Ready. Loading the local browser testnet manifest…");
+  loadManifest().catch((error) => {
+    elements.manifestState.textContent = "Not running";
+    log(`Local manifest not available yet: ${errorMessage(error)}`);
+  });
+}
