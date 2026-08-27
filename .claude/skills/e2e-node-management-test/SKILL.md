@@ -378,9 +378,99 @@ ant node status --json
 
 Verify all 3 nodes are `running` before proceeding to cleanup.
 
-### Phase 9: Cleanup
+### Phase 9: Log forwarding
 
-**Step 9.1 — Stop all nodes:**
+Validates `ant node logs forward` (V2-1021). Forwarding ships node logs to the beta Elasticsearch
+endpoint, so this phase must **never** point at the real endpoint. Everything below uses
+`--endpoint` against a throwaway local listener, and the phase ends with forwarding disabled.
+
+Note that the nodes added in Phase 6 were added **without** `--log-dir-path`, so they have no log
+files. That is the point of Steps 9.1–9.3: the common default must report itself honestly rather
+than silently forward nothing.
+
+**Step 9.1 — Status before enabling:**
+
+```
+ant node logs forward status --json
+```
+
+Verify: `enabled` is `false` and `token_fingerprint` is `null`.
+
+**Step 9.2 — Enable against a local endpoint:**
+
+```
+ant node logs forward enable --token e2e-test-token --endpoint http://127.0.0.1:19999 --json
+```
+
+Verify: `enabled` is `true`, `endpoint` is the local URL, and `min_level` is `"info"`.
+
+**Step 9.3 — Nodes without logging are reported as skipped:**
+
+Verify from the same response that `nodes_forwarding` is empty and `nodes_skipped` has one entry per
+node added in Phase 6, each with a `reason` mentioning `--log-dir-path`. A node with no log
+directory writes no log files, so there is nothing to forward and the command must say so.
+
+**Step 9.4 — Add a node with logging and confirm it is picked up:**
+
+```
+ant node add --rewards-address 0x03B770D9cD32077cC0bF330c13C114a87643B124 --count 1 --bootstrap <bootstrap-address> --evm-network arbitrum-sepolia --log-dir-path <tmp>/e2e-logs --json
+ant node logs forward status --json
+```
+
+Verify: `nodes_forwarding` now has one entry, whose `log_dir` is under the path just given.
+
+**Step 9.5 — The token is never returned:**
+
+```
+curl -s <api_base>/logs/forward
+```
+
+Verify: the response contains `token_fingerprint` but the string `e2e-test-token` appears **nowhere**
+in it. The daemon must not hand the write key back out over its API.
+
+**Step 9.6 — Config file permissions (Unix only):**
+
+```
+ls -l "${XDG_CONFIG_HOME:-$HOME/.config}/ant/log_forward.json"
+```
+
+Verify: the mode is `-rw-------` (0600). The file holds the write token. Skip on Windows.
+
+**Step 9.7 — Enable is reflected in the OpenAPI spec:**
+
+```
+curl -s <api_base>/openapi.json | grep -c "logs/forward"
+```
+
+Verify: the count is at least 3 (status, enable and disable paths are all documented).
+
+**Step 9.8 — Disable:**
+
+```
+ant node logs forward disable --json
+ant node logs forward status --json
+```
+
+Verify: `enabled` is `false` in both responses, and `active` is `false`. Disabling must not change
+anything else about the nodes — confirm with `ant node status --json` that every node's status and
+PID are unchanged from before Step 9.2.
+
+**Step 9.9 — Re-enable needs no token:**
+
+```
+ant node logs forward enable --json
+```
+
+Verify: succeeds without `--token`, reusing the stored one, and reports the same
+`token_fingerprint` as Step 9.5. Then disable again so the phase leaves forwarding off:
+
+```
+ant node logs forward disable --json
+```
+
+### Phase 10: Cleanup
+
+**Step 10.1 — Stop all nodes:**
 
 ```
 ant node stop --json
@@ -388,7 +478,7 @@ ant node stop --json
 
 Verify all nodes stopped.
 
-**Step 9.2 — Reset:**
+**Step 10.2 — Reset:**
 
 ```
 ant node reset --force --json
@@ -396,7 +486,7 @@ ant node reset --force --json
 
 Verify: `nodes_cleared` is 3.
 
-**Step 9.3 — Stop the daemon:**
+**Step 10.3 — Stop the daemon:**
 
 ```
 ant node daemon stop --json
@@ -404,7 +494,7 @@ ant node daemon stop --json
 
 Verify: response contains `pid`.
 
-**Step 9.4 — Verify daemon stopped:**
+**Step 10.4 — Verify daemon stopped:**
 
 ```
 ant node daemon status --json
@@ -412,7 +502,7 @@ ant node daemon status --json
 
 Verify: `running` is `false`.
 
-### Phase 10: Report
+### Phase 11: Report
 
 Print a summary of all test steps and their results. Include the operating system and architecture
 at the top of the report (e.g., from `uname -a` on Linux/macOS or `systeminfo` on Windows):
@@ -454,10 +544,21 @@ Phase 8: Daemon Restart Adoption
   [PASS] 8.7 Liveness monitor detected external kill
   [PASS] 8.8 Killed node restarted
 
-Phase 9: Cleanup
-  [PASS] 9.1 Stop all nodes
-  [PASS] 9.2 Reset
-  [PASS] 9.3 Daemon stop
+Phase 9: Log Forwarding
+  [PASS] 9.1 Status before enabling (off)
+  [PASS] 9.2 Enable against a local endpoint
+  [PASS] 9.3 Nodes without logging reported as skipped
+  [PASS] 9.4 Node with --log-dir-path picked up
+  [PASS] 9.5 Token never returned by the API
+  [PASS] 9.6 Config file is 0600
+  [PASS] 9.7 OpenAPI documents the forward paths
+  [PASS] 9.8 Disable leaves nodes untouched
+  [PASS] 9.9 Re-enable reuses the stored token
+
+Phase 10: Cleanup
+  [PASS] 10.1 Stop all nodes
+  [PASS] 10.2 Reset
+  [PASS] 10.3 Daemon stop
   [PASS] 9.4 Daemon not running
 
 Result: ALL TESTS PASSED

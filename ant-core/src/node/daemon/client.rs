@@ -2,6 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
+use crate::node::daemon::forward::{LogForwardEnableRequest, LogForwardResult, LogForwardStatus};
 use crate::node::daemon::health::FleetHealth;
 use crate::node::process::detach;
 use crate::node::types::{
@@ -161,6 +162,76 @@ pub async fn start_node(config: &DaemonConfig, node_id: u32) -> Result<NodeStart
     } else {
         let body = resp.text().await.unwrap_or_default();
         Err(Error::HttpRequest(body))
+    }
+}
+
+/// Read the daemon's log-forwarding status.
+pub async fn log_forward_status(config: &DaemonConfig) -> Result<LogForwardStatus> {
+    let port = read_port_file(&config.port_file_path).ok_or(Error::DaemonNotRunning)?;
+
+    let url = format!("http://127.0.0.1:{port}/api/v1/logs/forward");
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| Error::HttpRequest(e.to_string()))?;
+
+    if resp.status().is_success() {
+        resp.json::<LogForwardStatus>()
+            .await
+            .map_err(|e| Error::HttpRequest(e.to_string()))
+    } else {
+        Err(Error::HttpRequest(resp.text().await.unwrap_or_default()))
+    }
+}
+
+/// Enable log forwarding via the daemon, so it starts shipping immediately.
+pub async fn log_forward_enable(
+    config: &DaemonConfig,
+    request: &LogForwardEnableRequest,
+) -> Result<LogForwardResult> {
+    post_log_forward(config, "enable", Some(request)).await
+}
+
+/// Disable log forwarding via the daemon.
+pub async fn log_forward_disable(config: &DaemonConfig) -> Result<LogForwardResult> {
+    post_log_forward(config, "disable", None).await
+}
+
+async fn post_log_forward(
+    config: &DaemonConfig,
+    action: &str,
+    body: Option<&LogForwardEnableRequest>,
+) -> Result<LogForwardResult> {
+    let port = read_port_file(&config.port_file_path).ok_or(Error::DaemonNotRunning)?;
+
+    let url = format!("http://127.0.0.1:{port}/api/v1/logs/forward/{action}");
+    let mut request = reqwest::Client::new().post(&url);
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| Error::HttpRequest(e.to_string()))?;
+
+    if resp.status().is_success() {
+        resp.json::<LogForwardResult>()
+            .await
+            .map_err(|e| Error::HttpRequest(e.to_string()))
+    } else {
+        // The daemon returns `{"error": "..."}` for a rejected enable; surface just that text
+        // rather than the raw JSON envelope.
+        let body = resp.text().await.unwrap_or_default();
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or(body);
+        Err(Error::HttpRequest(message))
     }
 }
 

@@ -100,6 +100,9 @@ pub enum Error {
         "Cannot reset while nodes are running ({0} node(s) still running). Stop all nodes first."
     )]
     NodesStillRunning(u32),
+
+    #[error("Log forwarding: {0}")]
+    LogForward(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
