@@ -69,7 +69,9 @@ The Rust/WASM core will:
 - encode and decode the native MessagePack `DataMap` representation;
 - calculate and verify BLAKE3 content addresses;
 - verify every encrypted record against its DataMap destination address; and
-- authenticate, decompress, and reconstruct complete public files.
+- authenticate, decompress, and reconstruct complete public files; and
+- resolve nested DataMaps and decrypt bounded plaintext byte ranges after
+  asynchronously retrieving only the overlapping encrypted records.
 
 The `web/` package will remain responsible for browser-specific orchestration:
 
@@ -103,13 +105,21 @@ The `web/` package will remain responsible for browser-specific orchestration:
   then pass those records to the Rust/WASM reconstruction API;
 - verify the final file size and use the Rust/WASM BLAKE3 verifier before
   allowing a save;
+- expose a bounded `BrowserFileReader` that retains a small encrypted-record
+  cache and serves independent ranges for playback and seeking;
+- bridge native media-element requests to that reader through a same-origin
+  service worker returning standard `200`/`206`, `Content-Length`,
+  `Content-Range`, and `Accept-Ranges` responses; and
 - expose a small test site that loads the local testnet manifest, displays the
-  startup-published file, uploads paid files, and downloads through the browser
-  save flow.
+  startup-published file, uploads paid files, downloads through the browser
+  save flow, and stream-watches browser-supported video files.
 
-The local browser manifest is bootstrap metadata, not a gateway. Production
-clients will replace its unsigned endpoint list with the ML-DSA-signed records
-defined by ant-node ADR-0009.
+The local browser manifest is bootstrap metadata, not a gateway. Independently
+deployed nodes publish their WebRTC Direct multiaddresses through Saorsa's
+transport-authenticated DHT address sets, allowing a production client to
+discover peers after dialing one configured bootstrap address. ADR-0009 keeps
+an independently cacheable ML-DSA-signed endpoint record as a possible later
+hardening step.
 
 The JavaScript API and demo never accept a certificate hash separately from an
 endpoint. Their sole dialing input is a canonical address of the form
@@ -161,15 +171,17 @@ metadata chain.
   content verification.
 - Self-encryption, DataMap serialization, reconstruction, and content
   addressing have one Rust implementation across native and browser clients.
+- Video playback and seeks retrieve and decrypt only the required records;
+  playback memory is bounded independently of the complete file size.
 - The browser application keeps direct control of WebRTC, wallet, and
   DOM APIs without pulling native runtime dependencies into WASM.
 
 ### Negative / Trade-offs
 
-- The current client reconstructs files in memory and the local launcher caps
-  public files at 1 GB (1,000,000,000 bytes); upload encryption and
-  reconstruction are not yet streaming, so the practical limit depends on
-  available browser memory.
+- Whole-file upload and save still process complete files in memory and the
+  local launcher caps public files at 1 GB (1,000,000,000 bytes). Video range
+  playback is bounded, but it does not remove those separate upload/save
+  memory constraints.
 - JavaScript quote-verification behavior must remain aligned with native
   protocol rules until transport-free `ant-protocol` APIs exist.
 - The initial WASM module is approximately 1.4 MiB uncompressed and browser
@@ -192,6 +204,8 @@ metadata chain.
 - The manifest HTTP service carries only small bootstrap metadata.
 - Browser WebRTC APIs still require a secure browser context; localhost
   qualifies for development.
+- The range-response service worker also requires a secure context and the
+  controlling page must remain open to own WebRTC and the Rust range reader.
 - Node and client repositories must run compatible browser protocol versions.
 
 ## Validation
@@ -217,10 +231,13 @@ metadata chain.
   self-contained multiaddress, retrieves every record, and reconstructs the
   exact file, pays a real signed quote, accepts a paid binary PUT through the
   ordinary node verifier, and reads the stored record back.
+- The real-browser test uploads a nested-DataMap file, opens it through the
+  Rust range reader, verifies exact disjoint and suffix HTTP ranges through the
+  service worker, and then performs complete reconstruction as a separate path.
 - Before acceptance, run interactive tests on current Chrome, Firefox, and
   Safari and add shared lookup convergence vectors with the native client.
-- Revisit this decision when streaming file reconstruction or production signed
-  endpoint discovery is implemented.
+- Revisit this decision when relayed WebRTC or independently cacheable signed
+  endpoint records are implemented.
 
 ## Notes for AI-assisted work
 

@@ -22,7 +22,11 @@
       </header>
 
       <section aria-labelledby="testnet-heading">
-        <h2 id="testnet-heading">Local testnet</h2>
+        <h2 id="testnet-heading">Optional testnet manifest</h2>
+        <p class="section-note">
+          Load a local manifest for file metadata, or skip this and paste one
+          public WebRTC Direct bootstrap address below.
+        </p>
         <label>
           Browser manifest URL
           <input
@@ -49,6 +53,7 @@
         <p class="section-note">
           The certificate pins and peer identity are embedded in this address.
           It is populated from the testnet manifest and can also be pasted manually.
+          A successful connection installs this node as the Rust network bootstrap seed.
         </p>
         <label>
           WebRTC Direct multiaddress
@@ -60,7 +65,7 @@
           />
         </label>
         <div class="actions">
-          <button id="connect" type="button">Connect</button>
+          <button id="connect" type="button">Connect and use as bootstrap</button>
           <output id="connection-state">Disconnected</output>
         </div>
       </section>
@@ -133,6 +138,20 @@
           <output id="download-state"></output>
           <span id="download-link"></span>
         </div>
+      </section>
+
+      <section aria-labelledby="stream-heading">
+        <h2 id="stream-heading">Stream video directly</h2>
+        <p class="section-note">
+          Opens the public file as a seekable byte-range source. Playback fetches,
+          verifies, and decrypts only the encrypted chunks needed by the video element.
+          The public DataMap address from the download field above is used.
+        </p>
+        <div class="actions">
+          <button id="stream-file" type="button">Prepare video stream</button>
+          <output id="stream-state"></output>
+        </div>
+        <video id="stream-video" controls playsinline preload="none" hidden></video>
       </section>
 
       <section aria-labelledby="log-heading">

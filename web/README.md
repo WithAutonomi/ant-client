@@ -7,8 +7,9 @@ lookup engine. `ant-core` is compiled to WASM and owns the WebRTC peer
 connections and data channels, wire framing, authenticated HELLO, connection
 pool, Kademlia walk, native self-encryption, quote and commitment verification,
 payment planning, record upload/download, public DataMap serialization,
-reconstruction, and BLAKE3 content verification. JavaScript drives the page,
-browser file/save APIs, and Ethers transaction submission.
+whole-file reconstruction, random-access range decryption, and BLAKE3 content
+verification. JavaScript drives the page, browser file/save and service-worker
+APIs, and Ethers transaction submission.
 
 The node-side WebRTC Direct listener and testnet manifest API live in the
 `ant-node-web-support` sibling repository. No HTTP gateway performs lookup or
@@ -16,7 +17,7 @@ proxies file bytes.
 
 ## Requirements
 
-- Rust 1.88 or newer for the node's optional Saorsa WebRTC transport.
+- Rust 1.88 or newer for the node's Saorsa WebRTC transport.
 - The `wasm32-unknown-unknown` Rust target.
 - `wasm-pack` 0.15.
 - Node.js 20.19+ or 22.12+.
@@ -39,7 +40,7 @@ cargo install wasm-pack --version 0.15.0 --locked
 From `ant-node-web-support`:
 
 ```bash
-cargo run --features webrtc-direct --bin ant-devnet -- \
+cargo run --bin ant-devnet -- \
   --preset minimal \
   --base-port 23000 \
   --webrtc-direct \
@@ -91,8 +92,9 @@ Open `http://127.0.0.1:5173`. The page automatically loads the testnet
 manifest from port 25000 and fills in the default file:
 
 1. **Load testnet** refreshes the manifest and direct multiaddress catalog.
-2. **Connect** parses the first node multiaddress and performs a pinned
-   WebRTC Direct `HELLO` and verifies its ML-DSA identity signature.
+2. **Connect and use as bootstrap** parses the first node multiaddress,
+   performs a pinned WebRTC Direct `HELLO`, and verifies its ML-DSA identity
+   signature.
 3. **Find closest** runs Saorsa's iterative lookup engine and WebRTC Direct
    query batches entirely in Rust/WASM.
 4. Under **Paid public file upload**, choose a file, paste the funded private
@@ -106,10 +108,37 @@ manifest from port 25000 and fills in the default file:
 5. **Download and save file** opens the browser save flow, fetches the public
    DataMap and encrypted chunks from direct closest storage nodes, reconstructs
    the whole file, verifies BLAKE3, and retains a **Save again** link.
+6. For a browser-supported video, select **Prepare video stream** and then use
+   the native video controls. A Rust `BrowserFileReader` resolves the root
+   DataMap and fetches only records overlapping each requested byte range. A
+   thin service-worker adapter presents those decrypted ranges to the native
+   `<video>` element as `206 Partial Content`, including suffix ranges used to
+   locate MP4 metadata and disjoint ranges used for seeking.
+
+The endpoint field also supports manifest-free bootstrap. Paste one complete
+WebRTC Direct multiaddress and click **Connect and use as bootstrap**. After
+the authenticated HELLO succeeds, that address replaces the Rust network
+client's seed list and the authenticated HELLO response supplies the public
+payment configuration. The same address can be supplied when opening the page:
+
+```text
+http://127.0.0.1:5173/?endpoint=<URL-encoded-WebRTC-Direct-multiaddr>
+```
+
+When `endpoint` is present, startup skips the default local-manifest fetch.
+This is sufficient for a direct connectivity test without an HTTP manifest.
+File downloads and video streams still need a trusted public-file descriptor.
+Traversal to independently deployed nodes bootstraps from this one address:
+nodes propagate their WebRTC Direct multiaddresses in Saorsa's authenticated
+DHT address sets, and the browser verifies each discovered peer during HELLO.
 
 The browser receives the DataMap and all encrypted file bytes from UDP
 24000-24004 over ICE, DTLS, SCTP, and data channels, not from the manifest
 server on TCP 25000. The manifest server is bootstrap metadata only.
+Video playback keeps a bounded 32 MiB encrypted-record cache and does not
+reconstruct the complete file. Playback still depends on the browser supporting
+the file's container and codecs. The page must remain open because it owns the
+authenticated WebRTC associations used by the service worker's range response.
 
 For a LAN test, start the node devnet with `--host <LAN_IPV4>` and serve Vite with
 `npm run dev -- --host 0.0.0.0`. Change the manifest URL in the
@@ -155,6 +184,9 @@ downloads all public-file records through WebRTC Direct, reconstructs the
 original bytes, pays real quotes on local Anvil, uploads an incompressible file
 large enough to require a nested DataMap through the ordinary node payment
 validator, and downloads and verifies it again.
+The same live-browser test opens that nested file through `BrowserFileReader`
+and verifies exact disjoint and suffix HTTP byte ranges through the service
+worker, exercising seek and end-of-file metadata access without a gateway.
 
 ## Library boundary
 
@@ -163,14 +195,18 @@ repository. Its cross-platform `browser` modules own bootstrap manifest and
 public-file types, WebRTC Direct addresses and framing, HELLO identity
 authentication, BLAKE3/self-encryption, Saorsa lookup, storage quote and native
 commitment verification, pricing and payment planning, and complete public
-upload/download workflows. The `browser-wasm` host adapter owns
+upload/download workflows. It also exposes a bounded random-access
+`BrowserFileReader` for media and other seekable consumers. The `browser-wasm`
+host adapter owns
 `RTCPeerConnection` and `RTCDataChannel` through `web-sys`, allowing any web
 application to use `BrowserNetworkClient` without copying the Autonomi protocol
 into JavaScript.
 
 The application JavaScript owns only capabilities tied to the page or the
-selected wallet stack: DOM events, browser `File`/save-picker APIs, and Ethers
-contract calls. This is also the deliberate extension seam: another web app can
+selected wallet stack: DOM events, browser `File`/save-picker/service-worker
+APIs, and Ethers contract calls. The service worker does not connect to nodes;
+it translates native media byte-range requests into calls on the page-owned
+Rust reader. This is also the deliberate extension seam: another web app can
 provide its own UI and wallet callback while sharing all network and Autonomi
 logic from the Rust library.
 

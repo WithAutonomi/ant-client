@@ -1,7 +1,38 @@
 import { expect, test } from "@playwright/test";
 
-test("uploads and downloads a nested-DataMap file over WebRTC Direct", async ({
+test("a URL endpoint skips the local manifest and connects directly", async ({
   page,
+  request,
+}) => {
+  const applicationErrors = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") applicationErrors.push(message.text());
+  });
+  const manifestResponse = await request.get(
+    "http://127.0.0.1:35000/api/browser-manifest.json",
+  );
+  expect(manifestResponse.ok()).toBe(true);
+  const manifest = await manifestResponse.json();
+  const endpoint = manifest.endpoints[0].multiaddr;
+
+  await page.goto(`/?endpoint=${encodeURIComponent(endpoint)}`);
+  await expect(page.locator("#manifest-state")).toHaveText(
+    "Manual endpoint · manifest skipped",
+  );
+  await page
+    .getByRole("button", { name: "Connect and use as bootstrap", exact: true })
+    .click();
+  await expect(page.locator("#connection-state")).toContainText("Connected");
+  await expect(page.locator("#manifest-state")).toHaveText(
+    "Manual bootstrap · 1 direct node",
+  );
+  await expect(page.locator("#log")).toContainText("HELLO");
+  expect(applicationErrors).toEqual([]);
+});
+
+test("bootstraps from one address, then uploads and downloads over WebRTC Direct", async ({
+  page,
+  request,
 }) => {
   test.setTimeout(180_000);
   const applicationErrors = [];
@@ -15,16 +46,23 @@ test("uploads and downloads a nested-DataMap file over WebRTC Direct", async ({
     });
   });
 
-  const manifestUrl = "http://127.0.0.1:35000/api/browser-manifest.json";
-  await page.goto(`/?manifest=${encodeURIComponent(manifestUrl)}`);
-  await expect(page.locator("#manifest-state")).toContainText("direct nodes", {
-    timeout: 120_000,
-  });
+  const manifestResponse = await request.get(
+    "http://127.0.0.1:35000/api/browser-manifest.json",
+  );
+  expect(manifestResponse.ok()).toBe(true);
+  const manifest = await manifestResponse.json();
+  const endpoint = manifest.endpoints[0].multiaddr;
+  await page.goto(`/?endpoint=${encodeURIComponent(endpoint)}`);
+  await expect(page.locator("#manifest-state")).toHaveText(
+    "Manual endpoint · manifest skipped",
+  );
   await expect(page.locator("#endpoint-multiaddr")).toHaveValue(
     /\/webrtc-direct\/certhash\/.+\/p2p\//,
   );
 
-  await page.getByRole("button", { name: "Connect", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Connect and use as bootstrap", exact: true })
+    .click();
 
   try {
     await expect(page.locator("#connection-state")).toContainText("Connected");
@@ -45,7 +83,7 @@ test("uploads and downloads a nested-DataMap file over WebRTC Direct", async ({
   }
   await page.locator("#upload-file-input").setInputFiles({
     name: "nested-datamap.bin",
-    mimeType: "application/octet-stream",
+    mimeType: "video/mp4",
     buffer: content,
   });
   await page
@@ -62,6 +100,57 @@ test("uploads and downloads a nested-DataMap file over WebRTC Direct", async ({
     throw new Error(`${error.message}\n\nBrowser protocol log:\n${protocolLog}`);
   }
   await expect(page.locator("#upload-result-records")).toContainText("8 records");
+
+  await page.getByRole("button", { name: "Prepare video stream" }).click();
+  await expect(page.locator("#stream-state")).toContainText("Ready", {
+    timeout: 60_000,
+  });
+  const streamUrl = await page.locator("#stream-video").getAttribute("src");
+  const rangeStart = 1_000_000;
+  const rangeLength = 8192;
+  const streamed = await page.evaluate(
+    async ({ streamUrl, rangeStart, rangeLength }) => {
+      const response = await fetch(streamUrl, {
+        headers: { Range: `bytes=${rangeStart}-${rangeStart + rangeLength - 1}` },
+      });
+      return {
+        status: response.status,
+        contentRange: response.headers.get("content-range"),
+        acceptRanges: response.headers.get("accept-ranges"),
+        bytes: Array.from(new Uint8Array(await response.arrayBuffer())),
+      };
+    },
+    { streamUrl, rangeStart, rangeLength },
+  );
+  expect(streamed.status).toBe(206);
+  expect(streamed.contentRange).toBe(
+    `bytes ${rangeStart}-${rangeStart + rangeLength - 1}/${content.length}`,
+  );
+  expect(streamed.acceptRanges).toBe("bytes");
+  expect(streamed.bytes).toEqual(
+    Array.from(content.subarray(rangeStart, rangeStart + rangeLength)),
+  );
+  const tailLength = 512;
+  const streamedTail = await page.evaluate(
+    async ({ streamUrl, tailLength }) => {
+      const response = await fetch(streamUrl, {
+        headers: { Range: `bytes=-${tailLength}` },
+      });
+      return {
+        status: response.status,
+        contentRange: response.headers.get("content-range"),
+        bytes: Array.from(new Uint8Array(await response.arrayBuffer())),
+      };
+    },
+    { streamUrl, tailLength },
+  );
+  expect(streamedTail.status).toBe(206);
+  expect(streamedTail.contentRange).toBe(
+    `bytes ${content.length - tailLength}-${content.length - 1}/${content.length}`,
+  );
+  expect(streamedTail.bytes).toEqual(
+    Array.from(content.subarray(content.length - tailLength)),
+  );
 
   const downloadStarted = page.waitForEvent("download");
   await page.getByRole("button", { name: "Download and save file" }).click();

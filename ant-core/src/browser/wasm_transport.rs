@@ -28,7 +28,7 @@ use saorsa_dht_lookup::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Deref;
 use std::rc::Rc;
@@ -49,6 +49,8 @@ const DEFAULT_LOOKUP_ALPHA: usize = 3;
 const DEFAULT_MAX_LOOKUP_ITERATIONS: usize = 20;
 const MAX_STORE_TARGETS: usize = 7;
 const MAX_DOWNLOAD_CONCURRENCY: usize = 6;
+const MAX_BROWSER_RANGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 type ResponseInbox = Rc<Mutex<mpsc::UnboundedReceiver<Result<Vec<u8>, String>>>>;
 
@@ -945,6 +947,239 @@ struct BrowserUploadResult {
     records: usize,
 }
 
+struct CachedRangeRecord {
+    content: bytes::Bytes,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct BrowserRangeCache {
+    entries: HashMap<[u8; 32], CachedRangeRecord>,
+    total_bytes: usize,
+    clock: u64,
+}
+
+impl BrowserRangeCache {
+    fn contains(&self, address: &[u8; 32]) -> bool {
+        self.entries.contains_key(address)
+    }
+
+    fn get(&mut self, address: &[u8; 32]) -> Option<bytes::Bytes> {
+        self.clock = self.clock.wrapping_add(1);
+        let entry = self.entries.get_mut(address)?;
+        entry.last_used = self.clock;
+        Some(entry.content.clone())
+    }
+
+    fn insert(&mut self, address: [u8; 32], content: Vec<u8>) {
+        self.clock = self.clock.wrapping_add(1);
+        let content = bytes::Bytes::from(content);
+        if let Some(previous) = self.entries.remove(&address) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.content.len());
+        }
+        self.total_bytes = self.total_bytes.saturating_add(content.len());
+        self.entries.insert(
+            address,
+            CachedRangeRecord {
+                content,
+                last_used: self.clock,
+            },
+        );
+        while self.total_bytes > MAX_RANGE_CACHE_BYTES && self.entries.len() > 1 {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(address, _)| *address)
+            else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.content.len());
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.total_bytes = 0;
+    }
+}
+
+/// Random-access public-file reader for media playback and bounded downloads.
+#[wasm_bindgen(js_name = BrowserFileReader)]
+pub struct BrowserFileReader {
+    inner: Rc<BrowserNetworkCore>,
+    file: PublicFileDescriptor,
+    root_data_map: self_encryption::DataMap,
+    cache: RefCell<BrowserRangeCache>,
+    progress: ProgressReporter,
+    closed: Cell<bool>,
+}
+
+#[wasm_bindgen(js_class = BrowserFileReader)]
+impl BrowserFileReader {
+    /// Plaintext file size in bytes.
+    #[wasm_bindgen(getter)]
+    pub fn size(&self) -> usize {
+        self.file.size
+    }
+
+    /// Browser MIME type advertised by the file descriptor.
+    #[wasm_bindgen(getter, js_name = contentType)]
+    pub fn content_type(&self) -> String {
+        self.file.content_type.clone()
+    }
+
+    /// Display filename advertised by the file descriptor.
+    #[wasm_bindgen(getter)]
+    pub fn name(&self) -> String {
+        self.file.name.clone()
+    }
+
+    /// Fetch and decrypt one plaintext byte range without reconstructing the file.
+    #[wasm_bindgen(js_name = readRange)]
+    pub async fn read_range(&self, start: usize, length: usize) -> Result<Uint8Array, JsValue> {
+        let content = self
+            .read_range_inner(start, length)
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
+        Ok(Uint8Array::from(content.as_slice()))
+    }
+
+    /// Release cached encrypted records held for playback read-ahead and seeks.
+    pub fn close(&self) {
+        self.closed.set(true);
+        self.cache.borrow_mut().clear();
+    }
+}
+
+impl BrowserFileReader {
+    async fn read_range_inner(&self, start: usize, length: usize) -> Result<Vec<u8>, String> {
+        if self.closed.get() {
+            return Err("browser file reader is closed".to_string());
+        }
+        if length > MAX_BROWSER_RANGE_BYTES {
+            return Err(format!(
+                "browser range reads are limited to {MAX_BROWSER_RANGE_BYTES} bytes"
+            ));
+        }
+        if length == 0 || start >= self.file.size {
+            return Ok(Vec::new());
+        }
+        let end = start.saturating_add(length).min(self.file.size);
+        let required = required_range_records(&self.root_data_map, start, end)?;
+        if required.is_empty() {
+            return Err("DataMap contains no records for the requested range".to_string());
+        }
+
+        let missing = {
+            let cache = self.cache.borrow();
+            required
+                .iter()
+                .filter(|(_, address)| !cache.contains(address))
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        if !missing.is_empty() {
+            let downloads = stream::iter(missing)
+                .map(|(index, address)| {
+                    let inner = Rc::clone(&self.inner);
+                    let progress = self.progress.clone();
+                    async move {
+                        let encoded = hex::encode(address);
+                        progress.report(&format!(
+                            "Streaming encrypted chunk {} ({encoded})",
+                            index + 1
+                        ));
+                        inner
+                            .get_chunk_from_closest(&encoded, &progress)
+                            .await
+                            .map(|(content, _)| (address, content))
+                    }
+                })
+                .buffer_unordered(MAX_DOWNLOAD_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+            let mut cache = self.cache.borrow_mut();
+            for download in downloads {
+                let (address, content) = download?;
+                cache.insert(address, content);
+            }
+        }
+
+        let available = {
+            let mut cache = self.cache.borrow_mut();
+            required
+                .iter()
+                .map(|(_, address)| {
+                    cache
+                        .get(address)
+                        .map(|content| (*address, content))
+                        .ok_or_else(|| {
+                            format!("streaming cache omitted record {}", hex::encode(address))
+                        })
+                })
+                .collect::<Result<HashMap<_, _>, _>>()?
+        };
+        let fetch_cached = |requested: &[(usize, self_encryption::XorName)]| {
+            requested
+                .iter()
+                .map(|(index, address)| {
+                    available
+                        .get(&address.0)
+                        .cloned()
+                        .map(|content| (*index, content))
+                        .ok_or_else(|| {
+                            self_encryption::Error::Generic(format!(
+                                "streaming range omitted record {}",
+                                hex::encode(address.0)
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let stream = self_encryption::streaming_decrypt_with_batch_size(
+            &self.root_data_map,
+            fetch_cached,
+            required.len(),
+        )
+        .map_err(|error| format!("could not initialize range decryption: {error}"))?;
+        let plaintext = stream
+            .get_range(start, end - start)
+            .map_err(|error| format!("could not decrypt requested range: {error}"))?;
+        if plaintext.len() != end - start {
+            return Err(format!(
+                "range decryption returned {} bytes, expected {}",
+                plaintext.len(),
+                end - start
+            ));
+        }
+        Ok(plaintext.to_vec())
+    }
+}
+
+fn required_range_records(
+    data_map: &self_encryption::DataMap,
+    start: usize,
+    end: usize,
+) -> Result<Vec<(usize, [u8; 32])>, String> {
+    let mut infos = data_map.infos().to_vec();
+    infos.sort_by_key(|info| info.index);
+    let mut cursor = 0usize;
+    let mut required = Vec::new();
+    for info in infos {
+        let chunk_end = cursor
+            .checked_add(info.src_size)
+            .ok_or_else(|| "DataMap plaintext size overflow".to_string())?;
+        if cursor < end && chunk_end > start {
+            required.push((info.index, info.dst_hash.0));
+        }
+        cursor = chunk_end;
+    }
+    Ok(required)
+}
+
 /// Stateful Autonomi browser client sharing Rust lookup and data workflows.
 #[wasm_bindgen(js_name = BrowserNetworkClient)]
 pub struct BrowserNetworkClient {
@@ -1005,6 +1240,21 @@ impl BrowserNetworkClient {
         serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
+    /// Resolve and validate a public file for random-access range reads.
+    #[wasm_bindgen(js_name = openPublicFile)]
+    pub async fn open_public_file(
+        &self,
+        file: JsValue,
+        on_progress: Option<js_sys::Function>,
+    ) -> Result<BrowserFileReader, JsValue> {
+        let file: PublicFileDescriptor = serde_wasm_bindgen::from_value(file)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let progress = ProgressReporter::from_js(on_progress);
+        self.open_public_file_inner(file, progress)
+            .await
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
     /// Self-encrypt, quote, pay through a wallet callback, and store a public file.
     #[wasm_bindgen(js_name = uploadPublicFile)]
     pub async fn upload_public_file(
@@ -1043,6 +1293,120 @@ impl BrowserNetworkClient {
 }
 
 impl BrowserNetworkClient {
+    async fn open_public_file_inner(
+        &self,
+        mut file: PublicFileDescriptor,
+        progress: ProgressReporter,
+    ) -> Result<BrowserFileReader, String> {
+        file.address = super::protocol::normalize_hex(&file.address, 32)?;
+        file.blake3 = super::protocol::normalize_hex(&file.blake3, 32)?;
+        if file.name.is_empty() {
+            return Err("public file has no name".to_string());
+        }
+        if file.size == 0 || file.size > super::MAX_BROWSER_FILE_BYTES {
+            return Err(format!("invalid public file size {}", file.size));
+        }
+        progress.report(&format!(
+            "Opening {} for random-access streaming",
+            file.name
+        ));
+        let (encoded_data_map, _) = self
+            .inner
+            .get_chunk_from_closest(&file.address, &progress)
+            .await?;
+        if encoded_data_map.len() != file.data_map_size {
+            return Err(format!(
+                "public DataMap has {} bytes, expected {}",
+                encoded_data_map.len(),
+                file.data_map_size
+            ));
+        }
+        let published_data_map: self_encryption::DataMap = rmp_serde::from_slice(&encoded_data_map)
+            .map_err(|error| format!("could not decode public DataMap: {error}"))?;
+        let root_data_map = if published_data_map.is_child() {
+            let child_infos = published_data_map.infos().to_vec();
+            let downloads = stream::iter(child_infos.iter().cloned())
+                .map(|info| {
+                    let inner = Rc::clone(&self.inner);
+                    let progress = progress.clone();
+                    async move {
+                        let address = hex::encode(info.dst_hash.0);
+                        progress.report(&format!(
+                            "Resolving nested DataMap record {}",
+                            info.index + 1
+                        ));
+                        inner
+                            .get_chunk_from_closest(&address, &progress)
+                            .await
+                            .map(|(content, _)| (info.dst_hash.0, bytes::Bytes::from(content)))
+                    }
+                })
+                .buffer_unordered(MAX_DOWNLOAD_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+            let mut child_records = HashMap::with_capacity(downloads.len());
+            for download in downloads {
+                let (address, content) = download?;
+                child_records.insert(address, content);
+            }
+            let mut get_child = |address: self_encryption::XorName| {
+                child_records.get(&address.0).cloned().ok_or_else(|| {
+                    self_encryption::Error::Generic(format!(
+                        "nested DataMap resolution requested unavailable record {}",
+                        hex::encode(address.0)
+                    ))
+                })
+            };
+            self_encryption::get_root_data_map(published_data_map, &mut get_child)
+                .map_err(|error| format!("could not resolve root DataMap: {error}"))?
+        } else {
+            published_data_map
+        };
+
+        let actual_chunks = super::chunk_infos(&root_data_map);
+        let mut expected_chunks = file
+            .chunks
+            .iter()
+            .map(|chunk| super::BrowserChunkInfo {
+                index: chunk.index,
+                dst_hash: chunk.dst_hash.to_ascii_lowercase(),
+                src_hash: chunk.src_hash.to_ascii_lowercase(),
+                src_size: chunk.src_size,
+            })
+            .collect::<Vec<_>>();
+        expected_chunks.sort_by_key(|chunk| chunk.index);
+        if actual_chunks != expected_chunks {
+            return Err(
+                "resolved root DataMap does not match the public file descriptor".to_string(),
+            );
+        }
+        let resolved_size = actual_chunks.iter().try_fold(0usize, |total, chunk| {
+            total
+                .checked_add(chunk.src_size)
+                .ok_or_else(|| "resolved public file size overflow".to_string())
+        })?;
+        if resolved_size != file.size {
+            return Err(format!(
+                "resolved public file has {resolved_size} bytes, expected {}",
+                file.size
+            ));
+        }
+        progress.report(&format!(
+            "Ready to stream {} ({} bytes, {} chunks)",
+            file.name,
+            file.size,
+            actual_chunks.len()
+        ));
+        Ok(BrowserFileReader {
+            inner: Rc::clone(&self.inner),
+            file,
+            root_data_map,
+            cache: RefCell::new(BrowserRangeCache::default()),
+            progress,
+            closed: Cell::new(false),
+        })
+    }
+
     async fn download_public_file_inner(
         &self,
         file: PublicFileDescriptor,
@@ -1074,7 +1438,7 @@ impl BrowserNetworkClient {
         let mut chunks =
             super::decode_public_data_map(&data_map).map_err(|error| error.to_string())?;
         chunks.extend(file.chunks.iter().cloned());
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         chunks.retain(|chunk| seen.insert(chunk.dst_hash.clone()));
         if chunks.len() < 3 {
             return Err("ant-core returned an invalid public DataMap".to_string());
