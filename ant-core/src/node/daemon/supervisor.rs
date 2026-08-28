@@ -1019,6 +1019,13 @@ async fn monitor_node_inner(
             status_at_exit,
             Some(NodeStatus::Stopped) | Some(NodeStatus::Stopping) | Some(NodeStatus::Evicted)
         ) {
+            // Logged because this return is indistinguishable from a healthy user-initiated stop
+            // unless it says so. If anything else has parked the node in one of these states while
+            // it was shutting down, an auto-upgrade restart is silently abandoned here.
+            tracing::info!(
+                "node {node_id}: process exited while marked {status_at_exit:?}; treating it as an \
+                 intentional stop and not restarting"
+            );
             return;
         }
 
@@ -1035,14 +1042,28 @@ async fn monitor_node_inner(
         // upgrade we respawn directly (no backoff, no crash counter) and refresh the recorded
         // version via `respawn_upgraded_node`.
         if is_upgrade_restart_exit_code(exit_code) {
-            if let Ok(disk_version) = extract_version(&config.binary_path).await {
-                if disk_version != config.version {
+            // Every outcome below is logged. This is the point where an auto-upgrade either lands
+            // or is silently mistaken for a crash, and the two inputs to that decision -- the exit
+            // code and the on-disk version -- exist nowhere else afterwards. `NodeEvent`s alone are
+            // not enough: they go to a broadcast channel whose only consumer is the events stream,
+            // so with nothing attached at the moment of the exit they leave no trace at all.
+            match extract_version(&config.binary_path).await {
+                Ok(disk_version) if disk_version != config.version => {
+                    tracing::info!(
+                        "node {node_id}: exited with code {exit_code:?} and its binary is now \
+                         {disk_version} (registry has {}); treating this as an auto-upgrade restart",
+                        config.version
+                    );
                     match respawn_upgraded_node(config, &supervisor, &registry, &event_tx).await {
                         Ok(new_child) => {
                             child = new_child;
                             continue;
                         }
                         Err(e) => {
+                            tracing::error!(
+                                "node {node_id}: upgraded to {disk_version} but could not be \
+                                 respawned: {e}"
+                            );
                             let _ = event_tx.send(NodeEvent::NodeErrored {
                                 node_id,
                                 message: format!("Failed to respawn after upgrade: {e}"),
@@ -1053,10 +1074,31 @@ async fn monitor_node_inner(
                         }
                     }
                 }
+                Ok(disk_version) => {
+                    tracing::warn!(
+                        "node {node_id}: exited with code {exit_code:?}, but its binary is still \
+                         {disk_version}, so this is not an upgrade restart; treating it as a crash"
+                    );
+                }
+                Err(e) => {
+                    // Swallowing this is how an upgrade that did replace the binary gets recorded
+                    // as a crash with no explanation anywhere.
+                    tracing::warn!(
+                        "node {node_id}: exited with code {exit_code:?}, but the version of {} \
+                         could not be read: {e}. Treating it as a crash -- if an auto-upgrade had \
+                         just replaced that binary, this is where it was missed",
+                        config.binary_path.display()
+                    );
+                }
             }
-            // Clean exit but the binary didn't change — fall through to the crash / restart path.
-            // We report the crash with the exit code preserved; the crash counter guards against
-            // infinite restart loops if the process keeps exiting immediately.
+            // Fall through to the crash / restart path. We report the crash with the exit code
+            // preserved; the crash counter guards against infinite restart loops if the process
+            // keeps exiting immediately.
+        } else {
+            tracing::warn!(
+                "node {node_id}: exited with code {exit_code:?}, which is not an upgrade-restart \
+                 code; treating it as a crash"
+            );
         }
 
         // Crash (or clean exit that wasn't an upgrade)
@@ -1068,6 +1110,12 @@ async fn monitor_node_inner(
         };
 
         if !should_restart {
+            tracing::error!(
+                "node {node_id}: crashed {} times within {} seconds; giving up and marking it \
+                 errored",
+                MAX_CRASHES_BEFORE_ERRORED,
+                CRASH_WINDOW.as_secs()
+            );
             let _ = event_tx.send(NodeEvent::NodeErrored {
                 node_id,
                 message: format!(
@@ -1079,6 +1127,10 @@ async fn monitor_node_inner(
             return;
         }
 
+        tracing::info!(
+            "node {node_id}: restarting after crash (attempt {attempt}) in {}s",
+            backoff.as_secs()
+        );
         let _ = event_tx.send(NodeEvent::NodeRestarting { node_id, attempt });
 
         tokio::time::sleep(backoff).await;
@@ -1090,6 +1142,9 @@ async fn monitor_node_inner(
                     Some(pid) => pid,
                     None => {
                         // Process exited before we could read its PID
+                        tracing::error!(
+                            "node {node_id}: restarted process exited before its PID could be read"
+                        );
                         let _ = event_tx.send(NodeEvent::NodeErrored {
                             node_id,
                             message: "Restarted process exited before PID could be read"
@@ -1108,6 +1163,7 @@ async fn monitor_node_inner(
                 child = new_child;
             }
             Err(e) => {
+                tracing::error!("node {node_id}: failed to restart after crash: {e}");
                 let _ = event_tx.send(NodeEvent::NodeErrored {
                     node_id,
                     message: format!("Failed to restart node: {e}"),
@@ -1212,17 +1268,28 @@ async fn graceful_kill(pid: u32) {
 /// may differ from the snapshot (e.g. an upgrade respawn replaced the PID with a live one
 /// while leaving the status `Running`).
 ///
-/// We only stop the node if it is still `Running` AND the recorded PID is still the one we
-/// observed dead. The PID check is essential: between the snapshot and now, an upgrade (or
-/// crash) respawn can have replaced the dead `snapshot_pid` with a live `current_pid` while
-/// keeping the status `Running`. Stopping in that case would clobber a healthy, freshly
-/// respawned process (the "running node reported as stopped after an upgrade" bug).
+/// Three conditions, all necessary:
+///
+/// * **The node must be adopted.** A node this daemon spawned has a `monitor_node` task
+///   awaiting its `Child`, and that task owns the exit transition: it distinguishes an
+///   auto-upgrade restart from a crash and respawns accordingly. The sweep reaching the node
+///   first and parking it in `Stopped` does not merely duplicate that work, it *prevents* it —
+///   `monitor_node_inner` treats `Stopped` as a user-initiated stop and returns without
+///   restarting. The node is then left down for good, on a binary it already replaced, with the
+///   registry still naming the old version. That race is lost whenever shutdown outlasts a poll
+///   interval, which a graceful P2P shutdown routinely does.
+/// * **It must still be `Running`.** Anything else is already accounted for.
+/// * **The recorded PID must still be the one observed dead.** Between the snapshot and now, an
+///   upgrade (or crash) respawn can have replaced the dead `snapshot_pid` with a live
+///   `current_pid` while keeping the status `Running`. Stopping there would clobber a healthy,
+///   freshly respawned process (the "running node reported as stopped after an upgrade" bug).
 fn liveness_should_stop(
+    is_adopted: bool,
     snapshot_pid: u32,
     current_pid: Option<u32>,
     current_status: Option<NodeStatus>,
 ) -> bool {
-    current_status == Some(NodeStatus::Running) && current_pid == Some(snapshot_pid)
+    is_adopted && current_status == Some(NodeStatus::Running) && current_pid == Some(snapshot_pid)
 }
 
 /// Poll each Running node's PID for OS liveness every `LIVENESS_POLL_INTERVAL`,
@@ -1332,10 +1399,15 @@ pub fn spawn_liveness_monitor(
                 let mut sup = supervisor.write().await;
                 // Re-check under the write lock to avoid racing with a concurrent
                 // start/stop that flipped the state between the snapshot and now.
-                if !liveness_should_stop(pid, sup.node_pid(node_id), sup.node_status(node_id).ok())
-                {
+                if !liveness_should_stop(
+                    sup.is_adopted(node_id),
+                    pid,
+                    sup.node_pid(node_id),
+                    sup.node_status(node_id).ok(),
+                ) {
                     continue;
                 }
+                tracing::info!("node {node_id}: adopted process {pid} is gone; marking it stopped");
                 sup.update_state(node_id, NodeStatus::Stopped, None);
                 let _ = event_tx.send(NodeEvent::NodeStopped { node_id });
                 remove_node_pid(&data_dir);
@@ -1536,11 +1608,32 @@ mod tests {
         let live_respawned_pid = Some(2000); // PID_new from the upgrade respawn (alive)
         assert!(
             !liveness_should_stop(
+                true,
                 dead_snapshot_pid,
                 live_respawned_pid,
                 Some(NodeStatus::Running)
             ),
             "liveness must not stop a node whose PID changed under it (respawned with a live PID)"
+        );
+    }
+
+    // Regression test for the "upgraded node never restarts and reports Stopped" bug.
+    //
+    // A node this daemon spawned exits to apply an auto-upgrade. Its `monitor_node` task is about
+    // to read the exit and respawn it on the new binary. If the liveness sweep gets there first and
+    // marks it Stopped, `monitor_node_inner` reads that status, concludes the stop was intentional
+    // and returns — leaving the node down permanently with the registry still on the old version.
+    // The sweep must therefore leave daemon-owned nodes alone entirely.
+    #[test]
+    fn liveness_does_not_stop_a_daemon_owned_node() {
+        let dead_pid = 1000;
+        assert!(
+            !liveness_should_stop(false, dead_pid, Some(dead_pid), Some(NodeStatus::Running)),
+            "liveness must not pre-empt monitor_node's exit handling for a node this daemon spawned"
+        );
+        assert!(
+            liveness_should_stop(true, dead_pid, Some(dead_pid), Some(NodeStatus::Running)),
+            "an adopted node has no monitor_node, so the sweep is still its only supervisor"
         );
     }
 
