@@ -16,8 +16,17 @@ pub struct DaemonConfig {
     pub port: Option<u16>,
     /// Path to the node registry JSON file.
     pub registry_path: PathBuf,
-    /// Path to the daemon log file.
-    pub log_path: PathBuf,
+    /// Where the daemon writes its own log, or `None` to write none.
+    ///
+    /// `None` by default, in keeping with the CLI's "no logs unless asked for" stance. Set by
+    /// `ant node daemon start --log-path <PATH>`, which forwards the path to the detached
+    /// `daemon run`. A file rather than stdout is the point: the daemon can run for days before the
+    /// behaviour worth diagnosing (an upgrade restart, a crash loop) happens, and a detached
+    /// process has nowhere else to put it.
+    ///
+    /// The path names the log *family*, not one file: rotation inserts the date, so
+    /// `.../daemon.log` is written as `.../daemon.2026-08-27.log`.
+    pub log_path: Option<PathBuf>,
     /// Where to write the chosen port so the CLI can discover it.
     pub port_file_path: PathBuf,
     /// Daemon's own PID file.
@@ -27,12 +36,11 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         let data = config::data_dir().expect("Could not determine data directory");
-        let logs = config::log_dir().expect("Could not determine log directory");
         Self {
             listen_addr: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             port: None,
             registry_path: data.join("node_registry.json"),
-            log_path: logs.join("daemon.log"),
+            log_path: None,
             port_file_path: data.join("daemon.port"),
             pid_file_path: data.join("daemon.pid"),
         }
