@@ -11,7 +11,13 @@
 //! threaded through the file/chunk download path is `None`, so record
 //! construction is skipped entirely (no allocation, no I/O).
 //!
-//! # Schema v3: transport route and selected DHT-record context
+//! # Schema v4: exact node/client request correlation
+//!
+//! Peer-attempt records carry the request ID allocated by this client and the
+//! client's local peer ID. The same request ID is encoded on the chunk GET,
+//! while the peer ID matches the serving node's `source_peer`, permitting an
+//! exact join to node-side GET telemetry. Chunk-level records leave both
+//! fields `null` because no individual peer request was sent.
 //!
 //! The `ant-protocol` diagnostic branch
 //! `diagnostics/v2-903-response-transport-metadata` exposes
@@ -44,11 +50,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ant_protocol::transport::PeerId;
 use serde::Serialize;
 use tracing::{error, warn};
 
 /// Current diagnostic record schema discriminator.
-pub const DIAGNOSTICS_SCHEMA_VERSION: u8 = 3;
+pub const DIAGNOSTICS_SCHEMA_VERSION: u8 = 4;
+
+/// Correlation values captured once for a peer request and shared by both
+/// the encoded protocol message and its diagnostic record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DownloadRequestCorrelation {
+    pub(crate) request_id: u64,
+    pub(crate) local_peer_id: String,
+}
+
+impl DownloadRequestCorrelation {
+    pub(crate) fn new(request_id: u64, local_peer_id: &PeerId) -> Self {
+        Self {
+            request_id,
+            local_peer_id: local_peer_id.to_string(),
+        }
+    }
+}
 
 /// Bounded capacity of the diagnostics channel. A slow writer must not create
 /// unbounded memory growth: when full, further records are dropped (counted
@@ -127,7 +151,7 @@ impl Serialize for DownloadDiagnosticsOutcome {
 /// `null` for a cache hit, which has no peer).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct DownloadDiagnosticsRecord {
-    /// Stable schema discriminator, currently `3`.
+    /// Stable schema discriminator, currently `4`.
     pub schema_version: u8,
     /// UTC time the attempt completed, RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
     pub timestamp: String,
@@ -138,6 +162,13 @@ pub struct DownloadDiagnosticsRecord {
     /// Wall-clock Unix time immediately after the peer request completed, in
     /// milliseconds. `None` for chunk-level records.
     pub request_completed_unix_ms: Option<u64>,
+    /// Protocol request identifier allocated by this client and sent on the
+    /// wire; the serving node's record for this GET carries the same value.
+    /// `None` for chunk-level records where no peer request was sent.
+    pub request_id: Option<u64>,
+    /// This diagnostic client's local peer ID, matching the serving node's
+    /// `source_peer` field. `None` for chunk-level records.
+    pub local_peer_id: Option<String>,
     /// Outer file / deferred-retry attempt number (1 = first pass).
     pub file_attempt: usize,
     /// Chunk index within the file (1-based, matching the progress reports).
@@ -232,7 +263,7 @@ impl DownloadDiagnosticsRecord {
     /// this is the first peer attempt of the sweep (`peer_attempt == 1`).
     /// `route_note` should be `Some` only when `route` is `"unknown"`.
     #[allow(clippy::too_many_arguments)]
-    pub fn peer_attempt(
+    pub(crate) fn peer_attempt(
         file_attempt: usize,
         chunk_index: usize,
         chunk_address: &[u8; 32],
@@ -255,6 +286,7 @@ impl DownloadDiagnosticsRecord {
         fetch_cap: Option<usize>,
         request_started_unix_ms: u64,
         request_completed_unix_ms: u64,
+        correlation: &DownloadRequestCorrelation,
         response_elapsed_ms: u64,
         bytes: u64,
         outcome: DownloadDiagnosticsOutcome,
@@ -270,6 +302,8 @@ impl DownloadDiagnosticsRecord {
             timestamp: utc_now_rfc3339(),
             request_started_unix_ms: Some(request_started_unix_ms),
             request_completed_unix_ms: Some(request_completed_unix_ms),
+            request_id: Some(correlation.request_id),
+            local_peer_id: Some(correlation.local_peer_id.clone()),
             file_attempt,
             chunk_index,
             chunk_address: hex::encode(chunk_address),
@@ -319,6 +353,8 @@ impl DownloadDiagnosticsRecord {
             timestamp: utc_now_rfc3339(),
             request_started_unix_ms: None,
             request_completed_unix_ms: None,
+            request_id: None,
+            local_peer_id: None,
             file_attempt,
             chunk_index,
             chunk_address: hex::encode(chunk_address),
@@ -502,6 +538,10 @@ fn rfc3339_from_unix_secs(secs: u64) -> String {
 mod tests {
     use super::*;
 
+    fn test_correlation(request_id: u64) -> DownloadRequestCorrelation {
+        DownloadRequestCorrelation::new(request_id, &PeerId::from_bytes([42; 32]))
+    }
+
     #[test]
     fn outcome_as_str_is_stable_lowercase() {
         assert_eq!(DownloadDiagnosticsOutcome::Found.as_str(), "found");
@@ -532,6 +572,7 @@ mod tests {
     #[test]
     fn peer_attempt_record_pins_field_names_and_null_ttfb() {
         let addr = [7u8; 32];
+        let correlation = test_correlation(9_001);
         let record = DownloadDiagnosticsRecord::peer_attempt(
             1,
             3,
@@ -555,6 +596,7 @@ mod tests {
             Some(8),
             120,
             1024,
+            &correlation,
             904,
             1024,
             DownloadDiagnosticsOutcome::Found,
@@ -562,12 +604,14 @@ mod tests {
         );
         let json = serde_json::to_value(&record).unwrap();
         let obj = json.as_object().unwrap();
-        // Pin field names — schema v3.
+        // Pin field names — schema v4.
         for field in [
             "schema_version",
             "timestamp",
             "request_started_unix_ms",
             "request_completed_unix_ms",
+            "request_id",
+            "local_peer_id",
             "file_attempt",
             "chunk_index",
             "chunk_address",
@@ -631,7 +675,12 @@ mod tests {
         assert_eq!(obj["lookup_duration_ms"], serde_json::json!(42u64));
         assert_eq!(obj["bytes"], serde_json::json!(1024u64));
         assert_eq!(obj["outcome"], serde_json::json!("found"));
-        assert_eq!(obj["schema_version"], serde_json::json!(3u8));
+        assert_eq!(obj["request_id"], serde_json::json!(9_001u64));
+        assert_eq!(
+            obj["local_peer_id"],
+            serde_json::json!(correlation.local_peer_id)
+        );
+        assert_eq!(obj["schema_version"], serde_json::json!(4u8));
         assert_eq!(obj["lookup_correlation_id"], serde_json::json!("lookup-1"));
         assert_eq!(obj["selected_peer_ordinal"], serde_json::json!(1usize));
         assert_eq!(obj["local_last_seen_age_ms"], serde_json::json!(1_500u64));
@@ -672,6 +721,7 @@ mod tests {
             Some(4),
             500,
             1_000,
+            &test_correlation(9_002),
             500,
             0,
             DownloadDiagnosticsOutcome::Timeout,
@@ -729,6 +779,8 @@ mod tests {
         );
         assert_eq!(obj["request_started_unix_ms"], serde_json::Value::Null);
         assert_eq!(obj["request_completed_unix_ms"], serde_json::Value::Null);
+        assert_eq!(obj["request_id"], serde_json::Value::Null);
+        assert_eq!(obj["local_peer_id"], serde_json::Value::Null);
         assert_eq!(obj["active_requests_at_start"], serde_json::Value::Null);
         assert_eq!(obj["fetch_cap"], serde_json::json!(8usize));
         assert_eq!(obj["route"], serde_json::json!("unknown"));
@@ -856,6 +908,7 @@ mod tests {
             Some(8),
             30,
             60,
+            &test_correlation(9_003),
             30,
             128,
             DownloadDiagnosticsOutcome::Found,
@@ -873,7 +926,7 @@ mod tests {
         );
         let first = serde_json::from_str::<serde_json::Value>(lines[0]).unwrap();
         assert_eq!(first["outcome"], serde_json::json!("cache_hit"));
-        assert_eq!(first["schema_version"], serde_json::json!(3u8));
+        assert_eq!(first["schema_version"], serde_json::json!(4u8));
         let second = serde_json::from_str::<serde_json::Value>(lines[1]).unwrap();
         assert_eq!(second["outcome"], serde_json::json!("found"));
         assert_eq!(second["route"], serde_json::json!("direct"));

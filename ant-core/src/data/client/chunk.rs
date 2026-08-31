@@ -7,7 +7,7 @@ use crate::data::client::adaptive::Outcome;
 use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
 use crate::data::client::diagnostics::{
     bounded_error, unix_now_ms, DownloadDiagnosticsOutcome, DownloadDiagnosticsRecord,
-    DownloadDiagnosticsSender,
+    DownloadDiagnosticsSender, DownloadRequestCorrelation,
 };
 use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
@@ -49,6 +49,18 @@ impl Drop for ActiveDiagnosticRequestGuard {
     fn drop(&mut self) {
         ACTIVE_DIAGNOSTIC_REQUESTS.fetch_sub(1, AtomicOrdering::Relaxed);
     }
+}
+
+fn encode_diagnostic_chunk_get_request(
+    address: &XorName,
+    correlation: &DownloadRequestCorrelation,
+) -> Result<Vec<u8>> {
+    ChunkMessage {
+        request_id: correlation.request_id,
+        body: ChunkMessageBody::GetRequest(ChunkGetRequest::new(*address)),
+    }
+    .encode()
+    .map_err(|e| Error::Protocol(format!("Failed to encode GET request: {e}")))
 }
 
 /// Why a single-peer PUT was declined. Drives the surfaced aggregate error
@@ -272,6 +284,7 @@ impl<'a> ChunkFetchDiagnostics<'a> {
         active_requests_at_start: usize,
         request_started_unix_ms: u64,
         request_completed_unix_ms: u64,
+        correlation: &DownloadRequestCorrelation,
         response_elapsed_ms: u64,
         bytes: u64,
         outcome: DownloadDiagnosticsOutcome,
@@ -306,6 +319,7 @@ impl<'a> ChunkFetchDiagnostics<'a> {
                 Some(self.fetch_cap),
                 request_started_unix_ms,
                 request_completed_unix_ms,
+                correlation,
                 response_elapsed_ms,
                 bytes,
                 outcome,
@@ -1077,8 +1091,10 @@ impl Client {
                     ActiveDiagnosticRequestGuard::enter();
                 let request_started_unix_ms = unix_now_ms();
                 let resp_start = Instant::now();
+                let correlation =
+                    DownloadRequestCorrelation::new(self.next_request_id(), node.peer_id());
                 let observed = self
-                    .chunk_get_from_peer_with_metadata(address, peer, addrs)
+                    .chunk_get_from_peer_with_metadata(address, peer, addrs, &correlation)
                     .await;
                 let response_elapsed_ms =
                     u64::try_from(resp_start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1124,6 +1140,7 @@ impl Client {
                     active_requests_at_start,
                     request_started_unix_ms,
                     request_completed_unix_ms,
+                    &correlation,
                     response_elapsed_ms,
                     bytes,
                     outcome,
@@ -1366,17 +1383,10 @@ impl Client {
         address: &XorName,
         peer: &PeerId,
         peer_addrs: &[MultiAddr],
+        correlation: &DownloadRequestCorrelation,
     ) -> Result<ChunkProtocolResponse<Option<DataChunk>, Error>> {
         let node = self.network().node();
-        let request_id = self.next_request_id();
-        let request = ChunkGetRequest::new(*address);
-        let message = ChunkMessage {
-            request_id,
-            body: ChunkMessageBody::GetRequest(request),
-        };
-        let message_bytes = message
-            .encode()
-            .map_err(|e| Error::Protocol(format!("Failed to encode GET request: {e}")))?;
+        let message_bytes = encode_diagnostic_chunk_get_request(address, correlation)?;
 
         let timeout = Duration::from_secs(self.config().chunk_get_timeout_secs);
         let addr_hex = hex::encode(address);
@@ -1386,7 +1396,7 @@ impl Client {
             node,
             peer,
             message_bytes,
-            request_id,
+            correlation.request_id,
             timeout,
             peer_addrs,
             |body| match body {
@@ -1490,6 +1500,51 @@ mod tests {
     const TEST_XORNAME_BYTE_LEN: usize = 32;
     /// Last byte position in the test XOR distance arrays.
     const TEST_DISTANCE_TAIL_INDEX: usize = TEST_XORNAME_BYTE_LEN - 1;
+
+    #[test]
+    fn diagnostic_correlation_is_identical_on_wire_and_in_record() {
+        let address = [7u8; 32];
+        let correlation = DownloadRequestCorrelation::new(
+            9_903,
+            &PeerId::from_bytes([42; TEST_XORNAME_BYTE_LEN]),
+        );
+        let encoded = encode_diagnostic_chunk_get_request(&address, &correlation).unwrap();
+        let wire = ChunkMessage::decode(&encoded).unwrap();
+        assert_eq!(wire.request_id, correlation.request_id);
+        assert!(matches!(wire.body, ChunkMessageBody::GetRequest(_)));
+
+        let record = DownloadDiagnosticsRecord::peer_attempt(
+            1,
+            1,
+            &address,
+            "initial",
+            1,
+            None,
+            "lookup-1",
+            "expected-peer",
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            "unknown",
+            None,
+            Some(false),
+            Some(1),
+            Some(8),
+            100,
+            200,
+            &correlation,
+            100,
+            0,
+            DownloadDiagnosticsOutcome::Timeout,
+            Some("timeout".to_string()),
+        );
+        assert_eq!(record.request_id, Some(wire.request_id));
+        assert_eq!(record.local_peer_id, Some(correlation.local_peer_id));
+    }
 
     #[test]
     fn classify_peer_attempt_pins_outcomes_and_response_attribution() {
