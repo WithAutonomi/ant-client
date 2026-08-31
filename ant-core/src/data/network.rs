@@ -11,6 +11,19 @@ use ant_protocol::MAX_WIRE_MESSAGE_SIZE;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// Read-only DHT context captured for one diagnostics-enabled closest-peer
+/// selection. None of these fields influence selection or dialing.
+pub(crate) struct ClosestPeerDiagnostics {
+    pub peer_id: PeerId,
+    pub addresses: Vec<MultiAddr>,
+    pub address_types: Vec<String>,
+    /// This process's monotonic age since its last successful DHT interaction.
+    pub local_last_seen_age_ms: Option<u64>,
+    /// Publisher-clock-derived age of the latest address-set publication.
+    pub publisher_address_set_age_ms: Option<u64>,
+    pub publisher_address_set_unix_ns: Option<u64>,
+}
+
 /// Network abstraction for the Autonomi client.
 ///
 /// Wraps a `P2PNode` providing high-level operations for
@@ -129,6 +142,60 @@ impl Network {
                 (n.peer_id, addrs)
             })
             .collect())
+    }
+
+    /// Find the same peers, in the same order, while capturing read-only DHT
+    /// context for the explicitly enabled download diagnostics sidecar.
+    pub(crate) async fn find_closest_peers_with_diagnostics(
+        &self,
+        target: &[u8; 32],
+        count: usize,
+    ) -> Result<Vec<ClosestPeerDiagnostics>> {
+        let local_peer_id = self.node.peer_id();
+        let closest_nodes = self
+            .node
+            .dht()
+            .find_closest_nodes(target, count + 1)
+            .await
+            .map_err(|e| Error::Network(format!("DHT closest-nodes lookup failed: {e}")))?;
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let now_ns = u64::try_from(now_ns).unwrap_or(u64::MAX);
+
+        let mut result = Vec::with_capacity(count);
+        for node in closest_nodes
+            .into_iter()
+            .filter(|node| node.peer_id != *local_peer_id)
+            .take(count)
+        {
+            let publisher_address_set_unix_ns = node.publisher_address_set_unix_ns();
+            // A publisher clock may be ahead of ours. In that case, retain the
+            // raw timestamp but do not misreport its age as zero.
+            let publisher_address_set_age_ms = publisher_address_set_unix_ns
+                .and_then(|published| now_ns.checked_sub(published))
+                .map(|age_ns| age_ns / 1_000_000);
+            let local_last_seen_age_ms = self
+                .node
+                .peer_last_seen_elapsed(&node.peer_id)
+                .await
+                .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
+            let address_context = node.address_and_type_labels_by_priority();
+            let (addresses, address_types) = address_context
+                .into_iter()
+                .map(|(address, label)| (address, label.to_string()))
+                .unzip();
+            result.push(ClosestPeerDiagnostics {
+                peer_id: node.peer_id,
+                addresses,
+                address_types,
+                local_last_seen_age_ms,
+                publisher_address_set_age_ms,
+                publisher_address_set_unix_ns,
+            });
+        }
+        Ok(result)
     }
 
     /// Find a witnessed close-group transcript for a target address.

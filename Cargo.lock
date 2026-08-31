@@ -943,8 +943,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3081ee130dd45e8166bc8ac4d789aac17d143e2e7f54f1c3006503dc63cf3edb"
+source = "git+https://github.com/WithAutonomi/ant-protocol.git?branch=diagnostics%2Fv2-903-response-transport-metadata#5557a57f010009eac193122d32c5ca0b7f978098"
 dependencies = [
  "blake3",
  "bytes",
@@ -3255,7 +3254,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -5199,8 +5198,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.26.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "454529f8a72b4cf22f7d9c3b009ad9d4ba78520e11f6444ae460795d55c002da"
+source = "git+https://github.com/WithAutonomi/saorsa-core.git?branch=diagnostics%2Fv2-903-peer-route-classification#6be87a81f91a119d0761f9ce6f8ee69dec19edcc"
 dependencies = [
  "anyhow",
  "async-trait",
