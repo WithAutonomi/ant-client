@@ -998,6 +998,56 @@ fn fold_single_wave(
     }
 }
 
+/// Shape a corroborated settlement refusal that landed on a wave **after** an
+/// earlier wave had already paid and stored.
+///
+/// The refusal is terminal for this build, but by wave two or later it is no
+/// longer true that nothing was charged: the single-node path pays each wave
+/// before storing it, so the earlier waves' spend has settled on-chain. Bare
+/// `ClientUpdateRequired` would report the upload as costing nothing and drop
+/// the stored set a resume needs, so the refusal is surfaced as a
+/// `PartialUpload` carrying the real spend and the stored chunks, with the
+/// storer's upgrade instruction kept in the reason. Every remaining chunk is
+/// listed as failed: none of it was quoted, let alone paid for.
+#[allow(clippy::too_many_arguments)]
+fn settlement_refusal_after_paid_waves(
+    refusal: &str,
+    wave_num: usize,
+    wave_count: usize,
+    stored_addresses: Vec<[u8; 32]>,
+    total_stored: usize,
+    remaining: &[[u8; 32]],
+    total_chunks: usize,
+    total_storage: Amount,
+    total_gas: u128,
+) -> Error {
+    let remaining_count = remaining.len();
+    let refused_note = format!(
+        "not quoted: storers refused this client's settlement version at wave \
+         {wave_num}/{wave_count}"
+    );
+    let failed: Vec<([u8; 32], String)> = remaining
+        .iter()
+        .map(|addr| (*addr, refused_note.clone()))
+        .collect();
+    Error::PartialUpload {
+        stored: stored_addresses,
+        stored_count: total_stored,
+        failed,
+        failed_count: remaining_count,
+        total_chunks,
+        spend: Box::new(PartialUploadSpend {
+            storage_cost_atto: total_storage.to_string(),
+            gas_cost_wei: total_gas,
+        }),
+        reason: format!(
+            "storers refused this client's settlement version at wave {wave_num}/{wave_count}: \
+             the {total_stored} chunk(s) in earlier wave(s) were already paid for and stored, \
+             and the remaining {remaining_count} chunk(s) were neither quoted nor paid. {refusal}"
+        ),
+    }
+}
+
 /// Check that the spill directory has enough free space for the spilled chunks.
 ///
 /// `file_size` is the source file's byte count. We require
@@ -3243,9 +3293,9 @@ impl Client {
             }
             // Fold this wave's result. A quorum shortfall (`PartialUpload`) is
             // recoverable and its parts are returned to be recorded here;
-            // genuinely fatal errors propagate via `?` and abort the file, as in
+            // genuinely fatal errors abort the file, as in
             // `upload_merkle_from_spill`.
-            let outcome = fold_single_wave(
+            let outcome = match fold_single_wave(
                 self.batch_upload_chunks_with_events(
                     wave_data,
                     progress,
@@ -3254,7 +3304,29 @@ impl Client {
                     resume_key,
                 )
                 .await,
-            )?;
+            ) {
+                Ok(outcome) => outcome,
+                // A corroborated settlement refusal is terminal, but on any wave
+                // after the first it lands after earlier waves have paid and
+                // stored. Bare, it would report the upload as costing nothing
+                // and lose the stored set; carry both instead. On the first
+                // wave nothing has been paid, so the bare refusal — whose
+                // wording says nothing was charged — is exactly right.
+                Err(Error::ClientUpdateRequired(refusal)) if wave_idx > 0 => {
+                    return Err(settlement_refusal_after_paid_waves(
+                        &refusal,
+                        wave_num,
+                        wave_count,
+                        stored_addresses,
+                        total_stored,
+                        &addresses[wave_idx * UPLOAD_WAVE_SIZE..],
+                        total_chunks,
+                        total_storage,
+                        total_gas,
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
 
             if !outcome.failed.is_empty() {
                 warn!(
@@ -4796,6 +4868,65 @@ mod tests {
             matches!(result, Err(Error::Payment(_))),
             "fatal payment error must propagate, got: {result:?}"
         );
+    }
+
+    /// A settlement refusal on a later wave must not be reported as if nothing
+    /// was charged: the earlier waves paid before storing. The refusal is
+    /// reshaped into a `PartialUpload` that carries the real spend, the stored
+    /// set (for resume), every un-quoted chunk as failed, and the storer's
+    /// upgrade instruction in the reason.
+    #[test]
+    fn settlement_refusal_after_paid_waves_carries_spend_and_upgrade_instruction() {
+        let refusal = "your client is too old to pay the current storage rate. Run `ant update`";
+        let stored = vec![[1u8; 32], [2u8; 32]];
+        let remaining = [[3u8; 32], [4u8; 32], [5u8; 32]];
+
+        let err = settlement_refusal_after_paid_waves(
+            refusal,
+            2,
+            3,
+            stored.clone(),
+            stored.len(),
+            &remaining,
+            5,
+            Amount::from(700u64),
+            13,
+        );
+
+        let Error::PartialUpload {
+            stored: got_stored,
+            stored_count,
+            failed,
+            failed_count,
+            total_chunks,
+            spend,
+            reason,
+        } = err
+        else {
+            panic!("expected PartialUpload, got: {err:?}");
+        };
+        assert_eq!(got_stored, stored);
+        assert_eq!(stored_count, 2);
+        assert_eq!(failed_count, 3);
+        assert_eq!(total_chunks, 5);
+        // Every un-quoted chunk is listed, none of them as "stored".
+        let failed_addrs: Vec<[u8; 32]> = failed.iter().map(|(a, _)| *a).collect();
+        assert_eq!(failed_addrs, remaining.to_vec());
+        assert!(failed.iter().all(|(_, why)| why.contains("not quoted")));
+        // The spend is what the earlier waves actually paid, not zero.
+        assert_eq!(spend.storage_cost_atto, "700");
+        assert_eq!(spend.gas_cost_wei, 13);
+        // The user learns both facts: earlier waves paid, and how to upgrade.
+        assert!(reason.contains("wave 2/3"), "reason: {reason}");
+        assert!(
+            reason.contains("2 chunk(s) in earlier wave(s) were already paid"),
+            "reason: {reason}"
+        );
+        assert!(
+            reason.contains("3 chunk(s) were neither quoted nor paid"),
+            "reason: {reason}"
+        );
+        assert!(reason.contains(refusal), "reason: {reason}");
     }
 
     #[test]

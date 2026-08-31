@@ -5,7 +5,9 @@
 
 use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
+use crate::data::client::SettlementRefusals;
 use crate::data::client::PUT_TARGET_WIDTH;
+use crate::data::client::VERSIONED_QUOTE_PROBE_CEILING;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{Amount, PaymentQuote};
 use ant_protocol::payment::calculate_price;
@@ -18,12 +20,13 @@ use ant_protocol::transport::{
     DHTNode, MultiAddr, P2PNode, PeerId, ResponderView, WitnessedCloseGroup,
 };
 use ant_protocol::{
-    compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
-    ChunkQuoteRequest, ChunkQuoteResponse, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
+    client_update_required_message, compute_address, send_and_await_chunk_response, ChunkMessage,
+    ChunkMessageBody, ChunkQuoteRequest, ChunkQuoteRequestV2, ChunkQuoteResponse, ProtocolError,
+    CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE, CURRENT_SETTLEMENT_VERSION,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -229,13 +232,17 @@ fn quote_commitment_binding_is_valid(
 /// On success the returned commitment is the opaque signed-commitment blob the
 /// node shipped with the quote (`None` for a baseline quote), to be forwarded
 /// as a sidecar in the PUT bundle.
+///
+/// A quote as this module hands it on: the quote itself, the price to settle,
+/// and the opaque signed commitment it was priced against.
+type ClassifiedQuote = std::result::Result<(PaymentQuote, Amount, Option<Vec<u8>>), Error>;
 fn classify_quote_response(
     peer_id: &PeerId,
     expected_content: &[u8; 32],
     quote_bytes: &[u8],
     already_stored: bool,
     commitment: Option<Vec<u8>>,
-) -> std::result::Result<(PaymentQuote, Amount, Option<Vec<u8>>), Error> {
+) -> ClassifiedQuote {
     let payment_quote = rmp_serde::from_slice::<PaymentQuote>(quote_bytes).map_err(|e| {
         Error::Serialization(format!("Failed to deserialize quote from {peer_id}: {e}"))
     })?;
@@ -330,16 +337,42 @@ async fn request_store_quote_from_peer(
     data_size: u64,
     data_type: u32,
     per_peer_timeout: Duration,
+    unversioned_peers: Arc<Mutex<HashSet<PeerId>>>,
+    versioned_capable: Arc<Mutex<HashSet<PeerId>>>,
 ) -> StoreQuoteRequestResult {
-    let request = ChunkQuoteRequest {
+    let legacy_request = ChunkQuoteRequest {
         address,
         data_size,
         data_type,
     };
-    let message = ChunkMessage {
-        request_id,
-        body: ChunkMessageBody::QuoteRequest(request),
+
+    // A peer that already failed to answer a versioned request is asked in the
+    // legacy shape directly. Re-probing costs a full per-peer timeout every
+    // time, and against a fleet that predates the versioned requests that is
+    // paid on every quote: measured on the merkle E2E suite it took the run
+    // from ~24 minutes to past the 60-minute cap.
+    // The capable set wins. The two sets are updated under separate locks, so
+    // a slow probe can insert into the legacy set after a concurrent request
+    // has already proved the peer capable; letting capability win makes that
+    // interleaving harmless instead of permanently preferring the legacy shape.
+    let known_legacy = !versioned_capable
+        .lock()
+        .is_ok_and(|peers| peers.contains(&peer_id))
+        && unversioned_peers
+            .lock()
+            .is_ok_and(|peers| peers.contains(&peer_id));
+
+    // Declare the settlement version so a storer can turn us away before we
+    // pay. See `merkle.rs` for why the legacy retry below exists and when it
+    // can be deleted.
+    let body = if known_legacy {
+        ChunkMessageBody::QuoteRequest(legacy_request.clone())
+    } else {
+        let mut versioned_request = ChunkQuoteRequestV2::new(address, data_size);
+        versioned_request.data_type = data_type;
+        ChunkMessageBody::QuoteRequestV2(versioned_request)
     };
+    let message = ChunkMessage { request_id, body };
 
     let message_bytes = match message.encode() {
         Ok(bytes) => bytes,
@@ -354,38 +387,186 @@ async fn request_store_quote_from_peer(
         }
     };
 
+    // A first-contact probe waits only long enough to learn whether the peer
+    // can parse the shape; a peer already known to be legacy is asked with the
+    // caller's full patience because that request is the real one.
+    let attempt_timeout = if known_legacy {
+        per_peer_timeout
+    } else {
+        per_peer_timeout.min(VERSIONED_QUOTE_PROBE_CEILING)
+    };
+
     let result = send_and_await_chunk_response(
         &node,
         &peer_id,
         message_bytes,
         request_id,
-        per_peer_timeout,
+        attempt_timeout,
         &peer_addrs,
-        |body| match body {
-            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
-                quote,
-                already_stored,
-                commitment,
-            }) => Some(classify_quote_response(
-                &peer_id,
-                &address,
-                &quote,
-                already_stored,
-                commitment,
-            )),
-            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => Some(Err(
-                Error::Protocol(format!("Quote error from {peer_id}: {e}")),
-            )),
-            _ => None,
-        },
+        |body| map_quote_response(&peer_id, &address, body),
         |e| Error::Network(format!("Failed to send quote request to {peer_id}: {e}")),
         || Error::Timeout(format!("Timeout waiting for quote from {peer_id}")),
     )
     .await;
 
+    // Any recognised answer proves the peer parsed the versioned shape,
+    // including a structured error. Only silence and send failures leave the
+    // question open.
+    let answered = match &result {
+        Ok(_) => true,
+        Err(e) => !is_version_unaware(e),
+    };
+    if !known_legacy && answered {
+        if let Ok(mut peers) = versioned_capable.lock() {
+            peers.insert(peer_id);
+        }
+    }
+
+    // Only a storer that could not decode the versioned request is asked
+    // again in the legacy shape. One that answered has understood us, and a
+    // refusal must stay a refusal.
+    let result = match result {
+        Err(ref e) if is_version_unaware(e) && !known_legacy => {
+            // Remember it, so the next request to this peer skips the probe.
+            // Only silence counts as evidence: a send failure means the
+            // request never arrived, which says nothing about whether the peer
+            // could have parsed it, and caching that would strand a peer in
+            // the legacy shape for the rest of the session over one flaky send.
+            // A peer that has answered a versioned request before is never
+            // demoted: one lost response would otherwise pin an upgraded peer
+            // to the legacy shape for the rest of the session.
+            let ever_answered = versioned_capable
+                .lock()
+                .is_ok_and(|peers| peers.contains(&peer_id));
+            if matches!(e, Error::Timeout(_)) && !ever_answered {
+                if let Ok(mut peers) = unversioned_peers.lock() {
+                    peers.insert(peer_id);
+                }
+            }
+            let legacy = ChunkMessage {
+                request_id,
+                body: ChunkMessageBody::QuoteRequest(legacy_request),
+            };
+            match legacy.encode() {
+                Ok(legacy_bytes) => {
+                    send_and_await_chunk_response(
+                        &node,
+                        &peer_id,
+                        legacy_bytes,
+                        request_id,
+                        per_peer_timeout,
+                        &peer_addrs,
+                        |body| map_quote_response(&peer_id, &address, body),
+                        |e| {
+                            Error::Network(format!(
+                                "Failed to send quote request to {peer_id}: {e}"
+                            ))
+                        },
+                        || Error::Timeout(format!("Timeout waiting for quote from {peer_id}")),
+                    )
+                    .await
+                }
+                Err(e) => Err(Error::Protocol(format!(
+                    "Failed to encode quote request for {peer_id}: {e}"
+                ))),
+            }
+        }
+        other => other,
+    };
+
     (peer_id, peer_addrs, result)
 }
 
+/// Turn a quote response into the quote it carries, or the error explaining
+/// why there is none. Shared by the versioned request and its legacy retry.
+///
+/// `ClientUpdateRequired` is separated from the generic protocol error because
+/// it is terminal: it must reach the user with its own wording rather than
+/// being counted as one more peer that failed to quote.
+fn map_quote_response(
+    peer_id: &PeerId,
+    address: &[u8; 32],
+    body: ChunkMessageBody,
+) -> Option<ClassifiedQuote> {
+    match body {
+        ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+            quote,
+            already_stored,
+            commitment,
+        }) => Some(classify_quote_response(
+            peer_id,
+            address,
+            &quote,
+            already_stored,
+            commitment,
+        )),
+        ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(
+            ProtocolError::ClientUpdateRequired {
+                client_settlement_version,
+                min_settlement_version,
+            },
+        )) => Some(Err(settlement_refusal_error(
+            peer_id,
+            client_settlement_version,
+            min_settlement_version,
+        ))),
+        ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(
+            behind @ ProtocolError::StorerUpdateRequired { .. },
+        )) => Some(Err(Error::StorerUpdateRequired(behind.to_string()))),
+        ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => Some(Err(
+            Error::Protocol(format!("Quote error from {peer_id}: {e}")),
+        )),
+        _ => None,
+    }
+}
+
+/// Turn a peer's `ClientUpdateRequired` into an error, rejecting one that does
+/// not describe this client.
+///
+/// A refusal is unauthenticated, so the least this client can do is check that
+/// the peer is talking about the request it actually sent: the echoed version
+/// must be ours, and the stated minimum must genuinely exceed it. A peer that
+/// fails either is confused or lying, and is treated as an ordinary bad peer
+/// rather than as evidence about this build.
+pub(super) fn settlement_refusal_error(
+    peer_id: &PeerId,
+    client_settlement_version: u32,
+    min_settlement_version: u32,
+) -> Error {
+    if client_settlement_version != CURRENT_SETTLEMENT_VERSION
+        || min_settlement_version <= client_settlement_version
+    {
+        return Error::Protocol(format!(
+            "Peer {peer_id} sent an incoherent settlement refusal (claimed this client is at \
+             version {client_settlement_version} needing {min_settlement_version}, but this \
+             client is at {CURRENT_SETTLEMENT_VERSION}); ignoring it"
+        ));
+    }
+    Error::ClientUpdateRequired(client_update_required_message(
+        client_settlement_version,
+        min_settlement_version,
+    ))
+}
+
+/// Did this failure look like a storer that cannot parse a versioned request,
+/// as opposed to one that parsed it and refused? See the merkle path for the
+/// full reasoning.
+///
+/// This is the single-node fallback, independent of the merkle one, so it
+/// carries its own reference to the shared cutover guard. Without it, deleting
+/// the merkle fallback would take the only build-time check with it and leave
+/// this downgrade path live.
+const _: () = crate::data::client::UNVERSIONED_RETRY_REQUIRES_MIN_V1;
+
+const fn is_version_unaware(error: &Error) -> bool {
+    matches!(error, Error::Network(_) | Error::Timeout(_))
+}
+
+/// Fold one peer's quote result into the collection state.
+///
+/// Returns `Err` only when collection must stop outright: a storer has said
+/// this client cannot settle, and no number of further quotes makes paying
+/// safe.
 #[allow(clippy::too_many_arguments)]
 fn record_store_quote_result(
     peer_id: PeerId,
@@ -396,7 +577,9 @@ fn record_store_quote_result(
     already_stored_peers: &mut Vec<(PeerId, [u8; 32])>,
     failures: &mut Vec<String>,
     bad_quote_count: &mut usize,
-) {
+    settlement_refusal: &mut Option<Error>,
+    refusals: &SettlementRefusals,
+) -> Result<()> {
     match quote_result {
         Ok((quote, price, commitment)) => {
             quotes.push((peer_id, addrs, quote, price, commitment));
@@ -406,6 +589,43 @@ fn record_store_quote_result(
             let dist = peer_xor_distance(&peer_id, address);
             already_stored_peers.push((peer_id, dist));
         }
+        // A storer that has explicitly declared this client incompatible ends
+        // quote collection here. Recording it as one more failed peer would
+        // let the remaining peers supply a quorum and go on to pay, which is
+        // the burn this mechanism exists to prevent, and would bury the
+        // upgrade instruction among ordinary per-peer failures.
+        // Recorded as well as returned. The caller runs this inside an overall
+        // timeout, and if that timeout fires the returned error is thrown away
+        // with the rest of the collection state. The verdict must outlive it:
+        // a client told it cannot settle must not pay, whatever else happened
+        // during collection.
+        Err(e @ Error::ClientUpdateRequired(_)) => {
+            // One peer's word is not a verdict about this build: nothing
+            // authenticates a refusal, so a single hostile peer answering this
+            // to everything would deny every upload. Believe it once enough
+            // distinct peers agree, which a genuine incompatibility reaches at
+            // once because every enforcing peer refuses.
+            let Some(corroborated) = refusals.note(peer_id, &e.to_string()) else {
+                warn!("Peer {peer_id} refused this client's settlement version; awaiting corroboration");
+                failures.push(format!("{peer_id}: {e}"));
+                return Ok(());
+            };
+            // Name the corroborators. This is the only place the quorum is
+            // externally verifiable: the below-quorum branch above logs one
+            // peer at a time, so without this line a reader cannot tell a
+            // two-peer verdict from a one-peer misfire (V2-1109).
+            let corroborators = refusals.corroborating_peers();
+            warn!(
+                "Settlement refusal corroborated by {} distinct peers [{}]; aborting before payment",
+                corroborators.len(),
+                corroborators.join(", ")
+            );
+            let verdict = Error::ClientUpdateRequired(corroborated);
+            if settlement_refusal.is_none() {
+                *settlement_refusal = Some(Error::ClientUpdateRequired(verdict.to_string()));
+            }
+            return Err(verdict);
+        }
         Err(e) => {
             if matches!(&e, Error::BadQuoteBinding { .. }) {
                 *bad_quote_count += 1;
@@ -414,6 +634,7 @@ fn record_store_quote_result(
             failures.push(format!("{peer_id}: {e}"));
         }
     }
+    Ok(())
 }
 
 fn witnessed_quote_launch_budget(
@@ -1160,17 +1381,33 @@ impl Client {
         // network-broken) and the user benefits from seeing them called out.
         let mut bad_quote_count = 0usize;
 
+        // A storer's verdict that this client cannot settle, kept outside the
+        // collection loops so neither the overall timeout nor an early exit
+        // can discard it. Checked before any quote plan is built.
+        let mut settlement_refusal: Option<Error> = None;
+        let refusals = self.settlement_refusals();
+
         if staged_witnessed_collection {
             let mut quote_futures = FuturesUnordered::new();
             let mut next_peer_index = 0usize;
             let collect_result: std::result::Result<std::result::Result<(), Error>, _> =
                 tokio::time::timeout(overall_timeout, async {
                     loop {
-                        let launch_count = witnessed_quote_launch_budget(
-                            quotes.len(),
-                            quote_futures.len(),
-                            remote_peers.len().saturating_sub(next_peer_index),
-                        );
+                        // Stop launching once the target is met, but keep
+                        // draining below. Peers already in flight may yet
+                        // declare this client unable to settle, and dropping
+                        // that verdict because faster peers filled the quota
+                        // would make it depend on response order. The surplus
+                        // quotes are discarded; a refusal among them is not.
+                        let launch_count = if quotes.len() >= target_quote_count {
+                            0
+                        } else {
+                            witnessed_quote_launch_budget(
+                                quotes.len(),
+                                quote_futures.len(),
+                                remote_peers.len().saturating_sub(next_peer_index),
+                            )
+                        };
                         for _ in 0..launch_count {
                             let (peer_id, peer_addrs) = &remote_peers[next_peer_index];
                             next_peer_index += 1;
@@ -1183,10 +1420,12 @@ impl Client {
                                 data_size,
                                 data_type,
                                 per_peer_timeout,
+                                self.unversioned_quote_peers(),
+                                self.versioned_quote_capable_handle(),
                             ));
                         }
 
-                        if quotes.len() >= target_quote_count || quote_futures.is_empty() {
+                        if quote_futures.is_empty() {
                             break;
                         }
 
@@ -1203,7 +1442,9 @@ impl Client {
                             &mut already_stored_peers,
                             &mut failures,
                             &mut bad_quote_count,
-                        );
+                            &mut settlement_refusal,
+                            &refusals,
+                        )?;
                     }
                     Ok(())
                 })
@@ -1218,6 +1459,11 @@ impl Client {
                 }
                 Ok(Err(e)) => return Err(e),
                 Ok(Ok(())) => {}
+            }
+            // Outranks the timeout: a refusal says paying is unsafe no matter
+            // how many quotes were gathered before the clock ran out.
+            if let Some(refusal) = settlement_refusal.take() {
+                return Err(refusal);
             }
         } else {
             // Merkle preflight keeps the previous behaviour: query the full
@@ -1235,6 +1481,8 @@ impl Client {
                     data_size,
                     data_type,
                     per_peer_timeout,
+                    self.unversioned_quote_peers(),
+                    self.versioned_quote_capable_handle(),
                 ));
             }
 
@@ -1250,7 +1498,9 @@ impl Client {
                             &mut already_stored_peers,
                             &mut failures,
                             &mut bad_quote_count,
-                        );
+                            &mut settlement_refusal,
+                            &refusals,
+                        )?;
                     }
                     Ok(())
                 })
@@ -1268,6 +1518,11 @@ impl Client {
                 }
                 Ok(Err(e)) => return Err(e),
                 Ok(Ok(())) => {}
+            }
+            // Outranks the timeout: a refusal says paying is unsafe no matter
+            // how many quotes were gathered before the clock ran out.
+            if let Some(refusal) = settlement_refusal.take() {
+                return Err(refusal);
             }
         }
 
@@ -2733,5 +2988,358 @@ mod tests {
             matches!(result, Err(Error::BadQuoteCommitment { .. })),
             "off-curve quote must be dropped as BadQuoteCommitment; got {result:?}"
         );
+    }
+
+    /// A storer's refusal must arrive as its own terminal error, carrying the
+    /// storer's wording. Folding it into the generic protocol error would bury
+    /// the upgrade instruction among ordinary per-peer quote failures, which
+    /// is the outcome this whole change exists to avoid.
+    #[test]
+    fn an_update_refusal_is_surfaced_with_its_upgrade_instruction() {
+        let peer_id = PeerId::from_bytes([0x42; 32]);
+        let refusal = ProtocolError::ClientUpdateRequired {
+            client_settlement_version: CURRENT_SETTLEMENT_VERSION,
+            min_settlement_version: CURRENT_SETTLEMENT_VERSION.saturating_add(1),
+        };
+
+        let mapped = map_quote_response(
+            &peer_id,
+            &[0x11; 32],
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(refusal)),
+        );
+
+        match mapped {
+            Some(Err(Error::ClientUpdateRequired(msg))) => {
+                assert!(msg.contains("ant update"), "{msg}");
+                assert!(msg.contains("nothing was charged"), "{msg}");
+            }
+            other => panic!("expected ClientUpdateRequired, got: {other:?}"),
+        }
+    }
+
+    /// The legacy retry exists for storers that cannot parse a versioned
+    /// request, which are silent. A storer that answered has understood us, so
+    /// retrying its refusal without the version would talk it into quoting a
+    /// client that cannot pay. That is the exact failure this change removes,
+    /// so the predicate deciding it is pinned.
+    #[test]
+    fn only_silence_triggers_the_legacy_retry() {
+        assert!(is_version_unaware(&Error::Timeout("no answer".into())));
+        assert!(is_version_unaware(&Error::Network("send failed".into())));
+
+        assert!(!is_version_unaware(&Error::ClientUpdateRequired(
+            "too old".into()
+        )));
+        // A storer that says it is the old side has understood the request.
+        // Retrying it unversioned would obtain a quote from a peer that cannot
+        // verify the resulting payment, which is a burn.
+        assert!(!is_version_unaware(&Error::StorerUpdateRequired(
+            "node behind".into()
+        )));
+        assert!(!is_version_unaware(&Error::Protocol(
+            "quote error from peer".into()
+        )));
+    }
+
+    /// A storer declaring itself the old side is an ordinary skippable peer,
+    /// not a client fault. Surfacing it as `ClientUpdateRequired` would tell an
+    /// up-to-date user to upgrade, and during a client-first rollout it would
+    /// tell that to nearly everyone.
+    #[test]
+    fn a_storer_that_is_behind_is_not_reported_as_the_clients_fault() {
+        let peer_id = PeerId::from_bytes([0x43; 32]);
+        let mapped = map_quote_response(
+            &peer_id,
+            &[0x11; 32],
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(
+                ProtocolError::StorerUpdateRequired {
+                    client_settlement_version: 2,
+                    node_settlement_version: 1,
+                },
+            )),
+        );
+
+        match mapped {
+            Some(Err(Error::StorerUpdateRequired(msg))) => {
+                assert!(msg.contains("use a different storer"), "{msg}");
+                assert!(!msg.contains("ant update"), "{msg}");
+            }
+            other => panic!("expected StorerUpdateRequired, got: {other:?}"),
+        }
+    }
+
+    /// The refusal has to stop quote collection, not join the failure list.
+    /// If it is merely recorded, the remaining peers can still form a quorum
+    /// and the upload proceeds to pay, which is exactly the burn the gate is
+    /// meant to prevent.
+    #[test]
+    fn a_refusal_aborts_quote_collection_instead_of_counting_as_one_bad_peer() {
+        let mut quotes = Vec::new();
+        let mut already_stored = Vec::new();
+        let mut failures = Vec::new();
+        let mut bad_quotes = 0usize;
+        let mut refusal_slot: Option<Error> = None;
+
+        let refusals = SettlementRefusals::default();
+        let mut refuse =
+            |peer: u8, failures: &mut Vec<String>, slot: &mut Option<Error>| -> Result<()> {
+                record_store_quote_result(
+                    PeerId::from_bytes([peer; 32]),
+                    Vec::new(),
+                    Err(Error::ClientUpdateRequired(
+                        "too old, run ant update".into(),
+                    )),
+                    &[0x11; 32],
+                    &mut quotes,
+                    &mut already_stored,
+                    failures,
+                    &mut bad_quotes,
+                    slot,
+                    &refusals,
+                )
+            };
+
+        // One peer is not corroboration: recorded as an ordinary bad peer, so a
+        // single hostile responder cannot deny every upload.
+        let first = refuse(0x44, &mut failures, &mut refusal_slot);
+        assert!(first.is_ok(), "one peer must not abort, got {first:?}");
+        assert_eq!(failures.len(), 1);
+        assert!(refusal_slot.is_none());
+
+        // A second, distinct peer makes it a verdict about this build.
+        let second = refuse(0x45, &mut failures, &mut refusal_slot);
+        assert!(
+            matches!(second, Err(Error::ClientUpdateRequired(_))),
+            "a corroborated refusal must propagate, got {second:?}"
+        );
+    }
+
+    /// A storer being behind must NOT abort. Otherwise one lagging peer in the
+    /// close group fails an upload that the rest of the group could serve.
+    #[test]
+    fn a_storer_that_is_behind_does_not_abort_collection() {
+        let mut quotes = Vec::new();
+        let mut already_stored = Vec::new();
+        let mut failures = Vec::new();
+        let mut bad_quotes = 0usize;
+        let mut refusal_slot: Option<Error> = None;
+
+        let outcome = record_store_quote_result(
+            PeerId::from_bytes([0x45; 32]),
+            Vec::new(),
+            Err(Error::StorerUpdateRequired("node behind".into())),
+            &[0x11; 32],
+            &mut quotes,
+            &mut already_stored,
+            &mut failures,
+            &mut bad_quotes,
+            &mut refusal_slot,
+            &SettlementRefusals::default(),
+        );
+
+        assert!(
+            outcome.is_ok(),
+            "a lagging storer must be skipped, not fatal"
+        );
+        assert_eq!(failures.len(), 1, "and it should be recorded as a skip");
+        assert!(
+            refusal_slot.is_none(),
+            "a node being behind is not a verdict about this client"
+        );
+    }
+
+    /// The refusal must survive the overall collection timeout.
+    ///
+    /// The collector runs inside `tokio::time::timeout`, and its elapsed arm
+    /// deliberately falls through so quotes gathered from fast peers stay
+    /// usable. That arm would otherwise discard a refusal observed just before
+    /// the clock ran out, and the upload would pay anyway. Recording the
+    /// verdict in a slot that outlives the timeout is what prevents it, so the
+    /// slot is what gets tested.
+    #[test]
+    fn a_refusal_is_recorded_where_the_collection_timeout_cannot_discard_it() {
+        let mut quotes = Vec::new();
+        let mut already_stored = Vec::new();
+        let mut failures = Vec::new();
+        let mut bad_quotes = 0usize;
+        let mut refusal_slot: Option<Error> = None;
+
+        let refusals = SettlementRefusals::default();
+        for peer in [0x46u8, 0x47u8] {
+            let _ = record_store_quote_result(
+                PeerId::from_bytes([peer; 32]),
+                Vec::new(),
+                Err(Error::ClientUpdateRequired(
+                    "too old, run ant update".into(),
+                )),
+                &[0x11; 32],
+                &mut quotes,
+                &mut already_stored,
+                &mut failures,
+                &mut bad_quotes,
+                &mut refusal_slot,
+                &refusals,
+            );
+        }
+
+        match refusal_slot {
+            Some(Error::ClientUpdateRequired(msg)) => {
+                assert!(msg.contains("ant update"), "{msg}");
+            }
+            other => panic!("refusal must outlive the collection state, got {other:?}"),
+        }
+    }
+
+    /// Once the quote target is met the collector stops launching new peers
+    /// but keeps draining those already in flight, so a refusal cannot be
+    /// missed merely because faster peers filled the quota first.
+    ///
+    /// The launch budget enforces the first half, and the drain relies on it
+    /// reaching zero to terminate rather than recruiting forever.
+    #[test]
+    fn meeting_the_target_stops_launching_without_stopping_collection() {
+        assert!(
+            witnessed_quote_launch_budget(0, 0, 32) > 0,
+            "collection must start"
+        );
+        assert_eq!(witnessed_quote_launch_budget(CLOSE_GROUP_SIZE, 0, 32), 0);
+        assert_eq!(
+            witnessed_quote_launch_budget(CLOSE_GROUP_SIZE.saturating_add(1), 0, 32),
+            0
+        );
+        // In-flight peers count against the budget, so draining them does not
+        // pull in replacements.
+        assert_eq!(witnessed_quote_launch_budget(0, CLOSE_GROUP_SIZE, 32), 0);
+    }
+
+    /// The probe must be paid per peer, not per request.
+    ///
+    /// A storer that predates the versioned request never answers it, so the
+    /// client eats the probe wait before falling back. Without remembering the
+    /// answer that cost lands on every quote, and a merkle pool asks sixteen
+    /// candidates. Measured on the merkle E2E suite against a fleet on
+    /// published ant-node, re-probing took the run from ~24 minutes to past
+    /// the 60-minute CI cap.
+    ///
+    /// The cache is consulted, not enforced: concurrent first contacts are not
+    /// single-flighted, so the same peer can be probed by a few in-flight
+    /// requests before any of them records the answer. What the cache
+    /// guarantees is that later rounds do not re-probe.
+    #[test]
+    fn a_peer_that_cannot_answer_a_versioned_quote_is_only_probed_once() {
+        let peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
+        let legacy_peer = PeerId::from_bytes([0x51; 32]);
+        let fresh_peer = PeerId::from_bytes([0x52; 32]);
+
+        let known = |p: &PeerId| peers.lock().expect("cache lock").contains(p);
+
+        // First contact: nothing known, so the versioned request is sent.
+        assert!(!known(&legacy_peer));
+
+        // Silence records the peer.
+        peers.lock().expect("cache lock").insert(legacy_peer);
+
+        // Second contact skips the probe entirely.
+        assert!(known(&legacy_peer));
+        // and does not tar every other peer with the same brush.
+        assert!(!known(&fresh_peer));
+    }
+
+    /// Only silence is evidence that a peer cannot parse the versioned shape.
+    ///
+    /// Both a timeout and a send failure trigger the legacy retry, but they
+    /// mean different things: a send failure says the request never arrived,
+    /// so it teaches nothing about the peer's capabilities. Caching it would
+    /// strand that peer in the legacy shape for the rest of the session over
+    /// one flaky send.
+    #[test]
+    fn only_silence_is_evidence_worth_caching() {
+        assert!(matches!(
+            Error::Timeout("no answer".into()),
+            Error::Timeout(_)
+        ));
+        assert!(!matches!(
+            Error::Network("send failed".into()),
+            Error::Timeout(_)
+        ));
+        // Both still take the fallback, so a send failure is retried rather
+        // than left to fail outright.
+        assert!(is_version_unaware(&Error::Network("send failed".into())));
+        assert!(is_version_unaware(&Error::Timeout("no answer".into())));
+    }
+
+    /// One peer cannot condemn the client.
+    ///
+    /// Nothing authenticates a refusal, so a single hostile or misconfigured
+    /// storer answering `ClientUpdateRequired` to everything would otherwise
+    /// abort every upload. That turns an over-query design which tolerates
+    /// many bad peers into one that tolerates none.
+    #[test]
+    fn a_lone_peer_cannot_condemn_the_client() {
+        let refusals = SettlementRefusals::default();
+        assert!(
+            refusals
+                .note(PeerId::from_bytes([0x61; 32]), "too old")
+                .is_none(),
+            "one peer is not corroboration"
+        );
+        assert!(refusals.corroborated().is_none());
+        // The same peer repeating itself is still one peer.
+        assert!(refusals
+            .note(PeerId::from_bytes([0x61; 32]), "too old")
+            .is_none());
+        assert!(refusals.corroborated().is_none());
+    }
+
+    /// A genuine incompatibility reaches the threshold at once, because every
+    /// peer enforcing the newer rule refuses.
+    #[test]
+    fn a_second_peer_makes_the_refusal_terminal_and_it_stays_latched() {
+        let refusals = SettlementRefusals::default();
+        refusals.note(PeerId::from_bytes([0x62; 32]), "run ant update");
+        let verdict = refusals.note(PeerId::from_bytes([0x63; 32]), "run ant update");
+
+        assert!(verdict.is_some_and(|m| m.contains("ant update")));
+        // Latched: an upload starting later must see it before it spends,
+        // which is the whole point of holding it on the client rather than in
+        // one collector's local state.
+        assert!(refusals
+            .corroborated()
+            .is_some_and(|m| m.contains("ant update")));
+    }
+
+    /// A refusal that does not describe this client is a confused or lying
+    /// peer, not evidence about this build, and must not count toward the
+    /// threshold.
+    #[test]
+    fn an_incoherent_refusal_is_treated_as_a_bad_peer() {
+        let peer_id = PeerId::from_bytes([0x64; 32]);
+
+        // Claims to be about some other client version.
+        let wrong_echo = settlement_refusal_error(
+            &peer_id,
+            CURRENT_SETTLEMENT_VERSION.saturating_add(7),
+            CURRENT_SETTLEMENT_VERSION.saturating_add(8),
+        );
+        assert!(matches!(wrong_echo, Error::Protocol(_)), "{wrong_echo:?}");
+
+        // Claims a minimum that our version already satisfies.
+        let no_gap = settlement_refusal_error(
+            &peer_id,
+            CURRENT_SETTLEMENT_VERSION,
+            CURRENT_SETTLEMENT_VERSION,
+        );
+        assert!(matches!(no_gap, Error::Protocol(_)), "{no_gap:?}");
+
+        // A coherent one is believed, and carries the upgrade instruction.
+        let real = settlement_refusal_error(
+            &peer_id,
+            CURRENT_SETTLEMENT_VERSION,
+            CURRENT_SETTLEMENT_VERSION.saturating_add(1),
+        );
+        match real {
+            Error::ClientUpdateRequired(msg) => assert!(msg.contains("ant update"), "{msg}"),
+            other => panic!("expected ClientUpdateRequired, got {other:?}"),
+        }
     }
 }

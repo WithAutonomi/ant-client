@@ -838,7 +838,7 @@ version = "0.7.0"
 dependencies = [
  "alloy",
  "ant-node",
- "ant-protocol",
+ "ant-protocol 2.3.3 (git+https://github.com/grumbach/ant-protocol?branch=reapply%2Fpr-23-settlement-version)",
  "anyhow",
  "async-stream",
  "axum",
@@ -895,7 +895,7 @@ version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "722c2b8c9c867e0c78c20f3a82ae7244530f76caf78e16e8cebb049149bbc5e7"
 dependencies = [
- "ant-protocol",
+ "ant-protocol 2.3.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "bao",
  "blake3",
  "bytes",
@@ -945,6 +945,24 @@ name = "ant-protocol"
 version = "2.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20a8d4262f20934f579f1f37e7855718d75156e24b3441eabf089e3049d4c831"
+dependencies = [
+ "blake3",
+ "bytes",
+ "evmlib",
+ "hex",
+ "postcard",
+ "rmp-serde",
+ "saorsa-core",
+ "saorsa-pqc 0.5.1",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ant-protocol"
+version = "2.3.3"
+source = "git+https://github.com/grumbach/ant-protocol?branch=reapply%2Fpr-23-settlement-version#a22897d7a3048c41f8c419975274151c9ac9a843"
 dependencies = [
  "blake3",
  "bytes",
@@ -3339,7 +3357,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]

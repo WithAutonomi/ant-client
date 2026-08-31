@@ -23,9 +23,11 @@ use crate::data::peer_cache;
 use ant_protocol::evm::Wallet;
 use ant_protocol::transport::{MultiAddr, P2PNode, PeerId};
 use ant_protocol::{XorName, CLOSE_GROUP_SIZE};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use tracing::debug;
 
 /// Width of the chunk PUT-target set (initial writes plus fallback): the
@@ -36,6 +38,226 @@ use tracing::debug;
 /// closest-`CLOSE_GROUP_SIZE` quote issuers is within its own local 20-closest,
 /// so trying peers past this width is pointless.
 pub(crate) const PUT_TARGET_WIDTH: usize = 20;
+
+/// Ceiling on how long to wait for a peer to answer a settlement-versioned
+/// quote request before falling back to the unversioned shape.
+///
+/// A storer that predates the versioned request cannot decode it and never
+/// replies, so the only way to find out is to wait.
+///
+/// Note what is being waited for. This is **not** a cheap parse check: a peer
+/// that understands the request runs the whole quote handler, queueing,
+/// storage reads, pricing and signing, so the answer takes as long as any
+/// quote takes. Abandoning the wait does not cancel that work either, it just
+/// stops listening and adds a duplicate legacy request on top. So the wait has
+/// to be sized for a real quote, not for a ping.
+///
+/// The full timeout is what made this expensive. The merkle E2E suite runs
+/// with `quote_timeout_secs = 120`, so every probe against a fleet on the
+/// published node cost two minutes and the suite blew the 60-minute CI cap.
+///
+/// # It must never bind in production
+///
+/// **Keep this at or above the largest production `quote_timeout_secs`**,
+/// currently 10s. That is not a tuning preference, it is the safety property.
+///
+/// This wait is the only window in which a peer can refuse. Abandoning it
+/// early does not merely mislabel a slow peer: it drops the refusal, so it
+/// never counts toward corroboration, never sets the latch, and the legacy
+/// request it raced can return a perfectly good quote the client then pays
+/// against.
+///
+/// The two fallbacks lose it by different mechanisms. The merkle path sends
+/// its legacy request under a *new* request id (`merkle.rs`), so a refusal
+/// arriving after the ceiling is answering a request nobody is listening to
+/// and is discarded on the id mismatch. The single-node path reuses the same
+/// id (`quote.rs`), so a late refusal is seen only if it happens to arrive
+/// after the retry has resubscribed; the await that would have matched it is
+/// already gone, and anything landing in the gap between the two waits is
+/// lost. Neither path observes a late refusal reliably, which is what the
+/// ceiling exists to prevent.
+///
+/// A shorter ceiling was tried, at 5s, to bring the slower CI runner under the
+/// cap. It would have turned every legitimate 5-to-10 second refusal in
+/// production into exactly that silent downgrade. The never-demote rule does
+/// not help: it stops a peer being *cached* as legacy after it has answered
+/// once, but it does not stop the request in flight from falling back. And the
+/// compile-time guard does not help either, because it binds future builds
+/// while the clients at risk are the ones already released.
+///
+/// So the ceiling exists solely to bound configurations that set a timeout far
+/// above any real answer time, which in practice means test harnesses. Above
+/// 10s it never binds on a production client, and nothing real is truncated.
+///
+/// The cost of leaving it here is roughly two minutes per merkle E2E test
+/// while the suite's devnet still speaks the pre-versioned dialect. That is a
+/// consequence of the temporary fork-branch protocol pin, not of the design:
+/// once the fleet under test can answer a versioned request there are no
+/// probes to pay for, and the suite returns to its baseline.
+pub(crate) const VERSIONED_QUOTE_PROBE_CEILING: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// How many distinct peers must refuse this client's settlement version before
+/// the refusal is believed and uploads stop.
+///
+/// Nothing authenticates a refusal, so one peer's word cannot be enough: a
+/// single hostile or misconfigured storer answering `ClientUpdateRequired` to
+/// everything would otherwise deny every upload, turning an over-query design
+/// that tolerates many bad peers into one that tolerates none.
+///
+/// Two is deliberately low. A genuine incompatibility reaches it instantly,
+/// because every peer enforcing the newer rule refuses, and a client queries
+/// far more than two. An attacker has to control two of the peers a given
+/// request happens to reach, which is a materially different proposition from
+/// controlling one.
+pub(crate) const SETTLEMENT_REFUSAL_QUORUM: usize = 2;
+
+/// Compile-time cutover guard shared by **every** unversioned quote retry.
+///
+/// Both quote paths fall back to an unversioned request when a peer stays
+/// silent, because a storer built before the settlement version existed cannot
+/// decode the versioned one. Silence is not proof of that, though: a dropped
+/// response, packet loss, an overloaded peer, or one deliberately discarding
+/// versioned requests are indistinguishable from the client side. So the
+/// fallback is a downgrade path and can be provoked.
+///
+/// It is not only literal silence, either. `send_and_await_chunk_response`
+/// keeps waiting when a reply decodes but carries a body the mapper does not
+/// recognise, so a peer answering with an unexpected variant also lands on the
+/// timeout and takes this path. That grants no capability beyond staying
+/// silent, which is why it is bounded rather than special-cased, but a comment
+/// claiming "any structured response prevents the retry" would be wrong.
+///
+/// It is safe only while **no refusal of either kind is possible**, and that
+/// means bounding both constants, not just the minimum.
+///
+/// Raising `MIN` is the obvious hazard: a client below it would be refused,
+/// and the retry hands it a quote anyway. Raising `CURRENT` is the subtler
+/// one. As soon as some node runs a newer `CURRENT` than another, the older
+/// node refuses newer clients with `StorerUpdateRequired` precisely because it
+/// cannot promise to honour their payment. A client that retries such a peer
+/// unversioned gets that unhonourable quote, and for a settlement change that
+/// is not a pure increase the payment is then rejected after it has settled.
+/// Guarding only `MIN` would leave that route open.
+///
+/// So the guard requires both to still be at the first declarable version.
+///
+/// This bounds **future builds** only. A client binary already in the field
+/// carries whatever fallback it shipped with, and no source change reaches it;
+/// that is inherent to shipping software and is why the storer still verifies
+/// every payment it is actually offered.
+///
+/// Each fallback site references this constant so the guard cannot be orphaned
+/// by deleting one path and forgetting the other. Retiring the fallbacks means
+/// deleting this constant and every reference to it, which the compiler then
+/// points at one by one.
+pub(crate) const UNVERSIONED_RETRY_REQUIRES_MIN_V1: () = assert!(
+    ant_protocol::MIN_SUPPORTED_SETTLEMENT_VERSION == 1
+        && ant_protocol::CURRENT_SETTLEMENT_VERSION == 1,
+    "an unversioned quote retry is still compiled in: it is a downgrade path around \
+     both the too-old and the node-behind refusals, so delete every fallback site \
+     before raising MIN_SUPPORTED_SETTLEMENT_VERSION or CURRENT_SETTLEMENT_VERSION"
+);
+
+/// Distinct peers that have refused this client's settlement version, plus the
+/// wording of the first refusal.
+///
+/// A separate type rather than a field so the corroboration rule can be tested
+/// on its own: it is the piece that decides whether an upload stops, and it
+/// has to hold against both a lone lying peer and a genuine incompatibility.
+#[derive(Clone, Default)]
+pub(crate) struct SettlementRefusals {
+    inner: Arc<Mutex<(HashSet<PeerId>, Option<String>)>>,
+}
+
+impl SettlementRefusals {
+    /// Record a refusal from `peer_id`, returning the wording once
+    /// [`SETTLEMENT_REFUSAL_QUORUM`] distinct peers agree and `None` below it.
+    pub(crate) fn note(&self, peer_id: PeerId, message: &str) -> Option<String> {
+        let mut guard = self.inner.lock().ok()?;
+        let (peers, wording) = &mut *guard;
+        peers.insert(peer_id);
+        if wording.is_none() {
+            *wording = Some(message.to_string());
+        }
+        (peers.len() >= SETTLEMENT_REFUSAL_QUORUM)
+            .then(|| wording.clone())
+            .flatten()
+    }
+
+    /// The corroborated refusal, if one has been established.
+    pub(crate) fn corroborated(&self) -> Option<String> {
+        let guard = self.inner.lock().ok()?;
+        let (peers, wording) = &*guard;
+        (peers.len() >= SETTLEMENT_REFUSAL_QUORUM)
+            .then(|| wording.clone())
+            .flatten()
+    }
+
+    /// The distinct refusing peers recorded so far, rendered for logging,
+    /// sorted so the line is deterministic.
+    ///
+    /// Exists so the terminal abort can NAME its corroborators. Without it the
+    /// quorum is unverifiable from outside: "awaiting corroboration" is only
+    /// logged below the quorum and the terminal error carries no peer ids, so
+    /// a log reader sees one warned peer followed by an abort whether the
+    /// quorum counted two distinct peers or misfired on one — which is exactly
+    /// the ambiguity the V2-1109 testnet run hit (0/463 aborts showed a second
+    /// peer, because the second peer was structurally unloggable).
+    pub(crate) fn corroborating_peers(&self) -> Vec<String> {
+        let Ok(guard) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let (peers, _) = &*guard;
+        let mut ids: Vec<String> = peers.iter().map(|p| format!("{p}")).collect();
+        ids.sort();
+        ids
+    }
+}
+
+#[cfg(test)]
+mod settlement_refusal_tests {
+    use super::*;
+
+    fn peer(seed: u8) -> PeerId {
+        PeerId::from_bytes([seed; 32])
+    }
+
+    /// The question the V2-1109 run could not answer from logs: does one peer
+    /// refusing many times count as many? It must not — the quorum is over
+    /// DISTINCT peers, and a lone hostile or misconfigured storer repeating
+    /// itself must never become a verdict about this build.
+    #[test]
+    fn one_peer_refusing_many_times_never_reaches_the_quorum() {
+        let refusals = SettlementRefusals::default();
+        for _ in 0..50 {
+            assert!(
+                refusals.note(peer(7), "run ant update").is_none(),
+                "a single peer's repeated refusals must stay below the quorum"
+            );
+        }
+        assert!(refusals.corroborated().is_none());
+        assert_eq!(refusals.corroborating_peers().len(), 1);
+    }
+
+    /// The terminal log line must be able to name both corroborators, so the
+    /// distinct-peer property is verifiable from the outside.
+    #[test]
+    fn corroborating_peers_names_every_distinct_refuser() {
+        let refusals = SettlementRefusals::default();
+        assert!(refusals.note(peer(1), "run ant update").is_none());
+        assert!(refusals.note(peer(2), "run ant update").is_some());
+
+        let ids = refusals.corroborating_peers();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids, {
+            let mut sorted = ids.clone();
+            sorted.sort();
+            sorted
+        });
+    }
+}
 
 /// Classify a `data::error::Error` into a controller `Outcome`.
 ///
@@ -64,6 +286,9 @@ pub(crate) const PUT_TARGET_WIDTH: usize = 20;
 /// - `RemotePut` -> `ApplicationError` (the remote node responded with a
 ///   structured rejection — the transport succeeded, so the node declined
 ///   at the application layer; not a local capacity signal)
+/// - `ClientUpdateRequired` -> `ApplicationError` (the storer refused to quote
+///   a client that settles under superseded rules — a terminal verdict about
+///   this build, not about link capacity, and no retry rate clears it)
 /// - `CloseGroupShortfall` -> `ApplicationError` (a quorum shortfall caused
 ///   by close-group dial/relay churn with no PUT-response timeouts — remote
 ///   peer churn, not local backpressure; a timeout-bearing shortfall keeps
@@ -93,6 +318,12 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         | Error::InsufficientDiskSpace(_)
         | Error::CostEstimationInconclusive(_)
         | Error::Cancelled(_)
+        // The storer parsed our request and refused it on its merits, over a
+        // working link. Sending fewer requests would not help, and treating it
+        // as congestion would quietly shrink the limiter for the rest of the
+        // run on the basis of a fault no retry can clear.
+        | Error::ClientUpdateRequired(_)
+        | Error::StorerUpdateRequired(_)
         | Error::BadQuoteBinding { .. }
         | Error::BadQuoteCommitment { .. }
         // An external-signer merkle batch larger than one tree can hold —
@@ -383,6 +614,64 @@ pub struct Client {
     persist_path: Option<PathBuf>,
     /// Path for the persistent client peer cache. `None` disables the cache.
     peer_cache_path: Option<PathBuf>,
+    /// Peers that did not answer a settlement-versioned quote request, and are
+    /// therefore asked in the legacy shape from now on.
+    ///
+    /// Without this the probe cost is paid on **every** request rather than
+    /// roughly once per peer. Measured on the merkle E2E suite against a fleet
+    /// that predates the versioned requests, re-probing took the run from ~24
+    /// minutes to over 60, because each of the sixteen candidates per pool sat
+    /// out a full `quote_timeout_secs` before the fallback.
+    ///
+    /// Roughly, not exactly: concurrent first contacts are not coalesced, so
+    /// several in-flight requests can all miss the cache for the same peer and
+    /// each probe it once before any of them records the answer. Observed at
+    /// about two probes per peer on a 35-node devnet. Single-flighting them
+    /// would remove the duplicates but not the wall-clock cost, which is set
+    /// by how many *sequential* quote rounds an upload performs rather than by
+    /// how many probes each round contains.
+    ///
+    /// Process-local and never persisted. A peer that upgrades mid-run keeps
+    /// being asked in the legacy shape until the next start, which is
+    /// acceptable while the legacy shape still gets a quote, and stops
+    /// mattering when the fallback is deleted (see
+    /// [`UNVERSIONED_RETRY_REQUIRES_MIN_V1`]).
+    ///
+    /// Entries are only ever added for a peer that has **never** answered a
+    /// versioned request. Without that condition a single lost response would
+    /// pin an upgraded peer to the legacy shape for the rest of the session,
+    /// turning one dropped packet into a standing downgrade; with it, a peer
+    /// that has shown it understands the versioned shape can never be demoted.
+    ///
+    /// A peer that has never answered can still get itself asked without a
+    /// version by staying silent, exactly as it could through the fallback
+    /// alone. Remembering the answer makes that cheaper to sustain, so it is
+    /// not a new capability but it is a wider one, and the compile-time guard
+    /// requires the whole path to be gone before any refusal is possible.
+    unversioned_quote_peers: Arc<Mutex<HashSet<PeerId>>>,
+    /// Peers observed answering a settlement-versioned request. Never
+    /// downgraded, however they behave later.
+    versioned_capable_peers: Arc<Mutex<HashSet<PeerId>>>,
+    /// Distinct peers that have refused this client on settlement-version
+    /// grounds, and the wording of the first such refusal.
+    ///
+    /// Client-wide and sticky, for two reasons that pull in opposite
+    /// directions and are both real.
+    ///
+    /// It must outlive one operation, because the verdict is about this
+    /// **build**, not this upload. Held in a single collector's local state, a
+    /// refusal observed by one in-flight upload says nothing to another that
+    /// is about to submit a payment, and merkle payments cannot be undone.
+    ///
+    /// It must not fire on one peer's say-so, because nothing authenticates a
+    /// refusal. A single hostile or confused peer answering
+    /// `ClientUpdateRequired` to every query would otherwise abort every
+    /// upload the client attempts, converting an over-query design that
+    /// tolerates many bad peers into one that tolerates none. So a refusal
+    /// becomes terminal only once [`SETTLEMENT_REFUSAL_QUORUM`] distinct peers
+    /// agree, which a genuine incompatibility reaches immediately (every
+    /// upgraded peer refuses) and a lone attacker cannot reach at all.
+    settlement_refusals: SettlementRefusals,
 }
 
 impl Client {
@@ -409,6 +698,9 @@ impl Client {
             evm_network: None,
             chunk_cache: ChunkCache::default(),
             next_request_id: AtomicU64::new(1),
+            unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
+            versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
+            settlement_refusals: SettlementRefusals::default(),
             controller,
             persist_path,
             peer_cache_path,
@@ -444,6 +736,9 @@ impl Client {
             evm_network: None,
             chunk_cache: ChunkCache::default(),
             next_request_id: AtomicU64::new(1),
+            unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
+            versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
+            settlement_refusals: SettlementRefusals::default(),
             controller,
             persist_path,
             peer_cache_path: None,
@@ -560,6 +855,51 @@ impl Client {
     /// Get the next request ID for protocol messages.
     pub(crate) fn next_request_id(&self) -> u64 {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Handle to the set of peers that cannot answer a settlement-versioned
+    /// quote request, shared with the per-peer request futures on both quote
+    /// paths.
+    ///
+    /// Callers read it before choosing a request shape and insert into it when
+    /// a peer stays silent. A poisoned lock is treated as "nothing known", so
+    /// the worst case is a wasted probe rather than a silently skipped version
+    /// declaration.
+    pub(crate) fn unversioned_quote_peers(&self) -> Arc<Mutex<HashSet<PeerId>>> {
+        Arc::clone(&self.unversioned_quote_peers)
+    }
+
+    /// Handle to the set of peers already seen answering a versioned request.
+    /// Consulted before demoting a peer, so a lost response cannot strand an
+    /// upgraded peer in the legacy shape.
+    pub(crate) fn versioned_quote_capable_handle(&self) -> Arc<Mutex<HashSet<PeerId>>> {
+        Arc::clone(&self.versioned_capable_peers)
+    }
+
+    /// Record that `peer_id` refused this client's settlement version, and
+    /// report whether enough distinct peers now agree for it to be believed.
+    ///
+    /// Returns the refusal wording once [`SETTLEMENT_REFUSAL_QUORUM`] is met,
+    /// and `None` below it, so a lone peer is treated as a peer fault rather
+    /// than a verdict about this build.
+    pub(crate) fn note_settlement_refusal(&self, peer_id: PeerId, message: &str) -> Option<String> {
+        self.settlement_refusals.note(peer_id, message)
+    }
+
+    /// The corroborated refusal, if this client has already been told by
+    /// enough peers that it cannot settle.
+    ///
+    /// Checked before spending money. The verdict concerns this build rather
+    /// than any one upload, so an upload that starts after another has already
+    /// established it must not proceed to pay.
+    pub(crate) fn corroborated_settlement_refusal(&self) -> Option<String> {
+        self.settlement_refusals.corroborated()
+    }
+
+    /// Handle to the shared refusal tracker, for collectors that run outside
+    /// `&self`.
+    pub(crate) fn settlement_refusals(&self) -> SettlementRefusals {
+        self.settlement_refusals.clone()
     }
 
     /// Return the chunk PUT-target set: the closest [`PUT_TARGET_WIDTH`] peers
@@ -823,6 +1163,8 @@ mod tests {
             | Error::BadQuoteCommitment { .. }
             | Error::MerkleBatchTooLarge { .. }
             | Error::RemotePut { .. }
+            | Error::ClientUpdateRequired(_)
+            | Error::StorerUpdateRequired(_)
             | Error::CloseGroupShortfall(_) => (),
         };
     }

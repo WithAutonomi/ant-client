@@ -37,7 +37,10 @@ tower-http = { version = "0.6.8", features = ["cors"] }
 # under `ant_protocol::{evm, transport, pqc}`. This is the ONE pin for
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
-ant-protocol = "2.3.3"
+# Branch pin while the settlement-version wire types are in review
+# (WithAutonomi/ant-protocol#25). Swap back to a published `ant-protocol`
+# version pin once that PR merges and the release train publishes it.
+ant-protocol = { git = "https://github.com/grumbach/ant-protocol", branch = "reapply/pr-23-settlement-version" }
 xor_name = "5"
 self_encryption = "0.36"
 futures = "0.3"
