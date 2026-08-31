@@ -173,8 +173,15 @@ impl ForwarderRun {
     async fn run_cycle(&mut self) -> ForwarderSnapshot {
         self.refresh_tailers().await;
 
+        // Files seen across *all* tailers this cycle, and whether that view is complete. Pruning
+        // against a partial view would drop live positions, so a cycle that skipped a tailer --
+        // because it errored or because cancellation cut the loop short -- does not prune at all.
+        let mut live_files: Vec<String> = Vec::new();
+        let mut complete_view = true;
+
         for (tailer, tags) in self.tailers.values_mut() {
             if self.cancel.is_cancelled() {
+                complete_view = false;
                 break;
             }
             let outcome = match tailer.poll(&mut self.offsets, self.config.min_level).await {
@@ -184,11 +191,13 @@ impl ForwarderRun {
                         "log forwarding: node {} could not be read this cycle: {error}",
                         tailer.node_id()
                     );
+                    complete_view = false;
                     continue;
                 }
             };
 
             self.stats.events_dropped_by_level += outcome.dropped_by_level;
+            live_files.extend(outcome.live_files.iter().cloned());
 
             for event in &outcome.events {
                 match ForwardDocument::build(
@@ -203,6 +212,12 @@ impl ForwarderRun {
                     None => self.stats.events_dropped_by_level += 1,
                 }
             }
+        }
+
+        // Once, against every tailer's files: a per-tailer prune would delete the other nodes'
+        // positions and send them back to the start of their current file on the next cycle.
+        if complete_view {
+            self.offsets.prune(&live_files);
         }
 
         self.flush_queue().await;
@@ -427,6 +442,23 @@ mod tests {
 
     fn line(level: &str, message: &str) -> String {
         format!("2026-08-19T20:50:00.123456Z  {level} ant_node::node: {message}\n")
+    }
+
+    /// Wait until `condition` holds, or give up after `deadline`.
+    ///
+    /// Preferred over a fixed sleep wherever a test waits on the forwarder making progress: the
+    /// work is real I/O over megabytes of log, so a duration chosen on an idle machine turns into a
+    /// flake on a loaded CI runner. Returns whether the condition was met, so the caller can still
+    /// assert on the actual value and produce a useful message.
+    async fn wait_until(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let started = tokio::time::Instant::now();
+        while started.elapsed() < deadline {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        condition()
     }
 
     /// Drive the forwarder for long enough to observe several poll cycles.
@@ -681,6 +713,158 @@ mod tests {
         assert_eq!(
             skipped.iter().map(|n| n.node_id).collect::<Vec<_>>(),
             vec![2]
+        );
+    }
+
+    /// Reproduction of the beta cohort stall: a node that has written several megabytes since the
+    /// forwarder last caught up must have all of it shipped, not just the first chunk.
+    #[tokio::test]
+    async fn a_multi_megabyte_backlog_is_shipped_in_full() {
+        let harness = Harness::new(&[true]).await;
+        let sink = Arc::new(MockSink::accepting());
+
+        let handle = spawn_log_forwarder(
+            harness.registry.clone(),
+            harness.config(),
+            sink.clone(),
+            harness.offsets_path(),
+            Duration::from_millis(20),
+            CancellationToken::new(),
+        );
+
+        // Let the forwarder join the (empty) file at its end first.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Now write ~3MB, the way a busy node does over an hour.
+        let mut blob = String::new();
+        let mut expected = 0usize;
+        while blob.len() < 3 * 1024 * 1024 {
+            blob.push_str(&line("INFO", &format!("replication event {expected} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")));
+            expected += 1;
+        }
+        harness.append(1, &blob);
+
+        // 3MB is three chunks, so a correct forwarder finishes in a handful of cycles.
+        wait_until(Duration::from_secs(30), || {
+            sink.submitted_ids().len() >= expected
+        })
+        .await;
+        handle.stop();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stats = handle.snapshot().await.stats;
+        let shipped = sink.submitted_ids().len();
+        eprintln!(
+            "blob_bytes={} expected_events={expected} shipped={shipped} forwarded={} dropped_overflow={} dropped_level={} batches_sent={} batches_failed={} last_error={:?}",
+            blob.len(), stats.events_forwarded, stats.events_dropped_by_overflow,
+            stats.events_dropped_by_level, stats.batches_sent, stats.batches_failed, stats.last_error
+        );
+        assert_eq!(
+            shipped, expected,
+            "the whole backlog must be shipped, not just the first chunk"
+        );
+    }
+
+    /// Each tailer prunes the *shared* offset store against only its own files, so a second node
+    /// wipes the first node's positions every cycle.
+    #[tokio::test]
+    async fn a_second_node_does_not_wipe_the_first_nodes_offsets() {
+        let harness = Harness::new(&[true, true]).await;
+        let sink = Arc::new(MockSink::accepting());
+
+        let handle = spawn_log_forwarder(
+            harness.registry.clone(),
+            harness.config(),
+            sink.clone(),
+            harness.offsets_path(),
+            Duration::from_millis(20),
+            CancellationToken::new(),
+        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Node 1 is busy; node 2 is registered with a log dir but has written nothing.
+        let mut blob = String::new();
+        let mut expected = 0usize;
+        while blob.len() < 3 * 1024 * 1024 {
+            blob.push_str(&line("INFO", &format!("event {expected} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")));
+            expected += 1;
+        }
+        harness.append(1, &blob);
+
+        wait_until(Duration::from_secs(30), || {
+            sink.submitted_ids()
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                >= expected
+        })
+        .await;
+        handle.stop();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let ids = sink.submitted_ids();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        let stats = handle.snapshot().await.stats;
+        eprintln!(
+            "expected={expected} submitted={} unique={} forwarded={} batches={}",
+            ids.len(),
+            unique.len(),
+            stats.events_forwarded,
+            stats.batches_sent
+        );
+        assert_eq!(
+            unique.len(),
+            expected,
+            "node 1's whole backlog must ship; it stalled after {} distinct events \
+             (re-sent {} times over)",
+            unique.len(),
+            ids.len() / unique.len().max(1)
+        );
+    }
+
+    /// Retention deleting a daily file must still drop its offset -- now done once per cycle by the
+    /// runner, against every tailer's files rather than one node's.
+    #[tokio::test]
+    async fn offsets_for_retention_deleted_files_are_pruned() {
+        let harness = Harness::new(&[true]).await;
+        let sink = Arc::new(MockSink::accepting());
+        let log_dir = harness.root.join("logs-1");
+
+        for name in ["ant-node.2026-08-18.log", "ant-node.2026-08-19.log"] {
+            std::fs::write(log_dir.join(name), line("INFO", "hello")).unwrap();
+        }
+
+        let handle = spawn_log_forwarder(
+            harness.registry.clone(),
+            harness.config(),
+            sink.clone(),
+            harness.offsets_path(),
+            Duration::from_millis(20),
+            CancellationToken::new(),
+        );
+        let offsets_path = harness.offsets_path();
+        wait_until(Duration::from_secs(30), || {
+            OffsetStore::load(&offsets_path).len() == 2
+        })
+        .await;
+        assert_eq!(
+            OffsetStore::load(&offsets_path).len(),
+            2,
+            "both dailies are tracked"
+        );
+
+        std::fs::remove_file(log_dir.join("ant-node.2026-08-18.log")).unwrap();
+        wait_until(Duration::from_secs(30), || {
+            OffsetStore::load(&offsets_path).len() == 1
+        })
+        .await;
+        handle.stop();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert_eq!(
+            OffsetStore::load(&offsets_path).len(),
+            1,
+            "the deleted daily is pruned"
         );
     }
 }

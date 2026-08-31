@@ -542,6 +542,12 @@ fn daemon_run_args(config: &DaemonConfig) -> Vec<String> {
         args.push("--listen-addr".to_string());
         args.push(config.listen_addr.to_string());
     }
+    // Without this the path would be lost at the detach boundary: `daemon start` parses it, then
+    // spawns a fresh `daemon run` process that would otherwise log nothing.
+    if let Some(ref log_path) = config.log_path {
+        args.push("--log-path".to_string());
+        args.push(log_path.display().to_string());
+    }
     args
 }
 
@@ -649,6 +655,36 @@ mod tests {
         };
         let args = daemon_run_args(&config);
         assert_eq!(args, vec!["node", "daemon", "run", "--port", "8765"]);
+    }
+
+    /// The flag has to cross the detach boundary: `daemon start` parses it, but the process that
+    /// does the logging is the `daemon run` it spawns.
+    #[test]
+    fn run_args_forward_the_log_path() {
+        let config = DaemonConfig {
+            log_path: Some(std::path::PathBuf::from("/var/log/ant/daemon.log")),
+            ..DaemonConfig::default()
+        };
+        let args = daemon_run_args(&config);
+        assert_eq!(
+            args,
+            vec![
+                "node",
+                "daemon",
+                "run",
+                "--log-path",
+                "/var/log/ant/daemon.log"
+            ]
+        );
+    }
+
+    #[test]
+    fn run_args_omit_the_log_path_by_default() {
+        let args = daemon_run_args(&DaemonConfig::default());
+        assert!(
+            !args.contains(&"--log-path".to_string()),
+            "daemon logging must stay opt-in"
+        );
     }
 
     #[test]
