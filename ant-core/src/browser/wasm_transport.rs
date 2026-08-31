@@ -13,6 +13,10 @@ use super::protocol::{
     BrowserResponseFrame, WebRtcDirectEndpoint, MAX_BROWSER_RESPONSE_BYTES,
     WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
+use crate::client_engine::adaptive::{
+    observe_op, AdaptiveConfig, AdaptiveController, ChannelStart, Outcome,
+};
+use ant_protocol::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
 use futures_channel::{mpsc, oneshot};
 use futures_util::{
     future::{join_all, select, Either},
@@ -53,8 +57,6 @@ const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const MAX_BROWSER_ROUTING_ENTRIES: usize = 256;
 const MAX_BROWSER_ENDPOINT_FAILURES: usize = 256;
 const DEFAULT_BROWSER_QUOTE_CONCURRENCY: usize = 4;
-const DEFAULT_BROWSER_STORE_CONCURRENCY: usize = 4;
-const MAX_STORE_TARGETS: usize = 7;
 const MAX_DOWNLOAD_CONCURRENCY: usize = 6;
 const MAX_BROWSER_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
@@ -1293,6 +1295,7 @@ fn required_range_records(
 #[wasm_bindgen(js_name = BrowserNetworkClient)]
 pub struct BrowserNetworkClient {
     inner: Rc<BrowserNetworkCore>,
+    controller: AdaptiveController,
 }
 
 #[wasm_bindgen(js_class = BrowserNetworkClient)]
@@ -1312,6 +1315,7 @@ impl BrowserNetworkClient {
             BrowserNetworkCore::new(endpoints).map_err(|error| JsValue::from_str(&error))?;
         Ok(Self {
             inner: Rc::new(inner),
+            controller: AdaptiveController::new(ChannelStart::default(), AdaptiveConfig::default()),
         })
     }
 
@@ -1685,25 +1689,14 @@ impl BrowserNetworkClient {
             *transaction_hash = super::protocol::normalize_hex(transaction_hash, 32)?;
         }
 
-        let record_count = prepared.len();
-        let payment_network_ref = &payment_network;
-        let transaction_hash = payment.transaction_hash.as_deref();
-        let stores = prepared
-            .iter()
-            .enumerate()
-            .map(|(index, record)| async move {
-                progress.report(&format!("Storing record {}/{}", index + 1, record_count));
-                self.store_prepared(record, payment_network_ref, transaction_hash, progress)
-                    .await
-            });
-        let stores =
-            crate::client_engine::bounded_unordered(stores, DEFAULT_BROWSER_STORE_CONCURRENCY)
-                .collect::<Vec<_>>()
-                .await;
-        let mut replicas = usize::MAX;
-        for stored in stores {
-            replicas = replicas.min(stored?);
-        }
+        let replicas = self
+            .store_prepared_records(
+                &prepared,
+                &payment_network,
+                payment.transaction_hash.as_deref(),
+                progress,
+            )
+            .await?;
         let descriptor = PublicFileDescriptor {
             name: name.to_string(),
             address: encrypted.address,
@@ -1716,7 +1709,7 @@ impl BrowserNetworkClient {
             blake3: encrypted.blake3,
             data_map_size: encrypted.data_map_size,
             chunks: encrypted.chunks,
-            replicas: if replicas == usize::MAX { 0 } else { replicas },
+            replicas,
         };
         Ok(BrowserUploadResult {
             file: descriptor,
@@ -1743,7 +1736,7 @@ impl BrowserNetworkClient {
                     endpoint,
                 })
             })
-            .take(MAX_STORE_TARGETS)
+            .take(CLOSE_GROUP_SIZE)
             .collect::<Vec<_>>();
         if targets.is_empty() {
             return Err(
@@ -1806,7 +1799,107 @@ impl BrowserNetworkClient {
         ))
     }
 
-    async fn store_prepared(
+    /// Store every paid record with the same adaptive, byte-bounded retry
+    /// rounds used by the native client.
+    async fn store_prepared_records(
+        &self,
+        prepared: &[PreparedRecord],
+        payment_network: &BrowserPaymentNetwork,
+        transaction_hash: Option<&str>,
+        progress: &ProgressReporter,
+    ) -> Result<usize, String> {
+        let record_count = prepared.len();
+        let max_record_bytes = prepared
+            .iter()
+            .map(|record| record.record.content.len())
+            .max()
+            .unwrap_or(0);
+        let byte_bound = crate::client_engine::store_byte_bound(max_record_bytes);
+        let mut to_retry = prepared.iter().enumerate().collect::<Vec<_>>();
+        let mut replicas = usize::MAX;
+
+        for attempt in 0..=crate::client_engine::STORE_MAX_RETRIES {
+            if attempt > 0 {
+                let delay = crate::client_engine::store_retry_delay(attempt);
+                progress.report(&format!(
+                    "Retrying {} record(s), attempt {attempt}/{}",
+                    to_retry.len(),
+                    crate::client_engine::STORE_MAX_RETRIES
+                ));
+                TimeoutFuture::new(u32::try_from(delay.as_millis()).unwrap_or(u32::MAX)).await;
+            }
+
+            let op_limiter = self.controller.store.clone();
+            let cap_limiter = op_limiter.clone();
+            let results = crate::client_engine::rolling_unordered(
+                to_retry,
+                |(index, record)| {
+                    let limiter = op_limiter.clone();
+                    async move {
+                        progress.report(&format!(
+                            "Storing record {}/{} (attempt {}/{})",
+                            index + 1,
+                            record_count,
+                            attempt + 1,
+                            crate::client_engine::STORE_MAX_RETRIES + 1
+                        ));
+                        let result = observe_op(
+                            &limiter,
+                            || {
+                                self.store_prepared_once(
+                                    record,
+                                    payment_network,
+                                    transaction_hash,
+                                    progress,
+                                )
+                            },
+                            |error| classify_browser_store_error(error),
+                        )
+                        .await;
+                        ((index, record), result)
+                    }
+                },
+                || cap_limiter.current().min(byte_bound),
+            )
+            .await;
+
+            let mut failed = Vec::new();
+            for ((index, record), result) in results {
+                match result {
+                    Ok(stored) => replicas = replicas.min(stored),
+                    Err(error) => failed.push((index, record, error)),
+                }
+            }
+            if failed.is_empty() {
+                return Ok(if replicas == usize::MAX { 0 } else { replicas });
+            }
+            if attempt == crate::client_engine::STORE_MAX_RETRIES {
+                let failed_count = failed.len();
+                let details = failed
+                    .into_iter()
+                    .map(|(index, _, error)| {
+                        format!("record {}/{}: {error}", index + 1, record_count)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(format!(
+                    "{} paid record(s) failed after {} attempts: {details}",
+                    failed_count,
+                    crate::client_engine::STORE_MAX_RETRIES + 1
+                ));
+            }
+            to_retry = failed
+                .into_iter()
+                .map(|(index, record, _)| (index, record))
+                .collect();
+        }
+
+        Err("record store retry loop ended unexpectedly".to_string())
+    }
+
+    /// Store one record to a close-group majority, advancing through the rest
+    /// of the ordered K=7 target set only when an initial target fails.
+    async fn store_prepared_once(
         &self,
         prepared: &PreparedRecord,
         payment_network: &BrowserPaymentNetwork,
@@ -1823,46 +1916,71 @@ impl BrowserNetworkClient {
             .verified
             .as_ref()
             .ok_or_else(|| "paid record has no verified quote".to_string())?;
-        let attempts = prepared.targets.iter().cloned().map(|target| {
-            let pool = Rc::clone(&self.inner.pool);
-            let record = prepared.record.clone();
-            let quote = verified.quote.clone();
-            let payment_network = payment_network.clone();
-            let transaction_hash = transaction_hash.clone();
-            let progress = progress.clone();
-            async move {
-                let client = pool.client(&target.endpoint).await?;
-                let hello = client.hello().await?;
-                assert_upload_node(&hello, &payment_network)?;
-                let (_, already_stored) = client
-                    .put_chunk(&record.address, &record.content, quote, &transaction_hash)
-                    .await?;
-                progress.report(&format!(
-                    "{} {} on {}",
-                    if already_stored {
-                        "Confirmed"
-                    } else {
-                        "Stored"
-                    },
-                    record.address,
-                    target.peer_id
-                ));
-                Ok::<(), String>(())
-            }
-        });
-        let attempts = join_all(attempts).await;
-        let stored = attempts.iter().filter(|attempt| attempt.is_ok()).count();
-        if stored == 0 {
-            let failures = attempts
-                .into_iter()
-                .filter_map(Result::err)
-                .collect::<Vec<_>>()
-                .join("; ");
+        let outcome = crate::client_engine::quorum_with_fallback(
+            prepared.targets.iter().cloned(),
+            CLOSE_GROUP_MAJORITY,
+            |target| {
+                let pool = Rc::clone(&self.inner.pool);
+                let record = prepared.record.clone();
+                let quote = verified.quote.clone();
+                let payment_network = payment_network.clone();
+                let transaction_hash = transaction_hash.clone();
+                let progress = progress.clone();
+                async move {
+                    let client = pool.client(&target.endpoint).await?;
+                    let hello = client.hello().await?;
+                    assert_upload_node(&hello, &payment_network)?;
+                    let (_, already_stored) = client
+                        .put_chunk(&record.address, &record.content, quote, &transaction_hash)
+                        .await?;
+                    progress.report(&format!(
+                        "{} {} on {}",
+                        if already_stored {
+                            "Confirmed"
+                        } else {
+                            "Stored"
+                        },
+                        record.address,
+                        target.peer_id
+                    ));
+                    Ok::<(), String>(())
+                }
+            },
+        )
+        .await;
+        let failures = outcome
+            .failures
+            .into_iter()
+            .map(|(target, error)| {
+                progress.report(&format!("Store target {} failed: {error}", target.peer_id));
+                format!("{}: {error}", target.peer_id)
+            })
+            .collect::<Vec<_>>();
+        if !outcome.reached {
             return Err(format!(
-                "paid chunk was rejected by every closest node: {failures}"
+                "stored on {} peers, need {CLOSE_GROUP_MAJORITY}; failures: {}",
+                outcome.successes,
+                failures.join("; ")
             ));
         }
-        Ok(stored)
+        Ok(outcome.successes)
+    }
+}
+
+fn classify_browser_store_error(error: &str) -> Outcome {
+    let error = error.to_ascii_lowercase();
+    if error.contains("timed out") || error.contains("timeout") {
+        Outcome::Timeout
+    } else if error.contains("webrtc")
+        || error.contains("datachannel")
+        || error.contains("ice")
+        || error.contains("connect")
+        || error.contains("closed")
+        || error.contains("invalid state")
+    {
+        Outcome::NetworkError
+    } else {
+        Outcome::ApplicationError
     }
 }
 

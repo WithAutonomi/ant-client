@@ -20,7 +20,7 @@ use ant_protocol::payment::{
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{compute_address, XorName, CLOSE_GROUP_SIZE, DATA_TYPE_CHUNK};
 use bytes::Bytes;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -28,13 +28,6 @@ use tracing::{debug, info, warn};
 
 /// Number of chunks per payment wave.
 const PAYMENT_WAVE_SIZE: usize = 64;
-
-/// Soft ceiling on the combined body size of chunks stored concurrently in a
-/// single wave. Caps store concurrency for large chunks so the send path's
-/// per-peer body buffers can't pin multiple GB at once (see V2-461). At ~4 MB
-/// chunks this permits ~16 concurrent stores; small chunks hit the chunk-count
-/// / adaptive limits instead and are unaffected.
-const STORE_INFLIGHT_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
 /// Variable-size single-node payment plan for a chunk.
 ///
@@ -849,9 +842,6 @@ impl Client {
         stored_before: usize,
         total_chunks: usize,
     ) -> WaveResult {
-        const MAX_RETRIES: u32 = 3;
-        const BASE_DELAY_MS: u64 = 500;
-
         let mut stored = Vec::new();
         let mut to_retry = paid_chunks;
 
@@ -875,20 +865,18 @@ impl Client {
         let max_chunk_bytes = to_retry.iter().map(|c| c.content.len()).max().unwrap_or(0);
         // `checked_div` yields `None` only when `max_chunk_bytes == 0` (an
         // empty/zero-length wave), in which case there is no byte limit.
-        let byte_bound = STORE_INFLIGHT_BYTE_BUDGET
-            .checked_div(max_chunk_bytes)
-            .map_or(usize::MAX, |n| n.max(1));
+        let byte_bound = crate::client_engine::store_byte_bound(max_chunk_bytes);
 
         let mut chunk_attempts_total: usize = 0;
         let mut store_durations_ms: Vec<u64> = Vec::new();
         let mut retries_per_chunk: Vec<u32> = Vec::new();
 
-        for attempt in 0..=MAX_RETRIES {
+        for attempt in 0..=crate::client_engine::STORE_MAX_RETRIES {
             if attempt > 0 {
-                let delay = Duration::from_millis(BASE_DELAY_MS * 2u64.pow(attempt - 1));
-                tokio::time::sleep(delay).await;
+                tokio::time::sleep(crate::client_engine::store_retry_delay(attempt)).await;
                 info!(
-                    "Retry attempt {attempt}/{MAX_RETRIES} for {} chunks",
+                    "Retry attempt {attempt}/{} for {} chunks",
+                    crate::client_engine::STORE_MAX_RETRIES,
                     to_retry.len()
                 );
             }
@@ -924,21 +912,12 @@ impl Client {
                     (chunk_clone, result)
                 }
             };
-            let mut chunk_iter = to_retry.into_iter();
-            let mut in_flight = FuturesUnordered::new();
-
             let mut failed_this_round = Vec::new();
-            loop {
-                let slots = store_limiter.current().min(byte_bound).max(1);
-                while in_flight.len() < slots {
-                    match chunk_iter.next() {
-                        Some(chunk) => in_flight.push(make_store(chunk)),
-                        None => break,
-                    }
-                }
-                let Some((chunk, result)) = in_flight.next().await else {
-                    break;
-                };
+            let results = crate::client_engine::rolling_unordered(to_retry, make_store, || {
+                store_limiter.current().min(byte_bound)
+            })
+            .await;
+            for (chunk, result) in results {
                 match result {
                     Ok(name) => {
                         let duration_ms = first_seen
@@ -975,7 +954,7 @@ impl Client {
                 return result;
             }
 
-            if attempt == MAX_RETRIES {
+            if attempt == crate::client_engine::STORE_MAX_RETRIES {
                 let failed = failed_this_round
                     .into_iter()
                     .map(|(c, e)| (c.address, e))

@@ -26,6 +26,7 @@ self_encryption = "0.36"
 saorsa-dht-lookup = { version = "0.1.0", path = "../../saorsa-core-web-support/crates/saorsa-dht-lookup" }
 thiserror = "2"
 url = "2"
+web-time = "1.1"
 
 # Node management
 async-stream = { version = "0.3", optional = true }
@@ -156,6 +157,7 @@ browser-wasm = [
     "dep:gloo-timers",
     "dep:js-sys",
     "dep:serde-wasm-bindgen",
+    "dep:tracing",
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
     "dep:web-sys",

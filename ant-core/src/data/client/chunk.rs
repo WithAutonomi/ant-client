@@ -16,7 +16,7 @@ use ant_protocol::{
     ProofType, ProtocolError, XorName, CLOSE_GROUP_MAJORITY,
 };
 use bytes::Bytes;
-use futures::stream::{self, FuturesUnordered, StreamExt};
+use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -409,21 +409,17 @@ impl Client {
     ) -> Result<XorName> {
         let address = compute_address(&content);
 
-        let initial_count = peers.len().min(CLOSE_GROUP_MAJORITY);
-        let (initial_peers, fallback_peers) = peers.split_at(initial_count);
-        let mut fallback_iter = fallback_peers.iter();
-
-        let mut put_futures = FuturesUnordered::new();
-        for (peer_id, addrs) in initial_peers {
-            put_futures.push(self.spawn_chunk_put(
-                content.clone(),
-                proof.clone(),
-                *peer_id,
-                addrs.clone(),
-            ));
-        }
-
-        let mut success_count = 0usize;
+        let outcome = crate::client_engine::quorum_with_fallback(
+            peers.iter().cloned(),
+            CLOSE_GROUP_MAJORITY,
+            |(peer_id, addrs)| {
+                let content = content.clone();
+                let proof = proof.clone();
+                async move { self.spawn_chunk_put(content, proof, peer_id, addrs).await.1 }
+            },
+        )
+        .await;
+        let success_count = outcome.successes;
         let mut failures: Vec<String> = Vec::new();
         // Tally the *cause* of each failure. The store AIMD limiter must only be
         // pushed down by a transport shortfall (V2-468): a node that responds —
@@ -439,55 +435,33 @@ impl Client {
         let mut dial = 0usize;
         let mut first_app_rejection: Option<Error> = None;
 
-        while let Some((peer_id, result)) = put_futures.next().await {
-            match result {
-                Ok(_) => {
-                    success_count += 1;
-                    if success_count >= CLOSE_GROUP_MAJORITY {
-                        debug!(
-                            "Chunk {} stored on {success_count} peers (majority reached)",
-                            hex::encode(address)
-                        );
-                        return Ok(address);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to store chunk on {peer_id}: {e}");
-                    failures.push(format!("{peer_id}: {e}"));
-                    match classify_put_failure(&e) {
-                        PutRejection::Full => full += 1,
-                        PutRejection::PriceFloor => price_floor += 1,
-                        PutRejection::OtherRemote => other_remote += 1,
-                        PutRejection::Timeout => timeout += 1,
-                        PutRejection::Dial => dial += 1,
-                    }
-                    // An application-level decline is `RemotePut` (a structured
-                    // node rejection) or `Error::Payment` (`PaymentRequired`):
-                    // capture the first so an all-application shortfall surfaces
-                    // as `ApplicationError`, not `InsufficientPeers`
-                    // (`NetworkError`), and never suppresses the limiter.
-                    if matches!(e, Error::RemotePut { .. } | Error::Payment(_))
-                        && first_app_rejection.is_none()
-                    {
-                        first_app_rejection = Some(e);
-                    }
-
-                    // Advance to the next peer in the put-target set, reusing
-                    // the same proof.
-                    if let Some((fb_peer, fb_addrs)) = fallback_iter.next() {
-                        debug!(
-                            "Falling back to peer {fb_peer} for chunk {}",
-                            hex::encode(address)
-                        );
-                        put_futures.push(self.spawn_chunk_put(
-                            content.clone(),
-                            proof.clone(),
-                            *fb_peer,
-                            fb_addrs.clone(),
-                        ));
-                    }
-                }
+        for ((peer_id, _), error) in outcome.failures {
+            warn!("Failed to store chunk on {peer_id}: {error}");
+            failures.push(format!("{peer_id}: {error}"));
+            match classify_put_failure(&error) {
+                PutRejection::Full => full += 1,
+                PutRejection::PriceFloor => price_floor += 1,
+                PutRejection::OtherRemote => other_remote += 1,
+                PutRejection::Timeout => timeout += 1,
+                PutRejection::Dial => dial += 1,
             }
+            // An application-level decline is `RemotePut` (a structured node
+            // rejection) or `Error::Payment` (`PaymentRequired`): capture the
+            // first so an all-application shortfall surfaces as
+            // `ApplicationError`, not `InsufficientPeers` (`NetworkError`).
+            if matches!(error, Error::RemotePut { .. } | Error::Payment(_))
+                && first_app_rejection.is_none()
+            {
+                first_app_rejection = Some(error);
+            }
+        }
+
+        if outcome.reached {
+            debug!(
+                "Chunk {} stored on {success_count} peers (majority reached)",
+                hex::encode(address)
+            );
+            return Ok(address);
         }
 
         // Quorum not reached. A timeout-bearing shortfall is genuine local

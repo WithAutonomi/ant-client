@@ -47,18 +47,24 @@
 //!   removed from saorsa-core; this controller only tunes client
 //!   concurrency.
 
-use futures::stream::{self, FuturesUnordered, StreamExt};
+use futures_util::stream::{self, FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+#[cfg(feature = "native")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "native")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use std::time::Duration;
+use tracing::debug;
+#[cfg(feature = "native")]
+use tracing::warn;
+use web_time::Instant;
 
 /// Process-monotonic counter for unique snapshot temp filenames.
 /// Combined with PID + nanosecond timestamp, makes collision
 /// effectively impossible across concurrent save_snapshot calls.
+#[cfg(feature = "native")]
 static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Fetch starts at the residential-saturation floor validated in
@@ -1480,20 +1486,25 @@ where
 /// can evolve the controller without crashing on stale files — an
 /// unknown future schema version simply causes a silent fallback to
 /// cold defaults.
+#[cfg(feature = "native")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
     schema: u32,
     channels: ChannelStart,
 }
 
+#[cfg(feature = "native")]
 const PERSIST_SCHEMA: u32 = 2;
+#[cfg(feature = "native")]
 const PERSIST_SCHEMA_AIMD_FETCH: u32 = 1;
+#[cfg(feature = "native")]
 const PERSIST_FILENAME: &str = "client_adaptive.json";
 
 /// Default persistence path: `<data_dir>/client_adaptive.json`. Falls
 /// back to `None` if the platform data dir is not resolvable; in that
 /// case the controller still works, it just won't persist.
 #[must_use]
+#[cfg(feature = "native")]
 pub fn default_persist_path() -> Option<PathBuf> {
     crate::config::data_dir()
         .ok()
@@ -1506,6 +1517,7 @@ pub fn default_persist_path() -> Option<PathBuf> {
 /// effort — never propagate errors that would block the user's
 /// operation.
 #[must_use]
+#[cfg(feature = "native")]
 pub fn load_snapshot(path: &Path) -> Option<ChannelStart> {
     let bytes = std::fs::read(path).ok()?;
     let state: PersistedState = match serde_json::from_slice(&bytes) {
@@ -1541,6 +1553,7 @@ pub fn load_snapshot(path: &Path) -> Option<ChannelStart> {
 
 /// Save a snapshot to disk atomically (write to `<path>.tmp`, then
 /// rename). Best effort — failures are logged at warn and discarded.
+#[cfg(feature = "native")]
 pub fn save_snapshot(path: &Path, channels: ChannelStart) {
     let state = PersistedState {
         schema: PERSIST_SCHEMA,
@@ -1602,6 +1615,7 @@ pub fn save_snapshot(path: &Path, channels: ChannelStart) {
 ///
 /// Used by `Client::drop` so a stalled filesystem cannot block
 /// process shutdown indefinitely.
+#[cfg(feature = "native")]
 pub fn save_snapshot_with_timeout(path: PathBuf, channels: ChannelStart, timeout: Duration) {
     let handle = std::thread::spawn(move || {
         save_snapshot(&path, channels);

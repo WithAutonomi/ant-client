@@ -3,7 +3,9 @@
 //! Provides high-level APIs for storing and retrieving data
 //! on the Autonomi decentralized network.
 
-pub mod adaptive;
+pub mod adaptive {
+    pub use crate::client_engine::adaptive::*;
+}
 pub mod batch;
 pub mod cache;
 pub(crate) mod cached_merkle;

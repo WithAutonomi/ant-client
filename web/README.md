@@ -28,6 +28,13 @@ Nodes serialize these addresses from the native `saorsa_core::MultiAddr`
 representation; the shared Rust client parser consumes that canonical string
 form in WASM.
 
+Native QUIC and browser WebRTC uploads use the same `ant-core` scheduling
+policy: the adaptive store limiter, a 64 MiB in-flight source-record budget,
+four-of-seven close-group quorum with one-for-one fallback targets, and three
+whole-record retries with 500 ms, 1 s, and 2 s backoff. The browser transport
+adapts WebRTC requests to that shared engine rather than maintaining a separate
+upload algorithm in JavaScript.
+
 Install the WASM build tools once if needed:
 
 ```bash
