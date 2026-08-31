@@ -610,6 +610,16 @@ fn record_store_quote_result(
                 failures.push(format!("{peer_id}: {e}"));
                 return Ok(());
             };
+            // Name the corroborators. This is the only place the quorum is
+            // externally verifiable: the below-quorum branch above logs one
+            // peer at a time, so without this line a reader cannot tell a
+            // two-peer verdict from a one-peer misfire (V2-1109).
+            let corroborators = refusals.corroborating_peers();
+            warn!(
+                "Settlement refusal corroborated by {} distinct peers [{}]; aborting before payment",
+                corroborators.len(),
+                corroborators.join(", ")
+            );
             let verdict = Error::ClientUpdateRequired(corroborated);
             if settlement_refusal.is_none() {
                 *settlement_refusal = Some(Error::ClientUpdateRequired(verdict.to_string()));

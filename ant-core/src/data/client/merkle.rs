@@ -1479,6 +1479,16 @@ impl Client {
                     if let Some(corroborated) =
                         self.note_settlement_refusal(peer_id, &e.to_string())
                     {
+                        // Name the corroborators — the below-quorum branch logs
+                        // one peer at a time, so without this line a reader
+                        // cannot tell a two-peer verdict from a one-peer
+                        // misfire (V2-1109).
+                        let corroborators = self.settlement_refusals().corroborating_peers();
+                        warn!(
+                            "Settlement refusal corroborated by {} distinct peers [{}]; aborting before payment",
+                            corroborators.len(),
+                            corroborators.join(", ")
+                        );
                         return Err(Error::ClientUpdateRequired(corroborated));
                     }
                     warn!("Merkle candidate {peer_id} refused this client's settlement version; awaiting corroboration");

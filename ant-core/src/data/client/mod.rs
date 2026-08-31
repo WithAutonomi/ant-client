@@ -193,6 +193,70 @@ impl SettlementRefusals {
             .then(|| wording.clone())
             .flatten()
     }
+
+    /// The distinct refusing peers recorded so far, rendered for logging,
+    /// sorted so the line is deterministic.
+    ///
+    /// Exists so the terminal abort can NAME its corroborators. Without it the
+    /// quorum is unverifiable from outside: "awaiting corroboration" is only
+    /// logged below the quorum and the terminal error carries no peer ids, so
+    /// a log reader sees one warned peer followed by an abort whether the
+    /// quorum counted two distinct peers or misfired on one — which is exactly
+    /// the ambiguity the V2-1109 testnet run hit (0/463 aborts showed a second
+    /// peer, because the second peer was structurally unloggable).
+    pub(crate) fn corroborating_peers(&self) -> Vec<String> {
+        let Ok(guard) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let (peers, _) = &*guard;
+        let mut ids: Vec<String> = peers.iter().map(|p| format!("{p}")).collect();
+        ids.sort();
+        ids
+    }
+}
+
+#[cfg(test)]
+mod settlement_refusal_tests {
+    use super::*;
+
+    fn peer(seed: u8) -> PeerId {
+        PeerId::from_bytes([seed; 32])
+    }
+
+    /// The question the V2-1109 run could not answer from logs: does one peer
+    /// refusing many times count as many? It must not — the quorum is over
+    /// DISTINCT peers, and a lone hostile or misconfigured storer repeating
+    /// itself must never become a verdict about this build.
+    #[test]
+    fn one_peer_refusing_many_times_never_reaches_the_quorum() {
+        let refusals = SettlementRefusals::default();
+        for _ in 0..50 {
+            assert!(
+                refusals.note(peer(7), "run ant update").is_none(),
+                "a single peer's repeated refusals must stay below the quorum"
+            );
+        }
+        assert!(refusals.corroborated().is_none());
+        assert_eq!(refusals.corroborating_peers().len(), 1);
+    }
+
+    /// The terminal log line must be able to name both corroborators, so the
+    /// distinct-peer property is verifiable from the outside.
+    #[test]
+    fn corroborating_peers_names_every_distinct_refuser() {
+        let refusals = SettlementRefusals::default();
+        assert!(refusals.note(peer(1), "run ant update").is_none());
+        assert!(refusals.note(peer(2), "run ant update").is_some());
+
+        let ids = refusals.corroborating_peers();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids, {
+            let mut sorted = ids.clone();
+            sorted.sort();
+            sorted
+        });
+    }
 }
 
 /// Classify a `data::error::Error` into a controller `Outcome`.
