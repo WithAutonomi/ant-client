@@ -25,9 +25,11 @@ Each record contains:
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | Stable schema discriminator; `3` adds selected DHT-record context |
+| `schema_version` | Stable schema discriminator; `4` adds exact node/client request-correlation fields |
 | `timestamp` | UTC time when the attempt completed |
 | `request_started_unix_ms` / `request_completed_unix_ms` | Exact peer-request wall-clock bounds for joining to retained fleet telemetry and reconstructing overlap |
+| `request_id` | The exact protocol request ID allocated by this client and placed on the chunk GET; the serving node records the same value; `null` for chunk-level records |
+| `local_peer_id` | This client's PeerId, matching the serving node's `source_peer`; `null` for chunk-level records |
 | `file_attempt` | Outer file/deferred-retry attempt number |
 | `chunk_index` / `chunk_address` | Chunk identity within the file |
 | `sweep` | Initial or internal retry sweep |
