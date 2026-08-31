@@ -2017,16 +2017,15 @@ impl BrowserNetworkClient {
                     let (_, already_stored) = client
                         .put_chunk(&record.address, &record.content, quote, &transaction_hash)
                         .await?;
-                    progress.report(&format!(
-                        "{} {} on {}",
-                        if already_stored {
-                            "Confirmed"
-                        } else {
-                            "Stored"
-                        },
-                        record.address,
-                        target.peer_id
-                    ));
+                    if already_stored {
+                        progress.report(&format!(
+                            "Already stored on {}: {}",
+                            target.peer_id, record.address
+                        ));
+                    } else {
+                        progress
+                            .report(&format!("Stored {} on {}", record.address, target.peer_id));
+                    }
                     Ok::<(), String>(())
                 }
             },
