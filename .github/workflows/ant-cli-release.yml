@@ -314,8 +314,30 @@ jobs:
         id: changelog
         shell: bash
         run: |
-          # Extract the latest changelog section (between first two ## headers)
-          changelog=$(awk '/^## \[/{if(found) exit; found=1; next} found' CHANGELOG.md)
+          # Extract the changelog section for the version being released — NOT
+          # "the first section". Blindly taking the first section shipped the
+          # ever-growing `[Unreleased]` blob as the notes of every release from
+          # 0.2.x through 0.3.4 (0.3.4's notes were byte-identical to 0.3.3's;
+          # the dual-stack entry re-shipped for four months). See V2-1107.
+          #
+          # `-rc.N` / `-beta.N` builds share the base version's section: the
+          # section is created when the train cuts rc.1 (rotate `[Unreleased]`
+          # into `[X.Y.Z] - <date>` as part of the cut), so every prerelease
+          # and the final stable of one train ship the same, correct, notes.
+          version="${{ steps.meta.outputs.version }}"
+          base_version="${version%%-*}"
+          changelog=$(awk -v ver="$base_version" '
+            BEGIN { gsub(/\./, "\\.", ver); pat = "^## \\[" ver "\\]" }
+            $0 ~ pat { found = 1; next }
+            /^## \[/ { if (found) exit }
+            found' CHANGELOG.md)
+          if [ -z "$(echo "$changelog" | tr -d '[:space:]')" ]; then
+            echo "ERROR: CHANGELOG.md has no non-empty '## [${base_version}]' section." >&2
+            echo "Every release ships its own notes: rotate '## [Unreleased]' into" >&2
+            echo "'## [${base_version}] - $(date -u +%F)' as part of the cut (V2-1107)." >&2
+            echo "Refusing to publish a release with missing or stale notes." >&2
+            exit 1
+          fi
           # Write to file for the release body
           echo "$changelog" > /tmp/changelog_entry.md
 
