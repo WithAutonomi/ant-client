@@ -20,7 +20,7 @@ use ant_protocol::payment::{
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{compute_address, XorName, CLOSE_GROUP_SIZE, DATA_TYPE_CHUNK};
 use bytes::Bytes;
-use futures::stream::{self, FuturesUnordered, StreamExt};
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -785,8 +785,8 @@ impl Client {
         // See PERF-RESULTS.md — measured ~30% slowdown when
         // cap > batch size on quoting workloads (live mainnet).
         let quote_concurrency = quote_limiter.current().min(chunk_count.max(1));
-        let mut quote_stream = stream::iter(chunks_with_addr)
-            .map(|(content, address)| {
+        let mut quote_stream = crate::client_engine::bounded_unordered(
+            chunks_with_addr.into_iter().map(|(content, address)| {
                 let limiter = quote_limiter.clone();
                 async move {
                     let result = observe_op(
@@ -797,8 +797,9 @@ impl Client {
                     .await;
                     (address, result)
                 }
-            })
-            .buffer_unordered(quote_concurrency);
+            }),
+            quote_concurrency,
+        );
 
         let mut prepared = Vec::with_capacity(chunk_count);
         let mut already_stored = Vec::new();

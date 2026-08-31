@@ -29,7 +29,7 @@ use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{compute_address, XorName as ChunkAddress, DATA_TYPE_CHUNK};
 use bytes::Bytes;
 use fs2::FileExt;
-use futures::stream::{self, StreamExt};
+use futures::stream::StreamExt;
 use self_encryption::{
     get_root_data_map_parallel, stream_decrypt_batch_size, stream_encrypt,
     streaming_decrypt_with_batch_size, DataMap,
@@ -1687,8 +1687,8 @@ impl Client {
         // a progress bar through the slow quote phase.
         let quote_limiter = self.controller().quote.clone();
         let quote_concurrency = quote_limiter.current().min(chunk_count.max(1));
-        let mut quote_stream = stream::iter(chunks_with_addr)
-            .map(|(content, address)| {
+        let mut quote_stream = crate::client_engine::bounded_unordered(
+            chunks_with_addr.into_iter().map(|(content, address)| {
                 let limiter = quote_limiter.clone();
                 async move {
                     let result = observe_op(
@@ -1699,8 +1699,9 @@ impl Client {
                     .await;
                     (address, result)
                 }
-            })
-            .buffer_unordered(quote_concurrency);
+            }),
+            quote_concurrency,
+        );
 
         let mut prepared_chunks = Vec::with_capacity(chunk_count);
         let mut already_stored = Vec::new();

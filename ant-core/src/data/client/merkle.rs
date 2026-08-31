@@ -26,7 +26,7 @@ use ant_protocol::{
     MerkleCandidateQuoteRequest, MerkleCandidateQuoteResponse,
 };
 use bytes::Bytes;
-use futures::stream::{self, FuturesUnordered, StreamExt};
+use futures::stream::{FuturesUnordered, StreamExt};
 use rand::Rng;
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -545,23 +545,27 @@ impl Client {
 
         let quote_limiter = self.controller().quote.clone();
         let quote_concurrency = quote_limiter.current().min(total_chunks.max(1));
-        let mut check_stream = stream::iter(chunks.into_iter().enumerate())
-            .map(|(index, (address, data_size))| {
-                let limiter = quote_limiter.clone();
-                async move {
-                    let result = observe_op(
-                        &limiter,
-                        || async move {
-                            self.chunk_already_stored_for_merkle(&address, data_type, data_size)
-                                .await
-                        },
-                        classify_error,
-                    )
-                    .await;
-                    (index, address, data_size, result)
-                }
-            })
-            .buffer_unordered(quote_concurrency);
+        let mut check_stream = crate::client_engine::bounded_unordered(
+            chunks
+                .into_iter()
+                .enumerate()
+                .map(|(index, (address, data_size))| {
+                    let limiter = quote_limiter.clone();
+                    async move {
+                        let result = observe_op(
+                            &limiter,
+                            || async move {
+                                self.chunk_already_stored_for_merkle(&address, data_type, data_size)
+                                    .await
+                            },
+                            classify_error,
+                        )
+                        .await;
+                        (index, address, data_size, result)
+                    }
+                }),
+            quote_concurrency,
+        );
 
         let mut already_stored: Vec<(usize, [u8; 32])> = Vec::new();
         let mut to_upload: Vec<(usize, [u8; 32], u64)> = Vec::new();
