@@ -16,6 +16,7 @@ use super::protocol::{
 use crate::client_engine::adaptive::{
     observe_op, AdaptiveConfig, AdaptiveController, ChannelStart, Outcome,
 };
+use ant_protocol::web_rtc::transfer_timeout;
 use ant_protocol::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
 use futures_channel::{mpsc, oneshot};
 use futures_util::{
@@ -455,26 +456,43 @@ impl BrowserNodeClientCore {
         self.next_request_id.set(request_id.wrapping_add(1).max(1));
         let frame = encode_request_frame(request_id, request_type, fields, content)
             .map_err(|error| error.to_string())?;
-        let channel = self
-            .connection
-            .borrow()
-            .as_ref()
-            .map(|connection| connection.data_channel.clone())
-            .ok_or_else(|| "WebRTC DataChannel is not connected".to_string())?;
-        for message in frame.chunks(WEBRTC_WRITE_CHUNK_BYTES) {
-            wait_for_capacity(&channel).await?;
-            channel
-                .send_with_u8_array(message)
-                .map_err(js_error_message)?;
+        let transfer_timeout_ms = transfer_timeout_ms(frame.len());
+        let channel = {
+            let connection = self.connection.borrow();
+            connection
+                .as_ref()
+                .map(|connection| connection.data_channel.clone())
+        };
+        let Some(channel) = channel else {
+            self.close();
+            return Err("WebRTC DataChannel is not connected".to_string());
+        };
+        let send_deadline_ms = js_sys::Date::now() + f64::from(transfer_timeout_ms);
+        let send_result = async {
+            for message in frame.chunks(WEBRTC_WRITE_CHUNK_BYTES) {
+                wait_for_capacity(&channel, remaining_timeout_ms(send_deadline_ms)).await?;
+                channel
+                    .send_with_u8_array(message)
+                    .map_err(js_error_message)?;
+            }
+            Ok::<(), String>(())
         }
-        let receiver = self
-            .connection
-            .borrow()
-            .as_ref()
-            .map(|connection| Rc::clone(&connection.inbox))
-            .ok_or_else(|| "WebRTC response inbox is unavailable".to_string())?;
-        let response = timeout(read_response(receiver), "WebRTC request timed out").await;
-        let response = match response {
+        .await;
+        if let Err(error) = send_result {
+            self.close();
+            return Err(error);
+        }
+        let receiver = {
+            let connection = self.connection.borrow();
+            connection
+                .as_ref()
+                .map(|connection| Rc::clone(&connection.inbox))
+        };
+        let Some(receiver) = receiver else {
+            self.close();
+            return Err("WebRTC response inbox is unavailable".to_string());
+        };
+        let response = match read_response(receiver, transfer_timeout_ms).await {
             Ok(response) => response,
             Err(error) => {
                 self.close();
@@ -490,12 +508,18 @@ impl BrowserNodeClientCore {
             return Err(error);
         }
         if response.header.get("status").and_then(Value::as_str) == Some("error") {
-            return Err(response
+            let authentication_required = response.header.get("code").and_then(Value::as_str)
+                == Some("authentication_required");
+            let error = response
                 .header
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("node returned an error")
-                .to_string());
+                .to_string();
+            if authentication_required {
+                self.close();
+            }
+            return Err(error);
         }
         Ok(response)
     }
@@ -514,10 +538,20 @@ impl BrowserNodeClientCore {
         let mut fields = Map::new();
         fields.insert("challenge".to_string(), Value::from(hex::encode(challenge)));
         let response = self.request("hello", fields, &[]).await?;
-        let hello: BrowserHello = serde_json::from_value(response.header)
-            .map_err(|error| format!("invalid HELLO response: {error}"))?;
-        let peer_id = verify_hello_identity(&hello, &self.endpoint, &challenge)
-            .map_err(|error| error.to_string())?;
+        let hello: BrowserHello = match serde_json::from_value(response.header) {
+            Ok(hello) => hello,
+            Err(error) => {
+                self.close();
+                return Err(format!("invalid HELLO response: {error}"));
+            }
+        };
+        let peer_id = match verify_hello_identity(&hello, &self.endpoint, &challenge) {
+            Ok(peer_id) => peer_id,
+            Err(error) => {
+                self.close();
+                return Err(error.to_string());
+            }
+        };
         self.peer_id.replace(Some(peer_id));
         self.hello.replace(Some(hello.clone()));
         Ok(hello)
@@ -1038,6 +1072,26 @@ struct PreparedRecord {
     already_stored: bool,
     targets: Vec<StoreTarget>,
     verified: Option<VerifiedStorageQuote>,
+}
+
+struct PendingStoreRecord<'a> {
+    index: usize,
+    record: &'a PreparedRecord,
+    successful_peers: HashSet<String>,
+}
+
+struct StoreAttemptError {
+    successful_peers: HashSet<String>,
+    message: String,
+}
+
+impl StoreAttemptError {
+    fn new(successful_peers: HashSet<String>, message: impl Into<String>) -> Self {
+        Self {
+            successful_peers,
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1815,7 +1869,15 @@ impl BrowserNetworkClient {
             .max()
             .unwrap_or(0);
         let byte_bound = crate::client_engine::store_byte_bound(max_record_bytes);
-        let mut to_retry = prepared.iter().enumerate().collect::<Vec<_>>();
+        let mut to_retry = prepared
+            .iter()
+            .enumerate()
+            .map(|(index, record)| PendingStoreRecord {
+                index,
+                record,
+                successful_peers: HashSet::new(),
+            })
+            .collect::<Vec<_>>();
         let mut replicas = usize::MAX;
 
         for attempt in 0..=crate::client_engine::STORE_MAX_RETRIES {
@@ -1833,7 +1895,12 @@ impl BrowserNetworkClient {
             let cap_limiter = op_limiter.clone();
             let results = crate::client_engine::rolling_unordered(
                 to_retry,
-                |(index, record)| {
+                |pending| {
+                    let PendingStoreRecord {
+                        index,
+                        record,
+                        successful_peers,
+                    } = pending;
                     let limiter = op_limiter.clone();
                     async move {
                         progress.report(&format!(
@@ -1851,9 +1918,10 @@ impl BrowserNetworkClient {
                                     payment_network,
                                     transaction_hash,
                                     progress,
+                                    successful_peers,
                                 )
                             },
-                            |error| classify_browser_store_error(error),
+                            |error| classify_browser_store_error(&error.message),
                         )
                         .await;
                         ((index, record), result)
@@ -1867,7 +1935,14 @@ impl BrowserNetworkClient {
             for ((index, record), result) in results {
                 match result {
                     Ok(stored) => replicas = replicas.min(stored),
-                    Err(error) => failed.push((index, record, error)),
+                    Err(error) => failed.push((
+                        PendingStoreRecord {
+                            index,
+                            record,
+                            successful_peers: error.successful_peers,
+                        },
+                        error.message,
+                    )),
                 }
             }
             if failed.is_empty() {
@@ -1877,8 +1952,8 @@ impl BrowserNetworkClient {
                 let failed_count = failed.len();
                 let details = failed
                     .into_iter()
-                    .map(|(index, _, error)| {
-                        format!("record {}/{}: {error}", index + 1, record_count)
+                    .map(|(pending, error)| {
+                        format!("record {}/{}: {error}", pending.index + 1, record_count)
                     })
                     .collect::<Vec<_>>()
                     .join("; ");
@@ -1888,10 +1963,7 @@ impl BrowserNetworkClient {
                     crate::client_engine::STORE_MAX_RETRIES + 1
                 ));
             }
-            to_retry = failed
-                .into_iter()
-                .map(|(index, record, _)| (index, record))
-                .collect();
+            to_retry = failed.into_iter().map(|(pending, _)| pending).collect();
         }
 
         Err("record store retry loop ended unexpectedly".to_string())
@@ -1905,20 +1977,32 @@ impl BrowserNetworkClient {
         payment_network: &BrowserPaymentNetwork,
         transaction_hash: Option<&str>,
         progress: &ProgressReporter,
-    ) -> Result<usize, String> {
+        mut successful_peers: HashSet<String>,
+    ) -> Result<usize, StoreAttemptError> {
         if prepared.already_stored {
             return Ok(1);
         }
-        let transaction_hash = transaction_hash
-            .ok_or_else(|| "paid record has no transaction hash".to_string())?
-            .to_string();
-        let verified = prepared
-            .verified
-            .as_ref()
-            .ok_or_else(|| "paid record has no verified quote".to_string())?;
+        let Some(transaction_hash) = transaction_hash else {
+            return Err(StoreAttemptError::new(
+                successful_peers,
+                "paid record has no transaction hash",
+            ));
+        };
+        let transaction_hash = transaction_hash.to_string();
+        let Some(verified) = prepared.verified.as_ref() else {
+            return Err(StoreAttemptError::new(
+                successful_peers,
+                "paid record has no verified quote",
+            ));
+        };
+        let required = CLOSE_GROUP_MAJORITY.saturating_sub(successful_peers.len());
         let outcome = crate::client_engine::quorum_with_fallback(
-            prepared.targets.iter().cloned(),
-            CLOSE_GROUP_MAJORITY,
+            prepared
+                .targets
+                .iter()
+                .filter(|target| !successful_peers.contains(&target.peer_id))
+                .cloned(),
+            required,
             |target| {
                 let pool = Rc::clone(&self.inner.pool);
                 let record = prepared.record.clone();
@@ -1948,6 +2032,10 @@ impl BrowserNetworkClient {
             },
         )
         .await;
+        debug_assert_eq!(outcome.successes, outcome.successful_targets.len());
+        for target in outcome.successful_targets {
+            successful_peers.insert(target.peer_id);
+        }
         let failures = outcome
             .failures
             .into_iter()
@@ -1956,14 +2044,18 @@ impl BrowserNetworkClient {
                 format!("{}: {error}", target.peer_id)
             })
             .collect::<Vec<_>>();
-        if !outcome.reached {
-            return Err(format!(
-                "stored on {} peers, need {CLOSE_GROUP_MAJORITY}; failures: {}",
-                outcome.successes,
-                failures.join("; ")
+        if !outcome.reached || successful_peers.len() < CLOSE_GROUP_MAJORITY {
+            let replicas = successful_peers.len();
+            return Err(StoreAttemptError::new(
+                successful_peers,
+                format!(
+                    "stored on {} peers, need {CLOSE_GROUP_MAJORITY}; failures: {}",
+                    replicas,
+                    failures.join("; ")
+                ),
             ));
         }
-        Ok(outcome.successes)
+        Ok(successful_peers.len())
     }
 }
 
@@ -2147,11 +2239,22 @@ impl BrowserNodeClient {
     }
 }
 
-async fn read_response(receiver: ResponseInbox) -> Result<BrowserResponseFrame, String> {
+async fn read_response(
+    receiver: ResponseInbox,
+    initial_timeout_ms: u32,
+) -> Result<BrowserResponseFrame, String> {
     let mut frame = Vec::with_capacity(8 * 1024);
     let mut expected_length = None;
+    let response_started_ms = js_sys::Date::now();
+    let mut response_deadline_ms = response_started_ms + f64::from(initial_timeout_ms);
     loop {
-        let next = receiver.lock().await.next().await;
+        let remaining_ms = remaining_timeout_ms(response_deadline_ms);
+        let next = timeout_with_ms(
+            async { Ok(receiver.lock().await.next().await) },
+            "WebRTC request timed out",
+            remaining_ms,
+        )
+        .await?;
         let message = next
             .ok_or_else(|| "response ended before its declared frame was complete".to_string())??;
         let next_length = frame
@@ -2166,6 +2269,10 @@ async fn read_response(receiver: ResponseInbox) -> Result<BrowserResponseFrame, 
         frame.extend_from_slice(&message);
         if expected_length.is_none() {
             expected_length = response_frame_length(&frame).map_err(|error| error.to_string())?;
+            if let Some(expected) = expected_length {
+                response_deadline_ms = response_deadline_ms
+                    .max(response_started_ms + f64::from(transfer_timeout_ms(expected)));
+            }
         }
         if let Some(expected) = expected_length {
             if frame.len() > expected {
@@ -2178,7 +2285,10 @@ async fn read_response(receiver: ResponseInbox) -> Result<BrowserResponseFrame, 
     }
 }
 
-async fn wait_for_capacity(channel: &RtcDataChannel) -> Result<(), String> {
+async fn wait_for_capacity(channel: &RtcDataChannel, timeout_ms: u32) -> Result<(), String> {
+    if channel.ready_state() != RtcDataChannelState::Open {
+        return Err("WebRTC DataChannel closed while draining".to_string());
+    }
     if channel.buffered_amount() <= MAX_BUFFERED_AMOUNT {
         return Ok(());
     }
@@ -2192,13 +2302,22 @@ async fn wait_for_capacity(channel: &RtcDataChannel) -> Result<(), String> {
         }
     });
     channel.set_onbufferedamountlow(Some(on_ready.as_ref().unchecked_ref()));
-    let result = timeout(
+    // The buffer can cross the threshold between the first check and callback
+    // installation. Re-check after installing it so that race cannot turn a
+    // completed drain into a full transfer-timeout wait.
+    if channel.buffered_amount() <= MAX_BUFFERED_AMOUNT {
+        if let Some(sender) = sender.borrow_mut().take() {
+            let _ = sender.send(());
+        }
+    }
+    let result = timeout_with_ms(
         async move {
             receiver
                 .await
                 .map_err(|_| "WebRTC DataChannel closed while draining".to_string())
         },
         "WebRTC DataChannel drain timed out",
+        timeout_ms,
     )
     .await;
     channel.set_onbufferedamountlow(None);
@@ -2210,11 +2329,37 @@ async fn timeout<T, F>(future: F, message: &'static str) -> Result<T, String>
 where
     F: Future<Output = Result<T, String>>,
 {
+    timeout_with_ms(future, message, REQUEST_TIMEOUT_MS).await
+}
+
+async fn timeout_with_ms<T, F>(
+    future: F,
+    message: &'static str,
+    timeout_ms: u32,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
     let operation = Box::pin(future);
-    let timer = Box::pin(TimeoutFuture::new(REQUEST_TIMEOUT_MS));
+    let timer = Box::pin(TimeoutFuture::new(timeout_ms));
     match select(operation, timer).await {
         Either::Left((result, _)) => result,
         Either::Right(((), _)) => Err(message.to_string()),
+    }
+}
+
+fn transfer_timeout_ms(content_bytes: usize) -> u32 {
+    u32::try_from(transfer_timeout(content_bytes).as_millis()).unwrap_or(u32::MAX)
+}
+
+fn remaining_timeout_ms(deadline_ms: f64) -> u32 {
+    let remaining_ms = (deadline_ms - js_sys::Date::now()).ceil();
+    if !remaining_ms.is_finite() || remaining_ms <= 0.0 {
+        0
+    } else if remaining_ms >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        remaining_ms as u32
     }
 }
 

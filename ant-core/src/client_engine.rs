@@ -35,6 +35,7 @@ pub(crate) const STORE_RETRY_BASE_DELAY_MS: u64 = 500;
 #[derive(Debug)]
 pub(crate) struct QuorumOutcome<T, E> {
     pub(crate) successes: usize,
+    pub(crate) successful_targets: Vec<T>,
     pub(crate) failures: Vec<(T, E)>,
     pub(crate) reached: bool,
 }
@@ -58,6 +59,7 @@ where
     if required == 0 {
         return QuorumOutcome {
             successes: 0,
+            successful_targets: Vec::new(),
             failures: Vec::new(),
             reached: true,
         };
@@ -74,14 +76,17 @@ where
     }
 
     let mut successes = 0usize;
+    let mut successful_targets = Vec::with_capacity(required);
     let mut failures = Vec::new();
     while let Some((target, result)) = in_flight.next().await {
         match result {
             Ok(_) => {
                 successes += 1;
+                successful_targets.push(target);
                 if successes >= required {
                     return QuorumOutcome {
                         successes,
+                        successful_targets,
                         failures,
                         reached: true,
                     };
@@ -98,6 +103,7 @@ where
 
     QuorumOutcome {
         successes,
+        successful_targets,
         failures,
         reached: false,
     }
@@ -308,6 +314,9 @@ mod tests {
 
         assert!(outcome.reached);
         assert_eq!(outcome.successes, 4);
+        let mut successful_targets = outcome.successful_targets;
+        successful_targets.sort_unstable();
+        assert_eq!(successful_targets, vec![0, 1, 2, 3]);
         assert!(outcome.failures.is_empty());
         assert_eq!(launched.get(), 4);
     }
@@ -328,6 +337,9 @@ mod tests {
 
         assert!(outcome.reached);
         assert_eq!(outcome.successes, 4);
+        let mut successful_targets = outcome.successful_targets;
+        successful_targets.sort_unstable();
+        assert_eq!(successful_targets, vec![2, 3, 4, 5]);
         assert_eq!(outcome.failures.len(), 2);
         assert_eq!(launched.get(), 6);
     }
@@ -343,7 +355,25 @@ mod tests {
 
         assert!(!outcome.reached);
         assert_eq!(outcome.successes, 0);
+        assert!(outcome.successful_targets.is_empty());
         assert_eq!(outcome.failures.len(), 7);
+    }
+
+    #[test]
+    fn quorum_reports_partial_success_targets_when_exhausted() {
+        let outcome = futures::executor::block_on(async {
+            quorum_with_fallback(0_u8..7, 4, |target| {
+                futures_util::future::ready(if target < 3 { Ok(()) } else { Err(target) })
+            })
+            .await
+        });
+
+        assert!(!outcome.reached);
+        assert_eq!(outcome.successes, 3);
+        let mut successful_targets = outcome.successful_targets;
+        successful_targets.sort_unstable();
+        assert_eq!(successful_targets, vec![0, 1, 2]);
+        assert_eq!(outcome.failures.len(), 4);
     }
 
     #[test]
