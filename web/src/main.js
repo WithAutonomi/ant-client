@@ -280,7 +280,6 @@ elements.uploadFile.addEventListener("click", async () => {
   elements.uploadResult.hidden = true;
   elements.uploadFile.disabled = true;
   let walletSecret = elements.walletSecret.value.trim();
-  elements.walletSecret.value = "";
   try {
     if (!browserManifest)
       throw new Error("Load the browser testnet manifest first");
