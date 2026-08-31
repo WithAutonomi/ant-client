@@ -8,7 +8,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::time::Duration;
 #[cfg(any(feature = "browser-wasm", test))]
-use std::time::Instant;
+use web_time::Instant;
 
 #[cfg_attr(
     all(feature = "browser-wasm", not(feature = "native")),
