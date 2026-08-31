@@ -3,6 +3,9 @@ pub mod channel;
 /// Cross-platform Autonomi client logic and browser WASM bindings.
 pub mod browser;
 
+#[cfg(any(feature = "native", feature = "browser-wasm"))]
+mod client_engine;
+
 #[cfg(feature = "native")]
 pub mod config;
 #[cfg(feature = "native")]

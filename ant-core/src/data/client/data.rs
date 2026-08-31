@@ -310,8 +310,8 @@ impl Client {
         let quote_limiter = self.controller().quote.clone();
         let quote_concurrency = quote_limiter.current().min(chunk_count.max(1));
         let results: Vec<([u8; 32], Result<Option<PreparedChunk>>)> =
-            futures::stream::iter(chunks_with_addr)
-                .map(|(content, address)| {
+            crate::client_engine::bounded_unordered(
+                chunks_with_addr.into_iter().map(|(content, address)| {
                     let limiter = quote_limiter.clone();
                     async move {
                         let result = observe_op(
@@ -322,10 +322,11 @@ impl Client {
                         .await;
                         (address, result)
                     }
-                })
-                .buffer_unordered(quote_concurrency)
-                .collect()
-                .await;
+                }),
+                quote_concurrency,
+            )
+            .collect()
+            .await;
 
         let mut prepared_chunks = Vec::with_capacity(results.len());
         let mut already_stored_addresses = Vec::new();

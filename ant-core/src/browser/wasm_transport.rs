@@ -17,13 +17,13 @@ use futures_channel::{mpsc, oneshot};
 use futures_util::{
     future::{join_all, select, Either},
     lock::Mutex,
-    stream::{self, StreamExt as _},
+    stream::{self, FuturesUnordered, StreamExt as _},
 };
 use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, ArrayBuffer, Promise, Uint8Array};
 use saorsa_dht_lookup::{
-    run_iterative_lookup, IterativeLookup, LookupConfig, LookupKey, LookupNode, LookupQuery,
-    LookupQueryOutcome,
+    collect_after_first_with_grace, run_iterative_lookup, xor_distance, IterativeLookup,
+    LookupConfig, LookupKey, LookupNode, LookupQuery, LookupQueryOutcome,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -32,6 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Deref;
 use std::rc::Rc;
+use std::time::Duration;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -43,10 +44,16 @@ const REQUEST_TIMEOUT_MS: u32 = 10_000;
 const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 const ICE_CREDENTIAL_PREFIX: &str = "saorsa+webrtc+v1/";
 const ICE_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-const DEFAULT_MAX_POOLED_CLIENTS: usize = 10;
+const DEFAULT_MAX_POOLED_CLIENTS: usize = 32;
 const DEFAULT_LOOKUP_K: usize = 20;
 const DEFAULT_LOOKUP_ALPHA: usize = 3;
 const DEFAULT_MAX_LOOKUP_ITERATIONS: usize = 20;
+const LOOKUP_GRACE_TIMEOUT_MS: u32 = 5_000;
+const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+const MAX_BROWSER_ROUTING_ENTRIES: usize = 256;
+const MAX_BROWSER_ENDPOINT_FAILURES: usize = 256;
+const DEFAULT_BROWSER_QUOTE_CONCURRENCY: usize = 4;
+const DEFAULT_BROWSER_STORE_CONCURRENCY: usize = 4;
 const MAX_STORE_TARGETS: usize = 7;
 const MAX_DOWNLOAD_CONCURRENCY: usize = 6;
 const MAX_BROWSER_RANGE_BYTES: usize = 4 * 1024 * 1024;
@@ -473,10 +480,12 @@ impl BrowserNodeClientCore {
             }
         };
         if response.header.get("request_id").and_then(Value::as_u64) != Some(request_id) {
-            return Err(format!(
+            let error = format!(
                 "response ID {} does not match request {request_id}",
                 response.header.get("request_id").unwrap_or(&Value::Null)
-            ));
+            );
+            self.close();
+            return Err(error);
         }
         if response.header.get("status").and_then(Value::as_str) == Some("error") {
             return Err(response
@@ -634,6 +643,8 @@ impl BrowserNodeClientCore {
 struct BrowserNetworkCore {
     seeds: Vec<BrowserEndpoint>,
     pool: Rc<BrowserClientPool>,
+    routing: Rc<RefCell<HashMap<LookupKey, BrowserLookupCandidate>>>,
+    failed_endpoints: Rc<RefCell<crate::client_engine::EndpointFailureCache<LookupKey>>>,
 }
 
 impl BrowserNetworkCore {
@@ -654,6 +665,13 @@ impl BrowserNetworkCore {
         Ok(Self {
             seeds,
             pool: Rc::new(BrowserClientPool::new(DEFAULT_MAX_POOLED_CLIENTS)?),
+            routing: Rc::new(RefCell::new(HashMap::new())),
+            failed_endpoints: Rc::new(RefCell::new(
+                crate::client_engine::EndpointFailureCache::new(
+                    ENDPOINT_FAILURE_COOLDOWN,
+                    MAX_BROWSER_ENDPOINT_FAILURES,
+                ),
+            )),
         })
     }
 
@@ -695,12 +713,15 @@ impl BrowserNetworkCore {
                 }
             }
         });
-        let seed_candidates = join_all(seed_futures)
-            .await
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        if seed_candidates.is_empty() {
+        let mut initial_candidates = self.routing.borrow().values().cloned().collect::<Vec<_>>();
+        if initial_candidates.is_empty() {
+            initial_candidates = join_all(seed_futures)
+                .await
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+        }
+        if initial_candidates.is_empty() {
             let detail = failures
                 .borrow()
                 .iter()
@@ -720,10 +741,24 @@ impl BrowserNetworkCore {
         };
         let mut lookup =
             IterativeLookup::new(target_key, config).map_err(|error| error.to_string())?;
-        let mut known_endpoints = HashMap::new();
-        for candidate in seed_candidates {
+        let mut known_endpoints = self
+            .routing
+            .borrow()
+            .iter()
+            .filter_map(|(peer, candidate)| {
+                candidate
+                    .wire
+                    .webrtc_direct
+                    .clone()
+                    .map(|endpoint| (*peer, endpoint))
+            })
+            .collect::<HashMap<_, _>>();
+        for candidate in initial_candidates {
             if let Some(endpoint) = candidate.wire.webrtc_direct.clone() {
                 known_endpoints.insert(candidate.peer_id, endpoint);
+                self.routing
+                    .borrow_mut()
+                    .insert(candidate.peer_id, candidate.clone());
                 let _ = lookup.add_candidate(candidate);
             }
         }
@@ -732,10 +767,21 @@ impl BrowserNetworkCore {
             progress: progress.clone(),
             failures: Rc::clone(&failures),
             known_endpoints,
+            routing: Rc::clone(&self.routing),
+            failed_endpoints: Rc::clone(&self.failed_endpoints),
         };
         run_iterative_lookup(&mut lookup, &mut query)
             .await
             .map_err(|error| error.to_string())?;
+        let mut routes = self.routing.borrow_mut();
+        if routes.len() > MAX_BROWSER_ROUTING_ENTRIES {
+            let mut peers = routes.keys().copied().collect::<Vec<_>>();
+            peers.sort_by_key(|peer| xor_distance(peer, &target_key));
+            for peer in peers.into_iter().skip(MAX_BROWSER_ROUTING_ENTRIES) {
+                routes.remove(&peer);
+            }
+        }
+        drop(routes);
         let nodes = lookup
             .results()
             .into_iter()
@@ -765,9 +811,7 @@ impl BrowserNetworkCore {
             progress.report(&format!("Requesting {address} from {}", node.peer_id));
             let result = async {
                 let client = self.pool.client(endpoint).await?;
-                if client.peer_id().is_none() {
-                    client.hello().await?;
-                }
+                client.hello().await?;
                 client.get_chunk(&address).await
             }
             .await;
@@ -798,10 +842,25 @@ struct BrowserNetworkLookupQuery {
     progress: ProgressReporter,
     failures: Rc<RefCell<Vec<BrowserLookupFailure>>>,
     known_endpoints: HashMap<LookupKey, BrowserEndpoint>,
+    routing: Rc<RefCell<HashMap<LookupKey, BrowserLookupCandidate>>>,
+    failed_endpoints: Rc<RefCell<crate::client_engine::EndpointFailureCache<LookupKey>>>,
 }
 
 impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
     type Error = String;
+
+    async fn is_candidate_eligible(
+        &mut self,
+        candidate: &BrowserLookupCandidate,
+    ) -> Result<bool, Self::Error> {
+        let Some(endpoint) = candidate.wire.webrtc_direct.as_ref() else {
+            return Ok(false);
+        };
+        Ok(!self
+            .failed_endpoints
+            .borrow_mut()
+            .is_suppressed(&candidate.peer_id, &endpoint.multiaddr))
+    }
 
     async fn query_batch(
         &mut self,
@@ -811,60 +870,103 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
         batch: Vec<BrowserLookupCandidate>,
     ) -> Result<Vec<LookupQueryOutcome<BrowserLookupCandidate>>, Self::Error> {
         let target = hex::encode(target);
-        let futures = batch.into_iter().map(|candidate| {
-            let pool = Rc::clone(&self.pool);
-            let progress = self.progress.clone();
-            let failures = Rc::clone(&self.failures);
-            let target = target.clone();
-            async move {
-                let responder = candidate.peer_id;
-                let peer_id = candidate.wire.peer_id.clone();
-                let result = async {
-                    let endpoint = candidate.wire.webrtc_direct.as_ref().ok_or_else(|| {
-                        "lookup candidate has no WebRTC Direct endpoint".to_string()
-                    })?;
-                    let client = pool.client(endpoint).await?;
-                    if client.peer_id().is_none() {
+        let attempted = batch
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .wire
+                    .webrtc_direct
+                    .as_ref()
+                    .map(|endpoint| (candidate.peer_id, endpoint.multiaddr.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        let futures: FuturesUnordered<_> = batch
+            .into_iter()
+            .map(|candidate| {
+                let pool = Rc::clone(&self.pool);
+                let progress = self.progress.clone();
+                let failures = Rc::clone(&self.failures);
+                let failed_endpoints = Rc::clone(&self.failed_endpoints);
+                let target = target.clone();
+                async move {
+                    let responder = candidate.peer_id;
+                    let peer_id = candidate.wire.peer_id.clone();
+                    let failed_endpoint = candidate
+                        .wire
+                        .webrtc_direct
+                        .as_ref()
+                        .map(|endpoint| endpoint.multiaddr.clone());
+                    let result = async {
+                        let endpoint = candidate.wire.webrtc_direct.as_ref().ok_or_else(|| {
+                            "lookup candidate has no WebRTC Direct endpoint".to_string()
+                        })?;
+                        let client = pool.client(endpoint).await?;
                         client.hello().await?;
+                        client.find_node(&target, count).await
                     }
-                    client.find_node(&target, count).await
-                }
-                .await;
-                match result {
-                    Ok(nodes) => {
-                        progress.report(&format!(
-                            "Iteration {iteration}: {peer_id} returned {} nodes",
-                            nodes.len()
-                        ));
-                        let candidates = nodes
-                            .into_iter()
-                            .filter_map(|wire| match BrowserLookupCandidate::parse(wire) {
-                                Ok(candidate) => Some(candidate),
-                                Err(error) => {
-                                    progress.report(&format!(
-                                        "Ignoring invalid candidate from {peer_id}: {error}"
-                                    ));
-                                    None
-                                }
-                            })
-                            .collect();
-                        LookupQueryOutcome::Succeeded {
-                            responder,
-                            candidates,
+                    .await;
+                    match result {
+                        Ok(nodes) => {
+                            failed_endpoints.borrow_mut().record_success(&responder);
+                            progress.report(&format!(
+                                "Iteration {iteration}: {peer_id} returned {} nodes",
+                                nodes.len()
+                            ));
+                            let candidates = nodes
+                                .into_iter()
+                                .filter_map(|wire| match BrowserLookupCandidate::parse(wire) {
+                                    Ok(candidate) => Some(candidate),
+                                    Err(error) => {
+                                        progress.report(&format!(
+                                            "Ignoring invalid candidate from {peer_id}: {error}"
+                                        ));
+                                        None
+                                    }
+                                })
+                                .collect();
+                            LookupQueryOutcome::Succeeded {
+                                responder,
+                                candidates,
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(endpoint) = failed_endpoint {
+                                failed_endpoints
+                                    .borrow_mut()
+                                    .record_failure(responder, endpoint);
+                            }
+                            progress.report(&format!("Query {peer_id} failed: {error}"));
+                            failures.borrow_mut().push(BrowserLookupFailure {
+                                peer_id,
+                                message: error,
+                            });
+                            LookupQueryOutcome::Failed { responder }
                         }
                     }
-                    Err(error) => {
-                        progress.report(&format!("Query {peer_id} failed: {error}"));
-                        failures.borrow_mut().push(BrowserLookupFailure {
-                            peer_id,
-                            message: error,
-                        });
-                        LookupQueryOutcome::Failed { responder }
-                    }
                 }
+            })
+            .collect();
+        let mut outcomes =
+            collect_after_first_with_grace(futures, || TimeoutFuture::new(LOOKUP_GRACE_TIMEOUT_MS))
+                .await;
+        let responded = outcomes
+            .iter()
+            .map(|outcome| *outcome.responder())
+            .collect::<HashSet<_>>();
+        for (peer, endpoint) in attempted {
+            if !responded.contains(&peer) {
+                self.failed_endpoints
+                    .borrow_mut()
+                    .record_failure(peer, endpoint);
+                let peer_id = hex::encode(peer);
+                let message = "did not respond before the lookup grace period".to_string();
+                self.progress
+                    .report(&format!("Query {peer_id} failed: {message}"));
+                self.failures
+                    .borrow_mut()
+                    .push(BrowserLookupFailure { peer_id, message });
             }
-        });
-        let mut outcomes = join_all(futures).await;
+        }
         for outcome in &mut outcomes {
             if let LookupQueryOutcome::Succeeded { candidates, .. } = outcome {
                 candidates.retain_mut(|candidate| {
@@ -873,7 +975,14 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                     } else if let Some(endpoint) = self.known_endpoints.get(&candidate.peer_id) {
                         candidate.wire.webrtc_direct = Some(endpoint.clone());
                     }
-                    candidate.wire.webrtc_direct.is_some()
+                    if candidate.wire.webrtc_direct.is_some() {
+                        self.routing
+                            .borrow_mut()
+                            .insert(candidate.peer_id, candidate.clone());
+                        true
+                    } else {
+                        false
+                    }
                 });
             }
         }
@@ -1515,18 +1624,40 @@ impl BrowserNetworkClient {
             content.len()
         ));
         let encrypted = super::encrypt_public_file(content).map_err(|error| error.to_string())?;
+        let mut records = encrypted.records.iter().cloned().enumerate();
         let mut prepared = Vec::with_capacity(encrypted.records.len());
-        for (index, record) in encrypted.records.iter().cloned().enumerate() {
+        if let Some((index, record)) = records.next() {
             progress.report(&format!(
                 "Preparing record {}/{}",
                 index + 1,
                 encrypted.records.len()
             ));
-            prepared.push(
+            prepared.push((
+                index,
                 self.prepare_record(record, &payment_network, progress)
                     .await?,
-            );
+            ));
         }
+        let record_count = encrypted.records.len();
+        let payment_network_ref = &payment_network;
+        let remaining = records.map(|(index, record)| async move {
+            progress.report(&format!("Preparing record {}/{}", index + 1, record_count));
+            self.prepare_record(record, payment_network_ref, progress)
+                .await
+                .map(|prepared| (index, prepared))
+        });
+        let remaining =
+            crate::client_engine::bounded_unordered(remaining, DEFAULT_BROWSER_QUOTE_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+        for result in remaining {
+            prepared.push(result?);
+        }
+        prepared.sort_by_key(|(index, _)| *index);
+        let prepared = prepared
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect::<Vec<_>>();
         let verified_quotes = prepared
             .iter()
             .filter_map(|record| record.verified.clone())
@@ -1554,18 +1685,24 @@ impl BrowserNetworkClient {
             *transaction_hash = super::protocol::normalize_hex(transaction_hash, 32)?;
         }
 
+        let record_count = prepared.len();
+        let payment_network_ref = &payment_network;
+        let transaction_hash = payment.transaction_hash.as_deref();
+        let stores = prepared
+            .iter()
+            .enumerate()
+            .map(|(index, record)| async move {
+                progress.report(&format!("Storing record {}/{}", index + 1, record_count));
+                self.store_prepared(record, payment_network_ref, transaction_hash, progress)
+                    .await
+            });
+        let stores =
+            crate::client_engine::bounded_unordered(stores, DEFAULT_BROWSER_STORE_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
         let mut replicas = usize::MAX;
-        for (index, record) in prepared.iter().enumerate() {
-            progress.report(&format!("Storing record {}/{}", index + 1, prepared.len()));
-            let stored = self
-                .store_prepared(
-                    record,
-                    &payment_network,
-                    payment.transaction_hash.as_deref(),
-                    progress,
-                )
-                .await?;
-            replicas = replicas.min(stored);
+        for stored in stores {
+            replicas = replicas.min(stored?);
         }
         let descriptor = PublicFileDescriptor {
             name: name.to_string(),
