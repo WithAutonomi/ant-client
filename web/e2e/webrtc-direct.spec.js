@@ -34,7 +34,7 @@ test("bootstraps from one address, then uploads and downloads over WebRTC Direct
   page,
   request,
 }) => {
-  test.setTimeout(180_000);
+  test.setTimeout(300_000);
   const applicationErrors = [];
   page.on("console", (message) => {
     if (message.type() === "error") applicationErrors.push(message.text());
@@ -101,6 +101,17 @@ test("bootstraps from one address, then uploads and downloads over WebRTC Direct
   }
   await expect(page.locator("#upload-result-records")).toContainText("8 records");
 
+  // Start a fresh address-only client session. This models downloading a file
+  // uploaded by ant-cli or another browser, where no manifest descriptor or
+  // in-memory upload result is available.
+  const publicAddress = await page.locator("#file-address").inputValue();
+  await page.goto(`/?endpoint=${encodeURIComponent(endpoint)}`);
+  await page
+    .getByRole("button", { name: "Connect and use as bootstrap", exact: true })
+    .click();
+  await expect(page.locator("#connection-state")).toContainText("Connected");
+  await page.locator("#file-address").fill(publicAddress);
+
   await page.getByRole("button", { name: "Prepare video stream" }).click();
   await expect(page.locator("#stream-state")).toContainText("Ready", {
     timeout: 60_000,
@@ -164,6 +175,13 @@ test("bootstraps from one address, then uploads and downloads over WebRTC Direct
     throw new Error(`${error.message}\n\nBrowser protocol log:\n${protocolLog}`);
   }
   const download = await downloadStarted;
-  expect(download.suggestedFilename()).toBe("nested-datamap.bin");
+  expect(download.suggestedFilename()).toBe(
+    `public-file-${publicAddress.slice(0, 16)}.bin`,
+  );
+  expect(await download.createReadStream().then(async (stream) => {
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    return Buffer.concat(chunks);
+  })).toEqual(content);
   expect(applicationErrors).toEqual([]);
 });

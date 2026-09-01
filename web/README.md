@@ -116,11 +116,13 @@ manifest from port 25000 and fills in the default file:
    calculation, and storage while loading only active records. A narrow
    JavaScript callback uses Ethers for token approval and the wallet
    transaction; Rust verifies the callback's reported total before continuing.
-   The key field is cleared immediately and the resulting public DataMap
-   address is placed in the download field.
-5. **Download and save file** opens the browser save flow, fetches the public
+   The key remains in the form for repeat demo uploads, and the resulting
+   public DataMap address is placed in the download field.
+5. **Download and save file** accepts any public DataMap address, fetches the
    DataMap and encrypted chunks from direct closest storage nodes, reconstructs
-   the whole file, verifies BLAKE3, and retains a **Save again** link.
+   the whole file, verifies BLAKE3, opens the browser save flow, and retains a
+   **Save again** link. Manifest metadata supplies the original filename when
+   available; an address-only download uses an address-derived `.bin` name.
 6. For a browser-supported video, select **Prepare video stream** and then use
    the native video controls. A Rust `BrowserFileReader` resolves the root
    DataMap and fetches only records overlapping each requested byte range. A
@@ -139,8 +141,10 @@ http://127.0.0.1:5173/?endpoint=<URL-encoded-WebRTC-Direct-multiaddr>
 ```
 
 When `endpoint` is present, startup skips the default local-manifest fetch.
-This is sufficient for a direct connectivity test without an HTTP manifest.
-File downloads and video streams still need a trusted public-file descriptor.
+Public file downloads and byte-range streams need only the DataMap address;
+ant-core fetches the authenticated DataMap and derives its file size and chunk
+descriptors. A manifest remains useful for optional filename, MIME type, and
+whole-file hash metadata.
 Traversal to independently deployed nodes bootstraps from this one address:
 nodes propagate their WebRTC Direct multiaddresses in Saorsa's authenticated
 DHT address sets, and the browser verifies each discovered peer during HELLO.
