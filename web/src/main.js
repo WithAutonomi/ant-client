@@ -363,28 +363,22 @@ elements.downloadFile.addEventListener("click", async () => {
   elements.downloadState.textContent = "Preparing save…";
   elements.downloadFile.disabled = true;
   try {
-    const address = elements.fileAddress.value.trim().toLowerCase();
-    hexToBytes(address, 32);
+    const address = bytesToHex(hexToBytes(elements.fileAddress.value, 32));
     const published = browserManifest?.files.find(
       (file) => file.address === address,
     );
-    if (!published) {
-      throw new Error(
-        "That public file address is not described by the loaded testnet manifest",
-      );
-    }
-    const saveHandle = await chooseSaveHandle(published.name);
     elements.downloadState.textContent = "Downloading…";
-    log(
-      `Downloading complete public file ${published.name} (${published.size.toLocaleString()} bytes)`,
-    );
+    log(published
+      ? `Downloading complete public file ${published.name} (${published.size.toLocaleString()} bytes)`
+      : `Resolving and downloading public file ${address} directly from its DataMap`);
     if (!networkClient) throw new Error("Browser network client is not ready");
-    const { content, hash, dataMapNode } = await networkClient.downloadPublicFile(
-      published,
+    const { content, hash, file, dataMapNode } = await networkClient.downloadPublicFile(
+      published ?? address,
       3,
       (message) => log(message),
     );
-    const savedDirectly = await exposeSavedFile(published, content, saveHandle);
+    const saveHandle = await chooseSaveHandle(file.name);
+    const savedDirectly = await exposeSavedFile(file, content, saveHandle);
     elements.downloadState.textContent = `${
       savedDirectly ? "Saved" : "Browser download started"
     } · ${content.length.toLocaleString()} bytes`;
@@ -392,8 +386,8 @@ elements.downloadFile.addEventListener("click", async () => {
     log(
       `${
         savedDirectly ? "Saved" : "Started browser save for"
-      } whole-file BLAKE3-verified ${published.name} from direct nodes as ${hash}`,
-      { data_map_node: dataMapNode.peer_id, chunks: published.chunks.length },
+      } whole-file BLAKE3-verified ${file.name} from direct nodes as ${hash}`,
+      { data_map_node: dataMapNode.peer_id, chunks: file.chunks.length },
     );
   } catch (error) {
     elements.downloadState.textContent =
@@ -410,33 +404,33 @@ elements.streamFile.addEventListener("click", async () => {
   elements.streamState.textContent = "Opening stream…";
   elements.streamFile.disabled = true;
   try {
-    const address = elements.fileAddress.value.trim().toLowerCase();
-    hexToBytes(address, 32);
+    const address = bytesToHex(hexToBytes(elements.fileAddress.value, 32));
     const published = browserManifest?.files.find(
       (file) => file.address === address,
     );
-    if (!published) {
-      throw new Error(
-        "That public file address is not described by the loaded testnet manifest",
-      );
-    }
     if (!networkClient) throw new Error("Browser network client is not ready");
     stopVideoStream();
     await ensureVideoStreamWorker();
-    const reader = await networkClient.openPublicFile(published, (message) => {
+    const reader = await networkClient.openPublicFile(published ?? address, (message) => {
       elements.streamState.textContent = message;
       log(message);
     });
+    const resolved = published ?? {
+      address,
+      name: reader.name,
+      size: reader.size,
+      content_type: reader.contentType,
+    };
     const sessionId = bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
     videoReaders.set(sessionId, reader);
     activeVideoSession = sessionId;
-    elements.streamVideo.src = streamingUrl(sessionId, published);
+    elements.streamVideo.src = streamingUrl(sessionId, resolved);
     elements.streamVideo.hidden = false;
     elements.streamState.textContent = "Ready · press play to stream";
     elements.streamState.classList.add("connected");
-    log(`Prepared random-access video stream for ${published.name}`, {
-      size: published.size,
-      content_type: published.content_type,
+    log(`Prepared random-access video stream for ${resolved.name}`, {
+      size: resolved.size,
+      content_type: resolved.content_type,
       session_id: sessionId,
     });
   } catch (error) {

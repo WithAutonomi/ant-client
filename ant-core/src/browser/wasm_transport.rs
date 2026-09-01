@@ -1059,8 +1059,32 @@ struct BrowserDownloadResult {
     #[serde(with = "serde_bytes")]
     content: Vec<u8>,
     hash: String,
+    file: PublicFileDescriptor,
     #[serde(rename = "dataMapNode")]
     data_map_node: BrowserNode,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BrowserPublicFileInput {
+    Descriptor(PublicFileDescriptor),
+    Address(String),
+}
+
+impl BrowserPublicFileInput {
+    fn into_address_and_descriptor(self) -> (String, Option<PublicFileDescriptor>) {
+        match self {
+            Self::Descriptor(file) => (file.address.clone(), Some(file)),
+            Self::Address(address) => (address, None),
+        }
+    }
+}
+
+struct ResolvedBrowserPublicFile {
+    file: PublicFileDescriptor,
+    expected_hash: Option<String>,
+    data_map_node: BrowserNode,
+    root_data_map: self_encryption::DataMap,
 }
 
 #[derive(Clone)]
@@ -1440,7 +1464,7 @@ impl BrowserNetworkClient {
         concurrency: usize,
         on_progress: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
-        let file: PublicFileDescriptor = serde_wasm_bindgen::from_value(file)
+        let file: BrowserPublicFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let progress = ProgressReporter::from_js(on_progress);
         let result = self
@@ -1457,7 +1481,7 @@ impl BrowserNetworkClient {
         file: JsValue,
         on_progress: Option<js_sys::Function>,
     ) -> Result<BrowserFileReader, JsValue> {
-        let file: PublicFileDescriptor = serde_wasm_bindgen::from_value(file)
+        let file: BrowserPublicFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let progress = ProgressReporter::from_js(on_progress);
         self.open_public_file_inner(file, progress)
@@ -1539,32 +1563,121 @@ impl BrowserNetworkClient {
 impl BrowserNetworkClient {
     async fn open_public_file_inner(
         &self,
-        mut file: PublicFileDescriptor,
+        file: BrowserPublicFileInput,
         progress: ProgressReporter,
     ) -> Result<BrowserFileReader, String> {
-        file.address = super::protocol::normalize_hex(&file.address, 32)?;
-        file.blake3 = super::protocol::normalize_hex(&file.blake3, 32)?;
-        if file.name.is_empty() {
-            return Err("public file has no name".to_string());
-        }
-        if file.size == 0 || file.size > super::MAX_BROWSER_FILE_BYTES {
-            return Err(format!("invalid public file size {}", file.size));
-        }
+        let resolved = self.resolve_public_file(file, &progress).await?;
+        let file = resolved.file;
         progress.report(&format!(
-            "Opening {} for random-access streaming",
-            file.name
+            "Ready to stream {} ({} bytes, {} chunks)",
+            file.name,
+            file.size,
+            file.chunks.len()
         ));
-        let (encoded_data_map, _) = self
-            .inner
-            .get_chunk_from_closest(&file.address, &progress)
-            .await?;
-        if encoded_data_map.len() != file.data_map_size {
+        Ok(BrowserFileReader {
+            inner: Rc::clone(&self.inner),
+            file,
+            root_data_map: resolved.root_data_map,
+            cache: RefCell::new(BrowserRangeCache::default()),
+            progress,
+            closed: Cell::new(false),
+        })
+    }
+
+    async fn download_public_file_inner(
+        &self,
+        file: BrowserPublicFileInput,
+        concurrency: usize,
+        progress: &ProgressReporter,
+    ) -> Result<BrowserDownloadResult, String> {
+        if concurrency == 0 {
+            return Err("download concurrency must be a positive integer".to_string());
+        }
+        let concurrency = concurrency.min(MAX_DOWNLOAD_CONCURRENCY);
+        let mut resolved = self.resolve_public_file(file, progress).await?;
+        let total = resolved.file.chunks.len();
+        let downloads = stream::iter(resolved.file.chunks.iter().cloned().enumerate())
+            .map(|(position, chunk)| {
+                let inner = Rc::clone(&self.inner);
+                let progress = progress.clone();
+                async move {
+                    progress.report(&format!(
+                        "Fetching encrypted file chunk {}/{} ({})",
+                        position + 1,
+                        total,
+                        chunk.dst_hash
+                    ));
+                    inner
+                        .get_chunk_from_closest(&chunk.dst_hash, &progress)
+                        .await
+                        .map(|(content, _)| (position, content))
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        let mut encrypted_chunks = Vec::with_capacity(total);
+        for download in downloads {
+            encrypted_chunks.push(download?);
+        }
+        encrypted_chunks.sort_by_key(|(position, _)| *position);
+        let encrypted_chunks = encrypted_chunks
+            .into_iter()
+            .map(|(_, content)| content)
+            .collect::<Vec<_>>();
+        progress.report(&format!(
+            "Reconstructing {} with native ant-core WASM",
+            resolved.file.name
+        ));
+        let encrypted_chunks = encrypted_chunks
+            .into_iter()
+            .map(|content| self_encryption::EncryptedChunk {
+                content: bytes::Bytes::from(content),
+            })
+            .collect::<Vec<_>>();
+        let content = self_encryption::decrypt(&resolved.root_data_map, &encrypted_chunks)
+            .map_err(|error| format!("could not reconstruct public file: {error}"))?
+            .to_vec();
+        if content.len() != resolved.file.size {
             return Err(format!(
-                "public DataMap has {} bytes, expected {}",
-                encoded_data_map.len(),
-                file.data_map_size
+                "reconstructed file has {} bytes, expected {}",
+                content.len(),
+                resolved.file.size
             ));
         }
+        let hash = hex::encode(blake3::hash(&content).as_bytes());
+        if let Some(expected_hash) = resolved.expected_hash.as_ref() {
+            super::verify_record(expected_hash, &content).map_err(|error| error.to_string())?;
+        }
+        resolved.file.blake3 = hash.clone();
+        progress.report(&format!(
+            "Verified complete {} as {hash}",
+            resolved.file.name
+        ));
+        Ok(BrowserDownloadResult {
+            content,
+            hash,
+            file: resolved.file,
+            data_map_node: resolved.data_map_node,
+        })
+    }
+
+    async fn resolve_public_file(
+        &self,
+        file: BrowserPublicFileInput,
+        progress: &ProgressReporter,
+    ) -> Result<ResolvedBrowserPublicFile, String> {
+        let (address, descriptor) = file.into_address_and_descriptor();
+        let address = super::protocol::normalize_hex(&address, 32)?;
+        progress.report(&format!("Fetching public DataMap {address}"));
+        let (encoded_data_map, data_map_node) = self
+            .inner
+            .get_chunk_from_closest(&address, progress)
+            .await?;
+        progress.report(&format!(
+            "Verified public DataMap ({} bytes)",
+            encoded_data_map.len()
+        ));
         let published_data_map: self_encryption::DataMap = rmp_serde::from_slice(&encoded_data_map)
             .map_err(|error| format!("could not decode public DataMap: {error}"))?;
         let root_data_map = if published_data_map.is_child() {
@@ -1607,138 +1720,82 @@ impl BrowserNetworkClient {
             published_data_map
         };
 
-        let actual_chunks = super::chunk_infos(&root_data_map);
-        let mut expected_chunks = file
-            .chunks
-            .iter()
-            .map(|chunk| super::BrowserChunkInfo {
-                index: chunk.index,
-                dst_hash: chunk.dst_hash.to_ascii_lowercase(),
-                src_hash: chunk.src_hash.to_ascii_lowercase(),
-                src_size: chunk.src_size,
-            })
-            .collect::<Vec<_>>();
-        expected_chunks.sort_by_key(|chunk| chunk.index);
-        if actual_chunks != expected_chunks {
-            return Err(
-                "resolved root DataMap does not match the public file descriptor".to_string(),
-            );
+        let mut actual_chunks = super::chunk_infos(&root_data_map);
+        actual_chunks.sort_by_key(|chunk| chunk.index);
+        if actual_chunks.len() < 3 {
+            return Err("ant-core returned an invalid public DataMap".to_string());
         }
         let resolved_size = actual_chunks.iter().try_fold(0usize, |total, chunk| {
             total
                 .checked_add(chunk.src_size)
                 .ok_or_else(|| "resolved public file size overflow".to_string())
         })?;
-        if resolved_size != file.size {
-            return Err(format!(
-                "resolved public file has {resolved_size} bytes, expected {}",
-                file.size
-            ));
+        if !(self_encryption::MIN_ENCRYPTABLE_BYTES..=super::MAX_BROWSER_FILE_BYTES)
+            .contains(&resolved_size)
+        {
+            return Err(format!("invalid public file size {resolved_size}"));
         }
-        progress.report(&format!(
-            "Ready to stream {} ({} bytes, {} chunks)",
-            file.name,
-            file.size,
-            actual_chunks.len()
-        ));
-        Ok(BrowserFileReader {
-            inner: Rc::clone(&self.inner),
-            file,
-            root_data_map,
-            cache: RefCell::new(BrowserRangeCache::default()),
-            progress,
-            closed: Cell::new(false),
-        })
-    }
 
-    async fn download_public_file_inner(
-        &self,
-        file: PublicFileDescriptor,
-        concurrency: usize,
-        progress: &ProgressReporter,
-    ) -> Result<BrowserDownloadResult, String> {
-        let address = super::protocol::normalize_hex(&file.address, 32)?;
-        let expected_hash = super::protocol::normalize_hex(&file.blake3, 32)?;
-        if concurrency == 0 {
-            return Err("download concurrency must be a positive integer".to_string());
-        }
-        let concurrency = concurrency.min(MAX_DOWNLOAD_CONCURRENCY);
-        progress.report(&format!("Fetching public DataMap {address}"));
-        let (data_map, data_map_node) = self
-            .inner
-            .get_chunk_from_closest(&address, progress)
-            .await?;
-        if data_map.len() != file.data_map_size {
-            return Err(format!(
-                "public DataMap has {} bytes, expected {}",
-                data_map.len(),
-                file.data_map_size
-            ));
-        }
-        progress.report(&format!(
-            "Verified public DataMap ({} bytes)",
-            data_map.len()
-        ));
-        let mut chunks =
-            super::decode_public_data_map(&data_map).map_err(|error| error.to_string())?;
-        chunks.extend(file.chunks.iter().cloned());
-        let mut seen = HashSet::new();
-        chunks.retain(|chunk| seen.insert(chunk.dst_hash.clone()));
-        if chunks.len() < 3 {
-            return Err("ant-core returned an invalid public DataMap".to_string());
-        }
-        let total = chunks.len();
-        let downloads = stream::iter(chunks.into_iter().enumerate())
-            .map(|(position, chunk)| {
-                let inner = Rc::clone(&self.inner);
-                let progress = progress.clone();
-                async move {
-                    progress.report(&format!(
-                        "Fetching encrypted file chunk {}/{} ({})",
-                        position + 1,
-                        total,
-                        chunk.dst_hash
-                    ));
-                    inner
-                        .get_chunk_from_closest(&chunk.dst_hash, &progress)
-                        .await
-                        .map(|(content, _)| (position, content))
-                }
-            })
-            .buffer_unordered(concurrency)
-            .collect::<Vec<_>>()
-            .await;
-        let mut encrypted_chunks = Vec::with_capacity(total);
-        for download in downloads {
-            encrypted_chunks.push(download?);
-        }
-        encrypted_chunks.sort_by_key(|(position, _)| *position);
-        let encrypted_chunks = encrypted_chunks
-            .into_iter()
-            .map(|(_, content)| content)
-            .collect::<Vec<_>>();
-        progress.report(&format!(
-            "Reconstructing {} with native ant-core WASM",
-            file.name
-        ));
-        let content = super::decrypt_public_file(&data_map, &encrypted_chunks)
-            .map_err(|error| error.to_string())?;
-        if content.len() != file.size {
-            return Err(format!(
-                "reconstructed file has {} bytes, expected {}",
-                content.len(),
-                file.size
-            ));
-        }
-        super::verify_record(&expected_hash, &content).map_err(|error| error.to_string())?;
-        progress.report(&format!(
-            "Verified complete {} as {expected_hash}",
-            file.name
-        ));
-        Ok(BrowserDownloadResult {
-            content,
-            hash: expected_hash,
+        let (file, expected_hash) = if let Some(mut file) = descriptor {
+            file.address = super::protocol::normalize_hex(&file.address, 32)?;
+            file.blake3 = super::protocol::normalize_hex(&file.blake3, 32)?;
+            if file.name.is_empty() {
+                return Err("public file has no name".to_string());
+            }
+            if file.data_map_size != encoded_data_map.len() {
+                return Err(format!(
+                    "public DataMap has {} bytes, expected {}",
+                    encoded_data_map.len(),
+                    file.data_map_size
+                ));
+            }
+            let mut expected_chunks = file
+                .chunks
+                .iter()
+                .map(|chunk| super::BrowserChunkInfo {
+                    index: chunk.index,
+                    dst_hash: chunk.dst_hash.to_ascii_lowercase(),
+                    src_hash: chunk.src_hash.to_ascii_lowercase(),
+                    src_size: chunk.src_size,
+                })
+                .collect::<Vec<_>>();
+            expected_chunks.sort_by_key(|chunk| chunk.index);
+            if actual_chunks != expected_chunks {
+                return Err(
+                    "resolved root DataMap does not match the public file descriptor".to_string(),
+                );
+            }
+            if resolved_size != file.size {
+                return Err(format!(
+                    "resolved public file has {resolved_size} bytes, expected {}",
+                    file.size
+                ));
+            }
+            file.content_type = normalized_content_type(&file.content_type);
+            file.chunks = actual_chunks;
+            let expected_hash = file.blake3.clone();
+            (file, Some(expected_hash))
+        } else {
+            (
+                PublicFileDescriptor {
+                    name: fallback_public_file_name(&address),
+                    address,
+                    size: resolved_size,
+                    content_type: "application/octet-stream".to_string(),
+                    blake3: String::new(),
+                    data_map_size: encoded_data_map.len(),
+                    chunks: actual_chunks,
+                    replicas: 0,
+                },
+                None,
+            )
+        };
+
+        Ok(ResolvedBrowserPublicFile {
+            file,
+            expected_hash,
             data_map_node,
+            root_data_map,
         })
     }
 
@@ -2219,6 +2276,10 @@ fn normalized_content_type(content_type: &str) -> String {
     } else {
         content_type.to_string()
     }
+}
+
+fn fallback_public_file_name(address: &str) -> String {
+    format!("public-file-{}.bin", &address[..16])
 }
 
 fn validate_staged_file(staged: &mut BrowserStagedFile) -> Result<(), String> {
