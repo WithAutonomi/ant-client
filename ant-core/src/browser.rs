@@ -30,11 +30,10 @@ use self_encryption::{DataMap, EncryptedChunk};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-/// Maximum file size accepted by the in-memory browser demo (1 GB decimal).
+/// Maximum file size accepted by the browser demo (1 GB decimal).
 ///
-/// The current browser path retains the complete plaintext and encrypted
-/// records in memory, so reaching this protocol limit still depends on the
-/// browser's available memory.
+/// The page upload path streams through a worker and browser storage. Complete
+/// downloads and the legacy whole-buffer encryption binding remain memory-bound.
 pub const MAX_BROWSER_FILE_BYTES: usize = 1_000_000_000;
 
 /// One native self-encryption chunk descriptor exposed to the browser.
@@ -58,6 +57,36 @@ pub struct BrowserRecord {
     /// Raw record bytes. `serde_bytes` maps this to `Uint8Array` in WASM.
     #[serde(with = "serde_bytes")]
     pub content: Vec<u8>,
+}
+
+/// Metadata for a content-addressed record staged outside WASM memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserRecordInfo {
+    /// Lowercase hexadecimal BLAKE3 record address.
+    pub address: String,
+    /// Raw record size in bytes.
+    pub size: usize,
+}
+
+/// Result of streaming self-encryption whose record bytes live in browser storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserStagedFile {
+    /// Display filename supplied by the selected browser `File`.
+    pub name: String,
+    /// Browser MIME type, or `application/octet-stream` when none was supplied.
+    pub content_type: String,
+    /// Public DataMap record address.
+    pub address: String,
+    /// Whole-file plaintext BLAKE3 hash.
+    pub blake3: String,
+    /// Plaintext file size.
+    pub size: usize,
+    /// Serialized public DataMap size.
+    pub data_map_size: usize,
+    /// Native root DataMap chunk descriptors.
+    pub chunks: Vec<BrowserChunkInfo>,
+    /// Staged encrypted records followed by the public DataMap record.
+    pub records: Vec<BrowserRecordInfo>,
 }
 
 /// Result of native public-file self-encryption for a browser upload.
@@ -239,15 +268,22 @@ mod wasm {
         munge_offer_ice_credentials, parse_response_frame, parse_webrtc_direct_multiaddr,
         server_answer_sdp, verify_hello_identity, BrowserEndpointInput, BrowserHello,
     };
-    use super::{content_address, decrypt_public_file, encrypt_public_file, verify_record};
+    use super::{
+        chunk_infos, content_address, decrypt_public_file, encrypt_public_file, verify_record,
+        BrowserRecord, BrowserRecordInfo, BrowserStagedFile, MAX_BROWSER_FILE_BYTES,
+    };
+    use bytes::Bytes;
     use js_sys::{Array, Function, Promise, Uint8Array};
     use saorsa_dht_lookup::{
         run_iterative_lookup, IterativeLookup, LookupConfig, LookupKey, LookupNode, LookupQuery,
         LookupQueryOutcome,
     };
     use serde::{Deserialize, Serialize};
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
+    use std::rc::Rc;
     use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
     #[derive(Debug, Deserialize)]
@@ -653,6 +689,218 @@ mod wasm {
             encrypt_public_file(content).map_err(|error| JsValue::from_str(&error.to_string()))?;
         serde_wasm_bindgen::to_value(&encrypted)
             .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Incremental self-encryptor used from a worker with a synchronous file reader.
+    ///
+    /// Each call to `nextRecord` materializes at most one encrypted record. This
+    /// lets JavaScript persist the record before asking WASM for the next one,
+    /// keeping plaintext and ciphertext file-sized buffers out of the page.
+    #[wasm_bindgen(js_name = BrowserFileEncryptor)]
+    pub struct BrowserFileEncryptor {
+        stream: self_encryption::EncryptionStream<Box<dyn Iterator<Item = Bytes>>>,
+        file_size: usize,
+        bytes_read: Rc<Cell<usize>>,
+        read_error: Rc<RefCell<Option<String>>>,
+        whole_file_hasher: Rc<RefCell<blake3::Hasher>>,
+        data_map_records: HashMap<[u8; 32], Bytes>,
+        records: Vec<BrowserRecordInfo>,
+        data_map_record_yielded: bool,
+    }
+
+    #[wasm_bindgen(js_class = BrowserFileEncryptor)]
+    impl BrowserFileEncryptor {
+        /// Create an encryptor around a synchronous `(offset, length) => Uint8Array` reader.
+        ///
+        /// Browsers expose synchronous `File` reads only inside dedicated workers,
+        /// so page code should construct this class there rather than on the UI thread.
+        #[wasm_bindgen(constructor)]
+        pub fn new(file_size: usize, read_chunk: Function) -> Result<Self, JsValue> {
+            if file_size < self_encryption::MIN_ENCRYPTABLE_BYTES {
+                return Err(JsValue::from_str(&format!(
+                    "self-encryption requires at least {} bytes",
+                    self_encryption::MIN_ENCRYPTABLE_BYTES
+                )));
+            }
+            if file_size > MAX_BROWSER_FILE_BYTES {
+                return Err(JsValue::from_str(&format!(
+                    "browser files are limited to {MAX_BROWSER_FILE_BYTES} bytes"
+                )));
+            }
+
+            let bytes_read = Rc::new(Cell::new(0usize));
+            let iterator_bytes_read = Rc::clone(&bytes_read);
+            let read_error = Rc::new(RefCell::new(None));
+            let iterator_error = Rc::clone(&read_error);
+            let whole_file_hasher = Rc::new(RefCell::new(blake3::Hasher::new()));
+            let iterator_hasher = Rc::clone(&whole_file_hasher);
+            let iterator = std::iter::from_fn(move || {
+                if iterator_error.borrow().is_some() {
+                    return None;
+                }
+                let offset = iterator_bytes_read.get();
+                if offset >= file_size {
+                    return None;
+                }
+                let length = (file_size - offset).min(self_encryption::MAX_CHUNK_SIZE);
+                let returned = match read_chunk.call2(
+                    &JsValue::NULL,
+                    &JsValue::from_f64(offset as f64),
+                    &JsValue::from_f64(length as f64),
+                ) {
+                    Ok(returned) => returned,
+                    Err(error) => {
+                        *iterator_error.borrow_mut() = Some(js_error_message(error));
+                        return None;
+                    }
+                };
+                if !returned.is_instance_of::<Uint8Array>() {
+                    *iterator_error.borrow_mut() = Some(format!(
+                        "file reader returned a non-Uint8Array at byte offset {offset}"
+                    ));
+                    return None;
+                }
+                let returned = Uint8Array::new(&returned);
+                let actual = returned.length() as usize;
+                if actual != length {
+                    *iterator_error.borrow_mut() = Some(format!(
+                        "file reader returned {actual} bytes at offset {offset}, expected {length}"
+                    ));
+                    return None;
+                }
+                let mut content = vec![0u8; actual];
+                returned.copy_to(&mut content);
+                iterator_hasher.borrow_mut().update(&content);
+                iterator_bytes_read.set(offset + actual);
+                Some(Bytes::from(content))
+            });
+            let stream = self_encryption::stream_encrypt(
+                file_size,
+                Box::new(iterator) as Box<dyn Iterator<Item = Bytes>>,
+            )
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+
+            Ok(Self {
+                stream,
+                file_size,
+                bytes_read,
+                read_error,
+                whole_file_hasher,
+                data_map_records: HashMap::new(),
+                records: Vec::new(),
+                data_map_record_yielded: false,
+            })
+        }
+
+        /// Produce the next encrypted record, or `undefined` once all records are staged.
+        #[wasm_bindgen(js_name = nextRecord)]
+        pub fn next_record(&mut self) -> Result<JsValue, JsValue> {
+            if self.data_map_record_yielded {
+                return Ok(JsValue::UNDEFINED);
+            }
+
+            let next = self.stream.chunks().next();
+            if let Some(error) = self.read_error.borrow().as_ref() {
+                return Err(JsValue::from_str(error));
+            }
+            if let Some(result) = next {
+                let (hash, content) = result.map_err(|error| {
+                    JsValue::from_str(&format!("self-encryption failed: {error}"))
+                })?;
+                // Once `datamap()` becomes available, stream output consists only
+                // of the small encrypted child DataMaps needed to resolve the root.
+                if self.stream.datamap().is_some() {
+                    self.data_map_records.insert(hash.0, content.clone());
+                }
+                return self.serialize_record(hex::encode(hash.0), content.to_vec());
+            }
+
+            let published_data_map = self.stream.datamap().ok_or_else(|| {
+                JsValue::from_str("self-encryption ended before producing a DataMap")
+            })?;
+            let encoded = rmp_serde::to_vec(published_data_map).map_err(|error| {
+                JsValue::from_str(&format!("DataMap serialization failed: {error}"))
+            })?;
+            let address = content_address(&encoded);
+            self.data_map_record_yielded = true;
+            self.serialize_record(address, encoded)
+        }
+
+        /// Return upload metadata after `nextRecord` has reached `undefined`.
+        pub fn finish(&self, name: &str, content_type: &str) -> Result<JsValue, JsValue> {
+            if !self.data_map_record_yielded {
+                return Err(JsValue::from_str(
+                    "all encrypted records must be staged before finishing",
+                ));
+            }
+            if self.bytes_read.get() != self.file_size {
+                return Err(JsValue::from_str(&format!(
+                    "file reader supplied {} bytes, expected {}",
+                    self.bytes_read.get(),
+                    self.file_size
+                )));
+            }
+            let published_data_map = self
+                .stream
+                .datamap()
+                .ok_or_else(|| JsValue::from_str("self-encryption did not produce a DataMap"))?;
+            let mut get_local_chunk = |address: self_encryption::XorName| {
+                self.data_map_records
+                    .get(&address.0)
+                    .cloned()
+                    .ok_or_else(|| {
+                        self_encryption::Error::Generic(format!(
+                            "streaming output omitted DataMap chunk {}",
+                            hex::encode(address.0)
+                        ))
+                    })
+            };
+            let root_data_map = self_encryption::get_root_data_map(
+                published_data_map.clone(),
+                &mut get_local_chunk,
+            )
+            .map_err(|error| JsValue::from_str(&format!("self-encryption failed: {error}")))?;
+            let public_record = self.records.last().ok_or_else(|| {
+                JsValue::from_str("self-encryption omitted the public DataMap record")
+            })?;
+            let staged = BrowserStagedFile {
+                name: name.to_string(),
+                content_type: if content_type.is_empty() {
+                    "application/octet-stream".to_string()
+                } else {
+                    content_type.to_string()
+                },
+                address: public_record.address.clone(),
+                blake3: self
+                    .whole_file_hasher
+                    .borrow()
+                    .clone()
+                    .finalize()
+                    .to_hex()
+                    .to_string(),
+                size: self.file_size,
+                data_map_size: public_record.size,
+                chunks: chunk_infos(&root_data_map),
+                records: self.records.clone(),
+            };
+            serde_wasm_bindgen::to_value(&staged)
+                .map_err(|error| JsValue::from_str(&error.to_string()))
+        }
+    }
+
+    impl BrowserFileEncryptor {
+        fn serialize_record(
+            &mut self,
+            address: String,
+            content: Vec<u8>,
+        ) -> Result<JsValue, JsValue> {
+            self.records.push(BrowserRecordInfo {
+                address: address.clone(),
+                size: content.len(),
+            });
+            serde_wasm_bindgen::to_value(&BrowserRecord { address, content })
+                .map_err(|error| JsValue::from_str(&error.to_string()))
+        }
     }
 
     /// Native BLAKE3 content address.

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  BrowserFileEncryptor,
   BrowserIterativeLookup,
   decodePublicDataMap,
   decryptPublicFile,
@@ -121,4 +122,55 @@ test("generated ant-core WASM supports nested DataMaps", () => {
   );
   assert.equal(decrypted.length, content.length);
   assert.equal(verifyRecord(encrypted.blake3, decrypted), encrypted.blake3);
+});
+
+test("streaming WASM encryption emits one externally stageable record at a time", () => {
+  const maxChunkSize = 4_190_208;
+  const content = new Uint8Array(3 * maxChunkSize + 1);
+  for (let index = 0; index < content.length; index += 1) {
+    content[index] = index;
+  }
+
+  let reads = 0;
+  let largestRead = 0;
+  const encryptor = new BrowserFileEncryptor(content.length, (offset, length) => {
+    reads += 1;
+    largestRead = Math.max(largestRead, length);
+    return content.slice(offset, offset + length);
+  });
+  assert.equal(reads, 0, "construction must not eagerly read the file");
+  const records = [encryptor.nextRecord()];
+  assert(reads > 0 && reads < Math.ceil(content.length / maxChunkSize));
+  while (true) {
+    const record = encryptor.nextRecord();
+    if (record === undefined) break;
+    records.push(record);
+  }
+  const staged = encryptor.finish("streamed.bin", "application/octet-stream");
+  encryptor.free();
+
+  assert.equal(staged.size, content.length);
+  assert(largestRead <= maxChunkSize);
+  assert.equal(staged.name, "streamed.bin");
+  assert.equal(staged.content_type, "application/octet-stream");
+  assert.equal(staged.records.length, records.length);
+  assert.equal(staged.address, records.at(-1).address);
+  assert.equal(staged.data_map_size, records.at(-1).content.length);
+  assert.equal(verifyRecord(staged.blake3, content), staged.blake3);
+  assert.deepEqual(
+    staged.records,
+    records.map((record) => ({
+      address: record.address,
+      size: record.content.length,
+    })),
+  );
+  assert.equal(decodePublicDataMap(records.at(-1).content).length, 3);
+  assert.equal(staged.chunks.length, 4);
+  assert.deepEqual(
+    decryptPublicFile(
+      records.at(-1).content,
+      records.slice(0, -1).map((record) => record.content),
+    ),
+    content,
+  );
 });

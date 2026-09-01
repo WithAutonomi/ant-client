@@ -10,9 +10,10 @@ use super::protocol::{
     encode_request_frame, munge_offer_ice_credentials, parse_response_frame,
     parse_webrtc_direct_multiaddr, response_frame_length, server_answer_sdp, verify_hello_identity,
     BrowserEndpoint, BrowserEndpointInput, BrowserHello, BrowserProtocolError,
-    BrowserResponseFrame, WebRtcDirectEndpoint, MAX_BROWSER_RESPONSE_BYTES,
-    WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
+    BrowserResponseFrame, WebRtcDirectEndpoint, MAX_BROWSER_RECORD_BYTES,
+    MAX_BROWSER_RESPONSE_BYTES, WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
+use super::{BrowserRecord, BrowserRecordInfo, BrowserStagedFile};
 use crate::client_engine::adaptive::{
     observe_op, AdaptiveConfig, AdaptiveController, ChannelStart, Outcome,
 };
@@ -39,6 +40,7 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelState,
@@ -1068,10 +1070,37 @@ struct StoreTarget {
 }
 
 struct PreparedRecord {
-    record: super::BrowserRecord,
+    record: UploadRecord,
     already_stored: bool,
     targets: Vec<StoreTarget>,
     verified: Option<VerifiedStorageQuote>,
+}
+
+struct UploadRecord {
+    address: String,
+    size: usize,
+    content: Option<Rc<Vec<u8>>>,
+}
+
+impl From<BrowserRecord> for UploadRecord {
+    fn from(record: BrowserRecord) -> Self {
+        let size = record.content.len();
+        Self {
+            address: record.address,
+            size,
+            content: Some(Rc::new(record.content)),
+        }
+    }
+}
+
+impl From<BrowserRecordInfo> for UploadRecord {
+    fn from(record: BrowserRecordInfo) -> Self {
+        Self {
+            address: record.address,
+            size: record.size,
+            content: None,
+        }
+    }
 }
 
 struct PendingStoreRecord<'a> {
@@ -1110,6 +1139,20 @@ struct BrowserUploadResult {
     #[serde(rename = "storageCostAtto")]
     storage_cost_atto: String,
     records: usize,
+}
+
+struct BrowserStoredRecords {
+    payment: BrowserPaymentSubmission,
+    replicas: usize,
+    records: usize,
+}
+
+#[derive(Clone, Copy)]
+struct BrowserStoreContext<'a> {
+    payment_network: &'a BrowserPaymentNetwork,
+    transaction_hash: Option<&'a str>,
+    load_record: Option<&'a js_sys::Function>,
+    progress: &'a ProgressReporter,
 }
 
 struct CachedRangeRecord {
@@ -1453,6 +1496,40 @@ impl BrowserNetworkClient {
         serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
+    /// Quote, pay for, and upload records produced by `BrowserFileEncryptor`.
+    ///
+    /// Record bytes are requested lazily from the asynchronous JavaScript
+    /// callback, allowing the page to keep them in IndexedDB rather than WASM.
+    #[wasm_bindgen(js_name = uploadStagedPublicFile)]
+    pub async fn upload_staged_public_file(
+        &self,
+        staged: JsValue,
+        payment_network: JsValue,
+        load_record: js_sys::Function,
+        pay_for_quotes: js_sys::Function,
+        on_progress: Option<js_sys::Function>,
+    ) -> Result<JsValue, JsValue> {
+        let staged: BrowserStagedFile = serde_wasm_bindgen::from_value(staged)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let payment_network: BrowserPaymentNetwork =
+            serde_wasm_bindgen::from_value(payment_network)
+                .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let payment_network = validate_browser_payment_network(payment_network)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let progress = ProgressReporter::from_js(on_progress);
+        let result = self
+            .upload_staged_public_file_inner(
+                staged,
+                payment_network,
+                &load_record,
+                &pay_for_quotes,
+                &progress,
+            )
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
+        serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
     /// Close all pooled WebRTC associations.
     pub fn close(&self) {
         self.inner.pool.close();
@@ -1682,22 +1759,105 @@ impl BrowserNetworkClient {
             content.len()
         ));
         let encrypted = super::encrypt_public_file(content).map_err(|error| error.to_string())?;
-        let mut records = encrypted.records.iter().cloned().enumerate();
-        let mut prepared = Vec::with_capacity(encrypted.records.len());
+        let records = encrypted
+            .records
+            .into_iter()
+            .map(UploadRecord::from)
+            .collect::<Vec<_>>();
+        let stored = self
+            .prepare_pay_and_store_records(
+                records,
+                &payment_network,
+                None,
+                pay_for_quotes,
+                progress,
+            )
+            .await?;
+        let descriptor = PublicFileDescriptor {
+            name: name.to_string(),
+            address: encrypted.address,
+            size: content.len(),
+            content_type: normalized_content_type(content_type),
+            blake3: encrypted.blake3,
+            data_map_size: encrypted.data_map_size,
+            chunks: encrypted.chunks,
+            replicas: stored.replicas,
+        };
+        Ok(BrowserUploadResult {
+            file: descriptor,
+            transaction_hash: stored.payment.transaction_hash,
+            storage_cost_atto: stored.payment.total_amount,
+            records: stored.records,
+        })
+    }
+
+    async fn upload_staged_public_file_inner(
+        &self,
+        mut staged: BrowserStagedFile,
+        payment_network: BrowserPaymentNetwork,
+        load_record: &js_sys::Function,
+        pay_for_quotes: &js_sys::Function,
+        progress: &ProgressReporter,
+    ) -> Result<BrowserUploadResult, String> {
+        validate_staged_file(&mut staged)?;
+        progress.report(&format!(
+            "Preparing paid upload for staged {} ({} bytes, {} records)",
+            staged.name,
+            staged.size,
+            staged.records.len()
+        ));
+        let records = staged
+            .records
+            .into_iter()
+            .map(UploadRecord::from)
+            .collect::<Vec<_>>();
+        let stored = self
+            .prepare_pay_and_store_records(
+                records,
+                &payment_network,
+                Some(load_record),
+                pay_for_quotes,
+                progress,
+            )
+            .await?;
+        let descriptor = PublicFileDescriptor {
+            name: staged.name,
+            address: staged.address,
+            size: staged.size,
+            content_type: staged.content_type,
+            blake3: staged.blake3,
+            data_map_size: staged.data_map_size,
+            chunks: staged.chunks,
+            replicas: stored.replicas,
+        };
+        Ok(BrowserUploadResult {
+            file: descriptor,
+            transaction_hash: stored.payment.transaction_hash,
+            storage_cost_atto: stored.payment.total_amount,
+            records: stored.records,
+        })
+    }
+
+    async fn prepare_pay_and_store_records(
+        &self,
+        records: Vec<UploadRecord>,
+        payment_network: &BrowserPaymentNetwork,
+        load_record: Option<&js_sys::Function>,
+        pay_for_quotes: &js_sys::Function,
+        progress: &ProgressReporter,
+    ) -> Result<BrowserStoredRecords, String> {
+        let record_count = records.len();
+        let mut records = records.into_iter().enumerate();
+        let mut prepared = Vec::with_capacity(record_count);
         if let Some((index, record)) = records.next() {
-            progress.report(&format!(
-                "Preparing record {}/{}",
-                index + 1,
-                encrypted.records.len()
-            ));
+            progress.report(&format!("Preparing record {}/{}", index + 1, record_count));
             prepared.push((
                 index,
-                self.prepare_record(record, &payment_network, progress)
+                self.prepare_record(record, payment_network, progress)
                     .await?,
             ));
         }
-        let record_count = encrypted.records.len();
-        let payment_network_ref = &payment_network;
+        let payment_network_ref = payment_network;
         let remaining = records.map(|(index, record)| async move {
             progress.report(&format!("Preparing record {}/{}", index + 1, record_count));
             self.prepare_record(record, payment_network_ref, progress)
@@ -1728,7 +1888,7 @@ impl BrowserNetworkClient {
                 total_amount: "0".to_string(),
             }
         } else {
-            invoke_payment(pay_for_quotes, &payment_network, &verified_quotes).await?
+            invoke_payment(pay_for_quotes, payment_network, &verified_quotes).await?
         };
         if !verified_quotes.is_empty() && payment.transaction_hash.is_none() {
             return Err("wallet callback returned no storage payment transaction".to_string());
@@ -1746,36 +1906,22 @@ impl BrowserNetworkClient {
         let replicas = self
             .store_prepared_records(
                 &prepared,
-                &payment_network,
+                payment_network,
                 payment.transaction_hash.as_deref(),
+                load_record,
                 progress,
             )
             .await?;
-        let descriptor = PublicFileDescriptor {
-            name: name.to_string(),
-            address: encrypted.address,
-            size: content.len(),
-            content_type: if content_type.is_empty() {
-                "application/octet-stream".to_string()
-            } else {
-                content_type.to_string()
-            },
-            blake3: encrypted.blake3,
-            data_map_size: encrypted.data_map_size,
-            chunks: encrypted.chunks,
+        Ok(BrowserStoredRecords {
+            payment,
             replicas,
-        };
-        Ok(BrowserUploadResult {
-            file: descriptor,
-            transaction_hash: payment.transaction_hash,
-            storage_cost_atto: payment.total_amount,
             records: prepared.len(),
         })
     }
 
     async fn prepare_record(
         &self,
-        record: super::BrowserRecord,
+        record: UploadRecord,
         payment_network: &BrowserPaymentNetwork,
         progress: &ProgressReporter,
     ) -> Result<PreparedRecord, String> {
@@ -1803,9 +1949,8 @@ impl BrowserNetworkClient {
                 let client = self.inner.pool.client(&target.endpoint).await?;
                 let hello = client.hello().await?;
                 assert_upload_node(&hello, payment_network)?;
-                let (quote, already_stored) = client
-                    .quote_chunk(&record.address, record.content.len())
-                    .await?;
+                let (quote, already_stored) =
+                    client.quote_chunk(&record.address, record.size).await?;
                 let verified = verify_storage_quote(quote, &record.address, &target.peer_id)
                     .map_err(|error| error.to_string())?;
                 Ok::<_, String>((already_stored, verified))
@@ -1860,12 +2005,13 @@ impl BrowserNetworkClient {
         prepared: &[PreparedRecord],
         payment_network: &BrowserPaymentNetwork,
         transaction_hash: Option<&str>,
+        load_record: Option<&js_sys::Function>,
         progress: &ProgressReporter,
     ) -> Result<usize, String> {
         let record_count = prepared.len();
         let max_record_bytes = prepared
             .iter()
-            .map(|record| record.record.content.len())
+            .map(|record| record.record.size)
             .max()
             .unwrap_or(0);
         let byte_bound = crate::client_engine::store_byte_bound(max_record_bytes);
@@ -1879,6 +2025,12 @@ impl BrowserNetworkClient {
             })
             .collect::<Vec<_>>();
         let mut replicas = usize::MAX;
+        let context = BrowserStoreContext {
+            payment_network,
+            transaction_hash,
+            load_record,
+            progress,
+        };
 
         for attempt in 0..=crate::client_engine::STORE_MAX_RETRIES {
             if attempt > 0 {
@@ -1912,15 +2064,7 @@ impl BrowserNetworkClient {
                         ));
                         let result = observe_op(
                             &limiter,
-                            || {
-                                self.store_prepared_once(
-                                    record,
-                                    payment_network,
-                                    transaction_hash,
-                                    progress,
-                                    successful_peers,
-                                )
-                            },
+                            || self.store_prepared_once(index, record, &context, successful_peers),
                             |error| classify_browser_store_error(&error.message),
                         )
                         .await;
@@ -1973,16 +2117,15 @@ impl BrowserNetworkClient {
     /// of the ordered K=7 target set only when an initial target fails.
     async fn store_prepared_once(
         &self,
+        record_index: usize,
         prepared: &PreparedRecord,
-        payment_network: &BrowserPaymentNetwork,
-        transaction_hash: Option<&str>,
-        progress: &ProgressReporter,
+        context: &BrowserStoreContext<'_>,
         mut successful_peers: HashSet<String>,
     ) -> Result<usize, StoreAttemptError> {
         if prepared.already_stored {
             return Ok(1);
         }
-        let Some(transaction_hash) = transaction_hash else {
+        let Some(transaction_hash) = context.transaction_hash else {
             return Err(StoreAttemptError::new(
                 successful_peers,
                 "paid record has no transaction hash",
@@ -1995,6 +2138,9 @@ impl BrowserNetworkClient {
                 "paid record has no verified quote",
             ));
         };
+        let record = load_upload_record(record_index, &prepared.record, context.load_record)
+            .await
+            .map_err(|error| StoreAttemptError::new(successful_peers.clone(), error))?;
         let required = CLOSE_GROUP_MAJORITY.saturating_sub(successful_peers.len());
         let outcome = crate::client_engine::quorum_with_fallback(
             prepared
@@ -2005,26 +2151,33 @@ impl BrowserNetworkClient {
             required,
             |target| {
                 let pool = Rc::clone(&self.inner.pool);
-                let record = prepared.record.clone();
+                let record = Rc::clone(&record);
                 let quote = verified.quote.clone();
-                let payment_network = payment_network.clone();
+                let payment_network = context.payment_network.clone();
                 let transaction_hash = transaction_hash.clone();
-                let progress = progress.clone();
+                let progress = context.progress.clone();
                 async move {
                     let client = pool.client(&target.endpoint).await?;
                     let hello = client.hello().await?;
                     assert_upload_node(&hello, &payment_network)?;
                     let (_, already_stored) = client
-                        .put_chunk(&record.address, &record.content, quote, &transaction_hash)
+                        .put_chunk(
+                            &prepared.record.address,
+                            record.as_slice(),
+                            quote,
+                            &transaction_hash,
+                        )
                         .await?;
                     if already_stored {
                         progress.report(&format!(
                             "Already stored on {}: {}",
-                            target.peer_id, record.address
+                            target.peer_id, prepared.record.address
                         ));
                     } else {
-                        progress
-                            .report(&format!("Stored {} on {}", record.address, target.peer_id));
+                        progress.report(&format!(
+                            "Stored {} on {}",
+                            prepared.record.address, target.peer_id
+                        ));
                     }
                     Ok::<(), String>(())
                 }
@@ -2039,7 +2192,9 @@ impl BrowserNetworkClient {
             .failures
             .into_iter()
             .map(|(target, error)| {
-                progress.report(&format!("Store target {} failed: {error}", target.peer_id));
+                context
+                    .progress
+                    .report(&format!("Store target {} failed: {error}", target.peer_id));
                 format!("{}: {error}", target.peer_id)
             })
             .collect::<Vec<_>>();
@@ -2056,6 +2211,101 @@ impl BrowserNetworkClient {
         }
         Ok(successful_peers.len())
     }
+}
+
+fn normalized_content_type(content_type: &str) -> String {
+    if content_type.is_empty() {
+        "application/octet-stream".to_string()
+    } else {
+        content_type.to_string()
+    }
+}
+
+fn validate_staged_file(staged: &mut BrowserStagedFile) -> Result<(), String> {
+    if staged.name.is_empty() {
+        return Err("upload file has no name".to_string());
+    }
+    staged.content_type = normalized_content_type(&staged.content_type);
+    if staged.size < self_encryption::MIN_ENCRYPTABLE_BYTES
+        || staged.size > super::MAX_BROWSER_FILE_BYTES
+    {
+        return Err(format!("invalid staged file size {}", staged.size));
+    }
+    if staged.records.is_empty() {
+        return Err("staged upload contains no records".to_string());
+    }
+    // A 1 GB self-encrypted file currently needs only a few hundred records.
+    // Keep malformed JavaScript metadata from creating unbounded quote work.
+    if staged.records.len() > 4096 {
+        return Err("staged upload contains too many records".to_string());
+    }
+
+    staged.address = super::protocol::normalize_hex(&staged.address, 32)?;
+    staged.blake3 = super::protocol::normalize_hex(&staged.blake3, 32)?;
+    for record in &mut staged.records {
+        record.address = super::protocol::normalize_hex(&record.address, 32)?;
+        if record.size == 0 || record.size > MAX_BROWSER_RECORD_BYTES {
+            return Err(format!(
+                "staged record {} has invalid size {}",
+                record.address, record.size
+            ));
+        }
+    }
+    let public_data_map = staged
+        .records
+        .last()
+        .ok_or_else(|| "staged upload contains no public DataMap".to_string())?;
+    if public_data_map.address != staged.address || public_data_map.size != staged.data_map_size {
+        return Err("staged public DataMap metadata does not match its record".to_string());
+    }
+    for chunk in &mut staged.chunks {
+        chunk.dst_hash = super::protocol::normalize_hex(&chunk.dst_hash, 32)?;
+        chunk.src_hash = super::protocol::normalize_hex(&chunk.src_hash, 32)?;
+    }
+    Ok(())
+}
+
+async fn load_upload_record(
+    index: usize,
+    record: &UploadRecord,
+    loader: Option<&js_sys::Function>,
+) -> Result<Rc<Vec<u8>>, String> {
+    let content = if let Some(content) = &record.content {
+        Rc::clone(content)
+    } else {
+        let loader = loader.ok_or_else(|| "staged record loader is unavailable".to_string())?;
+        let returned = loader
+            .call3(
+                &JsValue::NULL,
+                &JsValue::from_f64(index as f64),
+                &JsValue::from_str(&record.address),
+                &JsValue::from_f64(record.size as f64),
+            )
+            .map_err(js_error_message)?;
+        let returned = JsFuture::from(Promise::resolve(&returned))
+            .await
+            .map_err(js_error_message)?;
+        if !returned.is_instance_of::<Uint8Array>() {
+            return Err(format!(
+                "staged record loader returned a non-Uint8Array for record {}",
+                index + 1
+            ));
+        }
+        let returned = Uint8Array::new(&returned);
+        if returned.length() as usize != record.size {
+            return Err(format!(
+                "staged record {} has {} bytes, expected {}",
+                index + 1,
+                returned.length(),
+                record.size
+            ));
+        }
+        let mut content = vec![0u8; record.size];
+        returned.copy_to(&mut content);
+        Rc::new(content)
+    };
+    super::verify_record(&record.address, content.as_slice()).map_err(|error| error.to_string())?;
+    Ok(content)
 }
 
 fn classify_browser_store_error(error: &str) -> Outcome {

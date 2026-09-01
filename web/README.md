@@ -79,8 +79,12 @@ Confirm that `HELLO.payment.rpc_url` is a loopback Anvil URL. An
 Pass `--public-file /path/to/file` to publish another file instead. The built-in
 file is generated as 5 MiB so the demo exercises whole-file reconstruction. A
 custom file may be up to 1 GB (1,000,000,000 bytes) in this local launcher.
-Uploads and downloads are currently processed in memory, so large files still
-depend on the browser having sufficient available memory.
+Uploads are self-encrypted incrementally in a dedicated worker and stage each
+encrypted record in IndexedDB, so the page does not hold the plaintext or the
+complete encrypted file in memory. The browser needs enough temporary origin
+storage for approximately the file size; staged records are removed when the
+upload finishes or fails. Complete-file downloads remain memory-bound; use the
+random-access reader for large media.
 
 ## Run the site
 
@@ -105,10 +109,12 @@ manifest from port 25000 and fills in the default file:
 3. **Find closest** runs Saorsa's iterative lookup engine and WebRTC Direct
    query batches entirely in Rust/WASM.
 4. Under **Paid public file upload**, choose a file, paste the funded private
-   key printed by ant-devnet, then select **Pay and upload file**. Rust/WASM
-   performs encryption, DataMap generation, closest-node selection,
-   quote/commitment verification, payment-total calculation, and storage. A
-   narrow JavaScript callback uses Ethers for token approval and the wallet
+   key printed by ant-devnet, then select **Pay and upload file**. A dedicated
+   worker runs Rust/WASM streaming self-encryption and stages one encrypted
+   record at a time in IndexedDB. The Rust network client then performs
+   closest-node selection, quote/commitment verification, payment-total
+   calculation, and storage while loading only active records. A narrow
+   JavaScript callback uses Ethers for token approval and the wallet
    transaction; Rust verifies the callback's reported total before continuing.
    The key field is cleared immediately and the resulting public DataMap
    address is placed in the download field.
@@ -210,8 +216,9 @@ application to use `BrowserNetworkClient` without copying the Autonomi protocol
 into JavaScript.
 
 The application JavaScript owns only capabilities tied to the page or the
-selected wallet stack: DOM events, browser `File`/save-picker/service-worker
-APIs, and Ethers contract calls. The service worker does not connect to nodes;
+selected wallet stack: DOM events, browser `File`/save-picker/worker/IndexedDB/
+service-worker APIs, and Ethers contract calls. The service worker does not
+connect to nodes;
 it translates native media byte-range requests into calls on the page-owned
 Rust reader. This is also the deliberate extension seam: another web app can
 provide its own UI and wallet callback while sharing all network and Autonomi

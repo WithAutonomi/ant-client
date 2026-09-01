@@ -6,6 +6,11 @@ import {
 } from "../pkg/ant_core.js";
 import { fetchBrowserManifest } from "./manifest.js";
 import { payForStorageQuotes } from "./payment.js";
+import {
+  clearStagedUpload,
+  loadStagedRecord,
+  stageFileForUpload,
+} from "./upload-staging.js";
 
 await initAntCore();
 
@@ -55,6 +60,8 @@ let browserManifest;
 let downloadObjectUrl;
 const videoReaders = new Map();
 let activeVideoSession;
+let protocolLog = "";
+const MAX_PROTOCOL_LOG_CHARACTERS = 256 * 1024;
 
 function timestamp() {
   return new Date().toLocaleTimeString();
@@ -63,7 +70,13 @@ function timestamp() {
 function log(message, value) {
   const suffix =
     value === undefined ? "" : `\n${JSON.stringify(value, null, 2)}`;
-  elements.log.textContent += `[${timestamp()}] ${message}${suffix}\n`;
+  protocolLog += `[${timestamp()}] ${message}${suffix}\n`;
+  if (protocolLog.length > MAX_PROTOCOL_LOG_CHARACTERS) {
+    protocolLog = `[Earlier log entries removed]\n${protocolLog.slice(
+      -MAX_PROTOCOL_LOG_CHARACTERS,
+    )}`;
+  }
+  elements.log.textContent = protocolLog;
   elements.log.scrollTop = elements.log.scrollHeight;
 }
 
@@ -280,6 +293,7 @@ elements.uploadFile.addEventListener("click", async () => {
   elements.uploadResult.hidden = true;
   elements.uploadFile.disabled = true;
   let walletSecret = elements.walletSecret.value.trim();
+  let stagedUpload;
   try {
     if (!browserManifest)
       throw new Error("Load the browser testnet manifest first");
@@ -289,16 +303,16 @@ elements.uploadFile.addEventListener("click", async () => {
 
     log(`Starting paid public upload for ${file.name}`);
     if (!networkClient) throw new Error("Browser network client is not ready");
-    const content = new Uint8Array(await file.arrayBuffer());
     const onProgress = (message) => {
       elements.uploadState.textContent = message;
       log(message);
     };
-    const result = await networkClient.uploadPublicFile(
-      content,
-      file.name,
-      file.type,
+    stagedUpload = await stageFileForUpload(file, onProgress);
+    const result = await networkClient.uploadStagedPublicFile(
+      stagedUpload.staged,
       browserManifest.payment,
+      (index, address, size) =>
+        loadStagedRecord(stagedUpload.sessionId, index, address, size),
       (paymentNetwork, quotes) =>
         payForStorageQuotes(paymentNetwork, quotes, walletSecret, { onProgress }),
       onProgress,
@@ -330,6 +344,16 @@ elements.uploadFile.addEventListener("click", async () => {
     console.error(error);
   } finally {
     walletSecret = "";
+    if (stagedUpload) {
+      try {
+        await clearStagedUpload(
+          stagedUpload.sessionId,
+          stagedUpload.staged.records.length,
+        );
+      } catch (error) {
+        log(`Could not clear temporary upload records: ${errorMessage(error)}`);
+      }
+    }
     elements.uploadFile.disabled = false;
   }
 });
