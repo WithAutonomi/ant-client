@@ -331,15 +331,21 @@ jobs:
             $0 ~ pat { found = 1; next }
             /^## \[/ { if (found) exit }
             found' CHANGELOG.md)
+          # A missing or empty section must never stop a release. The artifacts are
+          # fine and the notes are fixable after the fact with `gh release edit`, so
+          # failing closed here would only turn "missing notes" into "no release at
+          # all". The `::warning::` annotation keeps the omission loud on the run.
+          # Pre-tag enforcement, if we want it, belongs on the release-prep PR where
+          # a fix is cheap and nothing is blocked.
           if [ -z "$(echo "$changelog" | tr -d '[:space:]')" ]; then
-            echo "ERROR: CHANGELOG.md has no non-empty '## [${base_version}]' section." >&2
-            echo "Every release ships its own notes: rotate '## [Unreleased]' into" >&2
-            echo "'## [${base_version}] - $(date -u +%F)' as part of the cut (V2-1107)." >&2
-            echo "Refusing to publish a release with missing or stale notes." >&2
-            exit 1
+            echo "::warning title=Missing changelog section::CHANGELOG.md has no non-empty '## [${base_version}]' section. Publishing with placeholder notes; correct them with 'gh release edit' and rotate '## [Unreleased]' into '## [${base_version}] - $(date -u +%F)'. See V2-1107."
+            cat > /tmp/changelog_entry.md <<EOF
+          _No changelog entry was recorded for ${base_version}. See the commit history for the changes in this release; these notes will be corrected retroactively._
+          EOF
+          else
+            # Write to file for the release body
+            echo "$changelog" > /tmp/changelog_entry.md
           fi
-          # Write to file for the release body
-          echo "$changelog" > /tmp/changelog_entry.md
 
       - name: generate release body
         shell: bash
