@@ -1,6 +1,5 @@
 //! Browser-facing WebRTC Direct wire profile.
 
-use ant_protocol::crypto::verify_ml_dsa_65;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -9,11 +8,11 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr as _;
 
 /// Current browser request/response protocol version.
-pub const BROWSER_PROTOCOL_VERSION: u16 = 3;
+pub const BROWSER_PROTOCOL_VERSION: u16 = 4;
 /// Protocol name authenticated by the node HELLO response.
-pub const BROWSER_PROTOCOL_NAME: &str = "autonomi.web.poc.v3";
+pub const BROWSER_PROTOCOL_NAME: &str = "autonomi.web.poc.v4";
 /// Ordered WebRTC DataChannel label used by Autonomi nodes.
-pub const WEBRTC_DIRECT_DATA_CHANNEL: &str = "autonomi.web.v3";
+pub const WEBRTC_DIRECT_DATA_CHANNEL: &str = "autonomi.web.v4";
 /// Maximum content carried by one browser protocol frame.
 pub const MAX_BROWSER_RECORD_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum JSON header carried by one browser protocol frame.
@@ -26,7 +25,6 @@ pub const MAX_WEBRTC_DIRECT_MULTIADDR_LENGTH: usize = 2048;
 /// DataChannel message size shared with the native WebRTC Direct listener.
 pub const WEBRTC_WRITE_CHUNK_BYTES: usize = 16 * 1024;
 
-const HELLO_DOMAIN: &[u8] = b"autonomi-webrtc-direct-hello-v1\0";
 const SHA2_256_MULTIHASH_CODE: u8 = 0x12;
 const SHA2_256_MULTIHASH_LENGTH: u8 = 32;
 
@@ -345,7 +343,7 @@ pub fn encode_request_frame(
     Ok(frame)
 }
 
-/// Authenticated fields returned by a node's HELLO response.
+/// Metadata returned by an authenticated node's encrypted HELLO response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserHello {
     /// Response discriminator.
@@ -355,13 +353,7 @@ pub struct BrowserHello {
     pub protocol: String,
     /// Lowercase peer ID.
     pub peer_id: String,
-    /// Echoed client challenge.
-    pub challenge: String,
-    /// ML-DSA-65 public key.
-    pub public_key: String,
-    /// ML-DSA-65 signature.
-    pub signature: String,
-    /// Signed direct endpoint.
+    /// Direct endpoint authenticated by the enclosing post-quantum session.
     pub endpoint: BrowserEndpoint,
     /// Maximum node record size.
     #[serde(default)]
@@ -374,11 +366,10 @@ pub struct BrowserHello {
     pub payment: Value,
 }
 
-/// Verify that a HELLO binds an ANT identity to the expected direct endpoint.
-pub fn verify_hello_identity(
+/// Validate metadata received inside an authenticated post-quantum session.
+pub fn validate_hello_metadata(
     hello: &BrowserHello,
     expected_endpoint: &WebRtcDirectEndpoint,
-    challenge: &[u8; 32],
 ) -> Result<String, BrowserProtocolError> {
     if hello.response_type != "hello" {
         return Err(BrowserProtocolError::Identity(
@@ -392,13 +383,6 @@ pub fn verify_hello_identity(
         )));
     }
     let peer_id = normalize_hex(&hello.peer_id, 32).map_err(BrowserProtocolError::Identity)?;
-    if normalize_hex(&hello.challenge, 32).map_err(BrowserProtocolError::Identity)?
-        != hex::encode(challenge)
-    {
-        return Err(BrowserProtocolError::Identity(
-            "node signed a different HELLO challenge".to_string(),
-        ));
-    }
     let advertised = parse_webrtc_direct_multiaddr(&hello.endpoint.multiaddr)
         .map_err(|error| BrowserProtocolError::Identity(error.to_string()))?;
     if advertised.multiaddr != expected_endpoint.multiaddr || advertised.peer_id != peer_id {
@@ -411,27 +395,6 @@ pub fn verify_hello_identity(
             "endpoint identity mismatch: expected {}, received {peer_id}",
             expected_endpoint.peer_id
         )));
-    }
-    let public_key = hex::decode(&hello.public_key)
-        .map_err(|error| BrowserProtocolError::Identity(error.to_string()))?;
-    let signature = hex::decode(&hello.signature)
-        .map_err(|error| BrowserProtocolError::Identity(error.to_string()))?;
-    if blake3::hash(&public_key).to_hex().as_str() != peer_id {
-        return Err(BrowserProtocolError::Identity(
-            "HELLO public key is not bound to the ANT peer ID".to_string(),
-        ));
-    }
-    let mut transcript = Vec::with_capacity(
-        HELLO_DOMAIN.len() + challenge.len() + peer_id.len() + advertised.multiaddr.len(),
-    );
-    transcript.extend_from_slice(HELLO_DOMAIN);
-    transcript.extend_from_slice(challenge);
-    transcript.extend_from_slice(peer_id.as_bytes());
-    transcript.extend_from_slice(advertised.multiaddr.as_bytes());
-    if !verify_ml_dsa_65(&public_key, &signature, &transcript, b"") {
-        return Err(BrowserProtocolError::Identity(
-            "HELLO has an invalid ML-DSA-65 signature".to_string(),
-        ));
     }
     Ok(peer_id)
 }
@@ -549,6 +512,29 @@ mod tests {
         let parsed = parse_response_frame(&frame).expect("parse response-shaped frame");
         assert_eq!(parsed.header["request_id"], 9);
         assert_eq!(parsed.content, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn hello_metadata_must_match_the_authenticated_endpoint() {
+        let expected = parse_webrtc_direct_multiaddr(&endpoint()).expect("parse endpoint");
+        let mut hello = BrowserHello {
+            response_type: "hello".to_string(),
+            protocol: BROWSER_PROTOCOL_NAME.to_string(),
+            peer_id: "ab".repeat(32),
+            endpoint: BrowserEndpoint {
+                multiaddr: endpoint(),
+            },
+            max_chunk_size: MAX_BROWSER_RECORD_BYTES,
+            capabilities: vec!["get_chunk".to_string()],
+            payment: Value::Null,
+        };
+        assert_eq!(
+            validate_hello_metadata(&hello, &expected).expect("validate HELLO"),
+            "ab".repeat(32)
+        );
+
+        hello.peer_id = "cd".repeat(32);
+        assert!(validate_hello_metadata(&hello, &expected).is_err());
     }
 
     #[test]
