@@ -8,16 +8,19 @@ use super::payment::{
 };
 use super::protocol::{
     encode_request_frame, munge_offer_ice_credentials, parse_response_frame,
-    parse_webrtc_direct_multiaddr, response_frame_length, server_answer_sdp, verify_hello_identity,
-    BrowserEndpoint, BrowserEndpointInput, BrowserHello, BrowserProtocolError,
-    BrowserResponseFrame, WebRtcDirectEndpoint, MAX_BROWSER_RECORD_BYTES,
-    MAX_BROWSER_RESPONSE_BYTES, WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
+    parse_webrtc_direct_multiaddr, server_answer_sdp, validate_hello_metadata, BrowserEndpoint,
+    BrowserEndpointInput, BrowserHello, BrowserProtocolError, BrowserResponseFrame,
+    WebRtcDirectEndpoint, MAX_BROWSER_RECORD_BYTES, MAX_BROWSER_RESPONSE_BYTES,
+    WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
 use super::{BrowserRecord, BrowserRecordInfo, BrowserStagedFile};
 use crate::client_engine::adaptive::{
     observe_op, AdaptiveConfig, AdaptiveController, ChannelStart, Outcome,
 };
-use ant_protocol::web_rtc::transfer_timeout;
+use ant_protocol::web_rtc::{
+    decode_pq_frame, encode_pq_frame, pq_frame_length, transfer_timeout, PqClientHandshake,
+    PqSession, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_SERVER_ACCEPT_BYTES,
+};
 use ant_protocol::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
 use futures_channel::{mpsc, oneshot};
 use futures_util::{
@@ -282,6 +285,7 @@ struct Connection {
     peer_connection: RtcPeerConnection,
     data_channel: RtcDataChannel,
     inbox: ResponseInbox,
+    pq_session: RefCell<Option<PqSession>>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
     _on_error: Closure<dyn FnMut(Event)>,
     _on_close: Closure<dyn FnMut(Event)>,
@@ -343,6 +347,7 @@ impl Connection {
             peer_connection,
             data_channel,
             inbox: Rc::new(Mutex::new(inbox_rx)),
+            pq_session: RefCell::new(None),
             _on_message: on_message,
             _on_error: on_error,
             _on_close: on_close,
@@ -387,6 +392,9 @@ impl Connection {
         )
         .await?;
         connection.data_channel.set_onopen(None);
+
+        let session = establish_pq_session(&connection, endpoint).await?;
+        connection.pq_session.replace(Some(session));
 
         Ok(connection)
     }
@@ -456,8 +464,22 @@ impl BrowserNodeClientCore {
         self.ensure_connected().await?;
         let request_id = self.next_request_id.get();
         self.next_request_id.set(request_id.wrapping_add(1).max(1));
-        let frame = encode_request_frame(request_id, request_type, fields, content)
+        let plaintext = encode_request_frame(request_id, request_type, fields, content)
             .map_err(|error| error.to_string())?;
+        let frame = {
+            let connection = self.connection.borrow();
+            let connection = connection
+                .as_ref()
+                .ok_or_else(|| "WebRTC DataChannel is not connected".to_string())?;
+            let encrypted = connection
+                .pq_session
+                .borrow_mut()
+                .as_mut()
+                .ok_or_else(|| "WebRTC PQ session is not established".to_string())?
+                .seal(&plaintext)
+                .map_err(|error| error.to_string())?;
+            encode_pq_frame(&encrypted).map_err(|error| error.to_string())?
+        };
         let transfer_timeout_ms = transfer_timeout_ms(frame.len());
         let channel = {
             let connection = self.connection.borrow();
@@ -469,17 +491,7 @@ impl BrowserNodeClientCore {
             self.close();
             return Err("WebRTC DataChannel is not connected".to_string());
         };
-        let send_deadline_ms = js_sys::Date::now() + f64::from(transfer_timeout_ms);
-        let send_result = async {
-            for message in frame.chunks(WEBRTC_WRITE_CHUNK_BYTES) {
-                wait_for_capacity(&channel, remaining_timeout_ms(send_deadline_ms)).await?;
-                channel
-                    .send_with_u8_array(message)
-                    .map_err(js_error_message)?;
-            }
-            Ok::<(), String>(())
-        }
-        .await;
+        let send_result = send_data_channel_frame(&channel, &frame, transfer_timeout_ms).await;
         if let Err(error) = send_result {
             self.close();
             return Err(error);
@@ -494,11 +506,43 @@ impl BrowserNodeClientCore {
             self.close();
             return Err("WebRTC response inbox is unavailable".to_string());
         };
-        let response = match read_response(receiver, transfer_timeout_ms).await {
+        let encrypted_response = match read_pq_payload(
+            receiver,
+            MAX_BROWSER_RESPONSE_BYTES + PQ_ENCRYPTED_OVERHEAD_BYTES,
+            transfer_timeout_ms,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(error) => {
                 self.close();
                 return Err(error);
+            }
+        };
+        let decrypt_result = {
+            let connection = self.connection.borrow();
+            let Some(connection) = connection.as_ref() else {
+                return Err("WebRTC DataChannel is not connected".to_string());
+            };
+            let mut pq_session = connection.pq_session.borrow_mut();
+            pq_session
+                .as_mut()
+                .ok_or_else(|| "WebRTC PQ session is not established".to_string())?
+                .open(&encrypted_response)
+                .map_err(|error| error.to_string())
+        };
+        let plaintext_response = match decrypt_result {
+            Ok(response) => response,
+            Err(error) => {
+                self.close();
+                return Err(error);
+            }
+        };
+        let response = match parse_response_frame(&plaintext_response) {
+            Ok(response) => response,
+            Err(error) => {
+                self.close();
+                return Err(error.to_string());
             }
         };
         if response.header.get("request_id").and_then(Value::as_u64) != Some(request_id) {
@@ -534,12 +578,7 @@ impl BrowserNodeClientCore {
                 return Ok(hello);
             }
         }
-        let mut challenge = [0u8; 32];
-        getrandom::getrandom(&mut challenge)
-            .map_err(|error| format!("browser entropy failed: {error}"))?;
-        let mut fields = Map::new();
-        fields.insert("challenge".to_string(), Value::from(hex::encode(challenge)));
-        let response = self.request("hello", fields, &[]).await?;
+        let response = self.request("hello", Map::new(), &[]).await?;
         let hello: BrowserHello = match serde_json::from_value(response.header) {
             Ok(hello) => hello,
             Err(error) => {
@@ -547,7 +586,7 @@ impl BrowserNodeClientCore {
                 return Err(format!("invalid HELLO response: {error}"));
             }
         };
-        let peer_id = match verify_hello_identity(&hello, &self.endpoint, &challenge) {
+        let peer_id = match validate_hello_metadata(&hello, &self.endpoint) {
             Ok(peer_id) => peer_id,
             Err(error) => {
                 self.close();
@@ -2549,10 +2588,51 @@ impl BrowserNodeClient {
     }
 }
 
-async fn read_response(
+async fn establish_pq_session(
+    connection: &Connection,
+    endpoint: &WebRtcDirectEndpoint,
+) -> Result<PqSession, String> {
+    let expected_peer_id: [u8; 32] = hex::decode(&endpoint.peer_id)
+        .map_err(|error| format!("invalid endpoint peer ID: {error}"))?
+        .try_into()
+        .map_err(|peer_id: Vec<u8>| {
+            format!("endpoint peer ID is {} bytes; expected 32", peer_id.len())
+        })?;
+    let (handshake, client_hello) =
+        PqClientHandshake::start().map_err(|error| error.to_string())?;
+    let client_hello = encode_pq_frame(&client_hello).map_err(|error| error.to_string())?;
+    send_data_channel_frame(&connection.data_channel, &client_hello, REQUEST_TIMEOUT_MS).await?;
+    let server_accept = read_pq_payload(
+        Rc::clone(&connection.inbox),
+        PQ_SERVER_ACCEPT_BYTES,
+        REQUEST_TIMEOUT_MS,
+    )
+    .await?;
+    handshake
+        .finish(&server_accept, &expected_peer_id)
+        .map_err(|error| error.to_string())
+}
+
+async fn send_data_channel_frame(
+    channel: &RtcDataChannel,
+    frame: &[u8],
+    timeout_ms: u32,
+) -> Result<(), String> {
+    let send_deadline_ms = js_sys::Date::now() + f64::from(timeout_ms);
+    for message in frame.chunks(WEBRTC_WRITE_CHUNK_BYTES) {
+        wait_for_capacity(channel, remaining_timeout_ms(send_deadline_ms)).await?;
+        channel
+            .send_with_u8_array(message)
+            .map_err(js_error_message)?;
+    }
+    Ok(())
+}
+
+async fn read_pq_payload(
     receiver: ResponseInbox,
+    max_payload_bytes: usize,
     initial_timeout_ms: u32,
-) -> Result<BrowserResponseFrame, String> {
+) -> Result<Vec<u8>, String> {
     let mut frame = Vec::with_capacity(8 * 1024);
     let mut expected_length = None;
     let response_started_ms = js_sys::Date::now();
@@ -2571,14 +2651,18 @@ async fn read_response(
             .len()
             .checked_add(message.len())
             .ok_or_else(|| "response length overflow".to_string())?;
-        if next_length > MAX_BROWSER_RESPONSE_BYTES {
+        let max_frame_bytes = max_payload_bytes
+            .checked_add(4)
+            .ok_or_else(|| "PQ frame limit overflow".to_string())?;
+        if next_length > max_frame_bytes {
             return Err(format!(
-                "response exceeded the {MAX_BROWSER_RESPONSE_BYTES}-byte client limit"
+                "PQ frame exceeded the {max_payload_bytes}-byte payload limit"
             ));
         }
         frame.extend_from_slice(&message);
         if expected_length.is_none() {
-            expected_length = response_frame_length(&frame).map_err(|error| error.to_string())?;
+            expected_length =
+                pq_frame_length(&frame, max_payload_bytes).map_err(|error| error.to_string())?;
             if let Some(expected) = expected_length {
                 response_deadline_ms = response_deadline_ms
                     .max(response_started_ms + f64::from(transfer_timeout_ms(expected)));
@@ -2586,10 +2670,11 @@ async fn read_response(
         }
         if let Some(expected) = expected_length {
             if frame.len() > expected {
-                return Err("response contains bytes after its declared frame".to_string());
+                return Err("PQ frame contains bytes after its declared payload".to_string());
             }
             if frame.len() == expected {
-                return parse_response_frame(&frame).map_err(|error| error.to_string());
+                return decode_pq_frame(&frame, max_payload_bytes)
+                    .map_err(|error| error.to_string());
             }
         }
     }

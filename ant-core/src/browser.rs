@@ -266,7 +266,7 @@ mod wasm {
     use super::payment::{payment_quote_hash, verify_storage_quote, BrowserQuoteArtifact};
     use super::protocol::{
         munge_offer_ice_credentials, parse_response_frame, parse_webrtc_direct_multiaddr,
-        server_answer_sdp, verify_hello_identity, BrowserEndpointInput, BrowserHello,
+        server_answer_sdp, BrowserEndpointInput,
     };
     use super::{
         chunk_infos, content_address, decrypt_public_file, encrypt_public_file, verify_record,
@@ -623,26 +623,6 @@ mod wasm {
             sdp,
         })
         .map_err(|error| JsValue::from_str(&error.to_string()))
-    }
-
-    /// Authenticate a node HELLO against its expected endpoint and challenge.
-    #[wasm_bindgen(js_name = verifyHelloIdentity)]
-    pub fn verify_hello_identity_wasm(
-        hello: JsValue,
-        endpoint: JsValue,
-        challenge: &[u8],
-    ) -> Result<String, JsValue> {
-        let hello: BrowserHello = serde_wasm_bindgen::from_value(hello)
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let input: BrowserEndpointInput = serde_wasm_bindgen::from_value(endpoint)
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let endpoint = parse_webrtc_direct_multiaddr(input.multiaddr())
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let challenge: [u8; 32] = challenge
-            .try_into()
-            .map_err(|_| JsValue::from_str("HELLO verification requires a 32-byte challenge"))?;
-        verify_hello_identity(&hello, &endpoint, &challenge)
-            .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Validate and normalize browser bootstrap and public-file metadata.
