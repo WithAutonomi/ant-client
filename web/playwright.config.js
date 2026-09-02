@@ -47,6 +47,10 @@ export default defineConfig({
     baseURL: "http://127.0.0.1:35173",
     browserName: "chromium",
     headless: true,
+    launchOptions: {
+      // Exercise the Chrome enforcement that rejects v1 ICE-credential munging.
+      args: ["--force-fieldtrials=WebRTC-NoSdpMangleUfrag/Enabled/"],
+    },
   },
   webServer: [
     {
