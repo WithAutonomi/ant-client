@@ -265,8 +265,8 @@ mod wasm {
     use super::manifest::parse_browser_manifest;
     use super::payment::{payment_quote_hash, verify_storage_quote, BrowserQuoteArtifact};
     use super::protocol::{
-        munge_offer_ice_credentials, parse_response_frame, parse_webrtc_direct_multiaddr,
-        server_answer_sdp, BrowserEndpointInput,
+        ice_password_from_sdp, parse_response_frame, parse_webrtc_direct_multiaddr,
+        server_answer_sdp, v2_server_ice_credential, BrowserEndpointInput,
     };
     use super::{
         chunk_infos, content_address, decrypt_public_file, encrypt_public_file, verify_record,
@@ -285,11 +285,6 @@ mod wasm {
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
-
-    #[derive(Debug, Deserialize)]
-    struct BrowserOffer {
-        sdp: String,
-    }
 
     #[derive(Debug, Serialize)]
     struct BrowserSessionDescription {
@@ -608,21 +603,12 @@ mod wasm {
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
-    /// Replace a browser offer's generated ICE credentials with Saorsa's profile.
-    #[wasm_bindgen(js_name = mungeOfferIceCredentials)]
-    pub fn munge_offer_ice_credentials_wasm(
-        offer: JsValue,
-        ice_credential: &str,
-    ) -> Result<JsValue, JsValue> {
-        let offer: BrowserOffer = serde_wasm_bindgen::from_value(offer)
+    /// Derive the v2 server ufrag from an unchanged browser local description.
+    #[wasm_bindgen(js_name = webRtcDirectV2ServerCredential)]
+    pub fn web_rtc_direct_v2_server_credential_wasm(local_sdp: &str) -> Result<String, JsValue> {
+        let password = ice_password_from_sdp(local_sdp)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let sdp = munge_offer_ice_credentials(&offer.sdp, ice_credential)
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        serde_wasm_bindgen::to_value(&BrowserSessionDescription {
-            description_type: "offer",
-            sdp,
-        })
-        .map_err(|error| JsValue::from_str(&error.to_string()))
+        v2_server_ice_credential(&password).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Validate and normalize browser bootstrap and public-file metadata.

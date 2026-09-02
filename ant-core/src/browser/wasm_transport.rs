@@ -7,11 +7,11 @@ use super::payment::{
     storage_payment_total, verify_storage_quote, BrowserQuoteArtifact, VerifiedStorageQuote,
 };
 use super::protocol::{
-    encode_request_frame, munge_offer_ice_credentials, parse_response_frame,
-    parse_webrtc_direct_multiaddr, server_answer_sdp, validate_hello_metadata, BrowserEndpoint,
-    BrowserEndpointInput, BrowserHello, BrowserProtocolError, BrowserResponseFrame,
-    WebRtcDirectEndpoint, MAX_BROWSER_RECORD_BYTES, MAX_BROWSER_RESPONSE_BYTES,
-    WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
+    encode_request_frame, ice_password_from_sdp, parse_response_frame,
+    parse_webrtc_direct_multiaddr, server_answer_sdp, v2_server_ice_credential,
+    validate_hello_metadata, BrowserEndpoint, BrowserEndpointInput, BrowserHello,
+    BrowserProtocolError, BrowserResponseFrame, WebRtcDirectEndpoint, MAX_BROWSER_RECORD_BYTES,
+    MAX_BROWSER_RESPONSE_BYTES, WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
 use super::{BrowserRecord, BrowserRecordInfo, BrowserStagedFile};
 use crate::client_engine::adaptive::{
@@ -52,8 +52,6 @@ use web_sys::{
 
 const REQUEST_TIMEOUT_MS: u32 = 10_000;
 const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
-const ICE_CREDENTIAL_PREFIX: &str = "saorsa+webrtc+v1/";
-const ICE_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const DEFAULT_MAX_POOLED_CLIENTS: usize = 32;
 const DEFAULT_LOOKUP_K: usize = 20;
 const DEFAULT_LOOKUP_ALPHA: usize = 3;
@@ -354,7 +352,6 @@ impl Connection {
             _on_open: on_open,
         };
 
-        let credential = random_ice_credential()?;
         let offer = JsFuture::from(connection.peer_connection.create_offer())
             .await
             .map_err(js_error_message)?;
@@ -367,15 +364,21 @@ impl Connection {
             .as_string()
             .filter(|sdp| !sdp.is_empty())
             .ok_or_else(|| "browser created an empty WebRTC offer".to_string())?;
-        let munged_sdp = munge_offer_ice_credentials(&offer_sdp, &credential)
-            .map_err(|error| error.to_string())?;
         let local = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
-        local.set_sdp(&munged_sdp);
+        local.set_sdp(&offer_sdp);
         JsFuture::from(connection.peer_connection.set_local_description(&local))
             .await
             .map_err(js_error_message)?;
+        let local_sdp = connection
+            .peer_connection
+            .local_description()
+            .ok_or_else(|| "browser did not retain its local WebRTC offer".to_string())?
+            .sdp();
+        let client_pwd = ice_password_from_sdp(&local_sdp).map_err(|error| error.to_string())?;
+        let server_credential =
+            v2_server_ice_credential(&client_pwd).map_err(|error| error.to_string())?;
         let answer_sdp =
-            server_answer_sdp(endpoint, &credential).map_err(|error| error.to_string())?;
+            server_answer_sdp(endpoint, &server_credential).map_err(|error| error.to_string())?;
         let remote = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
         remote.set_sdp(&answer_sdp);
         JsFuture::from(connection.peer_connection.set_remote_description(&remote))
@@ -2756,20 +2759,6 @@ fn remaining_timeout_ms(deadline_ms: f64) -> u32 {
     } else {
         remaining_ms as u32
     }
-}
-
-fn random_ice_credential() -> Result<String, String> {
-    let mut random = [0u8; 32];
-    getrandom::getrandom(&mut random)
-        .map_err(|error| format!("browser entropy failed: {error}"))?;
-    let mut credential = String::with_capacity(ICE_CREDENTIAL_PREFIX.len() + random.len());
-    credential.push_str(ICE_CREDENTIAL_PREFIX);
-    for byte in random {
-        credential.push(char::from(
-            ICE_ALPHABET[usize::from(byte) % ICE_ALPHABET.len()],
-        ));
-    }
-    Ok(credential)
 }
 
 fn js_error_message(value: JsValue) -> String {

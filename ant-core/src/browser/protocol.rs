@@ -402,9 +402,9 @@ pub fn validate_hello_metadata(
 /// Build the certificate-pinned ICE-lite SDP answer for a direct endpoint.
 pub fn server_answer_sdp(
     endpoint: &WebRtcDirectEndpoint,
-    ice_credential: &str,
+    server_ufrag: &str,
 ) -> Result<String, BrowserProtocolError> {
-    validate_ice_credential(ice_credential)?;
+    validate_v2_server_ufrag(server_ufrag)?;
     let ip_version = if endpoint.host_protocol == "ip4" {
         "IP4"
     } else {
@@ -420,58 +420,81 @@ pub fn server_answer_sdp(
         "v=0\r\no=- 0 0 IN {ip_version} {host}\r\ns=-\r\nt=0 0\r\na=ice-lite\r\nm=application {port} UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN {ip_version} {host}\r\na=mid:0\r\na=ice-options:ice2\r\na=ice-ufrag:{credential}\r\na=ice-pwd:{credential}\r\na=fingerprint:sha-256 {fingerprint}\r\na=setup:passive\r\na=sctp-port:5000\r\na=max-message-size:{WEBRTC_WRITE_CHUNK_BYTES}\r\na=candidate:1467250027 1 UDP 1467250027 {host} {port} typ host\r\na=end-of-candidates\r\n",
         host = endpoint.host,
         port = endpoint.port,
-        credential = ice_credential,
+        credential = server_ufrag,
     ))
 }
 
-/// Replace the browser-generated offer ICE credentials with Saorsa's shared credential.
-pub fn munge_offer_ice_credentials(
-    sdp: &str,
-    ice_credential: &str,
-) -> Result<String, BrowserProtocolError> {
-    validate_ice_credential(ice_credential)?;
+/// Read the effective browser-generated ICE password from a local SDP offer.
+pub fn ice_password_from_sdp(sdp: &str) -> Result<String, BrowserProtocolError> {
     if sdp.is_empty() {
         return Err(BrowserProtocolError::Frame(
             "browser created an empty WebRTC offer".to_string(),
         ));
     }
-    let sdp = replace_sdp_attribute(sdp, "a=ice-ufrag:", ice_credential)?;
-    replace_sdp_attribute(&sdp, "a=ice-pwd:", ice_credential)
+
+    let mut passwords = sdp
+        .lines()
+        .filter_map(|line| line.strip_prefix("a=ice-pwd:"));
+    let password = passwords.next().ok_or_else(|| {
+        BrowserProtocolError::Frame(
+            "browser local description did not contain an ICE password".to_string(),
+        )
+    })?;
+    if !is_valid_ice_pwd(password) {
+        return Err(BrowserProtocolError::Frame(
+            "browser local description contained an invalid ICE password".to_string(),
+        ));
+    }
+    if passwords.any(|other| other != password) {
+        return Err(BrowserProtocolError::Frame(
+            "browser local description contained multiple ICE passwords".to_string(),
+        ));
+    }
+    Ok(password.to_string())
 }
 
-fn replace_sdp_attribute(
-    sdp: &str,
-    prefix: &str,
-    value: &str,
-) -> Result<String, BrowserProtocolError> {
-    let start = sdp.find(prefix).ok_or_else(|| {
-        BrowserProtocolError::Frame("browser offer did not contain ICE credentials".to_string())
-    })?;
-    let value_start = start + prefix.len();
-    let value_end = sdp[value_start..]
-        .find(['\r', '\n'])
-        .map_or(sdp.len(), |offset| value_start + offset);
-    let mut output = String::with_capacity(sdp.len() + value.len());
-    output.push_str(&sdp[..value_start]);
-    output.push_str(value);
-    output.push_str(&sdp[value_end..]);
-    Ok(output)
-}
-
-fn validate_ice_credential(value: &str) -> Result<(), BrowserProtocolError> {
-    let suffix = value.strip_prefix("saorsa+webrtc+v1/").ok_or_else(|| {
-        BrowserProtocolError::Endpoint("invalid Saorsa WebRTC Direct ICE credential".to_string())
-    })?;
-    if !(22..=256).contains(&suffix.len())
-        || !suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
-    {
+/// Build the v2 server username fragment that carries the browser's ICE password.
+pub fn v2_server_ice_credential(client_pwd: &str) -> Result<String, BrowserProtocolError> {
+    if !is_valid_ice_pwd(client_pwd) {
         return Err(BrowserProtocolError::Endpoint(
-            "invalid Saorsa WebRTC Direct ICE credential".to_string(),
+            "invalid browser ICE password for WebRTC Direct v2".to_string(),
+        ));
+    }
+    let server_ufrag = format!("saorsa+webrtc+v2/{client_pwd}");
+    if !is_valid_ice_ufrag(&server_ufrag) {
+        return Err(BrowserProtocolError::Endpoint(
+            "browser ICE password is too long for WebRTC Direct v2".to_string(),
+        ));
+    }
+    Ok(server_ufrag)
+}
+
+fn validate_v2_server_ufrag(value: &str) -> Result<(), BrowserProtocolError> {
+    let client_pwd = value.strip_prefix("saorsa+webrtc+v2/").ok_or_else(|| {
+        BrowserProtocolError::Endpoint(
+            "unsupported Saorsa WebRTC Direct connection profile".to_string(),
+        )
+    })?;
+    if !is_valid_ice_ufrag(value) || !is_valid_ice_pwd(client_pwd) {
+        return Err(BrowserProtocolError::Endpoint(
+            "invalid Saorsa WebRTC Direct v2 ICE credential".to_string(),
         ));
     }
     Ok(())
+}
+
+fn is_ice_char_string(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+}
+
+fn is_valid_ice_ufrag(value: &str) -> bool {
+    (4..=256).contains(&value.len()) && is_ice_char_string(value)
+}
+
+fn is_valid_ice_pwd(value: &str) -> bool {
+    (22..=256).contains(&value.len()) && is_ice_char_string(value)
 }
 
 #[cfg(test)]
@@ -538,18 +561,30 @@ mod tests {
     }
 
     #[test]
-    fn synthesizes_pinned_answer_and_munges_offer() {
+    fn synthesizes_pinned_v2_answer_without_mutating_the_offer() {
         let endpoint = parse_webrtc_direct_multiaddr(&endpoint()).expect("parse endpoint");
-        let credential = format!("saorsa+webrtc+v1/{}", "a".repeat(32));
+        let offer = "v=0\r\na=ice-ufrag:browserUfrag\r\na=ice-pwd:browserClientPassword1234\r\n";
+        let password = ice_password_from_sdp(offer).expect("read ICE password");
+        assert_eq!(password, "browserClientPassword1234");
+        let credential = v2_server_ice_credential(&password).expect("v2 server credential");
         let answer = server_answer_sdp(&endpoint, &credential).expect("answer");
         assert!(answer.contains("a=ice-lite"));
         assert!(answer.contains("a=fingerprint:sha-256 11:11:11:11"));
-        let offer = munge_offer_ice_credentials(
-            "v=0\r\na=ice-ufrag:old\r\na=ice-pwd:secret\r\n",
-            &credential,
+        assert!(answer.contains(&format!("a=ice-ufrag:{credential}")));
+        assert!(answer.contains(&format!("a=ice-pwd:{credential}")));
+        assert!(offer.contains("a=ice-ufrag:browserUfrag"));
+        assert!(offer.contains("a=ice-pwd:browserClientPassword1234"));
+    }
+
+    #[test]
+    fn rejects_malformed_or_ambiguous_v2_ice_passwords() {
+        assert!(ice_password_from_sdp("v=0\r\n").is_err());
+        assert!(ice_password_from_sdp("a=ice-pwd:too-short\r\n").is_err());
+        assert!(ice_password_from_sdp(
+            "a=ice-pwd:browserClientPassword1234\r\na=ice-pwd:differentBrowserPassword12\r\n"
         )
-        .expect("offer");
-        assert!(offer.contains(&format!("a=ice-ufrag:{credential}")));
-        assert!(offer.contains(&format!("a=ice-pwd:{credential}")));
+        .is_err());
+        assert!(v2_server_ice_credential(&format!("{}\r\na=candidate:x", "a".repeat(22))).is_err());
+        assert!(v2_server_ice_credential(&"a".repeat(240)).is_err());
     }
 }
