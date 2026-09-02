@@ -3,11 +3,11 @@ import test from "node:test";
 import {
   BrowserNetworkClient,
   BrowserNodeClient,
-  mungeOfferIceCredentials,
   parseResponseFrame,
   parseWebRtcDirectMultiaddr,
   paymentQuoteHash,
   serverAnswerFromEndpoint,
+  webRtcDirectV2ServerCredential,
 } from "../pkg/ant_core.js";
 
 test("Rust/WASM parses stable certificate-pinned WebRTC Direct addresses", () => {
@@ -37,7 +37,7 @@ test("Rust/WASM parses stable certificate-pinned WebRTC Direct addresses", () =>
 test("Rust/WASM validates response framing with a raw binary body", () => {
   const header = new TextEncoder().encode(
     JSON.stringify({
-      version: 3,
+      version: 4,
       request_id: 9,
       status: "ok",
       content_length: 3,
@@ -56,11 +56,17 @@ test("Rust/WASM validates response framing with a raw binary body", () => {
   assert.deepEqual([...parsed.content], [1, 2, 3]);
 });
 
-test("Rust/WASM synthesizes the pinned answer and shared ICE credentials", () => {
+test("Rust/WASM synthesizes a pinned v2 answer without mutating local SDP", () => {
   const endpoint = webRtcDirectMultiaddr("ab".repeat(32), 0x11);
-  const credential = `saorsa+webrtc+v1/${"a".repeat(32)}`;
+  const offerSdp =
+    "v=0\r\na=ice-ufrag:browserUfrag\r\na=ice-pwd:browserClientPassword1234\r\n";
+  const credential = webRtcDirectV2ServerCredential(offerSdp);
   const answer = serverAnswerFromEndpoint(endpoint, credential);
 
+  assert.equal(
+    credential,
+    "saorsa+webrtc+v2/browserClientPassword1234",
+  );
   assert.equal(answer.type, "answer");
   assert.match(answer.sdp, /a=ice-lite/);
   assert.match(
@@ -68,16 +74,13 @@ test("Rust/WASM synthesizes the pinned answer and shared ICE credentials", () =>
     /m=application 24000 UDP\/DTLS\/SCTP webrtc-datachannel/,
   );
   assert.match(answer.sdp, /a=fingerprint:sha-256 11:11:11:11/);
-
-  const offer = mungeOfferIceCredentials(
-    {
-      type: "offer",
-      sdp: "v=0\r\na=ice-ufrag:old\r\na=ice-pwd:secret\r\n",
-    },
-    credential,
+  assert.match(
+    answer.sdp,
+    new RegExp(`a=ice-ufrag:${escapeRegex(credential)}`),
   );
-  assert.match(offer.sdp, new RegExp(`a=ice-ufrag:${escapeRegex(credential)}`));
-  assert.match(offer.sdp, new RegExp(`a=ice-pwd:${escapeRegex(credential)}`));
+  assert.match(answer.sdp, new RegExp(`a=ice-pwd:${escapeRegex(credential)}`));
+  assert.match(offerSdp, /a=ice-ufrag:browserUfrag/);
+  assert.match(offerSdp, /a=ice-pwd:browserClientPassword1234/);
 });
 
 test("Rust/WASM uses the native EVM PaymentQuote Keccak hash", () => {
