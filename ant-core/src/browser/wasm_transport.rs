@@ -9,8 +9,9 @@ use super::payment::{
 use super::protocol::{
     encode_request_frame, ice_password_from_sdp, parse_response_frame,
     parse_webrtc_direct_multiaddr, server_answer_sdp, v2_server_ice_credential,
-    validate_hello_metadata, BrowserEndpoint, BrowserEndpointInput, BrowserHello,
-    BrowserProtocolError, BrowserResponseFrame, WebRtcDirectEndpoint, MAX_BROWSER_RECORD_BYTES,
+    validate_hello_metadata, BrowserEndpoint, BrowserEndpointInput, BrowserHello, BrowserNode,
+    BrowserRequest, BrowserRequestBody, BrowserResponseBody, BrowserResponseFrame,
+    BrowserResponseStatus, WebRtcDirectEndpoint, MAX_BROWSER_RECORD_BYTES,
     MAX_BROWSER_RESPONSE_BYTES, WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
 use super::{BrowserRecord, BrowserRecordInfo, BrowserStagedFile};
@@ -35,7 +36,6 @@ use saorsa_dht_lookup::{
     LookupConfig, LookupKey, LookupNode, LookupQuery, LookupQueryOutcome,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -66,17 +66,6 @@ const MAX_BROWSER_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 type ResponseInbox = Rc<Mutex<mpsc::UnboundedReceiver<Result<Vec<u8>, String>>>>;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct BrowserNode {
-    pub(super) peer_id: String,
-    #[serde(default)]
-    pub(super) native_addresses: Vec<String>,
-    #[serde(default)]
-    pub(super) reliability: f64,
-    #[serde(default)]
-    pub(super) webrtc_direct: Option<BrowserEndpoint>,
-}
 
 #[derive(Debug, Serialize)]
 struct BrowserLookupResult {
@@ -243,39 +232,6 @@ struct BrowserQuoteResponse {
 struct BrowserPutResponse {
     address: String,
     #[serde(rename = "alreadyStored")]
-    already_stored: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct NodesResponse {
-    #[serde(rename = "type")]
-    response_type: String,
-    target: String,
-    nodes: Vec<BrowserNode>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChunkResponse {
-    #[serde(rename = "type")]
-    response_type: String,
-    address: String,
-    size: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct QuoteResponse {
-    #[serde(rename = "type")]
-    response_type: String,
-    address: String,
-    already_stored: bool,
-    quote: BrowserQuoteArtifact,
-}
-
-#[derive(Debug, Deserialize)]
-struct PutResponse {
-    #[serde(rename = "type")]
-    response_type: String,
-    address: String,
     already_stored: bool,
 }
 
@@ -459,16 +415,16 @@ impl BrowserNodeClientCore {
 
     async fn request(
         &self,
-        request_type: &str,
-        fields: Map<String, Value>,
+        body: BrowserRequestBody,
         content: &[u8],
     ) -> Result<BrowserResponseFrame, String> {
         let _guard = self.request_lock.lock().await;
         self.ensure_connected().await?;
         let request_id = self.next_request_id.get();
         self.next_request_id.set(request_id.wrapping_add(1).max(1));
-        let plaintext = encode_request_frame(request_id, request_type, fields, content)
-            .map_err(|error| error.to_string())?;
+        let request = BrowserRequest::new(request_id, body, content.len());
+        let plaintext =
+            encode_request_frame(&request, content).map_err(|error| error.to_string())?;
         let frame = {
             let connection = self.connection.borrow();
             let connection = connection
@@ -548,23 +504,21 @@ impl BrowserNodeClientCore {
                 return Err(error.to_string());
             }
         };
-        if response.header.get("request_id").and_then(Value::as_u64) != Some(request_id) {
+        if response.header.request_id != request_id {
             let error = format!(
                 "response ID {} does not match request {request_id}",
-                response.header.get("request_id").unwrap_or(&Value::Null)
+                response.header.request_id
             );
             self.close();
             return Err(error);
         }
-        if response.header.get("status").and_then(Value::as_str) == Some("error") {
-            let authentication_required = response.header.get("code").and_then(Value::as_str)
-                == Some("authentication_required");
-            let error = response
-                .header
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("node returned an error")
-                .to_string();
+        if response.header.status == BrowserResponseStatus::Error {
+            let (authentication_required, error) = match &response.header.body {
+                BrowserResponseBody::Error { code, message } => {
+                    (code == "authentication_required", message.clone())
+                }
+                _ => (false, "node returned an invalid error response".to_string()),
+            };
             if authentication_required {
                 self.close();
             }
@@ -581,13 +535,27 @@ impl BrowserNodeClientCore {
                 return Ok(hello);
             }
         }
-        let response = self.request("hello", Map::new(), &[]).await?;
-        let hello: BrowserHello = match serde_json::from_value(response.header) {
-            Ok(hello) => hello,
-            Err(error) => {
-                self.close();
-                return Err(format!("invalid HELLO response: {error}"));
-            }
+        let response = self.request(BrowserRequestBody::Hello, &[]).await?;
+        let BrowserResponseBody::Hello {
+            protocol,
+            peer_id,
+            max_chunk_size,
+            endpoint,
+            payment,
+            capabilities,
+        } = response.header.body
+        else {
+            self.close();
+            return Err("expected a HELLO response".to_string());
+        };
+        let hello = BrowserHello {
+            response_type: "hello".to_string(),
+            protocol,
+            peer_id,
+            endpoint,
+            max_chunk_size,
+            capabilities,
+            payment,
         };
         let peer_id = match validate_hello_metadata(&hello, &self.endpoint) {
             Ok(peer_id) => peer_id,
@@ -607,19 +575,26 @@ impl BrowserNodeClientCore {
         count: usize,
     ) -> Result<Vec<BrowserNode>, String> {
         let target = super::protocol::normalize_hex(target, 32)?;
-        let mut fields = Map::new();
-        fields.insert("target".to_string(), Value::from(target.clone()));
-        fields.insert("count".to_string(), Value::from(count));
-        let response = self.request("find_node", fields, &[]).await?;
-        let response: NodesResponse = serde_json::from_value(response.header)
-            .map_err(|error| format!("invalid NODES response: {error}"))?;
-        if response.response_type != "nodes" {
+        let response = self
+            .request(
+                BrowserRequestBody::FindNode {
+                    target: target.clone(),
+                    count: Some(count),
+                },
+                &[],
+            )
+            .await?;
+        let BrowserResponseBody::Nodes {
+            target: response_target,
+            nodes,
+        } = response.header.body
+        else {
             return Err("expected a NODES response".to_string());
-        }
-        if response.target.to_ascii_lowercase() != target {
+        };
+        if response_target.to_ascii_lowercase() != target {
             return Err("node returned results for a different lookup target".to_string());
         }
-        for node in &response.nodes {
+        for node in &nodes {
             let peer_id = super::protocol::normalize_hex(&node.peer_id, 32)?;
             if let Some(endpoint) = &node.webrtc_direct {
                 let endpoint = parse_webrtc_direct_multiaddr(&endpoint.multiaddr)
@@ -629,26 +604,33 @@ impl BrowserNodeClientCore {
                 }
             }
         }
-        Ok(response.nodes)
+        Ok(nodes)
     }
 
     pub(super) async fn get_chunk(&self, address: &str) -> Result<(Vec<u8>, String), String> {
         let address = super::protocol::normalize_hex(address, 32)?;
-        let mut fields = Map::new();
-        fields.insert("address".to_string(), Value::from(address.clone()));
-        let response = self.request("get_chunk", fields, &[]).await?;
-        if response.header.get("status").and_then(Value::as_str) == Some("not_found") {
+        let response = self
+            .request(
+                BrowserRequestBody::GetChunk {
+                    address: address.clone(),
+                },
+                &[],
+            )
+            .await?;
+        if response.header.status == BrowserResponseStatus::NotFound {
             return Err(format!("chunk {address} was not found on this node"));
         }
-        let header: ChunkResponse = serde_json::from_value(response.header)
-            .map_err(|error| format!("invalid CHUNK response: {error}"))?;
-        if header.response_type != "chunk" {
+        let BrowserResponseBody::Chunk {
+            address: response_address,
+            size,
+        } = response.header.body
+        else {
             return Err("expected a CHUNK response".to_string());
-        }
-        if header.address.to_ascii_lowercase() != address {
+        };
+        if response_address.to_ascii_lowercase() != address {
             return Err("node returned a different chunk address".to_string());
         }
-        if header.size != response.content.len() {
+        if size != response.content.len() {
             return Err("chunk metadata size does not match its content".to_string());
         }
         super::verify_record(&address, &response.content).map_err(|error| error.to_string())?;
@@ -664,19 +646,27 @@ impl BrowserNodeClientCore {
         if size > super::protocol::MAX_BROWSER_RECORD_BYTES {
             return Err(format!("invalid chunk size {size}"));
         }
-        let mut fields = Map::new();
-        fields.insert("address".to_string(), Value::from(address.clone()));
-        fields.insert("size".to_string(), Value::from(size));
-        let response = self.request("quote_chunk", fields, &[]).await?;
-        let header: QuoteResponse = serde_json::from_value(response.header)
-            .map_err(|error| format!("invalid STORAGE_QUOTE response: {error}"))?;
-        if header.response_type != "storage_quote" {
+        let response = self
+            .request(
+                BrowserRequestBody::QuoteChunk {
+                    address: address.clone(),
+                    size: u64::try_from(size).map_err(|_| format!("invalid chunk size {size}"))?,
+                },
+                &[],
+            )
+            .await?;
+        let BrowserResponseBody::StorageQuote {
+            address: response_address,
+            already_stored,
+            quote,
+        } = response.header.body
+        else {
             return Err("expected a STORAGE_QUOTE response".to_string());
-        }
-        if header.address.to_ascii_lowercase() != address {
+        };
+        if response_address.to_ascii_lowercase() != address {
             return Err("node returned a quote for a different chunk address".to_string());
         }
-        Ok((header.quote, header.already_stored))
+        Ok((quote, already_stored))
     }
 
     pub(super) async fn put_chunk(
@@ -689,26 +679,27 @@ impl BrowserNodeClientCore {
         let address = super::protocol::normalize_hex(address, 32)?;
         let transaction_hash = super::protocol::normalize_hex(transaction_hash, 32)?;
         super::verify_record(&address, content).map_err(|error| error.to_string())?;
-        let mut fields = Map::new();
-        fields.insert("address".to_string(), Value::from(address.clone()));
-        fields.insert(
-            "quote".to_string(),
-            serde_json::to_value(quote).map_err(|error| error.to_string())?,
-        );
-        fields.insert(
-            "transaction_hash".to_string(),
-            Value::from(transaction_hash),
-        );
-        let response = self.request("put_chunk", fields, content).await?;
-        let header: PutResponse = serde_json::from_value(response.header)
-            .map_err(|error| format!("invalid CHUNK_STORED response: {error}"))?;
-        if header.response_type != "chunk_stored" {
+        let response = self
+            .request(
+                BrowserRequestBody::PutChunk {
+                    address: address.clone(),
+                    quote: Box::new(quote),
+                    transaction_hash,
+                },
+                content,
+            )
+            .await?;
+        let BrowserResponseBody::ChunkStored {
+            address: response_address,
+            already_stored,
+        } = response.header.body
+        else {
             return Err("expected a CHUNK_STORED response".to_string());
-        }
-        if header.address.to_ascii_lowercase() != address {
+        };
+        if response_address.to_ascii_lowercase() != address {
             return Err("node stored a different chunk address".to_string());
         }
-        Ok((address, header.already_stored))
+        Ok((address, already_stored))
     }
 
     pub(super) fn close(&self) {
@@ -2458,8 +2449,7 @@ fn assert_upload_node(
     {
         return Err("node does not advertise paid browser uploads".to_string());
     }
-    let advertised: BrowserPaymentNetwork = serde_json::from_value(hello.payment.clone())
-        .map_err(|error| format!("node advertises invalid payment configuration: {error}"))?;
+    let advertised = &hello.payment;
     let advertised_rpc = url::Url::parse(&advertised.rpc_url)
         .map_err(|error| format!("node advertises invalid payment RPC URL: {error}"))?;
     let expected_rpc = url::Url::parse(&expected.rpc_url)
@@ -2770,10 +2760,4 @@ fn js_error_message(value: JsValue) -> String {
                 .as_string()
         })
         .unwrap_or_else(|| format!("browser WebRTC operation failed: {value:?}"))
-}
-
-impl From<BrowserProtocolError> for JsValue {
-    fn from(error: BrowserProtocolError) -> Self {
-        JsValue::from_str(&error.to_string())
-    }
 }
