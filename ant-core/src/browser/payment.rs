@@ -1,6 +1,7 @@
 //! Verification and payment planning shared by native and browser clients.
 
 use super::protocol::normalize_hex;
+pub use super::protocol::{BrowserCommitmentArtifact, BrowserQuoteArtifact};
 use ant_protocol::crypto::verify_ml_dsa_65;
 use ant_protocol::payment::{
     calculate_price_wei, commitment_hash, payment_quote_bytes_for_signing,
@@ -14,50 +15,6 @@ pub use ant_protocol::payment::payment_quote_hash;
 const PAYMENT_MULTIPLIER: u128 = 3;
 #[cfg(test)]
 const PRICE_BASELINE_WEI: u128 = 3_906_250_000_000_000;
-
-/// JSON-safe form of a node's signed storage commitment.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrowserCommitmentArtifact {
-    /// MessagePack-encoded native commitment.
-    pub encoded: String,
-    /// Merkle root.
-    pub root: String,
-    /// Number of committed keys.
-    pub key_count: u32,
-    /// Signing peer ID.
-    pub sender_peer_id: String,
-    /// ML-DSA-65 public key.
-    pub sender_public_key: String,
-    /// ML-DSA-65 signature.
-    pub signature: String,
-}
-
-/// JSON-safe form of the native EVM payment quote returned over WebRTC.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrowserQuoteArtifact {
-    /// Quoting node peer ID.
-    pub peer_id: String,
-    /// Content address being quoted.
-    pub content: String,
-    /// Quote timestamp in seconds since the Unix epoch.
-    pub timestamp_secs: u64,
-    /// Decimal token price.
-    pub price: String,
-    /// Twenty-byte node rewards address.
-    pub rewards_address: String,
-    /// ML-DSA-65 public key.
-    pub public_key: String,
-    /// ML-DSA-65 signature.
-    pub signature: String,
-    /// Storage commitment key count used by the pricing curve.
-    pub committed_key_count: u32,
-    /// Optional pinned storage commitment.
-    pub commitment_pin: Option<String>,
-    /// Keccak-256 EVM payment quote hash.
-    pub quote_hash: String,
-    /// Optional resolved native storage commitment.
-    pub commitment: Option<BrowserCommitmentArtifact>,
-}
 
 /// A quote that is safe to hand to a transaction signer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

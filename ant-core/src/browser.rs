@@ -12,14 +12,13 @@ pub mod protocol;
 
 pub use manifest::{
     parse_browser_manifest, validate_browser_payment_network, BrowserManifest,
-    BrowserManifestEndpoint, BrowserPaymentNetwork, PublicFileDescriptor, BROWSER_MANIFEST_VERSION,
+    BrowserManifestEndpoint, PublicFileDescriptor, BROWSER_MANIFEST_VERSION,
 };
-pub use payment::{
-    storage_payment_total, verify_storage_quote, BrowserQuoteArtifact, VerifiedStorageQuote,
-};
+pub use payment::{storage_payment_total, verify_storage_quote, VerifiedStorageQuote};
 pub use protocol::{
-    parse_webrtc_direct_multiaddr, WebRtcDirectEndpoint, BROWSER_PROTOCOL_NAME,
-    BROWSER_PROTOCOL_VERSION, WEBRTC_DIRECT_DATA_CHANNEL,
+    parse_webrtc_direct_multiaddr, BrowserPaymentNetwork, BrowserQuoteArtifact,
+    WebRtcDirectEndpoint, BROWSER_PROTOCOL_NAME, BROWSER_PROTOCOL_VERSION,
+    WEBRTC_DIRECT_DATA_CHANNEL,
 };
 
 #[cfg(all(target_arch = "wasm32", feature = "browser-wasm"))]

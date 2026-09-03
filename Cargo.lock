@@ -956,8 +956,9 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.1"
-source = "git+https://github.com/WithAutonomi/ant-protocol.git?rev=4dad14b6947b6264e0b5982c976a385f9fdac9e0#4dad14b6947b6264e0b5982c976a385f9fdac9e0"
+source = "git+https://github.com/WithAutonomi/ant-protocol.git?rev=8d2fac7355489bd075e88f51c63dd9acc981c91b#8d2fac7355489bd075e88f51c63dd9acc981c91b"
 dependencies = [
+ "base64",
  "blake3",
  "bytes",
  "chacha20poly1305",
@@ -971,6 +972,9 @@ dependencies = [
  "saorsa-core",
  "saorsa-pqc 0.5.1",
  "serde",
+ "serde_bytes",
+ "serde_json",
+ "thiserror 2.0.18",
  "tiny-keccak",
  "tokio",
  "tracing",

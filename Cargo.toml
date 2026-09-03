@@ -3,6 +3,6 @@ members = ["ant-core", "ant-cli"]
 resolver = "2"
 
 [patch.crates-io]
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol.git", rev = "4dad14b6947b6264e0b5982c976a385f9fdac9e0" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol.git", rev = "8d2fac7355489bd075e88f51c63dd9acc981c91b" }
 saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core.git", rev = "1432fa9751d46887dc86767928bd3320a24c6367" }
 saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "2c6e23cd6cd4db79f475676e25af9334a044a343" }
