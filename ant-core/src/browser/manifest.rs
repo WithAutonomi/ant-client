@@ -1,5 +1,6 @@
 //! Cross-platform validation for browser bootstrap and public-file metadata.
 
+pub use super::protocol::BrowserPaymentNetwork;
 use super::protocol::{normalize_hex, parse_webrtc_direct_multiaddr, BrowserEndpoint};
 use super::BrowserChunkInfo;
 use serde::{Deserialize, Serialize};
@@ -11,17 +12,6 @@ const MAX_FILE_CHUNKS: usize = 1024;
 
 /// A validated WebRTC Direct bootstrap endpoint.
 pub type BrowserManifestEndpoint = BrowserEndpoint;
-
-/// Public EVM configuration required to pay for storage.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BrowserPaymentNetwork {
-    /// HTTP(S) JSON-RPC endpoint.
-    pub rpc_url: String,
-    /// ERC-20 payment token contract.
-    pub payment_token_address: String,
-    /// Autonomi payment vault contract.
-    pub payment_vault_address: String,
-}
 
 /// Complete public-file metadata shared by native tooling and the web client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
