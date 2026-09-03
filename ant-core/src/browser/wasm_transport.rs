@@ -37,7 +37,7 @@ use saorsa_dht_lookup::{
 };
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Deref;
 use std::rc::Rc;
@@ -110,14 +110,47 @@ struct BrowserClientPool {
     max_clients: usize,
     clients: RefCell<HashMap<String, PoolEntry>>,
     clock: Cell<u64>,
-    closed: Cell<bool>,
-    available_tx: mpsc::UnboundedSender<()>,
-    available_rx: Mutex<mpsc::UnboundedReceiver<()>>,
+    availability: Rc<PoolAvailability>,
 }
 
 struct BrowserClientLease {
     client: Rc<BrowserNodeClientCore>,
-    available_tx: mpsc::UnboundedSender<()>,
+    availability: Rc<PoolAvailability>,
+}
+
+#[derive(Default)]
+struct PoolAvailability {
+    closed: Cell<bool>,
+    waiters: RefCell<VecDeque<oneshot::Sender<()>>>,
+}
+
+impl PoolAvailability {
+    async fn wait(&self) -> Result<(), String> {
+        if self.closed.get() {
+            return Err("WebRTC client pool is closed".to_string());
+        }
+        let (sender, receiver) = oneshot::channel();
+        self.waiters.borrow_mut().push_back(sender);
+        receiver
+            .await
+            .map_err(|_| "WebRTC client pool closed while waiting for capacity".to_string())
+    }
+
+    fn notify_one(&self) {
+        if self.closed.get() {
+            return;
+        }
+        while let Some(waiter) = self.waiters.borrow_mut().pop_front() {
+            if waiter.send(()).is_ok() {
+                break;
+            }
+        }
+    }
+
+    fn close(&self) {
+        self.closed.set(true);
+        self.waiters.borrow_mut().clear();
+    }
 }
 
 impl Deref for BrowserClientLease {
@@ -130,7 +163,7 @@ impl Deref for BrowserClientLease {
 
 impl Drop for BrowserClientLease {
     fn drop(&mut self) {
-        let _ = self.available_tx.unbounded_send(());
+        self.availability.notify_one();
     }
 }
 
@@ -139,14 +172,11 @@ impl BrowserClientPool {
         if max_clients == 0 {
             return Err("WebRTC client pool size must be a positive integer".to_string());
         }
-        let (available_tx, available_rx) = mpsc::unbounded();
         Ok(Self {
             max_clients,
             clients: RefCell::new(HashMap::new()),
             clock: Cell::new(0),
-            closed: Cell::new(false),
-            available_tx,
-            available_rx: Mutex::new(available_rx),
+            availability: Rc::new(PoolAvailability::default()),
         })
     }
 
@@ -155,7 +185,7 @@ impl BrowserClientPool {
             .map_err(|error| error.to_string())?;
         let key = endpoint.multiaddr.clone();
         loop {
-            if self.closed.get() {
+            if self.availability.closed.get() {
                 return Err("WebRTC client pool is closed".to_string());
             }
             let now = self.clock.get().wrapping_add(1);
@@ -196,18 +226,15 @@ impl BrowserClientPool {
             if let Some(client) = client {
                 return Ok(BrowserClientLease {
                     client,
-                    available_tx: self.available_tx.clone(),
+                    availability: Rc::clone(&self.availability),
                 });
             }
-            if self.available_rx.lock().await.next().await.is_none() {
-                return Err("WebRTC client pool closed while waiting for capacity".to_string());
-            }
+            self.availability.wait().await?;
         }
     }
 
     fn close(&self) {
-        self.closed.set(true);
-        self.available_tx.close_channel();
+        self.availability.close();
         for (_, entry) in self.clients.borrow_mut().drain() {
             entry.client.close();
         }
