@@ -3,8 +3,8 @@
 //! The manifest, protocol, payment, and immutable-data modules are portable
 //! Rust shared by native clients and the browser WASM package. The
 //! `browser-wasm` feature additionally provides the `web-sys` WebRTC Direct
-//! host adapter; only DOM, file-save, and wallet transaction submission remain
-//! in JavaScript.
+//! host adapter. Higher-level browser integration is owned by the companion
+//! `ant-client-browser-sdk` project.
 
 pub mod manifest;
 pub mod payment;
@@ -30,7 +30,7 @@ use self_encryption::{DataMap, EncryptedChunk};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-/// Maximum file size accepted by the browser demo (1 GB decimal).
+/// Maximum file size accepted by the browser API (1 GB decimal).
 ///
 /// The page upload path streams through a worker and browser storage. Complete
 /// downloads and the legacy whole-buffer encryption binding remain memory-bound.
@@ -107,7 +107,7 @@ pub struct BrowserEncryptedFile {
 /// Browser immutable-data processing error.
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserError {
-    /// Input did not satisfy the browser demo limits.
+    /// Input did not satisfy the browser API limits.
     #[error("invalid browser data: {0}")]
     Invalid(String),
     /// Native self-encryption failed.

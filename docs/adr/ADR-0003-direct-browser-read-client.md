@@ -2,242 +2,186 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-08-25
+- **Last amended:** 2026-09-03
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** ant-node ADR-0009; Saorsa WebRTC Direct transport
+- **Related:** ant-node ADR-0009; Saorsa WebRTC Direct transport; ant-client-browser-sdk
 
 ## Context
 
-The Autonomi web client must perform closest-node lookup, immutable-data
-download, quote verification, payment, and upload itself. Sending those
-operations through an HTTP application gateway would make the gateway an
-availability, privacy, and bandwidth chokepoint.
-Browsers cannot use the native Saorsa QUIC protocol, but they can dial
-Saorsa-owned WebRTC Direct listeners over ICE-lite, DTLS, SCTP, and
-DataChannels without a signaling server or a libp2p layer.
+Browser applications must perform closest-node lookup, immutable-data transfer,
+quote verification, payment planning, and storage without routing file bytes
+through an HTTP application gateway. A gateway would become an availability,
+privacy, and bandwidth chokepoint.
 
-This repository owns the client and UI side of that split. Nodes own transport
-termination, local DHT answers, storage reads and paid writes, endpoint
-records, and testnet bootstrap-manifest production under ant-node ADR-0009.
+Browsers cannot use the native Saorsa QUIC transport, but they can connect to
+Saorsa WebRTC Direct listeners through ICE-lite, certificate-pinned DTLS, SCTP,
+and reliable ordered DataChannels. The reusable Autonomi behavior belongs in
+`ant-core`; browser application integration belongs in the separate
+`ant-client-browser-sdk` project.
 
 ## Decision Drivers
 
-- File bytes must travel directly from a storage node to the browser.
-- The browser must own iterative XOR lookup rather than ask a gateway to do it.
-- A bootstrap list must remain usable for months: each node therefore persists
-  its self-signed DTLS certificate and embeds one stable fingerprint in its
-  self-contained multiaddress.
-- Bootstrap endpoints must use literal IP addresses. Running a node must not
-  require DNS, a public CA certificate, an HTTPS endpoint, or a signaling
-  service.
-- Downloaded immutable content must be verified before it is exposed to users.
-- The wallet secret must be provided at runtime, used only by the local EVM
-  signer, and never sent to a node or persisted in bootstrap metadata.
-- Local testnets need a reproducible bootstrap and default-file workflow.
-- Compatibility-sensitive file processing should be shared with the Rust
-  client instead of being independently reimplemented in JavaScript.
+- File bytes must travel directly between storage nodes and the browser.
+- The client must perform iterative XOR lookup instead of delegating it to a
+  gateway.
+- Compatibility-sensitive networking, self-encryption, quote verification,
+  payment planning, and storage policy must be implemented in shared Rust.
+- Existing native `ant-core` and `ant-cli` callers must remain source-compatible.
+- Browser UI, wallet, file, worker, IndexedDB, and service-worker choices must
+  not become part of the low-level Rust crate.
+- Generated WASM bindings must be tested independently of any particular SDK or
+  demo application.
 
 ## Considered Options
 
-1. **Use the daemon REST API as a data gateway.** Rejected for lookup and file
-   bytes because it would not exercise a full browser client.
-2. **Compile the complete native Rust client to WebAssembly.** Deferred because
-   the native transport, EVM provider, Tokio, and filesystem dependency graph
-   is not currently browser-compatible.
-3. **Use a Rust/WASM data core with thin JavaScript browser adapters
-   (chosen).** Compile the portable immutable-data part of `ant-core` to WASM
-   while retaining JavaScript only where browser APIs or currently
-   native-only dependencies require it.
+1. **Use the daemon REST API as a data gateway.** Rejected because lookup and
+   file bytes would no longer be direct.
+2. **Compile the complete native client unchanged to WebAssembly.** Rejected for
+   now because its Tokio, filesystem, native QUIC, daemon, and native EVM
+   dependencies are not browser-compatible.
+3. **Keep an application and JavaScript protocol implementation in this
+   repository.** Rejected because the newer browser SDK owns that layer and a
+   second application implementation would drift.
+4. **Expose a Rust/WASM client core and keep browser integration in the SDK
+   (chosen).**
 
 ## Decision
 
-`ant-core` has two build surfaces. Its default `native` feature preserves the
-existing native library. A `wasm32-unknown-unknown` build with
-`--no-default-features --features browser-wasm` excludes node management,
-native transport, Tokio, filesystem, and native EVM-provider dependencies and
-exports browser-safe immutable-data operations through `wasm-bindgen`.
+`ant-core` retains its default `native` feature. Building for
+`wasm32-unknown-unknown` with `--no-default-features --features browser-wasm`
+selects a browser-safe dependency graph and exports the low-level browser API
+through `wasm-bindgen`. Native callers and `ant-cli` continue to use the
+existing native facade and QUIC transport.
 
-The Rust/WASM core will:
+### Responsibilities of ant-core
 
-- run iterative closest-node lookup through Saorsa's transport-independent
-  `run_iterative_lookup` driver and `LookupQuery` interface;
-- self-encrypt complete public files with the same `self_encryption 0.36`
-  implementation used by the Rust client;
-- encode and decode the native MessagePack `DataMap` representation;
-- calculate and verify BLAKE3 content addresses;
-- verify every encrypted record against its DataMap destination address; and
-- authenticate, decompress, and reconstruct complete public files; and
-- resolve nested DataMaps and decrypt bounded plaintext byte ranges after
-  asynchronously retrieving only the overlapping encrypted records.
+The Rust/WASM implementation owns:
 
-The `web/` package will remain responsible for browser-specific orchestration:
+- canonical WebRTC Direct multiaddress parsing, including the literal IP, UDP
+  port, DTLS certificate fingerprint, and expected ANT peer ID;
+- browser `RTCPeerConnection` and ordered `RTCDataChannel` management through
+  `web-sys`, including framing, fragmentation, backpressure, deadlines, and
+  bounded connection reuse;
+- authenticated protocol-v4 session establishment using ephemeral ML-KEM-768,
+  ML-DSA-65 transcript authentication, peer-ID/public-key binding, independent
+  direction keys, and ordered ChaCha20-Poly1305 records from `ant-protocol`;
+- iterative closest-node lookup through Saorsa's shared
+  transport-independent lookup runner;
+- authenticated discovery of additional WebRTC Direct node addresses;
+- public DataMap resolution, nested DataMap handling, chunk retrieval,
+  reconstruction, range decryption, and BLAKE3 verification;
+- incremental self-encryption and content-addressed record generation using the
+  same `self_encryption` implementation and MessagePack DataMap representation
+  as the native client;
+- signed storage-quote and commitment verification, price calculation, and
+  payment-plan construction using portable `ant-protocol` types;
+- paid record upload with the shared adaptive scheduler, bounded in-flight
+  bytes, close-group quorum, fallback targets, and whole-record retries; and
+- the bounded `BrowserFileReader` used by range-oriented consumers.
 
-- load a versioned browser bootstrap manifest containing WebRTC Direct
-  multiaddresses and published immutable-file metadata;
-- accept one canonical multiaddress per seed, extract its single `/certhash`
-  SHA-256 multihash internally, and construct a native browser
-  `RTCPeerConnection` description from its literal IP and UDP port;
-- open one persistent reliable ordered `RTCDataChannel` per association and
-  exchange bounded, declared-length request/response frames directly, without
-  Noise, multistream negotiation, or libp2p stream envelopes;
-- reuse authenticated associations through a bounded client pool for the
-  duration of a complete upload or download instead of opening a new peer
-  connection for every encrypted record;
-- require `/p2p/<peer-id>` in every address, verify the challenge-bound ML-DSA
-  `HELLO` signature, and reject certificate, endpoint, or peer mismatches;
-- execute each WebRTC Direct `FIND_NODE` request selected by the Rust/WASM
-  lookup engine and return its response or failure to that engine;
-- query closest direct endpoints with `GET_CHUNK`, retrying `not_found` and
-  unavailable nodes without routing bytes through the manifest service;
-- call the Rust/WASM core to self-encrypt selected public files and generate
-  their public MessagePack DataMaps;
-- request ordinary node storage quotes, verify their ML-DSA peer/content
-  binding, forced price, and signed storage commitment before payment;
-- construct an EVM wallet only from the runtime secret field, approve the
-  public vault when required, and make one batched `payForQuotes` transaction;
-- upload each content-addressed encrypted record with the signed quote and
-  transaction hash through paid `PUT_CHUNK`; the wallet key never crosses the
-  WebRTC Direct connection;
-- fetch the public MessagePack DataMap and every resolved encrypted data chunk,
-  then pass those records to the Rust/WASM reconstruction API;
-- verify the final file size and use the Rust/WASM BLAKE3 verifier before
-  allowing a save;
-- expose a bounded `BrowserFileReader` that retains a small encrypted-record
-  cache and serves independent ranges for playback and seeking;
-- bridge native media-element requests to that reader through a same-origin
-  service worker returning standard `200`/`206`, `Content-Length`,
-  `Content-Range`, and `Accept-Ranges` responses; and
-- expose a small test site that loads the local testnet manifest, displays the
-  startup-published file, uploads paid files, downloads through the browser
-  save flow, and stream-watches browser-supported video files.
+`ant-core` may call narrow JavaScript callbacks to obtain file ranges, load or
+discard externally staged encrypted records, report progress, and submit an
+already verified payment plan. Those callbacks expose browser capabilities;
+they do not reimplement Autonomi protocol behavior.
 
-The local browser manifest is bootstrap metadata, not a gateway. Independently
-deployed nodes publish their WebRTC Direct multiaddresses through Saorsa's
-transport-authenticated DHT address sets, allowing a production client to
-discover peers after dialing one configured bootstrap address. ADR-0009 keeps
-an independently cacheable ML-DSA-signed endpoint record as a possible later
-hardening step.
+### Responsibilities of ant-client-browser-sdk
 
-The JavaScript API and demo never accept a certificate hash separately from an
-endpoint. Their sole dialing input is a canonical address of the form
+The separate SDK owns:
+
+- packaging and initializing the generated WASM module;
+- the public TypeScript API and stable application-facing errors/events;
+- `File` and `Blob` handling, Web Workers, and IndexedDB upload staging;
+- wallet-independent payment-provider interfaces and Ethers or Wagmi/Viem
+  adapters;
+- browser save flows;
+- the same-origin service-worker bridge for media-element byte ranges;
+- runnable examples and demo user interfaces; and
+- TypeScript, bundler, and real-browser end-to-end tests.
+
+This repository does not ship a browser demo or duplicate those adapters. It
+keeps only a small generated-WASM smoke-test harness under
+`ant-core/wasm-tests/`. The harness validates that `wasm-pack` output loads in
+JavaScript and preserves key native/WASM compatibility vectors.
+
+### Bootstrap and protocol compatibility
+
+A bootstrap endpoint is one canonical address of the form
 `/ip4|ip6/<literal>/udp/<port>/webrtc-direct/certhash/<multihash>/p2p/<peer-id>`.
-DNS protocols, port zero, and repeated `/certhash` components are rejected.
-Keeping the transport location, accepted DTLS key, and expected ANT peer
-identity in one value prevents callers from accidentally combining fields
-belonging to different nodes.
+The endpoint binds transport location, accepted DTLS certificate, and expected
+ANT identity. DNS endpoints, port zero, malformed hashes, and ambiguous address
+components are rejected.
 
-Rust nodes construct and validate this syntax through
-`saorsa_transport::TransportAddr::WebRtcDirect` wrapped by
-`saorsa_core::MultiAddr`; it is not a browser-specific string type. The
-JavaScript parser is the browser implementation of that same canonical wire
-format and is covered by matching stable-pin fixtures.
+A local testnet manifest is optional bootstrap metadata, not a data gateway or
+download authorization source. A client can start from one complete endpoint,
+authenticate it, obtain public payment configuration, discover peers, and
+resolve any public DataMap address from the network. Production bootstrap
+distribution and certificate-rotation recovery remain operational concerns
+described by ant-node ADR-0009.
 
-Quote and storage-commitment verification remains JavaScript for now.
-`ant-protocol 2.3.1` unconditionally reaches the native Saorsa transport and
-EVM dependency graph, including Tokio networking and `mio`, and therefore
-cannot be linked into a browser WASM target. A future transport-free
-`ant-protocol` feature should expose the pure multiaddress, quote, commitment,
-and ML-DSA verification types without enabling native networking. At that
-point those compatibility-sensitive operations should also move behind the
-Rust/WASM boundary.
-
-The shared lookup engine is intentionally a small Saorsa crate rather than a
-second implementation inside `ant-core`. Native `DhtNetworkManager` and the
-browser WASM adapter both drive the same candidate queue, peer-state, α-batch,
-and convergence implementation. Native QUIC retains transport authentication,
-address-report consensus, failure-cache integration, and trust updates; the
-browser adapter retains WebRTC Direct connection establishment and endpoint
-validation.
-
-For compatibility with the local launcher, the bootstrap manifest still
-carries a resolved JSON view of the public root DataMap alongside its ordinary
-on-network DataMap address. The download path does not use that copy to select
-records: it fetches the public DataMap from a node and uses the Rust/WASM
-decoder to derive the encrypted-record addresses. Production discovery must
-still replace the unsigned manifest with validation of the signed/on-network
-metadata chain.
+Browser protocol v4 requires a matching v4 node listener. Plaintext v3 and
+encrypted v4 deliberately fail closed. This browser wire change does not alter
+native QUIC, stored chunk/DataMap formats, quote commitments, payment proofs, or
+public file addresses.
 
 ## Consequences
 
 ### Positive
 
-- Lookup, payment, and data transfer remain decentralized at the application
-  layer.
-- A local five-node testnet can validate multiple direct node connections,
-  multiaddress-embedded certificate pins, lookup convergence, fallback, and
-  content verification.
-- Self-encryption, DataMap serialization, reconstruction, and content
-  addressing have one Rust implementation across native and browser clients.
-- Video playback and seeks retrieve and decrypt only the required records;
-  playback memory is bounded independently of the complete file size.
-- The browser application keeps direct control of WebRTC, wallet, and
-  DOM APIs without pulling native runtime dependencies into WASM.
+- Native and browser clients share self-encryption, DataMaps, lookup behavior,
+  quote verification, payment planning, transfer scheduling, and retry policy.
+- Browser applications do not need to reproduce Autonomi networking or
+  cryptography in JavaScript.
+- The `ant-client` PR remains focused on the reusable Rust library rather than
+  embedding a competing application and SDK.
+- SDK UI and wallet integrations can evolve independently of the native CLI.
+- Generated bindings are still exercised directly, catching failures that a
+  Rust-only WASM target check would miss.
 
 ### Negative / Trade-offs
 
-- Whole-file upload and save still process complete files in memory and the
-  local launcher caps public files at 1 GB (1,000,000,000 bytes). Video range
-  playback is bounded, but it does not remove those separate upload/save
-  memory constraints.
-- JavaScript quote-verification behavior must remain aligned with native
-  protocol rules until transport-free `ant-protocol` APIs exist.
-- The initial WASM module is approximately 1.4 MiB uncompressed and browser
-  file processing is still in memory.
-- The node must preserve its DTLS certificate file; deleting it changes the
-  certhash and invalidates old bootstrap entries.
-- WebRTC DataChannels need explicit 16-KiB message fragmentation, declared-
-  length reassembly, and `bufferedAmount` backpressure for large chunk
-  transfers.
-- The Safari PoC observed later DataChannels timing out after repeatedly
-  replacing all seed associations between records, even though callers closed
-  earlier connections. Bounded association reuse avoids relying on prompt
-  browser resource reclamation and is required for multi-record operations.
-- A browser may reuse a local UDP source port for a replacement association.
-  Node-side UDP multiplexing must route STUN binding requests by ICE credential
-  before consulting a possibly stale source-address mapping.
+- `ant-core` and `ant-client-browser-sdk` releases must remain compatible, and
+  the SDK must regenerate its bundled WASM when the low-level API changes.
+- Browser-only failures involving workers, IndexedDB, wallets, service workers,
+  and media elements are detected in the SDK rather than this repository.
+- Complete-file downloads remain memory-bound; range reading is the bounded
+  path for large media and range-oriented formats.
+- WebRTC exposes transport metadata, lengths, and timing. The application-layer
+  post-quantum session protects RPC and chunk plaintext against later
+  compromise of only the classical DTLS key exchange; it does not make ICE,
+  DTLS, SCTP, or the browser WebRTC implementation post-quantum secure.
+- Nodes must preserve their DTLS certificate because changing it invalidates
+  certificate-pinned endpoints.
 
-### Neutral / Operational
+### Operational
 
-- The manifest HTTP service carries only small bootstrap metadata.
-- Browser WebRTC APIs still require a secure browser context; localhost
-  qualifies for development.
-- The range-response service worker also requires a secure context and the
-  controlling page must remain open to own WebRTC and the Rust range reader.
-- Node and client repositories must run compatible browser protocol versions.
+- WebRTC and service-worker consumers require a secure browser context;
+  localhost qualifies for development.
+- Browser protocol v4 clients and node listeners must be deployed together.
+- The SDK owns real-browser compatibility testing for current Chrome, Firefox,
+  and Safari.
 
 ## Validation
 
-- Rust unit tests cover an exact native `self_encryption 0.36` wire vector,
-  public DataMap generation, round-trip reconstruction, and tamper rejection.
-- Saorsa engine tests cover XOR ordering, α limits, final peer states, bounded
-  candidate eviction, multi-round discovery, and top-K convergence; the native
-  DHT manager and browser WASM adapter both invoke the same generic runner.
-- JavaScript unit tests cover fixed-width identifiers,
-  bidirectional binary framing, manifest/payment validation, quote signatures,
-  the native Keccak-256 EVM quote-hash vector, and the browser orchestration
-  around the Rust/WASM boundary.
-- CI compiles `ant-core` for `wasm32-unknown-unknown` with native features
-  disabled, builds the generated `wasm-pack` package, runs browser-client
-  tests against it, and produces the Vite bundle.
-- The browser production bundle builds without Node-specific runtime APIs.
-- The generated WASM package encrypts and reconstructs the same fixed vector
-  as the native Rust test, covering the native KDF, authenticated decryption,
-  Brotli reconstruction, MessagePack DataMap, and BLAKE3 addresses.
-- A live node integration test starts five WebRTC Direct-enabled nodes,
-  publishes a public DataMap and encrypted chunks, connects with the advertised
-  self-contained multiaddress, retrieves every record, and reconstructs the
-  exact file, pays a real signed quote, accepts a paid binary PUT through the
-  ordinary node verifier, and reads the stored record back.
-- The real-browser test uploads a nested-DataMap file, opens it through the
-  Rust range reader, verifies exact disjoint and suffix HTTP ranges through the
-  service worker, and then performs complete reconstruction as a separate path.
-- Before acceptance, run interactive tests on current Chrome, Firefox, and
-  Safari and add shared lookup convergence vectors with the native client.
-- Revisit this decision when relayed WebRTC or independently cacheable signed
-  endpoint records are implemented.
+This repository validates:
+
+- Rust unit tests for browser manifests, framing, payment verification,
+  self-encryption, DataMap handling, lookup, and transfer policy;
+- `cargo check` and `cargo clippy` for `wasm32-unknown-unknown` with only the
+  `browser-wasm` feature;
+- a release `wasm-pack` build;
+- JavaScript loading of the generated module;
+- fixed native/WASM vectors for WebRTC addresses, response framing, EVM quote
+  hashing, self-encryption, nested DataMaps, streaming encryption,
+  reconstruction, and tamper rejection; and
+- coordinated node integration tests for encrypted session establishment,
+  lookup, public download, signed quotes, paid upload, and record read-back.
+
+The browser SDK separately validates its TypeScript API, wallet adapters,
+worker and IndexedDB staging, save behavior, service-worker range bridge,
+examples, and live browser flows.
 
 ## Notes for AI-assisted work
 
