@@ -7,7 +7,7 @@ import {
   decryptPublicFile,
   encryptPublicFile,
   verifyRecord,
-} from "../pkg/ant_core.js";
+} from "./pkg/ant_core.js";
 
 const EXPECTED_CHUNK_ADDRESSES = [
   "c024c6884a2f39be7ba07c3d9636efedeb94df7397fcd38bac5ae904643c5cc9",

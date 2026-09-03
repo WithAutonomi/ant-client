@@ -8,7 +8,7 @@ import {
   paymentQuoteHash,
   serverAnswerFromEndpoint,
   webRtcDirectV2ServerCredential,
-} from "../pkg/ant_core.js";
+} from "./pkg/ant_core.js";
 
 test("Rust/WASM parses stable certificate-pinned WebRTC Direct addresses", () => {
   const peerId = "ab".repeat(32);
