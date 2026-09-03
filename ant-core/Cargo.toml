@@ -6,6 +6,7 @@ description = "Headless Rust library for the Autonomi network: data storage and 
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/WithAutonomi/ant-client"
 readme = "../README.md"
+exclude = ["wasm-tests"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseBrowserManifest } from "./manifest.js";
+import { parseBrowserManifest } from "./pkg/ant_core.js";
 
 test("browser manifest validates and normalizes endpoints and files", () => {
   const manifest = parseBrowserManifest({

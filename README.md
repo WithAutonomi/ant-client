@@ -4,36 +4,28 @@ A unified CLI and Rust library for storing data on the Autonomi decentralized ne
 
 ## Overview
 
-This project provides two Rust crates and a browser client:
+This project provides two Rust crates:
 
 - **ant-core** — A headless Rust library containing the Autonomi business logic: data storage/retrieval with self-encryption and EVM payments, node lifecycle management, and local devnet tooling. Its `browser` module shares manifest validation, protocol framing, authenticated WebRTC Direct access, lookup, quote verification, and complete public-file workflows with browser applications through the `browser-wasm` feature.
 - **ant-cli** — A thin CLI binary (`ant`) built on `ant-core`.
-- **web** — A thin browser UI around `ant-core`'s Rust/WASM client. JavaScript
-  is limited to DOM/file-save integration and submitting the already-verified
-  payment plan with Ethers; no gateway proxies Autonomi data.
 
 Data on Autonomi is **content-addressed**. Files are split into encrypted chunks (via [self-encryption](https://en.wikipedia.org/wiki/Convergent_encryption)), each stored at an XOR address derived from its content. A `DataMap` tracks which chunks belong to a file. Payments for storage are made on an EVM-compatible blockchain (Arbitrum).
 
-### Direct browser testnet client
+### Browser WebAssembly client
 
-The browser client works with an ADR-0009-enabled `ant-node` checkout. Start
-the browser-enabled node devnet, then run the site:
+Build `ant-core` for browsers without changing native callers:
 
 ```bash
-# In ant-node-web-support
-cargo run --features webrtc-direct --bin ant-devnet -- \
-  --preset minimal --base-port 23000 \
-  --webrtc-direct --webrtc-direct-base-port 24000 \
-  --serve-port 25000 --enable-evm --enable-logging
-
-# In ant-client-web-support/web
-npm ci
-npm run dev
+wasm-pack build --target web ant-core \
+  --no-default-features --features browser-wasm
 ```
 
-Open `http://127.0.0.1:5173`; the default public test file and direct node
-endpoints are loaded from the local browser manifest. See [web/README.md](web/README.md)
-for the one-time `wasm-pack` setup, protocol flow, and LAN configuration.
+This produces the low-level `wasm-bindgen` API backed by the shared Rust
+implementation. The companion
+[`ant-client-browser-sdk`](https://github.com/WithAutonomi/ant-client-browser-sdk)
+project owns the TypeScript API, wallet adapters, browser storage and worker
+integration, media streaming bridge, runnable examples, and browser end-to-end
+tests.
 
 ## Installation
 

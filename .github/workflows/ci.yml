@@ -45,25 +45,36 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
       - name: Check the portable Rust library
         run: >-
           cargo check -p ant-core
           --target wasm32-unknown-unknown
           --no-default-features
           --features browser-wasm
+      - name: Lint the portable Rust library
+        run: >-
+          cargo clippy -p ant-core
+          --target wasm32-unknown-unknown
+          --no-default-features
+          --features browser-wasm
+          -- -D warnings
       - name: Install wasm-pack
         run: cargo install wasm-pack --version 0.15.0 --locked
-      - name: Install browser dependencies
-        working-directory: web
-        run: npm ci
-      - name: Test browser client against Rust WASM
-        working-directory: web
-        run: npm test
-      - name: Build browser bundle
-        working-directory: web
-        run: npm run build
+      - name: Generate the browser bindings
+        working-directory: ant-core
+        run: >-
+          wasm-pack build
+          --target web
+          --out-dir wasm-tests/pkg
+          --release
+          .
+          --no-default-features
+          --features browser-wasm
+      - name: Test the generated browser bindings
+        working-directory: ant-core
+        run: >-
+          node --import ./wasm-tests/setup-wasm.mjs
+          --test ./wasm-tests/*.test.mjs
 
   test-unit:
     name: Unit Tests (${{ matrix.os }})
