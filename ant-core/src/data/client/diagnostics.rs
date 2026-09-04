@@ -19,14 +19,13 @@
 //! exact join to node-side GET telemetry. Chunk-level records leave both
 //! fields `null` because no individual peer request was sent.
 //!
-//! The `ant-protocol` diagnostic branch
-//! `diagnostics/v2-903-response-transport-metadata` exposes
+//! The stacked `ant-protocol` PR WithAutonomi/ant-protocol#32 exposes
 //! `send_and_await_chunk_response_with_metadata`, which returns a
 //! `ChunkProtocolResponse { result, source_peer, transport_source }`. The
-//! `saorsa-core` branch `diagnostics/v2-903-peer-route-classification`
-//! exposes `P2PNode::classify_peer_transport_route(expected_peer,
+//! stacked `saorsa-core` PR WithAutonomi/saorsa-core#162 exposes
+//! `P2PNode::classify_peer_transport_route(expected_peer,
 //! transport_source)` returning a `PeerRouteKind`
-//! (`direct`/`relay`/`lan`/`unverified`/`unknown`). Schema v2 records the
+//! (`direct`/`relay`/`lan`/`unverified`/`unknown`). Schema v4 records the
 //! *actual* `source_peer` and `transport_source` from the observed response,
 //! classifies the route from the actual transport source against the peer's
 //! typed DHT addresses, and attaches a `route_note` only when the route is
