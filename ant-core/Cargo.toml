@@ -26,7 +26,7 @@ serde_json = "1"
 self_encryption = "0.36"
 saorsa-dht-lookup = { version = "0.1.0", git = "https://github.com/WithAutonomi/saorsa-core.git", rev = "1432fa9751d46887dc86767928bd3320a24c6367" }
 # Portable WebRTC Direct profile shared with ant-node.
-saorsa-webrtc = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "ba6550b1e04942dc388aecb14d0d0aa55ba4f3d0" }
+saorsa-webrtc = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "9cf337b0dce2ee5b2f6b1b613a047d2be85a9754" }
 thiserror = "2"
 url = "2"
 web-time = "1.1"
@@ -125,7 +125,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 default = ["native"]
 native = [
     "dep:ant-protocol",
-    "ant-protocol/native",
     "ant-protocol/logging",
     "dep:async-stream",
     "dep:axum",
@@ -153,8 +152,6 @@ native = [
     "dep:zip",
 ]
 browser-wasm = [
-    "dep:ant-protocol",
-    "ant-protocol/portable",
     "dep:console_error_panic_hook",
     "dep:futures-channel",
     "dep:futures-util",
