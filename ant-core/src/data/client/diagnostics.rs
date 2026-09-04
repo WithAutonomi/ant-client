@@ -466,7 +466,7 @@ pub fn spawn_download_diagnostics_writer(
     Ok((DownloadDiagnosticsSender { tx, dropped }, handle))
 }
 
-/// Bound an error message to [`DIAGNOSTICS_ERROR_MAX_CHARS`] chars, preserving
+/// Bound an error message to `DIAGNOSTICS_ERROR_MAX_CHARS` chars, preserving
 /// a leading category if one is supplied.
 ///
 /// `category` is a short stable label (e.g. `"timeout"`); `detail` is the
