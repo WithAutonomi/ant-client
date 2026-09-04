@@ -18,7 +18,6 @@ use super::{BrowserRecord, BrowserRecordInfo, BrowserStagedFile};
 use crate::client_engine::adaptive::{
     observe_op, AdaptiveConfig, AdaptiveController, ChannelStart, Outcome,
 };
-use ant_protocol::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
 use futures_channel::{mpsc, oneshot};
 use futures_util::{
     future::{join_all, select, Either},
@@ -33,7 +32,8 @@ use saorsa_dht_lookup::{
 };
 use saorsa_webrtc::{
     decode_pq_frame, encode_pq_frame, pq_frame_length, transfer_timeout, PqClientHandshake,
-    PqSession, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_SERVER_ACCEPT_BYTES,
+    PqSession, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE, PQ_ENCRYPTED_OVERHEAD_BYTES,
+    PQ_SERVER_ACCEPT_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
