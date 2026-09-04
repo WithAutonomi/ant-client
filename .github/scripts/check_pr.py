@@ -10,6 +10,10 @@ Two modes, each wired to its own required status check:
                          no-op that passes on rc-* so hotfix/regression PRs are
                          not forced to carry the full template).
 
+Release-promotion PRs — a 'chore(release):' title from an 'rc-*' head branch,
+the promote step of the release train — are exempt from both checks (V2-1092):
+they are mechanical version-bump PRs with no issue or template of their own.
+
 PR fields are read from the environment (set by the workflow from the event
 payload): PR_TITLE, PR_BODY, PR_BRANCH, PR_BASE.
 
@@ -37,6 +41,14 @@ LINEAR_KEY = re.compile(
 LINEAR_URL = re.compile(
     r"linear\.app/[^/\s]+/issue/[A-Za-z][A-Za-z0-9]*-[0-9]+", re.IGNORECASE
 )
+
+# Release-promotion PRs (the promote step of the release train) are mechanical
+# version-bump PRs opened from an rc-* branch. Both checks self-pass on them —
+# they must pass rather than be skipped because linear-link/pr-template are
+# required status checks. Matched on BOTH the conventional-commit title prefix
+# and the rc-* head branch so an ordinary PR cannot opt out via its title alone.
+RELEASE_TITLE = re.compile(r"^chore\(release\):")
+RC_BRANCH = re.compile(r"^rc-")
 
 # Canonical section headings, exactly as they appear in the template, keyed by
 # their lower-cased form. Used so failure messages name the real heading.
@@ -72,6 +84,12 @@ def strip_comments(text):
     return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
 
 
+def release_promotion():
+    return bool(
+        RELEASE_TITLE.match(env("PR_TITLE")) and RC_BRANCH.match(env("PR_BRANCH"))
+    )
+
+
 def linear_ref(*parts):
     """Return the first Linear URL/key found in the given (comment-free) parts."""
     haystack = "\n".join(parts)
@@ -96,6 +114,12 @@ def sections(body):
 
 
 def check_linear():
+    if release_promotion():
+        ok(
+            f"✅ linear-link not enforced on release-promotion PRs "
+            f"(chore(release) from '{env('PR_BRANCH')}')."
+        )
+
     # Strip comments from the body so the template's own example does not count.
     ref = linear_ref(env("PR_TITLE"), strip_comments(env("PR_BODY")), env("PR_BRANCH"))
     if ref:
@@ -110,6 +134,12 @@ def check_linear():
 
 
 def check_template():
+    if release_promotion():
+        ok(
+            f"✅ pr-template not enforced on release-promotion PRs "
+            f"(chore(release) from '{env('PR_BRANCH')}')."
+        )
+
     base = env("PR_BASE")
     if base and base != "main":
         ok(f"✅ pr-template not enforced on base '{base}' (main only).")

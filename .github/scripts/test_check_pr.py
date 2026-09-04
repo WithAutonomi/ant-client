@@ -71,6 +71,17 @@ CASES = [
     ("linear: issue URL in body", "linear", {"PR_BODY": "https://linear.app/autonominetwork/issue/V2-719/foo"}, 0),
     ("linear: key in branch (lowercased)", "linear", {"PR_BRANCH": "chrisoneil/v2-720-ci-check"}, 0),
     ("linear: key in title", "linear", {"PR_TITLE": "AUTO-42 do the thing", "PR_BRANCH": "x"}, 0),
+    # --- release-promotion exemption (title prefix AND rc-* head branch) ---
+    ("linear: release promotion exempt", "linear",
+     {"PR_TITLE": "chore(release): promote rc-2026.8.3", "PR_BRANCH": "rc-2026.8.3"}, 0),
+    ("template: release promotion exempt", "template",
+     {"PR_TITLE": "chore(release): promote rc-2026.8.3", "PR_BRANCH": "rc-2026.8.3",
+      "PR_BASE": "main", "PR_BODY": "Promotes rc-2026.8.3 to release versions."}, 0),
+    ("linear: chore(release) title without rc branch still enforced", "linear",
+     {"PR_TITLE": "chore(release): tidy", "PR_BRANCH": "chore/tidy"}, 1),
+    ("template: rc branch without chore(release) title still enforced", "template",
+     {"PR_TITLE": "fix something", "PR_BRANCH": "rc-2026.9.1",
+      "PR_BASE": "main", "PR_BODY": "freeform"}, 1),
     # --- pr-template: acceptances ---
     ("template: valid T0 body", "template", {"PR_BASE": "main", "PR_BODY": VALID_BODY}, 0),
     ("template: rc-* base is a no-op pass", "template", {"PR_BASE": "rc-2025.10", "PR_BODY": "anything"}, 0),
