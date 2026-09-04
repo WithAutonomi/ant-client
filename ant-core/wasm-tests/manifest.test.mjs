@@ -33,7 +33,7 @@ test("browser manifest validates and normalizes endpoints and files", () => {
 
   assert.equal(
     manifest.endpoints[0].multiaddr,
-    webrtc_directMultiaddr("AA".repeat(32), 0xbb),
+    webrtc_directMultiaddr("aa".repeat(32), 0xbb),
   );
   assert.equal(manifest.files[0].address, "cc".repeat(32));
   assert.equal(manifest.files[0].blake3, "dd".repeat(32));
