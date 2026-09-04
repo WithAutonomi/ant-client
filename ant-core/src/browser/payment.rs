@@ -2,15 +2,14 @@
 
 use super::protocol::normalize_hex;
 pub use super::protocol::{BrowserCommitmentArtifact, BrowserQuoteArtifact};
-use ant_protocol::crypto::verify_ml_dsa_65;
-use ant_protocol::payment::{
+use saorsa_webrtc::{
     calculate_price_wei, commitment_hash, payment_quote_bytes_for_signing,
-    verify_commitment_signature, StorageCommitment, MAX_COMMITMENT_KEY_COUNT,
+    verify_commitment_signature, verify_ml_dsa_65, StorageCommitment, MAX_COMMITMENT_KEY_COUNT,
     MAX_COMMITMENT_SIDECAR_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
-pub use ant_protocol::payment::payment_quote_hash;
+pub use saorsa_webrtc::payment_quote_hash;
 
 const PAYMENT_MULTIPLIER: u128 = 3;
 #[cfg(test)]
@@ -262,8 +261,8 @@ fn decode_hex_array<const LENGTH: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ant_protocol::payment::{storage_commitment_bytes_for_signing, DOMAIN_COMMITMENT};
     use ant_protocol::pqc::api::ml_dsa_65;
+    use saorsa_webrtc::{storage_commitment_bytes_for_signing, DOMAIN_COMMITMENT};
 
     fn baseline_quote() -> (BrowserQuoteArtifact, String, String) {
         let content = [0x31; 32];
@@ -323,10 +322,32 @@ mod tests {
             .sign_with_context(&secret_key, &commitment_payload, DOMAIN_COMMITMENT)
             .expect("commitment signature")
             .to_bytes();
+        let native_commitment = ant_protocol::payment::StorageCommitment {
+            root: commitment.root,
+            key_count: commitment.key_count,
+            sender_peer_id: commitment.sender_peer_id,
+            sender_public_key: commitment.sender_public_key.clone(),
+            signature: commitment.signature.clone(),
+        };
+        assert!(ant_protocol::payment::verify_commitment_signature(
+            &native_commitment
+        ));
+        assert_eq!(
+            commitment_hash(&commitment),
+            ant_protocol::payment::commitment_hash(&native_commitment)
+        );
         let encoded = rmp_serde::to_vec(&commitment).expect("MessagePack commitment");
+        assert_eq!(
+            encoded,
+            rmp_serde::to_vec(&native_commitment).expect("native MessagePack commitment")
+        );
         let pin = hex::encode(commitment_hash(&commitment).expect("commitment hash"));
         let peer_id = hex::encode(peer_id);
         let price = calculate_price_wei(key_count);
+        assert_eq!(
+            ant_protocol::evm::Amount::from(price),
+            ant_protocol::payment::calculate_price(key_count as usize)
+        );
         let mut quote = BrowserQuoteArtifact {
             peer_id: peer_id.clone(),
             content: hex::encode(content),
@@ -349,12 +370,34 @@ mod tests {
         };
         let payload = canonical_quote_bytes(&quote, price, &hex::encode(rewards), Some(&pin))
             .expect("quote payload");
+        let native_quote = ant_protocol::evm::PaymentQuote {
+            content: xor_name::XorName(content),
+            timestamp: std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(timestamp),
+            price: ant_protocol::evm::Amount::from(price),
+            rewards_address: ant_protocol::evm::RewardsAddress::from(rewards),
+            pub_key: public_key.clone(),
+            signature: Vec::new(),
+            committed_key_count: key_count,
+            commitment_pin: Some(
+                hex::decode(&pin)
+                    .expect("pin")
+                    .try_into()
+                    .expect("32-byte pin"),
+            ),
+        };
+        assert_eq!(payload, native_quote.bytes_for_sig());
         let signature = ml_dsa_65()
             .sign(&secret_key, &payload)
             .expect("quote signature")
             .to_bytes();
         quote.signature = hex::encode(&signature);
         quote.quote_hash = hex::encode(payment_quote_hash(&payload, &public_key, &signature));
+        let native_quote = ant_protocol::evm::PaymentQuote {
+            signature: signature.clone(),
+            ..native_quote
+        };
+        assert_eq!(quote.quote_hash, hex::encode(native_quote.hash()));
         (quote, hex::encode(content), peer_id)
     }
 
