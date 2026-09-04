@@ -1,0 +1,20 @@
+# __PKG_NAME__
+
+The `ant` binary for __TARGET_DESC__ (`__RUST_TARGET__`).
+
+This package is an implementation detail of
+[`@withautonomi/ant`](https://www.npmjs.com/package/@withautonomi/ant), which declares it as an
+optional dependency guarded by `os`/`cpu` so npm installs only the binary your machine needs.
+Install the meta package instead:
+
+```sh
+npm install -g @withautonomi/ant
+```
+
+The binary is copied verbatim from the `ant-cli-v__VERSION__`
+[release assets](https://github.com/WithAutonomi/ant-client/releases/tag/ant-cli-v__VERSION__)
+after checksum and signature verification, so it is byte-identical to the published archive.
+
+## Licence
+
+MIT OR Apache-2.0

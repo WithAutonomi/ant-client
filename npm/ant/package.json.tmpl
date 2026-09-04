@@ -1,0 +1,44 @@
+{
+  "name": "@withautonomi/ant",
+  "version": "__VERSION__",
+  "description": "Unified CLI (`ant`) for the Autonomi network: store and retrieve data, and manage local nodes.",
+  "keywords": [
+    "autonomi",
+    "ant",
+    "cli",
+    "p2p",
+    "storage",
+    "decentralized"
+  ],
+  "homepage": "https://github.com/WithAutonomi/ant-client#readme",
+  "bugs": {
+    "url": "https://github.com/WithAutonomi/ant-client/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WithAutonomi/ant-client.git"
+  },
+  "license": "MIT OR Apache-2.0",
+  "bin": {
+    "ant": "bin/ant.js"
+  },
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "postinstall.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@withautonomi/ant-darwin-arm64": "__VERSION__",
+    "@withautonomi/ant-darwin-x64": "__VERSION__",
+    "@withautonomi/ant-linux-arm64": "__VERSION__",
+    "@withautonomi/ant-linux-x64": "__VERSION__",
+    "@withautonomi/ant-win32-x64": "__VERSION__"
+  }
+}

@@ -35,6 +35,26 @@ Both installers take the same environment variables:
 | `ANT_VERSION` | Install one specific version, e.g. `0.3.3`. Overrides `ANT_CHANNEL`. |
 | `INSTALL_DIR` | Where to put the binary. Defaults to `~/.local/bin` on Linux, `/usr/local/bin` on macOS, `%LOCALAPPDATA%\ant\bin` on Windows. |
 
+### npm
+
+`ant` is also on npm, which is useful in agent sandboxes and CI runners that allow
+package-manager traffic but block direct binary downloads:
+
+```bash
+npm install -g @withautonomi/ant
+```
+
+This installs the same signed binary as the release page — a per-platform companion package
+carries it, so only the one your machine needs is downloaded. Use `@withautonomi/ant@beta` for
+the beta channel, and `npm update -g @withautonomi/ant` to upgrade; `ant update` recognises an
+npm-managed install and points you at npm rather than replacing itself.
+
+> **Note:** npm 12 blocks package install scripts by default, so an npm install may not write
+> `bootstrap_peers.toml` into your config directory. `ant` works either way — it falls back to
+> the peer list compiled into the binary — but if you want the editable file, install with
+> `npm install -g --allow-scripts=@withautonomi/ant @withautonomi/ant`. See
+> [`npm/README.md`](npm/README.md).
+
 ## Quick Start
 
 ### Store and retrieve a file (production)

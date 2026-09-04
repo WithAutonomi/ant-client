@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ant` is distributed on npm as `@withautonomi/ant`, so `npm install -g @withautonomi/ant`
+  works in agent sandboxes and CI runners that allow package-manager traffic but block direct
+  binary downloads (V2-1152). Packaging only: the published packages carry the same signed
+  binaries as the GitHub release, verified against `SHA256SUMS.txt` and their ML-DSA-65
+  signatures during packaging, and published from the release workflow with npm provenance. A
+  per-platform companion package guarded by `os`/`cpu` means only one binary is downloaded. The
+  `beta` dist-tag tracks beta releases; `install.sh`, `install.ps1` and the release assets are
+  unchanged. See [`npm/README.md`](npm/README.md).
+- `ant` falls back to a bootstrap peer list compiled into the binary when no
+  `bootstrap_peers.toml` is present in the config directory. Priority is unchanged — explicit
+  `-b` peers, then a devnet manifest, then the config file, then the embedded list — and an
+  explicitly selected devnet manifest still errors rather than reaching for mainnet peers. This
+  is what makes an npm install usable out of the box: npm 12 blocks package install scripts by
+  default, so the step that copies that file into the config directory frequently does not run.
+  `bootstrap_peers.toml` moved from `resources/` to `ant-core/resources/`, since `include_str!`
+  cannot reach outside the crate and ant-core is published to crates.io; the release archives
+  carry the same bytes as before.
+
+### Changed
+- `ant update` no longer replaces the binary when `ant` was installed by a package manager. It
+  still reports whether a newer version is available, then prints the command that will install
+  it (`npm update -g @withautonomi/ant`). Self-replacing an npm-managed binary left npm's
+  metadata describing a file that was no longer there, so the next `npm update` silently rolled
+  the user back.
+
 ## [0.3.6] - 2026-09-01
 
 ### Fixed

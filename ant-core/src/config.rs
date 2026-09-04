@@ -57,6 +57,33 @@ pub fn log_dir() -> Result<PathBuf> {
     }
 }
 
+/// The peer list compiled into the binary, used when no config file is present.
+///
+/// This is the same `bootstrap_peers.toml` the release archives carry and the installers copy
+/// into the config directory. It is embedded because not every install path performs that copy:
+/// npm blocks package install scripts by default from npm 12 onwards, so an
+/// `npm install -g @withautonomi/ant` would otherwise leave a CLI that runs but cannot reach the
+/// network.
+///
+/// It is only ever a fallback — a config file, when present, wins, so a user's edited peer list
+/// stays authoritative. Staleness is no worse than the status quo: the installers copy this same
+/// file once at install time and never refresh it.
+const EMBEDDED_BOOTSTRAP_PEERS: &str = include_str!("../resources/bootstrap_peers.toml");
+
+/// Parse the bootstrap peers compiled into this binary.
+///
+/// See [`EMBEDDED_BOOTSTRAP_PEERS`]. Returns an empty vector only if the embedded file lists no
+/// parseable addresses, which a unit test guards against.
+///
+/// # Errors
+///
+/// Returns [`Error::BootstrapConfigParse`] if the embedded file is not valid TOML.
+pub fn embedded_bootstrap_peers() -> Result<Vec<SocketAddr>> {
+    let config: BootstrapConfig = toml::from_str(EMBEDDED_BOOTSTRAP_PEERS)
+        .map_err(|e| Error::BootstrapConfigParse(e.to_string()))?;
+    Ok(config.peers.iter().filter_map(|s| s.parse().ok()).collect())
+}
+
 /// Loads bootstrap peers from the platform-appropriate `bootstrap_peers.toml` file.
 ///
 /// Returns `Ok(Some(peers))` if the file exists and parses successfully,
@@ -84,10 +111,11 @@ pub fn load_bootstrap_peers() -> Result<Option<Vec<SocketAddr>>> {
 ///
 /// Priority: explicitly supplied peers (e.g. a frontend's `--bootstrap`
 /// flag) > devnet manifest peers > the platform `bootstrap_peers.toml`
-/// config file. Manifest peers without a resolvable socket address are
-/// filtered out. A selected manifest is authoritative: if it yields no
-/// usable peers, resolution fails rather than falling back to the
-/// config file.
+/// config file > the peers embedded at build time. Manifest peers
+/// without a resolvable socket address are filtered out. A selected
+/// manifest is authoritative: if it yields no usable peers, resolution
+/// fails rather than falling back to the config file or the embedded
+/// list — a devnet run must never silently reach for mainnet peers.
 ///
 /// # Errors
 ///
@@ -119,6 +147,18 @@ pub fn resolve_bootstrap_peers(
     if let Some(peers) = load_bootstrap_peers()? {
         tracing::info!("Loaded {} bootstrap peer(s) from config file", peers.len());
         return Ok(peers);
+    }
+
+    // No usable config file. Fall back to the list compiled in at build time, so an install that
+    // never copied the file — see EMBEDDED_BOOTSTRAP_PEERS — still reaches the network. This is
+    // reached only where the alternative is a hard error, so it cannot override anything.
+    let embedded = embedded_bootstrap_peers()?;
+    if !embedded.is_empty() {
+        tracing::info!(
+            "No bootstrap config file; using {} embedded bootstrap peer(s)",
+            embedded.len()
+        );
+        return Ok(embedded);
     }
 
     Err(Error::NoBootstrapPeers)
@@ -193,6 +233,33 @@ fn home_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_bootstrap_peers_parse_to_usable_addresses() {
+        // The embedded list is the last line of defence for installs that never copied
+        // bootstrap_peers.toml into the config directory. An unparseable or empty file would
+        // turn that fallback into a silent no-op, so fail the build here instead.
+        let peers = embedded_bootstrap_peers().expect("embedded bootstrap_peers.toml must parse");
+        assert!(
+            !peers.is_empty(),
+            "embedded bootstrap_peers.toml yielded no usable socket addresses"
+        );
+    }
+
+    #[test]
+    fn an_explicitly_selected_empty_manifest_never_falls_back_to_embedded_peers() {
+        // A devnet run that resolved to mainnet peers would be far worse than a clear error.
+        let manifest = DevnetManifest {
+            base_port: 12000,
+            node_count: 0,
+            bootstrap: Vec::new(),
+            data_dir: std::path::PathBuf::from("/tmp/devnet"),
+            created_at: String::new(),
+            evm: None,
+        };
+        let result = resolve_bootstrap_peers(&[], Some(&manifest));
+        assert!(matches!(result, Err(Error::NoBootstrapPeers)));
+    }
 
     #[test]
     fn data_dir_ends_with_ant() {

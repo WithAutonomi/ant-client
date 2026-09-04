@@ -1,7 +1,7 @@
 # Adaptive controller perf results vs live network
 
 Single-rep bench, fresh client per run, against
-`resources/bootstrap_peers.toml` mainnet bootstrap peers.
+`ant-core/resources/bootstrap_peers.toml` mainnet bootstrap peers.
 Workload: `client.prepare_chunk_payment` over N random chunks via
 `buffer_unordered(cap)`. No payment, no wallet — quoting only.
 DHT lookups (`find_closest_peers`) dominate per-chunk cost
