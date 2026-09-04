@@ -37,7 +37,7 @@ use saorsa_dht_lookup::{
 };
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Deref;
 use std::rc::Rc;
@@ -111,6 +111,7 @@ struct BrowserClientPool {
     clients: RefCell<HashMap<String, PoolEntry>>,
     clock: Cell<u64>,
     availability: Rc<PoolAvailability>,
+    availability_rx: Mutex<mpsc::Receiver<()>>,
 }
 
 struct BrowserClientLease {
@@ -118,38 +119,29 @@ struct BrowserClientLease {
     availability: Rc<PoolAvailability>,
 }
 
-#[derive(Default)]
 struct PoolAvailability {
     closed: Cell<bool>,
-    waiters: RefCell<VecDeque<oneshot::Sender<()>>>,
+    sender: mpsc::Sender<()>,
 }
 
 impl PoolAvailability {
-    async fn wait(&self) -> Result<(), String> {
-        if self.closed.get() {
-            return Err("WebRTC client pool is closed".to_string());
-        }
-        let (sender, receiver) = oneshot::channel();
-        self.waiters.borrow_mut().push_back(sender);
-        receiver
-            .await
-            .map_err(|_| "WebRTC client pool closed while waiting for capacity".to_string())
-    }
-
     fn notify_one(&self) {
         if self.closed.get() {
             return;
         }
-        while let Some(waiter) = self.waiters.borrow_mut().pop_front() {
-            if waiter.send(()).is_ok() {
-                break;
-            }
-        }
+        // The capacity-one channel coalesces repeated lease drops. Normal use
+        // can retain at most one wake token, including when a blocked client
+        // future is canceled before it consumes the notification.
+        let mut sender = self.sender.clone();
+        let _ = sender.try_send(());
     }
 
     fn close(&self) {
         self.closed.set(true);
-        self.waiters.borrow_mut().clear();
+        // Wake the one receiver that may currently hold the async mutex. Any
+        // additional waiters observe `closed` when they acquire that mutex.
+        let mut sender = self.sender.clone();
+        let _ = sender.try_send(());
     }
 }
 
@@ -172,12 +164,31 @@ impl BrowserClientPool {
         if max_clients == 0 {
             return Err("WebRTC client pool size must be a positive integer".to_string());
         }
+        let (availability_tx, availability_rx) = mpsc::channel(1);
         Ok(Self {
             max_clients,
             clients: RefCell::new(HashMap::new()),
             clock: Cell::new(0),
-            availability: Rc::new(PoolAvailability::default()),
+            availability: Rc::new(PoolAvailability {
+                closed: Cell::new(false),
+                sender: availability_tx,
+            }),
+            availability_rx: Mutex::new(availability_rx),
         })
+    }
+
+    async fn wait_for_availability(&self) -> Result<(), String> {
+        if self.availability.closed.get() {
+            return Err("WebRTC client pool is closed".to_string());
+        }
+        let mut receiver = self.availability_rx.lock().await;
+        if self.availability.closed.get() {
+            return Err("WebRTC client pool is closed".to_string());
+        }
+        if receiver.next().await.is_none() || self.availability.closed.get() {
+            return Err("WebRTC client pool closed while waiting for capacity".to_string());
+        }
+        Ok(())
     }
 
     async fn client(&self, endpoint: &BrowserEndpoint) -> Result<BrowserClientLease, String> {
@@ -229,7 +240,7 @@ impl BrowserClientPool {
                     availability: Rc::clone(&self.availability),
                 });
             }
-            self.availability.wait().await?;
+            self.wait_for_availability().await?;
         }
     }
 
