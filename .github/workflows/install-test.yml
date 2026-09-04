@@ -95,3 +95,166 @@ jobs:
           }
           Write-Host "Bootstrap config installed at $configFile"
           Get-Content $configFile
+
+  test-npm-linux:
+    name: test npm install (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: install from npm
+        run: npm install -g "@withautonomi/ant@${{ inputs.version }}"
+
+      - name: verify binary
+        run: |
+          ant --help
+          echo "Binary runs successfully"
+
+      - name: verify bootstrap config
+        run: |
+          config_file="${XDG_CONFIG_HOME:-$HOME/.config}/ant/bootstrap_peers.toml"
+          if [ ! -f "$config_file" ]; then
+            echo "ERROR: bootstrap_peers.toml not found at $config_file"
+            exit 1
+          fi
+          echo "Bootstrap config installed at $config_file"
+          cat "$config_file"
+
+      # AC3: uninstalling removes everything except the config directory.
+      - name: verify uninstall leaves the config directory
+        run: |
+          npm uninstall -g @withautonomi/ant
+          if command -v ant >/dev/null 2>&1; then
+            echo "ERROR: ant is still on PATH after uninstall"
+            exit 1
+          fi
+          config_file="${XDG_CONFIG_HOME:-$HOME/.config}/ant/bootstrap_peers.toml"
+          if [ ! -f "$config_file" ]; then
+            echo "ERROR: uninstall removed $config_file, which it must leave alone"
+            exit 1
+          fi
+          echo "Binary removed, config preserved"
+
+  test-npm-macos:
+    name: test npm install (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: install from npm
+        run: npm install -g "@withautonomi/ant@${{ inputs.version }}"
+
+      - name: verify binary
+        run: |
+          ant --help
+          echo "Binary runs successfully"
+
+      - name: verify bootstrap config
+        run: |
+          config_file="$HOME/Library/Application Support/ant/bootstrap_peers.toml"
+          if [ ! -f "$config_file" ]; then
+            echo "ERROR: bootstrap_peers.toml not found at $config_file"
+            exit 1
+          fi
+          echo "Bootstrap config installed at $config_file"
+          cat "$config_file"
+
+      - name: verify uninstall leaves the config directory
+        run: |
+          npm uninstall -g @withautonomi/ant
+          config_file="$HOME/Library/Application Support/ant/bootstrap_peers.toml"
+          if [ ! -f "$config_file" ]; then
+            echo "ERROR: uninstall removed $config_file, which it must leave alone"
+            exit 1
+          fi
+          echo "Binary removed, config preserved"
+
+  test-npm-windows:
+    name: test npm install (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: install from npm
+        shell: pwsh
+        run: npm install -g "@withautonomi/ant@${{ inputs.version }}"
+
+      - name: verify binary
+        shell: pwsh
+        run: |
+          ant --help
+          Write-Host "Binary runs successfully"
+
+      - name: verify bootstrap config
+        shell: pwsh
+        run: |
+          $configFile = Join-Path $env:APPDATA "ant\bootstrap_peers.toml"
+          if (-not (Test-Path $configFile)) {
+            Write-Error "bootstrap_peers.toml not found at $configFile"
+            exit 1
+          }
+          Write-Host "Bootstrap config installed at $configFile"
+          Get-Content $configFile
+
+      - name: verify uninstall leaves the config directory
+        shell: pwsh
+        run: |
+          npm uninstall -g @withautonomi/ant
+          $configFile = Join-Path $env:APPDATA "ant\bootstrap_peers.toml"
+          if (-not (Test-Path $configFile)) {
+            Write-Error "uninstall removed $configFile, which it must leave alone"
+            exit 1
+          }
+          Write-Host "Binary removed, config preserved"
+
+  # npm 12 blocks install scripts by default, and agent sandboxes and locked-down CI disable them
+  # explicitly. This package exists for exactly those environments, so `ant` must be fully usable
+  # with no postinstall: the bootstrap peers compiled into the binary cover the config file that
+  # never got written. See npm/README.md.
+  test-npm-ignore-scripts:
+    name: test npm install --ignore-scripts (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: install from npm without running scripts
+        run: npm install -g --ignore-scripts "@withautonomi/ant@${{ inputs.version }}"
+
+      - name: verify binary still runs
+        run: |
+          ant --help
+          ant --version
+          echo "Binary runs successfully without postinstall"
+
+      - name: verify the embedded bootstrap peers are used
+        run: |
+          config_file="${XDG_CONFIG_HOME:-$HOME/.config}/ant/bootstrap_peers.toml"
+          if [ -f "$config_file" ]; then
+            echo "Unexpected: $config_file exists even though scripts were skipped."
+            echo "Remove it so this job tests the no-config-file path."
+            exit 1
+          fi
+          # A command that must resolve peers but needs no wallet. Whether it finds the chunk is
+          # irrelevant — the assertion is that peer resolution succeeded, so it is capped with a
+          # timeout and its own exit status is ignored.
+          output="$(timeout 60 ant -v chunk get 0000000000000000000000000000000000000000000000000000000000000000 2>&1 || true)"
+          if echo "$output" | grep -qi "No bootstrap peers available"; then
+            echo "$output"
+            echo "ERROR: ant could not resolve bootstrap peers without a config file."
+            echo "The embedded fallback in ant-core/src/config.rs is not working."
+            exit 1
+          fi
+          if ! echo "$output" | grep -q "embedded bootstrap peer"; then
+            echo "$output"
+            echo "ERROR: expected ant to report using its embedded bootstrap peers."
+            exit 1
+          fi
+          echo "Bootstrap peers resolved from the embedded list, with no config file present"

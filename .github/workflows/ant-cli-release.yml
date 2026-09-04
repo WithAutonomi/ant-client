@@ -75,7 +75,7 @@ jobs:
           staging="ant-${{ steps.version.outputs.version }}-${{ matrix.target }}"
           mkdir "$staging"
           cp "target/${{ matrix.target }}/release/ant" "$staging/"
-          cp "resources/bootstrap_peers.toml" "$staging/"
+          cp "ant-core/resources/bootstrap_peers.toml" "$staging/"
           tar czf "$staging.tar.gz" "$staging"
           echo "ASSET=$staging.tar.gz" >> $GITHUB_ENV
 
@@ -86,7 +86,7 @@ jobs:
           staging="ant-${{ steps.version.outputs.version }}-${{ matrix.target }}"
           mkdir "$staging"
           cp "target/${{ matrix.target }}/release/ant.exe" "$staging/"
-          cp "resources/bootstrap_peers.toml" "$staging/"
+          cp "ant-core/resources/bootstrap_peers.toml" "$staging/"
           7z a "$staging.zip" "$staging"
           echo "ASSET=$staging.zip" >> $GITHUB_ENV
 
@@ -194,7 +194,7 @@ jobs:
           rm -rf "$staging"
           mkdir "$staging"
           cp artifacts/ant.exe "$staging/"
-          cp resources/bootstrap_peers.toml "$staging/"
+          cp ant-core/resources/bootstrap_peers.toml "$staging/"
           7z a "$staging.zip" "$staging"
 
       - uses: actions/upload-artifact@v4
@@ -440,3 +440,155 @@ jobs:
             assets/*.zip \
             assets/*.sig \
             assets/SHA256SUMS.txt
+
+  publish-npm:
+    name: publish to npm
+    runs-on: ubuntu-latest
+    needs: [release]
+    permissions:
+      contents: read
+      # Required for npm provenance: npm exchanges this token with Sigstore to attest which
+      # workflow run and commit produced each tarball.
+      id-token: write
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      # The GitHub release is already published by this point. A missing or misconfigured npm
+      # credential must not turn a successful release red, so the job warns and stops instead —
+      # the same principle as the changelog handling above.
+      - name: check for npm credentials
+        id: creds
+        shell: bash
+        run: |
+          if [ -z "${NPM_TOKEN}" ]; then
+            echo "::warning title=npm publish skipped::NPM_TOKEN is not configured, so @withautonomi/ant was not published for this release. The GitHub release is unaffected."
+            echo "configured=false" >> $GITHUB_OUTPUT
+          else
+            echo "configured=true" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.creds.outputs.configured == 'true'
+
+      - name: determine version and dist-tag
+        id: meta
+        if: steps.creds.outputs.configured == 'true'
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#ant-cli-v}"
+          echo "version=${version}" >> $GITHUB_OUTPUT
+
+          # Which npm dist-tag this release becomes. Deliberately mirrors
+          # `version_matches_channel` in ant-core/src/channel.rs and install.sh: the first
+          # dot-separated pre-release identifier decides, so `betamax.1` is not mistaken for a
+          # beta. An unrecognised suffix fails the job rather than guessing — publishing an
+          # unknown build to `latest` would hand it to every `npm install -g` user.
+          pre=""
+          if [ "$version" != "${version%%-*}" ]; then
+            pre="${version#*-}"
+          fi
+
+          if [ -z "$pre" ]; then
+            dist_tag="latest"
+          else
+            case "${pre%%.*}" in
+              beta) dist_tag="beta" ;;
+              # Release candidates are cut before the release gates report. Nothing installs them
+              # today — not install.sh, not `ant update` on any channel — so they get their own
+              # tag and must never move `latest`.
+              rc)   dist_tag="rc" ;;
+              *)
+                echo "::error title=Unrecognised pre-release::Version ${version} has pre-release identifier '${pre%%.*}', which maps to no npm dist-tag."
+                exit 1
+                ;;
+            esac
+          fi
+
+          echo "dist_tag=${dist_tag}" >> $GITHUB_OUTPUT
+          echo "Publishing ${version} to dist-tag ${dist_tag}"
+
+      - uses: actions/download-artifact@v4
+        if: steps.creds.outputs.configured == 'true'
+        with:
+          name: signed-releases
+          path: artifacts/
+
+      - uses: actions/setup-node@v4
+        if: steps.creds.outputs.configured == 'true'
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: download ant-keygen
+        if: steps.creds.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download --repo WithAutonomi/ant-keygen --pattern 'ant-keygen-linux-x64.tar.gz' --dir /tmp
+          tar -xzf /tmp/ant-keygen-linux-x64.tar.gz -C /tmp
+          chmod +x /tmp/ant-keygen
+
+      # Verifies every archive against SHA256SUMS.txt and every ML-DSA-65 signature against the
+      # committed public key before copying a byte, then unpacks the binaries into the package
+      # trees. Nothing is rebuilt, so the published binaries are byte-identical to the release
+      # assets uploaded in the previous job.
+      - name: build npm packages
+        if: steps.creds.outputs.configured == 'true'
+        run: |
+          npm/build-packages.sh \
+            --version "${{ steps.meta.outputs.version }}" \
+            --artifacts artifacts \
+            --out dist \
+            --keygen /tmp/ant-keygen
+
+      - name: publish packages
+        if: steps.creds.outputs.configured == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          DIST_TAG: ${{ steps.meta.outputs.dist_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The meta package pins its platform packages by exact version, so they must exist in
+          # the registry before it is published.
+          publish() {
+            local dir="$1"
+            local name
+            name="$(node -p "require('./${dir}/package.json').name")"
+
+            # A re-run after a partial publish must not fail on the packages that already went
+            # out. Anything else npm rejects is a real error and still fails the job.
+            if npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
+              echo "::notice title=Already published::${name}@${VERSION} is already in the registry; skipping."
+              return 0
+            fi
+
+            echo "Publishing ${name}@${VERSION} to dist-tag ${DIST_TAG}"
+            ( cd "$dir" && npm publish --access public --provenance --tag "$DIST_TAG" )
+          }
+
+          for pkg in dist/ant-*; do
+            publish "$pkg"
+          done
+          publish dist/ant
+
+      - name: summary
+        if: steps.creds.outputs.configured == 'true'
+        shell: bash
+        run: |
+          {
+            echo "### npm"
+            echo
+            echo "Published \`@withautonomi/ant@${{ steps.meta.outputs.version }}\` to dist-tag \`${{ steps.meta.outputs.dist_tag }}\`."
+            echo
+            echo '```sh'
+            if [ "${{ steps.meta.outputs.dist_tag }}" = "latest" ]; then
+              echo "npm install -g @withautonomi/ant"
+            else
+              echo "npm install -g @withautonomi/ant@${{ steps.meta.outputs.dist_tag }}"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
