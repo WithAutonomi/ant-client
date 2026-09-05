@@ -463,158 +463,167 @@ async fn handle_file_download(
         None => (None, None),
     };
 
-    let data_map = if let Some(addr_hex) = address {
-        info!("Downloading public file from address {addr_hex}");
-        let address = parse_address(addr_hex)?;
-        if !json_output {
-            let spinner = progress::new_spinner("Fetching data map...");
-            let result = if let Some(peer_count) = peer_count {
-                client
-                    .data_map_fetch_from_closest_peers(&address, peer_count)
-                    .await
+    // Keep the fallible download work inside a result boundary so the
+    // diagnostics sender is always closed and its writer joined, including
+    // failure paths. Failed downloads are the cases where the final records
+    // matter most.
+    let download_result: anyhow::Result<Option<FilePeerCheckJson>> = async {
+        let data_map = if let Some(addr_hex) = address {
+            info!("Downloading public file from address {addr_hex}");
+            let address = parse_address(addr_hex)?;
+            if !json_output {
+                let spinner = progress::new_spinner("Fetching data map...");
+                let result = if let Some(peer_count) = peer_count {
+                    client
+                        .data_map_fetch_from_closest_peers(&address, peer_count)
+                        .await
+                } else {
+                    client.data_map_fetch(&address).await
+                };
+                spinner.finish_and_clear();
+                result.map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
             } else {
-                client.data_map_fetch(&address).await
-            };
-            spinner.finish_and_clear();
-            result.map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
-        } else {
-            if let Some(peer_count) = peer_count {
-                client
-                    .data_map_fetch_from_closest_peers(&address, peer_count)
-                    .await
-            } else {
-                client.data_map_fetch(&address).await
+                if let Some(peer_count) = peer_count {
+                    client
+                        .data_map_fetch_from_closest_peers(&address, peer_count)
+                        .await
+                } else {
+                    client.data_map_fetch(&address).await
+                }
+                .map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
             }
-            .map_err(|e| anyhow::anyhow!("Failed to fetch public DataMap: {e}"))?
-        }
-    } else {
-        let dm_path = datamap_path
-            .ok_or_else(|| anyhow::anyhow!("--datamap required for private download"))?;
-        info!("Downloading file using datamap: {}", dm_path.display());
-        read_datamap(dm_path).map_err(|e| anyhow::anyhow!("Failed to read datamap: {e}"))?
-    };
-
-    let chunk_peer_check = if json_output {
-        if all_peers {
-            let peer_count = download_peer_check_count(client, peer_count)?;
-            let report = client
-                .file_download_with_peer_report_from_closest_peers(
-                    &data_map,
-                    &output_path,
-                    None,
-                    peer_count,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
-            Some(file_peer_check_from_reports(report.chunk_reports))
         } else {
-            let download_result = if let Some(diagnostics) = diagnostics.clone() {
+            let dm_path = datamap_path
+                .ok_or_else(|| anyhow::anyhow!("--datamap required for private download"))?;
+            info!("Downloading file using datamap: {}", dm_path.display());
+            read_datamap(dm_path).map_err(|e| anyhow::anyhow!("Failed to read datamap: {e}"))?
+        };
+
+        let chunk_peer_check = if json_output {
+            if all_peers {
                 let peer_count = download_peer_check_count(client, peer_count)?;
-                client
-                    .file_download_with_progress_and_diagnostics_from_closest_peers(
+                let report = client
+                    .file_download_with_peer_report_from_closest_peers(
                         &data_map,
                         &output_path,
                         None,
                         peer_count,
-                        Some(diagnostics),
                     )
                     .await
-            } else if let Some(peer_count) = peer_count {
-                client
-                    .file_download_from_closest_peers(&data_map, &output_path, peer_count)
-                    .await
+                    .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+                Some(file_peer_check_from_reports(report.chunk_reports))
             } else {
-                client.file_download(&data_map, &output_path).await
-            };
+                let download_result = if let Some(diagnostics) = diagnostics.clone() {
+                    let peer_count = download_peer_check_count(client, peer_count)?;
+                    client
+                        .file_download_with_progress_and_diagnostics_from_closest_peers(
+                            &data_map,
+                            &output_path,
+                            None,
+                            peer_count,
+                            Some(diagnostics),
+                        )
+                        .await
+                } else if let Some(peer_count) = peer_count {
+                    client
+                        .file_download_from_closest_peers(&data_map, &output_path, peer_count)
+                        .await
+                } else {
+                    client.file_download(&data_map, &output_path).await
+                };
 
-            download_result.map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
-            None
-        }
-    } else {
-        let (tx, mut rx) = mpsc::channel(64);
+                download_result.map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+                None
+            }
+        } else {
+            let (tx, mut rx) = mpsc::channel(64);
 
-        let progress_handle = tokio::spawn(async move {
-            let mut pb = progress::new_spinner("Resolving data map...");
+            let progress_handle = tokio::spawn(async move {
+                let mut pb = progress::new_spinner("Resolving data map...");
 
-            let bar_style = ProgressStyle::with_template(
-                "{spinner:.cyan} Downloading\n  [{bar:40.cyan/dim}] {pos}/{len} chunks",
-            )
-            .expect("valid template")
-            .progress_chars("━╸━")
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
+                let bar_style = ProgressStyle::with_template(
+                    "{spinner:.cyan} Downloading\n  [{bar:40.cyan/dim}] {pos}/{len} chunks",
+                )
+                .expect("valid template")
+                .progress_chars("━╸━")
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
 
-            while let Some(event) = rx.recv().await {
-                match event {
-                    DownloadEvent::ResolvingDataMap {
-                        total_map_chunks: _,
-                    } => {
-                        pb.set_message("Resolving data map...".to_string());
-                    }
-                    DownloadEvent::MapChunkFetched { fetched } => {
-                        pb.set_message(format!("Resolving data map... ({fetched} chunks)"));
-                    }
-                    DownloadEvent::DataMapResolved { total_chunks } => {
-                        pb.finish_and_clear();
-                        pb = progress::attach(ProgressBar::new(total_chunks as u64));
-                        pb.set_style(bar_style.clone());
-                        pb.set_message("Downloading");
-                        pb.enable_steady_tick(Duration::from_millis(80));
-                    }
-                    DownloadEvent::ChunksFetched { fetched, total: _ } => {
-                        pb.set_position(fetched as u64);
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        DownloadEvent::ResolvingDataMap {
+                            total_map_chunks: _,
+                        } => {
+                            pb.set_message("Resolving data map...".to_string());
+                        }
+                        DownloadEvent::MapChunkFetched { fetched } => {
+                            pb.set_message(format!("Resolving data map... ({fetched} chunks)"));
+                        }
+                        DownloadEvent::DataMapResolved { total_chunks } => {
+                            pb.finish_and_clear();
+                            pb = progress::attach(ProgressBar::new(total_chunks as u64));
+                            pb.set_style(bar_style.clone());
+                            pb.set_message("Downloading");
+                            pb.enable_steady_tick(Duration::from_millis(80));
+                        }
+                        DownloadEvent::ChunksFetched { fetched, total: _ } => {
+                            pb.set_position(fetched as u64);
+                        }
                     }
                 }
-            }
-            pb.finish_and_clear();
-        });
+                pb.finish_and_clear();
+            });
 
-        let chunk_peer_check = if all_peers {
-            let peer_count = download_peer_check_count(client, peer_count)?;
-            let report = client
-                .file_download_with_peer_report_from_closest_peers(
-                    &data_map,
-                    &output_path,
-                    Some(tx),
-                    peer_count,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
-            Some(file_peer_check_from_reports(report.chunk_reports))
-        } else {
-            let download_result = if let Some(diagnostics) = diagnostics.clone() {
+            let chunk_peer_check = if all_peers {
                 let peer_count = download_peer_check_count(client, peer_count)?;
-                client
-                    .file_download_with_progress_and_diagnostics_from_closest_peers(
-                        &data_map,
-                        &output_path,
-                        Some(tx),
-                        peer_count,
-                        Some(diagnostics),
-                    )
-                    .await
-            } else if let Some(peer_count) = peer_count {
-                client
-                    .file_download_with_progress_from_closest_peers(
+                let report = client
+                    .file_download_with_peer_report_from_closest_peers(
                         &data_map,
                         &output_path,
                         Some(tx),
                         peer_count,
                     )
                     .await
+                    .map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+                Some(file_peer_check_from_reports(report.chunk_reports))
             } else {
-                client
-                    .file_download_with_progress(&data_map, &output_path, Some(tx))
-                    .await
+                let download_result = if let Some(diagnostics) = diagnostics.clone() {
+                    let peer_count = download_peer_check_count(client, peer_count)?;
+                    client
+                        .file_download_with_progress_and_diagnostics_from_closest_peers(
+                            &data_map,
+                            &output_path,
+                            Some(tx),
+                            peer_count,
+                            Some(diagnostics),
+                        )
+                        .await
+                } else if let Some(peer_count) = peer_count {
+                    client
+                        .file_download_with_progress_from_closest_peers(
+                            &data_map,
+                            &output_path,
+                            Some(tx),
+                            peer_count,
+                        )
+                        .await
+                } else {
+                    client
+                        .file_download_with_progress(&data_map, &output_path, Some(tx))
+                        .await
+                };
+                download_result.map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
+                None
             };
-            download_result.map_err(|e| anyhow::anyhow!("Download failed: {e}"))?;
-            None
+
+            // Wait for progress bar cleanup (sender dropped → receiver exits)
+            let _ = progress_handle.await;
+
+            chunk_peer_check
         };
 
-        // Wait for progress bar cleanup (sender dropped → receiver exits)
-        let _ = progress_handle.await;
-
-        chunk_peer_check
-    };
+        Ok(chunk_peer_check)
+    }
+    .await;
 
     drop(diagnostics);
     if let Some(writer) = diagnostics_writer {
@@ -623,6 +632,7 @@ async fn handle_file_download(
             .map_err(|_| anyhow::anyhow!("Download diagnostics writer thread panicked"))?;
     }
 
+    let chunk_peer_check = download_result?;
     let file_size = std::fs::metadata(&output_path)?.len();
     let elapsed = start.elapsed();
 
