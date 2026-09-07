@@ -1,5 +1,6 @@
 //! Runtime-neutral scheduling and session state shared by native and browser clients.
 
+pub(crate) mod files;
 pub(crate) mod read;
 
 use futures_util::{stream, stream::FuturesUnordered, Stream, StreamExt as _};
