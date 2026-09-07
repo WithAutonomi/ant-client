@@ -915,9 +915,9 @@ impl Client {
             let mut failed_this_round = Vec::new();
             let results = crate::client_engine::rolling_unordered(to_retry, make_store, || {
                 store_limiter.current().min(byte_bound)
-            })
-            .await;
-            for (chunk, result) in results {
+            });
+            futures::pin_mut!(results);
+            while let Some((chunk, result)) = results.next().await {
                 match result {
                     Ok(name) => {
                         let duration_ms = first_seen

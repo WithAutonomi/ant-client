@@ -103,41 +103,43 @@ where
     }
 }
 
-/// Run all items with a rolling concurrency window whose cap is re-read after
-/// every completion.
+/// Yield each completion from a rolling concurrency window whose cap is
+/// re-read whenever the caller polls for the next result.
 ///
-/// Unlike [`bounded_unordered`], this collects every result and therefore fits
-/// retry rounds: one failed item does not prevent untouched siblings from
-/// being attempted. The cap callback lets callers combine the shared adaptive
-/// limiter with a payload-byte ceiling.
-pub(crate) async fn rolling_unordered<I, F, Fut, C>(
+/// Returning a stream lets callers report progress and record completion times
+/// immediately, even when another operation in the round is still pending.
+/// Every item is attempted, including after an operation returns an error.
+pub(crate) fn rolling_unordered<I, F, Fut, C>(
     items: I,
-    mut operation: F,
+    operation: F,
     current_cap: C,
-) -> Vec<Fut::Output>
+) -> impl Stream<Item = Fut::Output>
 where
     I: IntoIterator,
     F: FnMut(I::Item) -> Fut,
     Fut: Future,
     C: Fn() -> usize,
 {
-    let mut items = items.into_iter();
-    let mut in_flight = FuturesUnordered::new();
-    let mut results = Vec::new();
-    loop {
-        let cap = current_cap().max(1);
-        while in_flight.len() < cap {
-            match items.next() {
-                Some(item) => in_flight.push(operation(item)),
-                None => break,
+    stream::unfold(
+        (
+            items.into_iter(),
+            FuturesUnordered::new(),
+            operation,
+            current_cap,
+        ),
+        |(mut items, in_flight, mut operation, current_cap)| async move {
+            let cap = current_cap().max(1);
+            while in_flight.len() < cap {
+                match items.next() {
+                    Some(item) => in_flight.push(operation(item)),
+                    None => break,
+                }
             }
-        }
-        let Some(result) = in_flight.next().await else {
-            break;
-        };
-        results.push(result);
-    }
-    results
+            let mut in_flight = in_flight;
+            let result = in_flight.next().await?;
+            Some((result, (items, in_flight, operation, current_cap)))
+        },
+    )
 }
 
 /// Limit concurrent record stores by the shared source-body byte budget.
@@ -290,6 +292,49 @@ mod tests {
         assert_eq!(outputs.len(), 2);
         assert!(outputs.contains(&1));
         assert!(outputs.contains(&2));
+    }
+
+    #[test]
+    fn rolling_scheduler_reports_completions_before_slow_siblings() {
+        use futures::channel::oneshot;
+        use futures_util::FutureExt as _;
+
+        futures::executor::block_on(async {
+            let (fast_tx, fast_rx) = oneshot::channel::<u8>();
+            let (slow_tx, slow_rx) = oneshot::channel::<u8>();
+            let (last_tx, last_rx) = oneshot::channel::<u8>();
+            let cap = Cell::new(2usize);
+            let launched = Cell::new(0usize);
+            let completions = rolling_unordered(
+                [fast_rx, slow_rx, last_rx],
+                |receiver| {
+                    launched.set(launched.get() + 1);
+                    receiver
+                },
+                || cap.get(),
+            );
+            futures_util::pin_mut!(completions);
+
+            fast_tx.send(1).expect("receiver alive");
+            assert_eq!(completions.next().await, Some(Ok(1)));
+            assert_eq!(launched.get(), 2);
+
+            // A cap shrink must stop new launches while the slow sibling is
+            // pending, without hiding the completion already reported above.
+            cap.set(1);
+            assert!(completions.next().now_or_never().is_none());
+            assert_eq!(launched.get(), 2);
+            drop(slow_tx);
+            assert!(completions.next().await.expect("failed item").is_err());
+
+            // An error must not skip the remaining item; a zero cap still
+            // permits one operation so a transient limiter value cannot hang.
+            cap.set(0);
+            last_tx.send(3).expect("receiver alive");
+            assert_eq!(completions.next().await, Some(Ok(3)));
+            assert_eq!(launched.get(), 3);
+            assert!(completions.next().await.is_none());
+        });
     }
 
     #[test]

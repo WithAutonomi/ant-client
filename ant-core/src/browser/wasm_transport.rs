@@ -2201,6 +2201,7 @@ impl BrowserNetworkClient {
                 },
                 || cap_limiter.current().min(byte_bound),
             )
+            .collect::<Vec<_>>()
             .await;
 
             let mut failed = Vec::new();
