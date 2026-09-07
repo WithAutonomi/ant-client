@@ -1256,11 +1256,15 @@ mod tests {
         let mut wave2: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
         wave2.insert([3u8; 32], vec![30, 40]);
         let path2 = append_wave(&file_path, wave2, "70", 50)?;
-        // Same file path: one on-disk receipt per upload, appended across waves.
-        assert_eq!(path1, path2);
+        // Appending refreshes the receipt filename's timestamp. If the writes
+        // straddle a second boundary, the old path is replaced by the new one.
+        assert!(path2.exists());
+        if path1 != path2 {
+            assert!(!path1.exists());
+        }
 
         let (loaded_path, loaded) = load_for_file(&file_path)?.expect("receipt should load");
-        assert_eq!(loaded_path, path1);
+        assert_eq!(loaded_path, path2);
         assert_eq!(loaded.proofs.len(), 2);
         assert!(loaded.proofs.contains_key(&[2u8; 32]));
         assert!(loaded.proofs.contains_key(&[3u8; 32]));
