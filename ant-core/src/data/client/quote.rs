@@ -738,21 +738,13 @@ fn witnessed_quote_selection_or_error(
 }
 
 pub(crate) fn median_paid_quote_issuer(quotes: &[StoreQuote]) -> Option<(PeerId, Amount)> {
-    if quotes.is_empty() {
-        return None;
-    }
-
-    let median_quote_index = quotes.len() / 2;
-
-    let mut by_price: Vec<(usize, PeerId, Amount)> = quotes
+    let prices = quotes
         .iter()
-        .enumerate()
-        .map(|(index, (peer_id, _, _, price, _))| (index, *peer_id, *price))
-        .collect();
-    by_price.sort_by_key(|(index, _, price)| (*price, *index));
-    by_price
-        .get(median_quote_index)
-        .map(|(_, peer_id, price)| (*peer_id, *price))
+        .map(|(_, _, _, price, _)| *price)
+        .collect::<Vec<_>>();
+    let index = crate::payment_policy::median_quote_index(&prices)?;
+    let (peer_id, _, _, price, _) = &quotes[index];
+    Some((*peer_id, *price))
 }
 
 fn sort_quotes_by_distance(quotes: &mut [StoreQuote], address: &[u8; 32]) {
@@ -767,24 +759,13 @@ fn median_paid_quote_issuer_for_indices(
     quotes: &[StoreQuote],
     indices: &[usize],
 ) -> Option<(PeerId, Amount)> {
-    if indices.is_empty() {
-        return None;
-    }
-
-    let median_quote_index = indices.len() / 2;
-
-    let mut by_price: Vec<(usize, PeerId, Amount)> = indices
+    let prices = indices
         .iter()
-        .enumerate()
-        .map(|(selected_index, quote_index)| {
-            let (peer_id, _, _, price, _) = &quotes[*quote_index];
-            (selected_index, *peer_id, *price)
-        })
-        .collect();
-    by_price.sort_by_key(|(selected_index, _, price)| (*price, *selected_index));
-    by_price
-        .get(median_quote_index)
-        .map(|(_, peer_id, price)| (*peer_id, *price))
+        .map(|&index| quotes[index].3)
+        .collect::<Vec<_>>();
+    let selected = crate::payment_policy::median_quote_index(&prices)?;
+    let (peer_id, _, _, price, _) = &quotes[indices[selected]];
+    Some((*peer_id, *price))
 }
 
 fn median_issuer_voter_support(

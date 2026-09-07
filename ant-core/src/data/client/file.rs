@@ -21,7 +21,6 @@ use crate::data::client::merkle::{
     merkle_billable_leaves, merkle_deferred_retry, merkle_store_with_retry, should_use_merkle,
     MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
 };
-use crate::data::client::payment::SINGLE_NODE_PAYMENT_MULTIPLIER;
 use crate::data::client::Client;
 use crate::data::error::{Error, PartialUploadSpend, Result};
 use ant_protocol::evm::{Amount, PaymentQuote, QuoteHash, TxHash};
@@ -1345,13 +1344,11 @@ impl Client {
 
         // Use the median price × 3, matching the settlement multiplier both
         // payment paths now apply.
-        let mut prices: Vec<Amount> = quotes.iter().map(|(_, _, _, price, _)| *price).collect();
-        prices.sort();
-        let median_price = prices
-            .get(prices.len() / 2)
-            .copied()
-            .unwrap_or(Amount::ZERO);
-        let per_chunk_cost = median_price * Amount::from(SINGLE_NODE_PAYMENT_MULTIPLIER);
+        let prices: Vec<Amount> = quotes.iter().map(|(_, _, _, price, _)| *price).collect();
+        let median_price = crate::payment_policy::median_quote_index(&prices)
+            .map_or(Amount::ZERO, |index| prices[index]);
+        let per_chunk_cost = crate::payment_policy::enhanced_payment_amount(median_price)
+            .map_err(|error| Error::Payment(error.to_string()))?;
 
         let chunk_count_u64 = u64::try_from(chunk_count).unwrap_or(u64::MAX);
         // Merkle settles per *padded* leaf, not per chunk: the contract charges

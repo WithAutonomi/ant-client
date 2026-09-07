@@ -1,6 +1,8 @@
 /// Cross-platform Autonomi client logic and browser WASM bindings.
 pub mod browser;
 
+mod payment_policy;
+
 #[cfg(any(feature = "native", feature = "browser-wasm"))]
 mod client_engine;
 

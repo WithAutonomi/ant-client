@@ -82,6 +82,15 @@ The Rust/WASM implementation owns:
   bytes, close-group quorum, fallback targets, and whole-record retries; and
 - the bounded `BrowserFileReader` used by range-oriented consumers.
 
+Single-node quote selection and payment construction live in
+`ant-core/src/payment_policy.rs`. Native and browser adapters submit the prices
+of their verified payable quotes to this shared policy, which preserves stable
+tie ordering, selects the upper median, and pays that issuer three times its
+price. The native witness checks and cost estimate use the same median rule.
+Existing-holder responses count toward storage quorum and are excluded from
+payable quotes. Transport discovery, quote authentication, transaction
+submission, and proof encoding remain with the respective adapters.
+
 `ant-core` may call narrow JavaScript callbacks to obtain file ranges, load or
 discard externally staged encrypted records, report progress, and submit an
 already verified payment plan. Those callbacks expose browser capabilities;
