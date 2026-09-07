@@ -23,6 +23,8 @@ pub struct BrowserTestNode {
     already_stored: bool,
     last_method: String,
     chunk: Vec<u8>,
+    uploads_enabled: bool,
+    invalid_quote: bool,
 }
 
 fn network() -> BrowserPaymentNetwork {
@@ -58,6 +60,8 @@ impl BrowserTestNode {
             already_stored,
             last_method: String::new(),
             chunk: Vec::new(),
+            uploads_enabled: true,
+            invalid_quote: false,
         }
     }
     pub fn endpoint(&self) -> String {
@@ -65,6 +69,12 @@ impl BrowserTestNode {
     }
     pub fn last_method(&self) -> String {
         self.last_method.clone()
+    }
+    pub fn set_uploads_enabled(&mut self, enabled: bool) {
+        self.uploads_enabled = enabled;
+    }
+    pub fn set_invalid_quote(&mut self, invalid: bool) {
+        self.invalid_quote = invalid;
     }
     pub fn set_chunk(&mut self, chunk: Vec<u8>) {
         self.chunk = chunk;
@@ -104,12 +114,16 @@ impl BrowserTestNode {
                         multiaddr: self.endpoint.clone(),
                     },
                     payment: network(),
-                    capabilities: vec![
-                        "find_node".into(),
-                        "get_chunk".into(),
-                        "quote_chunk".into(),
-                        "put_chunk".into(),
-                    ],
+                    capabilities: if self.uploads_enabled {
+                        vec![
+                            "find_node".into(),
+                            "get_chunk".into(),
+                            "quote_chunk".into(),
+                            "put_chunk".into(),
+                        ]
+                    } else {
+                        vec!["find_node".into(), "get_chunk".into()]
+                    },
                 }
             }
             BrowserRequestBody::FindNode { target, .. } => {
@@ -150,7 +164,11 @@ impl BrowserTestNode {
                         signature: hex::encode(signature),
                         committed_key_count: 0,
                         commitment_pin: None,
-                        quote_hash: hex::encode(hash),
+                        quote_hash: if self.invalid_quote {
+                            "00".repeat(32)
+                        } else {
+                            hex::encode(hash)
+                        },
                         commitment: None,
                     },
                 }
