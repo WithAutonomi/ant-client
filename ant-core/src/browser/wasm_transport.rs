@@ -58,6 +58,9 @@ const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 const DEFAULT_MAX_POOLED_CLIENTS: usize = 32;
 const DEFAULT_LOOKUP_K: usize = 20;
 const DEFAULT_LOOKUP_ALPHA: usize = 3;
+// A failed FIND_NODE is not proof that GET_CHUNK is unavailable. Bound the
+// extra direct reads independently of the routing-cache size.
+const MAX_GET_FALLBACK_PEERS: usize = 20;
 const DEFAULT_MAX_LOOKUP_ITERATIONS: usize = 20;
 const LOOKUP_GRACE_TIMEOUT_MS: u32 = 5_000;
 const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
@@ -974,9 +977,54 @@ impl BrowserNetworkCore {
         progress: &ProgressReporter,
     ) -> Result<(Vec<u8>, BrowserNode), String> {
         let address = super::protocol::normalize_hex(address, 32)?;
-        let lookup = self.find_closest(&address, progress).await?;
         let mut failures = Vec::new();
-        for node in lookup.nodes {
+        let mut nodes = match self.find_closest(&address, progress).await {
+            Ok(lookup) => lookup.nodes,
+            Err(error) => {
+                progress.report(&format!(
+                    "Discovery for {address} failed; trying known endpoints: {error}"
+                ));
+                failures.push(format!("discovery: {error}"));
+                Vec::new()
+            }
+        };
+        let closest_count = nodes.len();
+        let mut seen = nodes
+            .iter()
+            .map(|node| node.peer_id.clone())
+            .collect::<HashSet<_>>();
+        let mut known = self.routing.borrow().clone();
+        // Cached routes can outlive the last successful seed lookup, or fail
+        // entirely. Keep the configured, certificate-pinned seeds eligible.
+        for seed in &self.seeds {
+            if let Ok(endpoint) = parse_webrtc_direct_multiaddr(&seed.multiaddr) {
+                if let Ok(candidate) = BrowserLookupCandidate::parse(BrowserNode {
+                    peer_id: endpoint.peer_id,
+                    native_addresses: Vec::new(),
+                    reliability: 1.0,
+                    webrtc_direct: Some(seed.clone()),
+                }) {
+                    known.entry(candidate.peer_id).or_insert(candidate);
+                }
+            }
+        }
+        let target = parse_lookup_key(&address, "record address")?;
+        let mut fallback = known.into_values().collect::<Vec<_>>();
+        fallback.sort_by_key(|candidate| xor_distance(&candidate.peer_id, &target));
+        nodes.extend(
+            fallback
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.wire.webrtc_direct.is_some()
+                        && seen.insert(candidate.wire.peer_id.clone())
+                })
+                .take(MAX_GET_FALLBACK_PEERS)
+                .map(|candidate| candidate.wire),
+        );
+        for (index, node) in nodes.into_iter().enumerate() {
+            if index == closest_count {
+                progress.report(&format!("Closest responders did not return {address}; trying additional known WebRtcDirect peers"));
+            }
             let Some(endpoint) = node.webrtc_direct.as_ref() else {
                 continue;
             };
@@ -999,7 +1047,7 @@ impl BrowserNetworkCore {
             }
         }
         Err(format!(
-            "no closest WebRtcDirect node returned chunk {address}{}",
+            "no queried WebRtcDirect node returned chunk {address}{}",
             if failures.is_empty() {
                 String::new()
             } else {

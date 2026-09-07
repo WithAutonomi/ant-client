@@ -23,6 +23,7 @@ pub struct BrowserTestNode {
     already_stored: bool,
     last_method: String,
     chunk: Vec<u8>,
+    records: HashMap<String, Vec<u8>>,
     uploads_enabled: bool,
     invalid_quote: bool,
     committed_key_count: u32,
@@ -65,6 +66,7 @@ impl BrowserTestNode {
             already_stored,
             last_method: String::new(),
             chunk: Vec::new(),
+            records: HashMap::new(),
             uploads_enabled: true,
             invalid_quote: false,
             committed_key_count: 0,
@@ -88,6 +90,12 @@ impl BrowserTestNode {
     }
     pub fn set_chunk(&mut self, chunk: Vec<u8>) {
         self.chunk = chunk;
+    }
+    pub fn set_record(&mut self, address: String, content: Vec<u8>) {
+        self.records.insert(address, content);
+    }
+    pub fn stored_record(&self, address: String) -> Vec<u8> {
+        self.records.get(&address).cloned().unwrap_or_default()
     }
     pub fn set_committed_key_count(&mut self, count: u32) {
         self.committed_key_count = count;
@@ -222,17 +230,28 @@ impl BrowserTestNode {
                         code: code.clone(),
                         message: message.clone(),
                     },
-                    None => BrowserResponseBody::ChunkStored {
-                        address,
-                        already_stored: false,
-                    },
+                    None => {
+                        self.records
+                            .insert(address.clone(), request.content.to_vec());
+                        BrowserResponseBody::ChunkStored {
+                            address,
+                            already_stored: false,
+                        }
+                    }
                 }
             }
             BrowserRequestBody::GetChunk { address } => {
                 self.last_method = "get_chunk".into();
-                BrowserResponseBody::Chunk {
-                    address,
-                    size: self.chunk.len(),
+                if let Some(content) = self.records.get(&address) {
+                    self.chunk = content.clone();
+                }
+                if self.chunk.is_empty() {
+                    BrowserResponseBody::ChunkNotFound { address }
+                } else {
+                    BrowserResponseBody::Chunk {
+                        address,
+                        size: self.chunk.len(),
+                    }
                 }
             }
         };
@@ -242,6 +261,9 @@ impl BrowserTestNode {
             &[]
         };
         let response = match body {
+            BrowserResponseBody::ChunkNotFound { address } => {
+                BrowserResponse::not_found(request.request.request_id, address)
+            }
             BrowserResponseBody::Error { code, message } => {
                 BrowserResponse::error(request.request.request_id, code, message)
             }

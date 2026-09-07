@@ -11,6 +11,7 @@ export const paymentNetwork = {
 export function mockWebRtc(nodes = [{}]) {
   const connections = [];
   const requests = [];
+  const stores = nodes.map(() => new Map());
   const endpoints = nodes.map((options, index) => {
     const node = new BrowserTestNode(index + 1, options.alreadyStored ?? false);
     const endpoint = node.endpoint();
@@ -28,6 +29,11 @@ export function mockWebRtc(nodes = [{}]) {
       const response = this.server.push(message);
       if (!response.length) return;
       const method = this.server.last_method();
+      if (method === "put_chunk") {
+        const address = this.server.last_put_address();
+        const content = this.server.stored_record(address);
+        if (content.length) stores[this.index].set(address, content);
+      }
       requests.push({ node: this.index, method, ...(method === "put_chunk" ? {
         address: this.server.last_put_address(),
         quoteHash: this.server.last_put_quote_hash(),
@@ -68,6 +74,9 @@ export function mockWebRtc(nodes = [{}]) {
         this.channel.options.alreadyStored ?? false,
       );
       this.channel.server.set_chunk(this.channel.options.chunk ?? new Uint8Array());
+      for (const [address, content] of stores[seed - 1]) {
+        this.channel.server.set_record(address, content);
+      }
       this.channel.server.set_uploads_enabled(this.channel.options.uploads ?? true);
       this.channel.server.set_invalid_quote(this.channel.options.invalidQuote ?? false);
       this.channel.server.set_committed_key_count(this.channel.options.keyCount ?? 0);
@@ -85,5 +94,5 @@ export function mockWebRtc(nodes = [{}]) {
       this.closed = true;
     }
   };
-  return { endpoints, connections, requests };
+  return { endpoints, connections, requests, stores };
 }

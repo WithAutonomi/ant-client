@@ -24,3 +24,9 @@ witness views, a supported paid median, and four successful stores. Tests
 cover inconsistent views, partial existing-holder votes, one payable quote,
 even quote counts, wider PUT fallback, and reuse of the paid proof. Structured
 remote errors are tested separately from an actual PUT-response deadline.
+
+Download regressions cover known holders omitted by failed discovery, complete
+discovery failure, bounded fallback, and unchanged BLAKE3 verification. The mock
+retains successful PUT payloads across connection replacements so a full upload,
+download and random-access read can run through the real WASM path, including
+when the storage holders stop answering FIND_NODE.
