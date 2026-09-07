@@ -7,7 +7,9 @@
 use crate::data::client::adaptive::observe_op;
 use crate::data::client::classify_error;
 use crate::data::client::file::UploadEvent;
-use crate::data::client::payment::{peer_id_to_encoded, SINGLE_NODE_PAYMENT_MULTIPLIER};
+use crate::data::client::payment::peer_id_to_encoded;
+#[cfg(test)]
+use crate::data::client::payment::SINGLE_NODE_PAYMENT_MULTIPLIER;
 use crate::data::client::Client;
 use crate::data::error::{Error, PartialUploadSpend, Result};
 use ant_protocol::evm::{
@@ -18,7 +20,9 @@ use ant_protocol::payment::{
     deserialize_proof, serialize_single_node_proof, PaymentProof, QuotePaymentInfo,
 };
 use ant_protocol::transport::{MultiAddr, PeerId};
-use ant_protocol::{compute_address, XorName, CLOSE_GROUP_SIZE, DATA_TYPE_CHUNK};
+#[cfg(test)]
+use ant_protocol::CLOSE_GROUP_SIZE;
+use ant_protocol::{compute_address, XorName, DATA_TYPE_CHUNK};
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -49,36 +53,20 @@ impl SingleNodeQuotePayment {
     /// The quotes are sorted by price, the median quote receives 3x its quoted
     /// price, and every other quote is included with a zero amount so proof and
     /// payment intent construction stay aligned.
-    pub fn from_quotes(mut quotes: Vec<PaymentQuote>) -> Result<Self> {
-        let quote_count = quotes.len();
-        if !(1..=CLOSE_GROUP_SIZE).contains(&quote_count) {
-            return Err(Error::Payment(format!(
-                "Single-node payment requires 1..={CLOSE_GROUP_SIZE} quotes, got {quote_count}"
-            )));
-        }
-
-        quotes.sort_by_key(|quote| quote.price);
-        let median_index = quote_count / 2;
-        let median_price = quotes[median_index].price;
-        let enhanced_price = median_price
-            .checked_mul(Amount::from(SINGLE_NODE_PAYMENT_MULTIPLIER))
-            .ok_or_else(|| {
-                Error::Payment("Price overflow when calculating 3x median".to_string())
-            })?;
-
-        let quotes = quotes
+    pub fn from_quotes(quotes: Vec<PaymentQuote>) -> Result<Self> {
+        let prices = quotes.iter().map(|quote| quote.price).collect::<Vec<_>>();
+        let plan = crate::payment_policy::SingleNodePaymentPlan::from_prices(&prices)
+            .map_err(|error| Error::Payment(error.to_string()))?;
+        let quotes = plan
+            .quotes
             .into_iter()
-            .enumerate()
-            .map(|(idx, quote)| {
+            .map(|planned| {
+                let quote = &quotes[planned.quote_index];
                 let quote_hash = quote.hash();
                 QuotePaymentInfo {
                     quote_hash,
                     rewards_address: quote.rewards_address,
-                    amount: if idx == median_index {
-                        enhanced_price
-                    } else {
-                        Amount::ZERO
-                    },
+                    amount: planned.amount,
                     price: quote.price,
                 }
             })
