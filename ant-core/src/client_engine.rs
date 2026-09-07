@@ -1,13 +1,13 @@
 //! Runtime-neutral scheduling and session state shared by native and browser clients.
 
 use futures_util::{stream, stream::FuturesUnordered, Stream, StreamExt as _};
-#[cfg(any(feature = "browser-wasm", test))]
+#[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
 use std::collections::HashMap;
 use std::future::Future;
-#[cfg(any(feature = "browser-wasm", test))]
+#[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
 use std::hash::Hash;
 use std::time::Duration;
-#[cfg(any(feature = "browser-wasm", test))]
+#[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
 use web_time::Instant;
 
 #[cfg_attr(
@@ -34,7 +34,6 @@ pub(crate) const STORE_RETRY_BASE_DELAY_MS: u64 = 500;
 /// Outcome of a quorum operation over an ordered target set.
 #[derive(Debug)]
 pub(crate) struct QuorumOutcome<T, E> {
-    pub(crate) successes: usize,
     pub(crate) successful_targets: Vec<T>,
     pub(crate) failures: Vec<(T, E)>,
     pub(crate) reached: bool,
@@ -58,7 +57,6 @@ where
 {
     if required == 0 {
         return QuorumOutcome {
-            successes: 0,
             successful_targets: Vec::new(),
             failures: Vec::new(),
             reached: true,
@@ -75,17 +73,14 @@ where
         in_flight.push(launch(target));
     }
 
-    let mut successes = 0usize;
     let mut successful_targets = Vec::with_capacity(required);
     let mut failures = Vec::new();
     while let Some((target, result)) = in_flight.next().await {
         match result {
             Ok(_) => {
-                successes += 1;
                 successful_targets.push(target);
-                if successes >= required {
+                if successful_targets.len() >= required {
                     return QuorumOutcome {
-                        successes,
                         successful_targets,
                         failures,
                         reached: true,
@@ -102,7 +97,6 @@ where
     }
 
     QuorumOutcome {
-        successes,
         successful_targets,
         failures,
         reached: false,
@@ -177,7 +171,7 @@ where
     stream::iter(futures).buffer_unordered(concurrency.max(1))
 }
 
-#[cfg(any(feature = "browser-wasm", test))]
+#[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
 #[derive(Debug, Clone)]
 struct FailureRecord {
     endpoint: String,
@@ -190,7 +184,7 @@ struct FailureRecord {
 /// endpoint that failed. A peer is immediately eligible again when it
 /// republishes a different endpoint, while repeated use of the same dead
 /// address is suppressed for the configured cooldown.
-#[cfg(any(feature = "browser-wasm", test))]
+#[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
 #[derive(Debug)]
 pub(crate) struct EndpointFailureCache<K> {
     cooldown: Duration,
@@ -198,7 +192,7 @@ pub(crate) struct EndpointFailureCache<K> {
     entries: HashMap<K, FailureRecord>,
 }
 
-#[cfg(any(feature = "browser-wasm", test))]
+#[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
 impl<K> EndpointFailureCache<K>
 where
     K: Clone + Eq + Hash,
@@ -313,7 +307,7 @@ mod tests {
         });
 
         assert!(outcome.reached);
-        assert_eq!(outcome.successes, 4);
+        assert_eq!(outcome.successful_targets.len(), 4);
         let mut successful_targets = outcome.successful_targets;
         successful_targets.sort_unstable();
         assert_eq!(successful_targets, vec![0, 1, 2, 3]);
@@ -336,7 +330,7 @@ mod tests {
         });
 
         assert!(outcome.reached);
-        assert_eq!(outcome.successes, 4);
+        assert_eq!(outcome.successful_targets.len(), 4);
         let mut successful_targets = outcome.successful_targets;
         successful_targets.sort_unstable();
         assert_eq!(successful_targets, vec![2, 3, 4, 5]);
@@ -354,7 +348,7 @@ mod tests {
         });
 
         assert!(!outcome.reached);
-        assert_eq!(outcome.successes, 0);
+        assert_eq!(outcome.successful_targets.len(), 0);
         assert!(outcome.successful_targets.is_empty());
         assert_eq!(outcome.failures.len(), 7);
     }
@@ -369,7 +363,7 @@ mod tests {
         });
 
         assert!(!outcome.reached);
-        assert_eq!(outcome.successes, 3);
+        assert_eq!(outcome.successful_targets.len(), 3);
         let mut successful_targets = outcome.successful_targets;
         successful_targets.sort_unstable();
         assert_eq!(successful_targets, vec![0, 1, 2]);

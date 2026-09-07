@@ -2312,7 +2312,6 @@ impl BrowserNetworkClient {
             },
         )
         .await;
-        debug_assert_eq!(outcome.successes, outcome.successful_targets.len());
         for target in outcome.successful_targets {
             successful_peers.insert(target.peer_id);
         }

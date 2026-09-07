@@ -419,7 +419,7 @@ impl Client {
             },
         )
         .await;
-        let success_count = outcome.successes;
+        let success_count = outcome.successful_targets.len();
         let mut failures: Vec<String> = Vec::new();
         // Tally the *cause* of each failure. The store AIMD limiter must only be
         // pushed down by a transport shortfall (V2-468): a node that responds —
