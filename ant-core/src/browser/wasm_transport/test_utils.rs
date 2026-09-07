@@ -25,6 +25,9 @@ pub struct BrowserTestNode {
     chunk: Vec<u8>,
     uploads_enabled: bool,
     invalid_quote: bool,
+    committed_key_count: u32,
+    last_put_address: String,
+    last_put_quote_hash: String,
 }
 
 fn network() -> BrowserPaymentNetwork {
@@ -62,6 +65,9 @@ impl BrowserTestNode {
             chunk: Vec::new(),
             uploads_enabled: true,
             invalid_quote: false,
+            committed_key_count: 0,
+            last_put_address: String::new(),
+            last_put_quote_hash: String::new(),
         }
     }
     pub fn endpoint(&self) -> String {
@@ -78,6 +84,15 @@ impl BrowserTestNode {
     }
     pub fn set_chunk(&mut self, chunk: Vec<u8>) {
         self.chunk = chunk;
+    }
+    pub fn set_committed_key_count(&mut self, count: u32) {
+        self.committed_key_count = count;
+    }
+    pub fn last_put_address(&self) -> String {
+        self.last_put_address.clone()
+    }
+    pub fn last_put_quote_hash(&self) -> String {
+        self.last_put_quote_hash.clone()
     }
     pub fn push(&mut self, message: &[u8]) -> Vec<u8> {
         self.received.extend_from_slice(message);
@@ -136,15 +151,18 @@ impl BrowserTestNode {
             BrowserRequestBody::QuoteChunk { address, .. } => {
                 self.last_method = "quote_chunk".into();
                 let content: [u8; 32] = hex::decode(&address).unwrap().try_into().unwrap();
-                let price = saorsa_webrtc::calculate_price_wei(0);
+                let count = self.committed_key_count;
+                let price = saorsa_webrtc::calculate_price_wei(count);
+                let commitment = self.storage_commitment();
+                let pin = commitment.as_ref().and_then(saorsa_webrtc::commitment_hash);
                 let timestamp = (js_sys::Date::now() / 1000.0) as u64;
                 let signed = saorsa_webrtc::payment_quote_bytes_for_signing(
                     &content,
                     timestamp,
                     price,
                     &[0x44; 20],
-                    0,
-                    None,
+                    count,
+                    pin.as_ref(),
                 );
                 let signature = self
                     .secret
@@ -162,19 +180,30 @@ impl BrowserTestNode {
                         rewards_address: hex::encode([0x44; 20]),
                         public_key: hex::encode(&self.public),
                         signature: hex::encode(signature),
-                        committed_key_count: 0,
-                        commitment_pin: None,
+                        committed_key_count: count,
+                        commitment_pin: pin.map(hex::encode),
                         quote_hash: if self.invalid_quote {
                             "00".repeat(32)
                         } else {
                             hex::encode(hash)
                         },
-                        commitment: None,
+                        commitment: commitment.map(|value| {
+                            super::super::payment::BrowserCommitmentArtifact {
+                                encoded: hex::encode(rmp_serde::to_vec(&value).unwrap()),
+                                root: hex::encode(value.root),
+                                key_count: value.key_count,
+                                sender_peer_id: hex::encode(value.sender_peer_id),
+                                sender_public_key: hex::encode(value.sender_public_key),
+                                signature: hex::encode(value.signature),
+                            }
+                        }),
                     },
                 }
             }
-            BrowserRequestBody::PutChunk { address, .. } => {
+            BrowserRequestBody::PutChunk { address, quote, .. } => {
                 self.last_method = "put_chunk".into();
+                self.last_put_address.clone_from(&address);
+                self.last_put_quote_hash = quote.quote_hash;
                 BrowserResponseBody::ChunkStored {
                     address,
                     already_stored: false,
@@ -197,6 +226,33 @@ impl BrowserTestNode {
         let plaintext = encode_response_frame(&response, content).unwrap();
         let encrypted = self.session.as_mut().unwrap().seal(&plaintext).unwrap();
         encode_pq_frame(&encrypted).unwrap()
+    }
+}
+
+impl BrowserTestNode {
+    fn storage_commitment(&self) -> Option<saorsa_webrtc::StorageCommitment> {
+        if self.committed_key_count == 0 {
+            return None;
+        }
+        let mut commitment = saorsa_webrtc::StorageCommitment {
+            root: [0x53; 32],
+            key_count: self.committed_key_count,
+            sender_peer_id: self.peer,
+            sender_public_key: self.public.clone(),
+            signature: Vec::new(),
+        };
+        let payload = saorsa_webrtc::storage_commitment_bytes_for_signing(
+            &commitment.root,
+            commitment.key_count,
+            &self.peer,
+            &self.public,
+        );
+        commitment.signature = self
+            .secret
+            .try_sign_with_seed(&[9; 32], &payload, saorsa_webrtc::DOMAIN_COMMITMENT)
+            .unwrap()
+            .to_vec();
+        Some(commitment)
     }
 }
 

@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 
 pub use saorsa_webrtc::payment_quote_hash;
 
-const PAYMENT_MULTIPLIER: u128 = 3;
+#[cfg(test)]
+const PAYMENT_MULTIPLIER: u128 = crate::payment_policy::SINGLE_NODE_PAYMENT_MULTIPLIER as u128;
 #[cfg(test)]
 const PRICE_BASELINE_WEI: u128 = 3_906_250_000_000_000;
 
@@ -34,6 +35,28 @@ pub struct VerifiedStorageQuote {
 #[derive(Debug, thiserror::Error)]
 #[error("invalid storage quote: {0}")]
 pub struct StorageQuoteError(pub String);
+
+/// Select the quote paid for one record using the native client's median policy.
+///
+/// Quotes must already have passed [`verify_storage_quote`] for distinct,
+/// eligible peers requiring payment for the same record. Input order breaks
+/// ties; one through seven quotes are supported. The selected issuer receives
+/// three times its price. Transport-specific storage-quorum checks remain
+/// with the caller.
+pub fn select_storage_quote(
+    mut quotes: Vec<VerifiedStorageQuote>,
+) -> Result<VerifiedStorageQuote, StorageQuoteError> {
+    let prices = quotes
+        .iter()
+        .map(|quote| parse_decimal_u128(&quote.quote.price, "quote price"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let plan = crate::payment_policy::SingleNodePaymentPlan::from_prices(&prices)
+        .map_err(|error| StorageQuoteError(error.to_string()))?;
+    let paid = plan.paid_quote();
+    let mut selected = quotes.swap_remove(paid.quote_index);
+    selected.amount = paid.amount.to_string();
+    Ok(selected)
+}
 
 /// Sum verified decimal quote amounts without exposing integer arithmetic to
 /// JavaScript or a wallet adapter.
@@ -130,9 +153,8 @@ pub fn verify_storage_quote(
         )?;
     }
 
-    let amount = price
-        .checked_mul(PAYMENT_MULTIPLIER)
-        .ok_or_else(|| StorageQuoteError("storage payment amount overflow".to_string()))?;
+    let amount = crate::payment_policy::enhanced_payment_amount(price)
+        .map_err(|error| StorageQuoteError(error.to_string()))?;
     Ok(VerifiedStorageQuote {
         quote,
         quote_hash,
@@ -296,11 +318,10 @@ mod tests {
         (quote, hex::encode(content), peer_id)
     }
 
-    fn bound_quote() -> (BrowserQuoteArtifact, String, String) {
+    fn bound_quote(key_count: u32) -> (BrowserQuoteArtifact, String, String) {
         let content = [0x31; 32];
         let rewards = [0x42; 20];
         let root = [0x53; 32];
-        let key_count = 23;
         let timestamp = 1_775_000_001;
         let (public_key, secret_key) = ml_dsa_65().generate_keypair().expect("keypair");
         let public_key = public_key.to_bytes();
@@ -422,7 +443,7 @@ mod tests {
 
     #[test]
     fn verifies_bound_commitment_and_exact_native_sidecar() {
-        let (quote, content, peer_id) = bound_quote();
+        let (quote, content, peer_id) = bound_quote(23);
         let verified =
             verify_storage_quote(quote.clone(), &content, &peer_id).expect("valid bound quote");
         assert_eq!(
@@ -435,5 +456,72 @@ mod tests {
         let error = verify_storage_quote(tampered, &content, &peer_id)
             .expect_err("sidecar mismatch must fail");
         assert!(error.to_string().contains("sidecar differs"));
+    }
+
+    #[test]
+    fn browser_and_native_adapters_select_the_same_signed_quote_and_payment() {
+        use crate::data::client::batch::SingleNodeQuotePayment;
+        use ant_protocol::evm::{Amount, PaymentQuote, RewardsAddress};
+
+        for (counts, expected_index) in [
+            (vec![1_000_000, 0, 0, 0, 0, 0, 0], 4),
+            (vec![0, 6000, 6000, 6000, 6000, 6000, 6000], 3),
+            (vec![6000, 1000, 4000, 2000], 2),
+            (vec![23, 23, 23, 23], 2),
+            (vec![23], 0),
+        ] {
+            let verified = counts
+                .iter()
+                .map(|&count| {
+                    let (quote, address, peer) = if count == 0 {
+                        baseline_quote()
+                    } else {
+                        bound_quote(count)
+                    };
+                    verify_storage_quote(quote, &address, &peer).expect("valid signed quote")
+                })
+                .collect::<Vec<_>>();
+            let expected_hash = verified[expected_index].quote_hash.clone();
+            let native_quotes = verified
+                .iter()
+                .map(|verified| {
+                    let quote = &verified.quote;
+                    PaymentQuote {
+                        content: xor_name::XorName(
+                            decode_hex_array(&quote.content, "content").unwrap(),
+                        ),
+                        timestamp: std::time::SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(quote.timestamp_secs),
+                        price: Amount::from(quote.price.parse::<u128>().unwrap()),
+                        rewards_address: RewardsAddress::from(
+                            decode_hex_array::<20>(&quote.rewards_address, "rewards").unwrap(),
+                        ),
+                        pub_key: hex::decode(&quote.public_key).unwrap(),
+                        signature: hex::decode(&quote.signature).unwrap(),
+                        committed_key_count: quote.committed_key_count,
+                        commitment_pin: quote
+                            .commitment_pin
+                            .as_ref()
+                            .map(|pin| decode_hex_array(pin, "pin").unwrap()),
+                    }
+                })
+                .collect();
+            let native = SingleNodeQuotePayment::from_quotes(native_quotes).expect("native plan");
+            let browser = select_storage_quote(verified).expect("browser plan");
+            let paid = native
+                .quotes
+                .iter()
+                .filter(|quote| !quote.amount.is_zero())
+                .collect::<Vec<_>>();
+            assert_eq!(paid.len(), 1);
+            assert_eq!(hex::encode(paid[0].quote_hash), expected_hash);
+            assert_eq!(browser.quote_hash, expected_hash);
+            assert_eq!(browser.amount, native.total_amount().to_string());
+            assert_eq!(
+                browser.amount,
+                (calculate_price_wei(counts[expected_index]) * 3).to_string()
+            );
+            assert_eq!(native.quotes.len(), counts.len());
+        }
     }
 }

@@ -5,7 +5,8 @@ use super::manifest::{
     PublicFileDescriptor,
 };
 use super::payment::{
-    storage_payment_total, verify_storage_quote, BrowserQuoteArtifact, VerifiedStorageQuote,
+    select_storage_quote, storage_payment_total, verify_storage_quote, BrowserQuoteArtifact,
+    VerifiedStorageQuote,
 };
 use super::protocol::{
     encode_request_frame, ice_password_from_sdp, parse_response_frame,
@@ -2114,22 +2115,17 @@ impl BrowserNetworkClient {
         let mut failures = Vec::new();
         let mut stored_peers = HashSet::new();
         let mut eligible_targets = Vec::with_capacity(targets.len());
-        let mut selected_quote: Option<(StoreTarget, bool, VerifiedStorageQuote)> = None;
+        let mut verified_quotes = Vec::with_capacity(targets.len());
         for (target, result) in targets.iter().zip(responses) {
             match result {
                 Ok((already_stored, verified)) => {
                     eligible_targets.push(target.clone());
                     if already_stored {
                         stored_peers.insert(target.peer_id.clone());
-                    }
-                    // Prefer paying a node that still needs the record. A
-                    // valid quote from an existing holder is also usable to
-                    // repair a partial upload when other quotes are absent.
-                    if selected_quote
-                        .as_ref()
-                        .is_none_or(|(_, stored, _)| *stored && !already_stored)
-                    {
-                        selected_quote = Some((target.clone(), already_stored, verified));
+                    } else {
+                        // Native quote collection counts existing holders as
+                        // storage votes, excluding their quotes from payment.
+                        verified_quotes.push(verified);
                     }
                 }
                 Err(error) => failures.push(format!("{}: {error}", target.peer_id)),
@@ -2157,12 +2153,12 @@ impl BrowserNetworkClient {
                 format!("{error} ({})", failures.join("; "))
             }
         })?;
-        let Some((quoted_target, _, verified)) = selected_quote else {
-            return Err(format!(
-                "no closest node supplied a valid quote ({})",
-                failures.join("; ")
-            ));
-        };
+        let verified = select_storage_quote(verified_quotes).map_err(|error| error.to_string())?;
+        let quoted_target = eligible_targets
+            .iter()
+            .find(|target| target.peer_id == verified.quote.peer_id)
+            .cloned()
+            .ok_or_else(|| "paid quote has no eligible storage target".to_string())?;
         progress.report(&format!(
             "Verified storage quote {} from {}",
             verified.quote_hash, quoted_target.peer_id

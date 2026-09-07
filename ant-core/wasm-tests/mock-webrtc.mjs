@@ -28,7 +28,10 @@ export function mockWebRtc(nodes = [{}]) {
       const response = this.server.push(message);
       if (!response.length) return;
       const method = this.server.last_method();
-      requests.push({ node: this.index, method });
+      requests.push({ node: this.index, method, ...(method === "put_chunk" ? {
+        address: this.server.last_put_address(),
+        quoteHash: this.server.last_put_quote_hash(),
+      } : {}) });
       if (this.options.respond?.(this, method, response) === false) return;
       setTimeout(() => {
         for (let offset = 0; offset < response.length; offset += 16_384) {
@@ -67,6 +70,7 @@ export function mockWebRtc(nodes = [{}]) {
       this.channel.server.set_chunk(this.channel.options.chunk ?? new Uint8Array());
       this.channel.server.set_uploads_enabled(this.channel.options.uploads ?? true);
       this.channel.server.set_invalid_quote(this.channel.options.invalidQuote ?? false);
+      this.channel.server.set_committed_key_count(this.channel.options.keyCount ?? 0);
       setTimeout(() => this.channel.onopen?.({}), 0);
     }
     close() {
