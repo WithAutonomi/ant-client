@@ -426,6 +426,22 @@ pub(super) struct BrowserNodeClientCore {
     peer_id: RefCell<Option<String>>,
 }
 
+// The request lock serializes RPCs, but releasing that lock is not enough
+// after cancellation: the next response still belongs to the canceled RPC.
+// Declare this guard after the lock so it closes the association first.
+struct PendingRequest<'a> {
+    client: &'a BrowserNodeClientCore,
+    completed: bool,
+}
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.client.close();
+        }
+    }
+}
+
 impl BrowserNodeClientCore {
     pub(super) fn new(endpoint: WebRtcDirectEndpoint) -> Self {
         Self {
@@ -462,6 +478,10 @@ impl BrowserNodeClientCore {
     ) -> Result<BrowserResponseFrame, String> {
         let _guard = self.request_lock.lock().await;
         self.ensure_connected().await?;
+        let mut pending = PendingRequest {
+            client: self,
+            completed: false,
+        };
         let request_id = self.next_request_id.get();
         self.next_request_id.set(request_id.wrapping_add(1).max(1));
         let request = BrowserRequest::new(request_id, body, content.len());
@@ -557,6 +577,9 @@ impl BrowserNodeClientCore {
             self.close();
             return Err(error);
         }
+        // The complete response has been consumed and authenticated. An
+        // ordinary application error can safely retain the session too.
+        pending.completed = true;
         if response.header.status == BrowserResponseStatus::Error {
             let (authentication_required, error) = match &response.header.body {
                 BrowserResponseBody::Error { code, message } => {
@@ -2714,6 +2737,19 @@ async fn read_pq_payload(
     }
 }
 
+struct CapacityListener {
+    channel: RtcDataChannel,
+    callback: Closure<dyn FnMut(Event)>,
+}
+
+impl Drop for CapacityListener {
+    fn drop(&mut self) {
+        // This also runs when the send future is canceled while draining.
+        // Detach before the Rust closure is freed.
+        self.channel.set_onbufferedamountlow(None);
+    }
+}
+
 async fn wait_for_capacity(channel: &RtcDataChannel, timeout_ms: u32) -> Result<(), String> {
     if channel.ready_state() != RtcDataChannelState::Open {
         return Err("WebRTC DataChannel closed while draining".to_string());
@@ -2730,7 +2766,11 @@ async fn wait_for_capacity(channel: &RtcDataChannel, timeout_ms: u32) -> Result<
             let _ = sender.send(());
         }
     });
-    channel.set_onbufferedamountlow(Some(on_ready.as_ref().unchecked_ref()));
+    let listener = CapacityListener {
+        channel: channel.clone(),
+        callback: on_ready,
+    };
+    channel.set_onbufferedamountlow(Some(listener.callback.as_ref().unchecked_ref()));
     // The buffer can cross the threshold between the first check and callback
     // installation. Re-check after installing it so that race cannot turn a
     // completed drain into a full transfer-timeout wait.
@@ -2739,7 +2779,7 @@ async fn wait_for_capacity(channel: &RtcDataChannel, timeout_ms: u32) -> Result<
             let _ = sender.send(());
         }
     }
-    let result = timeout_with_ms(
+    timeout_with_ms(
         async move {
             receiver
                 .await
@@ -2748,10 +2788,7 @@ async fn wait_for_capacity(channel: &RtcDataChannel, timeout_ms: u32) -> Result<
         "WebRTC DataChannel drain timed out",
         timeout_ms,
     )
-    .await;
-    channel.set_onbufferedamountlow(None);
-    drop(on_ready);
-    result
+    .await
 }
 
 async fn timeout<T, F>(future: F, message: &'static str) -> Result<T, String>
