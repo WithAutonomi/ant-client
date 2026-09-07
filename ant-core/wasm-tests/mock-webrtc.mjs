@@ -1,4 +1,4 @@
-import { BrowserTestNode } from "./pkg/ant_core.js";
+import { BrowserTestNode, parseWebRtcDirectMultiaddr } from "./pkg/ant_core.js";
 
 export const paymentNetwork = {
   chain_id: 31337,
@@ -71,6 +71,14 @@ export function mockWebRtc(nodes = [{}]) {
       this.channel.server.set_uploads_enabled(this.channel.options.uploads ?? true);
       this.channel.server.set_invalid_quote(this.channel.options.invalidQuote ?? false);
       this.channel.server.set_committed_key_count(this.channel.options.keyCount ?? 0);
+      const view = this.channel.options.view ?? nodes.map((_, i) => i);
+      this.channel.server.set_closest_peers(view.map(i => ({
+        peer_id: parseWebRtcDirectMultiaddr(endpoints[i]).peerId,
+        native_addresses: [], reliability: 1, webrtc_direct: { multiaddr: endpoints[i] },
+      })));
+      if (this.channel.options.putError) {
+        this.channel.server.set_put_error(this.channel.options.putError.code, this.channel.options.putError.message);
+      }
       setTimeout(() => this.channel.onopen?.({}), 0);
     }
     close() {

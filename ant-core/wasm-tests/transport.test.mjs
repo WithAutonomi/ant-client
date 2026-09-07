@@ -66,3 +66,17 @@ test("fragmented authenticated responses preserve normal connection reuse", asyn
     client.close();
   }
 });
+
+for (const message of ["price too low", "ICE failure", "remote request timed out"]) {
+  test(`authenticated PUT rejection stays an application failure: ${message}`, async () => {
+    const { test_put_failure_kind } = await import("./pkg/ant_core.js");
+    const rtc = mockWebRtc([{ putError: { code: "put_failed", message } }]);
+    assert.equal(await test_put_failure_kind(rtc.endpoints[0]), "Application");
+  });
+}
+
+test("an actual PUT response deadline remains a network capacity signal", async () => {
+  const { test_put_failure_kind } = await import("./pkg/ant_core.js");
+  const rtc = mockWebRtc([{ respond: (_, method) => method !== "put_chunk" }]);
+  assert.equal(await test_put_failure_kind(rtc.endpoints[0]), "Network");
+});
