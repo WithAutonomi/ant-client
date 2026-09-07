@@ -181,3 +181,52 @@ impl BrowserTestNode {
         encode_pq_frame(&encrypted).unwrap()
     }
 }
+
+/// Cancel a real RPC while retaining the owning client, then reuse the client.
+#[wasm_bindgen]
+pub async fn test_cancel_request(
+    endpoint: &str,
+    before_request: js_sys::Function,
+) -> Result<(), JsValue> {
+    let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
+    client
+        .hello()
+        .await
+        .map_err(|error| JsValue::from_str(&error))?;
+    before_request.call0(&JsValue::NULL)?;
+    let target = "11".repeat(32);
+    let request = Box::pin(client.find_node(&target, 20));
+    match select(request, Box::pin(TimeoutFuture::new(10))).await {
+        Either::Right((_, pending)) => drop(pending),
+        Either::Left(_) => return Err(JsValue::from_str("test RPC completed before cancellation")),
+    }
+    let result = client.find_node(&"22".repeat(32), 20).await;
+    client.close();
+    result
+        .map(|_| ())
+        .map_err(|error| JsValue::from_str(&error))
+}
+
+/// Cancel only a waiter for the request lock, leaving the active RPC intact.
+#[wasm_bindgen]
+pub async fn test_cancel_queued_request(endpoint: &str) -> Result<(), JsValue> {
+    let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
+    client
+        .hello()
+        .await
+        .map_err(|error| JsValue::from_str(&error))?;
+    let target = "11".repeat(32);
+    let active = client.find_node(&target, 20);
+    let waiting = async {
+        TimeoutFuture::new(1).await;
+        timeout_with_ms(client.find_node(&target, 20), "cancel waiting RPC", 10).await
+    };
+    let (result, canceled) = futures_util::future::join(active, waiting).await;
+    assert_eq!(canceled.unwrap_err(), "cancel waiting RPC");
+    result.map_err(|error| JsValue::from_str(&error))?;
+    let result = client.find_node(&target, 20).await;
+    client.close();
+    result
+        .map(|_| ())
+        .map_err(|error| JsValue::from_str(&error))
+}
