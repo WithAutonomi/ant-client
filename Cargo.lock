@@ -847,6 +847,7 @@ dependencies = [
  "blake3",
  "bytes",
  "console_error_panic_hook",
+ "fips204",
  "flate2",
  "fs2",
  "futures",
