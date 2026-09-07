@@ -2101,59 +2101,76 @@ impl BrowserNetworkClient {
                 "closest-node lookup returned no WebRTC Direct storage targets".to_string(),
             );
         }
+        // Verify votes from the whole close group before deciding whether
+        // payment and replication may be skipped. A signature authenticates
+        // one node's claim; it does not establish a storage quorum.
+        let responses = join_all(targets.iter().map(|target| async {
+            let client = self.inner.pool.client(&target.endpoint).await?;
+            let hello = client.hello().await?;
+            assert_upload_node(&hello, payment_network)?;
+            let (quote, already_stored) = client.quote_chunk(&record.address, record.size).await?;
+            let verified = verify_storage_quote(quote, &record.address, &target.peer_id)
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((already_stored, verified))
+        }))
+        .await;
         let mut failures = Vec::new();
-        for target in &targets {
-            let result = async {
-                let client = self.inner.pool.client(&target.endpoint).await?;
-                let hello = client.hello().await?;
-                assert_upload_node(&hello, payment_network)?;
-                let (quote, already_stored) =
-                    client.quote_chunk(&record.address, record.size).await?;
-                let verified = verify_storage_quote(quote, &record.address, &target.peer_id)
-                    .map_err(|error| error.to_string())?;
-                Ok::<_, String>((already_stored, verified))
-            }
-            .await;
+        let mut stored_peers = HashSet::new();
+        let mut selected_quote: Option<(StoreTarget, bool, VerifiedStorageQuote)> = None;
+        for (target, result) in targets.iter().zip(responses) {
             match result {
-                Ok((true, _)) => {
-                    progress.report(&format!(
-                        "Chunk {} is already stored; skipping payment",
-                        record.address
-                    ));
-                    return Ok(PreparedRecord {
-                        record,
-                        already_stored: true,
-                        targets,
-                        verified: None,
-                    });
-                }
-                Ok((false, verified)) => {
-                    progress.report(&format!(
-                        "Verified storage quote {} from {}",
-                        verified.quote_hash, target.peer_id
-                    ));
-                    let mut ordered_targets = Vec::with_capacity(targets.len());
-                    ordered_targets.push(target.clone());
-                    ordered_targets.extend(
-                        targets
-                            .iter()
-                            .filter(|candidate| candidate.peer_id != target.peer_id)
-                            .cloned(),
-                    );
-                    return Ok(PreparedRecord {
-                        record,
-                        already_stored: false,
-                        targets: ordered_targets,
-                        verified: Some(verified),
-                    });
+                Ok((already_stored, verified)) => {
+                    if already_stored {
+                        stored_peers.insert(target.peer_id.clone());
+                    }
+                    // Prefer paying a node that still needs the record. A
+                    // valid quote from an existing holder is also usable to
+                    // repair a partial upload when other quotes are absent.
+                    if selected_quote
+                        .as_ref()
+                        .is_none_or(|(_, stored, _)| *stored && !already_stored)
+                    {
+                        selected_quote = Some((target.clone(), already_stored, verified));
+                    }
                 }
                 Err(error) => failures.push(format!("{}: {error}", target.peer_id)),
             }
         }
-        Err(format!(
-            "no closest node supplied a valid quote ({})",
-            failures.join("; ")
-        ))
+        if stored_peers.len() >= CLOSE_GROUP_MAJORITY {
+            progress.report(&format!(
+                "Chunk {} is already stored on a close-group majority; skipping payment",
+                record.address
+            ));
+            return Ok(PreparedRecord {
+                record,
+                already_stored: true,
+                targets,
+                verified: None,
+            });
+        }
+        let Some((quoted_target, _, verified)) = selected_quote else {
+            return Err(format!(
+                "no closest node supplied a valid quote ({})",
+                failures.join("; ")
+            ));
+        };
+        progress.report(&format!(
+            "Verified storage quote {} from {}",
+            verified.quote_hash, quoted_target.peer_id
+        ));
+        let mut ordered_targets = Vec::with_capacity(targets.len());
+        ordered_targets.push(quoted_target.clone());
+        ordered_targets.extend(
+            targets
+                .into_iter()
+                .filter(|target| target.peer_id != quoted_target.peer_id),
+        );
+        Ok(PreparedRecord {
+            record,
+            already_stored: false,
+            targets: ordered_targets,
+            verified: Some(verified),
+        })
     }
 
     /// Store every paid record with the same adaptive, byte-bounded retry
@@ -2282,7 +2299,7 @@ impl BrowserNetworkClient {
         mut successful_peers: HashSet<String>,
     ) -> Result<usize, StoreAttemptError> {
         if prepared.already_stored {
-            return Ok(1);
+            return Ok(CLOSE_GROUP_MAJORITY);
         }
         let Some(transaction_hash) = context.transaction_hash else {
             return Err(StoreAttemptError::new(
