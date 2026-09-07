@@ -133,14 +133,10 @@ pub fn verify_record(address: &str, content: &[u8]) -> Result<(), BrowserError> 
             "record address must be 32 hexadecimal bytes".to_string(),
         ));
     }
-    let actual = content_address(content);
-    if !actual.eq_ignore_ascii_case(expected) {
-        return Err(BrowserError::Invalid(format!(
-            "BLAKE3 mismatch: expected {}, received {actual}",
-            expected.to_ascii_lowercase()
-        )));
-    }
-    Ok(())
+    let mut address = [0; 32];
+    hex::decode_to_slice(expected, &mut address)
+        .map_err(|e| BrowserError::Invalid(e.to_string()))?;
+    crate::record::verify(&address, content).map_err(BrowserError::Invalid)
 }
 
 /// Encrypt a complete public file with the native `self_encryption 0.36`
