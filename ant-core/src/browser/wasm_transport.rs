@@ -25,7 +25,7 @@ use futures_util::{
     stream::{self, FuturesUnordered, StreamExt as _},
 };
 use gloo_timers::future::TimeoutFuture;
-use js_sys::{Array, ArrayBuffer, Promise, Uint8Array};
+use js_sys::{Array, Promise, Uint8Array};
 use saorsa_dht_lookup::{
     collect_after_first_with_grace, run_iterative_lookup, xor_distance, IterativeLookup,
     LookupConfig, LookupKey, LookupNode, LookupQuery, LookupQueryOutcome,
@@ -65,7 +65,10 @@ const MAX_DOWNLOAD_CONCURRENCY: usize = 6;
 const MAX_BROWSER_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
-type ResponseInbox = Rc<Mutex<mpsc::UnboundedReceiver<Result<Vec<u8>, String>>>>;
+mod inbox;
+#[cfg(feature = "test-utils")]
+mod test_utils;
+use inbox::ResponseInbox;
 
 #[derive(Debug, Serialize)]
 struct BrowserLookupResult {
@@ -276,7 +279,7 @@ struct BrowserPutResponse {
 struct Connection {
     peer_connection: RtcPeerConnection,
     data_channel: RtcDataChannel,
-    inbox: ResponseInbox,
+    inbox: Rc<ResponseInbox>,
     pq_session: RefCell<Option<PqSession>>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
     _on_error: Closure<dyn FnMut(Event)>,
@@ -298,27 +301,27 @@ impl Connection {
         );
         data_channel.set_binary_type(RtcDataChannelType::Arraybuffer);
 
-        let (inbox_tx, inbox_rx) = mpsc::unbounded::<Result<Vec<u8>, String>>();
-        let message_tx = inbox_tx.clone();
+        let inbox = ResponseInbox::new();
+        let message_inbox = Rc::clone(&inbox);
+        let message_channel = data_channel.clone();
+        let message_connection = peer_connection.clone();
         let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            let data = event.data();
-            let result = if data.is_instance_of::<ArrayBuffer>() || ArrayBuffer::is_view(&data) {
-                Ok(Uint8Array::new(&data).to_vec())
-            } else {
-                Err("node sent a non-binary DataChannel message".to_string())
-            };
-            let _ = message_tx.unbounded_send(result);
+            if let Err(error) = message_inbox.push(event.data()) {
+                message_inbox.fail(error);
+                message_channel.close();
+                message_connection.close();
+            }
         });
         data_channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
-        let error_tx = inbox_tx.clone();
+        let error_inbox = Rc::clone(&inbox);
         let on_error = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
-            let _ = error_tx.unbounded_send(Err("WebRTC DataChannel failed".to_string()));
+            error_inbox.fail("WebRTC DataChannel failed".to_string());
         });
         data_channel.set_onerror(Some(on_error.as_ref().unchecked_ref()));
-        let close_tx = inbox_tx;
+        let close_inbox = Rc::clone(&inbox);
         let on_close = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
-            let _ = close_tx.unbounded_send(Err("WebRTC DataChannel closed".to_string()));
+            close_inbox.fail("WebRTC DataChannel closed".to_string());
         });
         data_channel.set_onclose(Some(on_close.as_ref().unchecked_ref()));
 
@@ -338,7 +341,7 @@ impl Connection {
         let connection = Self {
             peer_connection,
             data_channel,
-            inbox: Rc::new(Mutex::new(inbox_rx)),
+            inbox,
             pq_session: RefCell::new(None),
             _on_message: on_message,
             _on_error: on_error,
@@ -403,6 +406,7 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        self.inbox.fail("WebRTC connection closed".to_string());
         self.data_channel.set_onmessage(None);
         self.data_channel.set_onerror(None);
         self.data_channel.set_onclose(None);
@@ -468,6 +472,9 @@ impl BrowserNodeClientCore {
             let connection = connection
                 .as_ref()
                 .ok_or_else(|| "WebRTC DataChannel is not connected".to_string())?;
+            connection
+                .inbox
+                .expect_response(MAX_BROWSER_RESPONSE_BYTES + PQ_ENCRYPTED_OVERHEAD_BYTES)?;
             let encrypted = connection
                 .pq_session
                 .borrow_mut()
@@ -2632,6 +2639,7 @@ async fn establish_pq_session(
     let (handshake, client_hello) =
         PqClientHandshake::start().map_err(|error| error.to_string())?;
     let client_hello = encode_pq_frame(&client_hello).map_err(|error| error.to_string())?;
+    connection.inbox.expect_response(PQ_SERVER_ACCEPT_BYTES)?;
     send_data_channel_frame(&connection.data_channel, &client_hello, REQUEST_TIMEOUT_MS).await?;
     let server_accept = read_pq_payload(
         Rc::clone(&connection.inbox),
@@ -2660,7 +2668,7 @@ async fn send_data_channel_frame(
 }
 
 async fn read_pq_payload(
-    receiver: ResponseInbox,
+    receiver: Rc<ResponseInbox>,
     max_payload_bytes: usize,
     initial_timeout_ms: u32,
 ) -> Result<Vec<u8>, String> {
@@ -2670,14 +2678,8 @@ async fn read_pq_payload(
     let mut response_deadline_ms = response_started_ms + f64::from(initial_timeout_ms);
     loop {
         let remaining_ms = remaining_timeout_ms(response_deadline_ms);
-        let next = timeout_with_ms(
-            async { Ok(receiver.lock().await.next().await) },
-            "WebRTC request timed out",
-            remaining_ms,
-        )
-        .await?;
-        let message = next
-            .ok_or_else(|| "response ended before its declared frame was complete".to_string())??;
+        let message =
+            timeout_with_ms(receiver.next(), "WebRTC request timed out", remaining_ms).await?;
         let next_length = frame
             .len()
             .checked_add(message.len())
@@ -2704,6 +2706,7 @@ async fn read_pq_payload(
                 return Err("PQ frame contains bytes after its declared payload".to_string());
             }
             if frame.len() == expected {
+                receiver.finish_response()?;
                 return decode_pq_frame(&frame, max_payload_bytes)
                     .map_err(|error| error.to_string());
             }
