@@ -28,6 +28,8 @@ pub struct BrowserTestNode {
     committed_key_count: u32,
     last_put_address: String,
     last_put_quote_hash: String,
+    closest_peers: Vec<BrowserNode>,
+    put_error: Option<(String, String)>,
 }
 
 fn network() -> BrowserPaymentNetwork {
@@ -68,6 +70,8 @@ impl BrowserTestNode {
             committed_key_count: 0,
             last_put_address: String::new(),
             last_put_quote_hash: String::new(),
+            closest_peers: Vec::new(),
+            put_error: None,
         }
     }
     pub fn endpoint(&self) -> String {
@@ -87,6 +91,12 @@ impl BrowserTestNode {
     }
     pub fn set_committed_key_count(&mut self, count: u32) {
         self.committed_key_count = count;
+    }
+    pub fn set_closest_peers(&mut self, peers: JsValue) {
+        self.closest_peers = serde_wasm_bindgen::from_value(peers).unwrap();
+    }
+    pub fn set_put_error(&mut self, code: String, message: String) {
+        self.put_error = Some((code, message));
     }
     pub fn last_put_address(&self) -> String {
         self.last_put_address.clone()
@@ -141,12 +151,15 @@ impl BrowserTestNode {
                     },
                 }
             }
-            BrowserRequestBody::FindNode { target, .. } => {
+            BrowserRequestBody::FindNode { target, count } => {
                 self.last_method = "find_node".into();
-                BrowserResponseBody::Nodes {
-                    target,
-                    nodes: vec![],
-                }
+                let key = parse_lookup_key(&target, "target").unwrap();
+                let mut nodes = self.closest_peers.clone();
+                nodes.sort_by_key(|node| {
+                    xor_distance(&parse_lookup_key(&node.peer_id, "peer").unwrap(), &key)
+                });
+                nodes.truncate(count.unwrap_or(20));
+                BrowserResponseBody::Nodes { target, nodes }
             }
             BrowserRequestBody::QuoteChunk { address, .. } => {
                 self.last_method = "quote_chunk".into();
@@ -204,9 +217,15 @@ impl BrowserTestNode {
                 self.last_method = "put_chunk".into();
                 self.last_put_address.clone_from(&address);
                 self.last_put_quote_hash = quote.quote_hash;
-                BrowserResponseBody::ChunkStored {
-                    address,
-                    already_stored: false,
+                match &self.put_error {
+                    Some((code, message)) => BrowserResponseBody::Error {
+                        code: code.clone(),
+                        message: message.clone(),
+                    },
+                    None => BrowserResponseBody::ChunkStored {
+                        address,
+                        already_stored: false,
+                    },
                 }
             }
             BrowserRequestBody::GetChunk { address } => {
@@ -222,10 +241,47 @@ impl BrowserTestNode {
         } else {
             &[]
         };
-        let response = BrowserResponse::ok(request.request.request_id, body, content.len());
+        let response = match body {
+            BrowserResponseBody::Error { code, message } => {
+                BrowserResponse::error(request.request.request_id, code, message)
+            }
+            body => BrowserResponse::ok(request.request.request_id, body, content.len()),
+        };
         let plaintext = encode_response_frame(&response, content).unwrap();
         let encrypted = self.session.as_mut().unwrap().seal(&plaintext).unwrap();
         encode_pq_frame(&encrypted).unwrap()
+    }
+}
+
+/// Exercise classification after decoding an authenticated remote PUT error.
+#[wasm_bindgen]
+pub async fn test_put_failure_kind(endpoint: &str) -> Result<String, JsValue> {
+    let endpoint = parse_webrtc_direct_multiaddr(endpoint)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    let client = BrowserNodeClientCore::new(endpoint);
+    let content = b"structured PUT rejection fixture";
+    let address = super::super::content_address(content);
+    let (quote, _) = client
+        .quote_chunk(&address, content.len())
+        .await
+        .map_err(|error| JsValue::from_str(&error))?;
+    let result = client
+        .put_chunk_typed(&address, content, quote, &"ab".repeat(32))
+        .await;
+    client.close();
+    match result {
+        Ok(_) => Ok("Success".into()),
+        Err(error) => {
+            let (timeouts, dial, remote) = match error.put_rejection() {
+                PutRejection::Timeout => (1, 0, false),
+                PutRejection::Dial => (0, 1, false),
+                _ => (0, 0, true),
+            };
+            Ok(format!(
+                "{:?}",
+                crate::transfer_policy::put_shortfall(timeouts, dial, remote).failure_kind()
+            ))
+        }
     }
 }
 

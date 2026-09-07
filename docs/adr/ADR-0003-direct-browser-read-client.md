@@ -82,14 +82,35 @@ The Rust/WASM implementation owns:
   bytes, close-group quorum, fallback targets, and whole-record retries; and
 - the bounded `BrowserFileReader` used by range-oriented consumers.
 
-Single-node quote selection and payment construction live in
-`ant-core/src/payment_policy.rs`. Native and browser adapters submit the prices
-of their verified payable quotes to this shared policy, which preserves stable
-tie ordering, selects the upper median, and pays that issuer three times its
-price. The native witness checks and cost estimate use the same median rule.
-Existing-holder responses count toward storage quorum and are excluded from
-payable quotes. Transport discovery, quote authentication, transaction
-submission, and proof encoding remain with the respective adapters.
+Native client behavior is the reference for shared client policy:
+
+- `quote_validation.rs` owns the resolve-before-pay checks for peer binding,
+  signatures, commitment shape, forced pricing, sidecar limits, and commitment
+  resolution. Native adapters retain their native protocol verifiers and U256
+  amounts; browser adapters decode their wire representation and supply the
+  compatible portable protocol primitives. Baseline quotes have no pin to
+  resolve, so an unsolicited sidecar does not affect their admission.
+- `quote_policy.rs` owns witnessed peer eligibility, the quote collection
+  window, supported median subsets, existing-holder voting, and PUT ordering.
+  Both paths require seven initial peers, use the closest seven peers' views
+  to establish witness support, and prefer supporting witnesses for storage.
+  The base witness quorum is five, reduced by missing views as in native.
+  The initial PUT neighbourhood widens to twenty peers when available, with
+  a seven-peer fallback. Four successful stores remain the delivery quorum.
+- `payment_policy.rs` preserves stable tie ordering, selects the upper median,
+  and pays that issuer three times its price. The native cost estimate uses
+  the same median rule. Existing-holder quotes are excluded from payment.
+- `transfer_policy.rs` preserves native failure classification. Structured
+  remote PUT rejections and dial churn do not reduce adaptive concurrency;
+  a storage shortfall containing a PUT-response timeout does. Browser RPC
+  errors retain their codes and failure origin instead of classifying words
+  in a human-readable error message.
+
+The adapters own transport discovery, authenticated transcript collection,
+wire decoding, transaction submission, and proof encoding. Browser capability
+and payment-network checks additionally ensure eligible WebRTC targets exist
+before invoking the wallet. A peer's ability to supply a valid payable quote
+and its ability to store another issuer's proof are separate checks.
 
 `ant-core` may call narrow JavaScript callbacks to obtain file ranges, load or
 discard externally staged encrypted records, report progress, and submit an
