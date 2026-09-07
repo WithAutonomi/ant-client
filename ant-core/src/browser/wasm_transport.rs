@@ -18,14 +18,14 @@ use super::protocol::{
 };
 use super::{BrowserRecord, BrowserRecordInfo, BrowserStagedFile};
 use crate::client_engine::adaptive::{
-    observe_op, AdaptiveConfig, AdaptiveController, ChannelStart,
+    observe_op, AdaptiveConfig, AdaptiveController, ChannelStart, Outcome,
 };
 use crate::transfer_policy::{FailureKind, PutRejection, RpcError};
 use futures_channel::{mpsc, oneshot};
 use futures_util::{
     future::{join_all, select, Either},
     lock::Mutex,
-    stream::{self, FuturesUnordered, StreamExt as _},
+    stream::{FuturesUnordered, StreamExt as _},
 };
 use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Promise, Uint8Array};
@@ -815,6 +815,7 @@ impl BrowserNodeClientCore {
 }
 
 struct BrowserNetworkCore {
+    controller: AdaptiveController,
     seeds: Vec<BrowserEndpoint>,
     pool: Rc<BrowserClientPool>,
     routing: Rc<RefCell<HashMap<LookupKey, BrowserLookupCandidate>>>,
@@ -837,6 +838,7 @@ impl BrowserNetworkCore {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
+            controller: AdaptiveController::new(ChannelStart::default(), AdaptiveConfig::default()),
             seeds,
             pool: Rc::new(BrowserClientPool::new(DEFAULT_MAX_POOLED_CLIENTS)?),
             routing: Rc::new(RefCell::new(HashMap::new())),
@@ -975,6 +977,23 @@ impl BrowserNetworkCore {
     }
 
     async fn get_chunk_from_closest(
+        &self,
+        address: &str,
+        progress: &ProgressReporter,
+    ) -> Result<(Vec<u8>, BrowserNode), String> {
+        let started = web_time::Instant::now();
+        let result = self.retrieve_chunk(address, progress).await;
+        let (outcome, bytes) = match &result {
+            Ok((bytes, _)) => (Outcome::Success, bytes.len() as u64),
+            Err(_) => (Outcome::Timeout, 0),
+        };
+        self.controller
+            .fetch
+            .observe_with_bytes(outcome, started.elapsed(), bytes);
+        result
+    }
+
+    async fn retrieve_chunk(
         &self,
         address: &str,
         progress: &ProgressReporter,
@@ -1388,10 +1407,6 @@ struct BrowserRangeCache {
 }
 
 impl BrowserRangeCache {
-    fn contains(&self, address: &[u8; 32]) -> bool {
-        self.entries.contains_key(address)
-    }
-
     fn get(&mut self, address: &[u8; 32]) -> Option<bytes::Bytes> {
         self.clock = self.clock.wrapping_add(1);
         let entry = self.entries.get_mut(address)?;
@@ -1399,9 +1414,8 @@ impl BrowserRangeCache {
         Some(entry.content.clone())
     }
 
-    fn insert(&mut self, address: [u8; 32], content: Vec<u8>) {
+    fn insert(&mut self, address: [u8; 32], content: bytes::Bytes) {
         self.clock = self.clock.wrapping_add(1);
-        let content = bytes::Bytes::from(content);
         if let Some(previous) = self.entries.remove(&address) {
             self.total_bytes = self.total_bytes.saturating_sub(previous.content.len());
         }
@@ -1492,127 +1506,45 @@ impl BrowserFileReader {
                 "browser range reads are limited to {MAX_BROWSER_RANGE_BYTES} bytes"
             ));
         }
-        if length == 0 || start >= self.file.size {
-            return Ok(Vec::new());
-        }
-        let end = start.saturating_add(length).min(self.file.size);
-        let required = required_range_records(&self.root_data_map, start, end)?;
-        if required.is_empty() {
-            return Err("DataMap contains no records for the requested range".to_string());
-        }
-
-        let missing = {
-            let cache = self.cache.borrow();
-            required
-                .iter()
-                .filter(|(_, address)| !cache.contains(address))
-                .copied()
-                .collect::<Vec<_>>()
-        };
-        if !missing.is_empty() {
-            let downloads = stream::iter(missing)
-                .map(|(index, address)| {
-                    let inner = Rc::clone(&self.inner);
-                    let progress = self.progress.clone();
-                    async move {
-                        let encoded = hex::encode(address);
-                        progress.report(&format!(
-                            "Streaming encrypted chunk {} ({encoded})",
-                            index + 1
-                        ));
-                        inner
-                            .get_chunk_from_closest(&encoded, &progress)
-                            .await
-                            .map(|(content, _)| (address, content))
-                    }
-                })
-                .buffer_unordered(MAX_DOWNLOAD_CONCURRENCY)
-                .collect::<Vec<_>>()
-                .await;
-            let mut cache = self.cache.borrow_mut();
-            for download in downloads {
-                let (address, content) = download?;
-                cache.insert(address, content);
-            }
-        }
-
-        let available = {
-            let mut cache = self.cache.borrow_mut();
-            required
-                .iter()
-                .map(|(_, address)| {
-                    cache
-                        .get(address)
-                        .map(|content| (*address, content))
-                        .ok_or_else(|| {
-                            format!("streaming cache omitted record {}", hex::encode(address))
-                        })
-                })
-                .collect::<Result<HashMap<_, _>, _>>()?
-        };
-        let fetch_cached = |requested: &[(usize, self_encryption::XorName)]| {
-            requested
-                .iter()
-                .map(|(index, address)| {
-                    available
-                        .get(&address.0)
-                        .cloned()
-                        .map(|content| (*index, content))
-                        .ok_or_else(|| {
-                            self_encryption::Error::Generic(format!(
-                                "streaming range omitted record {}",
-                                hex::encode(address.0)
-                            ))
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()
-        };
-        let stream = self_encryption::streaming_decrypt_with_batch_size(
+        crate::client_engine::files::read_range(
             &self.root_data_map,
-            fetch_cached,
-            required.len(),
+            start,
+            length,
+            &|address| async move {
+                let cached = self.cache.borrow_mut().get(&address);
+                if let Some(content) = cached {
+                    return Ok(content);
+                }
+                let (content, _) = self
+                    .inner
+                    .get_chunk_from_closest(&hex::encode(address), &self.progress)
+                    .await?;
+                let content = bytes::Bytes::from(content);
+                if !self.closed.get() {
+                    self.cache.borrow_mut().insert(address, content.clone());
+                }
+                Ok::<_, String>(content)
+            },
+            &|| {
+                self.inner
+                    .controller
+                    .fetch
+                    .current()
+                    .min(MAX_DOWNLOAD_CONCURRENCY)
+            },
+            &|delay: Duration| TimeoutFuture::new(delay.as_millis() as u32),
+            |_| true,
         )
-        .map_err(|error| format!("could not initialize range decryption: {error}"))?;
-        let plaintext = stream
-            .get_range(start, end - start)
-            .map_err(|error| format!("could not decrypt requested range: {error}"))?;
-        if plaintext.len() != end - start {
-            return Err(format!(
-                "range decryption returned {} bytes, expected {}",
-                plaintext.len(),
-                end - start
-            ));
-        }
-        Ok(plaintext.to_vec())
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|error| error.to_string())
     }
-}
-
-fn required_range_records(
-    data_map: &self_encryption::DataMap,
-    start: usize,
-    end: usize,
-) -> Result<Vec<(usize, [u8; 32])>, String> {
-    let mut infos = data_map.infos().to_vec();
-    infos.sort_by_key(|info| info.index);
-    let mut cursor = 0usize;
-    let mut required = Vec::new();
-    for info in infos {
-        let chunk_end = cursor
-            .checked_add(info.src_size)
-            .ok_or_else(|| "DataMap plaintext size overflow".to_string())?;
-        if cursor < end && chunk_end > start {
-            required.push((info.index, info.dst_hash.0));
-        }
-        cursor = chunk_end;
-    }
-    Ok(required)
 }
 
 /// Stateful Autonomi browser client sharing Rust lookup and data workflows.
 #[wasm_bindgen(js_name = BrowserNetworkClient)]
 pub struct BrowserNetworkClient {
     inner: Rc<BrowserNetworkCore>,
-    controller: AdaptiveController,
 }
 
 #[wasm_bindgen(js_class = BrowserNetworkClient)]
@@ -1632,7 +1564,6 @@ impl BrowserNetworkClient {
             BrowserNetworkCore::new(endpoints).map_err(|error| JsValue::from_str(&error))?;
         Ok(Self {
             inner: Rc::new(inner),
-            controller: AdaptiveController::new(ChannelStart::default(), AdaptiveConfig::default()),
         })
     }
 
@@ -1791,49 +1722,25 @@ impl BrowserNetworkClient {
         }
         let concurrency = concurrency.min(MAX_DOWNLOAD_CONCURRENCY);
         let mut resolved = self.resolve_public_file(file, progress).await?;
-        let total = resolved.file.chunks.len();
-        let downloads = stream::iter(resolved.file.chunks.iter().cloned().enumerate())
-            .map(|(position, chunk)| {
-                let inner = Rc::clone(&self.inner);
-                let progress = progress.clone();
-                async move {
-                    progress.report(&format!(
-                        "Fetching encrypted file chunk {}/{} ({})",
-                        position + 1,
-                        total,
-                        chunk.dst_hash
-                    ));
-                    inner
-                        .get_chunk_from_closest(&chunk.dst_hash, &progress)
-                        .await
-                        .map(|(content, _)| (position, content))
-                }
-            })
-            .buffer_unordered(concurrency)
-            .collect::<Vec<_>>()
-            .await;
-        let mut encrypted_chunks = Vec::with_capacity(total);
-        for download in downloads {
-            encrypted_chunks.push(download?);
-        }
-        encrypted_chunks.sort_by_key(|(position, _)| *position);
-        let encrypted_chunks = encrypted_chunks
-            .into_iter()
-            .map(|(_, content)| content)
-            .collect::<Vec<_>>();
-        progress.report(&format!(
-            "Reconstructing {} with native ant-core WASM",
-            resolved.file.name
-        ));
-        let encrypted_chunks = encrypted_chunks
-            .into_iter()
-            .map(|content| self_encryption::EncryptedChunk {
-                content: bytes::Bytes::from(content),
-            })
-            .collect::<Vec<_>>();
-        let content = self_encryption::decrypt(&resolved.root_data_map, &encrypted_chunks)
-            .map_err(|error| format!("could not reconstruct public file: {error}"))?
-            .to_vec();
+        let content = crate::client_engine::files::download(
+            &resolved.root_data_map,
+            &|address| async move {
+                progress.report(&format!(
+                    "Fetching encrypted file chunk {}",
+                    hex::encode(address)
+                ));
+                self.inner
+                    .get_chunk_from_closest(&hex::encode(address), progress)
+                    .await
+                    .map(|(content, _)| bytes::Bytes::from(content))
+            },
+            &|| self.inner.controller.fetch.current().min(concurrency),
+            &|delay: Duration| TimeoutFuture::new(delay.as_millis() as u32),
+            |_| true,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .to_vec();
         if content.len() != resolved.file.size {
             return Err(format!(
                 "reconstructed file has {} bytes, expected {}",
@@ -1874,47 +1781,29 @@ impl BrowserNetworkClient {
             "Verified public DataMap ({} bytes)",
             encoded_data_map.len()
         ));
-        let published_data_map: self_encryption::DataMap = rmp_serde::from_slice(&encoded_data_map)
-            .map_err(|error| format!("could not decode public DataMap: {error}"))?;
-        let root_data_map = if published_data_map.is_child() {
-            let child_infos = published_data_map.infos().to_vec();
-            let downloads = stream::iter(child_infos.iter().cloned())
-                .map(|info| {
-                    let inner = Rc::clone(&self.inner);
-                    let progress = progress.clone();
-                    async move {
-                        let address = hex::encode(info.dst_hash.0);
-                        progress.report(&format!(
-                            "Resolving nested DataMap record {}",
-                            info.index + 1
-                        ));
-                        inner
-                            .get_chunk_from_closest(&address, &progress)
-                            .await
-                            .map(|(content, _)| (info.dst_hash.0, bytes::Bytes::from(content)))
-                    }
-                })
-                .buffer_unordered(MAX_DOWNLOAD_CONCURRENCY)
-                .collect::<Vec<_>>()
-                .await;
-            let mut child_records = HashMap::with_capacity(downloads.len());
-            for download in downloads {
-                let (address, content) = download?;
-                child_records.insert(address, content);
-            }
-            let mut get_child = |address: self_encryption::XorName| {
-                child_records.get(&address.0).cloned().ok_or_else(|| {
-                    self_encryption::Error::Generic(format!(
-                        "nested DataMap resolution requested unavailable record {}",
-                        hex::encode(address.0)
-                    ))
-                })
-            };
-            self_encryption::get_root_data_map(published_data_map, &mut get_child)
-                .map_err(|error| format!("could not resolve root DataMap: {error}"))?
-        } else {
-            published_data_map
-        };
+        let published_data_map = crate::client_engine::files::decode_map(&encoded_data_map)?;
+        let root_data_map = crate::client_engine::files::resolve(
+            &published_data_map,
+            &|address| async move {
+                progress.report(&format!(
+                    "Resolving nested DataMap record {}",
+                    hex::encode(address)
+                ));
+                self.inner
+                    .get_chunk_from_closest(&hex::encode(address), progress)
+                    .await
+                    .map(|(content, _)| bytes::Bytes::from(content))
+            },
+            &|| {
+                self.inner
+                    .controller
+                    .fetch
+                    .current()
+                    .min(MAX_DOWNLOAD_CONCURRENCY)
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
 
         let mut actual_chunks = super::chunk_infos(&root_data_map);
         actual_chunks.sort_by_key(|chunk| chunk.index);
@@ -2445,7 +2334,7 @@ impl BrowserNetworkClient {
                 TimeoutFuture::new(u32::try_from(delay.as_millis()).unwrap_or(u32::MAX)).await;
             }
 
-            let op_limiter = self.controller.store.clone();
+            let op_limiter = self.inner.controller.store.clone();
             let cap_limiter = op_limiter.clone();
             let results = crate::client_engine::rolling_unordered(
                 to_retry,

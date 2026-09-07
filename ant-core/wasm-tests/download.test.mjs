@@ -72,3 +72,25 @@ test("a just-uploaded file downloads and streams after its holders fail discover
     assert.deepEqual(await reader.readRange(0, content.length), content);
   } finally { reader?.close(); client.close(); }
 });
+
+test("native shrunk DataMaps download and stream through the shared async engine", async () => {
+  const maxChunkSize = 4_190_208;
+  const original = Uint8Array.from({ length: 3 * maxChunkSize + 1 }, (_, index) => index * 37);
+  const encrypted = encryptPublicFile(original);
+  const rtc = mockWebRtc([{}]);
+  for (const record of encrypted.records) rtc.stores[0].set(record.address, record.content);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let reader;
+  try {
+    const address = encrypted.records.at(-1).address;
+    const downloaded = await client.downloadPublicFile(address, 3);
+    assert.deepEqual(downloaded.content, original);
+    reader = await client.openPublicFile(address);
+    const boundary = encrypted.chunks[0].src_size;
+    for (const [start, length] of [[0, 32], [boundary - 1, 2], [boundary, 50], [original.length - 10, 100], [original.length, 10], [0, 0]]) {
+      assert.deepEqual(await reader.readRange(start, length), original.slice(start, start + length));
+    }
+    reader.close();
+    await assert.rejects(reader.readRange(0, 1), /closed/);
+  } finally { reader?.close(); client.close(); }
+});

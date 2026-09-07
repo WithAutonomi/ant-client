@@ -30,3 +30,10 @@ discovery failure, bounded fallback, and unchanged BLAKE3 verification. The mock
 retains successful PUT payloads across connection replacements so a full upload,
 download and random-access read can run through the real WASM path, including
 when the storage holders stop answering FIND_NODE.
+
+The shared read-engine regressions in `src/client_engine/{read,files}.rs` run
+with `cargo test -p ant-core --lib client_engine`. They cover native retry timing,
+peer deduplication and fallback bounds, typed fetch errors, multi-level DataMaps
+on a current-thread runtime, verified records, and range boundaries. Generated
+WASM additionally downloads a native shrunk DataMap through the mock network and
+checks media ranges across chunk boundaries and EOF.
