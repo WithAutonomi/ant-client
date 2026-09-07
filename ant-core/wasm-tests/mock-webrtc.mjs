@@ -1,7 +1,7 @@
 import { BrowserTestNode } from "./pkg/ant_core.js";
 
 export const paymentNetwork = {
-  rpc_url: "http://127.0.0.1:8545/",
+  chain_id: 31337,
   payment_token_address: `0x${"11".repeat(20)}`,
   payment_vault_address: `0x${"22".repeat(20)}`,
 };

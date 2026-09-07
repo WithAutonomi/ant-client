@@ -6,7 +6,7 @@ use super::BrowserChunkInfo;
 use serde::{Deserialize, Serialize};
 
 /// Current browser testnet manifest version.
-pub const BROWSER_MANIFEST_VERSION: u16 = 5;
+pub const BROWSER_MANIFEST_VERSION: u16 = 6;
 const MAX_DATA_MAP_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FILE_CHUNKS: usize = 1024;
 
@@ -97,22 +97,13 @@ pub fn parse_browser_manifest(
 pub fn validate_browser_payment_network(
     mut payment: BrowserPaymentNetwork,
 ) -> Result<BrowserPaymentNetwork, BrowserManifestError> {
-    let mut rpc_url = url::Url::parse(&payment.rpc_url)
-        .map_err(|error| BrowserManifestError(format!("payment RPC URL is invalid: {error}")))?;
-    if !matches!(rpc_url.scheme(), "http" | "https") {
+    // The JS SDK exposes chain IDs as numbers; reject identities that cannot
+    // survive that boundary exactly.
+    if payment.chain_id > 9_007_199_254_740_991 {
         return Err(BrowserManifestError(
-            "payment RPC URL must use HTTP or HTTPS".to_string(),
+            "payment chain ID exceeds JavaScript's safe integer range".to_string(),
         ));
     }
-    if !rpc_url.username().is_empty() || rpc_url.password().is_some() {
-        return Err(BrowserManifestError(
-            "payment RPC URL must not contain credentials".to_string(),
-        ));
-    }
-    if rpc_url.path().is_empty() {
-        rpc_url.set_path("/");
-    }
-    payment.rpc_url = rpc_url.to_string();
     payment.payment_token_address = format!(
         "0x{}",
         normalize_hex(&payment.payment_token_address, 20).map_err(BrowserManifestError)?
@@ -122,6 +113,34 @@ pub fn validate_browser_payment_network(
         normalize_hex(&payment.payment_vault_address, 20).map_err(BrowserManifestError)?
     );
     Ok(payment)
+}
+
+/// Check upload capabilities and payment identity without comparing RPC providers.
+#[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
+pub(crate) fn assert_upload_node(
+    hello: &super::protocol::BrowserHello,
+    expected: &BrowserPaymentNetwork,
+) -> Result<(), String> {
+    if !hello
+        .capabilities
+        .iter()
+        .any(|value| value == "quote_chunk")
+        || !hello.capabilities.iter().any(|value| value == "put_chunk")
+    {
+        return Err("node does not advertise paid browser uploads".to_string());
+    }
+    let advertised = &hello.payment;
+    if advertised.chain_id != expected.chain_id
+        || !advertised
+            .payment_token_address
+            .eq_ignore_ascii_case(&expected.payment_token_address)
+        || !advertised
+            .payment_vault_address
+            .eq_ignore_ascii_case(&expected.payment_vault_address)
+    {
+        return Err("node advertises a different payment network than the client".to_string());
+    }
+    Ok(())
 }
 
 fn normalize_file(file: &mut PublicFileDescriptor) -> Result<(), BrowserManifestError> {
@@ -200,13 +219,49 @@ mod tests {
     }
 
     #[test]
+    fn upload_identity_checks_chain_and_both_contracts() {
+        let payment = BrowserPaymentNetwork {
+            chain_id: 31337,
+            payment_token_address: format!("0x{}", "ab".repeat(20)),
+            payment_vault_address: format!("0x{}", "cd".repeat(20)),
+        };
+        let mut hello = super::super::protocol::BrowserHello {
+            response_type: "hello".into(),
+            protocol: super::super::protocol::BROWSER_PROTOCOL_NAME.into(),
+            peer_id: "aa".repeat(32),
+            endpoint: BrowserEndpoint {
+                multiaddr: endpoint(),
+            },
+            max_chunk_size: 4 * 1024 * 1024,
+            capabilities: vec!["quote_chunk".into(), "put_chunk".into()],
+            payment: payment.clone(),
+        };
+        assert!(assert_upload_node(&hello, &payment).is_ok());
+        hello.payment.payment_token_address = payment.payment_token_address.to_uppercase();
+        assert!(assert_upload_node(&hello, &payment).is_ok());
+        hello.payment.chain_id = 1;
+        assert!(assert_upload_node(&hello, &payment).is_err());
+        hello.payment = payment.clone();
+        hello.payment.payment_token_address = "11".repeat(20);
+        assert!(assert_upload_node(&hello, &payment).is_err());
+        hello.payment = payment.clone();
+        hello.payment.payment_vault_address = "22".repeat(20);
+        assert!(assert_upload_node(&hello, &payment).is_err());
+        hello.payment = payment.clone();
+        hello
+            .capabilities
+            .retain(|capability| capability != "put_chunk");
+        assert!(assert_upload_node(&hello, &payment).is_err());
+    }
+
+    #[test]
     fn validates_and_normalizes_manifest() {
         let value = serde_json::json!({
-            "version": 5,
+            "version": 6,
             "network_id": "local-test",
             "created_at": "2026-08-03T00:00:00Z",
             "payment": {
-                "rpc_url": "http://127.0.0.1:8545",
+                "chain_id": 31337,
                 "payment_token_address": format!("0x{}", "11".repeat(20)),
                 "payment_vault_address": format!("0x{}", "22".repeat(20)),
             },
@@ -229,6 +284,6 @@ mod tests {
         let manifest = parse_browser_manifest(value).expect("valid manifest");
         assert_eq!(manifest.files[0].address, "cc".repeat(32));
         assert_eq!(manifest.files[0].chunks[0].index, 0);
-        assert_eq!(manifest.payment.rpc_url, "http://127.0.0.1:8545/");
+        assert_eq!(manifest.payment.chain_id, 31337);
     }
 }
