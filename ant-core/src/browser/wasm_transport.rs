@@ -2096,11 +2096,7 @@ impl BrowserNetworkClient {
             })
             .take(CLOSE_GROUP_SIZE)
             .collect::<Vec<_>>();
-        if targets.is_empty() {
-            return Err(
-                "closest-node lookup returned no WebRTC Direct storage targets".to_string(),
-            );
-        }
+        ensure_store_quorum(&targets)?;
         // Verify votes from the whole close group before deciding whether
         // payment and replication may be skipped. A signature authenticates
         // one node's claim; it does not establish a storage quorum.
@@ -2116,10 +2112,12 @@ impl BrowserNetworkClient {
         .await;
         let mut failures = Vec::new();
         let mut stored_peers = HashSet::new();
+        let mut eligible_targets = Vec::with_capacity(targets.len());
         let mut selected_quote: Option<(StoreTarget, bool, VerifiedStorageQuote)> = None;
         for (target, result) in targets.iter().zip(responses) {
             match result {
                 Ok((already_stored, verified)) => {
+                    eligible_targets.push(target.clone());
                     if already_stored {
                         stored_peers.insert(target.peer_id.clone());
                     }
@@ -2148,6 +2146,16 @@ impl BrowserNetworkClient {
                 verified: None,
             });
         }
+        // Discovery alone does not establish upload eligibility: some peers
+        // may not support PUT, may advertise another payment network, or may
+        // fail quote validation. Never charge for an impossible target set.
+        ensure_store_quorum(&eligible_targets).map_err(|error| {
+            if failures.is_empty() {
+                error
+            } else {
+                format!("{error} ({})", failures.join("; "))
+            }
+        })?;
         let Some((quoted_target, _, verified)) = selected_quote else {
             return Err(format!(
                 "no closest node supplied a valid quote ({})",
@@ -2158,10 +2166,10 @@ impl BrowserNetworkClient {
             "Verified storage quote {} from {}",
             verified.quote_hash, quoted_target.peer_id
         ));
-        let mut ordered_targets = Vec::with_capacity(targets.len());
+        let mut ordered_targets = Vec::with_capacity(eligible_targets.len());
         ordered_targets.push(quoted_target.clone());
         ordered_targets.extend(
-            targets
+            eligible_targets
                 .into_iter()
                 .filter(|target| target.peer_id != quoted_target.peer_id),
         );
@@ -2386,6 +2394,20 @@ impl BrowserNetworkClient {
         }
         Ok(successful_peers.len())
     }
+}
+
+fn ensure_store_quorum(targets: &[StoreTarget]) -> Result<(), String> {
+    let distinct_peers = targets
+        .iter()
+        .map(|target| &target.peer_id)
+        .collect::<HashSet<_>>()
+        .len();
+    if distinct_peers < CLOSE_GROUP_MAJORITY {
+        return Err(format!(
+            "only {distinct_peers} eligible WebRTC Direct storage targets; need {CLOSE_GROUP_MAJORITY} before payment"
+        ));
+    }
+    Ok(())
 }
 
 fn normalized_content_type(content_type: &str) -> String {
