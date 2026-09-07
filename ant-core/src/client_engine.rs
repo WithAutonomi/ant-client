@@ -1,5 +1,7 @@
 //! Runtime-neutral scheduling and session state shared by native and browser clients.
 
+pub(crate) mod read;
+
 use futures_util::{stream, stream::FuturesUnordered, Stream, StreamExt as _};
 #[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
 use std::collections::HashMap;

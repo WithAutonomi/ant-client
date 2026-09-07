@@ -58,9 +58,6 @@ const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 const DEFAULT_MAX_POOLED_CLIENTS: usize = 32;
 const DEFAULT_LOOKUP_K: usize = 20;
 const DEFAULT_LOOKUP_ALPHA: usize = 3;
-// A failed FIND_NODE is not proof that GET_CHUNK is unavailable. Bound the
-// extra direct reads independently of the routing-cache size.
-const MAX_GET_FALLBACK_PEERS: usize = 20;
 const DEFAULT_MAX_LOOKUP_ITERATIONS: usize = 20;
 const LOOKUP_GRACE_TIMEOUT_MS: u32 = 5_000;
 const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
@@ -696,6 +693,12 @@ impl BrowserNodeClientCore {
     }
 
     pub(super) async fn get_chunk(&self, address: &str) -> Result<(Vec<u8>, String), String> {
+        self.try_get_chunk(address)
+            .await?
+            .ok_or_else(|| format!("chunk {address} was not found on this node"))
+    }
+
+    async fn try_get_chunk(&self, address: &str) -> Result<Option<(Vec<u8>, String)>, String> {
         let address = super::protocol::normalize_hex(address, 32)?;
         let response = self
             .request(
@@ -706,7 +709,7 @@ impl BrowserNodeClientCore {
             )
             .await?;
         if response.header.status == BrowserResponseStatus::NotFound {
-            return Err(format!("chunk {address} was not found on this node"));
+            return Ok(None);
         }
         let BrowserResponseBody::Chunk {
             address: response_address,
@@ -722,7 +725,7 @@ impl BrowserNodeClientCore {
             return Err("chunk metadata size does not match its content".to_string());
         }
         super::verify_record(&address, &response.content).map_err(|error| error.to_string())?;
-        Ok((response.content, address))
+        Ok(Some((response.content, address)))
     }
 
     pub(super) async fn quote_chunk(
@@ -977,83 +980,89 @@ impl BrowserNetworkCore {
         progress: &ProgressReporter,
     ) -> Result<(Vec<u8>, BrowserNode), String> {
         let address = super::protocol::normalize_hex(address, 32)?;
-        let mut failures = Vec::new();
-        let mut nodes = match self.find_closest(&address, progress).await {
-            Ok(lookup) => lookup.nodes,
-            Err(error) => {
-                progress.report(&format!(
-                    "Discovery for {address} failed; trying known endpoints: {error}"
-                ));
-                failures.push(format!("discovery: {error}"));
-                Vec::new()
-            }
-        };
-        let closest_count = nodes.len();
-        let mut seen = nodes
-            .iter()
-            .map(|node| node.peer_id.clone())
-            .collect::<HashSet<_>>();
-        let mut known = self.routing.borrow().clone();
-        // Cached routes can outlive the last successful seed lookup, or fail
-        // entirely. Keep the configured, certificate-pinned seeds eligible.
-        for seed in &self.seeds {
-            if let Ok(endpoint) = parse_webrtc_direct_multiaddr(&seed.multiaddr) {
-                if let Ok(candidate) = BrowserLookupCandidate::parse(BrowserNode {
-                    peer_id: endpoint.peer_id,
-                    native_addresses: Vec::new(),
-                    reliability: 1.0,
-                    webrtc_direct: Some(seed.clone()),
-                }) {
-                    known.entry(candidate.peer_id).or_insert(candidate);
-                }
-            }
-        }
+        let failures = RefCell::new(Vec::new());
         let target = parse_lookup_key(&address, "record address")?;
-        let mut fallback = known.into_values().collect::<Vec<_>>();
-        fallback.sort_by_key(|candidate| xor_distance(&candidate.peer_id, &target));
-        nodes.extend(
-            fallback
-                .into_iter()
-                .filter(|candidate| {
-                    candidate.wire.webrtc_direct.is_some()
-                        && seen.insert(candidate.wire.peer_id.clone())
-                })
-                .take(MAX_GET_FALLBACK_PEERS)
-                .map(|candidate| candidate.wire),
-        );
-        for (index, node) in nodes.into_iter().enumerate() {
-            if index == closest_count {
-                progress.report(&format!("Closest responders did not return {address}; trying additional known WebRtcDirect peers"));
-            }
-            let Some(endpoint) = node.webrtc_direct.as_ref() else {
-                continue;
-            };
-            progress.report(&format!("Requesting {address} from {}", node.peer_id));
-            let result = async {
-                let client = self.pool.client(endpoint).await?;
-                client.hello().await?;
-                client.get_chunk(&address).await
-            }
-            .await;
-            match result {
-                Ok((content, _)) => return Ok((content, node)),
-                Err(error) => {
-                    progress.report(&format!(
-                        "Node {} did not return the file: {error}",
-                        node.peer_id
-                    ));
-                    failures.push(format!("{}: {error}", node.peer_id));
+        let result = crate::client_engine::read::retrieve(
+            target,
+            || async {
+                let closest = match self.find_closest(&address, progress).await {
+                    Ok(lookup) => lookup
+                        .nodes
+                        .into_iter()
+                        .filter_map(|node| BrowserLookupCandidate::parse(node).ok())
+                        .collect(),
+                    Err(error) => {
+                        progress.report(&format!(
+                            "Discovery failed; trying known endpoints: {error}"
+                        ));
+                        failures.borrow_mut().push(format!("discovery: {error}"));
+                        Vec::new()
+                    }
+                };
+                let mut known = self.routing.borrow().clone();
+                for seed in &self.seeds {
+                    if let Ok(endpoint) = parse_webrtc_direct_multiaddr(&seed.multiaddr) {
+                        if let Ok(candidate) = BrowserLookupCandidate::parse(BrowserNode {
+                            peer_id: endpoint.peer_id,
+                            native_addresses: Vec::new(),
+                            reliability: 1.0,
+                            webrtc_direct: Some(seed.clone()),
+                        }) {
+                            known.entry(candidate.peer_id).or_insert(candidate);
+                        }
+                    }
                 }
-            }
-        }
-        Err(format!(
-            "no queried WebRtcDirect node returned chunk {address}{}",
-            if failures.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", failures.join("; "))
-            }
-        ))
+                crate::client_engine::read::ReadCandidates {
+                    closest,
+                    known: known.into_values().collect(),
+                }
+            },
+            |candidate| candidate.peer_id,
+            |candidate| {
+                let address = &address;
+                let failures = &failures;
+                async move {
+                    let node = candidate.wire;
+                    let result = async {
+                        let endpoint = node
+                            .webrtc_direct
+                            .as_ref()
+                            .ok_or("peer has no WebRTC endpoint")?;
+                        progress.report(&format!("Requesting {address} from {}", node.peer_id));
+                        let client = self.pool.client(endpoint).await?;
+                        client.hello().await?;
+                        client.try_get_chunk(address).await
+                    }
+                    .await;
+                    match result {
+                        Ok(Some((content, _))) => Ok(Some((content, node))),
+                        Ok(None) => {
+                            failures.borrow_mut().push(format!(
+                                "{}: chunk {address} was not found on this node",
+                                node.peer_id
+                            ));
+                            Ok(None)
+                        }
+                        Err(error) => {
+                            progress.report(&format!("GET {} failed: {error}", node.peer_id));
+                            failures
+                                .borrow_mut()
+                                .push(format!("{}: {error}", node.peer_id));
+                            Err(error)
+                        }
+                    }
+                }
+            },
+            |_| true,
+            |delay| TimeoutFuture::new(delay.as_millis() as u32),
+        )
+        .await?;
+        result.ok_or_else(|| {
+            format!(
+                "no queried WebRtcDirect node returned chunk {address} ({})",
+                failures.into_inner().join("; ")
+            )
+        })
     }
 }
 
