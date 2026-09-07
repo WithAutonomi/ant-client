@@ -1,7 +1,8 @@
 //! `web-sys` WebRTC Direct transport and typed node operations.
 
 use super::manifest::{
-    validate_browser_payment_network, BrowserPaymentNetwork, PublicFileDescriptor,
+    assert_upload_node, validate_browser_payment_network, BrowserPaymentNetwork,
+    PublicFileDescriptor,
 };
 use super::payment::{
     storage_payment_total, verify_storage_quote, BrowserQuoteArtifact, VerifiedStorageQuote,
@@ -2542,36 +2543,6 @@ async fn invoke_payment(
         .map_err(js_error_message)?;
     serde_wasm_bindgen::from_value(returned)
         .map_err(|error| format!("wallet callback returned an invalid payment result: {error}"))
-}
-
-fn assert_upload_node(
-    hello: &BrowserHello,
-    expected: &BrowserPaymentNetwork,
-) -> Result<(), String> {
-    if !hello
-        .capabilities
-        .iter()
-        .any(|value| value == "quote_chunk")
-        || !hello.capabilities.iter().any(|value| value == "put_chunk")
-    {
-        return Err("node does not advertise paid browser uploads".to_string());
-    }
-    let advertised = &hello.payment;
-    let advertised_rpc = url::Url::parse(&advertised.rpc_url)
-        .map_err(|error| format!("node advertises invalid payment RPC URL: {error}"))?;
-    let expected_rpc = url::Url::parse(&expected.rpc_url)
-        .map_err(|error| format!("manifest has invalid payment RPC URL: {error}"))?;
-    if advertised_rpc != expected_rpc
-        || !advertised
-            .payment_token_address
-            .eq_ignore_ascii_case(&expected.payment_token_address)
-        || !advertised
-            .payment_vault_address
-            .eq_ignore_ascii_case(&expected.payment_vault_address)
-    {
-        return Err("node advertises a different payment network than the manifest".to_string());
-    }
-    Ok(())
 }
 
 /// One authenticated browser-to-node WebRTC Direct client implemented in Rust.

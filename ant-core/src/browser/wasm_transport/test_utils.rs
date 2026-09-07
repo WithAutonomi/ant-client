@@ -29,7 +29,7 @@ pub struct BrowserTestNode {
 
 fn network() -> BrowserPaymentNetwork {
     BrowserPaymentNetwork {
-        rpc_url: "http://127.0.0.1:8545/".into(),
+        chain_id: 31337,
         payment_token_address: format!("0x{}", "11".repeat(20)),
         payment_vault_address: format!("0x{}", "22".repeat(20)),
     }
