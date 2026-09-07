@@ -10,7 +10,7 @@ fn test_config(dir: &tempfile::TempDir) -> DaemonConfig {
         listen_addr: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         port: Some(0), // random available port
         registry_path: dir.path().join("registry.json"),
-        log_path: dir.path().join("daemon.log"),
+        log_path: None,
         port_file_path: dir.path().join("daemon.port"),
         pid_file_path: dir.path().join("daemon.pid"),
     }

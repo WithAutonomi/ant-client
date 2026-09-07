@@ -314,10 +314,38 @@ jobs:
         id: changelog
         shell: bash
         run: |
-          # Extract the latest changelog section (between first two ## headers)
-          changelog=$(awk '/^## \[/{if(found) exit; found=1; next} found' CHANGELOG.md)
-          # Write to file for the release body
-          echo "$changelog" > /tmp/changelog_entry.md
+          # Extract the changelog section for the version being released — NOT
+          # "the first section". Blindly taking the first section shipped the
+          # ever-growing `[Unreleased]` blob as the notes of every release from
+          # 0.2.x through 0.3.4 (0.3.4's notes were byte-identical to 0.3.3's;
+          # the dual-stack entry re-shipped for four months). See V2-1107.
+          #
+          # `-rc.N` / `-beta.N` builds share the base version's section: the
+          # section is created when the train cuts rc.1 (rotate `[Unreleased]`
+          # into `[X.Y.Z] - <date>` as part of the cut), so every prerelease
+          # and the final stable of one train ship the same, correct, notes.
+          version="${{ steps.meta.outputs.version }}"
+          base_version="${version%%-*}"
+          changelog=$(awk -v ver="$base_version" '
+            BEGIN { gsub(/\./, "\\.", ver); pat = "^## \\[" ver "\\]" }
+            $0 ~ pat { found = 1; next }
+            /^## \[/ { if (found) exit }
+            found' CHANGELOG.md)
+          # A missing or empty section must never stop a release. The artifacts are
+          # fine and the notes are fixable after the fact with `gh release edit`, so
+          # failing closed here would only turn "missing notes" into "no release at
+          # all". The `::warning::` annotation keeps the omission loud on the run.
+          # Pre-tag enforcement, if we want it, belongs on the release-prep PR where
+          # a fix is cheap and nothing is blocked.
+          if [ -z "$(echo "$changelog" | tr -d '[:space:]')" ]; then
+            echo "::warning title=Missing changelog section::CHANGELOG.md has no non-empty '## [${base_version}]' section. Publishing with placeholder notes; correct them with 'gh release edit' and rotate '## [Unreleased]' into '## [${base_version}] - $(date -u +%F)'. See V2-1107."
+            cat > /tmp/changelog_entry.md <<EOF
+          _No changelog entry was recorded for ${base_version}. See the commit history for the changes in this release; these notes will be corrected retroactively._
+          EOF
+          else
+            # Write to file for the release body
+            echo "$changelog" > /tmp/changelog_entry.md
+          fi
 
       - name: generate release body
         shell: bash

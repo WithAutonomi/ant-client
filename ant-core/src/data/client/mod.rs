@@ -10,6 +10,7 @@ pub(crate) mod cached_merkle;
 pub(crate) mod cached_single;
 pub mod chunk;
 pub mod data;
+pub mod diagnostics;
 pub mod file;
 pub mod merkle;
 pub mod payment;

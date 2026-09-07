@@ -119,8 +119,11 @@ impl LogTailer {
         let files = self.discover_files().await?;
         let mut outcome = PollOutcome::default();
 
-        for path in &files {
-            match self.poll_file(path, offsets, min_level).await {
+        for (index, path) in files.iter().enumerate() {
+            // Only the file currently being written is a candidate for backfilling from its start;
+            // see `poll_file`.
+            let is_newest = index + 1 == files.len();
+            match self.poll_file(path, offsets, min_level, is_newest).await {
                 Ok(mut file_outcome) => {
                     outcome.events.append(&mut file_outcome.events);
                     outcome.dropped_by_level += file_outcome.dropped_by_level;
@@ -136,11 +139,15 @@ impl LogTailer {
             }
         }
 
+        // Pruning is deliberately *not* done here. The offset store is shared by every tailer, so
+        // pruning it against one node's files would delete every other node's positions — leaving
+        // them to restart their current file from byte zero on the next cycle, forever. The live
+        // set is reported upwards instead, and the runner prunes once against the union.
         let live: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-        offsets.prune(&live);
         self.last_seen_len.retain(|key, _| live.contains(key));
         self.primed = true;
 
+        outcome.live_files = live;
         Ok(outcome)
     }
 
@@ -172,6 +179,7 @@ impl LogTailer {
         path: &Path,
         offsets: &mut OffsetStore,
         min_level: LogLevel,
+        is_newest: bool,
     ) -> Result<PollOutcome> {
         let key = path.display().to_string();
         let file_name = path
@@ -184,9 +192,14 @@ impl LogTailer {
 
         let mut start = match offsets.get(&key) {
             Some(offset) => offset,
-            // A file we have never read: join at the end on the very first poll after enabling,
-            // otherwise (a new day's file, or a node added later) read it from the beginning.
-            None if !self.primed => len,
+            // A file we have never read. Joining at its end is the default, for two cases that
+            // amount to the same thing: the very first poll after enabling (forward-looking
+            // consent, not a request to upload the retained backlog), and any *older* daily that
+            // retention still holds. The latter matters after a fix or a config change leaves a
+            // tailer resuming with positions for some files and not others -- without it, a
+            // `--log-max-files` window of retained dailies (7 by default) would all be uploaded
+            // from byte zero at once. Only the file currently being written is backfilled.
+            None if !self.primed || !is_newest => len,
             None => 0,
         };
 
@@ -307,6 +320,9 @@ pub struct PollOutcome {
     pub events: Vec<TailedEvent>,
     /// Events discarded for being below the configured minimum level.
     pub dropped_by_level: u64,
+    /// Log files this tailer can currently see, so the caller can prune the shared offset store
+    /// against every tailer's files at once rather than one node's view of them.
+    pub live_files: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -329,6 +345,7 @@ impl CollectOutcome {
         PollOutcome {
             events: self.events,
             dropped_by_level: self.dropped_by_level,
+            live_files: Vec::new(),
         }
     }
 }
@@ -680,21 +697,50 @@ mod tests {
         assert_eq!(offsets.len(), 1, "only the rolling log file is tracked");
     }
 
+    /// The tailer reports what it can see; pruning against that view is the runner's job, because
+    /// only the runner sees every node's files. See
+    /// `runner::tests::offsets_for_retention_deleted_files_are_pruned`.
     #[tokio::test]
-    async fn offsets_for_retention_deleted_files_are_pruned() {
+    async fn a_retention_deleted_file_drops_out_of_the_reported_live_set() {
         let fixture = Fixture::new();
         fixture.append("ant-node.2026-08-18.log", &line("INFO", "old"));
         fixture.append("ant-node.2026-08-19.log", &line("INFO", "current"));
 
         let mut tailer = fixture.tailer();
         let mut offsets = fixture.offsets();
-        tailer.poll(&mut offsets, LogLevel::Info).await.unwrap();
+        let outcome = tailer.poll(&mut offsets, LogLevel::Info).await.unwrap();
+        assert_eq!(outcome.live_files.len(), 2);
         assert_eq!(offsets.len(), 2);
 
         std::fs::remove_file(fixture.log_dir.join("ant-node.2026-08-18.log")).unwrap();
+        let outcome = tailer.poll(&mut offsets, LogLevel::Info).await.unwrap();
+
+        assert_eq!(
+            outcome.live_files.len(),
+            1,
+            "the deleted file is no longer live"
+        );
+        assert!(outcome.live_files[0].ends_with("ant-node.2026-08-19.log"));
+    }
+
+    /// A tailer must not evict positions from the shared store: with several nodes forwarding, the
+    /// store holds files this tailer has never heard of.
+    #[tokio::test]
+    async fn polling_does_not_evict_another_nodes_offsets() {
+        let fixture = Fixture::new();
+        fixture.append("ant-node.2026-08-19.log", &line("INFO", "mine"));
+
+        let mut tailer = fixture.tailer();
+        let mut offsets = fixture.offsets();
+        offsets.set("/some/other/node/logs/ant-node.2026-08-19.log", 4242);
+
         tailer.poll(&mut offsets, LogLevel::Info).await.unwrap();
 
-        assert_eq!(offsets.len(), 1);
+        assert_eq!(
+            offsets.get("/some/other/node/logs/ant-node.2026-08-19.log"),
+            Some(4242),
+            "another node's position must survive this tailer's poll"
+        );
     }
 
     const INSTALL_A: &str = "0123456789abcdef";
@@ -773,5 +819,103 @@ mod tests {
         ];
         let unique: std::collections::HashSet<&String> = ids.iter().collect();
         assert_eq!(unique.len(), 4);
+    }
+
+    /// Reproduction: a day's file larger than MAX_CHUNK_BYTES must be shipped in full, not
+    /// stalled after the first chunk.
+    #[tokio::test]
+    async fn a_file_larger_than_one_chunk_is_read_to_the_end() {
+        let fixture = Fixture::new();
+        let mut tailer = fixture.tailer();
+        tailer.mark_primed();
+        let mut offsets = fixture.offsets();
+
+        // Build a file of ~3 chunks.
+        let one = line(
+            "INFO",
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        );
+        let per_chunk = (MAX_CHUNK_BYTES / one.len()) + 1;
+        let total = per_chunk * 3;
+        let mut blob = String::with_capacity(total * one.len());
+        for i in 0..total {
+            blob.push_str(&format!(
+                "2026-08-19T20:50:00.123456Z  INFO ant_node::node: event {i}\n"
+            ));
+        }
+        let file_len = blob.len() as u64;
+        fixture.append("ant-node.2026-08-19.log", &blob);
+
+        // Poll repeatedly; a correct tailer reaches the end of the file.
+        let mut seen = 0usize;
+        for _ in 0..50 {
+            let outcome = tailer.poll(&mut offsets, LogLevel::Info).await.unwrap();
+            seen += outcome.events.len();
+        }
+
+        let key = fixture
+            .log_dir
+            .join("ant-node.2026-08-19.log")
+            .display()
+            .to_string();
+        let final_offset = offsets.get(&key).unwrap_or(0);
+        eprintln!(
+            "file_len={file_len} final_offset={final_offset} events_seen={seen} expected={total} MAX_CHUNK_BYTES={MAX_CHUNK_BYTES}"
+        );
+        assert_eq!(
+            seen, total,
+            "every event must be shipped; stalled at offset {final_offset} of {file_len}"
+        );
+    }
+
+    /// A tailer resuming with positions for some files but not others must not upload the whole
+    /// retained window. Only the file being written is backfilled; older dailies join at their end.
+    #[tokio::test]
+    async fn older_unseen_dailies_are_not_backfilled() {
+        let fixture = Fixture::new();
+        for day in ["16", "17", "18"] {
+            fixture.append(
+                &format!("ant-node.2026-08-{day}.log"),
+                &line("INFO", &format!("retained history from the {day}th")),
+            );
+        }
+        fixture.append("ant-node.2026-08-19.log", &line("INFO", "today"));
+
+        // Primed: the daemon is resuming, not adopting these logs for the first time.
+        let mut tailer = fixture.tailer();
+        tailer.mark_primed();
+        let mut offsets = fixture.offsets();
+
+        let outcome = drain(&mut tailer, &mut offsets, LogLevel::Info).await;
+
+        let messages: Vec<&str> = outcome
+            .events
+            .iter()
+            .map(|event| event.event.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            vec!["today"],
+            "only the newest daily is backfilled; the retained window must be left alone"
+        );
+    }
+
+    /// The complement: a genuinely new day's file is still read from its first line, because it is
+    /// the newest.
+    #[tokio::test]
+    async fn the_newest_daily_is_still_backfilled_from_its_start() {
+        let fixture = Fixture::new();
+        fixture.append("ant-node.2026-08-18.log", &line("INFO", "yesterday"));
+
+        let mut tailer = fixture.tailer();
+        tailer.mark_primed();
+        let mut offsets = fixture.offsets();
+        drain(&mut tailer, &mut offsets, LogLevel::Info).await;
+
+        fixture.append("ant-node.2026-08-19.log", &line("INFO", "today"));
+        let outcome = drain(&mut tailer, &mut offsets, LogLevel::Info).await;
+
+        assert_eq!(outcome.events.len(), 1);
+        assert_eq!(outcome.events[0].event.message, "today");
     }
 }
