@@ -53,3 +53,60 @@ test("four distinct already-stored votes skip both payment and PUTs", async () =
     client.close();
   }
 });
+
+for (const count of [1, 2, 3]) {
+  test(`${count} discovered targets fail before any payment`, async () => {
+    const rtc = mockWebRtc(Array.from({ length: count }, () => ({})));
+    const client = new BrowserNetworkClient(rtc.endpoints);
+    const signer = wallet();
+    try {
+      await assert.rejects(upload(client, signer), /need 4 before payment/);
+      assert.equal(signer.calls.length, 0);
+      assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, 0);
+    } finally {
+      client.close();
+    }
+  });
+}
+
+test("duplicate endpoints cannot satisfy the distinct-peer minimum", async () => {
+  const rtc = mockWebRtc([{ alreadyStored: true }]);
+  const client = new BrowserNetworkClient(Array(4).fill(rtc.endpoints[0]));
+  const signer = wallet();
+  try {
+    await assert.rejects(upload(client, signer), /only 1 eligible.*need 4 before payment/);
+    assert.equal(signer.calls.length, 0);
+    assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, 0);
+  } finally {
+    client.close();
+  }
+});
+
+for (const ineligible of [{ uploads: false }, { invalidQuote: true, alreadyStored: true }]) {
+  test(`ineligible storage target (${JSON.stringify(ineligible)}) prevents payment`, async () => {
+    const rtc = mockWebRtc([{}, {}, {}, ineligible]);
+    const client = new BrowserNetworkClient(rtc.endpoints);
+    const signer = wallet();
+    try {
+      await assert.rejects(upload(client, signer), /only 3 eligible.*need 4 before payment/);
+      assert.equal(signer.calls.length, 0);
+      assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, 0);
+    } finally {
+      client.close();
+    }
+  });
+}
+
+test("an ineligible peer is excluded when four valid storage targets remain", async () => {
+  const rtc = mockWebRtc([{}, {}, {}, {}, { uploads: false }]);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    const result = await upload(client, signer);
+    assert.equal(result.file.replicas, 4);
+    assert.equal(signer.calls.length, 1);
+    assert.equal(rtc.requests.filter(({ node, method }) => node === 4 && method === "put_chunk").length, 0);
+  } finally {
+    client.close();
+  }
+});

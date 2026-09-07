@@ -65,6 +65,8 @@ export function mockWebRtc(nodes = [{}]) {
         this.channel.options.alreadyStored ?? false,
       );
       this.channel.server.set_chunk(this.channel.options.chunk ?? new Uint8Array());
+      this.channel.server.set_uploads_enabled(this.channel.options.uploads ?? true);
+      this.channel.server.set_invalid_quote(this.channel.options.invalidQuote ?? false);
       setTimeout(() => this.channel.onopen?.({}), 0);
     }
     close() {
