@@ -103,6 +103,8 @@ web-sys = { version = "0.3", optional = true, features = [
     "RtcSessionDescriptionInit",
 ] }
 gloo-timers = { version = "0.3", features = ["futures"], optional = true }
+# Deterministic mock-node signing for generated-WASM transport regression tests.
+fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-65"], optional = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # self_encryption/rand use getrandom 0.2. Browser entropy is supplied by the
 # Web Crypto API through its `js` feature.
@@ -168,7 +170,7 @@ browser-wasm = [
 devnet = ["native", "dep:ant-node"]
 # Expose test-only client seams (e.g. forcing the ADR-0002 extended PUT
 # fallback) used by the e2e/integration test suite.
-test-utils = []
+test-utils = ["dep:fips204"]
 
 [dev-dependencies]
 # Test infrastructure in tests/support/mod.rs spawns real ant-nodes

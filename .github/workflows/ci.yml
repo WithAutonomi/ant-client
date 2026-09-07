@@ -69,7 +69,7 @@ jobs:
           --release
           .
           --no-default-features
-          --features browser-wasm
+          --features browser-wasm,test-utils
       - name: Test the generated browser bindings
         working-directory: ant-core
         run: >-
