@@ -37,3 +37,7 @@ peer deduplication and fallback bounds, typed fetch errors, multi-level DataMaps
 on a current-thread runtime, verified records, and range boundaries. Generated
 WASM additionally downloads a native shrunk DataMap through the mock network and
 checks media ranges across chunk boundaries and EOF.
+
+Upload discovery regressions also reproduce five responders plus two transient
+FIND_NODE failures, verify fresh discovery succeeds before a single payment,
+and reject persistent five-peer results without any payment or PUT.
