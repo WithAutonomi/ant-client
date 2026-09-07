@@ -88,6 +88,24 @@ pub(crate) fn validate_witnessed_peers(
     validate_initial_peers(initial_count)
 }
 
+/// Native wide-to-close-group discovery fallback, also used by browser uploads.
+/// A partial successful lookup is inconclusive when it has fewer than seven
+/// initial peers. The second pass requests a fresh transport probe, never a
+/// weaker payment quorum or an unverified cached replacement for a responder.
+pub(crate) async fn discover_put_peers<T, E, F, Fut>(
+    discover: F,
+    count: impl Fn(&T) -> usize,
+) -> Result<T, E>
+where
+    F: Fn(usize, bool) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    match discover(PUT_TARGET_WIDTH, false).await {
+        Ok(result) if count(&result) >= CLOSE_GROUP_SIZE => Ok(result),
+        _ => discover(CLOSE_GROUP_SIZE, true).await,
+    }
+}
+
 pub(crate) fn validate_initial_peers(initial_count: usize) -> Result<(), String> {
     if initial_count < CLOSE_GROUP_SIZE {
         return Err(format!("Witnessed close group returned only {initial_count}/{CLOSE_GROUP_SIZE} initial PUT peers before payment."));
@@ -237,6 +255,32 @@ pub(crate) fn order_put_peers<K: Peer>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn upload_discovery_retries_errors_and_thin_successes_without_lowering_minimum() {
+        for first in [Ok(5usize), Err("lookup failed"), Ok(7), Ok(20)] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let result = futures::executor::block_on(super::discover_put_peers(
+                |width, fresh| {
+                    calls.borrow_mut().push((width, fresh));
+                    std::future::ready(if fresh { Ok(7) } else { first })
+                },
+                |count| *count,
+            ))
+            .unwrap();
+            assert!(result >= 7);
+            let expected = if matches!(first, Ok(count) if count >= 7) {
+                1
+            } else {
+                2
+            };
+            assert_eq!(calls.borrow().len(), expected);
+            if expected == 2 {
+                assert_eq!(calls.borrow()[1], (7, true));
+            }
+        }
+        assert!(super::validate_initial_peers(5).is_err());
+    }
+
     use super::*;
 
     fn peer(n: u8) -> [u8; 32] {

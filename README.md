@@ -49,6 +49,13 @@ retry only missing records, immediately once and then after 15 and 45 seconds,
 as native file downloads do. Browser concurrency and range-memory limits remain
 platform-specific ceilings on the shared adaptive scheduler.
 
+Upload discovery uses a shared wide-to-close-group retry before payment. A
+lookup with fewer than seven initial PUT peers triggers a fresh probe; in the
+browser that probe rechecks suppressed endpoints and waits for each request's
+normal deadline instead of the fast lookup grace period. Seven authenticated
+initial peers are still required. Cached addresses alone do not satisfy this
+check, and quote witnessing and storage-majority requirements are unchanged.
+
 Browser protocol v5 and browser manifest v6 advertise only the payment chain ID
 and token/vault addresses. RPC providers belong to the application or wallet;
 the node's verification RPC URL is never sent to the browser. Paid uploads

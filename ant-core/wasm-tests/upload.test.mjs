@@ -253,3 +253,48 @@ for (const staged of [false, true]) {
     } finally { client.close(); }
   });
 }
+
+test("upload refreshes five-peer discovery and rechecks suppressed witnesses before payment", async () => {
+  const failures = new Set();
+  const nodes = Array.from({ length: 7 }, (_, index) => ({
+    respond(channel, method) {
+      if (index < 2 && method === "find_node" && !failures.has(index)) {
+        failures.add(index);
+        channel.emit(new ArrayBuffer(0));
+        return false;
+      }
+    },
+  }));
+  const rtc = mockWebRtc(nodes);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  const progress = [];
+  try {
+    const result = await client.uploadPublicFile(content, "retry.txt", "text/plain", paymentNetwork, signer.pay, message => progress.push(message));
+    assert.equal(failures.size, 2);
+    assert(progress.some(message => message.includes("rechecking known peers before payment")));
+    assert.equal(signer.calls.length, 1);
+    assert.equal(result.file.replicas, 4);
+    for (const node of failures) {
+      assert(rtc.requests.filter(request => request.node === node && request.method === "find_node").length >= 2);
+    }
+  } finally { client.close(); }
+});
+
+test("cached endpoints alone never turn a persistent five-peer lookup into payment authorization", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, (_, index) => ({
+    respond(channel, method) {
+      if (index < 2 && method === "find_node") {
+        channel.emit(new ArrayBuffer(0));
+        return false;
+      }
+    },
+  })));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    await assert.rejects(upload(client, signer), /only 5\/7 initial PUT peers before payment/);
+    assert.equal(signer.calls.length, 0);
+    assert.equal(rtc.requests.filter(request => request.method === "put_chunk").length, 0);
+  } finally { client.close(); }
+});

@@ -856,6 +856,17 @@ impl BrowserNetworkCore {
         target: &str,
         progress: &ProgressReporter,
     ) -> Result<BrowserLookupResult, String> {
+        self.find_closest_pass(target, progress, DEFAULT_LOOKUP_K, false)
+            .await
+    }
+
+    async fn find_closest_pass(
+        &self,
+        target: &str,
+        progress: &ProgressReporter,
+        count: usize,
+        fresh: bool,
+    ) -> Result<BrowserLookupResult, String> {
         let target_key = parse_lookup_key(target, "lookup target")?;
         let failures = Rc::new(RefCell::new(Vec::new()));
         let views = Rc::new(RefCell::new(HashMap::new()));
@@ -891,12 +902,8 @@ impl BrowserNetworkCore {
             }
         });
         let mut initial_candidates = self.routing.borrow().values().cloned().collect::<Vec<_>>();
-        if initial_candidates.is_empty() {
-            initial_candidates = join_all(seed_futures)
-                .await
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
+        if initial_candidates.is_empty() || fresh {
+            initial_candidates.extend(join_all(seed_futures).await.into_iter().flatten());
         }
         if initial_candidates.is_empty() {
             let detail = failures
@@ -911,10 +918,10 @@ impl BrowserNetworkCore {
         }
 
         let config = LookupConfig {
-            count: DEFAULT_LOOKUP_K,
+            count,
             alpha: DEFAULT_LOOKUP_ALPHA,
             max_iterations: DEFAULT_MAX_LOOKUP_ITERATIONS,
-            ..LookupConfig::saorsa(DEFAULT_LOOKUP_K)
+            ..LookupConfig::saorsa(count)
         };
         let mut lookup =
             IterativeLookup::new(target_key, config).map_err(|error| error.to_string())?;
@@ -940,6 +947,7 @@ impl BrowserNetworkCore {
             }
         }
         let mut query = BrowserNetworkLookupQuery {
+            fresh,
             pool: Rc::clone(&self.pool),
             progress: progress.clone(),
             failures: Rc::clone(&failures),
@@ -1086,6 +1094,7 @@ impl BrowserNetworkCore {
 }
 
 struct BrowserNetworkLookupQuery {
+    fresh: bool,
     pool: Rc<BrowserClientPool>,
     progress: ProgressReporter,
     failures: Rc<RefCell<Vec<BrowserLookupFailure>>>,
@@ -1105,10 +1114,11 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
         let Some(endpoint) = candidate.wire.webrtc_direct.as_ref() else {
             return Ok(false);
         };
-        Ok(!self
-            .failed_endpoints
-            .borrow_mut()
-            .is_suppressed(&candidate.peer_id, &endpoint.multiaddr))
+        Ok(self.fresh
+            || !self
+                .failed_endpoints
+                .borrow_mut()
+                .is_suppressed(&candidate.peer_id, &endpoint.multiaddr))
     }
 
     async fn query_batch(
@@ -1152,7 +1162,12 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                         })?;
                         let client = pool.client(endpoint).await?;
                         client.hello().await?;
-                        client.find_node(&target, count).await
+                        client
+                            .find_node(
+                                &target,
+                                count.max(crate::quote_policy::SINGLE_NODE_WITNESSED_VIEW_COUNT),
+                            )
+                            .await
                     }
                     .await;
                     match result {
@@ -1197,9 +1212,14 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                 }
             })
             .collect();
-        let mut outcomes =
+        let mut outcomes = if self.fresh {
+            // Each RPC already has its own deadline. A recovery probe waits
+            // for it instead of applying the shorter fast-lookup grace period.
+            futures.collect::<Vec<_>>().await
+        } else {
             collect_after_first_with_grace(futures, || TimeoutFuture::new(LOOKUP_GRACE_TIMEOUT_MS))
-                .await;
+                .await
+        };
         let responded = outcomes
             .iter()
             .map(|outcome| *outcome.responder())
@@ -2068,7 +2088,21 @@ impl BrowserNetworkClient {
         progress: &ProgressReporter,
     ) -> Result<PreparedRecord, String> {
         progress.report(&format!("Finding closest nodes for {}", record.address));
-        let mut lookup = self.inner.find_closest(&record.address, progress).await?;
+        let record_address = &record.address;
+        let mut lookup = crate::quote_policy::discover_put_peers(
+            |width, fresh| async move {
+                if fresh {
+                    progress.report(
+                        "Upload discovery is incomplete; rechecking known peers before payment",
+                    );
+                }
+                self.inner
+                    .find_closest_pass(record_address, progress, width, fresh)
+                    .await
+            },
+            |lookup| lookup.nodes.len(),
+        )
+        .await?;
         let address = parse_lookup_key(&record.address, "record address")?;
         // Native first requests the wider PUT neighbourhood, falling back to
         // seven initial peers if the full width is unavailable.
@@ -2078,7 +2112,15 @@ impl BrowserNetworkClient {
             CLOSE_GROUP_SIZE
         };
         let initial = lookup.nodes.iter().take(width).cloned().collect::<Vec<_>>();
-        crate::quote_policy::validate_initial_peers(initial.len())?;
+        if let Err(error) = crate::quote_policy::validate_initial_peers(initial.len()) {
+            for failure in &lookup.failures {
+                progress.report(&format!(
+                    "Upload discovery {}: {}",
+                    failure.peer_id, failure.message
+                ));
+            }
+            return Err(error);
+        }
         // Reuse authenticated FIND_NODE transcripts. As native does, ask only
         // initial peers whose views were missing from the iterative lookup.
         let missing = initial.iter().filter(|node| {

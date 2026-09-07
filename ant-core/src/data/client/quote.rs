@@ -819,44 +819,25 @@ impl Client {
     ) -> Result<WitnessedQuoteSelection> {
         // Query the close-group width, but single-node payment now only needs
         // one valid witnessed quote to proceed.
-        let close_group_query_count = single_node_quote_query_count();
         let required_quotes = SINGLE_NODE_MIN_QUOTE_COUNT;
         // Contact the closest PUT_TARGET_WIDTH peers directly so the whole
         // PUT-target set's addresses arrive in this single query. A network
         // with fewer than that near the target can't satisfy the wide lookup,
         // so fall back to the close-group width — the upload still proceeds with
         // a narrower (but valid) PUT-target set rather than failing.
-        let witnessed = match self
-            .network()
-            .find_witnessed_close_group_with_view_count(
-                address,
-                PUT_TARGET_WIDTH,
-                SINGLE_NODE_WITNESSED_VIEW_COUNT,
-            )
-            .await
-        {
-            Ok(witnessed) => witnessed,
-            Err(wide_err) => {
-                debug!(
-                    target = %hex::encode(address),
-                    "Wide witnessed lookup ({PUT_TARGET_WIDTH}) failed ({wide_err}); \
-                     retrying at close-group width ({close_group_query_count})"
-                );
-                self.network()
-                    .find_witnessed_close_group_with_view_count(
-                        address,
-                        close_group_query_count,
-                        SINGLE_NODE_WITNESSED_VIEW_COUNT,
-                    )
-                    .await
-                    .map_err(|e| {
-                        Error::InsufficientPeers(format!(
-                            "Witnessed close group lookup failed before payment for target {}: {e}",
-                            hex::encode(address)
-                        ))
-                    })?
-            }
-        };
+        let witnessed = crate::quote_policy::discover_put_peers(
+            |width, fresh| async move {
+                if fresh {
+                    debug!(target = %hex::encode(address), "Retrying witnessed discovery at close-group width");
+                }
+                self.network().find_witnessed_close_group_with_view_count(
+                    address, width, SINGLE_NODE_WITNESSED_VIEW_COUNT,
+                ).await
+            },
+            |witnessed| witnessed.initial_closest.len(),
+        ).await.map_err(|e| Error::InsufficientPeers(format!(
+            "Witnessed close group lookup failed before payment for target {}: {e}", hex::encode(address),
+        )))?;
         // Run quoting/quorum on the closest CLOSE_GROUP_SIZE only, so payment
         // semantics are unaffected by the wider PUT query.
         let witnessed_quote = scope_witnessed_to_close_group(&witnessed);
