@@ -27,6 +27,12 @@ project owns the TypeScript API, wallet adapters, browser storage and worker
 integration, media streaming bridge, runnable examples, and browser end-to-end
 tests.
 
+Browser protocol v5 and browser manifest v6 advertise only the payment chain ID
+and token/vault addresses. RPC providers belong to the application or wallet;
+the node's verification RPC URL is never sent to the browser. Paid uploads
+check that every selected node advertises the same chain and contracts. Deploy
+matching node, Rust/WASM client, and SDK versions together.
+
 ## Installation
 
 ### Linux / macOS

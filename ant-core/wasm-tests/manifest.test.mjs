@@ -4,7 +4,7 @@ import { parseBrowserManifest } from "./pkg/ant_core.js";
 
 test("browser manifest validates and normalizes endpoints and files", () => {
   const manifest = parseBrowserManifest({
-    version: 5,
+    version: 6,
     network_id: "local-test",
     created_at: "2026-08-03T00:00:00Z",
     payment: paymentNetwork(),
@@ -49,7 +49,7 @@ test("browser manifest rejects missing endpoints and malformed multiaddresses", 
   assert.throws(
     () =>
       parseBrowserManifest({
-        version: 5,
+        version: 6,
         network_id: "test",
         payment: paymentNetwork(),
         endpoints: [],
@@ -59,7 +59,7 @@ test("browser manifest rejects missing endpoints and malformed multiaddresses", 
   assert.throws(
     () =>
       parseBrowserManifest({
-        version: 5,
+        version: 6,
         network_id: "test",
         payment: paymentNetwork(),
         endpoints: [
@@ -76,24 +76,24 @@ test("browser manifest rejects missing endpoints and malformed multiaddresses", 
 test("browser manifest requires public payment contract configuration", () => {
   const endpoint = { multiaddr: webrtc_directMultiaddr("aa".repeat(32), 0xbb) };
   assert.throws(
-    () => parseBrowserManifest({ version: 5, network_id: "test", endpoints: [endpoint] }),
+    () => parseBrowserManifest({ version: 6, network_id: "test", endpoints: [endpoint] }),
     /missing field.*payment|payment network/i,
   );
   assert.throws(
     () =>
       parseBrowserManifest({
-        version: 5,
+        version: 6,
         network_id: "test",
         endpoints: [endpoint],
-        payment: { ...paymentNetwork(), rpc_url: "file:///tmp/anvil" },
+        payment: { ...paymentNetwork(), chain_id: Number.MAX_SAFE_INTEGER + 1 },
       }),
-    /HTTP or HTTPS/,
+    /safe integer|expected u64/,
   );
 });
 
 function paymentNetwork() {
   return {
-    rpc_url: "http://127.0.0.1:8545/",
+    chain_id: 31337,
     payment_token_address: `0x${"11".repeat(20)}`,
     payment_vault_address: `0x${"22".repeat(20)}`,
   };
