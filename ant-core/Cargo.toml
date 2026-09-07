@@ -24,9 +24,9 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
 self_encryption = "0.36"
-saorsa-dht-lookup = { version = "0.1.0", git = "https://github.com/WithAutonomi/saorsa-core.git", rev = "1432fa9751d46887dc86767928bd3320a24c6367" }
+saorsa-dht-lookup = { version = "0.1.0", git = "https://github.com/WithAutonomi/saorsa-core.git", rev = "a87ebd641627aaabd5f5aea7b0d1c002c9f03915" }
 # Portable WebRTC Direct profile shared with ant-node.
-saorsa-webrtc = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "79fe1d8aca0e3434c41a4f19af65ab098aac102a" }
+saorsa-webrtc = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "d2147379ae45ecccc28fb8313ec1d42efac407f6" }
 thiserror = "2"
 url = "2"
 web-time = "1.1"
@@ -57,7 +57,7 @@ tower-http = { version = "0.6.8", features = ["cors"], optional = true }
 # under `ant_protocol::{evm, transport, pqc}`. This is the ONE pin for
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
-ant-protocol = { version = "2.3.1", default-features = false, optional = true }
+ant-protocol = { version = "2.3.5", default-features = false, optional = true }
 xor_name = { version = "5", optional = true }
 futures = { version = "0.3", optional = true }
 tracing = { version = "0.1", optional = true }
@@ -76,11 +76,10 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"], o
 # Must track the same `saorsa-core` / `ant-protocol` line as the
 # `ant-protocol` pin above — a version skew pulls a second copy of
 # `saorsa-core` into the graph and makes `ant_node`'s and `ant_protocol`'s
-# `MultiAddr` mutually incompatible in `node/devnet.rs`. While the runtime
-# `ant-protocol` pin above points at a released version, this ant-node must
-# track the matching released version carrying the same saorsa-core /
-# ant-protocol lineage.
-ant-node = { version = "0.16.0", optional = true }
+# `MultiAddr` mutually incompatible in `node/devnet.rs`. The draft node
+# revision below carries the same reviewed core/transport pins as this
+# workspace and uses the same released ant-protocol lineage.
+ant-node = { version = "0.18.1", git = "https://github.com/WithAutonomi/ant-node.git", rev = "f71275402a8a2b84331eadb07ab908ed6b985c37", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # Browser bindings are optional so ordinary native consumers do not pull the
@@ -179,7 +178,7 @@ test-utils = ["dep:fips204"]
 # always compile even without the `devnet` feature. Pinned to the same
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
-ant-node = { version = "0.16.0", features = ["test-utils"] }
+ant-node = { version = "0.18.1", git = "https://github.com/WithAutonomi/ant-node.git", rev = "f71275402a8a2b84331eadb07ab908ed6b985c37", features = ["test-utils"] }
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
