@@ -85,57 +85,8 @@ fn put_shortfall_error(
     }
 }
 
-/// Result of one sweep over a chunk's close group.
-///
-/// Either we got the chunk from some peer, or every peer in the group
-/// returned NotFound, timed out, or hit a transport / protocol error.
-/// The counts feed the retry decision (`is_authoritative_not_found`):
-/// only a *unanimous* NotFound from a *well-sampled* close group counts
-/// as authoritative data absence — anything else (a non-unanimous
-/// result, or a thin/under-sampled DHT walk) leaves room for the actual
-/// storer to be in the timeout / network-error / protocol-error bucket
-/// or outside the sampled view, and is worth a retry against a freshly
-/// re-walked close group.
-struct CloseGroupOutcome {
-    chunk: Option<DataChunk>,
-    queried: usize,
-    not_found: usize,
-    timeout: usize,
-    network_err: usize,
-    /// Counts peers that responded with a remote `Error` (e.g.
-    /// "Chunk verification failed") or any other protocol-level error
-    /// that classifies as `Error::Protocol`. Treated the same as
-    /// `timeout` / `network_err` for retry decisions: one peer's bad
-    /// response must not abort the whole close-group sweep — the
-    /// remaining peers might still have a clean copy.
-    protocol_err: usize,
-}
-
-/// `true` if the close-group sweep is strong enough evidence to
-/// conclude the chunk is genuinely absent, so retrying is pointless.
-///
-/// Two conditions, both required:
-///
-/// 1. *Unanimous*: every peer we managed to query responded with an
-///    authoritative NotFound (`not_found == queried`). An earlier
-///    version used a majority quorum (`not_found >= close_group_size /
-///    2 + 1`), but production traffic disproved that: storage
-///    replicates to `CLOSE_GROUP_MAJORITY` (4) of the K=7 close-group
-///    peers, so up to 3 peers legitimately don't store any given chunk
-///    and a `not_found=4 timeout=3` result is "3 storers we couldn't
-///    reach" plus "4 non-storers," not data loss.
-///
-/// 2. *Well-sampled*: at least `CLOSE_GROUP_MAJORITY` peers were
-///    queried. `closest_peers` (via `find_closest_peers`) accepts
-///    any non-empty DHT result, so a thin/under-sampled walk can return
-///    1 or 2 peers. A `1/1` or `3/3` NotFound from such a walk is NOT
-///    authoritative — the real replica majority may sit entirely
-///    outside that narrow view. Requiring a majority-sized sample means
-///    a thin lookup falls through to the retry (which re-walks the DHT)
-///    instead of being declared a final absence.
-fn is_authoritative_not_found(not_found: usize, queried: usize) -> bool {
-    queried >= CLOSE_GROUP_MAJORITY && not_found == queried
-}
+#[cfg(test)]
+use crate::client_engine::read::is_authoritative_not_found;
 
 /// Store-response timeout for non-merkle chunk PUTs.
 const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -593,8 +544,7 @@ impl Client {
     ) -> Result<Option<DataChunk>> {
         // Check cache first, with integrity verification.
         if let Some(cached) = self.chunk_cache().get(address) {
-            let computed = compute_address(&cached);
-            if computed == *address {
+            if crate::record::verify(address, &cached).is_ok() {
                 debug!("Cache hit for chunk {}", hex::encode(address));
                 return Ok(Some(DataChunk::new(*address, cached)));
             }
@@ -606,179 +556,49 @@ impl Client {
             self.chunk_cache().remove(address);
         }
 
-        let addr_hex = hex::encode(address);
-
-        // First attempt against the current close-group view. A
-        // lookup/transport error here (e.g. closest_peers' DHT walk
-        // momentarily returning an error, or InsufficientPeers from a
-        // thin routing table) is NOT fatal: fall through to the retry
-        // path exactly as a non-authoritative miss would. Otherwise one
-        // transient error on the *initial* close-group walk for a single
-        // chunk would fail an entire multi-hundred-chunk download. A
-        // zeroed outcome (queried=0) is never authoritative, so it flows
-        // straight to the retry below.
-        let first = match self.chunk_get_try_closest_peers(address, peer_count).await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                info!("chunk_get first close-group lookup failed for {addr_hex}: {e}; will retry");
-                CloseGroupOutcome {
-                    chunk: None,
-                    queried: 0,
-                    not_found: 0,
-                    timeout: 0,
-                    network_err: 0,
-                    protocol_err: 0,
-                }
-            }
-        };
-        if let Some(chunk) = first.chunk {
-            self.chunk_cache().put(chunk.address, chunk.content.clone());
-            return Ok(Some(chunk));
-        }
-
-        // Only treat as authoritative absence when *every* queried peer
-        // responded NotFound. Anything less leaves the actual storer
-        // possibly in the timeout / network-error bucket, which a retry
-        // could reach.
-        if is_authoritative_not_found(first.not_found, first.queried) {
-            info!(
-                "chunk_get giving up on {addr_hex} (unanimous NotFound): \
-                 queried={} not_found={} timeout={} network_err={} protocol_err={}",
-                first.queried,
-                first.not_found,
-                first.timeout,
-                first.network_err,
-                first.protocol_err,
-            );
-            return Ok(None);
-        }
-
-        // Otherwise the failure looks like reachability (most peers timed out
-        // or hit transport errors). The chunk is most likely still on the
-        // network but the current close-group view either (a) caught a
-        // transient transport blip or (b) converged on the wrong neighbourhood
-        // because the routing table is thin. One retry against a freshly
-        // re-walked close group is the cheapest defence against both.
-        info!(
-            "chunk_get retrying {addr_hex} after reachability failure: \
-             queried={} not_found={} timeout={} network_err={} protocol_err={}",
-            first.queried, first.not_found, first.timeout, first.network_err, first.protocol_err,
-        );
-
-        // Brief settle so any in-flight transport state can quiesce before
-        // we re-walk the DHT. Keep this small so we don't add meaningful
-        // latency to the genuinely-lost case (we already paid for one full
-        // close-group sweep before getting here).
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // If the retry's DHT lookup itself fails, treat that as "still
-        // couldn't find" rather than escalating the error — matches the
-        // semantics of the first attempt when peers are unreachable.
-        let retry = match self.chunk_get_try_closest_peers(address, peer_count).await {
-            Ok(o) => o,
-            Err(e) => {
-                info!(
-                    "chunk_get retry close-group lookup failed for {addr_hex}: {e}; \
-                     first(queried={} not_found={} timeout={} network_err={} protocol_err={})",
-                    first.queried,
-                    first.not_found,
-                    first.timeout,
-                    first.network_err,
-                    first.protocol_err,
-                );
-                return Ok(None);
-            }
-        };
-        if let Some(chunk) = retry.chunk {
-            info!("chunk_get retry succeeded for {addr_hex}");
-            self.chunk_cache().put(chunk.address, chunk.content.clone());
-            return Ok(Some(chunk));
-        }
-
-        info!(
-            "chunk_get exhausted close group after retry for {addr_hex}: \
-             first(queried={} not_found={} timeout={} network_err={} protocol_err={}) \
-             retry(queried={} not_found={} timeout={} network_err={} protocol_err={})",
-            first.queried,
-            first.not_found,
-            first.timeout,
-            first.network_err,
-            first.protocol_err,
-            retry.queried,
-            retry.not_found,
-            retry.timeout,
-            retry.network_err,
-            retry.protocol_err,
-        );
-        Ok(None)
-    }
-
-    /// One sweep of the requested closest peers: fetch the closest peers
-    /// for `address` from the DHT and ask each for the chunk in turn,
-    /// returning on the first success.
-    async fn chunk_get_try_closest_peers(
-        &self,
-        address: &XorName,
-        peer_count: usize,
-    ) -> Result<CloseGroupOutcome> {
-        let peers = self.closest_peers(address, peer_count).await?;
-        let addr_hex = hex::encode(address);
-        let queried = peers.len();
-        let mut not_found = 0usize;
-        let mut timeout = 0usize;
-        let mut network_err = 0usize;
-        let mut protocol_err = 0usize;
-
-        for (peer, addrs) in &peers {
-            match self.chunk_get_from_peer(address, peer, addrs).await {
-                Ok(Some(chunk)) => {
-                    return Ok(CloseGroupOutcome {
-                        chunk: Some(chunk),
-                        queried,
-                        not_found,
-                        timeout,
-                        network_err,
-                        protocol_err,
+        let result = crate::client_engine::read::retrieve(
+            *address,
+            || async {
+                let closest = self
+                    .closest_peers(address, peer_count)
+                    .await
+                    .unwrap_or_else(|e| {
+                        info!(
+                            "Chunk discovery failed for {}: {e}; trying known peers",
+                            hex::encode(address)
+                        );
+                        Vec::new()
                     });
-                }
-                Ok(None) => {
-                    not_found += 1;
-                    debug!("Chunk {addr_hex} not found on peer {peer}, trying next");
-                }
-                Err(Error::Timeout(_)) => {
-                    timeout += 1;
-                    debug!("Peer {peer} timed out for chunk {addr_hex}, trying next");
-                }
-                Err(Error::Network(_)) => {
-                    network_err += 1;
-                    debug!("Peer {peer} unreachable for chunk {addr_hex}, trying next");
-                }
-                // A `Protocol` error here is the storer responding with
-                // `ChunkGetResponse::Error(...)` — e.g. "Chunk verification
-                // failed" from a peer that has a corrupted local copy.
-                // That's a per-peer problem, not a per-chunk one: the
-                // remaining peers might still have a clean copy, so
-                // continue the sweep rather than aborting it. Counted
-                // separately from network_err so the summary log still
-                // distinguishes "peer corrupted" from "peer unreachable".
-                Err(Error::Protocol(ref e)) => {
-                    protocol_err += 1;
-                    debug!(
-                        "Peer {peer} returned protocol error for chunk {addr_hex} ({e}), trying next"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
+                let known = self
+                    .network()
+                    .node()
+                    .dht()
+                    .routing_table_peers()
+                    .await
+                    .into_iter()
+                    .filter(|node| node.peer_id != *self.network().peer_id())
+                    .map(|node| {
+                        let addrs = node.addresses_by_priority();
+                        (node.peer_id, addrs)
+                    })
+                    .collect();
+                crate::client_engine::read::ReadCandidates { closest, known }
+            },
+            |(peer, _)| *peer.as_bytes(),
+            |(peer, addrs)| async move { self.chunk_get_from_peer(address, &peer, &addrs).await },
+            |error| {
+                matches!(
+                    error,
+                    Error::Timeout(_) | Error::Network(_) | Error::Protocol(_)
+                )
+            },
+            tokio::time::sleep,
+        )
+        .await?;
+        if let Some(chunk) = &result {
+            self.chunk_cache().put(chunk.address, chunk.content.clone());
         }
-
-        Ok(CloseGroupOutcome {
-            chunk: None,
-            queried,
-            not_found,
-            timeout,
-            network_err,
-            protocol_err,
-        })
+        Ok(result)
     }
 
     /// Retrieve a chunk from every peer in the close group.
@@ -912,12 +732,8 @@ impl Client {
                         ))));
                     }
 
-                    let computed = compute_address(&content);
-                    if computed != addr {
-                        return Some(Err(Error::InvalidData(format!(
-                            "Invalid chunk content: expected hash {addr_hex}, got {}",
-                            hex::encode(computed)
-                        ))));
+                    if let Err(error) = crate::record::verify(&addr, &content) {
+                        return Some(Err(Error::InvalidData(error)));
                     }
 
                     debug!(

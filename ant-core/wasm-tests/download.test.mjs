@@ -43,8 +43,11 @@ test("fallback is bounded and never accepts a chunk with the wrong hash", async 
   try {
     await assert.rejects(client.openPublicFile(datamap.address), /BLAKE3 mismatch/);
     const gets = rtc.requests.filter(request => request.method === "get_chunk");
-    assert.equal(gets.length, 20, "try at most twenty additional endpoints");
-    assert.equal(new Set(gets.map(request => request.node)).size, gets.length, "do not repeat a peer");
+    assert.equal(gets.length, 40, "try at most twenty additional endpoints per native retry sweep");
+    assert.equal(new Set(gets.map(request => request.node)).size, 20, "deduplicate peers within each sweep");
+    for (const node of new Set(gets.map(request => request.node))) {
+      assert.equal(gets.filter(request => request.node === node).length, 2);
+    }
   } finally { client.close(); }
 });
 
