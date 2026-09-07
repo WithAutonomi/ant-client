@@ -5,24 +5,63 @@
 
 use crate::data::client::adaptive::Outcome;
 use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
+use crate::data::client::diagnostics::{
+    bounded_error, unix_now_ms, DownloadDiagnosticsOutcome, DownloadDiagnosticsRecord,
+    DownloadDiagnosticsSender, DownloadRequestCorrelation,
+};
 use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
+use crate::data::network::ClosestPeerDiagnostics;
 use ant_protocol::evm::{QuoteHash, TxHash};
-use ant_protocol::transport::{MultiAddr, PeerId};
+use ant_protocol::transport::{MultiAddr, PeerId, PeerRouteKind};
 use ant_protocol::{
-    compute_address, detect_proof_type, send_and_await_chunk_response, ChunkGetRequest,
-    ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, DataChunk,
+    compute_address, detect_proof_type, send_and_await_chunk_response,
+    send_and_await_chunk_response_with_metadata, ChunkGetRequest, ChunkGetResponse, ChunkMessage,
+    ChunkMessageBody, ChunkProtocolResponse, ChunkPutRequest, ChunkPutResponse, DataChunk,
     ProofType, ProtocolError, XorName, CLOSE_GROUP_MAJORITY,
 };
 use bytes::Bytes;
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Data type identifier for chunks (used in quote requests).
 const CHUNK_DATA_TYPE: u32 = 0;
+
+/// Number of diagnostics-enabled peer requests currently in flight in this
+/// process. The counter is untouched when runtime diagnostics are disabled.
+static ACTIVE_DIAGNOSTIC_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static NEXT_DIAGNOSTIC_LOOKUP_ID: AtomicUsize = AtomicUsize::new(1);
+
+struct ActiveDiagnosticRequestGuard;
+
+impl ActiveDiagnosticRequestGuard {
+    fn enter() -> (Self, usize) {
+        let active = ACTIVE_DIAGNOSTIC_REQUESTS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        (Self, active)
+    }
+}
+
+impl Drop for ActiveDiagnosticRequestGuard {
+    fn drop(&mut self) {
+        ACTIVE_DIAGNOSTIC_REQUESTS.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+}
+
+fn encode_diagnostic_chunk_get_request(
+    address: &XorName,
+    correlation: &DownloadRequestCorrelation,
+) -> Result<Vec<u8>> {
+    ChunkMessage {
+        request_id: correlation.request_id,
+        body: ChunkMessageBody::GetRequest(ChunkGetRequest::new(*address)),
+    }
+    .encode()
+    .map_err(|e| Error::Protocol(format!("Failed to encode GET request: {e}")))
+}
 
 /// Why a single-peer PUT was declined. Drives the surfaced aggregate error
 /// and keeps the store AIMD limiter honest — only genuine local backpressure
@@ -195,6 +234,173 @@ struct ChunkPeerGetTarget {
     xor_distance: [u8; 32],
 }
 
+/// Shared context for emitting per-chunk download diagnostics records from
+/// the normal-path chunk fetch. Constructed only when the caller supplied a
+/// [`DownloadDiagnosticsSender`] (i.e. `--download-diagnostics` was passed);
+/// otherwise `None` and no records are allocated.
+///
+/// `sweep` is set per `chunk_get_try_closest_peers` call: `"initial"` for the
+/// first close-group sweep, `"retry"` for the internal retry sweep.
+pub(crate) struct ChunkFetchDiagnostics<'a> {
+    sender: &'a DownloadDiagnosticsSender,
+    file_attempt: usize,
+    chunk_index: usize,
+    chunk_address: [u8; 32],
+    fetch_cap: usize,
+}
+
+impl<'a> ChunkFetchDiagnostics<'a> {
+    pub(crate) fn new(
+        sender: &'a DownloadDiagnosticsSender,
+        file_attempt: usize,
+        chunk_index: usize,
+        chunk_address: [u8; 32],
+        fetch_cap: usize,
+    ) -> Self {
+        Self {
+            sender,
+            file_attempt,
+            chunk_index,
+            chunk_address,
+            fetch_cap,
+        }
+    }
+
+    /// Emit a per-peer-attempt record. `lookup_duration_ms` is attached only
+    /// for the first peer attempt of the sweep.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_peer_attempt(
+        &self,
+        sweep: &'static str,
+        peer_attempt: usize,
+        lookup_duration_ms: Option<u64>,
+        lookup_correlation_id: &str,
+        peer_context: &ClosestPeerDiagnostics,
+        expected_peer: &PeerId,
+        source_peer: Option<&PeerId>,
+        transport_source: Option<&MultiAddr>,
+        route: PeerRouteKind,
+        peer_connected_before_request: bool,
+        active_requests_at_start: usize,
+        request_started_unix_ms: u64,
+        request_completed_unix_ms: u64,
+        correlation: &DownloadRequestCorrelation,
+        response_elapsed_ms: u64,
+        bytes: u64,
+        outcome: DownloadDiagnosticsOutcome,
+        error: Option<String>,
+    ) {
+        self.sender
+            .try_emit(DownloadDiagnosticsRecord::peer_attempt(
+                self.file_attempt,
+                self.chunk_index,
+                &self.chunk_address,
+                sweep,
+                peer_attempt,
+                lookup_duration_ms,
+                lookup_correlation_id,
+                &expected_peer.to_string(),
+                peer_context
+                    .addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                peer_context.address_types.clone(),
+                peer_context.local_last_seen_age_ms,
+                peer_context.publisher_address_set_age_ms,
+                peer_context.publisher_address_set_unix_ns,
+                source_peer.map(ToString::to_string).as_deref(),
+                transport_source.map(ToString::to_string).as_deref(),
+                route.as_str(),
+                (route == PeerRouteKind::Unknown)
+                    .then_some(DownloadDiagnosticsRecord::ROUTE_UNKNOWN_NOTE),
+                Some(peer_connected_before_request),
+                Some(active_requests_at_start),
+                Some(self.fetch_cap),
+                request_started_unix_ms,
+                request_completed_unix_ms,
+                correlation,
+                response_elapsed_ms,
+                bytes,
+                outcome,
+                error,
+            ));
+    }
+
+    /// Emit a chunk-level record (cache hit, lookup error, or exhausted).
+    fn emit_chunk_level(
+        &self,
+        sweep: &'static str,
+        bytes: u64,
+        outcome: DownloadDiagnosticsOutcome,
+        error: Option<String>,
+    ) {
+        self.sender.try_emit(DownloadDiagnosticsRecord::chunk_level(
+            self.file_attempt,
+            self.chunk_index,
+            &self.chunk_address,
+            sweep,
+            Some(self.fetch_cap),
+            bytes,
+            outcome,
+            error,
+        ));
+    }
+}
+
+/// Classify a `chunk_get_from_peer` result into a diagnostics outcome plus the
+/// returned byte count and whether a response was received (so `source_peer`
+/// can be attributed). No secrets: the bounded error string uses only the
+/// error's `Display` form.
+fn classify_peer_attempt(
+    result: &Result<Option<DataChunk>>,
+) -> (DownloadDiagnosticsOutcome, u64, bool, Option<String>) {
+    match result {
+        Ok(Some(chunk)) => (
+            DownloadDiagnosticsOutcome::Found,
+            chunk.content.len() as u64,
+            true,
+            None,
+        ),
+        Ok(None) => (DownloadDiagnosticsOutcome::NotFound, 0, true, None),
+        Err(Error::Timeout(msg)) => (
+            DownloadDiagnosticsOutcome::Timeout,
+            0,
+            false,
+            Some(bounded_error("timeout", msg)),
+        ),
+        Err(Error::Network(msg)) => (
+            DownloadDiagnosticsOutcome::NetworkError,
+            0,
+            false,
+            Some(bounded_error("network", msg)),
+        ),
+        // Invalid data can only be constructed after a response body was
+        // received and validated, so attributing the matched peer is sound.
+        Err(Error::InvalidData(msg)) => (
+            DownloadDiagnosticsOutcome::ProtocolError,
+            0,
+            true,
+            Some(bounded_error("protocol", msg)),
+        ),
+        // `Protocol` includes both a remote GET error and a local request
+        // encoding failure. Without a distinct provenance bit, conservatively
+        // avoid claiming a response peer for either case.
+        Err(Error::Protocol(msg)) => (
+            DownloadDiagnosticsOutcome::ProtocolError,
+            0,
+            false,
+            Some(bounded_error("protocol", msg)),
+        ),
+        Err(e) => (
+            DownloadDiagnosticsOutcome::ProtocolError,
+            0,
+            false,
+            Some(bounded_error("protocol", &e.to_string())),
+        ),
+    }
+}
+
 fn chunk_peer_get_targets(
     peers: Vec<(PeerId, Vec<MultiAddr>)>,
     address: &XorName,
@@ -269,7 +475,7 @@ impl Client {
     /// sustained run of close-group exhaustions correctly drives the
     /// cap down rather than silently inflating it.
     pub(crate) async fn chunk_get_observed(&self, address: &XorName) -> Result<Option<DataChunk>> {
-        self.chunk_get_observed_from_closest_peers(address, self.config().close_group_size)
+        self.chunk_get_observed_from_closest_peers(address, self.config().close_group_size, None)
             .await
     }
 
@@ -277,9 +483,12 @@ impl Client {
         &self,
         address: &XorName,
         peer_count: usize,
+        diag: Option<&ChunkFetchDiagnostics<'_>>,
     ) -> Result<Option<DataChunk>> {
         let started = Instant::now();
-        let result = self.chunk_get_from_closest_peers(address, peer_count).await;
+        let result = self
+            .chunk_get_from_closest_peers_with_diagnostics(address, peer_count, diag)
+            .await;
         let latency = started.elapsed();
         let bytes = result
             .as_ref()
@@ -649,11 +858,29 @@ impl Client {
         address: &XorName,
         peer_count: usize,
     ) -> Result<Option<DataChunk>> {
+        self.chunk_get_from_closest_peers_with_diagnostics(address, peer_count, None)
+            .await
+    }
+
+    async fn chunk_get_from_closest_peers_with_diagnostics(
+        &self,
+        address: &XorName,
+        peer_count: usize,
+        diag: Option<&ChunkFetchDiagnostics<'_>>,
+    ) -> Result<Option<DataChunk>> {
         // Check cache first, with integrity verification.
         if let Some(cached) = self.chunk_cache().get(address) {
             let computed = compute_address(&cached);
             if computed == *address {
                 debug!("Cache hit for chunk {}", hex::encode(address));
+                if let Some(diag) = diag {
+                    diag.emit_chunk_level(
+                        "initial",
+                        cached.len() as u64,
+                        DownloadDiagnosticsOutcome::CacheHit,
+                        None,
+                    );
+                }
                 return Ok(Some(DataChunk::new(*address, cached)));
             }
             // Cache entry corrupted — evict and fall through to network fetch.
@@ -675,7 +902,10 @@ impl Client {
         // chunk would fail an entire multi-hundred-chunk download. A
         // zeroed outcome (queried=0) is never authoritative, so it flows
         // straight to the retry below.
-        let first = match self.chunk_get_try_closest_peers(address, peer_count).await {
+        let first = match self
+            .chunk_get_try_closest_peers(address, peer_count, diag, "initial")
+            .await
+        {
             Ok(outcome) => outcome,
             Err(e) => {
                 info!("chunk_get first close-group lookup failed for {addr_hex}: {e}; will retry");
@@ -732,7 +962,10 @@ impl Client {
         // If the retry's DHT lookup itself fails, treat that as "still
         // couldn't find" rather than escalating the error — matches the
         // semantics of the first attempt when peers are unreachable.
-        let retry = match self.chunk_get_try_closest_peers(address, peer_count).await {
+        let retry = match self
+            .chunk_get_try_closest_peers(address, peer_count, diag, "retry")
+            .await
+        {
             Ok(o) => o,
             Err(e) => {
                 info!(
@@ -774,21 +1007,152 @@ impl Client {
     /// One sweep of the requested closest peers: fetch the closest peers
     /// for `address` from the DHT and ask each for the chunk in turn,
     /// returning on the first success.
+    ///
+    /// `sweep` is `"initial"` for the first close-group attempt and
+    /// `"retry"` for the internal retry sweep; it is only used as a label
+    /// on diagnostic records when `diag` is `Some`.
     async fn chunk_get_try_closest_peers(
         &self,
         address: &XorName,
         peer_count: usize,
+        diag: Option<&ChunkFetchDiagnostics<'_>>,
+        sweep: &'static str,
     ) -> Result<CloseGroupOutcome> {
-        let peers = self.closest_peers(address, peer_count).await?;
+        let lookup_start = Instant::now();
+        let (peers, peer_contexts) = if diag.is_some() {
+            match self
+                .network()
+                .find_closest_peers_with_diagnostics(address, peer_count)
+                .await
+            {
+                Ok(contexts) => {
+                    let peers = contexts
+                        .iter()
+                        .map(|context| (context.peer_id, context.addresses.clone()))
+                        .collect();
+                    (peers, Some(contexts))
+                }
+                Err(e) => {
+                    if let Some(diag) = diag {
+                        diag.emit_chunk_level(
+                            sweep,
+                            0,
+                            DownloadDiagnosticsOutcome::LookupError,
+                            Some(bounded_error("lookup", &e.to_string())),
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            // Preserve the pre-instrumentation lookup path exactly when
+            // diagnostics are disabled.
+            match self.closest_peers(address, peer_count).await {
+                Ok(peers) => (peers, None),
+                Err(e) => return Err(e),
+            }
+        };
+        let lookup_duration_ms =
+            u64::try_from(lookup_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let lookup_duration_opt = Some(lookup_duration_ms);
         let addr_hex = hex::encode(address);
+        let lookup_correlation_id = diag.map(|diag| {
+            let sequence = NEXT_DIAGNOSTIC_LOOKUP_ID.fetch_add(1, AtomicOrdering::Relaxed);
+            format!(
+                "{}-{}-{}-{}-{sequence}",
+                diag.file_attempt, diag.chunk_index, sweep, addr_hex
+            )
+        });
         let queried = peers.len();
         let mut not_found = 0usize;
         let mut timeout = 0usize;
         let mut network_err = 0usize;
         let mut protocol_err = 0usize;
 
-        for (peer, addrs) in &peers {
-            match self.chunk_get_from_peer(address, peer, addrs).await {
+        for (peer_attempt, (peer, addrs)) in peers.iter().enumerate() {
+            let peer_attempt_no = peer_attempt + 1;
+            let result = if let Some(diag) = diag {
+                let Some(peer_context) = peer_contexts
+                    .as_ref()
+                    .and_then(|contexts| contexts.get(peer_attempt))
+                else {
+                    return Err(Error::Network(
+                        "diagnostics peer context missing for selected peer".to_string(),
+                    ));
+                };
+                let Some(lookup_correlation_id) = lookup_correlation_id.as_deref() else {
+                    return Err(Error::Network(
+                        "diagnostics lookup correlation ID missing".to_string(),
+                    ));
+                };
+                let node = self.network().node();
+                let peer_connected_before_request = node.is_peer_connected(peer).await;
+                let (active_guard, active_requests_at_start) =
+                    ActiveDiagnosticRequestGuard::enter();
+                let request_started_unix_ms = unix_now_ms();
+                let resp_start = Instant::now();
+                let correlation =
+                    DownloadRequestCorrelation::new(self.next_request_id(), node.peer_id());
+                let observed = self
+                    .chunk_get_from_peer_with_metadata(address, peer, addrs, &correlation)
+                    .await;
+                let response_elapsed_ms =
+                    u64::try_from(resp_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let request_completed_unix_ms = unix_now_ms();
+                // Count only the network request itself; route classification
+                // and sidecar emission are diagnostic bookkeeping.
+                drop(active_guard);
+
+                let (result, source_peer, transport_source, route) = match observed {
+                    Ok(response) => {
+                        let route = node
+                            .classify_peer_transport_route(
+                                &response.source_peer,
+                                response.transport_source.as_ref(),
+                            )
+                            .await;
+                        (
+                            response.result,
+                            Some(response.source_peer),
+                            response.transport_source,
+                            route,
+                        )
+                    }
+                    Err(error) => (Err(error), None, None, PeerRouteKind::Unknown),
+                };
+                let (outcome, bytes, _got_response, error) = classify_peer_attempt(&result);
+                let lookup = if peer_attempt_no == 1 {
+                    lookup_duration_opt
+                } else {
+                    None
+                };
+                diag.emit_peer_attempt(
+                    sweep,
+                    peer_attempt_no,
+                    lookup,
+                    lookup_correlation_id,
+                    peer_context,
+                    peer,
+                    source_peer.as_ref(),
+                    transport_source.as_ref(),
+                    route,
+                    peer_connected_before_request,
+                    active_requests_at_start,
+                    request_started_unix_ms,
+                    request_completed_unix_ms,
+                    &correlation,
+                    response_elapsed_ms,
+                    bytes,
+                    outcome,
+                    error,
+                );
+                result
+            } else {
+                // Preserve the existing request path exactly when diagnostics
+                // are disabled: no metadata lookup, clock read, or counter.
+                self.chunk_get_from_peer(address, peer, addrs).await
+            };
+            match result {
                 Ok(Some(chunk)) => {
                     return Ok(CloseGroupOutcome {
                         chunk: Some(chunk),
@@ -827,6 +1191,13 @@ impl Client {
                 }
                 Err(e) => return Err(e),
             }
+        }
+
+        // The sweep queried every selected peer without success. Emit an
+        // explicit exhausted record so the peer-set exhaustion is a record
+        // rather than a silent gap.
+        if let Some(diag) = diag {
+            diag.emit_chunk_level(sweep, 0, DownloadDiagnosticsOutcome::Exhausted, None);
         }
 
         Ok(CloseGroupOutcome {
@@ -1003,6 +1374,72 @@ impl Client {
         result
     }
 
+    /// Diagnostics-only variant of [`Self::chunk_get_from_peer`] that retains
+    /// the authenticated response peer and observed transport source. Request
+    /// construction, validation, timeouts, and error mapping mirror the normal
+    /// helper exactly.
+    async fn chunk_get_from_peer_with_metadata(
+        &self,
+        address: &XorName,
+        peer: &PeerId,
+        peer_addrs: &[MultiAddr],
+        correlation: &DownloadRequestCorrelation,
+    ) -> Result<ChunkProtocolResponse<Option<DataChunk>, Error>> {
+        let node = self.network().node();
+        let message_bytes = encode_diagnostic_chunk_get_request(address, correlation)?;
+
+        let timeout = Duration::from_secs(self.config().chunk_get_timeout_secs);
+        let addr_hex = hex::encode(address);
+        let timeout_secs = self.config().chunk_get_timeout_secs;
+
+        send_and_await_chunk_response_with_metadata(
+            node,
+            peer,
+            message_bytes,
+            correlation.request_id,
+            timeout,
+            peer_addrs,
+            |body| match body {
+                ChunkMessageBody::GetResponse(ChunkGetResponse::Success {
+                    address: addr,
+                    content,
+                }) => {
+                    if addr != *address {
+                        return Some(Err(Error::InvalidData(format!(
+                            "Mismatched chunk address: expected {addr_hex}, got {}",
+                            hex::encode(addr)
+                        ))));
+                    }
+                    let computed = compute_address(&content);
+                    if computed != addr {
+                        return Some(Err(Error::InvalidData(format!(
+                            "Invalid chunk content: expected hash {addr_hex}, got {}",
+                            hex::encode(computed)
+                        ))));
+                    }
+                    debug!(
+                        "Retrieved chunk {} ({} bytes) from peer {peer}",
+                        hex::encode(addr),
+                        content.len()
+                    );
+                    Some(Ok(Some(DataChunk::new(addr, Bytes::from(content)))))
+                }
+                ChunkMessageBody::GetResponse(ChunkGetResponse::NotFound { .. }) => Some(Ok(None)),
+                ChunkMessageBody::GetResponse(ChunkGetResponse::Error(e)) => Some(Err(
+                    Error::Protocol(format!("Remote GET error for {addr_hex}: {e}")),
+                )),
+                _ => None,
+            },
+            |e| Error::Network(format!("Failed to send GET to peer {peer}: {e}")),
+            || {
+                Error::Timeout(format!(
+                    "Timeout waiting for chunk {addr_hex} from {peer} after {timeout_secs}s"
+                ))
+            },
+        )
+        .await
+    }
+
     /// Check if a chunk exists on the network.
     ///
     /// # Errors
@@ -1063,6 +1500,108 @@ mod tests {
     const TEST_XORNAME_BYTE_LEN: usize = 32;
     /// Last byte position in the test XOR distance arrays.
     const TEST_DISTANCE_TAIL_INDEX: usize = TEST_XORNAME_BYTE_LEN - 1;
+
+    #[test]
+    fn diagnostic_correlation_is_identical_on_wire_and_in_record() {
+        let address = [7u8; 32];
+        let correlation = DownloadRequestCorrelation::new(
+            9_903,
+            &PeerId::from_bytes([42; TEST_XORNAME_BYTE_LEN]),
+        );
+        let encoded = encode_diagnostic_chunk_get_request(&address, &correlation).unwrap();
+        let wire = ChunkMessage::decode(&encoded).unwrap();
+        assert_eq!(wire.request_id, correlation.request_id);
+        assert!(matches!(wire.body, ChunkMessageBody::GetRequest(_)));
+
+        let record = DownloadDiagnosticsRecord::peer_attempt(
+            1,
+            1,
+            &address,
+            "initial",
+            1,
+            None,
+            "lookup-1",
+            "expected-peer",
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            "unknown",
+            None,
+            Some(false),
+            Some(1),
+            Some(8),
+            100,
+            200,
+            &correlation,
+            100,
+            0,
+            DownloadDiagnosticsOutcome::Timeout,
+            Some("timeout".to_string()),
+        );
+        assert_eq!(record.request_id, Some(wire.request_id));
+        assert_eq!(record.local_peer_id, Some(correlation.local_peer_id));
+    }
+
+    #[test]
+    fn classify_peer_attempt_pins_outcomes_and_response_attribution() {
+        let chunk = DataChunk::new([0u8; 32], Bytes::from_static(b"payload"));
+        let cases = [
+            (
+                Ok(Some(chunk)),
+                DownloadDiagnosticsOutcome::Found,
+                7,
+                true,
+                None,
+            ),
+            (
+                Ok(None),
+                DownloadDiagnosticsOutcome::NotFound,
+                0,
+                true,
+                None,
+            ),
+            (
+                Err(Error::Timeout("late".to_string())),
+                DownloadDiagnosticsOutcome::Timeout,
+                0,
+                false,
+                Some("timeout: late"),
+            ),
+            (
+                Err(Error::Network("dial".to_string())),
+                DownloadDiagnosticsOutcome::NetworkError,
+                0,
+                false,
+                Some("network: dial"),
+            ),
+            (
+                Err(Error::InvalidData("hash".to_string())),
+                DownloadDiagnosticsOutcome::ProtocolError,
+                0,
+                true,
+                Some("protocol: hash"),
+            ),
+            (
+                Err(Error::Protocol("remote".to_string())),
+                DownloadDiagnosticsOutcome::ProtocolError,
+                0,
+                false,
+                Some("protocol: remote"),
+            ),
+        ];
+
+        for (result, expected_outcome, expected_bytes, expected_response, expected_error) in cases {
+            let (outcome, bytes, got_response, error) = classify_peer_attempt(&result);
+            assert_eq!(outcome, expected_outcome);
+            assert_eq!(bytes, expected_bytes);
+            assert_eq!(got_response, expected_response);
+            assert_eq!(error.as_deref(), expected_error);
+        }
+    }
 
     #[test]
     fn classify_put_failure_maps_remote_timeout_and_dial_reasons() {

@@ -1,0 +1,86 @@
+# Normal-path download diagnostics design
+
+## Status
+
+Implementation design for the V2-903 investigation. This is temporary, runtime-gated diagnostic instrumentation rather than a change to download policy.
+
+## Requirement
+
+Capture one JSON Lines record for each normal-path chunk fetch attempt while preserving the existing early-success behaviour, retry policy, adaptive concurrency, stdout, and default resource use.
+
+The diagnostic runner is independent of version A/B testing. It should run beside the existing PROD-DL-01 runner in the same region and provider so the network vantage is not changed.
+
+## Runtime interface
+
+`ant file download ... --download-diagnostics <PATH>`
+
+- Omitted: the existing path and output remain unchanged; no diagnostic channel or file is created.
+- Present: the CLI opens a sidecar JSONL file and passes an optional bounded diagnostics sender through the normal file/chunk download path.
+- Diagnostic output never replaces or contaminates normal stdout or `--json` output.
+- Records are streamed as attempts finish so a later process or file-download failure does not discard earlier evidence.
+
+## Record schema
+
+Each record contains:
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | Stable schema discriminator; `4` adds exact node/client request-correlation fields |
+| `timestamp` | UTC time when the attempt completed |
+| `request_started_unix_ms` / `request_completed_unix_ms` | Exact peer-request wall-clock bounds for joining to retained fleet telemetry and reconstructing overlap |
+| `request_id` | The exact protocol request ID allocated by this client and placed on the chunk GET; the serving node records the same value; `null` for chunk-level records |
+| `local_peer_id` | This client's PeerId, matching the serving node's `source_peer`; `null` for chunk-level records |
+| `file_attempt` | Outer file/deferred-retry attempt number |
+| `chunk_index` / `chunk_address` | Chunk identity within the file |
+| `sweep` | Initial or internal retry sweep |
+| `peer_attempt` | Peer attempt number within the sweep |
+| `lookup_duration_ms` | Closest-peer DHT lookup duration; emitted on the first attempt associated with that lookup |
+| `lookup_correlation_id` | Process-local ID shared by attempts produced by one closest-peer lookup |
+| `selected_peer_ordinal` | One-based position in the unchanged DHT-selected peer order |
+| `expected_peer` | Peer selected by the DHT lookup |
+| `selected_peer_addresses` / `selected_peer_address_types` | Parallel, priority-ordered advertised addresses and their DHT type labels |
+| `local_last_seen_age_ms` | This client's monotonic age since its latest successful DHT interaction with the peer; local knowledge, not remote uptime |
+| `publisher_address_set_unix_ns` / `publisher_address_set_age_ms` | Untrusted publisher-clock address-set timestamp and derived age; age is `null` for future-skewed clocks |
+| `source_peer` | Peer identified by the received protocol response |
+| `transport_source` | Actual response event transport MultiAddr, when available |
+| `route` | `direct`, `relay`, `lan`, `unverified`, or `unknown`, classified from the actual transport source against typed DHT addresses |
+| `route_note` | Explanation only when the route is `unknown` |
+| `peer_connected_before_request` | Connection-state sample immediately before the send |
+| `active_requests_at_start` | Process-local diagnostics-enabled peer requests active when this request entered the active set |
+| `fetch_cap` | Adaptive fetch-concurrency cap snapshot for the chunk fetch |
+| `response_elapsed_ms` | Elapsed time until the complete response was reassembled and delivered |
+| `ttfb_ms` | `null` until the protocol exposes a first-byte/first-frame event |
+| `ttfb_available` / `ttfb_unavailable_reason` | Explicitly prevents complete-response latency being presented as TTFB |
+| `bytes` | Valid returned chunk bytes; otherwise `0` |
+| `outcome` | `found`, `not_found`, `timeout`, `network_error`, `protocol_error`, `cache_hit`, `lookup_error`, or `exhausted` |
+| `error` | Bounded diagnostic error category/detail; no secrets |
+
+A cache hit is a chunk-level record without a source peer or transport route. Lookup failures and exhausted peer sets are also explicit records rather than silent gaps.
+
+## Transport classification
+
+`ant-protocol` supplies the authenticated response peer and actual
+`P2PEvent::Message.transport_source`. `saorsa-core` supplies a small public
+route-classification API on `P2PNode`. The client classifies the actual source
+against that response peer's typed DHT addresses. It must not infer route type
+from address-list position or from the expected destination address.
+
+## TTFB limitation
+
+The current protocol event is emitted only after complete message reassembly. Therefore this branch can measure complete-response latency, not true network time-to-first-byte. True TTFB requires a new first-frame/streaming event in `ant-protocol` or the transport layer and is deliberately left unavailable here.
+
+## Safety and bounds
+
+- The normal early-return path remains normal; unlike `--all-peers`, diagnostics do not query every close-group peer after success.
+- The optional channel is bounded. A slow diagnostic writer must not create unbounded memory growth; its failure is surfaced without altering the fetched data result.
+- Error strings are bounded and diagnostics contain no credentials.
+- Existing public methods delegate to the diagnostic-capable implementation with diagnostics disabled.
+
+## Verification
+
+- Route classification unit tests cover direct, relay, LAN, unverified, and unknown addresses.
+- Normal-path tests cover cache hit, first-peer success, retry sweep, and exhausted/error outcomes.
+- A disabled-diagnostics regression test confirms the existing path does not allocate or emit records.
+- JSON schema/serialization tests pin field names and the explicit unavailable-TTFB representation.
+- Run `cargo fmt --check`, focused tests, and `cargo check` in both repositories.
+- Independent reviewers check specification compliance, concurrency/back-pressure behaviour, route correctness, and compatibility before either branch is pushed.

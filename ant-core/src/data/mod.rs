@@ -26,6 +26,10 @@ pub use client::batch::{
     finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk, SingleNodeQuotePayment,
 };
 pub use client::data::DataUploadResult;
+pub use client::diagnostics::{
+    spawn_download_diagnostics_writer, DownloadDiagnosticsOutcome, DownloadDiagnosticsRecord,
+    DownloadDiagnosticsSender,
+};
 pub use client::file::{
     CostEstimateConfidence, DownloadEvent, ExternalChunkStore, ExternalPaymentInfo,
     FileChunkPeerReport, FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport,
