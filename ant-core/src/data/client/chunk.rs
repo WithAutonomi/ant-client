@@ -507,17 +507,9 @@ impl Client {
     ///
     /// ## Adaptive controller feedback
     ///
-    /// Each per-peer GET attempt is fed individually to the adaptive
-    /// fetch limiter via `controller().fetch.observe(...)`. This is
-    /// deliberately finer-grained than wrapping the outer `chunk_get`
-    /// with `observe_op`: when a chunk takes 6 peer tries to land,
-    /// 5 of them are real capacity signals (timeouts / network errors)
-    /// that should pull the cap down even if the chunk eventually
-    /// succeeds. The outer `Ok(_)` would mask all five as a single
-    /// `Outcome::Success`. See `adaptive::Outcome` for the per-attempt
-    /// classification rules used below.
-    ///
-    /// Callers should therefore NOT wrap `chunk_get` in `observe_op`.
+    /// Download workflows use `chunk_get_observed` to feed the adaptive fetch
+    /// limiter once per completed retrieval, including exhausted close groups.
+    /// Internal peer failures are handled by the shared read policy.
     ///
     /// # Errors
     ///

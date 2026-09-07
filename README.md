@@ -27,6 +27,28 @@ project owns the TypeScript API, wallet adapters, browser storage and worker
 integration, media streaming bridge, runnable examples, and browser end-to-end
 tests.
 
+Native and WASM reads share `ant-core/src/client_engine/read.rs` and
+`client_engine/files.rs`. The engine owns XOR-ordered peer selection, bounded
+known-peer fallback, close-group retries, adaptive batch scheduling, deferred
+file retries, recursive DataMap resolution, and plaintext range reads. Both
+transports use `record.rs` for BLAKE3 verification. Native
+`Client::data_download_range` and the browser media reader call the same range
+implementation.
+
+The adapters supply QUIC or WebRTC discovery/GET requests, runtime timers,
+caches, progress callbacks, and output handling. Browser descriptors and wallet
+callbacks remain browser API concerns. Native filesystem streaming still uses
+its synchronous self-encryption iterator bridge, but its map resolution and
+batch retry policy now come from the shared engine. In-memory downloads and
+DataMap resolution no longer require a multi-threaded Tokio runtime.
+
+Reads retry an inconclusive close-group sweep after one second. Each sweep
+tries the discovered peers followed by at most twenty additional known peers;
+failed discovery does not exclude a known holder from direct GET. File batches
+retry only missing records, immediately once and then after 15 and 45 seconds,
+as native file downloads do. Browser concurrency and range-memory limits remain
+platform-specific ceilings on the shared adaptive scheduler.
+
 Browser protocol v5 and browser manifest v6 advertise only the payment chain ID
 and token/vault addresses. RPC providers belong to the application or wallet;
 the node's verification RPC URL is never sent to the browser. Paid uploads

@@ -10,7 +10,7 @@
 //!
 //! For in-memory data uploads, see the `data` module.
 
-use crate::data::client::adaptive::{observe_op, rebucketed_unordered};
+use crate::data::client::adaptive::observe_op;
 use crate::data::client::batch::{
     finalize_batch_payment, PaymentIntent, PreparedChunk, WaveAggregateStats,
 };
@@ -30,8 +30,7 @@ use bytes::Bytes;
 use fs2::FileExt;
 use futures::stream::StreamExt;
 use self_encryption::{
-    get_root_data_map_parallel, stream_decrypt_batch_size, stream_encrypt,
-    streaming_decrypt_with_batch_size, DataMap,
+    stream_decrypt_batch_size, stream_encrypt, streaming_decrypt_with_batch_size, DataMap,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -206,12 +205,6 @@ const DOWNLOAD_STREAM_BATCH_BYTES_PER_CHUNK_MULTIPLIER: u64 = 3;
 /// `AlreadyStored` retry path, which only matters when many leading chunks
 /// of a file already live on the network.
 const ESTIMATE_SAMPLE_CAP: usize = 5;
-
-/// First diagnostic all-peer fetch attempt for a file chunk.
-const FIRST_DIAGNOSTIC_FETCH_ATTEMPT: usize = 1;
-
-/// Deferred retry attempt number for retry round 0.
-const DEFERRED_RETRY_ATTEMPT_OFFSET: usize = 2;
 
 /// Pick up to `cap` chunk indices spread evenly across `[0, total)`, always
 /// including the first and last chunk.
@@ -3048,79 +3041,34 @@ impl Client {
                 });
             }
 
-            let resolve_progress = progress.clone();
-            let resolve_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-            let resolved = tokio::task::block_in_place(|| {
-                let counter_ref = resolve_counter.clone();
-                let progress_ref = resolve_progress.clone();
-                let fetch_limiter = self.controller().fetch.clone();
-                let fetch = |batch: &[(usize, XorName)]| {
-                    let batch_owned: Vec<(usize, XorName)> = batch.to_vec();
-                    let counter = counter_ref.clone();
-                    let prog = progress_ref.clone();
-                    let limiter = fetch_limiter.clone();
-                    handle.block_on(async {
-                        // Use rebucketed_unordered so the in-flight cap
-                        // is re-read from the limiter as each slot frees.
-                        // `buffer_unordered` snapshots the cap once at
-                        // pipeline build, which means observe_op
-                        // signals from inside chunk_get cannot reduce
-                        // concurrency on the current batch — exactly
-                        // the case where load-shedding is needed.
-                        let mut results = rebucketed_unordered(
-                            &limiter,
-                            batch_owned,
-                            |(idx, hash): (usize, XorName)| {
-                                let counter = counter.clone();
-                                let prog = prog.clone();
-                                async move {
-                                    let addr = hash.0;
-                                    // chunk_get_observed feeds the
-                                    // adaptive fetch limiter once per
-                                    // call via chunk_get_outcome
-                                    // (Ok(None) -> Timeout is the
-                                    // load-shedding signal for
-                                    // sustained close-group exhaustion).
-                                    let chunk = self
-                                        .chunk_get_observed_from_closest_peers(&addr, peer_count)
-                                        .await
-                                        .map_err(|e| {
-                                            self_encryption::Error::Generic(format!(
-                                                "DataMap resolution failed: {e}"
-                                            ))
-                                        })?
-                                        .ok_or_else(|| {
-                                            self_encryption::Error::Generic(format!(
-                                                "DataMap chunk not found: {}",
-                                                hex::encode(addr)
-                                            ))
-                                        })?;
-                                    let fetched = counter
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                        + 1;
-                                    if let Some(ref tx) = prog {
-                                        let _ =
-                                            tx.try_send(DownloadEvent::MapChunkFetched { fetched });
-                                    }
-                                    Ok::<_, self_encryption::Error>((idx, chunk.content))
-                                }
-                            },
-                        )
-                        .await?;
-                        // CRITICAL: self_encryption::get_root_data_map_parallel
-                        // pairs the returned Vec POSITIONALLY with the input
-                        // hashes via .zip() and discards our idx field.
-                        // rebucketed_unordered preserves first-completion
-                        // order, so sort by idx to restore input order
-                        // before returning.
-                        results.sort_by_key(|(idx, _)| *idx);
-                        Ok(results)
-                    })
-                };
-                get_root_data_map_parallel(data_map.clone(), &fetch)
-            })
-            .map_err(|e| Error::Encryption(format!("DataMap resolution failed: {e}")))?;
+            let resolve_counter = std::sync::atomic::AtomicUsize::new(0);
+            let resolved = crate::client_engine::files::resolve(
+                data_map,
+                &|address| {
+                    let resolve_counter = &resolve_counter;
+                    let progress = &progress;
+                    async move {
+                        let chunk = self
+                            .chunk_get_observed_from_closest_peers(&address, peer_count)
+                            .await?
+                            .ok_or_else(|| {
+                                Error::NotFound(format!(
+                                    "DataMap chunk not found: {}",
+                                    hex::encode(address)
+                                ))
+                            })?;
+                        let fetched =
+                            resolve_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if let Some(ref tx) = progress {
+                            let _ = tx.try_send(DownloadEvent::MapChunkFetched { fetched });
+                        }
+                        Ok(chunk.content)
+                    }
+                },
+                &|| self.controller().fetch.current(),
+            )
+            .await
+            .map_err(super::data::map_read_error)?;
 
             info!(
                 "Resolved hierarchical DataMap: {} data chunks",
@@ -3177,128 +3125,27 @@ impl Client {
 
                 tokio::task::block_in_place(|| {
                     handle.block_on(async {
-                        // First pass: try every chunk in the batch. Normal mode
-                        // uses chunk_get_observed (early-return after a found
-                        // peer); diagnostic mode asks every selected closest
-                        // peer and records that sweep before returning bytes.
-                        // Any missing chunk or transient fetch error is encoded
-                        // as Err(hash), so one noisy chunk does not abort the
-                        // whole batch before the deferred retry rounds run.
-                        let first_fetch_context = fetch_context.clone();
-                        let raw: Vec<DownloadBatchEntry> = rebucketed_unordered(
-                            &fetch_limiter,
+                        crate::client_engine::files::deferred_batch(
                             batch_owned,
-                            |(idx, hash): (usize, XorName)| {
-                                let fetch_context = first_fetch_context.clone();
-                                async move {
-                                    self.download_fetch_file_chunk(
-                                        idx,
-                                        hash,
-                                        fetch_context,
-                                        false,
-                                        FIRST_DIAGNOSTIC_FETCH_ATTEMPT,
-                                    )
-                                    .await
-                                }
+                            |idx, hash, attempt| {
+                                self.download_fetch_file_chunk(
+                                    idx,
+                                    hash,
+                                    fetch_context.clone(),
+                                    attempt > 1,
+                                    attempt,
+                                )
+                            },
+                            || fetch_limiter.current(),
+                            tokio::time::sleep,
+                            |hash: XorName| {
+                                self_encryption::Error::Generic(format!(
+                                    "Chunk not found after 3 deferred retry rounds: {}",
+                                    hex::encode(hash.0),
+                                ))
                             },
                         )
-                        .await?;
-
-                        // Partition: things we already have vs the
-                        // deferred set we need to retry.
-                        let mut results: Vec<(usize, bytes::Bytes)> = Vec::new();
-                        let mut deferred: Vec<(usize, XorName)> = Vec::new();
-                        for (idx, inner) in raw {
-                            match inner {
-                                Ok(bytes) => results.push((idx, bytes)),
-                                Err(hash) => deferred.push((idx, hash)),
-                            }
-                        }
-
-                        // Deferred retry pass: retry the deferred chunks
-                        // in CONCURRENT rounds (reusing the fetch
-                        // limiter's cap), not serially. The first round
-                        // fires immediately — most deferrals on a
-                        // healthy-but-lossy link are peer-side noise
-                        // that clears in well under a second, and
-                        // serializing them behind mandatory multi-second
-                        // sleeps was the single biggest throughput sink
-                        // on such links (a batch deferring ~20 chunks
-                        // burned minutes of near-zero throughput even
-                        // though every chunk succeeded on its first
-                        // retry). Only chunks that survive a round get a
-                        // longer back-off before the next, so genuine
-                        // saturation still gets time to settle.
-                        if !deferred.is_empty() {
-                            // Round delays in seconds. Round 0 is
-                            // immediate; later rounds back off to ride
-                            // out sustained saturation.
-                            const DEFERRED_ROUND_DELAYS_SECS: [u64; 3] = [0, 15, 45];
-                            info!(
-                                "Deferring {} chunk(s) for concurrent retry after batch settles",
-                                deferred.len()
-                            );
-                            let mut remaining = deferred;
-                            for (round, &delay_secs) in
-                                DEFERRED_ROUND_DELAYS_SECS.iter().enumerate()
-                            {
-                                if remaining.is_empty() {
-                                    break;
-                                }
-                                if delay_secs > 0 {
-                                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs))
-                                        .await;
-                                }
-                                info!(
-                                    "Deferred retry round {}/{}: {} chunk(s)",
-                                    round + 1,
-                                    DEFERRED_ROUND_DELAYS_SECS.len(),
-                                    remaining.len(),
-                                );
-                                let round_input = std::mem::take(&mut remaining);
-                                let retry_fetch_context = fetch_context.clone();
-                                let round_results: Vec<DownloadBatchEntry> = rebucketed_unordered(
-                                    &fetch_limiter,
-                                    round_input,
-                                    |(idx, hash): (usize, XorName)| {
-                                        let fetch_context = retry_fetch_context.clone();
-                                        async move {
-                                            self.download_fetch_file_chunk(
-                                                idx,
-                                                hash,
-                                                fetch_context,
-                                                true,
-                                                round + DEFERRED_RETRY_ATTEMPT_OFFSET,
-                                            )
-                                            .await
-                                        }
-                                    },
-                                )
-                                .await?;
-                                for (idx, inner) in round_results {
-                                    match inner {
-                                        Ok(bytes) => results.push((idx, bytes)),
-                                        Err(hash) => remaining.push((idx, hash)),
-                                    }
-                                }
-                            }
-                            if let Some((_, hash)) = remaining.first() {
-                                return Err(self_encryption::Error::Generic(format!(
-                                    "Chunk not found after {} deferred retry rounds: {}",
-                                    DEFERRED_ROUND_DELAYS_SECS.len(),
-                                    hex::encode(hash.0),
-                                )));
-                            }
-                        }
-
-                        // streaming_decrypt itself sort_by_keys before
-                        // zipping, but the same closure is also passed
-                        // through get_root_data_map_parallel internally
-                        // (see self_encryption::stream_decrypt.rs::new), and
-                        // THAT path zips positionally without sorting. Sort
-                        // here so both consumers see input order.
-                        results.sort_by_key(|(idx, _)| *idx);
-                        Ok(results)
+                        .await
                     })
                 })
             },

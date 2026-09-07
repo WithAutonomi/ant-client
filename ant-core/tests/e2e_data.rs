@@ -58,6 +58,17 @@ async fn test_data_upload_download_round_trip() {
         "downloaded content should match original"
     );
 
+    let range = client
+        .data_download_range(&result.data_map, 1020, 1500)
+        .await
+        .expect("shared range reader should succeed");
+    assert_eq!(range, content.slice(1020..2520));
+    assert!(client
+        .data_download_range(&result.data_map, content.len(), 10)
+        .await
+        .unwrap()
+        .is_empty());
+
     drop(client);
     testnet.teardown().await;
 }
