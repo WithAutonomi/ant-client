@@ -24,37 +24,7 @@ use tracing::{debug, info, warn};
 /// Data type identifier for chunks (used in quote requests).
 const CHUNK_DATA_TYPE: u32 = 0;
 
-/// Why a single-peer PUT was declined. Drives the surfaced aggregate error
-/// and keeps the store AIMD limiter honest — only genuine local backpressure
-/// (a PUT-response `Timeout`) is a "client is sending too fast" signal; a node
-/// that responds with a structured rejection is an application-level decline
-/// (ADR-0002 / V2-468), and a bare dial/relay failure is remote peer churn,
-/// not local capacity (V2-554).
-#[derive(Clone, Copy)]
-enum PutRejection {
-    /// Node is out of storage (`ProtocolError::StorageFailed`) — try a
-    /// further peer.
-    Full,
-    /// Payment did not clear the node's local price floor, or the proof's
-    /// issuers are not close enough in this peer's view
-    /// (`ProtocolError::PaymentFailed`), or the node asked for more than was
-    /// paid (`ChunkPutResponse::PaymentRequired` → [`Error::Payment`]) — skip
-    /// this peer, do not re-quote.
-    PriceFloor,
-    /// Some other structured remote rejection.
-    OtherRemote,
-    /// The peer accepted the connection but did not answer the PUT within the
-    /// deadline (`Error::Timeout`). This is the genuine local-backpressure
-    /// signal: under real congestion the client's own requests time out, so a
-    /// shortfall carrying any timeout stays a capacity signal (V2-554).
-    Timeout,
-    /// A dial/relay/transport failure — the peer could not be reached at all
-    /// (`Error::Network` and other non-response errors), typically a dead or
-    /// stale relayed DHT address. This is remote peer churn, not local
-    /// backpressure, so a shortfall made up purely of these must not push the
-    /// store AIMD limiter down (V2-554).
-    Dial,
-}
+use crate::transfer_policy::{PutRejection, PutShortfall};
 
 /// Classify a failed single-peer PUT (ADR-0002 / V2-468 / V2-554). A
 /// `RemotePut` carries the node's structured `ProtocolError`; a
@@ -106,15 +76,13 @@ fn put_shortfall_error(
     first_app_rejection: Option<Error>,
     shortfall_message: String,
 ) -> Error {
-    if timeout > 0 {
-        return Error::InsufficientPeers(shortfall_message);
-    }
-    if dial == 0 {
-        if let Some(app_rejection) = first_app_rejection {
-            return app_rejection;
+    match crate::transfer_policy::put_shortfall(timeout, dial, first_app_rejection.is_some()) {
+        PutShortfall::ResponseTimeout => Error::InsufficientPeers(shortfall_message),
+        PutShortfall::RemoteRejection => {
+            first_app_rejection.unwrap_or(Error::CloseGroupShortfall(shortfall_message))
         }
+        PutShortfall::PeerChurn => Error::CloseGroupShortfall(shortfall_message),
     }
-    Error::CloseGroupShortfall(shortfall_message)
 }
 
 /// Result of one sweep over a chunk's close group.

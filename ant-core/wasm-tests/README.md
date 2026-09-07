@@ -18,3 +18,9 @@ The test build enables `test-utils` for a deterministic mock node. Transport
 regressions use a mock `RTCPeerConnection` while running the real PQ handshake,
 record encryption, lookup, quote verification, and upload implementation.
 Production packages should enable only `browser-wasm`.
+
+Upload fixtures follow native policy: seven initial peers, authenticated
+witness views, a supported paid median, and four successful stores. Tests
+cover inconsistent views, partial existing-holder votes, one payable quote,
+even quote counts, wider PUT fallback, and reuse of the paid proof. Structured
+remote errors are tested separately from an actual PUT-response deadline.

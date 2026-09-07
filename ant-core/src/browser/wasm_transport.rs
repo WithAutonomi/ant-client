@@ -18,8 +18,9 @@ use super::protocol::{
 };
 use super::{BrowserRecord, BrowserRecordInfo, BrowserStagedFile};
 use crate::client_engine::adaptive::{
-    observe_op, AdaptiveConfig, AdaptiveController, ChannelStart, Outcome,
+    observe_op, AdaptiveConfig, AdaptiveController, ChannelStart,
 };
+use crate::transfer_policy::{FailureKind, PutRejection, RpcError};
 use futures_channel::{mpsc, oneshot};
 use futures_util::{
     future::{join_all, select, Either},
@@ -77,6 +78,8 @@ struct BrowserLookupResult {
     nodes: Vec<BrowserNode>,
     queried: Vec<String>,
     failures: Vec<BrowserLookupFailure>,
+    #[serde(skip)]
+    views: HashMap<LookupKey, Vec<BrowserNode>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -478,6 +481,16 @@ impl BrowserNodeClientCore {
         body: BrowserRequestBody,
         content: &[u8],
     ) -> Result<BrowserResponseFrame, String> {
+        self.request_typed(body, content)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn request_typed(
+        &self,
+        body: BrowserRequestBody,
+        content: &[u8],
+    ) -> Result<BrowserResponseFrame, RpcError> {
         let _guard = self.request_lock.lock().await;
         self.ensure_connected().await?;
         let mut pending = PendingRequest {
@@ -515,12 +528,12 @@ impl BrowserNodeClientCore {
         };
         let Some(channel) = channel else {
             self.close();
-            return Err("WebRTC DataChannel is not connected".to_string());
+            return Err("WebRTC DataChannel is not connected".to_string().into());
         };
         let send_result = send_data_channel_frame(&channel, &frame, transfer_timeout_ms).await;
         if let Err(error) = send_result {
             self.close();
-            return Err(error);
+            return Err(error.into());
         }
         let receiver = {
             let connection = self.connection.borrow();
@@ -530,9 +543,9 @@ impl BrowserNodeClientCore {
         };
         let Some(receiver) = receiver else {
             self.close();
-            return Err("WebRTC response inbox is unavailable".to_string());
+            return Err("WebRTC response inbox is unavailable".to_string().into());
         };
-        let encrypted_response = match read_pq_payload(
+        let encrypted_response = match read_pq_payload_typed(
             receiver,
             MAX_BROWSER_RESPONSE_BYTES + PQ_ENCRYPTED_OVERHEAD_BYTES,
             transfer_timeout_ms,
@@ -548,7 +561,7 @@ impl BrowserNodeClientCore {
         let decrypt_result = {
             let connection = self.connection.borrow();
             let Some(connection) = connection.as_ref() else {
-                return Err("WebRTC DataChannel is not connected".to_string());
+                return Err("WebRTC DataChannel is not connected".to_string().into());
             };
             let mut pq_session = connection.pq_session.borrow_mut();
             pq_session
@@ -561,14 +574,14 @@ impl BrowserNodeClientCore {
             Ok(response) => response,
             Err(error) => {
                 self.close();
-                return Err(error);
+                return Err(error.into());
             }
         };
         let response = match parse_response_frame(&plaintext_response) {
             Ok(response) => response,
             Err(error) => {
                 self.close();
-                return Err(error.to_string());
+                return Err(error.to_string().into());
             }
         };
         if response.header.request_id != request_id {
@@ -577,23 +590,25 @@ impl BrowserNodeClientCore {
                 response.header.request_id
             );
             self.close();
-            return Err(error);
+            return Err(error.into());
         }
         // The complete response has been consumed and authenticated. An
         // ordinary application error can safely retain the session too.
         pending.completed = true;
         if response.header.status == BrowserResponseStatus::Error {
-            let (authentication_required, error) = match &response.header.body {
-                BrowserResponseBody::Error { code, message } => {
-                    (code == "authentication_required", message.clone())
-                }
-                _ => (false, "node returned an invalid error response".to_string()),
+            let (code, message) = match &response.header.body {
+                BrowserResponseBody::Error { code, message } => (code.clone(), message.clone()),
+                _ => (
+                    "invalid_response".into(),
+                    "node returned an invalid error response".into(),
+                ),
             };
-            if authentication_required {
+            if code == "authentication_required" {
                 self.close();
             }
-            return Err(error);
+            return Err(RpcError::Remote { code, message });
         }
+
         Ok(response)
     }
 
@@ -746,11 +761,23 @@ impl BrowserNodeClientCore {
         quote: BrowserQuoteArtifact,
         transaction_hash: &str,
     ) -> Result<(String, bool), String> {
+        self.put_chunk_typed(address, content, quote, transaction_hash)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) async fn put_chunk_typed(
+        &self,
+        address: &str,
+        content: &[u8],
+        quote: BrowserQuoteArtifact,
+        transaction_hash: &str,
+    ) -> Result<(String, bool), RpcError> {
         let address = super::protocol::normalize_hex(address, 32)?;
         let transaction_hash = super::protocol::normalize_hex(transaction_hash, 32)?;
         super::verify_record(&address, content).map_err(|error| error.to_string())?;
         let response = self
-            .request(
+            .request_typed(
                 BrowserRequestBody::PutChunk {
                     address: address.clone(),
                     quote: Box::new(quote),
@@ -764,10 +791,10 @@ impl BrowserNodeClientCore {
             already_stored,
         } = response.header.body
         else {
-            return Err("expected a CHUNK_STORED response".to_string());
+            return Err("expected a CHUNK_STORED response".to_string().into());
         };
         if response_address.to_ascii_lowercase() != address {
-            return Err("node stored a different chunk address".to_string());
+            return Err("node stored a different chunk address".to_string().into());
         }
         Ok((address, already_stored))
     }
@@ -823,6 +850,7 @@ impl BrowserNetworkCore {
     ) -> Result<BrowserLookupResult, String> {
         let target_key = parse_lookup_key(target, "lookup target")?;
         let failures = Rc::new(RefCell::new(Vec::new()));
+        let views = Rc::new(RefCell::new(HashMap::new()));
         let seed_futures = self.seeds.iter().cloned().map(|endpoint| {
             let pool = Rc::clone(&self.pool);
             let failures = Rc::clone(&failures);
@@ -907,6 +935,7 @@ impl BrowserNetworkCore {
             pool: Rc::clone(&self.pool),
             progress: progress.clone(),
             failures: Rc::clone(&failures),
+            views: Rc::clone(&views),
             known_endpoints,
             routing: Rc::clone(&self.routing),
             failed_endpoints: Rc::clone(&self.failed_endpoints),
@@ -930,10 +959,12 @@ impl BrowserNetworkCore {
             .collect();
         let queried = lookup.queried_peers().iter().map(hex::encode).collect();
         let failures = failures.borrow().clone();
+        let views = views.borrow().clone();
         Ok(BrowserLookupResult {
             nodes,
             queried,
             failures,
+            views,
         })
     }
 
@@ -982,6 +1013,7 @@ struct BrowserNetworkLookupQuery {
     pool: Rc<BrowserClientPool>,
     progress: ProgressReporter,
     failures: Rc<RefCell<Vec<BrowserLookupFailure>>>,
+    views: Rc<RefCell<HashMap<LookupKey, Vec<BrowserNode>>>>,
     known_endpoints: HashMap<LookupKey, BrowserEndpoint>,
     routing: Rc<RefCell<HashMap<LookupKey, BrowserLookupCandidate>>>,
     failed_endpoints: Rc<RefCell<crate::client_engine::EndpointFailureCache<LookupKey>>>,
@@ -1028,6 +1060,7 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                 let progress = self.progress.clone();
                 let failures = Rc::clone(&self.failures);
                 let failed_endpoints = Rc::clone(&self.failed_endpoints);
+                let views = Rc::clone(&self.views);
                 let target = target.clone();
                 async move {
                     let responder = candidate.peer_id;
@@ -1048,6 +1081,7 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                     .await;
                     match result {
                         Ok(nodes) => {
+                            views.borrow_mut().insert(responder, nodes.clone());
                             failed_endpoints.borrow_mut().record_success(&responder);
                             progress.report(&format!(
                                 "Iteration {iteration}: {peer_id} returned {} nodes",
@@ -1239,6 +1273,7 @@ struct PendingStoreRecord<'a> {
 struct StoreAttemptError {
     successful_peers: HashSet<String>,
     message: String,
+    kind: FailureKind,
 }
 
 impl StoreAttemptError {
@@ -1246,6 +1281,7 @@ impl StoreAttemptError {
         Self {
             successful_peers,
             message: message.into(),
+            kind: FailureKind::Application,
         }
     }
 }
@@ -2086,52 +2122,171 @@ impl BrowserNetworkClient {
         progress: &ProgressReporter,
     ) -> Result<PreparedRecord, String> {
         progress.report(&format!("Finding closest nodes for {}", record.address));
-        let lookup = self.inner.find_closest(&record.address, progress).await?;
-        let targets = lookup
-            .nodes
-            .into_iter()
-            .filter_map(|node| {
-                node.webrtc_direct.map(|endpoint| StoreTarget {
-                    peer_id: node.peer_id,
-                    endpoint,
-                })
-            })
-            .take(CLOSE_GROUP_SIZE)
-            .collect::<Vec<_>>();
-        ensure_store_quorum(&targets)?;
-        // Verify votes from the whole close group before deciding whether
-        // payment and replication may be skipped. A signature authenticates
-        // one node's claim; it does not establish a storage quorum.
-        let responses = join_all(targets.iter().map(|target| async {
-            let client = self.inner.pool.client(&target.endpoint).await?;
-            let hello = client.hello().await?;
-            assert_upload_node(&hello, payment_network)?;
-            let (quote, already_stored) = client.quote_chunk(&record.address, record.size).await?;
-            let verified = verify_storage_quote(quote, &record.address, &target.peer_id)
-                .map_err(|error| error.to_string())?;
-            Ok::<_, String>((already_stored, verified))
+        let mut lookup = self.inner.find_closest(&record.address, progress).await?;
+        let address = parse_lookup_key(&record.address, "record address")?;
+        // Native first requests the wider PUT neighbourhood, falling back to
+        // seven initial peers if the full width is unavailable.
+        let width = if lookup.nodes.len() >= crate::quote_policy::PUT_TARGET_WIDTH {
+            crate::quote_policy::PUT_TARGET_WIDTH
+        } else {
+            CLOSE_GROUP_SIZE
+        };
+        let initial = lookup.nodes.iter().take(width).cloned().collect::<Vec<_>>();
+        crate::quote_policy::validate_initial_peers(initial.len())?;
+        // Reuse authenticated FIND_NODE transcripts. As native does, ask only
+        // initial peers whose views were missing from the iterative lookup.
+        let missing = initial.iter().filter(|node| {
+            parse_lookup_key(&node.peer_id, "peer ID")
+                .is_ok_and(|peer| !lookup.views.contains_key(&peer))
+        });
+        let responses = join_all(missing.map(|node| async {
+            let peer = parse_lookup_key(&node.peer_id, "peer ID")?;
+            let endpoint = node
+                .webrtc_direct
+                .as_ref()
+                .ok_or_else(|| "witness has no WebRTC endpoint".to_string())?;
+            let client = self.inner.pool.client(endpoint).await?;
+            client.hello().await?;
+            let nodes = client
+                .find_node(
+                    &record.address,
+                    crate::quote_policy::SINGLE_NODE_WITNESSED_VIEW_COUNT,
+                )
+                .await?;
+            Ok::<_, String>((peer, nodes))
         }))
         .await;
-        let mut failures = Vec::new();
-        let mut stored_peers = HashSet::new();
-        let mut eligible_targets = Vec::with_capacity(targets.len());
-        let mut verified_quotes = Vec::with_capacity(targets.len());
-        for (target, result) in targets.iter().zip(responses) {
-            match result {
-                Ok((already_stored, verified)) => {
-                    eligible_targets.push(target.clone());
-                    if already_stored {
-                        stored_peers.insert(target.peer_id.clone());
-                    } else {
-                        // Native quote collection counts existing holders as
-                        // storage votes, excluding their quotes from payment.
-                        verified_quotes.push(verified);
-                    }
-                }
-                Err(error) => failures.push(format!("{}: {error}", target.peer_id)),
+        for (peer, nodes) in responses.into_iter().flatten() {
+            lookup.views.insert(peer, nodes);
+        }
+        let initial_keys = initial
+            .iter()
+            .map(|node| parse_lookup_key(&node.peer_id, "peer ID"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let views = lookup
+            .views
+            .iter()
+            .map(|(peer, nodes)| {
+                let peers = nodes
+                    .iter()
+                    .filter_map(|node| parse_lookup_key(&node.peer_id, "peer ID").ok())
+                    .collect();
+                crate::quote_policy::normalize_view(*peer, peers, &address)
+            })
+            .collect::<Vec<_>>();
+        let scoped = crate::quote_policy::scope_views(&initial_keys, &views);
+        let quorum =
+            crate::quote_policy::witness_quorum(CLOSE_GROUP_SIZE.saturating_sub(scoped.len()));
+        let voters = crate::quote_policy::witness_votes(&scoped);
+        let candidates = crate::quote_policy::consensus_peers(&voters, &address, quorum);
+        crate::quote_policy::validate_witnessed_peers(
+            initial.len(),
+            candidates.len(),
+            crate::quote_policy::SINGLE_NODE_MIN_QUOTE_COUNT,
+        )?;
+        let mut endpoints = self
+            .inner
+            .routing
+            .borrow()
+            .iter()
+            .filter_map(|(peer, node)| {
+                node.wire
+                    .webrtc_direct
+                    .clone()
+                    .map(|endpoint| (*peer, endpoint))
+            })
+            .collect::<HashMap<_, _>>();
+        for node in &initial {
+            if let Some(endpoint) = &node.webrtc_direct {
+                endpoints.insert(
+                    parse_lookup_key(&node.peer_id, "peer ID")?,
+                    endpoint.clone(),
+                );
             }
         }
-        if stored_peers.len() >= CLOSE_GROUP_MAJORITY {
+        for node in lookup.views.values().flatten() {
+            if let Some(endpoint) = &node.webrtc_direct {
+                endpoints
+                    .entry(parse_lookup_key(&node.peer_id, "peer ID")?)
+                    .or_insert_with(|| endpoint.clone());
+            }
+        }
+        // Capability/payment-network checks are browser protocol admission.
+        // Quote rejection does not disqualify a peer from storing another
+        // issuer's valid proof; native keeps those roles independent too.
+        let eligible = join_all(initial_keys.iter().map(|peer| async {
+            let endpoint = endpoints.get(peer)?;
+            let client = self.inner.pool.client(endpoint).await.ok()?;
+            let hello = client.hello().await.ok()?;
+            assert_upload_node(&hello, payment_network).ok()?;
+            Some(*peer)
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let mut verified_quotes = Vec::new();
+        let mut stored_peers = Vec::new();
+        let mut failures = Vec::new();
+        let mut next = 0;
+        let mut in_flight = FuturesUnordered::new();
+        loop {
+            let launch = crate::quote_policy::quote_launch_budget(
+                verified_quotes.len(),
+                in_flight.len(),
+                candidates.len().saturating_sub(next),
+            );
+            for _ in 0..launch {
+                let peer = candidates[next];
+                next += 1;
+                let endpoint = endpoints.get(&peer).cloned();
+                let record = &record;
+                in_flight.push(async move {
+                    let result = async {
+                        let endpoint = endpoint
+                            .ok_or_else(|| "quote peer has no WebRTC endpoint".to_string())?;
+                        let client = self.inner.pool.client(&endpoint).await?;
+                        let hello = client.hello().await?;
+                        assert_upload_node(&hello, payment_network)?;
+                        let (quote, stored) =
+                            client.quote_chunk(&record.address, record.size).await?;
+                        let verified =
+                            verify_storage_quote(quote, &record.address, &hex::encode(peer))
+                                .map_err(|error| error.to_string())?;
+                        Ok::<_, String>((stored, verified))
+                    }
+                    .await;
+                    (peer, result)
+                });
+            }
+            if verified_quotes.len() >= CLOSE_GROUP_SIZE || in_flight.is_empty() {
+                break;
+            }
+            let Some((peer, result)) = in_flight.next().await else {
+                break;
+            };
+            match result {
+                Ok((true, _)) => stored_peers.push(peer),
+                Ok((false, quote)) => verified_quotes.push((peer, quote)),
+                Err(error) => failures.push(format!("{}: {error}", hex::encode(peer))),
+            }
+        }
+        drop(in_flight);
+        let targets = |keys: Vec<LookupKey>| {
+            keys.into_iter()
+                .filter_map(|peer| {
+                    endpoints.get(&peer).cloned().map(|endpoint| StoreTarget {
+                        peer_id: hex::encode(peer),
+                        endpoint,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        if crate::quote_policy::already_stored(
+            verified_quotes.iter().map(|(peer, _)| *peer),
+            stored_peers,
+            &address,
+        ) {
             progress.report(&format!(
                 "Chunk {} is already stored on a close-group majority; skipping payment",
                 record.address
@@ -2139,41 +2294,51 @@ impl BrowserNetworkClient {
             return Ok(PreparedRecord {
                 record,
                 already_stored: true,
-                targets,
+                targets: targets(initial_keys),
                 verified: None,
             });
         }
-        // Discovery alone does not establish upload eligibility: some peers
-        // may not support PUT, may advertise another payment network, or may
-        // fail quote validation. Never charge for an impossible target set.
-        ensure_store_quorum(&eligible_targets).map_err(|error| {
-            if failures.is_empty() {
-                error
-            } else {
-                format!("{error} ({})", failures.join("; "))
-            }
-        })?;
-        let verified = select_storage_quote(verified_quotes).map_err(|error| error.to_string())?;
-        let quoted_target = eligible_targets
+        let prices = verified_quotes
             .iter()
-            .find(|target| target.peer_id == verified.quote.peer_id)
-            .cloned()
-            .ok_or_else(|| "paid quote has no eligible storage target".to_string())?;
+            .map(|(peer, quote)| {
+                Ok((
+                    *peer,
+                    quote
+                        .quote
+                        .price
+                        .parse::<u128>()
+                        .map_err(|error| error.to_string())?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let selected =
+            crate::quote_policy::select_witnessed_quotes(&prices, &address, &voters, quorum)
+                .ok_or_else(|| {
+                    format!(
+                        "No payable quote set has {quorum} witnesses before payment ({})",
+                        failures.join("; ")
+                    )
+                })?;
+        let quotes = selected
+            .into_iter()
+            .map(|index| verified_quotes[index].1.clone())
+            .collect();
+        let verified = select_storage_quote(quotes).map_err(|error| error.to_string())?;
+        let paid_peer = parse_lookup_key(&verified.quote.peer_id, "paid peer")?;
+        let ordered = crate::quote_policy::order_put_peers(paid_peer, &eligible, &voters, quorum)
+            .ok_or_else(|| format!("Fewer than {quorum} eligible initial witness PUT peers recognise the paid issuer before payment"))?;
+        // At least four distinct eligible stores remain necessary even when
+        // missing witness views lower the quote-support quorum below four.
+        let targets = targets(ordered);
+        ensure_store_quorum(&targets)?;
         progress.report(&format!(
             "Verified storage quote {} from {}",
-            verified.quote_hash, quoted_target.peer_id
+            verified.quote_hash, verified.quote.peer_id
         ));
-        let mut ordered_targets = Vec::with_capacity(eligible_targets.len());
-        ordered_targets.push(quoted_target.clone());
-        ordered_targets.extend(
-            eligible_targets
-                .into_iter()
-                .filter(|target| target.peer_id != quoted_target.peer_id),
-        );
         Ok(PreparedRecord {
             record,
             already_stored: false,
-            targets: ordered_targets,
+            targets,
             verified: Some(verified),
         })
     }
@@ -2245,7 +2410,7 @@ impl BrowserNetworkClient {
                         let result = observe_op(
                             &limiter,
                             || self.store_prepared_once(index, record, &context, successful_peers),
-                            |error| classify_browser_store_error(&error.message),
+                            |error| error.kind.outcome(),
                         )
                         .await;
                         ((index, record), result)
@@ -2295,7 +2460,7 @@ impl BrowserNetworkClient {
     }
 
     /// Store one record to a close-group majority, advancing through the rest
-    /// of the ordered K=7 target set only when an initial target fails.
+    /// of the ordered native PUT neighbourhood only when an initial target fails.
     async fn store_prepared_once(
         &self,
         record_index: usize,
@@ -2342,7 +2507,7 @@ impl BrowserNetworkClient {
                     let hello = client.hello().await?;
                     assert_upload_node(&hello, &payment_network)?;
                     let (_, already_stored) = client
-                        .put_chunk(
+                        .put_chunk_typed(
                             &prepared.record.address,
                             record.as_slice(),
                             quote,
@@ -2360,7 +2525,7 @@ impl BrowserNetworkClient {
                             prepared.record.address, target.peer_id
                         ));
                     }
-                    Ok::<(), String>(())
+                    Ok::<(), RpcError>(())
                 }
             },
         )
@@ -2368,10 +2533,18 @@ impl BrowserNetworkClient {
         for target in outcome.successful_targets {
             successful_peers.insert(target.peer_id);
         }
+        let mut timeouts = 0;
+        let mut dial = 0;
+        let mut remote = false;
         let failures = outcome
             .failures
             .into_iter()
             .map(|(target, error)| {
+                match error.put_rejection() {
+                    PutRejection::Timeout => timeouts += 1,
+                    PutRejection::Dial => dial += 1,
+                    _ => remote = true,
+                }
                 context
                     .progress
                     .report(&format!("Store target {} failed: {error}", target.peer_id));
@@ -2380,14 +2553,15 @@ impl BrowserNetworkClient {
             .collect::<Vec<_>>();
         if !outcome.reached || successful_peers.len() < CLOSE_GROUP_MAJORITY {
             let replicas = successful_peers.len();
-            return Err(StoreAttemptError::new(
+            return Err(StoreAttemptError {
                 successful_peers,
-                format!(
+                kind: crate::transfer_policy::put_shortfall(timeouts, dial, remote).failure_kind(),
+                message: format!(
                     "stored on {} peers, need {CLOSE_GROUP_MAJORITY}; failures: {}",
                     replicas,
                     failures.join("; ")
                 ),
-            ));
+            });
         }
         Ok(successful_peers.len())
     }
@@ -2504,23 +2678,6 @@ async fn load_upload_record(
     };
     super::verify_record(&record.address, content.as_slice()).map_err(|error| error.to_string())?;
     Ok(content)
-}
-
-fn classify_browser_store_error(error: &str) -> Outcome {
-    let error = error.to_ascii_lowercase();
-    if error.contains("timed out") || error.contains("timeout") {
-        Outcome::Timeout
-    } else if error.contains("webrtc")
-        || error.contains("datachannel")
-        || error.contains("ice")
-        || error.contains("connect")
-        || error.contains("closed")
-        || error.contains("invalid state")
-    {
-        Outcome::NetworkError
-    } else {
-        Outcome::ApplicationError
-    }
 }
 
 async fn invoke_payment(
@@ -2701,14 +2858,33 @@ async fn read_pq_payload(
     max_payload_bytes: usize,
     initial_timeout_ms: u32,
 ) -> Result<Vec<u8>, String> {
+    read_pq_payload_typed(receiver, max_payload_bytes, initial_timeout_ms)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn read_pq_payload_typed(
+    receiver: Rc<ResponseInbox>,
+    max_payload_bytes: usize,
+    initial_timeout_ms: u32,
+) -> Result<Vec<u8>, RpcError> {
     let mut frame = Vec::with_capacity(8 * 1024);
     let mut expected_length = None;
     let response_started_ms = js_sys::Date::now();
     let mut response_deadline_ms = response_started_ms + f64::from(initial_timeout_ms);
     loop {
         let remaining_ms = remaining_timeout_ms(response_deadline_ms);
-        let message =
-            timeout_with_ms(receiver.next(), "WebRTC request timed out", remaining_ms).await?;
+        let message = match select(
+            Box::pin(receiver.next()),
+            Box::pin(TimeoutFuture::new(remaining_ms)),
+        )
+        .await
+        {
+            Either::Left((result, _)) => result?,
+            Either::Right(((), _)) => {
+                return Err(RpcError::Timeout("WebRTC request timed out".into()))
+            }
+        };
         let next_length = frame
             .len()
             .checked_add(message.len())
@@ -2717,9 +2893,9 @@ async fn read_pq_payload(
             .checked_add(4)
             .ok_or_else(|| "PQ frame limit overflow".to_string())?;
         if next_length > max_frame_bytes {
-            return Err(format!(
-                "PQ frame exceeded the {max_payload_bytes}-byte payload limit"
-            ));
+            return Err(
+                format!("PQ frame exceeded the {max_payload_bytes}-byte payload limit").into(),
+            );
         }
         frame.extend_from_slice(&message);
         if expected_length.is_none() {
@@ -2732,12 +2908,14 @@ async fn read_pq_payload(
         }
         if let Some(expected) = expected_length {
             if frame.len() > expected {
-                return Err("PQ frame contains bytes after its declared payload".to_string());
+                return Err("PQ frame contains bytes after its declared payload"
+                    .to_string()
+                    .into());
             }
             if frame.len() == expected {
                 receiver.finish_response()?;
                 return decode_pq_frame(&frame, max_payload_bytes)
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| RpcError::Transport(error.to_string()));
             }
         }
     }

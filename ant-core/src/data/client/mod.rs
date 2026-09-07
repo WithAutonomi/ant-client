@@ -37,7 +37,7 @@ use tracing::debug;
 /// (20): a node accepts a reused payment proof only when one of the proof's
 /// closest-`CLOSE_GROUP_SIZE` quote issuers is within its own local 20-closest,
 /// so trying peers past this width is pointless.
-pub(crate) const PUT_TARGET_WIDTH: usize = 20;
+pub(crate) use crate::quote_policy::PUT_TARGET_WIDTH;
 
 /// Classify a `data::error::Error` into a controller `Outcome`.
 ///
@@ -73,13 +73,13 @@ pub(crate) const PUT_TARGET_WIDTH: usize = 20;
 ///   cuts the cap — V2-554)
 pub(crate) fn classify_error(err: &Error) -> Outcome {
     match err {
-        Error::Timeout(_) => Outcome::Timeout,
+        Error::Timeout(_) => crate::transfer_policy::FailureKind::Timeout,
         Error::Network(_)
         | Error::InsufficientPeers(_)
         | Error::Io(_)
         | Error::Protocol(_)
         | Error::Storage(_)
-        | Error::PartialUpload { .. } => Outcome::NetworkError,
+        | Error::PartialUpload { .. } => crate::transfer_policy::FailureKind::Network,
         Error::AlreadyStored
         | Error::Encryption(_)
         | Error::Crypto(_)
@@ -112,8 +112,9 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         // "client sending too fast" — must not push the limiter down
         // (V2-554). A shortfall that DID time out keeps `InsufficientPeers`
         // (`NetworkError`) so real congestion still cuts the cap.
-        | Error::CloseGroupShortfall(_) => Outcome::ApplicationError,
+        | Error::CloseGroupShortfall(_) => crate::transfer_policy::FailureKind::Application,
     }
+    .outcome()
 }
 
 /// Compute XOR distance between a peer's ID bytes and a target address.

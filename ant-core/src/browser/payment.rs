@@ -2,9 +2,10 @@
 
 use super::protocol::normalize_hex;
 pub use super::protocol::{BrowserCommitmentArtifact, BrowserQuoteArtifact};
+#[cfg(test)]
+use saorsa_webrtc::{calculate_price_wei, commitment_hash};
 use saorsa_webrtc::{
-    calculate_price_wei, commitment_hash, payment_quote_bytes_for_signing,
-    verify_commitment_signature, verify_ml_dsa_65, StorageCommitment, MAX_COMMITMENT_KEY_COUNT,
+    payment_quote_bytes_for_signing, verify_ml_dsa_65, StorageCommitment,
     MAX_COMMITMENT_SIDECAR_BYTES,
 };
 use serde::{Deserialize, Serialize};
@@ -92,26 +93,9 @@ pub fn verify_storage_quote(
             "storage quote belongs to a different WebRtcDirect peer".to_string(),
         ));
     }
-    if quote.committed_key_count > MAX_COMMITMENT_KEY_COUNT {
-        return Err(StorageQuoteError(format!(
-            "invalid committed key count {}",
-            quote.committed_key_count
-        )));
-    }
     let public_key = decode_unbounded_hex(&quote.public_key, "quote public key")?;
     let signature = decode_unbounded_hex(&quote.signature, "quote signature")?;
-    if blake3::hash(&public_key).to_hex().as_str() != quote.peer_id {
-        return Err(StorageQuoteError(
-            "storage quote public key is not bound to its peer ID".to_string(),
-        ));
-    }
     let price = parse_decimal_u128(&quote.price, "quote price")?;
-    let expected_price = calculate_price_wei(quote.committed_key_count);
-    if price != expected_price {
-        return Err(StorageQuoteError(
-            "storage quote price is not bound to its committed key count".to_string(),
-        ));
-    }
     let rewards = normalize_hex(&quote.rewards_address, 20).map_err(StorageQuoteError)?;
     quote.rewards_address.clone_from(&rewards);
     let commitment_pin = quote
@@ -121,11 +105,32 @@ pub fn verify_storage_quote(
         .transpose()?;
     quote.commitment_pin.clone_from(&commitment_pin);
     let signed_bytes = canonical_quote_bytes(&quote, price, &rewards, commitment_pin.as_deref())?;
-    if !verify_ml_dsa_65(&public_key, &signature, &signed_bytes, b"") {
-        return Err(StorageQuoteError(
-            "storage quote has an invalid ML-DSA-65 signature".to_string(),
-        ));
-    }
+    let sidecar = if quote.committed_key_count > 0 {
+        quote
+            .commitment
+            .as_ref()
+            .map(|artifact| decode_unbounded_hex(&artifact.encoded, "storage commitment sidecar"))
+            .transpose()?
+    } else {
+        None
+    };
+    crate::quote_validation::validate_quote::<_, StorageCommitment>(
+        &decode_hex_array(&expected_peer_id, "peer ID")?,
+        &decode_hex_array(&expected_address, "content address")?,
+        &crate::quote_validation::QuoteFields {
+            public_key: &public_key,
+            content: &decode_hex_array(&quote.content, "quote content")?,
+            price,
+            committed_key_count: quote.committed_key_count,
+            commitment_pin: commitment_pin
+                .as_deref()
+                .map(|pin| decode_hex_array(pin, "commitment pin"))
+                .transpose()?,
+        },
+        || verify_ml_dsa_65(&public_key, &signature, &signed_bytes, b""),
+        sidecar.as_deref(),
+    )
+    .map_err(|error| StorageQuoteError(error.to_string()))?;
     let quote_hash = hex::encode(payment_quote_hash(&signed_bytes, &public_key, &signature));
     if normalize_hex(&quote.quote_hash, 32).map_err(StorageQuoteError)? != quote_hash {
         return Err(StorageQuoteError(
@@ -134,23 +139,12 @@ pub fn verify_storage_quote(
     }
     quote.quote_hash.clone_from(&quote_hash);
 
-    if quote.committed_key_count == 0 {
-        if quote.commitment_pin.is_some() || quote.commitment.is_some() {
-            return Err(StorageQuoteError(
-                "baseline storage quote has an incoherent commitment".to_string(),
-            ));
+    if quote.committed_key_count > 0 {
+        // The browser wire duplicates the sidecar fields; only this envelope
+        // consistency check is adapter-specific. Admission was checked above.
+        if let Some(artifact) = quote.commitment.as_mut() {
+            normalize_commitment_artifact(artifact)?;
         }
-    } else {
-        let pin = commitment_pin
-            .ok_or_else(|| StorageQuoteError("bound storage quote omitted its pin".to_string()))?;
-        verify_commitment(
-            quote.commitment.as_mut().ok_or_else(|| {
-                StorageQuoteError("bound quote omitted its storage commitment".to_string())
-            })?,
-            &quote.peer_id,
-            quote.committed_key_count,
-            &pin,
-        )?;
     }
 
     let amount = crate::payment_policy::enhanced_payment_amount(price)
@@ -184,11 +178,8 @@ fn canonical_quote_bytes(
     ))
 }
 
-fn verify_commitment(
+fn normalize_commitment_artifact(
     artifact: &mut BrowserCommitmentArtifact,
-    expected_peer_id: &str,
-    expected_key_count: u32,
-    expected_pin: &str,
 ) -> Result<(), StorageQuoteError> {
     let encoded = decode_unbounded_hex(&artifact.encoded, "storage commitment sidecar")?;
     if encoded.len() > MAX_COMMITMENT_SIDECAR_BYTES {
@@ -222,28 +213,6 @@ fn verify_commitment(
     artifact.sender_public_key = hex::encode(&public_key);
     artifact.signature = hex::encode(&signature);
     artifact.encoded = hex::encode(&encoded);
-    if commitment.key_count != expected_key_count {
-        return Err(StorageQuoteError(
-            "storage commitment key count does not match quote".to_string(),
-        ));
-    }
-    if peer_id != expected_peer_id
-        || blake3::hash(&public_key).to_hex().as_str() != expected_peer_id
-    {
-        return Err(StorageQuoteError(
-            "storage commitment belongs to a different peer".to_string(),
-        ));
-    }
-    if !verify_commitment_signature(&commitment) {
-        return Err(StorageQuoteError(
-            "storage commitment has an invalid ML-DSA-65 signature".to_string(),
-        ));
-    }
-    if commitment_hash(&commitment).map(hex::encode).as_deref() != Some(expected_pin) {
-        return Err(StorageQuoteError(
-            "storage commitment does not resolve the quote pin".to_string(),
-        ));
-    }
     Ok(())
 }
 
@@ -458,11 +427,77 @@ mod tests {
         assert!(error.to_string().contains("sidecar differs"));
     }
 
+    fn native_quote(quote: &BrowserQuoteArtifact) -> ant_protocol::evm::PaymentQuote {
+        use ant_protocol::evm::{Amount, PaymentQuote, RewardsAddress};
+        PaymentQuote {
+            content: xor_name::XorName(decode_hex_array(&quote.content, "content").unwrap()),
+            timestamp: std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(quote.timestamp_secs),
+            price: Amount::from(quote.price.parse::<u128>().unwrap()),
+            rewards_address: RewardsAddress::from(
+                decode_hex_array::<20>(&quote.rewards_address, "rewards").unwrap(),
+            ),
+            pub_key: hex::decode(&quote.public_key).unwrap(),
+            signature: hex::decode(&quote.signature).unwrap(),
+            committed_key_count: quote.committed_key_count,
+            commitment_pin: quote
+                .commitment_pin
+                .as_deref()
+                .map(|pin| decode_hex_array(pin, "pin").unwrap()),
+        }
+    }
+
+    #[test]
+    fn native_and_browser_validation_accept_and_reject_identical_signed_artifacts() {
+        use ant_protocol::transport::PeerId;
+        let (baseline, content, peer) = baseline_quote();
+        let (bound, _, bound_peer) = bound_quote(23);
+        let mut extra_baseline_sidecar = baseline.clone();
+        extra_baseline_sidecar.commitment = bound.commitment.clone();
+        extra_baseline_sidecar.commitment.as_mut().unwrap().encoded = "c1".into();
+        let mut missing = bound.clone();
+        missing.commitment = None;
+        let mut corrupt = bound.clone();
+        corrupt.commitment.as_mut().unwrap().encoded = "c1".into();
+        let mut wrong_key = baseline.clone();
+        wrong_key.public_key = bound.public_key.clone();
+        let mut bad_signature = baseline.clone();
+        bad_signature.signature = "00".repeat(3309);
+        let mut wrong_content = baseline.clone();
+        wrong_content.content = "01".repeat(32);
+        for (quote, peer, expected) in [
+            (baseline, peer.clone(), true),
+            (extra_baseline_sidecar, peer.clone(), true),
+            (bound, bound_peer.clone(), true),
+            (missing, bound_peer.clone(), false),
+            (corrupt, bound_peer, false),
+            (wrong_key, peer.clone(), false),
+            (bad_signature, peer.clone(), false),
+            (wrong_content, peer, false),
+        ] {
+            let native = native_quote(&quote);
+            let sidecar = quote
+                .commitment
+                .as_ref()
+                .map(|artifact| hex::decode(&artifact.encoded).unwrap());
+            let native_result = crate::data::client::quote::classify_quote_response(
+                &PeerId::from_bytes(decode_hex_array(&peer, "peer").unwrap()),
+                &decode_hex_array(&content, "content").unwrap(),
+                &rmp_serde::to_vec(&native).unwrap(),
+                false,
+                sidecar,
+            );
+            assert_eq!(native_result.is_ok(), expected);
+            assert_eq!(
+                verify_storage_quote(quote, &content, &peer).is_ok(),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn browser_and_native_adapters_select_the_same_signed_quote_and_payment() {
         use crate::data::client::batch::SingleNodeQuotePayment;
-        use ant_protocol::evm::{Amount, PaymentQuote, RewardsAddress};
-
         for (counts, expected_index) in [
             (vec![1_000_000, 0, 0, 0, 0, 0, 0], 4),
             (vec![0, 6000, 6000, 6000, 6000, 6000, 6000], 3),
@@ -484,27 +519,7 @@ mod tests {
             let expected_hash = verified[expected_index].quote_hash.clone();
             let native_quotes = verified
                 .iter()
-                .map(|verified| {
-                    let quote = &verified.quote;
-                    PaymentQuote {
-                        content: xor_name::XorName(
-                            decode_hex_array(&quote.content, "content").unwrap(),
-                        ),
-                        timestamp: std::time::SystemTime::UNIX_EPOCH
-                            + std::time::Duration::from_secs(quote.timestamp_secs),
-                        price: Amount::from(quote.price.parse::<u128>().unwrap()),
-                        rewards_address: RewardsAddress::from(
-                            decode_hex_array::<20>(&quote.rewards_address, "rewards").unwrap(),
-                        ),
-                        pub_key: hex::decode(&quote.public_key).unwrap(),
-                        signature: hex::decode(&quote.signature).unwrap(),
-                        committed_key_count: quote.committed_key_count,
-                        commitment_pin: quote
-                            .commitment_pin
-                            .as_ref()
-                            .map(|pin| decode_hex_array(pin, "pin").unwrap()),
-                    }
-                })
+                .map(|verified| native_quote(&verified.quote))
                 .collect();
             let native = SingleNodeQuotePayment::from_quotes(native_quotes).expect("native plan");
             let browser = select_storage_quote(verified).expect("browser plan");

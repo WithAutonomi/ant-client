@@ -7,19 +7,23 @@ use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::client::PUT_TARGET_WIDTH;
 use crate::data::error::{Error, Result};
+#[cfg(test)]
+use ant_protocol::compute_address;
 use ant_protocol::evm::{Amount, PaymentQuote};
+#[cfg(test)]
 use ant_protocol::payment::calculate_price;
+use ant_protocol::payment::commitment::StorageCommitment;
+#[cfg(test)]
 use ant_protocol::payment::commitment::{
-    commitment_hash, verify_commitment_signature, StorageCommitment, MAX_COMMITMENT_KEY_COUNT,
-    MAX_COMMITMENT_SIDECAR_BYTES,
+    commitment_hash, MAX_COMMITMENT_KEY_COUNT, MAX_COMMITMENT_SIDECAR_BYTES,
 };
-use ant_protocol::payment::{verify_quote_content, verify_quote_signature};
+use ant_protocol::payment::verify_quote_signature;
 use ant_protocol::transport::{
     DHTNode, MultiAddr, P2PNode, PeerId, ResponderView, WitnessedCloseGroup,
 };
 use ant_protocol::{
-    compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
-    ChunkQuoteRequest, ChunkQuoteResponse, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE,
+    send_and_await_chunk_response, ChunkMessage, ChunkMessageBody, ChunkQuoteRequest,
+    ChunkQuoteResponse, CLOSE_GROUP_SIZE,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
@@ -33,17 +37,7 @@ use tracing::{debug, info, warn};
 /// ask only the actual close group.
 const FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER: usize = 2;
 
-/// Witnessed close-group quorum as a fraction of the initial close group.
-/// For today's `CLOSE_GROUP_SIZE = 7`, this yields the requested 5-of-7
-/// quorum.
-const WITNESSED_QUORUM_NUMERATOR: usize = 2;
-const WITNESSED_QUORUM_DENOMINATOR: usize = 3;
-
-/// Number of closest nodes each initial witnessed responder contributes.
-const SINGLE_NODE_WITNESSED_VIEW_COUNT: usize = 20;
-
-/// Minimum quote count accepted by the single-node payment path.
-const SINGLE_NODE_MIN_QUOTE_COUNT: usize = 1;
+use crate::quote_policy::{SINGLE_NODE_MIN_QUOTE_COUNT, SINGLE_NODE_WITNESSED_VIEW_COUNT};
 
 /// Overall timeout for collecting quote responses. Must accommodate
 /// connect_with_fallback cascade (direct 5s + hole-punch 15s×3 + relay 30s ≈
@@ -58,7 +52,8 @@ const QUOTE_COLLECTION_TIMEOUT_SECS: u64 = 120;
 ///
 /// TODO: switch to `saorsa_pqc::pqc::types::ML_DSA_65_PUBLIC_KEY_SIZE` once
 /// `ant-protocol` re-exports it (`pqc::ops::ML_DSA_65_PUBLIC_KEY_SIZE`).
-const ML_DSA_PUB_KEY_LEN: usize = 1952;
+#[cfg(test)]
+use crate::quote_validation::ML_DSA_PUB_KEY_LEN;
 
 /// One collected quote: the responding peer, its addresses, the signed quote,
 /// the price it demands, and (ADR-0004) the opaque signed-commitment blob the
@@ -71,6 +66,16 @@ type QuotedPeer = (
     Amount,
     Option<Vec<u8>>,
 );
+
+fn quote_fields(quote: &PaymentQuote) -> crate::quote_validation::QuoteFields<'_, Amount> {
+    crate::quote_validation::QuoteFields {
+        public_key: &quote.pub_key,
+        content: &quote.content.0,
+        price: quote.price,
+        committed_key_count: quote.committed_key_count,
+        commitment_pin: quote.commitment_pin,
+    }
+}
 
 /// Check that a quote's `pub_key` is well-formed and BLAKE3-hashes to the
 /// claimed `peer_id`.
@@ -87,10 +92,7 @@ type QuotedPeer = (
 /// in [`classify_quote_response`] before paying, so a quote the storer would
 /// reject never gets paid.
 fn quote_binding_is_valid(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
-    if quote.pub_key.len() != ML_DSA_PUB_KEY_LEN {
-        return false;
-    }
-    compute_address(&quote.pub_key) == *peer_id.as_bytes()
+    crate::quote_validation::peer_binding_is_valid(peer_id.as_bytes(), &quote.pub_key)
 }
 
 /// ADR-0004 client-side resolve-before-pay gate — "the client pays nothing it
@@ -118,83 +120,17 @@ fn quote_binding_is_valid(peer_id: &PeerId, quote: &PaymentQuote) -> bool {
 ///
 /// Returns `Ok(())` if the binding fully resolves, or `Err(detail)` naming the
 /// rule that failed.
+#[cfg(test)]
 fn quote_commitment_binding_is_valid(
     peer_id: &PeerId,
     quote: &PaymentQuote,
     commitment: &Option<Vec<u8>>,
 ) -> std::result::Result<(), String> {
-    let count = quote.committed_key_count;
-    let pin = quote.commitment_pin;
-    match (count, pin.is_some()) {
-        (0, false) | (1.., true) => {}
-        (1.., false) => {
-            return Err(format!(
-                "committed_key_count={count} > 0 but commitment_pin is None (unauditable count)"
-            ));
-        }
-        (0, true) => {
-            return Err("committed_key_count=0 with a commitment_pin (incoherent baseline)".into());
-        }
-    }
-    if count > MAX_COMMITMENT_KEY_COUNT {
-        return Err(format!(
-            "committed_key_count={count} exceeds MAX_COMMITMENT_KEY_COUNT={MAX_COMMITMENT_KEY_COUNT}"
-        ));
-    }
-    // Forced price: exact recomputation, never inversion.
-    let expected = calculate_price(count as usize);
-    if quote.price != expected {
-        return Err(format!(
-            "price {} does not equal calculate_price(committed_key_count={count}) = {expected}",
-            quote.price
-        ));
-    }
-
-    // Baseline `(0, None)` pins nothing — fully resolved by the checks above.
-    let Some(pin) = pin else {
-        return Ok(());
-    };
-
-    // Bound quote: the commitment MUST have arrived and MUST resolve the pin.
-    let Some(blob) = commitment else {
-        return Err(
-            "bound quote did not ship its commitment; the pin is unresolvable so the quote \
-             is dropped before payment"
-                .into(),
-        );
-    };
-    // Cap before parsing: bound the deserialize work a malicious responder can
-    // force, and never forward an oversized blob in the PUT bundle.
-    if blob.len() > MAX_COMMITMENT_SIDECAR_BYTES {
-        return Err(format!(
-            "shipped commitment is {} bytes, exceeds MAX_COMMITMENT_SIDECAR_BYTES={MAX_COMMITMENT_SIDECAR_BYTES}",
-            blob.len()
-        ));
-    }
-    let commitment: StorageCommitment = rmp_serde::from_slice(blob).map_err(|e| {
-        format!("shipped commitment did not deserialize as a StorageCommitment: {e}")
-    })?;
-
-    // Peer binding: the commitment must belong to the quoting peer, exactly as
-    // the storer derives a candidate's peer id (`BLAKE3(pub_key)`).
-    if compute_address(&commitment.sender_public_key) != *peer_id.as_bytes()
-        || commitment.sender_peer_id != *peer_id.as_bytes()
-    {
-        return Err("shipped commitment is not bound to the quoting peer".into());
-    }
-    if !verify_commitment_signature(&commitment) {
-        return Err("shipped commitment has an invalid signature".into());
-    }
-    if commitment_hash(&commitment) != Some(pin) {
-        return Err("shipped commitment does not hash to the quote's pin".into());
-    }
-    if commitment.key_count != count {
-        return Err(format!(
-            "shipped commitment attests key_count={} but the quote claims {count}",
-            commitment.key_count
-        ));
-    }
-    Ok(())
+    crate::quote_validation::validate_commitment_binding::<_, StorageCommitment>(
+        peer_id.as_bytes(),
+        &quote_fields(quote),
+        commitment.as_deref(),
+    )
 }
 
 /// Classification of a `ChunkQuoteResponse::Success` body for a single peer.
@@ -229,7 +165,7 @@ fn quote_commitment_binding_is_valid(
 /// On success the returned commitment is the opaque signed-commitment blob the
 /// node shipped with the quote (`None` for a baseline quote), to be forwarded
 /// as a sidecar in the PUT bundle.
-fn classify_quote_response(
+pub(crate) fn classify_quote_response(
     peer_id: &PeerId,
     expected_content: &[u8; 32],
     quote_bytes: &[u8],
@@ -240,57 +176,25 @@ fn classify_quote_response(
         Error::Serialization(format!("Failed to deserialize quote from {peer_id}: {e}"))
     })?;
 
-    // Peer binding: BLAKE3(pub_key) must equal peer_id. This is the
-    // exact mitigation Chris and the AI investigation requested for the
-    // 2026-04-30 production failure: drop crossed-key peers before they
-    // poison the close-group ProofOfPayment.
-    if !quote_binding_is_valid(peer_id, &payment_quote) {
-        let derived = compute_address(&payment_quote.pub_key);
-        warn!(
-            "Dropping response from {peer_id} — quote.pub_key BLAKE3 mismatch \
-             (peer is signing quotes with another peer's key); the storer \
-             would reject this proof"
-        );
-        return Err(Error::BadQuoteBinding {
-            peer_id: peer_id.to_string(),
-            detail: format!(
-                "BLAKE3(pub_key)={} pub_key_len={}",
-                hex::encode(derived),
-                payment_quote.pub_key.len(),
-            ),
-        });
-    }
-
-    // ADR-0004 "the client runs the full binding check": verify the quote's OWN
-    // ML-DSA-65 signature and that it is for THIS content, before paying —
-    // exactly what the storer checks and what the merkle path already does
-    // client-side. A quote with a valid pub_key binding but a bad signature or
-    // wrong content would otherwise be paid and then rejected by the storer.
-    if !verify_quote_content(&payment_quote, expected_content) {
-        return Err(Error::BadQuoteBinding {
-            peer_id: peer_id.to_string(),
-            detail: "quote content does not match the requested address".to_string(),
-        });
-    }
-    if !verify_quote_signature(&payment_quote) {
-        return Err(Error::BadQuoteBinding {
-            peer_id: peer_id.to_string(),
-            detail: "quote ML-DSA-65 signature is invalid".to_string(),
-        });
-    }
-
-    // ADR-0004 forced-price gate: drop a quote whose price is not exactly the
-    // public formula of its committed count, whose (count, pin) shape is
-    // incoherent, or which is bound but did not ship its commitment. The storer
-    // re-runs the arithmetic and would reject the bundle; we drop it here so we
-    // never pay a quote we cannot resolve.
-    if let Err(detail) = quote_commitment_binding_is_valid(peer_id, &payment_quote, &commitment) {
-        warn!("Dropping response from {peer_id} — ADR-0004 binding invalid: {detail}");
-        return Err(Error::BadQuoteCommitment {
+    crate::quote_validation::validate_quote::<_, StorageCommitment>(
+        peer_id.as_bytes(),
+        expected_content,
+        &quote_fields(&payment_quote),
+        || verify_quote_signature(&payment_quote),
+        commitment.as_deref(),
+    )
+    .map_err(|error| match error {
+        crate::quote_validation::QuoteValidationError::Binding(detail) => Error::BadQuoteBinding {
             peer_id: peer_id.to_string(),
             detail,
-        });
-    }
+        },
+        crate::quote_validation::QuoteValidationError::Commitment(detail) => {
+            Error::BadQuoteCommitment {
+                peer_id: peer_id.to_string(),
+                detail,
+            }
+        }
+    })?;
 
     if already_stored {
         debug!("Peer {peer_id} already has chunk");
@@ -421,9 +325,7 @@ fn witnessed_quote_launch_budget(
     in_flight: usize,
     remaining_peers: usize,
 ) -> usize {
-    CLOSE_GROUP_SIZE
-        .saturating_sub(successful_quotes.saturating_add(in_flight))
-        .min(remaining_peers)
+    crate::quote_policy::quote_launch_budget(successful_quotes, in_flight, remaining_peers)
 }
 
 fn single_node_quote_query_count() -> usize {
@@ -435,13 +337,11 @@ fn fault_tolerant_quote_query_count() -> usize {
 }
 
 fn witnessed_close_group_quorum() -> usize {
-    (CLOSE_GROUP_SIZE * WITNESSED_QUORUM_NUMERATOR).div_ceil(WITNESSED_QUORUM_DENOMINATOR)
+    crate::quote_policy::witness_quorum(0)
 }
 
 fn witnessed_close_group_quorum_for_missing_views(missing_views: usize) -> usize {
-    witnessed_close_group_quorum()
-        .saturating_sub(missing_views)
-        .max(1)
+    crate::quote_policy::witness_quorum(missing_views)
 }
 
 fn missing_witnessed_responder_views(witnessed: &WitnessedCloseGroup) -> usize {
@@ -470,11 +370,26 @@ fn scope_witnessed_to_close_group(witnessed: &WitnessedCloseGroup) -> WitnessedC
         .take(CLOSE_GROUP_SIZE)
         .cloned()
         .collect();
-    let scope: HashSet<PeerId> = initial_closest.iter().map(|node| node.peer_id).collect();
+    let keys = initial_closest
+        .iter()
+        .map(|node| node.peer_id)
+        .collect::<Vec<_>>();
+    let views = witnessed
+        .responder_views
+        .iter()
+        .map(|view| crate::quote_policy::ResponderView {
+            responder: view.responder,
+            closest: view.closest.iter().map(|node| node.peer_id).collect(),
+        })
+        .collect::<Vec<_>>();
+    let scoped = crate::quote_policy::scope_views(&keys, &views)
+        .into_iter()
+        .map(|view| view.responder)
+        .collect::<HashSet<_>>();
     let responder_views: Vec<ResponderView> = witnessed
         .responder_views
         .iter()
-        .filter(|view| scope.contains(&view.responder))
+        .filter(|view| scoped.contains(&view.responder))
         .cloned()
         .collect();
     WitnessedCloseGroup {
@@ -592,19 +507,20 @@ fn witnessed_vote_counts_and_nodes(
         merge_witnessed_node(&mut known_nodes, node.clone());
     }
 
-    let mut voters_by_peer: HashMap<PeerId, HashSet<PeerId>> = HashMap::new();
     for view in &witnessed.responder_views {
-        let mut voted = HashSet::new();
         for node in &view.closest {
             merge_witnessed_node(&mut known_nodes, node.clone());
-            if voted.insert(node.peer_id) {
-                voters_by_peer
-                    .entry(node.peer_id)
-                    .or_default()
-                    .insert(view.responder);
-            }
         }
     }
+    let views = witnessed
+        .responder_views
+        .iter()
+        .map(|view| crate::quote_policy::ResponderView {
+            responder: view.responder,
+            closest: view.closest.iter().map(|node| node.peer_id).collect(),
+        })
+        .collect::<Vec<_>>();
+    let voters_by_peer = crate::quote_policy::witness_votes(&views);
 
     let mut vote_counts: Vec<(PeerId, usize)> = voters_by_peer
         .iter()
@@ -619,39 +535,20 @@ fn witnessed_consensus_candidates(
     address: &[u8; 32],
     quorum: usize,
 ) -> Vec<WitnessedQuoteCandidate> {
-    let (known_nodes, voters_by_peer, vote_counts) =
-        witnessed_vote_counts_and_nodes(witnessed, address);
-    let mut candidates = vote_counts
-        .iter()
-        .filter_map(|(peer_id, votes)| {
-            if *votes < quorum {
-                return None;
-            }
-            known_nodes.get(peer_id).cloned().and_then(|node| {
-                voters_by_peer
-                    .get(peer_id)
-                    .cloned()
-                    .map(|voters| WitnessedQuoteCandidate {
-                        node,
-                        votes: *votes,
-                        voters,
-                    })
-            })
+    let (known_nodes, voters_by_peer, _) = witnessed_vote_counts_and_nodes(witnessed, address);
+    crate::quote_policy::consensus_peers(&voters_by_peer, address, quorum)
+        .into_iter()
+        .filter_map(|peer| {
+            known_nodes
+                .get(&peer)
+                .cloned()
+                .map(|node| WitnessedQuoteCandidate {
+                    node,
+                    votes: voters_by_peer[&peer].len(),
+                    voters: voters_by_peer[&peer].clone(),
+                })
         })
-        .collect::<Vec<_>>();
-
-    candidates.sort_by(|left, right| {
-        peer_xor_distance(&left.node.peer_id, address)
-            .cmp(&peer_xor_distance(&right.node.peer_id, address))
-            .then_with(|| right.votes.cmp(&left.votes))
-            .then_with(|| {
-                left.node
-                    .peer_id
-                    .as_bytes()
-                    .cmp(right.node.peer_id.as_bytes())
-            })
-    });
-    candidates
+        .collect()
 }
 
 fn witnessed_vote_counts(witnessed: &WitnessedCloseGroup, address: &[u8; 32]) -> Vec<String> {
@@ -696,14 +593,17 @@ fn witnessed_quote_selection_or_error(
     quorum: usize,
 ) -> Result<WitnessedQuoteSelection> {
     let candidates = witnessed_consensus_candidates(witnessed, address, quorum);
-    if candidates.len() < required {
-        return Err(Error::InsufficientPeers(format!(
-            "Witnessed close group inconclusive before payment: got {}/{} quorum-recognised peers. {}",
-            candidates.len(),
-            required,
+    crate::quote_policy::validate_witnessed_peers(
+        witnessed.initial_closest.len(),
+        candidates.len(),
+        required,
+    )
+    .map_err(|error| {
+        Error::InsufficientPeers(format!(
+            "{error} {}",
             witnessed_close_group_diagnostics(address, witnessed, quorum)
-        )));
-    }
+        ))
+    })?;
 
     let initial_put_peers = witnessed
         .initial_closest
@@ -711,15 +611,6 @@ fn witnessed_quote_selection_or_error(
         .take(CLOSE_GROUP_SIZE)
         .map(|node| (node.peer_id, node.addresses_by_priority()))
         .collect::<Vec<_>>();
-
-    if initial_put_peers.len() < CLOSE_GROUP_SIZE {
-        return Err(Error::InsufficientPeers(format!(
-            "Witnessed close group returned only {}/{} initial PUT peers before payment. {}",
-            initial_put_peers.len(),
-            CLOSE_GROUP_SIZE,
-            witnessed_close_group_diagnostics(address, witnessed, quorum)
-        )));
-    }
 
     let quote_peers = candidates
         .into_iter()
@@ -755,52 +646,6 @@ fn sort_quotes_by_distance(quotes: &mut [StoreQuote], address: &[u8; 32]) {
     });
 }
 
-fn median_paid_quote_issuer_for_indices(
-    quotes: &[StoreQuote],
-    indices: &[usize],
-) -> Option<(PeerId, Amount)> {
-    let prices = indices
-        .iter()
-        .map(|&index| quotes[index].3)
-        .collect::<Vec<_>>();
-    let selected = crate::payment_policy::median_quote_index(&prices)?;
-    let (peer_id, _, _, price, _) = &quotes[indices[selected]];
-    Some((*peer_id, *price))
-}
-
-fn median_issuer_voter_support(
-    quotes: &[StoreQuote],
-    indices: &[usize],
-    voters_by_peer: &VotersByPeer,
-) -> Option<(PeerId, usize)> {
-    let (median_peer_id, _) = median_paid_quote_issuer_for_indices(quotes, indices)?;
-    let voters = voters_by_peer.get(&median_peer_id)?;
-    Some((median_peer_id, voters.len()))
-}
-
-fn visit_quote_subsets<F>(
-    quote_count: usize,
-    subset_size: usize,
-    start_index: usize,
-    current: &mut Vec<usize>,
-    visit: &mut F,
-) where
-    F: FnMut(&[usize]),
-{
-    if current.len() == subset_size {
-        visit(current);
-        return;
-    }
-
-    let remaining = subset_size - current.len();
-    let last_start = quote_count - remaining;
-    for index in start_index..=last_start {
-        current.push(index);
-        visit_quote_subsets(quote_count, subset_size, index + 1, current, visit);
-        current.pop();
-    }
-}
-
 fn select_closest_quotes(mut quotes: Vec<StoreQuote>, address: &[u8; 32]) -> Vec<StoreQuote> {
     sort_quotes_by_distance(&mut quotes, address);
     quotes.truncate(CLOSE_GROUP_SIZE);
@@ -808,55 +653,27 @@ fn select_closest_quotes(mut quotes: Vec<StoreQuote>, address: &[u8; 32]) -> Vec
 }
 
 fn select_witnessed_median_voter_quotes(
-    mut quotes: Vec<StoreQuote>,
+    quotes: Vec<StoreQuote>,
     address: &[u8; 32],
     voters_by_peer: &VotersByPeer,
     required_support: usize,
 ) -> Option<Vec<StoreQuote>> {
-    if quotes.is_empty() {
-        return None;
-    }
-
-    sort_quotes_by_distance(&mut quotes, address);
-
-    let max_quote_count = single_node_quote_query_count().min(quotes.len());
-    for quote_count in (SINGLE_NODE_MIN_QUOTE_COUNT..=max_quote_count).rev() {
-        let mut best_indices: Option<(usize, Vec<usize>)> = None;
-        let mut current_indices = Vec::with_capacity(quote_count);
-        visit_quote_subsets(
-            quotes.len(),
-            quote_count,
-            0,
-            &mut current_indices,
-            &mut |indices| {
-                let Some((_, support)) =
-                    median_issuer_voter_support(&quotes, indices, voters_by_peer)
-                else {
-                    return;
-                };
-                if support < required_support {
-                    return;
-                }
-                match &best_indices {
-                    Some((best_support, best)) if *best_support > support => {}
-                    Some((best_support, best))
-                        if *best_support == support && best.as_slice() <= indices => {}
-                    _ => best_indices = Some((support, indices.to_vec())),
-                }
-            },
-        );
-
-        if let Some((_, indices)) = best_indices {
-            return Some(
-                indices
-                    .into_iter()
-                    .map(|index| quotes[index].clone())
-                    .collect(),
-            );
-        }
-    }
-
-    None
+    let prices = quotes
+        .iter()
+        .map(|quote| (quote.0, quote.3))
+        .collect::<Vec<_>>();
+    let indices = crate::quote_policy::select_witnessed_quotes(
+        &prices,
+        address,
+        voters_by_peer,
+        required_support,
+    )?;
+    Some(
+        indices
+            .into_iter()
+            .map(|index| quotes[index].clone())
+            .collect(),
+    )
 }
 
 fn put_peers_with_median_voters_first(
@@ -866,25 +683,23 @@ fn put_peers_with_median_voters_first(
     required_support: usize,
 ) -> Option<Vec<(PeerId, Vec<MultiAddr>)>> {
     let (median_peer_id, _) = median_paid_quote_issuer(quotes)?;
-    let voters = voters_by_peer.get(&median_peer_id)?;
-
-    let mut supporting_peers = Vec::new();
-    let mut fallback_peers = Vec::new();
-    for (peer_id, addrs) in put_peers {
-        let peer = (*peer_id, addrs.clone());
-        if voters.contains(peer_id) {
-            supporting_peers.push(peer);
-        } else {
-            fallback_peers.push(peer);
-        }
-    }
-
-    if supporting_peers.len() < required_support {
-        return None;
-    }
-
-    supporting_peers.extend(fallback_peers);
-    Some(supporting_peers)
+    let keys = put_peers.iter().map(|peer| peer.0).collect::<Vec<_>>();
+    let ordered = crate::quote_policy::order_put_peers(
+        median_peer_id,
+        &keys,
+        voters_by_peer,
+        required_support,
+    )?;
+    let addresses = put_peers
+        .iter()
+        .map(|(peer, addrs)| (*peer, addrs))
+        .collect::<HashMap<_, _>>();
+    Some(
+        ordered
+            .into_iter()
+            .map(|peer| (peer, addresses[&peer].clone()))
+            .collect(),
+    )
 }
 
 impl Client {
@@ -1268,30 +1083,16 @@ impl Client {
             bad_quote_count += bad_dropped;
         }
 
-        // Check already-stored: only count votes from the closest CLOSE_GROUP_SIZE peers.
-        if !already_stored_peers.is_empty() {
-            let mut all_peers_by_distance: Vec<(bool, [u8; 32])> = Vec::new();
-            for (peer_id, _, _, _, _) in &quotes {
-                all_peers_by_distance.push((false, peer_xor_distance(peer_id, address)));
-            }
-            for (_, dist) in &already_stored_peers {
-                all_peers_by_distance.push((true, *dist));
-            }
-            all_peers_by_distance.sort_by_key(|a| a.1);
-
-            let close_group_stored = all_peers_by_distance
-                .iter()
-                .take(CLOSE_GROUP_SIZE)
-                .filter(|(is_stored, _)| *is_stored)
-                .count();
-
-            if close_group_stored >= CLOSE_GROUP_MAJORITY {
-                debug!(
-                    "Chunk {} already stored ({close_group_stored}/{CLOSE_GROUP_SIZE} close-group peers confirm)",
-                    hex::encode(address)
-                );
-                return Err(Error::AlreadyStored);
-            }
+        if crate::quote_policy::already_stored(
+            quotes.iter().map(|quote| quote.0),
+            already_stored_peers.iter().map(|peer| peer.0),
+            address,
+        ) {
+            debug!(
+                "Chunk {} already stored on a close-group majority",
+                hex::encode(address)
+            );
+            return Err(Error::AlreadyStored);
         }
 
         let already_stored_count = already_stored_peers.len();
