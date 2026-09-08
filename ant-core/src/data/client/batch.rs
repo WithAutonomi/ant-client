@@ -28,7 +28,6 @@ use futures::stream::StreamExt;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
-#[cfg(any(feature = "native", test))]
 use web_time::Duration;
 use web_time::Instant;
 
@@ -42,7 +41,7 @@ const PAYMENT_WAVE_SIZE: usize = 64;
 /// accepts any non-empty quote bundle up to `CLOSE_GROUP_SIZE`, so the client
 /// keeps the same 3x-median payment rule while allowing the single-node path to
 /// proceed with as few as one valid quote.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SingleNodeQuotePayment {
     /// Quotes sorted by price; the median-priced quote receives 3x payment and
     /// the rest receive zero.
@@ -141,7 +140,7 @@ pub struct PreparedChunk {
 }
 
 /// Verified payment plan for a record staged outside the Rust heap.
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChunkPaymentPlan {
     /// Expected BLAKE3 content address.
     pub address: XorName,
@@ -311,42 +310,43 @@ fn build_paid_chunks(
     prepared: Vec<PreparedChunk>,
     tx_hash_map: &HashMap<QuoteHash, TxHash>,
 ) -> Result<Vec<PaidChunk>> {
-    let mut paid_chunks = Vec::with_capacity(prepared.len());
-    for chunk in prepared {
-        let mut tx_hashes = Vec::new();
-        for info in &chunk.payment.quotes {
-            if !info.amount.is_zero() {
-                let tx_hash = tx_hash_map.get(&info.quote_hash).copied().ok_or_else(|| {
+    prepared
+        .into_iter()
+        .map(|chunk| super::upload_state::UploadState::pay_prepared(chunk, tx_hash_map))
+        .collect()
+}
+
+pub(super) fn build_plan_proof(
+    plan: &ChunkPaymentPlan,
+    tx_hash_map: &HashMap<QuoteHash, TxHash>,
+) -> Result<Vec<u8>> {
+    let mut tx_hashes = Vec::new();
+    for info in &plan.payment.quotes {
+        if !info.amount.is_zero() {
+            let tx_hash = tx_hash_map.get(&info.quote_hash).copied().ok_or_else(|| {
                     Error::Payment(format!(
                         "Missing tx hash for quote {} — external signer did not return a receipt for this payment",
                         hex::encode(info.quote_hash)
                     ))
                 })?;
-                tx_hashes.push(tx_hash);
-            }
+            tx_hashes.push(tx_hash);
         }
-
-        let proof = PaymentProof {
-            proof_of_payment: ProofOfPayment {
-                peer_quotes: chunk.peer_quotes,
-            },
-            tx_hashes,
-            // ADR-0004: forward the bound quotes' commitments so storers
-            // cross-check synchronously; stripped before persistence node-side.
-            commitment_sidecars: chunk.commitment_sidecars,
-        };
-
-        let proof_bytes = serialize_single_node_proof(&proof)
-            .map_err(|e| Error::Serialization(format!("Failed to serialize payment proof: {e}")))?;
-
-        paid_chunks.push(PaidChunk {
-            content: chunk.content,
-            address: chunk.address,
-            quoted_peers: chunk.quoted_peers,
-            proof_bytes,
-        });
     }
-    Ok(paid_chunks)
+
+    let proof = PaymentProof {
+        proof_of_payment: ProofOfPayment {
+            peer_quotes: plan.peer_quotes.clone(),
+        },
+        tx_hashes,
+        // ADR-0004: forward the bound quotes' commitments so storers
+        // cross-check synchronously; stripped before persistence node-side.
+        commitment_sidecars: plan.commitment_sidecars.clone(),
+    };
+
+    let proof_bytes = serialize_single_node_proof(&proof)
+        .map_err(|e| Error::Serialization(format!("Failed to serialize payment proof: {e}")))?;
+
+    Ok(proof_bytes)
 }
 
 /// Finalize a batch payment using externally-provided transaction hashes.
@@ -593,6 +593,7 @@ impl Client {
 
         #[cfg(not(feature = "native"))]
         let cached_proofs: HashMap<XorName, Vec<u8>> = HashMap::new();
+        let recovery = super::upload_state::UploadState::from_proofs(cached_proofs);
         let mut all_addresses = Vec::with_capacity(total_chunks);
         let mut seen_addresses: HashSet<XorName> = HashSet::new();
 
@@ -710,17 +711,13 @@ impl Client {
             let mut needs_pay: Vec<PreparedChunk> = Vec::with_capacity(prepared_chunks.len());
             let mut cached_paid: Vec<PaidChunk> = Vec::new();
             for prep in prepared_chunks {
-                if let Some(proof_bytes) = cached_proofs.get(&prep.address).cloned() {
-                    cached_paid.push(PaidChunk {
-                        content: prep.content,
-                        address: prep.address,
-                        quoted_peers: prep.quoted_peers,
-                        proof_bytes,
-                    });
+                if let Some(paid) = recovery.reuse_prepared(&prep, crate::runtime::system_time()) {
+                    cached_paid.push(paid);
                 } else {
                     needs_pay.push(prep);
                 }
             }
+
             if !cached_paid.is_empty() {
                 info!(
                     "Wave {wave_num}/{wave_count}: reusing {} cached payment proofs",
@@ -1073,8 +1070,7 @@ fn log_wave_summary(result: &WaveResult) {
 /// the chunk body. 5 minutes is generous for all three combined and
 /// cheap: a wrongly-kept proof costs an extra retry round trip, a
 /// wrongly-dropped proof costs one re-pay (cheap chunk).
-#[cfg(any(feature = "native", test))]
-const CACHED_PROOF_SAFETY_MARGIN_SECS: u64 = 300;
+pub(super) const CACHED_PROOF_SAFETY_MARGIN_SECS: u64 = 300;
 
 /// Storer-side budget for a quote's age. Mirrors `QUOTE_MAX_AGE_SECS`
 /// in `ant-node/src/payment/verifier.rs`. If this value drifts on the
@@ -1082,8 +1078,7 @@ const CACHED_PROOF_SAFETY_MARGIN_SECS: u64 = 300;
 /// past the storer limit (forced re-pay on next retry, no money lost)
 /// or drops them slightly early (one extra re-pay, no money lost).
 /// Either way, no payment is double-spent or stranded.
-#[cfg(any(feature = "native", test))]
-const CACHED_PROOF_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+pub(super) const CACHED_PROOF_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
 /// How far a cached quote's `timestamp` may be in the future before we
 /// classify it as too-skewed-to-trust and prune.
@@ -1095,8 +1090,7 @@ const CACHED_PROOF_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 /// forward drift would re-pay those chunks on every retry. Allow the
 /// same 5-minute window the storer does so the client and node agree
 /// on which proofs are fresh.
-#[cfg(any(feature = "native", test))]
-const CACHED_PROOF_FUTURE_SKEW_TOLERANCE_SECS: u64 = 300;
+pub(super) const CACHED_PROOF_FUTURE_SKEW_TOLERANCE_SECS: u64 = 300;
 
 /// Drop cached `proof_bytes` whose quote timestamps are too close to
 /// the storer's expiry window to safely reuse.
@@ -1171,8 +1165,7 @@ fn prune_locally_expired_proofs(
 /// `QUOTE_FUTURE_SKEW_TOLERANCE_SECS` (300s) so a slow-running client
 /// clock doesn't cause us to wrongly prune perfectly fresh proofs
 /// that the storer would still accept.
-#[cfg(any(feature = "native", test))]
-fn proof_is_safely_fresh(
+pub(super) fn proof_is_safely_fresh(
     proof: &ProofOfPayment,
     now: std::time::SystemTime,
     max_safe_age: Duration,

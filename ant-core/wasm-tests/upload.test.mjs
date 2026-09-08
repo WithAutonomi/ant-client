@@ -381,3 +381,83 @@ test("a cancelled discovery batch does not suppress reachable endpoints for the 
     assert.equal(signer.calls.length, 2);
   } finally { client.close(); }
 });
+
+test("paid checkpoint survives a staged-loader failure and restores on a new client without paying fresh quotes", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const encrypted = encryptPublicFile(content);
+  const staged = {
+    ...encrypted, name: "recovery.txt", content_type: "text/plain", size: content.length,
+    records: encrypted.records.map(record => ({ address: record.address, size: record.content.length })),
+  };
+  const signer = wallet();
+  let checkpoint;
+  let client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    await assert.rejects(client.uploadStagedPublicFile(staged, paymentNetwork,
+      async () => { throw new Error("staged storage temporarily unavailable"); }, signer.pay,
+      undefined, undefined, value => { checkpoint = value; }), /staged storage temporarily unavailable/);
+    assert.equal(signer.calls.length, 1);
+    assert.equal(typeof checkpoint, "string");
+    client.close();
+    // Fresh discovery now issues quotes with a different signed timestamp.
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    client = new BrowserNetworkClient(rtc.endpoints);
+    const result = await client.uploadStagedPublicFile(staged, paymentNetwork,
+      async index => encrypted.records[index].content,
+      async () => { throw new Error("already paid records must not request payment"); },
+      undefined, checkpoint);
+    assert.equal(result.storageCostAtto, "0");
+    assert.equal(result.records, encrypted.records.length);
+    const original = new Map(signer.calls[0].quotes.map(quote => [quote.quote.content, quote.quoteHash]));
+    for (const request of rtc.requests.filter(request => request.method === "put_chunk")) {
+      assert.equal(request.quoteHash.replace(/^0x/, ""), original.get(request.address).replace(/^0x/, ""));
+    }
+  } finally { client.close(); }
+});
+
+test("prepared checkpoint retains the exact wallet intent after callback interruption", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  let client = new BrowserNetworkClient(rtc.endpoints);
+  let checkpoint, original;
+  try {
+    await assert.rejects(client.uploadPublicFile(content, "recovery.txt", "text/plain", paymentNetwork,
+      async (_, quotes) => { original = quotes; throw new Error("wallet observer interrupted"); },
+      undefined, undefined, value => { checkpoint = value; }), /wallet observer interrupted/);
+    client.close();
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    client = new BrowserNetworkClient(rtc.endpoints);
+    const signer = wallet();
+    await client.uploadPublicFile(content, "recovery.txt", "text/plain", paymentNetwork, signer.pay, undefined, checkpoint);
+    assert.deepEqual(signer.calls[0].quotes, original);
+  } finally { client.close(); }
+});
+
+test("checkpoint persistence failure prevents payment and checkpoints are bound to content and network", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  let checkpoint;
+  try {
+    await assert.rejects(client.uploadPublicFile(content, "recovery.txt", "text/plain", paymentNetwork, signer.pay,
+      undefined, undefined, value => { checkpoint = value; throw new Error("checkpoint disk full"); }), /checkpoint disk full/);
+    assert.equal(signer.calls.length, 0);
+    const different = new Uint8Array(content); different[0] ^= 1;
+    await assert.rejects(client.uploadPublicFile(different, "recovery.txt", "text/plain", paymentNetwork, signer.pay,
+      undefined, checkpoint), /different file or payment network/);
+    await assert.rejects(client.uploadPublicFile(content, "recovery.txt", "text/plain", {...paymentNetwork, chain_id: 1}, signer.pay,
+      undefined, checkpoint), /different file or payment network/);
+    assert.equal(signer.calls.length, 0);
+  } finally { client.close(); }
+});
+
+test("wallet may return separate transactions for each prepared record", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const result = await client.uploadPublicFile(content, "split.txt", "text/plain", paymentNetwork, async (_, quotes) => ({
+      totalAmount: quotes.reduce((sum, quote) => sum + BigInt(quote.amount), 0n).toString(),
+      transactionHashes: Object.fromEntries(quotes.map((quote, index) => [quote.quoteHash, (index + 1).toString(16).padStart(64, "0")])),
+    }));
+    assert.equal(result.file.replicas, 4);
+  } finally { client.close(); }
+});

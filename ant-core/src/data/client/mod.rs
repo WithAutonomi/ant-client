@@ -18,6 +18,7 @@ pub mod file;
 pub mod merkle;
 pub mod payment;
 pub mod quote;
+pub mod upload_state;
 
 use crate::data::client::adaptive::{AdaptiveConfig, AdaptiveController, ChannelStart, Outcome};
 use crate::data::client::cache::ChunkCache;

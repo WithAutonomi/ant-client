@@ -38,3 +38,13 @@ pub(crate) async fn timeout<F: std::future::Future>(
         futures_util::future::Either::Right(_) => Err(Elapsed),
     }
 }
+
+/// Read the platform clock while preserving the protocol's serialized SystemTime type.
+pub(crate) fn system_time() -> std::time::SystemTime {
+    let elapsed = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .unwrap_or_default();
+    std::time::SystemTime::UNIX_EPOCH
+        .checked_add(elapsed)
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+}

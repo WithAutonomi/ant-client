@@ -6,7 +6,7 @@
 use super::*;
 use crate::data::error::{Error as DataError, Result as DataResult};
 use crate::data::network::BrowserNetwork;
-use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, ResponderView, WitnessedCloseGroup};
+use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, WitnessedCloseGroup};
 use ant_protocol::{ChunkMessage, ChunkMessageBody};
 use futures::future::LocalBoxFuture;
 
@@ -30,29 +30,7 @@ impl SharedNetworkAdapter {
     }
 }
 
-fn peer_record(node: &BrowserNode) -> DataResult<DHTNode> {
-    let peer_id = PeerId::from_hex(&node.peer_id).map_err(|e| DataError::Network(e.to_string()))?;
-    let endpoint = node
-        .webrtc_direct
-        .as_ref()
-        .ok_or_else(|| DataError::Network("peer has no browser endpoint".into()))?;
-    let address = endpoint
-        .multiaddr
-        .parse::<MultiAddr>()
-        .map_err(|e| DataError::Network(e.to_string()))?;
-    if address.peer_id() != Some(&peer_id) {
-        return Err(DataError::Network(
-            "endpoint belongs to another peer".into(),
-        ));
-    }
-    Ok(DHTNode {
-        peer_id,
-        addresses: vec![address],
-        address_types: Vec::new(),
-        distance: None,
-        reliability: node.reliability,
-    })
-}
+pub(super) use super::super::peer_records::{browser_record, peer_record};
 
 impl BrowserNetwork for SharedNetworkAdapter {
     fn peer_id(&self) -> &PeerId {
@@ -116,34 +94,34 @@ impl BrowserNetwork for SharedNetworkAdapter {
             for (peer, nodes) in responses.into_iter().flatten() {
                 lookup.views.insert(peer, nodes);
             }
+            if initial_closest.len() < count {
+                return Err(DataError::Network(format!(
+                    "witnessed close group initial lookup found {} peers, need {count}",
+                    initial_closest.len()
+                )));
+            }
             let responder_views = initial_closest
                 .iter()
                 .filter_map(|responder| {
                     let nodes = lookup.views.get(responder.peer_id.as_bytes())?;
-                    let mut closest = nodes
-                        .iter()
-                        .filter_map(|node| peer_record(node).ok())
-                        .collect::<Vec<_>>();
-                    if !closest.iter().any(|node| node.peer_id == responder.peer_id) {
-                        closest.push(responder.clone());
-                    }
-                    closest.sort_by_key(|node| {
-                        node.peer_id.xor_distance(&PeerId::from_bytes(*target))
-                    });
-                    closest.dedup_by_key(|node| node.peer_id);
-                    closest.truncate(view_count);
-                    Some(ResponderView {
-                        responder: responder.peer_id,
-                        closest,
-                    })
+                    Some((
+                        responder.peer_id,
+                        nodes
+                            .iter()
+                            .filter_map(|node| peer_record(node).ok())
+                            .collect(),
+                    ))
                 })
                 .collect();
-            Ok(WitnessedCloseGroup {
-                target: *target,
-                k: count,
-                initial_closest,
-                responder_views,
-            })
+            Ok(
+                ant_protocol::transport::client_routing::build_witnessed_close_group(
+                    target,
+                    count,
+                    view_count,
+                    initial_closest,
+                    responder_views,
+                ),
+            )
         })
     }
 
@@ -158,6 +136,7 @@ impl BrowserNetwork for SharedNetworkAdapter {
         for endpoint in &self.inner.seeds {
             if let Ok(parsed) = parse_webrtc_direct_multiaddr(&endpoint.multiaddr) {
                 if let Ok(node) = peer_record(&BrowserNode {
+                    peer_record: None,
                     peer_id: parsed.peer_id,
                     native_addresses: Vec::new(),
                     reliability: 1.0,
@@ -247,6 +226,7 @@ impl BrowserNetwork for SharedNetworkAdapter {
                 self.sources.borrow_mut().put(
                     *address,
                     BrowserNode {
+                        peer_record: None,
                         peer_id: peer.to_hex(),
                         native_addresses: Vec::new(),
                         reliability: 1.0,
