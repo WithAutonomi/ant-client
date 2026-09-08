@@ -2,14 +2,11 @@
 pub mod browser;
 
 mod payment_policy;
-#[cfg(any(feature = "native", feature = "browser-wasm"))]
 mod quote_policy;
 mod quote_validation;
 mod record;
-#[cfg(any(feature = "native", feature = "browser-wasm"))]
 mod transfer_policy;
 
-#[cfg(any(feature = "native", feature = "browser-wasm"))]
 mod client_engine;
 
 #[cfg(feature = "native")]

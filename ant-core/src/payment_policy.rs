@@ -56,7 +56,6 @@ fn rank_quotes<P: Ord>(prices: &[P]) -> Option<RankedQuotes> {
 }
 
 /// Original index of the upper-median quote, preserving input order for ties.
-#[cfg(any(feature = "native", feature = "browser-wasm", test))]
 pub(crate) fn median_quote_index<P: Ord>(prices: &[P]) -> Option<usize> {
     rank_quotes(prices).map(|ranked| ranked.quote_indices[ranked.paid_position])
 }
