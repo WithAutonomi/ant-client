@@ -3,20 +3,64 @@
 //! Provides peer discovery, message sending, and DHT operations
 //! for the client library.
 
-use crate::data::error::{Error, Result};
-use ant_protocol::transport::{
-    CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode, PeerId, WitnessedCloseGroup,
+#[cfg(feature = "native")]
+use crate::data::error::Error;
+use crate::data::error::Result;
+use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, WitnessedCloseGroup};
+#[cfg(feature = "native")]
+use ant_protocol::{
+    transport::{CoreNodeConfig, IPDiversityConfig, NodeMode, P2PNode},
+    MAX_WIRE_MESSAGE_SIZE,
 };
-use ant_protocol::MAX_WIRE_MESSAGE_SIZE;
+#[cfg(feature = "native")]
 use std::net::SocketAddr;
+#[cfg(feature = "native")]
 use std::sync::Arc;
 
 /// Network abstraction for the Autonomi client.
 ///
 /// Wraps a `P2PNode` providing high-level operations for
 /// peer discovery and message routing.
+#[derive(Clone)]
 pub struct Network {
+    #[cfg(feature = "native")]
     node: Arc<P2PNode>,
+    #[cfg(not(feature = "native"))]
+    backend: std::rc::Rc<dyn BrowserNetwork>,
+}
+
+/// Peer identities and the addresses that can reach them.
+pub type PeerAddresses = Vec<(PeerId, Vec<MultiAddr>)>;
+
+/// Browser transport boundary for the shared client. Implementations perform
+/// authenticated RPC and discovery; client policy stays in `Client`.
+#[cfg(not(feature = "native"))]
+pub trait BrowserNetwork {
+    /// Local identity used when excluding the client from remote candidates.
+    fn peer_id(&self) -> &PeerId;
+    /// Closest authenticated peers, ordered by XOR distance.
+    fn find_closest_peers<'a>(
+        &'a self,
+        target: &'a [u8; 32],
+        count: usize,
+    ) -> futures::future::LocalBoxFuture<'a, Result<PeerAddresses>>;
+    /// Authenticated responder views for witnessed quote admission.
+    fn find_witnessed_close_group<'a>(
+        &'a self,
+        target: &'a [u8; 32],
+        count: usize,
+        view_count: usize,
+    ) -> futures::future::LocalBoxFuture<'a, Result<WitnessedCloseGroup>>;
+    /// Known records used as fallback candidates after a lookup failure.
+    fn known_peers(&self) -> Vec<DHTNode>;
+    /// Execute one authenticated request, preserving its request identifier.
+    fn request<'a>(
+        &'a self,
+        peer: &'a PeerId,
+        addrs: &'a [MultiAddr],
+        request: ant_protocol::ChunkMessage,
+        timeout: std::time::Duration,
+    ) -> futures::future::LocalBoxFuture<'a, Result<ant_protocol::ChunkMessage>>;
 }
 
 impl Network {
@@ -40,6 +84,7 @@ impl Network {
     /// # Errors
     ///
     /// Returns an error if the P2P node cannot be created or bootstrapping fails.
+    #[cfg(feature = "native")]
     pub async fn new(
         bootstrap_peers: &[SocketAddr],
         allow_loopback: bool,
@@ -80,18 +125,21 @@ impl Network {
 
     /// Create a network from an existing P2P node.
     #[must_use]
+    #[cfg(feature = "native")]
     pub fn from_node(node: Arc<P2PNode>) -> Self {
         Self { node }
     }
 
     /// Get a reference to the underlying P2P node.
     #[must_use]
+    #[cfg(feature = "native")]
     pub fn node(&self) -> &Arc<P2PNode> {
         &self.node
     }
 
     /// Get the local peer ID.
     #[must_use]
+    #[cfg(feature = "native")]
     pub fn peer_id(&self) -> &PeerId {
         self.node.peer_id()
     }
@@ -105,6 +153,7 @@ impl Network {
     /// # Errors
     ///
     /// Returns an error if the DHT lookup fails.
+    #[cfg(feature = "native")]
     pub async fn find_closest_peers(
         &self,
         target: &[u8; 32],
@@ -159,6 +208,7 @@ impl Network {
     ///
     /// Returns an error if the DHT lookup itself fails. The returned transcript
     /// may still be inconclusive; callers should evaluate it before payment.
+    #[cfg(feature = "native")]
     pub async fn find_witnessed_close_group_with_view_count(
         &self,
         target: &[u8; 32],
@@ -173,7 +223,118 @@ impl Network {
     }
 
     /// Get all currently connected peers.
+    #[cfg(feature = "native")]
     pub async fn connected_peers(&self) -> Vec<PeerId> {
         self.node.connected_peers().await
+    }
+}
+
+impl Network {
+    /// Construct the same client network facade with a browser transport.
+    #[cfg(not(feature = "native"))]
+    pub fn from_browser(backend: std::rc::Rc<dyn BrowserNetwork>) -> Self {
+        Self { backend }
+    }
+
+    /// Local client identity.
+    #[cfg(not(feature = "native"))]
+    pub fn peer_id(&self) -> &PeerId {
+        self.backend.peer_id()
+    }
+
+    /// Find closest authenticated peers through the browser adapter.
+    #[cfg(not(feature = "native"))]
+    pub async fn find_closest_peers(
+        &self,
+        target: &[u8; 32],
+        count: usize,
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
+        self.backend.find_closest_peers(target, count).await
+    }
+
+    /// Collect authenticated close-group responder views.
+    #[cfg(not(feature = "native"))]
+    pub async fn find_witnessed_close_group_with_view_count(
+        &self,
+        target: &[u8; 32],
+        count: usize,
+        view_count: usize,
+    ) -> Result<WitnessedCloseGroup> {
+        self.backend
+            .find_witnessed_close_group(target, count, view_count)
+            .await
+    }
+
+    /// Currently known peers on the browser session.
+    #[cfg(not(feature = "native"))]
+    pub async fn connected_peers(&self) -> Vec<PeerId> {
+        self.backend
+            .known_peers()
+            .into_iter()
+            .map(|node| node.peer_id)
+            .collect()
+    }
+
+    /// Peer records available for fallback retrieval.
+    pub async fn known_peers(&self) -> Vec<DHTNode> {
+        #[cfg(feature = "native")]
+        {
+            self.node.dht().routing_table_peers().await
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.backend.known_peers()
+        }
+    }
+}
+
+/// Execute a request through the platform adapter and apply the shared response handler.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_and_await_chunk_response<T, E>(
+    network: &Network,
+    target_peer: &PeerId,
+    message_bytes: Vec<u8>,
+    request_id: u64,
+    timeout: std::time::Duration,
+    peer_addrs: &[MultiAddr],
+    response_handler: impl Fn(ant_protocol::ChunkMessageBody) -> Option<std::result::Result<T, E>>,
+    send_error: impl FnOnce(String) -> E,
+    timeout_error: impl FnOnce() -> E,
+) -> std::result::Result<T, E> {
+    #[cfg(feature = "native")]
+    {
+        ant_protocol::send_and_await_chunk_response(
+            network.node(),
+            target_peer,
+            message_bytes,
+            request_id,
+            timeout,
+            peer_addrs,
+            response_handler,
+            send_error,
+            timeout_error,
+        )
+        .await
+    }
+    #[cfg(not(feature = "native"))]
+    {
+        let response = match ant_protocol::ChunkMessage::decode(&message_bytes) {
+            Ok(request) => {
+                network
+                    .backend
+                    .request(target_peer, peer_addrs, request, timeout)
+                    .await
+            }
+            Err(error) => Err(crate::data::error::Error::Protocol(error.to_string())),
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(crate::data::error::Error::Timeout(_)) => return Err(timeout_error()),
+            Err(error) => return Err(send_error(error.to_string())),
+        };
+        if response.request_id != request_id {
+            return Err(timeout_error());
+        }
+        response_handler(response.body).unwrap_or_else(|| Err(timeout_error()))
     }
 }

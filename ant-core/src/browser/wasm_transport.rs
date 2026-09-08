@@ -4,10 +4,7 @@ use super::manifest::{
     assert_upload_node, validate_browser_payment_network, BrowserPaymentNetwork,
     PublicFileDescriptor,
 };
-use super::payment::{
-    select_storage_quote, storage_payment_total, verify_storage_quote, BrowserQuoteArtifact,
-    VerifiedStorageQuote,
-};
+use super::payment::{BrowserQuoteArtifact, VerifiedStorageQuote};
 use super::protocol::{
     encode_request_frame, ice_password_from_sdp, parse_response_frame,
     parse_webrtc_direct_multiaddr, server_answer_sdp, v2_server_ice_credential,
@@ -17,10 +14,13 @@ use super::protocol::{
     MAX_BROWSER_RESPONSE_BYTES, WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
 use super::{BrowserRecord, BrowserRecordInfo, BrowserStagedFile};
-use crate::client_engine::adaptive::{
-    observe_op, AdaptiveConfig, AdaptiveController, ChannelStart, Outcome,
+#[cfg(feature = "test-utils")]
+use crate::transfer_policy::PutRejection;
+use crate::transfer_policy::RpcError;
+use ant_protocol::transport::{
+    collect_after_first_with_grace, run_iterative_lookup, xor_distance, IterativeLookup,
+    LookupConfig, LookupKey, LookupNode, LookupQuery, LookupQueryOutcome,
 };
-use crate::transfer_policy::{FailureKind, PutRejection, RpcError};
 use futures_channel::{mpsc, oneshot};
 use futures_util::{
     future::{join_all, select, Either},
@@ -29,14 +29,9 @@ use futures_util::{
 };
 use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Promise, Uint8Array};
-use saorsa_dht_lookup::{
-    collect_after_first_with_grace, run_iterative_lookup, xor_distance, IterativeLookup,
-    LookupConfig, LookupKey, LookupNode, LookupQuery, LookupQueryOutcome,
-};
 use saorsa_webrtc::{
     decode_pq_frame, encode_pq_frame, pq_frame_length, transfer_timeout, PqClientHandshake,
-    PqSession, CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE, PQ_ENCRYPTED_OVERHEAD_BYTES,
-    PQ_SERVER_ACCEPT_BYTES,
+    PqSession, CLOSE_GROUP_MAJORITY, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_SERVER_ACCEPT_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
@@ -67,6 +62,8 @@ const MAX_BROWSER_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 mod inbox;
+mod shared;
+use shared::{native_quote_artifact, SharedNetworkAdapter};
 #[cfg(feature = "test-utils")]
 mod test_utils;
 use inbox::ResponseInbox;
@@ -868,7 +865,6 @@ impl BrowserNodeClientCore {
 }
 
 struct BrowserNetworkCore {
-    controller: AdaptiveController,
     seeds: Vec<BrowserEndpoint>,
     pool: Rc<BrowserClientPool>,
     routing: Rc<RefCell<HashMap<LookupKey, BrowserLookupCandidate>>>,
@@ -890,7 +886,6 @@ impl BrowserNetworkCore {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            controller: AdaptiveController::new(ChannelStart::default(), AdaptiveConfig::default()),
             seeds,
             pool: Rc::new(BrowserClientPool::new(DEFAULT_MAX_POOLED_CLIENTS)?),
             routing: Rc::new(RefCell::new(HashMap::new())),
@@ -1019,114 +1014,6 @@ impl BrowserNetworkCore {
             queried,
             failures,
             views,
-        })
-    }
-
-    async fn get_chunk_from_closest(
-        &self,
-        address: &str,
-        progress: &ProgressReporter,
-    ) -> Result<(Vec<u8>, BrowserNode), String> {
-        let started = web_time::Instant::now();
-        let result = self.retrieve_chunk(address, progress).await;
-        let (outcome, bytes) = match &result {
-            Ok((bytes, _)) => (Outcome::Success, bytes.len() as u64),
-            Err(_) => (Outcome::Timeout, 0),
-        };
-        self.controller
-            .fetch
-            .observe_with_bytes(outcome, started.elapsed(), bytes);
-        result
-    }
-
-    async fn retrieve_chunk(
-        &self,
-        address: &str,
-        progress: &ProgressReporter,
-    ) -> Result<(Vec<u8>, BrowserNode), String> {
-        let address = super::protocol::normalize_hex(address, 32)?;
-        let failures = RefCell::new(Vec::new());
-        let target = parse_lookup_key(&address, "record address")?;
-        let result = crate::client_engine::read::retrieve(
-            target,
-            || async {
-                let closest = match self.find_closest(&address, progress).await {
-                    Ok(lookup) => lookup
-                        .nodes
-                        .into_iter()
-                        .filter_map(|node| BrowserLookupCandidate::parse(node).ok())
-                        .collect(),
-                    Err(error) => {
-                        progress.report(&format!(
-                            "Discovery failed; trying known endpoints: {error}"
-                        ));
-                        failures.borrow_mut().push(format!("discovery: {error}"));
-                        Vec::new()
-                    }
-                };
-                let mut known = self.routing.borrow().clone();
-                for seed in &self.seeds {
-                    if let Ok(endpoint) = parse_webrtc_direct_multiaddr(&seed.multiaddr) {
-                        if let Ok(candidate) = BrowserLookupCandidate::parse(BrowserNode {
-                            peer_id: endpoint.peer_id,
-                            native_addresses: Vec::new(),
-                            reliability: 1.0,
-                            webrtc_direct: Some(seed.clone()),
-                        }) {
-                            known.entry(candidate.peer_id).or_insert(candidate);
-                        }
-                    }
-                }
-                crate::client_engine::read::ReadCandidates {
-                    closest,
-                    known: known.into_values().collect(),
-                }
-            },
-            |candidate| candidate.peer_id,
-            |candidate| {
-                let address = &address;
-                let failures = &failures;
-                async move {
-                    let node = candidate.wire;
-                    let result = async {
-                        let endpoint = node
-                            .webrtc_direct
-                            .as_ref()
-                            .ok_or("peer has no WebRTC endpoint")?;
-                        progress.report(&format!("Requesting {address} from {}", node.peer_id));
-                        let client = self.pool.client(endpoint).await?;
-                        client.hello().await?;
-                        client.try_get_chunk(address).await
-                    }
-                    .await;
-                    match result {
-                        Ok(Some((content, _))) => Ok(Some((content, node))),
-                        Ok(None) => {
-                            failures.borrow_mut().push(format!(
-                                "{}: chunk {address} was not found on this node",
-                                node.peer_id
-                            ));
-                            Ok(None)
-                        }
-                        Err(error) => {
-                            progress.report(&format!("GET {} failed: {error}", node.peer_id));
-                            failures
-                                .borrow_mut()
-                                .push(format!("{}: {error}", node.peer_id));
-                            Err(error)
-                        }
-                    }
-                }
-            },
-            |_| true,
-            |delay| TimeoutFuture::new(delay.as_millis() as u32),
-        )
-        .await?;
-        result.ok_or_else(|| {
-            format!(
-                "no queried WebRtcDirect node returned chunk {address} ({})",
-                failures.into_inner().join("; ")
-            )
         })
     }
 }
@@ -1331,19 +1218,6 @@ struct ResolvedBrowserPublicFile {
     root_data_map: self_encryption::DataMap,
 }
 
-#[derive(Clone)]
-struct StoreTarget {
-    peer_id: String,
-    endpoint: BrowserEndpoint,
-}
-
-struct PreparedRecord {
-    record: UploadRecord,
-    already_stored: bool,
-    targets: Vec<StoreTarget>,
-    verified: Option<VerifiedStorageQuote>,
-}
-
 struct UploadRecord {
     address: String,
     size: usize,
@@ -1367,28 +1241,6 @@ impl From<BrowserRecordInfo> for UploadRecord {
             address: record.address,
             size: record.size,
             content: None,
-        }
-    }
-}
-
-struct PendingStoreRecord<'a> {
-    index: usize,
-    record: &'a PreparedRecord,
-    successful_peers: HashSet<String>,
-}
-
-struct StoreAttemptError {
-    successful_peers: HashSet<String>,
-    message: String,
-    kind: FailureKind,
-}
-
-impl StoreAttemptError {
-    fn new(successful_peers: HashSet<String>, message: impl Into<String>) -> Self {
-        Self {
-            successful_peers,
-            message: message.into(),
-            kind: FailureKind::Application,
         }
     }
 }
@@ -1417,76 +1269,12 @@ struct BrowserStoredRecords {
     records: usize,
 }
 
-#[derive(Clone, Copy)]
-struct BrowserStoreContext<'a> {
-    payment_network: &'a BrowserPaymentNetwork,
-    transaction_hash: Option<&'a str>,
-    load_record: Option<&'a js_sys::Function>,
-    progress: &'a ProgressReporter,
-}
-
-struct CachedRangeRecord {
-    content: bytes::Bytes,
-    last_used: u64,
-}
-
-#[derive(Default)]
-struct BrowserRangeCache {
-    entries: HashMap<[u8; 32], CachedRangeRecord>,
-    total_bytes: usize,
-    clock: u64,
-}
-
-impl BrowserRangeCache {
-    fn get(&mut self, address: &[u8; 32]) -> Option<bytes::Bytes> {
-        self.clock = self.clock.wrapping_add(1);
-        let entry = self.entries.get_mut(address)?;
-        entry.last_used = self.clock;
-        Some(entry.content.clone())
-    }
-
-    fn insert(&mut self, address: [u8; 32], content: bytes::Bytes) {
-        self.clock = self.clock.wrapping_add(1);
-        if let Some(previous) = self.entries.remove(&address) {
-            self.total_bytes = self.total_bytes.saturating_sub(previous.content.len());
-        }
-        self.total_bytes = self.total_bytes.saturating_add(content.len());
-        self.entries.insert(
-            address,
-            CachedRangeRecord {
-                content,
-                last_used: self.clock,
-            },
-        );
-        while self.total_bytes > MAX_RANGE_CACHE_BYTES && self.entries.len() > 1 {
-            let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(address, _)| *address)
-            else {
-                break;
-            };
-            if let Some(removed) = self.entries.remove(&oldest) {
-                self.total_bytes = self.total_bytes.saturating_sub(removed.content.len());
-            }
-        }
-    }
-
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.total_bytes = 0;
-    }
-}
-
 /// Random-access public-file reader for media playback and bounded downloads.
 #[wasm_bindgen(js_name = BrowserFileReader)]
 pub struct BrowserFileReader {
-    inner: Rc<BrowserNetworkCore>,
+    shared: Rc<crate::data::Client>,
     file: PublicFileDescriptor,
     root_data_map: self_encryption::DataMap,
-    cache: RefCell<BrowserRangeCache>,
-    progress: ProgressReporter,
     closed: Cell<bool>,
 }
 
@@ -1523,7 +1311,7 @@ impl BrowserFileReader {
     /// Release cached encrypted records held for playback read-ahead and seeks.
     pub fn close(&self) {
         self.closed.set(true);
-        self.cache.borrow_mut().clear();
+        self.shared.chunk_cache().clear();
     }
 }
 
@@ -1537,38 +1325,11 @@ impl BrowserFileReader {
                 "browser range reads are limited to {MAX_BROWSER_RANGE_BYTES} bytes"
             ));
         }
-        crate::client_engine::files::read_range(
-            &self.root_data_map,
-            start,
-            length,
-            &|address| async move {
-                let cached = self.cache.borrow_mut().get(&address);
-                if let Some(content) = cached {
-                    return Ok(content);
-                }
-                let (content, _) = self
-                    .inner
-                    .get_chunk_from_closest(&hex::encode(address), &self.progress)
-                    .await?;
-                let content = bytes::Bytes::from(content);
-                if !self.closed.get() {
-                    self.cache.borrow_mut().insert(address, content.clone());
-                }
-                Ok::<_, String>(content)
-            },
-            &|| {
-                self.inner
-                    .controller
-                    .fetch
-                    .current()
-                    .min(MAX_DOWNLOAD_CONCURRENCY)
-            },
-            &|delay: Duration| TimeoutFuture::new(delay.as_millis() as u32),
-            |_| true,
-        )
-        .await
-        .map(|bytes| bytes.to_vec())
-        .map_err(|error| error.to_string())
+        self.shared
+            .data_download_range(&self.root_data_map, start, length)
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -1576,6 +1337,8 @@ impl BrowserFileReader {
 #[wasm_bindgen(js_name = BrowserNetworkClient)]
 pub struct BrowserNetworkClient {
     inner: Rc<BrowserNetworkCore>,
+    shared: Rc<crate::data::Client>,
+    adapter: Rc<SharedNetworkAdapter>,
 }
 
 #[wasm_bindgen(js_class = BrowserNetworkClient)]
@@ -1593,8 +1356,19 @@ impl BrowserNetworkClient {
             .collect();
         let inner =
             BrowserNetworkCore::new(endpoints).map_err(|error| JsValue::from_str(&error))?;
+        let inner = Rc::new(inner);
+        let adapter = Rc::new(SharedNetworkAdapter::new(Rc::clone(&inner)));
+        let network = crate::data::Network::from_browser(adapter.clone());
+        let shared = Rc::new(
+            crate::data::Client::from_network(network, crate::data::ClientConfig::default())
+                .with_chunk_cache(crate::data::ChunkCache::new(
+                    MAX_RANGE_CACHE_BYTES / MAX_BROWSER_RECORD_BYTES,
+                )),
+        );
         Ok(Self {
-            inner: Rc::new(inner),
+            inner,
+            shared,
+            adapter,
         })
     }
 
@@ -1719,6 +1493,34 @@ impl BrowserNetworkClient {
 }
 
 impl BrowserNetworkClient {
+    async fn get_shared_chunk(
+        &self,
+        address: &str,
+        progress: &ProgressReporter,
+    ) -> Result<(Vec<u8>, BrowserNode), String> {
+        let key = parse_lookup_key(address, "record address")?;
+        progress.report(&format!("Fetching {address}"));
+        // Source metadata is bounded separately from the content cache. A
+        // metadata miss refreshes the record through the authenticated adapter.
+        if !self.adapter.sources.borrow().contains(&key) {
+            self.shared.chunk_cache().remove(&key);
+        }
+        let chunk = self
+            .shared
+            .chunk_get(&key)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("record {address} not found"))?;
+        let node = self
+            .adapter
+            .sources
+            .borrow_mut()
+            .get(&key)
+            .cloned()
+            .ok_or("record source metadata missing")?;
+        Ok((chunk.content.to_vec(), node))
+    }
+
     async fn open_public_file_inner(
         &self,
         file: BrowserPublicFileInput,
@@ -1733,11 +1535,9 @@ impl BrowserNetworkClient {
             file.chunks.len()
         ));
         Ok(BrowserFileReader {
-            inner: Rc::clone(&self.inner),
+            shared: Rc::clone(&self.shared),
             file,
             root_data_map: resolved.root_data_map,
-            cache: RefCell::new(BrowserRangeCache::default()),
-            progress,
             closed: Cell::new(false),
         })
     }
@@ -1753,25 +1553,12 @@ impl BrowserNetworkClient {
         }
         let concurrency = concurrency.min(MAX_DOWNLOAD_CONCURRENCY);
         let mut resolved = self.resolve_public_file(file, progress).await?;
-        let content = crate::client_engine::files::download(
-            &resolved.root_data_map,
-            &|address| async move {
-                progress.report(&format!(
-                    "Fetching encrypted file chunk {}",
-                    hex::encode(address)
-                ));
-                self.inner
-                    .get_chunk_from_closest(&hex::encode(address), progress)
-                    .await
-                    .map(|(content, _)| bytes::Bytes::from(content))
-            },
-            &|| self.inner.controller.fetch.current().min(concurrency),
-            &|delay: Duration| TimeoutFuture::new(delay.as_millis() as u32),
-            |_| true,
-        )
-        .await
-        .map_err(|error| error.to_string())?
-        .to_vec();
+        let content = self
+            .shared
+            .data_download_with_concurrency(&resolved.root_data_map, concurrency)
+            .await
+            .map_err(|error| error.to_string())?
+            .to_vec();
         if content.len() != resolved.file.size {
             return Err(format!(
                 "reconstructed file has {} bytes, expected {}",
@@ -1804,10 +1591,7 @@ impl BrowserNetworkClient {
         let (address, descriptor) = file.into_address_and_descriptor();
         let address = super::protocol::normalize_hex(&address, 32)?;
         progress.report(&format!("Fetching public DataMap {address}"));
-        let (encoded_data_map, data_map_node) = self
-            .inner
-            .get_chunk_from_closest(&address, progress)
-            .await?;
+        let (encoded_data_map, data_map_node) = self.get_shared_chunk(&address, progress).await?;
         progress.report(&format!(
             "Verified public DataMap ({} bytes)",
             encoded_data_map.len()
@@ -1820,14 +1604,13 @@ impl BrowserNetworkClient {
                     "Resolving nested DataMap record {}",
                     hex::encode(address)
                 ));
-                self.inner
-                    .get_chunk_from_closest(&hex::encode(address), progress)
+                self.get_shared_chunk(&hex::encode(address), progress)
                     .await
                     .map(|(content, _)| bytes::Bytes::from(content))
             },
             &|| {
-                self.inner
-                    .controller
+                self.shared
+                    .controller()
                     .fetch
                     .current()
                     .min(MAX_DOWNLOAD_CONCURRENCY)
@@ -2019,543 +1802,177 @@ impl BrowserNetworkClient {
         pay_for_quotes: &js_sys::Function,
         progress: &ProgressReporter,
     ) -> Result<BrowserStoredRecords, String> {
-        let record_count = records.len();
-        let mut records = records.into_iter().enumerate();
-        let mut prepared = Vec::with_capacity(record_count);
-        if let Some((index, record)) = records.next() {
-            progress.report(&format!("Preparing record {}/{}", index + 1, record_count));
-            prepared.push((
-                index,
-                self.prepare_record(record, payment_network, progress)
-                    .await?,
-            ));
+        use crate::data::client::batch::finalize_batch_payment;
+        use ant_protocol::evm::{Amount, QuoteHash, TxHash};
+        let count = records.len();
+        let max_size = records.iter().map(|record| record.size).max().unwrap_or(0);
+        // The wallet/network selection belongs to this upload, so concurrent
+        // uploads cannot overwrite each other's admission configuration.
+        let mut adapter = SharedNetworkAdapter::new(Rc::clone(&self.inner));
+        adapter.payment_network = Some(payment_network.clone());
+        let client = crate::data::Client::from_network(
+            crate::data::Network::from_browser(Rc::new(adapter)),
+            crate::data::ClientConfig::default(),
+        );
+        let plans = crate::client_engine::rolling_unordered(
+            records.into_iter().enumerate(),
+            |(index, record)| {
+                let client = &client;
+                async move {
+                    progress.report(&format!("Preparing record {}/{}", index + 1, count));
+                    let address = parse_lookup_key(&record.address, "record address")?;
+                    let mut plan = client
+                        .prepare_chunk_payment_plan(address, record.size as u64)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if let Some(plan) = plan.as_mut() {
+                        let eligible = join_all(plan.quoted_peers.iter().map(
+                            |(peer, addresses)| async move {
+                                let endpoint = addresses
+                                    .iter()
+                                    .find(|address| address.is_webrtc_direct())?;
+                                let endpoint = BrowserEndpoint {
+                                    multiaddr: endpoint.to_string(),
+                                };
+                                let node = self.inner.pool.client(&endpoint).await.ok()?;
+                                let hello = node.hello().await.ok()?;
+                                assert_upload_node(&hello, payment_network).ok()?;
+                                if !hello.capabilities.iter().any(|cap| cap == "chunk_protocol") {
+                                    return None;
+                                }
+                                Some((*peer, addresses.clone()))
+                            },
+                        ))
+                        .await
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                        let required = crate::quote_policy::witness_quorum(0);
+                        if eligible.len() < required {
+                            return Err(format!(
+                                "Fewer than {required} eligible initial witness PUT peers: got {}",
+                                eligible.len()
+                            ));
+                        }
+                        plan.quoted_peers = eligible;
+                    }
+                    Ok::<_, String>((index, record, plan))
+                }
+            },
+            || {
+                client
+                    .controller()
+                    .quote
+                    .current()
+                    .min(DEFAULT_BROWSER_QUOTE_CONCURRENCY)
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let mut plans = plans.into_iter().collect::<Result<Vec<_>, _>>()?;
+        plans.sort_by_key(|(index, _, _)| *index);
+        let mut verified = Vec::new();
+        let mut total = Amount::ZERO;
+        for (_, _, plan) in &plans {
+            let Some(plan) = plan else {
+                continue;
+            };
+            let payable = plan
+                .payment
+                .quotes
+                .iter()
+                .find(|quote| !quote.amount.is_zero())
+                .ok_or("payment plan has no paid quote")?;
+            let (_, quote) = plan
+                .peer_quotes
+                .iter()
+                .find(|(_, quote)| quote.hash() == payable.quote_hash)
+                .ok_or("paid quote missing from plan")?;
+            total = total
+                .checked_add(payable.amount)
+                .ok_or("payment total overflow")?;
+            verified.push(VerifiedStorageQuote {
+                quote: native_quote_artifact(quote, &plan.commitment_sidecars)?,
+                quote_hash: hex::encode(payable.quote_hash),
+                rewards_address: format!("0x{}", hex::encode(payable.rewards_address)),
+                amount: payable.amount.to_string(),
+            });
         }
-        let payment_network_ref = payment_network;
-        let remaining = records.map(|(index, record)| async move {
-            progress.report(&format!("Preparing record {}/{}", index + 1, record_count));
-            self.prepare_record(record, payment_network_ref, progress)
-                .await
-                .map(|prepared| (index, prepared))
-        });
-        let remaining =
-            crate::client_engine::bounded_unordered(remaining, DEFAULT_BROWSER_QUOTE_CONCURRENCY)
-                .collect::<Vec<_>>()
-                .await;
-        for result in remaining {
-            prepared.push(result?);
-        }
-        prepared.sort_by_key(|(index, _)| *index);
-        let prepared = prepared
-            .into_iter()
-            .map(|(_, record)| record)
-            .collect::<Vec<_>>();
-        let verified_quotes = prepared
-            .iter()
-            .filter_map(|record| record.verified.clone())
-            .collect::<Vec<_>>();
-        let expected_total =
-            storage_payment_total(&verified_quotes).map_err(|error| error.to_string())?;
-        let mut payment = if verified_quotes.is_empty() {
+        let mut payment = if verified.is_empty() {
             BrowserPaymentSubmission {
                 transaction_hash: None,
-                total_amount: "0".to_string(),
+                total_amount: "0".into(),
             }
         } else {
-            invoke_payment(pay_for_quotes, payment_network, &verified_quotes).await?
+            invoke_payment(pay_for_quotes, payment_network, &verified).await?
         };
-        if !verified_quotes.is_empty() && payment.transaction_hash.is_none() {
-            return Err("wallet callback returned no storage payment transaction".to_string());
+        if payment.total_amount != total.to_string() {
+            return Err("wallet reported a different payment total".into());
         }
-        if payment.total_amount != expected_total {
-            return Err(format!(
-                "wallet callback reported payment total {}, expected {expected_total}",
-                payment.total_amount
-            ));
-        }
-        if let Some(transaction_hash) = payment.transaction_hash.as_mut() {
-            *transaction_hash = super::protocol::normalize_hex(transaction_hash, 32)?;
-        }
-
-        let replicas = self
-            .store_prepared_records(
-                &prepared,
-                payment_network,
-                payment.transaction_hash.as_deref(),
-                load_record,
-                progress,
-            )
-            .await?;
-        Ok(BrowserStoredRecords {
-            payment,
-            replicas,
-            records: prepared.len(),
-        })
-    }
-
-    async fn prepare_record(
-        &self,
-        record: UploadRecord,
-        payment_network: &BrowserPaymentNetwork,
-        progress: &ProgressReporter,
-    ) -> Result<PreparedRecord, String> {
-        progress.report(&format!("Finding closest nodes for {}", record.address));
-        let record_address = &record.address;
-        let mut lookup = crate::quote_policy::discover_put_peers(
-            |width| self.inner.find_closest_with_count(record_address, progress, width),
-            |lookup| lookup.nodes.len(),
-            |found, width| format!("Witnessed close group returned only {found}/{width} initial PUT peers before payment."),
-        )
-        .await?;
-        let address = parse_lookup_key(&record.address, "record address")?;
-        // The shared discovery policy has already validated the requested
-        // responder count (20 or the native fallback of 7).
-        let initial = lookup.nodes.clone();
-        // Reuse authenticated FIND_NODE transcripts. As native does, ask only
-        // initial peers whose views were missing from the iterative lookup.
-        let missing = initial.iter().filter(|node| {
-            parse_lookup_key(&node.peer_id, "peer ID")
-                .is_ok_and(|peer| !lookup.views.contains_key(&peer))
-        });
-        let responses = join_all(missing.map(|node| async {
-            let peer = parse_lookup_key(&node.peer_id, "peer ID")?;
-            let endpoint = node
-                .webrtc_direct
-                .as_ref()
-                .ok_or_else(|| "witness has no WebRTC endpoint".to_string())?;
-            let client = self.inner.pool.client(endpoint).await?;
-            client.hello().await?;
-            let nodes = client
-                .find_node(
-                    &record.address,
-                    crate::quote_policy::SINGLE_NODE_WITNESSED_VIEW_COUNT,
-                )
-                .await?;
-            Ok::<_, String>((peer, nodes))
-        }))
-        .await;
-        for (peer, nodes) in responses.into_iter().flatten() {
-            lookup.views.insert(peer, nodes);
-        }
-        let initial_keys = initial
-            .iter()
-            .map(|node| parse_lookup_key(&node.peer_id, "peer ID"))
-            .collect::<Result<Vec<_>, _>>()?;
-        let views = lookup
-            .views
-            .iter()
-            .map(|(peer, nodes)| {
-                let peers = nodes
-                    .iter()
-                    .filter_map(|node| parse_lookup_key(&node.peer_id, "peer ID").ok())
-                    .collect();
-                crate::quote_policy::normalize_view(*peer, peers, &address)
-            })
-            .collect::<Vec<_>>();
-        let scoped = crate::quote_policy::scope_views(&initial_keys, &views);
-        let quorum =
-            crate::quote_policy::witness_quorum(CLOSE_GROUP_SIZE.saturating_sub(scoped.len()));
-        let voters = crate::quote_policy::witness_votes(&scoped);
-        let candidates = crate::quote_policy::consensus_peers(&voters, &address, quorum);
-        crate::quote_policy::validate_witnessed_peers(
-            initial.len(),
-            candidates.len(),
-            crate::quote_policy::SINGLE_NODE_MIN_QUOTE_COUNT,
-        )?;
-        let mut endpoints = self
-            .inner
-            .routing
-            .borrow()
-            .iter()
-            .filter_map(|(peer, node)| {
-                node.wire
-                    .webrtc_direct
-                    .clone()
-                    .map(|endpoint| (*peer, endpoint))
-            })
-            .collect::<HashMap<_, _>>();
-        for node in &initial {
-            if let Some(endpoint) = &node.webrtc_direct {
-                endpoints.insert(
-                    parse_lookup_key(&node.peer_id, "peer ID")?,
-                    endpoint.clone(),
+        let mut transactions = HashMap::<QuoteHash, TxHash>::new();
+        if !verified.is_empty() {
+            let hash = payment
+                .transaction_hash
+                .as_mut()
+                .ok_or("wallet returned no payment transaction")?;
+            *hash = super::protocol::normalize_hex(hash, 32)?;
+            let tx = TxHash::from(parse_lookup_key(hash, "transaction hash")?);
+            for quote in &verified {
+                transactions.insert(
+                    QuoteHash::from(parse_lookup_key(&quote.quote_hash, "quote hash")?),
+                    tx,
                 );
             }
         }
-        for node in lookup.views.values().flatten() {
-            if let Some(endpoint) = &node.webrtc_direct {
-                endpoints
-                    .entry(parse_lookup_key(&node.peer_id, "peer ID")?)
-                    .or_insert_with(|| endpoint.clone());
-            }
-        }
-        // Capability/payment-network checks are browser protocol admission.
-        // Quote rejection does not disqualify a peer from storing another
-        // issuer's valid proof; native keeps those roles independent too.
-        let eligible = join_all(initial_keys.iter().map(|peer| async {
-            let endpoint = endpoints.get(peer)?;
-            let client = self.inner.pool.client(endpoint).await.ok()?;
-            let hello = client.hello().await.ok()?;
-            assert_upload_node(&hello, payment_network).ok()?;
-            Some(*peer)
-        }))
-        .await
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-        let mut verified_quotes = Vec::new();
-        let mut stored_peers = Vec::new();
-        let mut failures = Vec::new();
-        let mut next = 0;
-        let mut in_flight = FuturesUnordered::new();
-        loop {
-            let launch = crate::quote_policy::quote_launch_budget(
-                verified_quotes.len(),
-                in_flight.len(),
-                candidates.len().saturating_sub(next),
-            );
-            for _ in 0..launch {
-                let peer = candidates[next];
-                next += 1;
-                let endpoint = endpoints.get(&peer).cloned();
-                let record = &record;
-                in_flight.push(async move {
-                    let result = async {
-                        let endpoint = endpoint
-                            .ok_or_else(|| "quote peer has no WebRTC endpoint".to_string())?;
-                        let client = self.inner.pool.client(&endpoint).await?;
-                        let hello = client.hello().await?;
-                        assert_upload_node(&hello, payment_network)?;
-                        let (quote, stored) =
-                            client.quote_chunk(&record.address, record.size).await?;
-                        let verified =
-                            verify_storage_quote(quote, &record.address, &hex::encode(peer))
-                                .map_err(|error| error.to_string())?;
-                        Ok::<_, String>((stored, verified))
-                    }
-                    .await;
-                    (peer, result)
-                });
-            }
-            if verified_quotes.len() >= CLOSE_GROUP_SIZE || in_flight.is_empty() {
-                break;
-            }
-            let Some((peer, result)) = in_flight.next().await else {
-                break;
-            };
-            match result {
-                Ok((true, _)) => stored_peers.push(peer),
-                Ok((false, quote)) => verified_quotes.push((peer, quote)),
-                Err(error) => failures.push(format!("{}: {error}", hex::encode(peer))),
-            }
-        }
-        drop(in_flight);
-        let targets = |keys: Vec<LookupKey>| {
-            keys.into_iter()
-                .filter_map(|peer| {
-                    endpoints.get(&peer).cloned().map(|endpoint| StoreTarget {
-                        peer_id: hex::encode(peer),
-                        endpoint,
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-        if crate::quote_policy::already_stored(
-            verified_quotes.iter().map(|(peer, _)| *peer),
-            stored_peers,
-            &address,
-        ) {
-            progress.report(&format!(
-                "Chunk {} is already stored on a close-group majority; skipping payment",
-                record.address
-            ));
-            return Ok(PreparedRecord {
-                record,
-                already_stored: true,
-                targets: targets(initial_keys),
-                verified: None,
-            });
-        }
-        let prices = verified_quotes
-            .iter()
-            .map(|(peer, quote)| {
-                Ok((
-                    *peer,
-                    quote
-                        .quote
-                        .price
-                        .parse::<u128>()
-                        .map_err(|error| error.to_string())?,
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let selected =
-            crate::quote_policy::select_witnessed_quotes(&prices, &address, &voters, quorum)
-                .ok_or_else(|| {
-                    format!(
-                        "No payable quote set has {quorum} witnesses before payment ({})",
-                        failures.join("; ")
-                    )
-                })?;
-        let quotes = selected
-            .into_iter()
-            .map(|index| verified_quotes[index].1.clone())
-            .collect();
-        let verified = select_storage_quote(quotes).map_err(|error| error.to_string())?;
-        let paid_peer = parse_lookup_key(&verified.quote.peer_id, "paid peer")?;
-        let ordered = crate::quote_policy::order_put_peers(paid_peer, &eligible, &voters, quorum)
-            .ok_or_else(|| format!("Fewer than {quorum} eligible initial witness PUT peers recognise the paid issuer before payment"))?;
-        // At least four distinct eligible stores remain necessary even when
-        // missing witness views lower the quote-support quorum below four.
-        let targets = targets(ordered);
-        ensure_store_quorum(&targets)?;
-        progress.report(&format!(
-            "Verified storage quote {} from {}",
-            verified.quote_hash, verified.quote.peer_id
-        ));
-        Ok(PreparedRecord {
-            record,
-            already_stored: false,
-            targets,
-            verified: Some(verified),
-        })
-    }
-
-    /// Store every paid record with the same adaptive, byte-bounded retry
-    /// rounds used by the native client.
-    async fn store_prepared_records(
-        &self,
-        prepared: &[PreparedRecord],
-        payment_network: &BrowserPaymentNetwork,
-        transaction_hash: Option<&str>,
-        load_record: Option<&js_sys::Function>,
-        progress: &ProgressReporter,
-    ) -> Result<usize, String> {
-        let record_count = prepared.len();
-        let max_record_bytes = prepared
-            .iter()
-            .map(|record| record.record.size)
-            .max()
-            .unwrap_or(0);
-        let byte_bound = crate::client_engine::store_byte_bound(max_record_bytes);
-        let mut to_retry = prepared
-            .iter()
-            .enumerate()
-            .map(|(index, record)| PendingStoreRecord {
-                index,
-                record,
-                successful_peers: HashSet::new(),
-            })
-            .collect::<Vec<_>>();
-        let mut replicas = usize::MAX;
-        let context = BrowserStoreContext {
-            payment_network,
-            transaction_hash,
-            load_record,
-            progress,
-        };
-
-        for attempt in 0..=crate::client_engine::STORE_MAX_RETRIES {
-            if attempt > 0 {
-                let delay = crate::client_engine::store_retry_delay(attempt);
-                progress.report(&format!(
-                    "Retrying {} record(s), attempt {attempt}/{}",
-                    to_retry.len(),
-                    crate::client_engine::STORE_MAX_RETRIES
-                ));
-                TimeoutFuture::new(u32::try_from(delay.as_millis()).unwrap_or(u32::MAX)).await;
-            }
-
-            let op_limiter = self.inner.controller.store.clone();
-            let cap_limiter = op_limiter.clone();
-            let results = crate::client_engine::rolling_unordered(
-                to_retry,
-                |pending| {
-                    let PendingStoreRecord {
-                        index,
-                        record,
-                        successful_peers,
-                    } = pending;
-                    let limiter = op_limiter.clone();
-                    async move {
-                        progress.report(&format!(
-                            "Storing record {}/{} (attempt {}/{})",
-                            index + 1,
-                            record_count,
-                            attempt + 1,
-                            crate::client_engine::STORE_MAX_RETRIES + 1
-                        ));
-                        let result = observe_op(
-                            &limiter,
-                            || self.store_prepared_once(index, record, &context, successful_peers),
-                            |error| error.kind.outcome(),
-                        )
-                        .await;
-                        ((index, record), result)
-                    }
-                },
-                || cap_limiter.current().min(byte_bound),
-            )
-            .collect::<Vec<_>>()
-            .await;
-
-            let mut failed = Vec::new();
-            for ((index, record), result) in results {
-                match result {
-                    Ok(stored) => replicas = replicas.min(stored),
-                    Err(error) => failed.push((
-                        PendingStoreRecord {
-                            index,
-                            record,
-                            successful_peers: error.successful_peers,
-                        },
-                        error.message,
-                    )),
-                }
-            }
-            if failed.is_empty() {
-                return Ok(if replicas == usize::MAX { 0 } else { replicas });
-            }
-            if attempt == crate::client_engine::STORE_MAX_RETRIES {
-                let failed_count = failed.len();
-                let details = failed
-                    .into_iter()
-                    .map(|(pending, error)| {
-                        format!("record {}/{}: {error}", pending.index + 1, record_count)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(format!(
-                    "{} paid record(s) failed after {} attempts: {details}",
-                    failed_count,
-                    crate::client_engine::STORE_MAX_RETRIES + 1
-                ));
-            }
-            to_retry = failed.into_iter().map(|(pending, _)| pending).collect();
-        }
-
-        Err("record store retry loop ended unexpectedly".to_string())
-    }
-
-    /// Store one record to a close-group majority, advancing through the rest
-    /// of the ordered native PUT neighbourhood only when an initial target fails.
-    async fn store_prepared_once(
-        &self,
-        record_index: usize,
-        prepared: &PreparedRecord,
-        context: &BrowserStoreContext<'_>,
-        mut successful_peers: HashSet<String>,
-    ) -> Result<usize, StoreAttemptError> {
-        if prepared.already_stored {
-            return Ok(CLOSE_GROUP_MAJORITY);
-        }
-        let Some(transaction_hash) = context.transaction_hash else {
-            return Err(StoreAttemptError::new(
-                successful_peers,
-                "paid record has no transaction hash",
-            ));
-        };
-        let transaction_hash = transaction_hash.to_string();
-        let Some(verified) = prepared.verified.as_ref() else {
-            return Err(StoreAttemptError::new(
-                successful_peers,
-                "paid record has no verified quote",
-            ));
-        };
-        let record = load_upload_record(record_index, &prepared.record, context.load_record)
-            .await
-            .map_err(|error| StoreAttemptError::new(successful_peers.clone(), error))?;
-        let required = CLOSE_GROUP_MAJORITY.saturating_sub(successful_peers.len());
-        let outcome = crate::client_engine::quorum_with_fallback(
-            prepared
-                .targets
-                .iter()
-                .filter(|target| !successful_peers.contains(&target.peer_id))
-                .cloned(),
-            required,
-            |target| {
-                let pool = Rc::clone(&self.inner.pool);
-                let record = Rc::clone(&record);
-                let quote = verified.quote.clone();
-                let payment_network = context.payment_network.clone();
-                let transaction_hash = transaction_hash.clone();
-                let progress = context.progress.clone();
+        // Stage only a bounded window of bytes; proof construction and all
+        // per-record retries/quorums are the ordinary native client methods.
+        let stores = crate::client_engine::rolling_unordered(
+            plans,
+            |(index, record, plan)| {
+                let transactions = &transactions;
+                let client = &client;
                 async move {
-                    let client = pool.client(&target.endpoint).await?;
-                    let hello = client.hello().await?;
-                    assert_upload_node(&hello, &payment_network)?;
-                    let (_, already_stored) = client
-                        .put_chunk_typed(
-                            &prepared.record.address,
-                            record.as_slice(),
-                            quote,
-                            &transaction_hash,
-                        )
-                        .await?;
-                    if already_stored {
-                        progress.report(&format!(
-                            "Already stored on {}: {}",
-                            target.peer_id, prepared.record.address
-                        ));
-                    } else {
-                        progress.report(&format!(
-                            "Stored {} on {}",
-                            prepared.record.address, target.peer_id
-                        ));
+                    let Some(plan) = plan else {
+                        return Ok::<_, String>(());
+                    };
+                    let bytes = load_upload_record(index, &record, load_record).await?;
+                    let prepared = plan
+                        .with_content(bytes::Bytes::copy_from_slice(bytes.as_slice()))
+                        .map_err(|e| e.to_string())?;
+                    let paid = finalize_batch_payment(vec![prepared], transactions)
+                        .map_err(|e| e.to_string())?;
+                    let result = client
+                        .store_paid_chunks_with_events(paid, None, index, count)
+                        .await;
+                    if !result.failed.is_empty() {
+                        return Err(result
+                            .failed
+                            .into_iter()
+                            .map(|(_, message)| message)
+                            .collect::<Vec<_>>()
+                            .join("; "));
                     }
-                    Ok::<(), RpcError>(())
+                    progress.report(&format!("Stored record {}/{}", index + 1, count));
+                    Ok(())
                 }
             },
+            || {
+                client
+                    .controller()
+                    .store
+                    .current()
+                    .min(crate::client_engine::store_byte_bound(max_size))
+            },
         )
+        .collect::<Vec<_>>()
         .await;
-        for target in outcome.successful_targets {
-            successful_peers.insert(target.peer_id);
-        }
-        let mut timeouts = 0;
-        let mut dial = 0;
-        let mut remote = false;
-        let failures = outcome
-            .failures
-            .into_iter()
-            .map(|(target, error)| {
-                match error.put_rejection() {
-                    PutRejection::Timeout => timeouts += 1,
-                    PutRejection::Dial => dial += 1,
-                    _ => remote = true,
-                }
-                context
-                    .progress
-                    .report(&format!("Store target {} failed: {error}", target.peer_id));
-                format!("{}: {error}", target.peer_id)
-            })
-            .collect::<Vec<_>>();
-        if !outcome.reached || successful_peers.len() < CLOSE_GROUP_MAJORITY {
-            let replicas = successful_peers.len();
-            return Err(StoreAttemptError {
-                successful_peers,
-                kind: crate::transfer_policy::put_shortfall(timeouts, dial, remote).failure_kind(),
-                message: format!(
-                    "stored on {} peers, need {CLOSE_GROUP_MAJORITY}; failures: {}",
-                    replicas,
-                    failures.join("; ")
-                ),
-            });
-        }
-        Ok(successful_peers.len())
+        stores.into_iter().collect::<Result<Vec<_>, _>>()?;
+        Ok(BrowserStoredRecords {
+            payment,
+            replicas: CLOSE_GROUP_MAJORITY,
+            records: count,
+        })
     }
-}
-
-fn ensure_store_quorum(targets: &[StoreTarget]) -> Result<(), String> {
-    let distinct_peers = targets
-        .iter()
-        .map(|target| &target.peer_id)
-        .collect::<HashSet<_>>()
-        .len();
-    if distinct_peers < CLOSE_GROUP_MAJORITY {
-        return Err(format!(
-            "only {distinct_peers} eligible WebRTC Direct storage targets; need {CLOSE_GROUP_MAJORITY} before payment"
-        ));
-    }
-    Ok(())
 }
 
 fn normalized_content_type(content_type: &str) -> String {

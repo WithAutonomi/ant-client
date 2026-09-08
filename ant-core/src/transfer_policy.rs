@@ -4,7 +4,6 @@ use crate::client_engine::adaptive::Outcome;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailureKind {
-    #[cfg(feature = "native")]
     Timeout,
     Network,
     Application,
@@ -13,7 +12,6 @@ pub(crate) enum FailureKind {
 impl FailureKind {
     pub(crate) fn outcome(self) -> Outcome {
         match self {
-            #[cfg(feature = "native")]
             Self::Timeout => Outcome::Timeout,
             Self::Network => Outcome::NetworkError,
             Self::Application => Outcome::ApplicationError,
@@ -23,9 +21,7 @@ impl FailureKind {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PutRejection {
-    #[cfg(feature = "native")]
     Full,
-    #[cfg(feature = "native")]
     PriceFloor,
     OtherRemote,
     Timeout,
@@ -57,6 +53,7 @@ pub(crate) fn put_shortfall(
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl PutShortfall {
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn failure_kind(self) -> FailureKind {
         match self {
             Self::ResponseTimeout => FailureKind::Network,
@@ -85,6 +82,7 @@ impl From<String> for RpcError {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl RpcError {
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn put_rejection(&self) -> PutRejection {
         match self {
             Self::Timeout(_) => PutRejection::Timeout,

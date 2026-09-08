@@ -6,6 +6,7 @@
 pub mod client;
 pub mod error;
 pub mod network;
+#[cfg(feature = "native")]
 pub mod peer_cache;
 
 pub use client::cache::ChunkCache;
@@ -43,6 +44,7 @@ pub use self_encryption::DataMap;
 // Datamap file persistence helpers. Canonical path is
 // `ant_core::datamap_file::*`; these convenience re-exports let existing
 // `ant_core::data` callers reach them without an extra import.
+#[cfg(feature = "native")]
 pub use crate::datamap_file::{
     datamap_filename_for, original_name_from_datamap, read_datamap, write_datamap, CollisionPolicy,
     DATAMAP_EXTENSION,
@@ -52,6 +54,7 @@ pub use crate::datamap_file::{
 // devnet manifest types live in ant-protocol because both the node
 // (writer) and the CLI (reader) need them; they are always available
 // regardless of the `devnet` feature.
+#[cfg(feature = "native")]
 pub use ant_protocol::transport::{
     CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode,
 };

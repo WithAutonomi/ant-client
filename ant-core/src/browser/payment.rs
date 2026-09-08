@@ -2,12 +2,12 @@
 
 use super::protocol::normalize_hex;
 pub use super::protocol::{BrowserCommitmentArtifact, BrowserQuoteArtifact};
+use ant_protocol::evm::{Amount, PaymentQuote, RewardsAddress};
 #[cfg(test)]
-use saorsa_webrtc::{calculate_price_wei, commitment_hash};
-use saorsa_webrtc::{
-    payment_quote_bytes_for_signing, verify_ml_dsa_65, StorageCommitment,
-    MAX_COMMITMENT_SIDECAR_BYTES,
-};
+use ant_protocol::payment::commitment::commitment_hash;
+use ant_protocol::payment::commitment::{StorageCommitment, MAX_COMMITMENT_SIDECAR_BYTES};
+#[cfg(test)]
+use saorsa_webrtc::calculate_price_wei;
 use serde::{Deserialize, Serialize};
 
 pub use saorsa_webrtc::payment_quote_hash;
@@ -49,7 +49,7 @@ pub fn select_storage_quote(
 ) -> Result<VerifiedStorageQuote, StorageQuoteError> {
     let prices = quotes
         .iter()
-        .map(|quote| parse_decimal_u128(&quote.quote.price, "quote price"))
+        .map(|quote| parse_decimal_amount(&quote.quote.price, "quote price"))
         .collect::<Result<Vec<_>, _>>()?;
     let plan = crate::payment_policy::SingleNodePaymentPlan::from_prices(&prices)
         .map_err(|error| StorageQuoteError(error.to_string()))?;
@@ -64,8 +64,8 @@ pub fn select_storage_quote(
 pub fn storage_payment_total(quotes: &[VerifiedStorageQuote]) -> Result<String, StorageQuoteError> {
     quotes
         .iter()
-        .try_fold(0u128, |total, quote| {
-            let amount = parse_decimal_u128(&quote.amount, "storage payment amount")?;
+        .try_fold(Amount::ZERO, |total, quote| {
+            let amount = parse_decimal_amount(&quote.amount, "storage payment amount")?;
             total
                 .checked_add(amount)
                 .ok_or_else(|| StorageQuoteError("storage payment total overflow".to_string()))
@@ -95,7 +95,7 @@ pub fn verify_storage_quote(
     }
     let public_key = decode_unbounded_hex(&quote.public_key, "quote public key")?;
     let signature = decode_unbounded_hex(&quote.signature, "quote signature")?;
-    let price = parse_decimal_u128(&quote.price, "quote price")?;
+    let price = parse_decimal_amount(&quote.price, "quote price")?;
     let rewards = normalize_hex(&quote.rewards_address, 20).map_err(StorageQuoteError)?;
     quote.rewards_address.clone_from(&rewards);
     let commitment_pin = quote
@@ -104,7 +104,24 @@ pub fn verify_storage_quote(
         .map(|pin| normalize_hex(pin, 32).map_err(StorageQuoteError))
         .transpose()?;
     quote.commitment_pin.clone_from(&commitment_pin);
-    let signed_bytes = canonical_quote_bytes(&quote, price, &rewards, commitment_pin.as_deref())?;
+    let native_quote = PaymentQuote {
+        content: xor_name::XorName(decode_hex_array(&quote.content, "quote content")?),
+        timestamp: std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(quote.timestamp_secs))
+            .ok_or_else(|| StorageQuoteError("quote timestamp out of range".into()))?,
+        price,
+        rewards_address: RewardsAddress::from(decode_hex_array::<20>(
+            &rewards,
+            "quote rewards address",
+        )?),
+        pub_key: public_key.clone(),
+        signature: signature.clone(),
+        committed_key_count: quote.committed_key_count,
+        commitment_pin: commitment_pin
+            .as_deref()
+            .map(|pin| decode_hex_array(pin, "commitment pin"))
+            .transpose()?,
+    };
     let sidecar = if quote.committed_key_count > 0 {
         quote
             .commitment
@@ -127,11 +144,11 @@ pub fn verify_storage_quote(
                 .map(|pin| decode_hex_array(pin, "commitment pin"))
                 .transpose()?,
         },
-        || verify_ml_dsa_65(&public_key, &signature, &signed_bytes, b""),
+        || ant_protocol::payment::verify_quote_signature(&native_quote),
         sidecar.as_deref(),
     )
     .map_err(|error| StorageQuoteError(error.to_string()))?;
-    let quote_hash = hex::encode(payment_quote_hash(&signed_bytes, &public_key, &signature));
+    let quote_hash = hex::encode(native_quote.hash());
     if normalize_hex(&quote.quote_hash, 32).map_err(StorageQuoteError)? != quote_hash {
         return Err(StorageQuoteError(
             "storage quote hash does not match its signed fields".to_string(),
@@ -157,6 +174,7 @@ pub fn verify_storage_quote(
     })
 }
 
+#[cfg(test)]
 fn canonical_quote_bytes(
     quote: &BrowserQuoteArtifact,
     price: u128,
@@ -168,13 +186,13 @@ fn canonical_quote_bytes(
     let commitment_pin = commitment_pin
         .map(|pin| decode_hex_array::<32>(pin, "storage commitment pin"))
         .transpose()?;
-    Ok(payment_quote_bytes_for_signing(
-        &content,
-        quote.timestamp_secs,
-        price,
-        &rewards,
+    Ok(PaymentQuote::bytes_for_signing(
+        xor_name::XorName(content),
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(quote.timestamp_secs),
+        &Amount::from(price),
+        &RewardsAddress::from(rewards),
         quote.committed_key_count,
-        commitment_pin.as_ref(),
+        &commitment_pin,
     ))
 }
 
@@ -216,7 +234,7 @@ fn normalize_commitment_artifact(
     Ok(())
 }
 
-fn parse_decimal_u128(value: &str, label: &str) -> Result<u128, StorageQuoteError> {
+fn parse_decimal_amount(value: &str, label: &str) -> Result<Amount, StorageQuoteError> {
     if value.is_empty()
         || (value.len() > 1 && value.starts_with('0'))
         || !value.bytes().all(|byte| byte.is_ascii_digit())
@@ -224,7 +242,7 @@ fn parse_decimal_u128(value: &str, label: &str) -> Result<u128, StorageQuoteErro
         return Err(StorageQuoteError(format!("invalid {label}")));
     }
     value
-        .parse::<u128>()
+        .parse::<Amount>()
         .map_err(|_| StorageQuoteError(format!("{label} exceeds the supported protocol range")))
 }
 
@@ -433,7 +451,7 @@ mod tests {
             content: xor_name::XorName(decode_hex_array(&quote.content, "content").unwrap()),
             timestamp: std::time::SystemTime::UNIX_EPOCH
                 + std::time::Duration::from_secs(quote.timestamp_secs),
-            price: Amount::from(quote.price.parse::<u128>().unwrap()),
+            price: Amount::from(quote.price.parse::<Amount>().unwrap()),
             rewards_address: RewardsAddress::from(
                 decode_hex_array::<20>(&quote.rewards_address, "rewards").unwrap(),
             ),

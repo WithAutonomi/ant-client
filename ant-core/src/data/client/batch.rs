@@ -16,9 +16,9 @@ use ant_protocol::evm::{
     Amount, EncodedPeerId, PayForQuotesError, PaymentQuote, ProofOfPayment, QuoteHash,
     RewardsAddress, TxHash, Wallet,
 };
-use ant_protocol::payment::{
-    deserialize_proof, serialize_single_node_proof, PaymentProof, QuotePaymentInfo,
-};
+#[cfg(any(feature = "native", test))]
+use ant_protocol::payment::deserialize_proof;
+use ant_protocol::payment::{serialize_single_node_proof, PaymentProof, QuotePaymentInfo};
 use ant_protocol::transport::{MultiAddr, PeerId};
 #[cfg(test)]
 use ant_protocol::CLOSE_GROUP_SIZE;
@@ -26,9 +26,11 @@ use ant_protocol::{compute_address, XorName, DATA_TYPE_CHUNK};
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+#[cfg(any(feature = "native", test))]
+use web_time::Duration;
+use web_time::Instant;
 
 /// Number of chunks per payment wave.
 const PAYMENT_WAVE_SIZE: usize = 64;
@@ -136,6 +138,42 @@ pub struct PreparedChunk {
     /// sidecars in the PUT bundle so storers cross-check synchronously. Empty
     /// when every quote was baseline (no commitment to pin).
     pub commitment_sidecars: Vec<Vec<u8>>,
+}
+
+/// Verified payment plan for a record staged outside the Rust heap.
+#[derive(Debug)]
+pub struct ChunkPaymentPlan {
+    /// Expected BLAKE3 content address.
+    pub address: XorName,
+    /// Expected record length.
+    pub data_size: u64,
+    /// Ordered peers eligible to store the proof.
+    pub quoted_peers: Vec<(PeerId, Vec<MultiAddr>)>,
+    /// Median payment selected by the shared quote policy.
+    pub payment: SingleNodeQuotePayment,
+    /// Verified quotes included in the proof.
+    pub peer_quotes: Vec<(EncodedPeerId, PaymentQuote)>,
+    /// Verified commitment evidence carried to storers.
+    pub commitment_sidecars: Vec<Vec<u8>>,
+}
+
+impl ChunkPaymentPlan {
+    /// Bind externally staged bytes to the address and size that were quoted.
+    pub fn with_content(self, content: Bytes) -> Result<PreparedChunk> {
+        if content.len() as u64 != self.data_size || compute_address(&content) != self.address {
+            return Err(Error::InvalidData(
+                "staged chunk differs from its payment plan".into(),
+            ));
+        }
+        Ok(PreparedChunk {
+            content,
+            address: self.address,
+            quoted_peers: self.quoted_peers,
+            payment: self.payment,
+            peer_quotes: self.peer_quotes,
+            commitment_sidecars: self.commitment_sidecars,
+        })
+    }
 }
 
 /// Chunk paid but not yet stored. Produced by [`Client::batch_pay`].
@@ -336,7 +374,24 @@ impl Client {
         let address = compute_address(&content);
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::InvalidData(format!("content size too large: {e}")))?;
+        self.prepare_chunk_payment_plan(address, data_size)
+            .await?
+            .map(|plan| plan.with_content(content))
+            .transpose()
+    }
 
+    /// Quote a content-addressed record without retaining its bytes. The
+    /// returned plan must be bound to verified content before proof construction.
+    pub async fn prepare_chunk_payment_plan(
+        &self,
+        address: XorName,
+        data_size: u64,
+    ) -> Result<Option<ChunkPaymentPlan>> {
+        if data_size > ant_protocol::MAX_CHUNK_SIZE as u64 {
+            return Err(Error::InvalidData(
+                "chunk exceeds the protocol size limit".into(),
+            ));
+        }
         let quote_plan = match self
             .get_store_quote_plan(&address, data_size, DATA_TYPE_CHUNK)
             .await
@@ -374,8 +429,8 @@ impl Client {
         let payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment)
             .map_err(|e| Error::Payment(format!("Failed to create payment: {e}")))?;
 
-        Ok(Some(PreparedChunk {
-            content,
+        Ok(Some(ChunkPaymentPlan {
+            data_size,
             address,
             quoted_peers,
             payment,
@@ -485,7 +540,7 @@ impl Client {
         progress: Option<&mpsc::Sender<UploadEvent>>,
         stored_offset: usize,
         file_total: usize,
-        resume_key: Option<&str>,
+        _resume_key: Option<&str>,
     ) -> Result<(Vec<XorName>, String, u128, WaveAggregateStats)> {
         if chunks.is_empty() {
             return Ok((
@@ -527,7 +582,8 @@ impl Client {
         // the per-call costs, so seeding the return with the cumulative cache
         // (which grows as each wave appends to it) double-counts:
         // A + (A+B) + (A+B+C) instead of A+B+C.
-        let cached_proofs: HashMap<XorName, Vec<u8>> = match resume_key {
+        #[cfg(feature = "native")]
+        let cached_proofs: HashMap<XorName, Vec<u8>> = match _resume_key {
             Some(key) => match crate::data::client::cached_single::try_load_for_file(key) {
                 Some((_, receipt)) => prune_locally_expired_proofs(key, receipt.proofs),
                 None => HashMap::new(),
@@ -535,6 +591,8 @@ impl Client {
             None => HashMap::new(),
         };
 
+        #[cfg(not(feature = "native"))]
+        let cached_proofs: HashMap<XorName, Vec<u8>> = HashMap::new();
         let mut all_addresses = Vec::with_capacity(total_chunks);
         let mut seen_addresses: HashSet<XorName> = HashSet::new();
 
@@ -686,7 +744,8 @@ impl Client {
 
             // Persist the freshly-paid wave's proofs so a later
             // failure can resume without re-paying.
-            if let Some(key) = resume_key {
+            #[cfg(feature = "native")]
+            if let Some(key) = _resume_key {
                 if !paid_chunks.is_empty() {
                     let new_proofs: HashMap<[u8; 32], Vec<u8>> = paid_chunks
                         .iter()
@@ -861,7 +920,7 @@ impl Client {
 
         for attempt in 0..=crate::client_engine::STORE_MAX_RETRIES {
             if attempt > 0 {
-                tokio::time::sleep(crate::client_engine::store_retry_delay(attempt)).await;
+                crate::runtime::sleep(crate::client_engine::store_retry_delay(attempt)).await;
                 info!(
                     "Retry attempt {attempt}/{} for {} chunks",
                     crate::client_engine::STORE_MAX_RETRIES,
@@ -1014,6 +1073,7 @@ fn log_wave_summary(result: &WaveResult) {
 /// the chunk body. 5 minutes is generous for all three combined and
 /// cheap: a wrongly-kept proof costs an extra retry round trip, a
 /// wrongly-dropped proof costs one re-pay (cheap chunk).
+#[cfg(any(feature = "native", test))]
 const CACHED_PROOF_SAFETY_MARGIN_SECS: u64 = 300;
 
 /// Storer-side budget for a quote's age. Mirrors `QUOTE_MAX_AGE_SECS`
@@ -1022,6 +1082,7 @@ const CACHED_PROOF_SAFETY_MARGIN_SECS: u64 = 300;
 /// past the storer limit (forced re-pay on next retry, no money lost)
 /// or drops them slightly early (one extra re-pay, no money lost).
 /// Either way, no payment is double-spent or stranded.
+#[cfg(any(feature = "native", test))]
 const CACHED_PROOF_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
 /// How far a cached quote's `timestamp` may be in the future before we
@@ -1034,6 +1095,7 @@ const CACHED_PROOF_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 /// forward drift would re-pay those chunks on every retry. Allow the
 /// same 5-minute window the storer does so the client and node agree
 /// on which proofs are fresh.
+#[cfg(any(feature = "native", test))]
 const CACHED_PROOF_FUTURE_SKEW_TOLERANCE_SECS: u64 = 300;
 
 /// Drop cached `proof_bytes` whose quote timestamps are too close to
@@ -1059,6 +1121,7 @@ const CACHED_PROOF_FUTURE_SKEW_TOLERANCE_SECS: u64 = 300;
 ///
 /// Side-effect: dropped entries are removed from the on-disk cache so
 /// they don't reappear on the next load.
+#[cfg(feature = "native")]
 fn prune_locally_expired_proofs(
     resume_key: &str,
     proofs: HashMap<[u8; 32], Vec<u8>>,
@@ -1108,6 +1171,7 @@ fn prune_locally_expired_proofs(
 /// `QUOTE_FUTURE_SKEW_TOLERANCE_SECS` (300s) so a slow-running client
 /// clock doesn't cause us to wrongly prune perfectly fresh proofs
 /// that the storer would still accept.
+#[cfg(any(feature = "native", test))]
 fn proof_is_safely_fresh(
     proof: &ProofOfPayment,
     now: std::time::SystemTime,
@@ -1402,6 +1466,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "native", test))]
     fn proof_is_safely_fresh_accepts_recent_quote() {
         let proof = make_proof_with_timestamps(&[std::time::SystemTime::now()]);
         assert!(proof_is_safely_fresh(
@@ -1413,6 +1478,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "native", test))]
     fn proof_is_safely_fresh_rejects_quote_past_safe_window() {
         // 23h57m old: past the 24h - 5min safe-reuse threshold but
         // still within the storer's hard 24h limit. The whole point
@@ -1435,6 +1501,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "native", test))]
     fn proof_is_safely_fresh_rejects_if_any_quote_is_stale() {
         // The storer rejects on a per-quote basis: a proof with even
         // one stale quote will fail on every retry. We must drop it.
@@ -1454,6 +1521,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "native", test))]
     fn proof_is_safely_fresh_accepts_slight_future_skew_within_node_tolerance() {
         // Client clock 60s slow. Quote claims 60s in the future of
         // our local view. Node tolerates 300s forward skew, so the
@@ -1470,6 +1538,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "native", test))]
     fn proof_is_safely_fresh_rejects_far_future_dated_quote() {
         // 1 hour in the future of our local clock. Exceeds the
         // node's 300s forward-skew tolerance and the storer would
@@ -1487,6 +1556,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "native", test))]
     fn proof_is_safely_fresh_empty_quotes_is_vacuously_safe() {
         // No quotes = no storer-side timestamp check to fail. The
         // proof is structurally invalid for other reasons, but

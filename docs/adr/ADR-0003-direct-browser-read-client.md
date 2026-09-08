@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-09-03
+- **Last amended:** 2026-09-08
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -65,9 +65,10 @@ The Rust/WASM implementation owns:
 - browser `RTCPeerConnection` and ordered `RTCDataChannel` management through
   `web-sys`, including framing, fragmentation, backpressure, deadlines, and
   bounded connection reuse;
-- authenticated protocol-v4 session establishment using ephemeral ML-KEM-768,
+- authenticated protocol-v5 session establishment using ephemeral ML-KEM-768,
   ML-DSA-65 transcript authentication, peer-ID/public-key binding, independent
-  direction keys, and ordered ChaCha20-Poly1305 records from `ant-protocol`;
+  direction keys, and ordered ChaCha20-Poly1305 records from `saorsa-webrtc`
+  using `saorsa-pqc`;
 - iterative closest-node lookup through Saorsa's shared
   transport-independent lookup runner;
 - authenticated discovery of additional WebRTC Direct node addresses;
@@ -86,9 +87,8 @@ Native client behavior is the reference for shared client policy:
 
 - `quote_validation.rs` owns the resolve-before-pay checks for peer binding,
   signatures, commitment shape, forced pricing, sidecar limits, and commitment
-  resolution. Native adapters retain their native protocol verifiers and U256
-  amounts; browser adapters decode their wire representation and supply the
-  compatible portable protocol primitives. Baseline quotes have no pin to
+  resolution. Both targets use ant-protocol verifiers, commitments, and U256
+  amounts; browser adapters decode their JSON envelope into these same types. Baseline quotes have no pin to
   resolve, so an unsolicited sidecar does not affect their admission.
 - `quote_policy.rs` owns witnessed peer eligibility, the quote collection
   window, supported median subsets, existing-holder voting, and PUT ordering.
@@ -218,3 +218,33 @@ examples, and live browser flows.
 AI tools may help draft this ADR, but **must not mark it Accepted without human
 review**. Accepted ADRs are immutable: create a new superseding ADR rather than
 editing an Accepted ADR.
+
+## Shared crate graph amendment (2026-09-08)
+
+Browser WASM now imports ant-protocol, saorsa-core, saorsa-pqc, and evmlib.
+The ordinary `data::Client` owns discovery policy, quote admission, U256 median
+payment plans, proof construction, PUT retries/quorum, GET integrity checking,
+chunk caching, and in-memory file reads on both targets. Native filesystem
+streaming, persistent resume receipts, node management, sockets and background
+runtime tasks remain feature-gated.
+
+`BrowserNetwork` supplies authenticated discovery and request I/O as local
+futures. The WebRTC implementation sends encoded `ChunkMessage` requests in the
+`chunk_protocol` binary frame; ant-node routes these to its existing handler.
+HELLO capability checks and browser payment-network selection run before the
+wallet callback. Application record limits remain 4 MiB; encoded native messages
+allow 5 MiB for proof overhead. This capability is additive to browser v5 and
+requires a node advertising `chunk_protocol` for the shared Client facade.
+
+The browser facade retains JS wallet callbacks and staged content loaders.
+`ChunkPaymentPlan` separates payment metadata from bytes, so staging can load
+records within a bounded store window. `with_content` checks length and hash
+before the shared proof/store path runs. Browser reads use a bounded instance
+of the native chunk cache. Browser clocks use web-time and JS deadlines; payment
+wire timestamps retain std::time::SystemTime serialization.
+
+Native and WASM unit/integration checks cover these boundaries. Generated-WASM
+transport tests mock the WebRTC host while exercising the shared Client and
+real PQ session, signature, proof, framing, and encryption code. The node devnet
+test sends the same native quote/PUT/GET messages through real WebRTC endpoints
+and pays against a local Anvil chain.

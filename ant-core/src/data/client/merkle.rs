@@ -9,6 +9,7 @@ use crate::data::client::classify_error;
 use crate::data::client::file::UploadEvent;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
+use crate::data::network::send_and_await_chunk_response;
 use ant_protocol::evm::{
     Amount, MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
     MidpointProof, PoolCommitment, CANDIDATES_PER_POOL, MAX_LEAVES,
@@ -22,8 +23,8 @@ use ant_protocol::payment::{
 };
 use ant_protocol::transport::PeerId;
 use ant_protocol::{
-    compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
-    MerkleCandidateQuoteRequest, MerkleCandidateQuoteResponse,
+    compute_address, ChunkMessage, ChunkMessageBody, MerkleCandidateQuoteRequest,
+    MerkleCandidateQuoteResponse,
 };
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -684,8 +685,8 @@ impl Client {
             .map_err(|e| Error::Payment(format!("Failed to build merkle tree: {e}")))?;
 
         let depth = tree.depth();
-        let merkle_payment_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let merkle_payment_timestamp = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .map_err(|e| Error::Payment(format!("System time error: {e}")))?
             .as_secs();
 
@@ -887,7 +888,7 @@ impl Client {
         data_size: u64,
         merkle_payment_timestamp: u64,
     ) -> Result<[MerklePaymentCandidateNode; CANDIDATES_PER_POOL]> {
-        let node = self.network().node();
+        let node = self.network();
         let timeout = Duration::from_secs(self.config().quote_timeout_secs);
 
         // Query extra peers to handle validation failures (bad sigs, wrong type, etc.)
@@ -1159,7 +1160,7 @@ impl Client {
             let content = bodies.get(&addr).cloned();
             let proof_bytes = batch_result.proofs.get(&addr).cloned();
             async move {
-                let started = std::time::Instant::now();
+                let started = web_time::Instant::now();
                 let content = content.ok_or_else(|| {
                     Error::InvalidData(format!("missing chunk body for {}", hex::encode(addr)))
                 })?;
@@ -1298,7 +1299,7 @@ pub(crate) async fn merkle_store_with_retry<F, Fut, C>(
 ) -> Result<MerkleStoreOutcome>
 where
     F: Fn([u8; 32]) -> Fut,
-    Fut: std::future::Future<Output = Result<std::time::Instant>>,
+    Fut: std::future::Future<Output = Result<web_time::Instant>>,
     C: Fn() -> usize,
 {
     let attempts = max_attempts.max(1);
@@ -1410,7 +1411,7 @@ where
                     let factor = 1.0 + rng.gen_range(-MERKLE_RETRY_JITTER..=MERKLE_RETRY_JITTER);
                     backoff.mul_f64(factor)
                 };
-                tokio::time::sleep(wait).await;
+                crate::runtime::sleep(wait).await;
             }
         } else {
             outcome.failed = next_failed.len();
@@ -1430,6 +1431,7 @@ where
 /// Only chunks that survive a round get a longer back-off before the next, so a
 /// genuinely saturated/diverged group still gets time to settle. Mirrors the
 /// download path's `DEFERRED_ROUND_DELAYS_SECS`.
+#[cfg(any(feature = "native", test))]
 pub(crate) const DEFERRED_ROUND_DELAYS_SECS: [u64; 3] = [0, 15, 45];
 
 /// Histogram slot for a deferred-retry round's successes.
@@ -1438,12 +1440,14 @@ pub(crate) const DEFERRED_ROUND_DELAYS_SECS: [u64; 3] = [0, 15, 45];
 /// slot `r + 1`, clamped to the last slot so the four-slot
 /// [`WaveAggregateStats::retries_histogram`] keeps recording "which round a
 /// chunk landed on" under the post-wave deferred structure.
+#[cfg(any(feature = "native", test))]
 pub(crate) fn deferred_round_histogram_slot(round: usize, hist_len: usize) -> usize {
     (round + 1).min(hist_len.saturating_sub(1))
 }
 
 /// Outcome of the post-wave deferred-retry pass.
 #[derive(Debug, Default)]
+#[cfg(any(feature = "native", test))]
 pub(crate) struct DeferredRetryOutcome {
     /// Running total of stored chunks, seeded with the `stored_offset` passed in
     /// (i.e. everything the wave passes already stored) and advanced by each
@@ -1485,6 +1489,7 @@ pub(crate) struct DeferredRetryOutcome {
 /// `store_one`, `progress`, `stored_offset` and `total` mirror
 /// [`merkle_store_with_retry`].
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "native", test))]
 pub(crate) async fn merkle_deferred_retry<CF, SF, Fut>(
     deferred: Vec<([u8; 32], String)>,
     round_delays_secs: &[u64],
@@ -1497,7 +1502,7 @@ pub(crate) async fn merkle_deferred_retry<CF, SF, Fut>(
 where
     CF: Fn(usize) -> usize,
     SF: Fn([u8; 32]) -> Fut,
-    Fut: std::future::Future<Output = Result<std::time::Instant>>,
+    Fut: std::future::Future<Output = Result<web_time::Instant>>,
 {
     let mut outcome = DeferredRetryOutcome {
         stored: stored_offset,
@@ -1511,7 +1516,7 @@ where
             break;
         }
         if delay_secs > 0 {
-            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            crate::runtime::sleep(Duration::from_secs(delay_secs)).await;
         }
         info!(
             "Deferred merkle retry round {}/{}: {} chunk(s) short of quorum",
@@ -1905,8 +1910,8 @@ mod tests {
         let xornames: Vec<XorName> = addrs.iter().map(|a| XorName(*a)).collect();
         let tree = MerkleTree::from_xornames(xornames.clone()).unwrap();
 
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let timestamp = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
@@ -1993,8 +1998,8 @@ mod tests {
         let xornames: Vec<XorName> = addrs.iter().map(|a| XorName(*a)).collect();
         let tree = MerkleTree::from_xornames(xornames).unwrap();
 
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let timestamp = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
@@ -2411,7 +2416,7 @@ mod tests {
                 if fail {
                     Err(Error::InsufficientPeers("test shortfall".into()))
                 } else {
-                    Ok(std::time::Instant::now())
+                    Ok(web_time::Instant::now())
                 }
             }
         };
@@ -2443,7 +2448,7 @@ mod tests {
             *cap_calls_for_closure.lock().expect("cap counter poisoned") += 1;
             2
         };
-        let store_one = move |_addr: [u8; 32]| async move { Ok(std::time::Instant::now()) };
+        let store_one = move |_addr: [u8; 32]| async move { Ok(web_time::Instant::now()) };
 
         let outcome =
             merkle_store_with_retry(chunks, cap, 1, Duration::ZERO, None, 0, count, store_one)
@@ -2486,11 +2491,11 @@ mod tests {
                 } else if fast_completed.fetch_add(1, Ordering::SeqCst) + 1 == count - 1 {
                     release_slow.notify_one();
                 }
-                Ok(std::time::Instant::now())
+                Ok(web_time::Instant::now())
             }
         };
 
-        let outcome = tokio::time::timeout(
+        let outcome = crate::runtime::timeout(
             Duration::from_secs(5),
             merkle_store_with_retry(addrs, || 8, 1, Duration::ZERO, None, 0, count, store_one),
         )
@@ -2525,7 +2530,7 @@ mod tests {
                 // maximising the observed in-flight count.
                 tokio::task::yield_now().await;
                 in_flight.fetch_sub(1, Ordering::SeqCst);
-                Ok(std::time::Instant::now())
+                Ok(web_time::Instant::now())
             }
         };
 
@@ -2575,7 +2580,7 @@ mod tests {
                         ),
                     })
                 } else {
-                    Ok(std::time::Instant::now())
+                    Ok(web_time::Instant::now())
                 }
             }
         };
@@ -2596,7 +2601,7 @@ mod tests {
     async fn store_with_retry_reports_non_quorum_errors_as_fatal() {
         let chunks = make_addrs(3);
         let store_one = |_addr: [u8; 32]| async move {
-            Err::<std::time::Instant, _>(Error::Payment("missing proof".into()))
+            Err::<web_time::Instant, _>(Error::Payment("missing proof".into()))
         };
 
         let outcome =
@@ -2618,7 +2623,7 @@ mod tests {
             if addr == bad {
                 Err(Error::Payment("fatal".into()))
             } else {
-                Ok(std::time::Instant::now())
+                Ok(web_time::Instant::now())
             }
         };
 
@@ -2657,7 +2662,7 @@ mod tests {
                 if fail {
                     Err(Error::InsufficientPeers("round-1 shortfall".into()))
                 } else {
-                    Ok(std::time::Instant::now())
+                    Ok(web_time::Instant::now())
                 }
             }
         };
@@ -2704,7 +2709,7 @@ mod tests {
                 if fail {
                     Err(Error::InsufficientPeers("transient".into()))
                 } else {
-                    Ok(std::time::Instant::now())
+                    Ok(web_time::Instant::now())
                 }
             }
         };
@@ -2733,7 +2738,7 @@ mod tests {
         let total = chunks.len();
 
         let store_one = |_addr: [u8; 32]| async move {
-            Err::<std::time::Instant, _>(Error::InsufficientPeers("never converges".into()))
+            Err::<web_time::Instant, _>(Error::InsufficientPeers("never converges".into()))
         };
 
         let outcome = merkle_store_with_retry(
@@ -2776,7 +2781,7 @@ mod tests {
                 if fail {
                     Err(Error::InsufficientPeers("permanent shortfall".into()))
                 } else {
-                    Ok(std::time::Instant::now())
+                    Ok(web_time::Instant::now())
                 }
             }
         };
@@ -2813,7 +2818,7 @@ mod tests {
     async fn store_with_retry_failed_addresses_empty_on_full_success() {
         let chunks = make_addrs(4);
         let total = chunks.len();
-        let store_one = |_addr: [u8; 32]| async move { Ok(std::time::Instant::now()) };
+        let store_one = |_addr: [u8; 32]| async move { Ok(web_time::Instant::now()) };
 
         let outcome = merkle_store_with_retry(
             chunks,
@@ -2878,7 +2883,7 @@ mod tests {
                 if n < 2 {
                     Err(Error::InsufficientPeers("still short".into()))
                 } else {
-                    Ok(std::time::Instant::now())
+                    Ok(web_time::Instant::now())
                 }
             }
         };
@@ -2913,7 +2918,7 @@ mod tests {
     async fn deferred_retry_leftovers_become_failed() {
         let deferred = deferred_set(2);
         let store_one = |_addr: [u8; 32]| async move {
-            Err::<std::time::Instant, _>(Error::InsufficientPeers("always short".into()))
+            Err::<web_time::Instant, _>(Error::InsufficientPeers("always short".into()))
         };
 
         let outcome = merkle_deferred_retry(
@@ -2962,7 +2967,7 @@ mod tests {
                     *e
                 };
                 if addr == good {
-                    Ok(std::time::Instant::now())
+                    Ok(web_time::Instant::now())
                 } else if n == 1 {
                     Err(Error::InsufficientPeers("short".into()))
                 } else {
@@ -2995,7 +3000,7 @@ mod tests {
     #[tokio::test]
     async fn deferred_retry_empty_set_is_a_noop() {
         let store_one = |_addr: [u8; 32]| async move {
-            Err::<std::time::Instant, _>(Error::InsufficientPeers("unused".into()))
+            Err::<web_time::Instant, _>(Error::InsufficientPeers("unused".into()))
         };
 
         let outcome = merkle_deferred_retry(

@@ -64,7 +64,7 @@ for (const count of [1, 2, 3, 4, 5, 6]) {
     const client = new BrowserNetworkClient(rtc.endpoints);
     const signer = wallet();
     try {
-      await assert.rejects(upload(client, signer), /initial PUT peers before payment/);
+      await assert.rejects(upload(client, signer), /initial lookup found [1-6] peers, need 7/);
       assert.equal(signer.calls.length, 0);
       assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, 0);
     } finally {
@@ -78,7 +78,7 @@ test("duplicate endpoints cannot satisfy the distinct-peer minimum", async () =>
   const client = new BrowserNetworkClient(Array(4).fill(rtc.endpoints[0]));
   const signer = wallet();
   try {
-    await assert.rejects(upload(client, signer), /only 1\/7 initial PUT peers before payment/);
+    await assert.rejects(upload(client, signer), /initial lookup found 1 peers, need 7/);
     assert.equal(signer.calls.length, 0);
     assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, 0);
   } finally {
@@ -293,7 +293,7 @@ test("cached endpoints alone never turn a persistent five-peer lookup into payme
   const client = new BrowserNetworkClient(rtc.endpoints);
   const signer = wallet();
   try {
-    await assert.rejects(upload(client, signer), /only 5\/7 initial PUT peers before payment/);
+    await assert.rejects(upload(client, signer), /initial lookup found 5 peers, need 7/);
     assert.equal(signer.calls.length, 0);
     assert.equal(rtc.requests.filter(request => request.method === "put_chunk").length, 0);
   } finally { client.close(); }
@@ -349,7 +349,7 @@ test("actual failed connections remain suppressed across upload attempts", async
   const signer = wallet();
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
-      await assert.rejects(upload(client, signer), /only 3\/7 initial PUT peers before payment/);
+      await assert.rejects(upload(client, signer), /initial lookup found 3 peers, need 7/);
     }
     for (let node = 0; node < 4; node++) {
       assert.equal(rtc.connections.filter(connection => connection.channel.index === node).length, 1);

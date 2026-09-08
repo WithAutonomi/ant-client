@@ -3167,8 +3167,10 @@ mod tests {
                     observe_op_with_success_bytes(
                         &limiter,
                         || async {
-                            tokio::time::sleep(Duration::from_millis(HILL_TEST_ASYNC_LATENCY_MS))
-                                .await;
+                            crate::runtime::sleep(Duration::from_millis(
+                                HILL_TEST_ASYNC_LATENCY_MS,
+                            ))
+                            .await;
                             Ok::<(), ()>(())
                         },
                         |_| Outcome::NetworkError,
@@ -3377,7 +3379,7 @@ mod tests {
         // started to "warm up".
         let bump_handle = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_millis(2)).await;
+                crate::runtime::sleep(Duration::from_millis(2)).await;
                 if processed_for_bump.load(AtomicOrdering::Relaxed) >= 16 {
                     l_for_bump.warm_start(16);
                     return;
@@ -3391,7 +3393,7 @@ mod tests {
             async move {
                 let cur = in_flight.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                 max_seen.fetch_max(cur, AtomicOrdering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                crate::runtime::sleep(Duration::from_millis(1)).await;
                 in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
                 processed.fetch_add(1, AtomicOrdering::Relaxed);
                 Ok::<(), &'static str>(())
@@ -3611,9 +3613,9 @@ mod tests {
                 // scheduler, items 1..N can start as soon as their
                 // slot frees from a fast completion.
                 if i == 0 {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    crate::runtime::sleep(Duration::from_millis(50)).await;
                 } else {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    crate::runtime::sleep(Duration::from_millis(1)).await;
                 }
                 in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
                 Ok::<(), &'static str>(())
@@ -3647,7 +3649,7 @@ mod tests {
             |(idx, v)| async move {
                 // Reverse-bias delay so out-of-order completion is likely.
                 let delay = (50 - v) as u64;
-                tokio::time::sleep(Duration::from_micros(delay)).await;
+                crate::runtime::sleep(Duration::from_micros(delay)).await;
                 Ok::<_, &'static str>((idx, v * 10))
             },
         )
@@ -3678,7 +3680,7 @@ mod tests {
         let items: Vec<(usize, u64)> = (0..40).map(|i| (i, 1000u64 + i as u64)).collect();
         let result: Vec<u64> = rebucketed_ordered(&l, items, |(idx, hash)| async move {
             let delay = (40 - idx) as u64; // reverse delay
-            tokio::time::sleep(Duration::from_micros(delay)).await;
+            crate::runtime::sleep(Duration::from_micros(delay)).await;
             // "content_for_hash" derived from the hash.
             Ok::<_, &'static str>((idx, hash * 7))
         })
@@ -3798,13 +3800,13 @@ mod tests {
                 if i == 5 {
                     // Slight delay so item 6, 7 also start before
                     // this error propagates.
-                    tokio::time::sleep(Duration::from_micros(100)).await;
+                    crate::runtime::sleep(Duration::from_micros(100)).await;
                     return Err("first error");
                 }
                 if i == 10 {
                     return Err("second error - should be ignored");
                 }
-                tokio::time::sleep(Duration::from_micros(50)).await;
+                crate::runtime::sleep(Duration::from_micros(50)).await;
                 Ok(())
             }
         })
@@ -4064,7 +4066,7 @@ mod tests {
         let shrink_handle = tokio::spawn(async move {
             // Bump down the cap once 50 items have completed.
             loop {
-                tokio::time::sleep(Duration::from_millis(2)).await;
+                crate::runtime::sleep(Duration::from_millis(2)).await;
                 if p_for_shrink.load(AtomicOrdering::Relaxed) >= 50 {
                     l_for_shrink.warm_start(2);
                     shrunk_for_shrink.store(true, AtomicOrdering::Relaxed);
@@ -4082,7 +4084,7 @@ mod tests {
                 if shrunk.load(AtomicOrdering::Relaxed) {
                     max_after_shrink.fetch_max(cur, AtomicOrdering::Relaxed);
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                crate::runtime::sleep(Duration::from_millis(1)).await;
                 in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
                 processed.fetch_add(1, AtomicOrdering::Relaxed);
                 Ok::<(), &'static str>(())
