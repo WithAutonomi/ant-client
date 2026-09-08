@@ -6,7 +6,7 @@ pub(crate) const MAX_GET_FALLBACK_PEERS: usize = 20;
 pub(crate) const CLOSE_GROUP_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub(crate) fn is_authoritative_not_found(not_found: usize, queried: usize) -> bool {
-    queried >= saorsa_webrtc::CLOSE_GROUP_MAJORITY && not_found == queried
+    queried >= saorsa_transport::webrtc::CLOSE_GROUP_MAJORITY && not_found == queried
 }
 
 /// Discovery results need not include all reachable storage holders.

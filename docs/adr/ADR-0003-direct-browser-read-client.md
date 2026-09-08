@@ -67,7 +67,7 @@ The Rust/WASM implementation owns:
   bounded connection reuse;
 - authenticated protocol-v5 session establishment using ephemeral ML-KEM-768,
   ML-DSA-65 transcript authentication, peer-ID/public-key binding, independent
-  direction keys, and ordered ChaCha20-Poly1305 records from `saorsa-webrtc`
+  direction keys, and ordered ChaCha20-Poly1305 records from `saorsa_transport::webrtc`
   using `saorsa-pqc`;
 - iterative closest-node lookup through Saorsa's shared
   transport-independent lookup runner;

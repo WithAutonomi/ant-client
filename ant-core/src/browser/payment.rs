@@ -7,10 +7,10 @@ use ant_protocol::evm::{Amount, PaymentQuote, RewardsAddress};
 use ant_protocol::payment::commitment::commitment_hash;
 use ant_protocol::payment::commitment::{StorageCommitment, MAX_COMMITMENT_SIDECAR_BYTES};
 #[cfg(test)]
-use saorsa_webrtc::calculate_price_wei;
+use saorsa_transport::webrtc::calculate_price_wei;
 use serde::{Deserialize, Serialize};
 
-pub use saorsa_webrtc::payment_quote_hash;
+pub use saorsa_transport::webrtc::payment_quote_hash;
 
 #[cfg(test)]
 const PAYMENT_MULTIPLIER: u128 = crate::payment_policy::SINGLE_NODE_PAYMENT_MULTIPLIER as u128;
@@ -271,7 +271,7 @@ fn decode_hex_array<const LENGTH: usize>(
 mod tests {
     use super::*;
     use ant_protocol::pqc::api::ml_dsa_65;
-    use saorsa_webrtc::{storage_commitment_bytes_for_signing, DOMAIN_COMMITMENT};
+    use saorsa_transport::webrtc::{storage_commitment_bytes_for_signing, DOMAIN_COMMITMENT};
 
     fn baseline_quote() -> (BrowserQuoteArtifact, String, String) {
         let content = [0x31; 32];

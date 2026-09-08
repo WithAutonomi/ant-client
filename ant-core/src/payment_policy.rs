@@ -4,7 +4,7 @@
 //! discovery, signature verification, wallet submission, and proof encoding
 //! remain the responsibility of the adapters.
 
-use saorsa_webrtc::CLOSE_GROUP_SIZE;
+use saorsa_transport::webrtc::CLOSE_GROUP_SIZE;
 
 pub(crate) const SINGLE_NODE_PAYMENT_MULTIPLIER: u64 = 3;
 

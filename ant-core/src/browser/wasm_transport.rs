@@ -29,7 +29,7 @@ use futures_util::{
 };
 use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Promise, Uint8Array};
-use saorsa_webrtc::{
+use saorsa_transport::webrtc::{
     decode_pq_frame, encode_pq_frame, pq_frame_length, transfer_timeout, PqClientHandshake,
     PqSession, CLOSE_GROUP_MAJORITY, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_SERVER_ACCEPT_BYTES,
 };
