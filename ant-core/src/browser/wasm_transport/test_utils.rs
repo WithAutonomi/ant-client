@@ -136,7 +136,12 @@ impl BrowserTestNode {
         }
         let plaintext = self.session.as_mut().unwrap().open(&payload).unwrap();
         let request = parse_request_frame(&plaintext).unwrap();
+        let mut protocol_content = Vec::new();
         let body = match request.request.body {
+            BrowserRequestBody::ChunkProtocol => {
+                protocol_content = self.chunk_protocol(&request.content);
+                BrowserResponseBody::ChunkProtocol
+            }
             BrowserRequestBody::Hello => {
                 self.last_method = "hello".into();
                 BrowserResponseBody::Hello {
@@ -149,13 +154,18 @@ impl BrowserTestNode {
                     payment: network(),
                     capabilities: if self.uploads_enabled {
                         vec![
+                            "chunk_protocol".into(),
                             "find_node".into(),
                             "get_chunk".into(),
                             "quote_chunk".into(),
                             "put_chunk".into(),
                         ]
                     } else {
-                        vec!["find_node".into(), "get_chunk".into()]
+                        vec![
+                            "chunk_protocol".into(),
+                            "find_node".into(),
+                            "get_chunk".into(),
+                        ]
                     },
                 }
             }
@@ -255,7 +265,9 @@ impl BrowserTestNode {
                 }
             }
         };
-        let content = if self.last_method == "get_chunk" {
+        let content = if !protocol_content.is_empty() {
+            protocol_content.as_slice()
+        } else if self.last_method == "get_chunk" {
             self.chunk.as_slice()
         } else {
             &[]
@@ -381,4 +393,136 @@ pub async fn test_cancel_queued_request(endpoint: &str) -> Result<(), JsValue> {
     result
         .map(|_| ())
         .map_err(|error| JsValue::from_str(&error))
+}
+
+impl BrowserTestNode {
+    fn chunk_protocol(&mut self, bytes: &[u8]) -> Vec<u8> {
+        use ant_protocol::evm::{Amount, PaymentQuote, RewardsAddress};
+        use ant_protocol::{
+            ChunkGetResponse, ChunkMessage, ChunkMessageBody as Body, ChunkPutResponse,
+            ChunkQuoteResponse,
+        };
+        let request = ChunkMessage::decode(bytes).unwrap();
+        let body = match request.body {
+            Body::QuoteRequest(request) => {
+                self.last_method = "quote_chunk".into();
+                let commitment = self.storage_commitment();
+                let pin = commitment.as_ref().and_then(saorsa_webrtc::commitment_hash);
+                let mut quote = PaymentQuote {
+                    content: xor_name::XorName(request.address),
+                    timestamp: std::time::UNIX_EPOCH
+                        + Duration::from_secs((js_sys::Date::now() / 1000.0) as u64),
+                    price: Amount::from(saorsa_webrtc::calculate_price_wei(
+                        self.committed_key_count,
+                    )),
+                    rewards_address: RewardsAddress::from([0x44; 20]),
+                    pub_key: self.public.clone(),
+                    signature: Vec::new(),
+                    committed_key_count: self.committed_key_count,
+                    commitment_pin: pin,
+                };
+                quote.signature = self
+                    .secret
+                    .try_sign_with_seed(&[8; 32], &quote.bytes_for_sig(), b"")
+                    .unwrap()
+                    .to_vec();
+                if self.invalid_quote {
+                    quote.signature[0] ^= 1;
+                }
+                Body::QuoteResponse(ChunkQuoteResponse::Success {
+                    quote: rmp_serde::to_vec(&quote).unwrap(),
+                    already_stored: self.already_stored,
+                    commitment: commitment.map(|value| rmp_serde::to_vec(&value).unwrap()),
+                })
+            }
+            Body::GetRequest(request) => {
+                self.last_method = "get_chunk".into();
+                let content = self
+                    .records
+                    .get(&hex::encode(request.address))
+                    .cloned()
+                    .unwrap_or_else(|| self.chunk.clone());
+                Body::GetResponse(if content.is_empty() {
+                    ChunkGetResponse::NotFound {
+                        address: request.address,
+                    }
+                } else {
+                    ChunkGetResponse::Success {
+                        address: request.address,
+                        content,
+                    }
+                })
+            }
+            Body::PutRequest(request) => {
+                self.last_method = "put_chunk".into();
+                self.last_put_address = hex::encode(request.address);
+                let (proof, _) = ant_protocol::payment::deserialize_proof(
+                    request.payment_proof.as_deref().unwrap(),
+                )
+                .unwrap();
+                let mut quotes = proof
+                    .peer_quotes
+                    .iter()
+                    .map(|(_, quote)| quote)
+                    .collect::<Vec<_>>();
+                quotes.sort_by_key(|quote| quote.price);
+                self.last_put_quote_hash = hex::encode(quotes[quotes.len() / 2].hash());
+                Body::PutResponse(match &self.put_error {
+                    Some((code, message)) => ChunkPutResponse::Error(match code.as_str() {
+                        "storage_full" => {
+                            ant_protocol::ProtocolError::StorageFailed(message.clone())
+                        }
+                        "price_floor" => {
+                            ant_protocol::ProtocolError::PaymentFailed(message.clone())
+                        }
+                        _ => ant_protocol::ProtocolError::StorageFailed(message.clone()),
+                    }),
+                    None => {
+                        assert_eq!(
+                            ant_protocol::compute_address(&request.content),
+                            request.address
+                        );
+                        self.records
+                            .insert(self.last_put_address.clone(), request.content.to_vec());
+                        ChunkPutResponse::Success {
+                            address: request.address,
+                        }
+                    }
+                })
+            }
+            other => panic!("unsupported mock request: {other:?}"),
+        };
+        ChunkMessage {
+            request_id: request.request_id,
+            body,
+        }
+        .encode()
+        .unwrap()
+    }
+}
+
+/// Exercise core identity and the platform timer from generated WASM.
+#[wasm_bindgen]
+pub async fn test_shared_identity_and_timers() {
+    let identity = ant_protocol::transport::NodeIdentity::generate().unwrap();
+    let imported = ant_protocol::transport::NodeIdentity::import(&identity.export()).unwrap();
+    let signature = imported.sign(b"shared native and wasm identity").unwrap();
+    assert!(identity
+        .verify(b"shared native and wasm identity", &signature)
+        .unwrap());
+    assert!(!identity.verify(b"tampered", &signature).unwrap());
+    let started = js_sys::Date::now();
+    crate::runtime::sleep(Duration::from_millis(5)).await;
+    assert!(js_sys::Date::now() >= started + 4.0);
+    assert!(
+        crate::runtime::timeout(Duration::from_millis(2), std::future::pending::<()>())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        crate::runtime::timeout(Duration::from_secs(1), async { 42 })
+            .await
+            .unwrap(),
+        42
+    );
 }

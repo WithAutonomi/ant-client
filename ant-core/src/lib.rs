@@ -16,7 +16,6 @@ mod client_engine;
 
 #[cfg(feature = "native")]
 pub mod config;
-#[cfg(feature = "native")]
 pub mod data;
 #[cfg(feature = "native")]
 pub mod datamap_file;
@@ -24,6 +23,7 @@ pub mod datamap_file;
 pub mod error;
 #[cfg(feature = "native")]
 pub mod node;
+mod runtime;
 #[cfg(feature = "native")]
 pub mod update;
 

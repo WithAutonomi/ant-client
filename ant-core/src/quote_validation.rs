@@ -17,7 +17,6 @@ impl QuotePrice for u128 {
     }
 }
 
-#[cfg(feature = "native")]
 impl QuotePrice for ant_protocol::evm::Amount {
     fn for_key_count(count: u32) -> Self {
         ant_protocol::payment::calculate_price(count as usize)
@@ -65,7 +64,6 @@ mod portable {
     commitment_adapter!(saorsa_webrtc);
 }
 
-#[cfg(feature = "native")]
 mod native {
     use super::Commitment;
     commitment_adapter!(ant_protocol::payment::commitment);

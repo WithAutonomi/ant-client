@@ -451,11 +451,26 @@ impl Client {
     /// Returns the underlying fetch error, or an encryption error for invalid
     /// datamaps and content that fails verification/decryption.
     pub async fn data_download(&self, data_map: &DataMap) -> Result<Bytes> {
+        self.data_download_with_concurrency(data_map, usize::MAX)
+            .await
+    }
+
+    /// Download data with an upper bound on concurrent record fetches.
+    pub async fn data_download_with_concurrency(
+        &self,
+        data_map: &DataMap,
+        concurrency: usize,
+    ) -> Result<Bytes> {
+        if concurrency == 0 {
+            return Err(Error::Config(
+                "download concurrency must be positive".into(),
+            ));
+        }
         crate::client_engine::files::download(
             data_map,
             &|address| self.fetch_data_record(address),
-            &|| self.controller().fetch.current(),
-            &tokio::time::sleep,
+            &|| self.controller().fetch.current().min(concurrency),
+            &crate::runtime::sleep,
             retry_data_fetch,
         )
         .await
@@ -485,7 +500,7 @@ impl Client {
             length,
             &fetch,
             &cap,
-            &tokio::time::sleep,
+            &crate::runtime::sleep,
             retry_data_fetch,
         )
         .await

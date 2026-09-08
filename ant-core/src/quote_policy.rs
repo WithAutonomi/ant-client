@@ -16,7 +16,6 @@ impl Peer for [u8; 32] {
         self
     }
 }
-#[cfg(feature = "native")]
 impl Peer for ant_protocol::transport::PeerId {
     fn bytes(&self) -> &[u8; 32] {
         self.as_bytes()
@@ -128,6 +127,7 @@ pub(crate) fn validate_initial_peers(initial_count: usize) -> Result<(), String>
 
 /// Apply native self-inclusive view normalization to a raw transport response.
 #[cfg(any(target_arch = "wasm32", test))]
+#[cfg(test)]
 pub(crate) fn normalize_view<K: Peer>(
     responder: K,
     mut closest: Vec<K>,
@@ -338,7 +338,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "native")]
     #[test]
     fn full_and_portable_amounts_select_the_native_supported_subset() {
         use ant_protocol::{evm::Amount, transport::PeerId};
