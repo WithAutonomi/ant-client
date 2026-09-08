@@ -40,4 +40,8 @@ checks media ranges across chunk boundaries and EOF.
 
 Upload discovery regressions verify native's twenty-to-seven fallback, reject
 persistent five-peer results without payment or PUT, and ensure the browser
-adapter does not bypass endpoint suppression on the fallback attempt.
+adapter does not bypass genuine failed-connection suppression on fallback.
+Sequential-upload tests reproduce a first success followed by four FIND_NODE
+failures and a 3/7 result; the same client must recover through normal discovery.
+A separate test covers grace-cancelled requests, while actual connection failures
+remain cached across attempts.

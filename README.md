@@ -52,6 +52,11 @@ platform-specific ceilings on the shared adaptive scheduler.
 Upload discovery follows native's witnessed lookup contract: request twenty
 initial responders and, if that lookup fails, retry at seven. Both attempts
 use normal iterative lookup, endpoint failure handling, and grace deadlines.
+The endpoint cache records only connection-establishment failures, matching
+native's dial-failure semantics. A failed FIND_NODE or a request dropped at the
+lookup grace deadline does not suppress that endpoint for future uploads.
+Established connections remain eligible and successful connection establishment
+clears the failure entry.
 There is no browser-specific recovery probe or relaxed payment threshold.
 The requested responder count must be satisfied before quote witnessing and
 storage-majority checks proceed.
