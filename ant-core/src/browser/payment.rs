@@ -6,16 +6,19 @@ use ant_protocol::evm::{Amount, PaymentQuote, RewardsAddress};
 #[cfg(test)]
 use ant_protocol::payment::commitment::commitment_hash;
 use ant_protocol::payment::commitment::{StorageCommitment, MAX_COMMITMENT_SIDECAR_BYTES};
-#[cfg(test)]
-use saorsa_transport::webrtc::calculate_price_wei;
 use serde::{Deserialize, Serialize};
 
-pub use saorsa_transport::webrtc::payment_quote_hash;
+/// Compute the native EVM quote identifier from its signed fields.
+pub fn payment_quote_hash(payload: &[u8], public_key: &[u8], signature: &[u8]) -> [u8; 32] {
+    PaymentQuote::hash_signed_bytes(payload, public_key, signature).into()
+}
 
 #[cfg(test)]
 const PAYMENT_MULTIPLIER: u128 = crate::payment_policy::SINGLE_NODE_PAYMENT_MULTIPLIER as u128;
 #[cfg(test)]
-const PRICE_BASELINE_WEI: u128 = 3_906_250_000_000_000;
+fn calculate_price_wei(count: u32) -> u128 {
+    ant_protocol::payment::calculate_price(count as usize).to::<u128>()
+}
 
 /// A quote that is safe to hand to a transaction signer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,8 +273,10 @@ fn decode_hex_array<const LENGTH: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ant_protocol::payment::commitment::{
+        commitment_signed_payload as storage_commitment_bytes_for_signing, DOMAIN_COMMITMENT,
+    };
     use ant_protocol::pqc::api::ml_dsa_65;
-    use saorsa_transport::webrtc::{storage_commitment_bytes_for_signing, DOMAIN_COMMITMENT};
 
     fn baseline_quote() -> (BrowserQuoteArtifact, String, String) {
         let content = [0x31; 32];
@@ -284,7 +289,7 @@ mod tests {
             peer_id: peer_id.clone(),
             content: hex::encode(content),
             timestamp_secs: timestamp,
-            price: PRICE_BASELINE_WEI.to_string(),
+            price: calculate_price_wei(0).to_string(),
             rewards_address: hex::encode(rewards),
             public_key: hex::encode(&public_key),
             signature: String::new(),
@@ -294,7 +299,7 @@ mod tests {
             commitment: None,
         };
         let payload =
-            canonical_quote_bytes(&quote, PRICE_BASELINE_WEI, &hex::encode(rewards), None)
+            canonical_quote_bytes(&quote, calculate_price_wei(0), &hex::encode(rewards), None)
                 .expect("payload");
         let signature = ml_dsa_65()
             .sign(&secret_key, &payload)
@@ -422,9 +427,9 @@ mod tests {
         let (quote, content, peer_id) = baseline_quote();
         let verified =
             verify_storage_quote(quote.clone(), &content, &peer_id).expect("valid quote");
-        assert_eq!(verified.amount, (PRICE_BASELINE_WEI * 3).to_string());
+        assert_eq!(verified.amount, (calculate_price_wei(0) * 3).to_string());
         let mut tampered = quote;
-        tampered.price = (PRICE_BASELINE_WEI + 1).to_string();
+        tampered.price = (calculate_price_wei(0) + 1).to_string();
         assert!(verify_storage_quote(tampered, &content, &peer_id).is_err());
     }
 

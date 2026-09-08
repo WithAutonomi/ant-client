@@ -183,26 +183,26 @@ impl BrowserTestNode {
                 self.last_method = "quote_chunk".into();
                 let content: [u8; 32] = hex::decode(&address).unwrap().try_into().unwrap();
                 let count = self.committed_key_count;
-                let price = saorsa_transport::webrtc::calculate_price_wei(count);
+                let price = ant_protocol::payment::calculate_price(count as usize);
                 let commitment = self.storage_commitment();
                 let pin = commitment
                     .as_ref()
-                    .and_then(saorsa_transport::webrtc::commitment_hash);
+                    .and_then(ant_protocol::payment::commitment::commitment_hash);
                 let timestamp = (js_sys::Date::now() / 1000.0) as u64;
-                let signed = saorsa_transport::webrtc::payment_quote_bytes_for_signing(
-                    &content,
-                    timestamp,
-                    price,
-                    &[0x44; 20],
+                let signed = ant_protocol::evm::PaymentQuote::bytes_for_signing(
+                    xor_name::XorName(content),
+                    std::time::UNIX_EPOCH + Duration::from_secs(timestamp),
+                    &price,
+                    &ant_protocol::evm::RewardsAddress::from([0x44; 20]),
                     count,
-                    pin.as_ref(),
+                    &pin,
                 );
                 let signature = self
                     .secret
                     .try_sign_with_seed(&[8; 32], &signed, b"")
                     .unwrap();
                 let hash =
-                    saorsa_transport::webrtc::payment_quote_hash(&signed, &self.public, &signature);
+                    super::super::payment::payment_quote_hash(&signed, &self.public, &signature);
                 BrowserResponseBody::StorageQuote {
                     address: address.clone(),
                     already_stored: self.already_stored,
@@ -323,18 +323,18 @@ pub async fn test_put_failure_kind(endpoint: &str) -> Result<String, JsValue> {
 }
 
 impl BrowserTestNode {
-    fn storage_commitment(&self) -> Option<saorsa_transport::webrtc::StorageCommitment> {
+    fn storage_commitment(&self) -> Option<ant_protocol::payment::commitment::StorageCommitment> {
         if self.committed_key_count == 0 {
             return None;
         }
-        let mut commitment = saorsa_transport::webrtc::StorageCommitment {
+        let mut commitment = ant_protocol::payment::commitment::StorageCommitment {
             root: [0x53; 32],
             key_count: self.committed_key_count,
             sender_peer_id: self.peer,
             sender_public_key: self.public.clone(),
             signature: Vec::new(),
         };
-        let payload = saorsa_transport::webrtc::storage_commitment_bytes_for_signing(
+        let payload = ant_protocol::payment::commitment::commitment_signed_payload(
             &commitment.root,
             commitment.key_count,
             &self.peer,
@@ -345,7 +345,7 @@ impl BrowserTestNode {
             .try_sign_with_seed(
                 &[9; 32],
                 &payload,
-                saorsa_transport::webrtc::DOMAIN_COMMITMENT,
+                ant_protocol::payment::commitment::DOMAIN_COMMITMENT,
             )
             .unwrap()
             .to_vec();
@@ -404,7 +404,7 @@ pub async fn test_cancel_queued_request(endpoint: &str) -> Result<(), JsValue> {
 
 impl BrowserTestNode {
     fn chunk_protocol(&mut self, bytes: &[u8]) -> Vec<u8> {
-        use ant_protocol::evm::{Amount, PaymentQuote, RewardsAddress};
+        use ant_protocol::evm::{PaymentQuote, RewardsAddress};
         use ant_protocol::{
             ChunkGetResponse, ChunkMessage, ChunkMessageBody as Body, ChunkPutResponse,
             ChunkQuoteResponse,
@@ -416,14 +416,14 @@ impl BrowserTestNode {
                 let commitment = self.storage_commitment();
                 let pin = commitment
                     .as_ref()
-                    .and_then(saorsa_transport::webrtc::commitment_hash);
+                    .and_then(ant_protocol::payment::commitment::commitment_hash);
                 let mut quote = PaymentQuote {
                     content: xor_name::XorName(request.address),
                     timestamp: std::time::UNIX_EPOCH
                         + Duration::from_secs((js_sys::Date::now() / 1000.0) as u64),
-                    price: Amount::from(saorsa_transport::webrtc::calculate_price_wei(
-                        self.committed_key_count,
-                    )),
+                    price: ant_protocol::payment::calculate_price(
+                        self.committed_key_count as usize,
+                    ),
                     rewards_address: RewardsAddress::from([0x44; 20]),
                     pub_key: self.public.clone(),
                     signature: Vec::new(),
