@@ -654,9 +654,10 @@ fn cached_merkle_covers_addresses(
 /// proof in `proofs`, and those that don't.
 ///
 /// A partial [`MerkleBatchPaymentResult`] (from a `pay_for_merkle_multi_batch`
-/// where a later sub-batch's payment failed) carries proofs only for the
-/// already-paid sub-batches, so unpaid chunks reach the upload path with no
-/// proof. `upload_merkle_from_spill` reports those as failed via
+/// where a later sub-batch failed) carries proofs only for the sub-batches that
+/// both settled AND produced proofs, so chunks reach the upload path with no
+/// proof. Usually that means they were never paid for, but not always: a
+/// sub-batch settles on-chain before its proofs are generated. `upload_merkle_from_spill` reports those as failed via
 /// [`Error::PartialUpload`] rather than aborting the whole file. Order within
 /// each group follows `addresses`.
 fn partition_addresses_by_proof(
@@ -667,6 +668,78 @@ fn partition_addresses_by_proof(
         .iter()
         .copied()
         .partition(|addr| proofs.contains_key(addr))
+}
+
+/// The clause naming chunks that reached the store path with no merkle proof,
+/// or `None` when every chunk had one.
+///
+/// `payment_refusal` is the storers' verdict when one stopped this upload's
+/// own payment. It goes last, and is scoped before it is quoted: the refusal's
+/// own wording says nothing was charged, which is true of the sub-batch it
+/// refused and false of an upload whose earlier sub-batches already settled —
+/// the CLI prints that spend on the same line. Mirrors
+/// [`settlement_refusal_after_paid_waves`], which does the same job for the
+/// single-node wave path.
+///
+/// Says only that the proof is absent, never that the chunk went unpaid: a
+/// sub-batch settles on-chain before its proofs are generated, so a
+/// proof-generation failure leaves chunks that were charged for and still have
+/// no proof.
+fn proofless_clause(proofless_count: usize, payment_refusal: Option<&str>) -> Option<String> {
+    if proofless_count == 0 {
+        return None;
+    }
+    Some(match payment_refusal {
+        Some(refusal) => format!(
+            "{proofless_count} chunk(s) have no merkle proof because storers refused this \
+             client's settlement version during payment. That refusal covers those chunks; \
+             any spend reported here settled for earlier sub-batches. {refusal}"
+        ),
+        None => format!("{proofless_count} chunk(s) have no merkle proof"),
+    })
+}
+
+/// The `PartialUpload` reason for a merkle upload that ends with failed chunks.
+///
+/// Chunks with no proof were never attempted, so folding them into "short of
+/// quorum after N attempts" reports a failure they did not have and, when a
+/// settlement refusal stopped the payment, replaces the one instruction that
+/// makes the next attempt work. The two groups are reported separately so the
+/// counts still add up to `failed_count`.
+fn merkle_partial_reason(
+    failed_count: usize,
+    proofless_count: usize,
+    total_attempts: usize,
+    payment_refusal: Option<&str>,
+) -> String {
+    let quorum = |n: usize| format!("{n} chunk(s) short of quorum after {total_attempts} attempts");
+    match proofless_clause(proofless_count, payment_refusal) {
+        None => quorum(failed_count),
+        // Saturating because the proof-less chunks are a subset of the failed
+        // ones by construction; if that ever stops holding, under-reporting the
+        // shortfall beats an underflow panic on the error path.
+        Some(proofless) => match failed_count.saturating_sub(proofless_count) {
+            0 => proofless,
+            short => format!("{}; {proofless}", quorum(short)),
+        },
+    }
+}
+
+/// The `PartialUpload` reason for a merkle upload that a store failure aborted.
+///
+/// The abort is the immediate cause and leads, but chunks that arrived with no
+/// proof are a second, independent failure with its own remedy. Reporting only
+/// the abort leaves that remedy in the per-chunk messages, which the CLI does
+/// not print.
+fn merkle_fatal_reason(
+    abort: &str,
+    proofless_count: usize,
+    payment_refusal: Option<&str>,
+) -> String {
+    match proofless_clause(proofless_count, payment_refusal) {
+        Some(proofless) => format!("{abort}; {proofless}"),
+        None => abort.to_string(),
+    }
 }
 
 /// Build a `PartialUpload` after a fatal merkle store error, with accurate
@@ -2424,6 +2497,11 @@ impl Client {
                         &batch_result,
                         &already_stored_addresses,
                         progress.as_ref(),
+                        // The external signer chose which sub-batches to pay.
+                        // A refusal latched by some other operation on this
+                        // client did not cause the gaps it left, and saying so
+                        // would blame the wrong thing.
+                        None,
                     )
                     .await?;
 
@@ -2726,6 +2804,8 @@ impl Client {
                 &batch_result,
                 &stored_addresses,
                 progress,
+                // External-signer payment material; see above.
+                None,
             )
             .await;
         assemble_merkle_finalize_outcome(
@@ -2943,6 +3023,10 @@ impl Client {
                                 cached,
                                 &[],
                                 progress.as_ref(),
+                                // Resumed from a cached receipt: no payment ran
+                                // on this pass, and the cache is only reused
+                                // when it covers every address.
+                                None,
                             )
                             .await?;
                         crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
@@ -3021,6 +3105,8 @@ impl Client {
                             cached,
                             &merkle_plan.already_stored,
                             progress.as_ref(),
+                            // Resumed from a cached receipt; see above.
+                            None,
                         )
                         .await?;
                     crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
@@ -3129,6 +3215,14 @@ impl Client {
                     Err(e) => return Err(e),
                 };
 
+                // Read straight after this upload's own payment returned. A
+                // multi-sub-batch payment that is refused part-way hands back
+                // a partial receipt rather than an error, so the verdict that
+                // stopped it reaches the store path only here. The latch is
+                // empty unless this payment set it: `pay_for_merkle_batch`
+                // refuses before spending whenever one is already present.
+                let payment_refusal = self.corroborated_settlement_refusal();
+
                 let (stored, sc, gc, stats) = self
                     .upload_merkle_from_spill(
                         &spill,
@@ -3136,6 +3230,7 @@ impl Client {
                         &batch_result,
                         &merkle_plan.already_stored,
                         progress.as_ref(),
+                        payment_refusal.as_deref(),
                     )
                     .await?;
                 // Upload succeeded end-to-end; the cached receipt is
@@ -3428,6 +3523,7 @@ impl Client {
         batch_result: &MerkleBatchPaymentResult,
         already_stored_addresses: &[[u8; 32]],
         progress: Option<&mpsc::Sender<UploadEvent>>,
+        payment_refusal: Option<&str>,
     ) -> Result<(usize, String, u128, WaveAggregateStats)> {
         let mut total_stored = already_stored_addresses.len();
         let total_chunks = total_stored + addresses.len();
@@ -3435,24 +3531,34 @@ impl Client {
         let mut failed: Vec<([u8; 32], String)> = Vec::new();
         let mut agg_stats = WaveAggregateStats::default();
 
-        // Chunks without a merkle proof were never paid for: a partial
+        // Chunks without a merkle proof cannot be stored: a partial
         // `pay_for_merkle_multi_batch` result carries proofs only for the
-        // sub-batches whose on-chain payment succeeded. Such a chunk cannot be
-        // stored, so record it as failed (surfaced via `PartialUpload` once the
+        // sub-batches that both settled and produced proofs. Record them as
+        // failed (surfaced via `PartialUpload` once the
         // storable chunks have been attempted) rather than letting its
         // "missing proof" error abort the whole file and discard every other
         // chunk's progress.
         let (to_store, missing_proof) =
             partition_addresses_by_proof(addresses, &batch_result.proofs);
         if !missing_proof.is_empty() {
-            warn!(
-                "{} chunk(s) lack a merkle proof (partial payment); reporting them as failed",
-                missing_proof.len()
-            );
+            match payment_refusal {
+                Some(reason) => warn!(
+                    "{} chunk(s) lack a merkle proof ({reason}); reporting them as failed",
+                    missing_proof.len()
+                ),
+                None => warn!(
+                    "{} chunk(s) lack a merkle proof (partial payment); reporting them as failed",
+                    missing_proof.len()
+                ),
+            }
             for addr in &missing_proof {
+                let hex_addr = hex::encode(addr);
                 failed.push((
                     *addr,
-                    format!("Missing merkle proof for chunk {}", hex::encode(addr)),
+                    match payment_refusal {
+                        Some(reason) => format!("No merkle proof for chunk {hex_addr}: {reason}"),
+                        None => format!("Missing merkle proof for chunk {hex_addr}"),
+                    },
                 ));
             }
         }
@@ -3563,7 +3669,11 @@ impl Client {
                     storage_cost_atto: batch_result.storage_cost_atto.clone(),
                     gas_cost_wei: batch_result.gas_cost_wei,
                 },
-                format!("merkle chunk store aborted: {e}"),
+                merkle_fatal_reason(
+                    &format!("merkle chunk store aborted: {e}"),
+                    missing_proof.len(),
+                    payment_refusal,
+                ),
             ));
         }
 
@@ -3629,7 +3739,11 @@ impl Client {
                         storage_cost_atto: batch_result.storage_cost_atto.clone(),
                         gas_cost_wei: batch_result.gas_cost_wei,
                     },
-                    format!("merkle chunk store aborted: {reason}"),
+                    merkle_fatal_reason(
+                        &format!("merkle chunk store aborted: {reason}"),
+                        missing_proof.len(),
+                        payment_refusal,
+                    ),
                 ));
             }
             failed.extend(dr.failed_addresses);
@@ -3641,8 +3755,14 @@ impl Client {
         if !failed.is_empty() {
             let failed_count = failed.len();
             let total_attempts = 1 + DEFERRED_ROUND_DELAYS_SECS.len();
+            let reason = merkle_partial_reason(
+                failed_count,
+                missing_proof.len(),
+                total_attempts,
+                payment_refusal,
+            );
             warn!(
-                "merkle upload incomplete: {failed_count}/{total_chunks} chunks short of quorum after retries"
+                "merkle upload incomplete: {failed_count}/{total_chunks} chunks failed — {reason}"
             );
             return Err(Error::PartialUpload {
                 stored: stored_addresses,
@@ -3654,9 +3774,7 @@ impl Client {
                     storage_cost_atto: batch_result.storage_cost_atto.clone(),
                     gas_cost_wei: batch_result.gas_cost_wei,
                 }),
-                reason: format!(
-                    "{failed_count} chunk(s) short of quorum after {total_attempts} attempts"
-                ),
+                reason,
             });
         }
 
@@ -4867,6 +4985,135 @@ mod tests {
 
         assert_eq!(to_store, vec![paid_a, paid_c]);
         assert_eq!(missing, vec![unpaid_b, unpaid_d]);
+    }
+
+    /// The real storer wording, as `ant_protocol::client_update_required_message`
+    /// builds it. Used verbatim so the tests exercise the "nothing was charged"
+    /// clause that has to be scoped before it is quoted.
+    fn real_refusal() -> String {
+        ant_protocol::client_update_required_message(1, 2)
+    }
+
+    /// The defect: a multi-batch merkle payment stops when storers refuse this
+    /// client's settlement version, and the chunks its later sub-batches never
+    /// covered reach the store path with no proof. The CLI prints this reason
+    /// and nothing else, so calling them short of quorum after N attempts
+    /// reports a failure they never had and drops the storer's upgrade
+    /// instruction, which is the only thing that makes the next attempt work.
+    #[test]
+    fn the_partial_reason_carries_a_refusal_instead_of_a_bogus_shortfall() {
+        let refusal = real_refusal();
+        assert!(
+            refusal.contains("ant update"),
+            "the storer wording must carry the instruction: {refusal}"
+        );
+
+        // Every failed chunk is one the payment never covered.
+        let all_proofless = merkle_partial_reason(3, 3, 4, Some(&refusal));
+        assert!(all_proofless.contains("ant update"), "{all_proofless}");
+        assert!(
+            !all_proofless.contains("short of quorum"),
+            "{all_proofless}"
+        );
+
+        // Mixed: two with no proof, one genuinely short of quorum. Both halves
+        // survive and the counts still add up to the three that failed.
+        let mixed = merkle_partial_reason(3, 2, 4, Some(&refusal));
+        assert!(mixed.contains("ant update"), "{mixed}");
+        assert!(mixed.contains("2 chunk(s) have no merkle proof"), "{mixed}");
+        assert!(
+            mixed.contains("1 chunk(s) short of quorum after 4 attempts"),
+            "{mixed}"
+        );
+
+        // No refusal: still not a quorum shortfall, just no proof.
+        let silent = merkle_partial_reason(2, 2, 4, None);
+        assert!(!silent.contains("short of quorum"), "{silent}");
+        assert!(
+            silent.contains("2 chunk(s) have no merkle proof"),
+            "{silent}"
+        );
+        assert!(!silent.contains("refused"), "{silent}");
+    }
+
+    /// The storer's wording says nothing was charged. That is true of the
+    /// sub-batch it refused and false of the upload, whose earlier sub-batches
+    /// settled — and the CLI prints that spend on the same line. Quoting it
+    /// unscoped would read as "spent X ... nothing was charged".
+    #[test]
+    fn the_refusal_is_scoped_before_its_nothing_was_charged_clause_is_quoted() {
+        let refusal = real_refusal();
+        assert!(
+            refusal.contains("nothing was charged"),
+            "precondition: {refusal}"
+        );
+
+        let reason = merkle_partial_reason(2, 2, 4, Some(&refusal));
+
+        // The scope has to come BEFORE the quoted refusal, or the reader hits
+        // "nothing was charged" with no qualification.
+        let scope = reason
+            .find("settled for earlier sub-batches")
+            .expect("the reason must scope the refusal");
+        let charged = reason
+            .find("nothing was charged")
+            .expect("the storer wording must still be quoted in full");
+        assert!(scope < charged, "scope must precede the claim: {reason}");
+    }
+
+    /// The ordinary case — every chunk had a proof and simply could not reach
+    /// quorum — must read exactly as it did before.
+    #[test]
+    fn the_partial_reason_is_unchanged_when_every_chunk_had_a_proof() {
+        assert_eq!(
+            merkle_partial_reason(2, 0, 4, None),
+            "2 chunk(s) short of quorum after 4 attempts"
+        );
+        // A refusal is irrelevant when nothing is missing a proof: the
+        // failures really are quorum shortfalls.
+        assert_eq!(
+            merkle_partial_reason(2, 0, 4, Some(&real_refusal())),
+            "2 chunk(s) short of quorum after 4 attempts"
+        );
+    }
+
+    /// A sub-batch settles on-chain BEFORE its proofs are generated, so a
+    /// proof-generation failure leaves chunks that were charged for and have
+    /// no proof. The wording must never claim a proof-less chunk went unpaid,
+    /// or it tells the user their money is safe when it is not.
+    #[test]
+    fn the_reason_never_claims_a_proofless_chunk_went_unpaid() {
+        // The clause the store path contributes, with no storer wording mixed
+        // in, so this asserts on our own words only.
+        let ours = proofless_clause(2, None).expect("two proofless chunks produce a clause");
+        assert_eq!(ours, "2 chunk(s) have no merkle proof");
+        assert!(!ours.contains("paid"), "{ours}");
+        assert!(!ours.contains("charged"), "{ours}");
+
+        assert!(proofless_clause(0, None).is_none());
+        assert!(
+            proofless_clause(0, Some(&real_refusal())).is_none(),
+            "no proofless chunks means no clause, refusal or not"
+        );
+    }
+
+    /// A store abort and a refusal that stopped the payment are independent
+    /// failures with different remedies. The abort is the immediate cause and
+    /// leads, but dropping the other leaves its remedy only in the per-chunk
+    /// messages, which the CLI does not print.
+    #[test]
+    fn a_fatal_store_abort_still_reports_the_refusal() {
+        let abort = "merkle chunk store aborted: connection reset";
+        let refusal = real_refusal();
+
+        let both = merkle_fatal_reason(abort, 5, Some(&refusal));
+        assert!(both.starts_with(abort), "the abort leads: {both}");
+        assert!(both.contains("ant update"), "{both}");
+        assert!(both.contains("5 chunk(s) have no merkle proof"), "{both}");
+
+        // Every chunk had a proof, so there is nothing to add.
+        assert_eq!(merkle_fatal_reason(abort, 0, Some(&refusal)), abort);
+        assert_eq!(merkle_fatal_reason(abort, 0, None), abort);
     }
 
     /// A wave that returns `Ok` contributes its stored chunks, parsed cost, and

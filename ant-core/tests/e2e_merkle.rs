@@ -577,11 +577,30 @@ async fn test_external_merkle_partial_payment_is_partial_upload() {
             stored_count,
             failed_count,
             total_chunks,
+            reason,
             ..
         } => {
             assert_eq!(stored_count, 2, "the paid batch's chunks must store");
             assert_eq!(failed_count, 2, "the unpaid batch's chunks must fail");
             assert_eq!(total_chunks, 4);
+            // The CLI prints this reason and nothing else. Chunks with no proof
+            // were never attempted, so reporting them as short of quorum after
+            // N attempts describes a failure they never had.
+            assert!(
+                reason.contains("2 chunk(s) have no merkle proof"),
+                "proofless chunks must be reported as such, got: {reason}"
+            );
+            assert!(
+                !reason.contains("short of quorum"),
+                "they had no quorum shortfall, got: {reason}"
+            );
+            // The external signer chose not to pay this batch. No settlement
+            // refusal was involved, so the report must not invent one even if
+            // some other operation on this client had latched a verdict.
+            assert!(
+                !reason.contains("refused") && !reason.contains("ant update"),
+                "an unpaid external batch is not a refusal, got: {reason}"
+            );
         }
         other => panic!("expected PartialUpload, got: {other}"),
     }
