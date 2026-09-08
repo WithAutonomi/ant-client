@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binaries as the GitHub release, verified against `SHA256SUMS.txt` and their ML-DSA-65
   signatures during packaging, and published from the release workflow with npm provenance. A
   per-platform companion package guarded by `os`/`cpu` means only one binary is downloaded. The
-  `beta` dist-tag tracks beta releases; `install.sh`, `install.ps1` and the release assets are
-  unchanged. See [`npm/README.md`](npm/README.md).
+  `beta` dist-tag tracks beta releases and `rc` tracks release candidates, so a plain
+  `npm install -g @withautonomi/ant` only ever serves a stable build; `install.sh`, `install.ps1`
+  and the release assets are unchanged. See [`npm/README.md`](npm/README.md).
 - `ant` falls back to a bootstrap peer list compiled into the binary when no
   `bootstrap_peers.toml` is present in the config directory. Priority is unchanged — explicit
   `-b` peers, then a devnet manifest, then the config file, then the embedded list — and an

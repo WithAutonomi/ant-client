@@ -508,20 +508,60 @@ jobs:
           echo "dist_tag=${dist_tag}" >> $GITHUB_OUTPUT
           echo "Publishing ${version} to dist-tag ${dist_tag}"
 
-      - uses: actions/download-artifact@v4
+      # npm sets the `latest` dist-tag on a package's very first publish even when `--tag` names
+      # something else, and later pre-release publishes move only their own tag — so a
+      # pre-release debut would pin `latest` to that first beta, and a plain
+      # `npm install -g @withautonomi/ant` would serve it, until a stable release came along.
+      # (Both behaviours verified against a local registry, 2026-09-08.) The stable channel must
+      # never hand anyone a pre-release, which is exactly what install.sh and `ant update`
+      # already guarantee. So the npm distribution debuts on a stable release; pre-releases
+      # publish only once the package exists and `latest` belongs to a stable version.
+      #
+      # Self-clearing: this skips at most the pre-releases published before the first stable one.
+      - name: decide whether to publish
+        id: gate
         if: steps.creds.outputs.configured == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          DIST_TAG: ${{ steps.meta.outputs.dist_tag }}
+        shell: bash
+        run: |
+          if [ "$DIST_TAG" = "latest" ]; then
+            echo "publish=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Asked of the registry directly rather than via `npm view`, which resolves a version
+          # spec (defaulting to `latest`) and so conflates "no such package" with "no latest tag".
+          status="$(curl -sS -o /dev/null -w '%{http_code}' https://registry.npmjs.org/@withautonomi%2Fant)"
+          case "$status" in
+            200)
+              echo "publish=true" >> $GITHUB_OUTPUT
+              ;;
+            404)
+              echo "::warning title=npm publish skipped::@withautonomi/ant has never been published and ${VERSION} is a pre-release. npm would set the 'latest' dist-tag from this first publish regardless of --tag, making a plain 'npm install -g @withautonomi/ant' serve a pre-release. The npm packages will publish on the next stable release. The GitHub release is unaffected."
+              echo "publish=false" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "::error title=Registry check failed::Unexpected HTTP ${status} from the npm registry while checking whether @withautonomi/ant exists. Refusing to guess."
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/download-artifact@v4
+        if: steps.gate.outputs.publish == 'true'
         with:
           name: signed-releases
           path: artifacts/
 
       - uses: actions/setup-node@v4
-        if: steps.creds.outputs.configured == 'true'
+        if: steps.gate.outputs.publish == 'true'
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
       - name: download ant-keygen
-        if: steps.creds.outputs.configured == 'true'
+        if: steps.gate.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -534,7 +574,7 @@ jobs:
       # trees. Nothing is rebuilt, so the published binaries are byte-identical to the release
       # assets uploaded in the previous job.
       - name: build npm packages
-        if: steps.creds.outputs.configured == 'true'
+        if: steps.gate.outputs.publish == 'true'
         run: |
           npm/build-packages.sh \
             --version "${{ steps.meta.outputs.version }}" \
@@ -543,7 +583,7 @@ jobs:
             --keygen /tmp/ant-keygen
 
       - name: publish packages
-        if: steps.creds.outputs.configured == 'true'
+        if: steps.gate.outputs.publish == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ steps.meta.outputs.version }}
@@ -576,7 +616,7 @@ jobs:
           publish dist/ant
 
       - name: summary
-        if: steps.creds.outputs.configured == 'true'
+        if: steps.gate.outputs.publish == 'true'
         shell: bash
         run: |
           {

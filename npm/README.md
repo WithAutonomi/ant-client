@@ -103,6 +103,44 @@ the same single source of truth.
 The postinstall is kept regardless, because a real file in the config directory is discoverable
 and editable in a way an embedded constant is not.
 
+## dist-tags, and why pre-releases cannot debut the package
+
+The publish job maps the release version onto an npm dist-tag, mirroring `version_matches_channel`
+in `ant-core/src/channel.rs` and `install.sh`: the first dot-separated pre-release identifier
+decides, so `betamax.1` is not mistaken for a beta, and an unrecognised suffix fails the job
+rather than guessing.
+
+| Version | dist-tag | Installed by |
+|---|---|---|
+| `0.3.7` | `latest` | `npm install -g @withautonomi/ant` |
+| `0.3.7-beta.1` | `beta` | `npm install -g @withautonomi/ant@beta` |
+| `0.3.7-rc.1` | `rc` | `npm install -g @withautonomi/ant@rc` |
+
+Release candidates get their own tag because they are cut before the release gates report, and
+nothing installs them today — not `install.sh`, not `ant update` on any channel.
+
+**A pre-release is not allowed to be the package's first publish.** npm sets `latest` from a
+package's very first publish *even when `--tag` names something else*, and later pre-release
+publishes move only their own tag. Verified against a local registry:
+
+```
+first publish of 0.3.7-beta.1 with --tag beta
+  -> {'latest': '0.3.7-beta.1', 'beta': '0.3.7-beta.1'}
+then publish 0.3.8-beta.1 with --tag beta
+  -> {'latest': '0.3.7-beta.1', 'beta': '0.3.8-beta.1'}
+```
+
+So a beta debut would make the plain `npm install -g @withautonomi/ant` serve a beta, and would
+pin `latest` to that one beta until a stable release finally moved it. The stable channel must
+never hand anyone a pre-release — the guarantee `install.sh` and `ant update` already make — so
+the `decide whether to publish` step asks the registry whether the package exists and skips a
+pre-release publish when it does not, with a warning. The condition clears itself: at most the
+pre-releases before the first stable release are skipped, and a later stable publish with
+`--tag latest` reclaims the tag cleanly.
+
+The registry is queried directly rather than through `npm view`, which resolves a version spec
+(defaulting to `latest`) and would conflate "no such package" with "no latest tag".
+
 ## Building the packages
 
 ```sh
