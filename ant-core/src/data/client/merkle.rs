@@ -7,6 +7,7 @@
 use crate::data::client::adaptive::{observe_op, Outcome};
 use crate::data::client::classify_error;
 use crate::data::client::file::UploadEvent;
+use crate::data::client::quote::settlement_refusal_error;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{
@@ -23,12 +24,14 @@ use ant_protocol::payment::{
 use ant_protocol::transport::PeerId;
 use ant_protocol::{
     compute_address, send_and_await_chunk_response, ChunkMessage, ChunkMessageBody,
-    MerkleCandidateQuoteRequest, MerkleCandidateQuoteResponse,
+    MerkleCandidateQuoteRequest, MerkleCandidateQuoteRequestV2, MerkleCandidateQuoteResponse,
+    ProtocolError,
 };
 use bytes::Bytes;
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use rand::Rng;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -160,6 +163,131 @@ fn pool_commitment_with_payment_multiplier(
         })?;
     }
     Ok(commitment)
+}
+
+/// Turn a merkle candidate quote response into the candidate it carries, or
+/// the error that explains why there is none.
+///
+/// Shared by the versioned request and its legacy retry so the two cannot
+/// interpret the same response differently.
+///
+/// `ClientUpdateRequired` is lifted out of the generic protocol-error case
+/// deliberately. It is the one rejection that is about this client rather than
+/// about this request, it already carries wording aimed at the person running
+/// the upload, and it must not be retried in a shape that would get a quote
+/// anyway.
+/// Which failure a fully drained set of candidate pools should report.
+///
+/// Pools are drained rather than short-circuited, so more than one can fail.
+/// A refusal outranks an ordinary failure: if one pool runs out of peers while
+/// another declares this client unable to settle, the second is the answer that
+/// keeps the caller from falling back to a payment path and spending.
+#[derive(Default)]
+struct PoolVerdict {
+    refusal: Option<Error>,
+    first_failure: Option<Error>,
+}
+
+impl PoolVerdict {
+    fn note(&mut self, e: Error) {
+        match e {
+            e @ Error::ClientUpdateRequired(_) => {
+                if self.refusal.is_none() {
+                    self.refusal = Some(e);
+                }
+            }
+            e => {
+                if self.first_failure.is_none() {
+                    self.first_failure = Some(e);
+                }
+            }
+        }
+    }
+
+    fn into_error(self) -> Option<Error> {
+        self.refusal.or(self.first_failure)
+    }
+}
+
+fn map_merkle_candidate_response(
+    peer_id: PeerId,
+    body: ChunkMessageBody,
+) -> Option<Result<(MerklePaymentCandidateNode, Option<Vec<u8>>)>> {
+    match body {
+        ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Success {
+            candidate_node,
+            commitment,
+        }) => match rmp_serde::from_slice::<MerklePaymentCandidateNode>(&candidate_node) {
+            Ok(node) => Some(Ok((node, commitment))),
+            Err(e) => Some(Err(Error::Serialization(format!(
+                "Failed to deserialize candidate node from {peer_id}: {e}"
+            )))),
+        },
+        // Validated, not taken at face value. A refusal is unauthenticated and
+        // two of them latch this client for its whole run, so the merkle path
+        // applies the same coherence check as the single-node one: the echoed
+        // version must be ours and the stated minimum must genuinely exceed it.
+        // Without it, two faulty or hostile candidates could deny every upload
+        // with a refusal that does not describe this client at all.
+        ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(
+            ProtocolError::ClientUpdateRequired {
+                client_settlement_version,
+                min_settlement_version,
+            },
+        )) => Some(Err(settlement_refusal_error(
+            &peer_id,
+            client_settlement_version,
+            min_settlement_version,
+        ))),
+        ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(
+            behind @ ProtocolError::StorerUpdateRequired { .. },
+        )) => Some(Err(Error::StorerUpdateRequired(behind.to_string()))),
+        ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(e)) => {
+            Some(Err(Error::Protocol(format!(
+                "Merkle quote error from {peer_id}: {e}"
+            ))))
+        }
+        _ => None,
+    }
+}
+
+/// Should this failure be retried as an unversioned request?
+///
+/// A storer built before the settlement version existed cannot decode the
+/// versioned request, so it never replies and the send fails at the transport
+/// layer. Any response this client *recognises*, refusal included, means the
+/// storer understood us, and retrying that in an older shape would defeat the
+/// gate.
+///
+/// A reply that decodes but carries a body the mapper does not recognise is
+/// not distinguished: the wait continues and ends in a timeout, so it takes
+/// the fallback too. That is no more than a peer could achieve by saying
+/// nothing, which is why it is bounded by the cutover guard rather than
+/// special-cased here.
+///
+/// # This is a downgrade path, and it is only safe because nothing can be
+/// refused yet
+///
+/// Silence is **not** proof that a peer cannot parse the request. A dropped
+/// response, packet loss, an overloaded peer, or one deliberately discarding
+/// versioned requests all look identical from here. So this predicate can be
+/// provoked, and a peer that provokes it gets asked again without a version.
+///
+/// That is harmless only while no client can be refused on version grounds,
+/// which is exactly the case while `MIN_SUPPORTED_SETTLEMENT_VERSION` is the
+/// first declarable version. The moment the minimum is raised, this becomes a
+/// way to obtain a quote the gate meant to withhold, and then to burn a
+/// payment against it.
+///
+/// The guard below turns "remember to delete the fallback before raising the
+/// minimum" from a comment into a build failure. It lives in
+/// [`crate::data::client::UNVERSIONED_RETRY_REQUIRES_MIN_V1`] and is referenced
+/// from every fallback site, including the independent single-node one in
+/// `quote.rs`, so deleting one path cannot silently leave the other unguarded.
+const _: () = crate::data::client::UNVERSIONED_RETRY_REQUIRES_MIN_V1;
+
+const fn is_version_unaware(error: &Error) -> bool {
+    matches!(error, Error::Network(_) | Error::Timeout(_))
 }
 
 /// Payment mode for uploads.
@@ -561,6 +689,13 @@ impl Client {
         data_type: u32,
         data_size: u64,
     ) -> Result<MerkleBatchPaymentResult> {
+        // A refusal established by any earlier upload on this client stops
+        // this one before it spends. The verdict is about this build, not
+        // about one operation, so an upload that started after another had
+        // already been told the settlement rules are wrong must not pay.
+        if let Some(refusal) = self.corroborated_settlement_refusal() {
+            return Err(Error::ClientUpdateRequired(refusal));
+        }
         let chunk_count = addresses.len();
         if chunk_count < 2 {
             return Err(Error::Payment(
@@ -775,6 +910,13 @@ impl Client {
         data_type: u32,
         data_size: u64,
     ) -> Result<PreparedMerkleBatch> {
+        // A refusal established by any earlier upload on this client stops
+        // this one before it spends. The verdict is about this build, not
+        // about one operation, so an upload that started after another had
+        // already been told the settlement rules are wrong must not pay.
+        if let Some(refusal) = self.corroborated_settlement_refusal() {
+            return Err(Error::ClientUpdateRequired(refusal));
+        }
         ensure_single_merkle_tree_batch(addresses.len())?;
 
         let chunk_count = addresses.len();
@@ -917,6 +1059,33 @@ impl Client {
                         // First sub-batch failed, nothing paid yet -- propagate directly.
                         return Err(e);
                     }
+                    // A storer saying this client cannot settle is terminal
+                    // even mid-batch. Folding it into a partial result would
+                    // report success, hide the upgrade instruction, and leave
+                    // the caller to rediscover the same refusal on its next
+                    // upload. Every remaining sub-batch would be refused the
+                    // same way, so there is nothing to salvage by continuing.
+                    if matches!(e, Error::ClientUpdateRequired(_)) {
+                        // Do NOT return Err here. The caller writes the receipt
+                        // cache only on the Ok path, so failing the call would
+                        // discard proofs for sub-batches whose payment has
+                        // already settled on-chain and cannot be undone. That is
+                        // the very destruction this work exists to stop.
+                        //
+                        // The verdict is not lost by returning the partial
+                        // result: it was latched client-wide when it was
+                        // corroborated, so the next quote collection refuses
+                        // before spending anything and the upgrade instruction
+                        // reaches the user from there.
+                        warn!(
+                            "Merkle sub-batch {}/{total_sub_batches}: storers refused this \
+                             client's settlement version. Returning {} proofs from \
+                             already-paid sub-batches so that spend is not stranded; the \
+                             refusal is latched and will stop the next payment.",
+                            i + 1,
+                            all_proofs.len()
+                        );
+                    }
                     // Return partial result so caller can still store already-paid chunks.
                     warn!(
                         "Merkle sub-batch {}/{total_sub_batches} failed: {e}. \
@@ -973,9 +1142,27 @@ impl Client {
             });
         }
 
+        // Drained rather than short-circuited. Returning on the first error
+        // would drop `pool_futures`, cancelling every pool still in flight, and
+        // one of those may be carrying the second refusal that corroborates a
+        // verdict about this client. A refusal lost that way is a refusal the
+        // latch never sees, and the caller can fall back to wave payment and
+        // spend. This is the same rule the single-node collector follows: stop
+        // making progress, but never drop a verdict that is already in flight.
+        //
+        // A refusal outranks an ordinary failure for the same reason. If one
+        // pool runs out of peers while another declares this client unable to
+        // settle, the second is the answer worth returning.
         let mut pools = Vec::with_capacity(midpoint_proofs.len());
+        let mut verdict = PoolVerdict::default();
         while let Some(result) = pool_futures.next().await {
-            pools.push(result?);
+            match result {
+                Ok(pool) => pools.push(pool),
+                Err(e) => verdict.note(e),
+            }
+        }
+        if let Some(e) = verdict.into_error() {
+            return Err(e);
         }
 
         Ok(pools)
@@ -1022,17 +1209,51 @@ impl Client {
 
         let mut candidate_futures = FuturesUnordered::new();
 
+        let unversioned_peers = self.unversioned_quote_peers();
+        let versioned_capable = self.versioned_quote_capable_handle();
+
         for (peer_id, peer_addrs) in &remote_peers {
             let request_id = self.next_request_id();
-            let request = MerkleCandidateQuoteRequest {
+            // A peer that already failed to answer a versioned request is
+            // asked in the legacy shape directly. Re-probing costs a full
+            // per-peer timeout every time, and a merkle pool asks sixteen
+            // candidates per pool, so against a fleet that predates the
+            // versioned requests the probes dominate the run: measured on this
+            // suite it went from ~24 minutes to past the 60-minute CI cap.
+            // The capable set wins. The two sets are updated under separate
+            // locks, so a slow probe can insert into the legacy set after a
+            // concurrent request has already proved the peer capable; letting
+            // capability win makes that interleaving harmless instead of
+            // permanently preferring the legacy shape.
+            let known_legacy = !versioned_capable
+                .lock()
+                .is_ok_and(|peers| peers.contains(peer_id))
+                && unversioned_peers
+                    .lock()
+                    .is_ok_and(|peers| peers.contains(peer_id));
+
+            let legacy_request = MerkleCandidateQuoteRequest {
                 address: *address,
                 data_type,
                 data_size,
                 merkle_payment_timestamp,
             };
+
+            // Declare the settlement version so a storer can turn us away
+            // before we pay, rather than refusing the payment afterwards.
             let message = ChunkMessage {
                 request_id,
-                body: ChunkMessageBody::MerkleCandidateQuoteRequest(request),
+                body: if known_legacy {
+                    ChunkMessageBody::MerkleCandidateQuoteRequest(legacy_request.clone())
+                } else {
+                    ChunkMessageBody::MerkleCandidateQuoteRequestV2(
+                        MerkleCandidateQuoteRequestV2::new(
+                            *address,
+                            data_size,
+                            merkle_payment_timestamp,
+                        ),
+                    )
+                },
             };
 
             let message_bytes = match message.encode() {
@@ -1043,41 +1264,53 @@ impl Client {
                 }
             };
 
+            // Fallback for the mixed fleet. A storer that predates the
+            // versioned request cannot decode it and simply never answers, so
+            // without this every quote would fail until the whole network had
+            // upgraded. Retried only on a transport-level failure, never on a
+            // refusal: see `is_version_unaware` below.
+            //
+            // Delete this, and the second request id, once the fleet is known
+            // to answer V2.
+            let legacy_request_id = self.next_request_id();
+            let legacy_message_bytes = match (ChunkMessage {
+                request_id: legacy_request_id,
+                body: ChunkMessageBody::MerkleCandidateQuoteRequest(legacy_request),
+            })
+            .encode()
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!("Failed to encode legacy merkle candidate request for {peer_id}: {e}");
+                    continue;
+                }
+            };
+
             let peer_id_clone = *peer_id;
             let addrs_clone = peer_addrs.clone();
             let node_clone = node.clone();
+            let peers_handle = Arc::clone(&unversioned_peers);
+            let capable_handle = Arc::clone(&versioned_capable);
 
             let fut = async move {
+                // First contact waits only long enough to learn whether the
+                // peer can parse the shape. A peer already known to be legacy
+                // gets the caller's full patience, because that request is the
+                // real one rather than a probe.
+                let attempt_timeout = if known_legacy {
+                    timeout
+                } else {
+                    timeout.min(crate::data::client::VERSIONED_QUOTE_PROBE_CEILING)
+                };
+
                 let result = send_and_await_chunk_response(
                     &node_clone,
                     &peer_id_clone,
                     message_bytes,
                     request_id,
-                    timeout,
+                    attempt_timeout,
                     &addrs_clone,
-                    |body| match body {
-                        ChunkMessageBody::MerkleCandidateQuoteResponse(
-                            MerkleCandidateQuoteResponse::Success {
-                                candidate_node,
-                                commitment,
-                            },
-                        ) => {
-                            match rmp_serde::from_slice::<MerklePaymentCandidateNode>(
-                                &candidate_node,
-                            ) {
-                                Ok(node) => Some(Ok((node, commitment))),
-                                Err(e) => Some(Err(Error::Serialization(format!(
-                                    "Failed to deserialize candidate node from {peer_id_clone}: {e}"
-                                )))),
-                            }
-                        }
-                        ChunkMessageBody::MerkleCandidateQuoteResponse(
-                            MerkleCandidateQuoteResponse::Error(e),
-                        ) => Some(Err(Error::Protocol(format!(
-                            "Merkle quote error from {peer_id_clone}: {e}"
-                        )))),
-                        _ => None,
-                    },
+                    |body| map_merkle_candidate_response(peer_id_clone, body),
                     |e| {
                         Error::Network(format!(
                             "Failed to send merkle candidate request to {peer_id_clone}: {e}"
@@ -1090,6 +1323,70 @@ impl Client {
                     },
                 )
                 .await;
+
+                // Any answer at all to the versioned shape proves the peer
+                // can parse it, so it can never later be demoted.
+                // Any recognised answer proves the peer parsed the versioned
+                // shape, including a structured error. Only silence and send
+                // failures leave the question open.
+                let answered = match &result {
+                    Ok(_) => true,
+                    Err(e) => !is_version_unaware(e),
+                };
+                if !known_legacy && answered {
+                    if let Ok(mut peers) = capable_handle.lock() {
+                        peers.insert(peer_id_clone);
+                    }
+                }
+
+                // Silence from a storer means it could not decode the
+                // versioned request, so ask again in the shape it understands.
+                // A storer that answered with a refusal is NOT retried: it
+                // understood us and said no, and asking again without the
+                // version would talk it into quoting a client that cannot pay.
+                let result = match result {
+                    Err(ref e) if is_version_unaware(e) && !known_legacy => {
+                        // Only silence is evidence the peer cannot parse the
+                        // shape. A send failure means the request never
+                        // arrived and teaches nothing, so it must not strand
+                        // the peer in the legacy shape for the whole session.
+                        // Nor may a peer that has answered a versioned request
+                        // before be demoted by one lost response.
+                        let ever_answered = capable_handle
+                            .lock()
+                            .is_ok_and(|peers| peers.contains(&peer_id_clone));
+                        if matches!(e, Error::Timeout(_)) && !ever_answered {
+                            if let Ok(mut peers) = peers_handle.lock() {
+                                peers.insert(peer_id_clone);
+                            }
+                        }
+                        debug!(
+                            "Peer {peer_id_clone} did not answer a versioned merkle quote; \
+                             retrying in the legacy shape"
+                        );
+                        send_and_await_chunk_response(
+                            &node_clone,
+                            &peer_id_clone,
+                            legacy_message_bytes,
+                            legacy_request_id,
+                            timeout,
+                            &addrs_clone,
+                            |body| map_merkle_candidate_response(peer_id_clone, body),
+                            |e| {
+                                Error::Network(format!(
+                                    "Failed to send merkle candidate request to {peer_id_clone}: {e}"
+                                ))
+                            },
+                            || {
+                                Error::Timeout(format!(
+                                    "Timeout waiting for merkle candidate from {peer_id_clone}"
+                                ))
+                            },
+                        )
+                        .await
+                    }
+                    other => other,
+                };
 
                 (peer_id_clone, result)
             };
@@ -1169,6 +1466,33 @@ impl Client {
                         continue;
                     }
                     valid.push((candidate_peer, candidate));
+                }
+                // A storer that has explicitly declared this client
+                // incompatible ends the batch, but only once enough distinct
+                // peers agree. Collecting a corroborated refusal as one more
+                // failed peer would let the pool fill from the remaining
+                // sixteen and go on to pay, which is the burn this mechanism
+                // exists to prevent; acting on a single peer's unauthenticated
+                // word would instead let one hostile responder deny every
+                // upload.
+                Err(e @ Error::ClientUpdateRequired(_)) => {
+                    if let Some(corroborated) =
+                        self.note_settlement_refusal(peer_id, &e.to_string())
+                    {
+                        // Name the corroborators — the below-quorum branch logs
+                        // one peer at a time, so without this line a reader
+                        // cannot tell a two-peer verdict from a one-peer
+                        // misfire (V2-1109).
+                        let corroborators = self.settlement_refusals().corroborating_peers();
+                        warn!(
+                            "Settlement refusal corroborated by {} distinct peers [{}]; aborting before payment",
+                            corroborators.len(),
+                            corroborators.join(", ")
+                        );
+                        return Err(Error::ClientUpdateRequired(corroborated));
+                    }
+                    warn!("Merkle candidate {peer_id} refused this client's settlement version; awaiting corroboration");
+                    failures.push(format!("{peer_id}: {e}"));
                 }
                 Err(e) => {
                     debug!("Failed to get merkle candidate from {peer_id}: {e}");
@@ -3266,5 +3590,102 @@ mod tests {
         assert!(outcome.stored_addresses.is_empty());
         assert!(outcome.failed_addresses.is_empty());
         assert!(outcome.fatal.is_none());
+    }
+
+    // =========================================================================
+    // Settlement refusals on the merkle path
+    // =========================================================================
+
+    /// A refusal is unauthenticated and two of them latch this client for the
+    /// rest of its run, so the merkle path must apply the same coherence check
+    /// the single-node path applies. Without it, two faulty or hostile
+    /// candidates could deny every upload with a refusal that is not about this
+    /// client at all.
+    #[test]
+    fn a_merkle_refusal_that_does_not_describe_this_client_is_ignored() {
+        use ant_protocol::CURRENT_SETTLEMENT_VERSION;
+
+        let peer_id = PeerId::from_bytes([0x71; 32]);
+        let refusal = |client: u32, min: u32| {
+            map_merkle_candidate_response(
+                peer_id,
+                ChunkMessageBody::MerkleCandidateQuoteResponse(
+                    MerkleCandidateQuoteResponse::Error(ProtocolError::ClientUpdateRequired {
+                        client_settlement_version: client,
+                        min_settlement_version: min,
+                    }),
+                ),
+            )
+        };
+
+        // Echoes a version that is not ours: the peer is talking about someone
+        // else's request.
+        let wrong_echo = refusal(
+            CURRENT_SETTLEMENT_VERSION.saturating_add(7),
+            CURRENT_SETTLEMENT_VERSION.saturating_add(8),
+        );
+        assert!(
+            matches!(wrong_echo, Some(Err(Error::Protocol(_)))),
+            "{wrong_echo:?}"
+        );
+
+        // States a minimum this client already meets, so there is nothing to
+        // refuse.
+        let no_gap = refusal(CURRENT_SETTLEMENT_VERSION, CURRENT_SETTLEMENT_VERSION);
+        assert!(
+            matches!(no_gap, Some(Err(Error::Protocol(_)))),
+            "{no_gap:?}"
+        );
+
+        // A coherent one is believed, and still carries the upgrade wording.
+        match refusal(
+            CURRENT_SETTLEMENT_VERSION,
+            CURRENT_SETTLEMENT_VERSION.saturating_add(1),
+        ) {
+            Some(Err(Error::ClientUpdateRequired(msg))) => {
+                assert!(msg.contains("ant update"), "{msg}");
+            }
+            other => panic!("expected ClientUpdateRequired, got {other:?}"),
+        }
+    }
+
+    /// Pools are drained rather than cancelled on the first error, so more than
+    /// one can fail. A refusal has to win: reporting the ordinary failure
+    /// instead would hide the one verdict that stops the caller falling back to
+    /// another payment path and spending.
+    #[test]
+    fn a_refusal_outranks_an_ordinary_pool_failure() {
+        let refusal = || Error::ClientUpdateRequired("run ant update".to_string());
+        let ordinary = || Error::InsufficientPeers("need 16, got 2".to_string());
+
+        // Ordinary failure first, refusal second.
+        let mut verdict = PoolVerdict::default();
+        verdict.note(ordinary());
+        verdict.note(refusal());
+        assert!(
+            matches!(verdict.into_error(), Some(Error::ClientUpdateRequired(_))),
+            "a later refusal must still outrank an earlier failure"
+        );
+
+        // Refusal first, ordinary failure second. Order must not matter.
+        let mut verdict = PoolVerdict::default();
+        verdict.note(refusal());
+        verdict.note(ordinary());
+        assert!(
+            matches!(verdict.into_error(), Some(Error::ClientUpdateRequired(_))),
+            "an earlier refusal must not be displaced by a later failure"
+        );
+
+        // With no refusal, the first ordinary failure is what the caller sees.
+        let mut verdict = PoolVerdict::default();
+        verdict.note(ordinary());
+        verdict.note(Error::Protocol("second".to_string()));
+        assert!(
+            matches!(verdict.into_error(), Some(Error::InsufficientPeers(_))),
+            "the first ordinary failure is the one reported"
+        );
+
+        // Every pool succeeded, so there is nothing to report.
+        assert!(PoolVerdict::default().into_error().is_none());
     }
 }

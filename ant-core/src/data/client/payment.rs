@@ -46,6 +46,13 @@ impl Client {
         data_size: u64,
         data_type: u32,
     ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>)> {
+        // A refusal established by any earlier upload on this client stops
+        // this one before it spends. The verdict is about this build, not
+        // about one operation.
+        if let Some(refusal) = self.corroborated_settlement_refusal() {
+            return Err(Error::ClientUpdateRequired(refusal));
+        }
+
         // Wallet is required for the on-chain payment step (step 4 below).
         // Check early so we don't waste time collecting quotes for a misconfigured client.
         let wallet = self.require_wallet()?;

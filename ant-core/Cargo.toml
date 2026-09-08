@@ -37,6 +37,8 @@ tower-http = { version = "0.6.8", features = ["cors"] }
 # under `ant_protocol::{evm, transport, pqc}`. This is the ONE pin for
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
+# The settlement-version wire types ride the workspace [patch.crates-io]
+# override (root Cargo.toml) until the release train publishes them.
 ant-protocol = "2.3.5"
 xor_name = "5"
 self_encryption = "0.36"

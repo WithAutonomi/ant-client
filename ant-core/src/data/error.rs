@@ -99,6 +99,30 @@ pub enum Error {
     #[error("insufficient peers: {0}")]
     InsufficientPeers(String),
 
+    /// The network refused to quote this client because it settles payments
+    /// under superseded rules.
+    ///
+    /// Deliberately terminal. A client that reaches this would pay an amount
+    /// every storer rejects, and merkle payments are not refundable, so
+    /// retrying or falling back to an older request shape would convert a
+    /// clean refusal into destroyed money. The message is the storer's own
+    /// wording, which already tells the user how to upgrade and that nothing
+    /// has been charged.
+    #[error("{0}")]
+    ClientUpdateRequired(String),
+
+    /// A storer declined to quote because *it* settles under older rules than
+    /// this client.
+    ///
+    /// The opposite of [`Self::ClientUpdateRequired`] and deliberately not
+    /// terminal. Nothing is wrong with this client, so the upload should use a
+    /// different peer and say nothing to the user. During a client-first
+    /// rollout most of the fleet is briefly in this state. If too few peers
+    /// remain the operation fails for lack of quotes, which is the correct
+    /// outcome: it fails before any payment rather than after.
+    #[error("{0}")]
+    StorerUpdateRequired(String),
+
     /// BLS signature verification failed.
     #[error("signature verification failed: {0}")]
     SignatureVerification(String),

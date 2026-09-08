@@ -352,6 +352,16 @@ impl Client {
     ///
     /// Returns an error if quote collection or payment construction fails.
     pub async fn prepare_chunk_payment(&self, content: Bytes) -> Result<Option<PreparedChunk>> {
+        // A refusal established by any earlier upload on this client stops this
+        // one before it quotes. The verdict is about this build, not about one
+        // operation, so the wave path has to honour it exactly as the
+        // single-node path does in `pay_for_storage`. Checked here as well as
+        // at the spend because a prepared chunk is also what the external
+        // signer is handed, and handing one out is telling a user to pay.
+        if let Some(refusal) = self.corroborated_settlement_refusal() {
+            return Err(Error::ClientUpdateRequired(refusal));
+        }
+
         let address = compute_address(&content);
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::InvalidData(format!("content size too large: {e}")))?;
@@ -420,6 +430,13 @@ impl Client {
     ) -> Result<(Vec<PaidChunk>, String, u128)> {
         if prepared.is_empty() {
             return Ok((Vec::new(), "0".to_string(), 0));
+        }
+
+        // Re-checked immediately before the spend, not only at preparation.
+        // Waves are pipelined, so chunks quoted for wave N+1 while wave N is
+        // still storing can have been prepared before a refusal landed.
+        if let Some(refusal) = self.corroborated_settlement_refusal() {
+            return Err(Error::ClientUpdateRequired(refusal));
         }
 
         let wallet = self.require_wallet()?;
