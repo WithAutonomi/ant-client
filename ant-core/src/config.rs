@@ -72,8 +72,8 @@ const EMBEDDED_BOOTSTRAP_PEERS: &str = include_str!("../resources/bootstrap_peer
 
 /// Parse the bootstrap peers compiled into this binary.
 ///
-/// See [`EMBEDDED_BOOTSTRAP_PEERS`]. Returns an empty vector only if the embedded file lists no
-/// parseable addresses, which a unit test guards against.
+/// See the `EMBEDDED_BOOTSTRAP_PEERS` constant. Returns an empty vector only if the embedded
+/// file lists no parseable addresses, which a unit test guards against.
 ///
 /// # Errors
 ///
