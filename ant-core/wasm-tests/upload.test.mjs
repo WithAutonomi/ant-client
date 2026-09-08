@@ -254,7 +254,7 @@ for (const staged of [false, true]) {
   });
 }
 
-test("upload refreshes five-peer discovery and rechecks suppressed witnesses before payment", async () => {
+test("upload fallback uses normal discovery without a WASM-only suppression bypass", async () => {
   const failures = new Set();
   const nodes = Array.from({ length: 7 }, (_, index) => ({
     respond(channel, method) {
@@ -270,13 +270,16 @@ test("upload refreshes five-peer discovery and rechecks suppressed witnesses bef
   const signer = wallet();
   const progress = [];
   try {
-    const result = await client.uploadPublicFile(content, "retry.txt", "text/plain", paymentNetwork, signer.pay, message => progress.push(message));
+    await assert.rejects(
+      client.uploadPublicFile(content, "retry.txt", "text/plain", paymentNetwork, signer.pay, message => progress.push(message)),
+      /only 5\/7 initial PUT peers before payment/,
+    );
     assert.equal(failures.size, 2);
-    assert(progress.some(message => message.includes("rechecking known peers before payment")));
-    assert.equal(signer.calls.length, 1);
-    assert.equal(result.file.replicas, 4);
+    assert(!progress.some(message => message.includes("rechecking known peers before payment")));
+    assert.equal(signer.calls.length, 0);
+    assert.equal(rtc.requests.filter(request => request.method === "put_chunk").length, 0);
     for (const node of failures) {
-      assert(rtc.requests.filter(request => request.node === node && request.method === "find_node").length >= 2);
+      assert.equal(rtc.requests.filter(request => request.node === node && request.method === "find_node").length, 1);
     }
   } finally { client.close(); }
 });
@@ -296,5 +299,21 @@ test("cached endpoints alone never turn a persistent five-peer lookup into payme
     await assert.rejects(upload(client, signer), /only 5\/7 initial PUT peers before payment/);
     assert.equal(signer.calls.length, 0);
     assert.equal(rtc.requests.filter(request => request.method === "put_chunk").length, 0);
+  } finally { client.close(); }
+});
+
+
+test("native seven-peer fallback succeeds when the twenty-peer neighbourhood is unavailable", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    const result = await upload(client, signer);
+    assert.equal(signer.calls.length, 1);
+    assert.equal(result.file.replicas, 4);
+    // Every record first tries width 20, then performs native's width-7
+    // fallback. Both walks use the normal iterative lookup adapter.
+    const lookups = rtc.requests.filter(request => request.method === "find_node");
+    assert.equal(lookups.length, result.records * 14);
   } finally { client.close(); }
 });

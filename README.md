@@ -49,12 +49,12 @@ retry only missing records, immediately once and then after 15 and 45 seconds,
 as native file downloads do. Browser concurrency and range-memory limits remain
 platform-specific ceilings on the shared adaptive scheduler.
 
-Upload discovery uses a shared wide-to-close-group retry before payment. A
-lookup with fewer than seven initial PUT peers triggers a fresh probe; in the
-browser that probe rechecks suppressed endpoints and waits for each request's
-normal deadline instead of the fast lookup grace period. Seven authenticated
-initial peers are still required. Cached addresses alone do not satisfy this
-check, and quote witnessing and storage-majority requirements are unchanged.
+Upload discovery follows native's witnessed lookup contract: request twenty
+initial responders and, if that lookup fails, retry at seven. Both attempts
+use normal iterative lookup, endpoint failure handling, and grace deadlines.
+There is no browser-specific recovery probe or relaxed payment threshold.
+The requested responder count must be satisfied before quote witnessing and
+storage-majority checks proceed.
 
 Browser protocol v5 and browser manifest v6 advertise only the payment chain ID
 and token/vault addresses. RPC providers belong to the application or wallet;

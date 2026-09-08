@@ -826,8 +826,8 @@ impl Client {
         // so fall back to the close-group width — the upload still proceeds with
         // a narrower (but valid) PUT-target set rather than failing.
         let witnessed = crate::quote_policy::discover_put_peers(
-            |width, fresh| async move {
-                if fresh {
+            |width| async move {
+                if width == CLOSE_GROUP_SIZE {
                     debug!(target = %hex::encode(address), "Retrying witnessed discovery at close-group width");
                 }
                 self.network().find_witnessed_close_group_with_view_count(
@@ -835,6 +835,7 @@ impl Client {
                 ).await
             },
             |witnessed| witnessed.initial_closest.len(),
+            |found, width| Error::InsufficientPeers(format!("Witnessed close group initial lookup found {found} peers, need {width}")),
         ).await.map_err(|e| Error::InsufficientPeers(format!(
             "Witnessed close group lookup failed before payment for target {}: {e}", hex::encode(address),
         )))?;
