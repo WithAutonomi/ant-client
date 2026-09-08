@@ -112,7 +112,10 @@ struct PoolEntry {
     last_used: u64,
 }
 
+type DialFailures = Rc<RefCell<crate::client_engine::EndpointFailureCache<String>>>;
+
 struct BrowserClientPool {
+    dial_failures: DialFailures,
     max_clients: usize,
     clients: RefCell<HashMap<String, PoolEntry>>,
     clock: Cell<u64>,
@@ -172,6 +175,12 @@ impl BrowserClientPool {
         }
         let (availability_tx, availability_rx) = mpsc::channel(1);
         Ok(Self {
+            dial_failures: Rc::new(RefCell::new(
+                crate::client_engine::EndpointFailureCache::new(
+                    ENDPOINT_FAILURE_COOLDOWN,
+                    MAX_BROWSER_ENDPOINT_FAILURES,
+                ),
+            )),
             max_clients,
             clients: RefCell::new(HashMap::new()),
             clock: Cell::new(0),
@@ -226,7 +235,9 @@ impl BrowserClientPool {
                         }
                     }
                     if clients.len() < self.max_clients {
-                        let client = Rc::new(BrowserNodeClientCore::new(endpoint.clone()));
+                        let mut client = BrowserNodeClientCore::new(endpoint.clone());
+                        client.dial_failures = Some(Rc::clone(&self.dial_failures));
+                        let client = Rc::new(client);
                         clients.insert(
                             key.clone(),
                             PoolEntry {
@@ -248,6 +259,23 @@ impl BrowserClientPool {
             }
             self.wait_for_availability().await?;
         }
+    }
+
+    fn is_lookup_eligible(&self, peer: &str, endpoint: &BrowserEndpoint) -> bool {
+        // Native allows an existing connection even when its advertised
+        // address is in the dial-failure cache.
+        if self
+            .clients
+            .borrow()
+            .get(&endpoint.multiaddr)
+            .is_some_and(|entry| entry.client.is_connected())
+        {
+            return true;
+        }
+        !self
+            .dial_failures
+            .borrow_mut()
+            .is_suppressed(&peer.to_string(), &endpoint.multiaddr)
     }
 
     fn close(&self) {
@@ -421,6 +449,7 @@ impl Drop for Connection {
 }
 
 pub(super) struct BrowserNodeClientCore {
+    dial_failures: Option<DialFailures>,
     endpoint: WebRtcDirectEndpoint,
     connection: RefCell<Option<Connection>>,
     request_lock: Mutex<()>,
@@ -448,6 +477,7 @@ impl Drop for PendingRequest<'_> {
 impl BrowserNodeClientCore {
     pub(super) fn new(endpoint: WebRtcDirectEndpoint) -> Self {
         Self {
+            dial_failures: None,
             endpoint,
             connection: RefCell::new(None),
             request_lock: Mutex::new(()),
@@ -461,15 +491,40 @@ impl BrowserNodeClientCore {
         self.peer_id.borrow().clone()
     }
 
-    async fn ensure_connected(&self) -> Result<(), String> {
-        let open = self.connection.borrow().as_ref().is_some_and(|connection| {
+    fn is_connected(&self) -> bool {
+        self.connection.borrow().as_ref().is_some_and(|connection| {
             connection.data_channel.ready_state() == RtcDataChannelState::Open
-        });
-        if open {
+        })
+    }
+
+    async fn ensure_connected(&self) -> Result<(), String> {
+        if self.is_connected() {
             return Ok(());
         }
         self.close();
-        let connection = Connection::open(&self.endpoint).await?;
+        if let Some(cache) = &self.dial_failures {
+            if cache
+                .borrow_mut()
+                .is_suppressed(&self.endpoint.peer_id, &self.endpoint.multiaddr)
+            {
+                return Err("WebRTC endpoint is in the failed-connection cache".to_string());
+            }
+        }
+        let connection = match Connection::open(&self.endpoint).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                if let Some(cache) = &self.dial_failures {
+                    cache.borrow_mut().record_failure(
+                        self.endpoint.peer_id.clone(),
+                        self.endpoint.multiaddr.clone(),
+                    );
+                }
+                return Err(error);
+            }
+        };
+        if let Some(cache) = &self.dial_failures {
+            cache.borrow_mut().record_success(&self.endpoint.peer_id);
+        }
         self.connection.replace(Some(connection));
         Ok(())
     }
@@ -817,7 +872,6 @@ struct BrowserNetworkCore {
     seeds: Vec<BrowserEndpoint>,
     pool: Rc<BrowserClientPool>,
     routing: Rc<RefCell<HashMap<LookupKey, BrowserLookupCandidate>>>,
-    failed_endpoints: Rc<RefCell<crate::client_engine::EndpointFailureCache<LookupKey>>>,
 }
 
 impl BrowserNetworkCore {
@@ -840,12 +894,6 @@ impl BrowserNetworkCore {
             seeds,
             pool: Rc::new(BrowserClientPool::new(DEFAULT_MAX_POOLED_CLIENTS)?),
             routing: Rc::new(RefCell::new(HashMap::new())),
-            failed_endpoints: Rc::new(RefCell::new(
-                crate::client_engine::EndpointFailureCache::new(
-                    ENDPOINT_FAILURE_COOLDOWN,
-                    MAX_BROWSER_ENDPOINT_FAILURES,
-                ),
-            )),
         })
     }
 
@@ -945,7 +993,6 @@ impl BrowserNetworkCore {
             views: Rc::clone(&views),
             known_endpoints,
             routing: Rc::clone(&self.routing),
-            failed_endpoints: Rc::clone(&self.failed_endpoints),
         };
         run_iterative_lookup(&mut lookup, &mut query)
             .await
@@ -1091,7 +1138,6 @@ struct BrowserNetworkLookupQuery {
     views: Rc<RefCell<HashMap<LookupKey, Vec<BrowserNode>>>>,
     known_endpoints: HashMap<LookupKey, BrowserEndpoint>,
     routing: Rc<RefCell<HashMap<LookupKey, BrowserLookupCandidate>>>,
-    failed_endpoints: Rc<RefCell<crate::client_engine::EndpointFailureCache<LookupKey>>>,
 }
 
 impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
@@ -1104,10 +1150,9 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
         let Some(endpoint) = candidate.wire.webrtc_direct.as_ref() else {
             return Ok(false);
         };
-        Ok(!self
-            .failed_endpoints
-            .borrow_mut()
-            .is_suppressed(&candidate.peer_id, &endpoint.multiaddr))
+        Ok(self
+            .pool
+            .is_lookup_eligible(&candidate.wire.peer_id, endpoint))
     }
 
     async fn query_batch(
@@ -1120,31 +1165,19 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
         let target = hex::encode(target);
         let attempted = batch
             .iter()
-            .filter_map(|candidate| {
-                candidate
-                    .wire
-                    .webrtc_direct
-                    .as_ref()
-                    .map(|endpoint| (candidate.peer_id, endpoint.multiaddr.clone()))
-            })
-            .collect::<HashMap<_, _>>();
+            .map(|candidate| candidate.peer_id)
+            .collect::<HashSet<_>>();
         let futures: FuturesUnordered<_> = batch
             .into_iter()
             .map(|candidate| {
                 let pool = Rc::clone(&self.pool);
                 let progress = self.progress.clone();
                 let failures = Rc::clone(&self.failures);
-                let failed_endpoints = Rc::clone(&self.failed_endpoints);
                 let views = Rc::clone(&self.views);
                 let target = target.clone();
                 async move {
                     let responder = candidate.peer_id;
                     let peer_id = candidate.wire.peer_id.clone();
-                    let failed_endpoint = candidate
-                        .wire
-                        .webrtc_direct
-                        .as_ref()
-                        .map(|endpoint| endpoint.multiaddr.clone());
                     let result = async {
                         let endpoint = candidate.wire.webrtc_direct.as_ref().ok_or_else(|| {
                             "lookup candidate has no WebRTC Direct endpoint".to_string()
@@ -1162,7 +1195,6 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                     match result {
                         Ok(nodes) => {
                             views.borrow_mut().insert(responder, nodes.clone());
-                            failed_endpoints.borrow_mut().record_success(&responder);
                             progress.report(&format!(
                                 "Iteration {iteration}: {peer_id} returned {} nodes",
                                 nodes.len()
@@ -1185,11 +1217,6 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                             }
                         }
                         Err(error) => {
-                            if let Some(endpoint) = failed_endpoint {
-                                failed_endpoints
-                                    .borrow_mut()
-                                    .record_failure(responder, endpoint);
-                            }
                             progress.report(&format!("Query {peer_id} failed: {error}"));
                             failures.borrow_mut().push(BrowserLookupFailure {
                                 peer_id,
@@ -1208,11 +1235,11 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
             .iter()
             .map(|outcome| *outcome.responder())
             .collect::<HashSet<_>>();
-        for (peer, endpoint) in attempted {
+        for peer in attempted {
             if !responded.contains(&peer) {
-                self.failed_endpoints
-                    .borrow_mut()
-                    .record_failure(peer, endpoint);
+                // A grace-cancelled RPC says nothing about whether dialing
+                // this endpoint works. Native does not poison its dial cache
+                // here; only Connection::open failures populate that cache.
                 let peer_id = hex::encode(peer);
                 let message = "did not respond before the lookup grace period".to_string();
                 self.progress

@@ -69,6 +69,7 @@ export function mockWebRtc(nodes = [{}]) {
       const seed = Number(remote.sdp.match(/m=application (\d+)/)[1]) - 24_000;
       this.channel.index = seed - 1;
       this.channel.options = nodes[seed - 1];
+      if (this.channel.options.connectError) throw new Error(this.channel.options.connectError);
       this.channel.server = new BrowserTestNode(
         seed,
         this.channel.options.alreadyStored ?? false,

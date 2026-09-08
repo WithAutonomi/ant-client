@@ -254,7 +254,7 @@ for (const staged of [false, true]) {
   });
 }
 
-test("upload fallback uses normal discovery without a WASM-only suppression bypass", async () => {
+test("RPC failures remain eligible on native fallback without a special recovery probe", async () => {
   const failures = new Set();
   const nodes = Array.from({ length: 7 }, (_, index) => ({
     respond(channel, method) {
@@ -270,16 +270,13 @@ test("upload fallback uses normal discovery without a WASM-only suppression bypa
   const signer = wallet();
   const progress = [];
   try {
-    await assert.rejects(
-      client.uploadPublicFile(content, "retry.txt", "text/plain", paymentNetwork, signer.pay, message => progress.push(message)),
-      /only 5\/7 initial PUT peers before payment/,
-    );
+    const result = await client.uploadPublicFile(content, "retry.txt", "text/plain", paymentNetwork, signer.pay, message => progress.push(message));
     assert.equal(failures.size, 2);
     assert(!progress.some(message => message.includes("rechecking known peers before payment")));
-    assert.equal(signer.calls.length, 0);
-    assert.equal(rtc.requests.filter(request => request.method === "put_chunk").length, 0);
+    assert.equal(signer.calls.length, 1);
+    assert.equal(result.file.replicas, 4);
     for (const node of failures) {
-      assert.equal(rtc.requests.filter(request => request.node === node && request.method === "find_node").length, 1);
+      assert(rtc.requests.filter(request => request.node === node && request.method === "find_node").length >= 2);
     }
   } finally { client.close(); }
 });
@@ -315,5 +312,72 @@ test("native seven-peer fallback succeeds when the twenty-peer neighbourhood is 
     // fallback. Both walks use the normal iterative lookup adapter.
     const lookups = rtc.requests.filter(request => request.method === "find_node");
     assert.equal(lookups.length, result.records * 14);
+  } finally { client.close(); }
+});
+
+test("a second upload survives four transient FIND_NODE failures without poisoning the client", async () => {
+  const nodes = Array.from({ length: 7 }, () => ({}));
+  const rtc = mockWebRtc(nodes);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    await upload(client, signer);
+    const failed = new Set();
+    for (let index = 0; index < 4; index++) {
+      nodes[index].respond = (channel, method) => {
+        if (method === "find_node" && !failed.has(index)) {
+          failed.add(index);
+          channel.emit(new ArrayBuffer(0));
+          return false;
+        }
+      };
+    }
+    const secondContent = content.slice();
+    secondContent[0] ^= 1;
+    const second = await client.uploadPublicFile(secondContent, "second.txt", "text/plain", paymentNetwork, signer.pay);
+    assert.equal(failed.size, 4);
+    assert.equal(second.file.replicas, 4);
+    assert.equal(signer.calls.length, 2);
+  } finally { client.close(); }
+});
+
+
+test("actual failed connections remain suppressed across upload attempts", async () => {
+  const nodes = Array.from({ length: 7 }, (_, index) => index < 4 ? { connectError: "connection establishment failed" } : {});
+  const rtc = mockWebRtc(nodes);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await assert.rejects(upload(client, signer), /only 3\/7 initial PUT peers before payment/);
+    }
+    for (let node = 0; node < 4; node++) {
+      assert.equal(rtc.connections.filter(connection => connection.channel.index === node).length, 1);
+    }
+    assert.equal(signer.calls.length, 0);
+  } finally { client.close(); }
+});
+
+
+test("a cancelled discovery batch does not suppress reachable endpoints for the next upload", async () => {
+  const nodes = Array.from({ length: 7 }, () => ({}));
+  const rtc = mockWebRtc(nodes);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    await upload(client, signer);
+    let cancelled = false;
+    nodes[0].respond = (channel, method) => {
+      if (method === "find_node" && !cancelled) { cancelled = true; return false; }
+    };
+    // One slow FIND_NODE is cancelled at the normal native five-second grace
+    // deadline. Later normal lookups must still be allowed to dial that peer.
+    await client.findClosest("00".repeat(32));
+    const secondContent = content.slice();
+    secondContent[0] ^= 2;
+    const second = await client.uploadPublicFile(secondContent, "after-grace.txt", "text/plain", paymentNetwork, signer.pay);
+    assert(cancelled);
+    assert.equal(second.file.replicas, 4);
+    assert.equal(signer.calls.length, 2);
   } finally { client.close(); }
 });
