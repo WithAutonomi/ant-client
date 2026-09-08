@@ -78,7 +78,7 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"], o
 # `MultiAddr` mutually incompatible in `node/devnet.rs`. The draft node
 # revision below carries the same reviewed core/transport pins as this
 # workspace and uses the same released ant-protocol lineage.
-ant-node = { version = "0.18.1", git = "https://github.com/WithAutonomi/ant-node.git", rev = "5426952bea27e9acc0ca9dbdba2a519c6cf4517f", optional = true }
+ant-node = { version = "0.18.1", git = "https://github.com/WithAutonomi/ant-node.git", rev = "2b4dd1adb683710cefdf4554312f8a7497a742c2", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # Browser bindings are optional so ordinary native consumers do not pull the
@@ -168,7 +168,7 @@ test-utils = ["dep:fips204"]
 # always compile even without the `devnet` feature. Pinned to the same
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
-ant-node = { version = "0.18.1", git = "https://github.com/WithAutonomi/ant-node.git", rev = "5426952bea27e9acc0ca9dbdba2a519c6cf4517f", features = ["test-utils"] }
+ant-node = { version = "0.18.1", git = "https://github.com/WithAutonomi/ant-node.git", rev = "2b4dd1adb683710cefdf4554312f8a7497a742c2", features = ["test-utils"] }
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
