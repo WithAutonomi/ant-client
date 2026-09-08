@@ -37,17 +37,13 @@ test("GET can recover even when no node answers discovery", async () => {
 });
 
 
-test("fallback is bounded and never accepts a chunk with the wrong hash", async () => {
+test("shared Client rejects corrupt content immediately, matching native GET", async () => {
   const rtc = mockWebRtc(Array.from({ length: 24 }, () => ({ chunk: new Uint8Array([1, 2, 3]), respond: failDiscovery })));
   const client = new BrowserNetworkClient(rtc.endpoints);
   try {
     await assert.rejects(client.openPublicFile(datamap.address), /BLAKE3 mismatch/);
     const gets = rtc.requests.filter(request => request.method === "get_chunk");
-    assert.equal(gets.length, 40, "try at most twenty additional endpoints per native retry sweep");
-    assert.equal(new Set(gets.map(request => request.node)).size, 20, "deduplicate peers within each sweep");
-    for (const node of new Set(gets.map(request => request.node))) {
-      assert.equal(gets.filter(request => request.node === node).length, 2);
-    }
+    assert.equal(gets.length, 1, "native GET treats a verified integrity failure as fatal");
   } finally { client.close(); }
 });
 

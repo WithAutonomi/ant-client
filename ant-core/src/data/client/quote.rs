@@ -9,6 +9,7 @@ use crate::data::client::SettlementRefusals;
 use crate::data::client::PUT_TARGET_WIDTH;
 use crate::data::client::VERSIONED_QUOTE_PROBE_CEILING;
 use crate::data::error::{Error, Result};
+use crate::data::network::send_and_await_chunk_response;
 #[cfg(test)]
 use ant_protocol::compute_address;
 use ant_protocol::evm::{Amount, PaymentQuote};
@@ -20,11 +21,9 @@ use ant_protocol::payment::commitment::{
     commitment_hash, MAX_COMMITMENT_KEY_COUNT, MAX_COMMITMENT_SIDECAR_BYTES,
 };
 use ant_protocol::payment::verify_quote_signature;
-use ant_protocol::transport::{
-    DHTNode, MultiAddr, P2PNode, PeerId, ResponderView, WitnessedCloseGroup,
-};
+use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, ResponderView, WitnessedCloseGroup};
 use ant_protocol::{
-    client_update_required_message, send_and_await_chunk_response, ChunkMessage,
+    client_update_required_message, ChunkMessage,
     ChunkMessageBody, ChunkQuoteRequest, ChunkQuoteRequestV2, ChunkQuoteResponse, ProtocolError,
     CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE, CURRENT_SETTLEMENT_VERSION,
 };
@@ -233,7 +232,7 @@ fn drop_quotes_with_bad_bindings(quotes: &mut Vec<QuotedPeer>) -> usize {
 
 #[allow(clippy::too_many_arguments)]
 async fn request_store_quote_from_peer(
-    node: Arc<P2PNode>,
+    node: crate::data::network::Network,
     peer_id: PeerId,
     peer_addrs: Vec<MultiAddr>,
     request_id: u64,
@@ -1115,7 +1114,7 @@ impl Client {
     ) -> Result<Vec<StoreQuote>> {
         let peer_query_count = remote_peers.len();
 
-        let node = self.network().node();
+        let node = self.network();
 
         debug!(
             "Requesting quotes from up to {peer_query_count} peers for address {} (size: {data_size})",
@@ -1169,7 +1168,7 @@ impl Client {
             let mut quote_futures = FuturesUnordered::new();
             let mut next_peer_index = 0usize;
             let collect_result: std::result::Result<std::result::Result<(), Error>, _> =
-                tokio::time::timeout(overall_timeout, async {
+                crate::runtime::timeout(overall_timeout, async {
                     loop {
                         // Stop launching once the target is met, but keep
                         // draining below. Peers already in flight may yet
@@ -1265,7 +1264,7 @@ impl Client {
             }
 
             let collect_result: std::result::Result<std::result::Result<(), Error>, _> =
-                tokio::time::timeout(overall_timeout, async {
+                crate::runtime::timeout(overall_timeout, async {
                     while let Some((peer_id, addrs, quote_result)) = quote_futures.next().await {
                         record_store_quote_result(
                             peer_id,

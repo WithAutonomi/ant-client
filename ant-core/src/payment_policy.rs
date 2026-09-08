@@ -21,7 +21,6 @@ impl PaymentAmount for u128 {
     }
 }
 
-#[cfg(feature = "native")]
 impl PaymentAmount for ant_protocol::evm::Amount {
     const ZERO: Self = Self::ZERO;
     fn checked_mul_multiplier(self, multiplier: u64) -> Option<Self> {
@@ -132,7 +131,6 @@ mod tests {
             assert_eq!(median_quote_index(&prices), Some(index));
             assert_eq!(plan.paid_quote().quote_index, index);
             assert_eq!(plan.paid_quote().amount, amount);
-            #[cfg(feature = "native")]
             {
                 use ant_protocol::evm::Amount;
                 let native_prices = prices.iter().copied().map(Amount::from).collect::<Vec<_>>();
@@ -178,7 +176,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "native")]
     #[test]
     fn preserves_full_native_amount_range_and_protocol_constants() {
         use ant_protocol::evm::Amount;

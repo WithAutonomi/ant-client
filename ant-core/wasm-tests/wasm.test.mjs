@@ -7,6 +7,7 @@ import {
   decryptPublicFile,
   encryptPublicFile,
   verifyRecord,
+  test_shared_identity_and_timers,
 } from "./pkg/ant_core.js";
 
 const EXPECTED_CHUNK_ADDRESSES = [
@@ -173,4 +174,8 @@ test("streaming WASM encryption emits one externally stageable record at a time"
     ),
     content,
   );
+});
+
+test("WASM uses saorsa-core identity and browser deadlines without a Tokio runtime", async () => {
+  await test_shared_identity_and_timers();
 });

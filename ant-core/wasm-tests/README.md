@@ -45,3 +45,10 @@ Sequential-upload tests reproduce a first success followed by four FIND_NODE
 failures and a 3/7 result; the same client must recover through normal discovery.
 A separate test covers grace-cancelled requests, while actual connection failures
 remain cached across attempts.
+
+The browser network facade now constructs the ordinary `data::Client`. The Rust
+test node decodes native `ant_protocol::ChunkMessage` requests inside encrypted
+WebRTC frames, signs canonical evmlib quotes, and decodes the native payment
+proof on PUT. The fixtures also exercise saorsa-core identity generation,
+export/import, signing, tamper rejection, and browser deadlines without Tokio.
+Native GET's immediate integrity-failure behavior applies to the browser too.

@@ -24,8 +24,8 @@ pub(crate) fn read_targets<P>(
 ) -> Vec<P> {
     let mut primary = candidates.closest;
     let mut known = candidates.known;
-    primary.sort_by_key(|p| saorsa_dht_lookup::xor_distance(&key(p), target));
-    known.sort_by_key(|p| saorsa_dht_lookup::xor_distance(&key(p), target));
+    primary.sort_by_key(|p| ant_protocol::transport::xor_distance(&key(p), target));
+    known.sort_by_key(|p| ant_protocol::transport::xor_distance(&key(p), target));
     let mut seen = HashSet::new();
     primary.retain(|p| seen.insert(key(p)));
     primary.extend(

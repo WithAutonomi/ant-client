@@ -267,12 +267,12 @@ mod wasm {
         chunk_infos, content_address, decrypt_public_file, encrypt_public_file, verify_record,
         BrowserRecord, BrowserRecordInfo, BrowserStagedFile, MAX_BROWSER_FILE_BYTES,
     };
-    use bytes::Bytes;
-    use js_sys::{Array, Function, Promise, Uint8Array};
-    use saorsa_dht_lookup::{
+    use ant_protocol::transport::{
         run_iterative_lookup, IterativeLookup, LookupConfig, LookupKey, LookupNode, LookupQuery,
         LookupQueryOutcome,
     };
+    use bytes::Bytes;
+    use js_sys::{Array, Function, Promise, Uint8Array};
     use serde::{Deserialize, Serialize};
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;

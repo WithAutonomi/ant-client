@@ -8,18 +8,19 @@ use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
 use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
+use crate::data::network::send_and_await_chunk_response;
 use ant_protocol::evm::{QuoteHash, TxHash};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{
-    compute_address, detect_proof_type, send_and_await_chunk_response, ChunkGetRequest,
-    ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, DataChunk,
-    ProofType, ProtocolError, XorName, CLOSE_GROUP_MAJORITY,
+    compute_address, detect_proof_type, ChunkGetRequest, ChunkGetResponse, ChunkMessage,
+    ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, DataChunk, ProofType, ProtocolError,
+    XorName, CLOSE_GROUP_MAJORITY,
 };
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+use web_time::{Duration, Instant};
 
 /// Data type identifier for chunks (used in quote requests).
 const CHUNK_DATA_TYPE: u32 = 0;
@@ -432,7 +433,7 @@ impl Client {
         peer_addrs: &[MultiAddr],
     ) -> Result<XorName> {
         let address = compute_address(&content);
-        let node = self.network().node();
+        let node = self.network();
         let timeout =
             store_response_timeout_for_proof(&proof, self.config().merkle_store_timeout_secs);
         let timeout_secs = timeout.as_secs();
@@ -563,9 +564,7 @@ impl Client {
                     });
                 let known = self
                     .network()
-                    .node()
-                    .dht()
-                    .routing_table_peers()
+                    .known_peers()
                     .await
                     .into_iter()
                     .filter(|node| node.peer_id != *self.network().peer_id())
@@ -584,7 +583,7 @@ impl Client {
                     Error::Timeout(_) | Error::Network(_) | Error::Protocol(_)
                 )
             },
-            tokio::time::sleep,
+            crate::runtime::sleep,
         )
         .await?;
         if let Some(chunk) = &result {
@@ -664,7 +663,7 @@ impl Client {
             }
         };
 
-        if tokio::time::timeout(overall_timeout, collect_results)
+        if crate::runtime::timeout(overall_timeout, collect_results)
             .await
             .is_err()
         {
@@ -690,7 +689,7 @@ impl Client {
         peer: &PeerId,
         peer_addrs: &[MultiAddr],
     ) -> Result<Option<DataChunk>> {
-        let node = self.network().node();
+        let node = self.network();
         let request_id = self.next_request_id();
         let request = ChunkGetRequest::new(*address);
         let message = ChunkMessage {
