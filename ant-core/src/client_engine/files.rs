@@ -22,6 +22,14 @@ impl<E: std::fmt::Display> std::fmt::Display for ReadError<E> {
     }
 }
 
+/// Encode and address a public DataMap using the canonical record format.
+pub(crate) fn public_map_record(map: &DataMap) -> Result<([u8; 32], Bytes), String> {
+    let bytes = rmp_serde::to_vec(map)
+        .map(Bytes::from)
+        .map_err(|e| format!("Failed to serialize DataMap: {e}"))?;
+    Ok((ant_protocol::compute_address(&bytes), bytes))
+}
+
 pub(crate) fn decode_map(bytes: &[u8]) -> Result<DataMap, String> {
     rmp_serde::from_slice(bytes).map_err(|e| format!("Failed to deserialize DataMap: {e}"))
 }

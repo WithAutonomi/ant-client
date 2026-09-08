@@ -10,10 +10,10 @@ use crate::data::client::adaptive::observe_op;
 use crate::data::client::batch::{PaymentIntent, PreparedChunk};
 use crate::data::client::classify_error;
 use crate::data::client::file::{ExternalPaymentInfo, PreparedUpload, Visibility};
-use crate::data::client::merkle::{chunk_contents_for_upload_addresses, PaymentMode};
+use crate::data::client::merkle::PaymentMode;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_protocol::{compute_address, DATA_TYPE_CHUNK};
+use ant_protocol::compute_address;
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use self_encryption::{encrypt, DataMap};
@@ -82,142 +82,37 @@ impl Client {
         content: Bytes,
         mode: PaymentMode,
     ) -> Result<DataUploadResult> {
-        let content_len = content.len();
-        debug!("Encrypting data ({content_len} bytes) with mode {mode:?}");
-
-        let (data_map, encrypted_chunks) = encrypt(content)
-            .map_err(|e| Error::Encryption(format!("Failed to encrypt data: {e}")))?;
-
-        let chunk_count = encrypted_chunks.len();
-        info!("Data encrypted into {chunk_count} chunks");
-
-        let chunk_contents: Vec<Bytes> = encrypted_chunks
+        let (data_map, encrypted) =
+            encrypt(content).map_err(|e| Error::Encryption(e.to_string()))?;
+        let chunks = encrypted
             .into_iter()
             .map(|chunk| chunk.content)
+            .collect::<Vec<_>>();
+        let records = chunks
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| super::upload::UploadRecord {
+                address: compute_address(bytes),
+                size: bytes.len() as u64,
+                index,
+            })
             .collect();
-
-        if self.should_use_merkle(chunk_count, mode) {
-            // Merkle batch payment path
-            info!("Using merkle batch payment for {chunk_count} chunks");
-
-            let chunk_entries: Vec<([u8; 32], u64)> = chunk_contents
-                .iter()
-                .map(|chunk| {
-                    let size = u64::try_from(chunk.len())
-                        .map_err(|e| Error::InvalidData(format!("chunk size too large: {e}")))?;
-                    Ok((compute_address(chunk), size))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let merkle_plan = match self
-                .plan_merkle_upload(chunk_entries, DATA_TYPE_CHUNK, None)
-                .await
-            {
-                Ok(plan) => plan,
-                Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
-                    info!("Merkle preflight needs more peers ({msg}), falling back to wave-batch");
-                    let (addresses, _sc, _gc) = self.batch_upload_chunks(chunk_contents).await?;
-                    return Ok(DataUploadResult {
-                        data_map,
-                        chunks_stored: addresses.len(),
-                        payment_mode_used: PaymentMode::Single,
-                    });
-                }
-                Err(e) => return Err(e),
-            };
-
-            if merkle_plan.to_upload.is_empty() {
-                info!("All {chunk_count} chunks already stored; skipping merkle payment");
-                return Ok(DataUploadResult {
-                    data_map,
-                    chunks_stored: chunk_count,
-                    payment_mode_used: PaymentMode::Merkle,
-                });
-            }
-
-            let chunk_contents =
-                chunk_contents_for_upload_addresses(chunk_contents, &merkle_plan.to_upload)?;
-
-            let remaining_chunks = merkle_plan.to_upload.len();
-            if !self.should_use_merkle(remaining_chunks, mode) {
-                info!(
-                    "{remaining_chunks} chunks need upload after merkle preflight; \
-                     using single-node payment"
-                );
-                let (addresses, _sc, _gc) = self.batch_upload_chunks(chunk_contents).await?;
-                return Ok(DataUploadResult {
-                    data_map,
-                    chunks_stored: merkle_plan.already_stored.len() + addresses.len(),
-                    payment_mode_used: PaymentMode::Single,
-                });
-            }
-
-            // Try merkle batch; in Auto mode, fall back to per-chunk on network issues
-            let batch_result = match self
-                .pay_for_merkle_batch(
-                    &merkle_plan.to_upload,
-                    DATA_TYPE_CHUNK,
-                    merkle_plan.to_upload_avg_size(),
-                )
-                .await
-            {
-                Ok(result) => result,
-                Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
-                    info!("Merkle needs more peers ({msg}), falling back to wave-batch");
-                    let (addresses, _sc, _gc) = self.batch_upload_chunks(chunk_contents).await?;
-                    return Ok(DataUploadResult {
-                        data_map,
-                        chunks_stored: merkle_plan.already_stored.len() + addresses.len(),
-                        payment_mode_used: PaymentMode::Single,
-                    });
-                }
-                Err(e) => return Err(e),
-            };
-
-            let outcome = self
-                .merkle_upload_chunks(
-                    chunk_contents,
-                    merkle_plan.to_upload,
-                    &batch_result,
-                    None,
-                    merkle_plan.already_stored.len(),
-                    chunk_count,
-                )
-                .await?;
-            // Unlike `FileUploadResult`, `DataUploadResult` cannot express a
-            // partial store, and the returned `data_map` is unusable unless
-            // every chunk landed (download fails on any missing chunk). So a
-            // residual shortfall after retries is a hard failure here, not a
-            // success with a quietly broken data map.
-            if outcome.failed > 0 {
-                return Err(Error::InsufficientPeers(format!(
-                    "Data merkle upload incomplete: {} of {} chunk(s) short of quorum after retries",
-                    outcome.failed, chunk_count
-                )));
-            }
-
-            info!(
-                "Data uploaded via merkle: {} chunks stored ({content_len} bytes)",
-                outcome.stored
-            );
-            Ok(DataUploadResult {
-                data_map,
-                chunks_stored: outcome.stored,
-                payment_mode_used: PaymentMode::Merkle,
-            })
-        } else {
-            // Wave-based batch payment path (single EVM tx per wave).
-            let (addresses, _sc, _gc) = self.batch_upload_chunks(chunk_contents).await?;
-
-            info!(
-                "Data uploaded: {} chunks stored ({content_len} bytes original)",
-                addresses.len()
-            );
-            Ok(DataUploadResult {
-                data_map,
-                chunks_stored: addresses.len(),
-                payment_mode_used: PaymentMode::Single,
-            })
-        }
+        let adapter = super::upload::MemoryUploadAdapter {
+            client: self,
+            chunks: &chunks,
+            progress: None,
+            stored_offset: 0,
+            file_total: chunks.len(),
+            resume_key: None,
+        };
+        let outcome = self
+            .upload_records(records, &mut Default::default(), &adapter, mode)
+            .await?;
+        Ok(DataUploadResult {
+            data_map,
+            chunks_stored: outcome.addresses.len(),
+            payment_mode_used: outcome.mode,
+        })
     }
 
     /// Phase 1 of external-signer data upload: encrypt and collect quotes.
@@ -281,11 +176,8 @@ impl Client {
         let data_map_address = match visibility {
             Visibility::Private => None,
             Visibility::Public => {
-                let serialized = rmp_serde::to_vec(&data_map).map_err(|e| {
-                    Error::Serialization(format!("Failed to serialize DataMap: {e}"))
-                })?;
-                let bytes = Bytes::from(serialized);
-                let address = compute_address(&bytes);
+                let (address, bytes) = crate::client_engine::files::public_map_record(&data_map)
+                    .map_err(Error::Serialization)?;
                 info!(
                     "Public upload: bundling DataMap chunk ({} bytes) at address {}",
                     bytes.len(),
@@ -377,15 +269,15 @@ impl Client {
     ///
     /// Returns an error if serialization or the chunk store fails.
     pub async fn data_map_store(&self, data_map: &DataMap) -> Result<[u8; 32]> {
-        let serialized = rmp_serde::to_vec(data_map)
-            .map_err(|e| Error::Serialization(format!("Failed to serialize DataMap: {e}")))?;
+        let (_, serialized) = crate::client_engine::files::public_map_record(data_map)
+            .map_err(Error::Serialization)?;
 
         info!(
             "Storing DataMap as public chunk ({} bytes serialized)",
             serialized.len()
         );
 
-        self.chunk_put(Bytes::from(serialized)).await
+        self.chunk_put(serialized).await
     }
 
     /// Fetch a `DataMap` from the network by its chunk address.

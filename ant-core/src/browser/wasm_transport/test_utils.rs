@@ -444,6 +444,43 @@ impl BrowserTestNode {
                     commitment: commitment.map(|value| rmp_serde::to_vec(&value).unwrap()),
                 })
             }
+            Body::MerkleCandidateQuoteRequest(request) => {
+                self.last_method = "merkle_quote".into();
+                use ant_protocol::evm::MerklePaymentCandidateNode;
+                let commitment = self.storage_commitment();
+                let pin = commitment
+                    .as_ref()
+                    .and_then(ant_protocol::payment::commitment::commitment_hash);
+                let price =
+                    ant_protocol::payment::calculate_price(self.committed_key_count as usize);
+                let rewards = RewardsAddress::from([0x44; 20]);
+                let signed = MerklePaymentCandidateNode::bytes_to_sign(
+                    &price,
+                    &rewards,
+                    request.merkle_payment_timestamp,
+                    self.committed_key_count,
+                    &pin,
+                );
+                let candidate = MerklePaymentCandidateNode {
+                    pub_key: self.public.clone(),
+                    price,
+                    reward_address: rewards,
+                    merkle_payment_timestamp: request.merkle_payment_timestamp,
+                    signature: self
+                        .secret
+                        .try_sign_with_seed(&[8; 32], &signed, b"")
+                        .unwrap()
+                        .to_vec(),
+                    committed_key_count: self.committed_key_count,
+                    commitment_pin: pin,
+                };
+                Body::MerkleCandidateQuoteResponse(
+                    ant_protocol::MerkleCandidateQuoteResponse::Success {
+                        candidate_node: rmp_serde::to_vec(&candidate).unwrap(),
+                        commitment: commitment.map(|value| rmp_serde::to_vec(&value).unwrap()),
+                    },
+                )
+            }
             Body::GetRequest(request) => {
                 self.last_method = "get_chunk".into();
                 let content = self
@@ -465,17 +502,25 @@ impl BrowserTestNode {
             Body::PutRequest(request) => {
                 self.last_method = "put_chunk".into();
                 self.last_put_address = hex::encode(request.address);
-                let (proof, _) = ant_protocol::payment::deserialize_proof(
+                if let Ok(proof) = ant_protocol::payment::deserialize_merkle_proof(
                     request.payment_proof.as_deref().unwrap(),
-                )
-                .unwrap();
-                let mut quotes = proof
-                    .peer_quotes
-                    .iter()
-                    .map(|(_, quote)| quote)
-                    .collect::<Vec<_>>();
-                quotes.sort_by_key(|quote| quote.price);
-                self.last_put_quote_hash = hex::encode(quotes[quotes.len() / 2].hash());
+                ) {
+                    assert!(proof.data_proof.verify());
+                    assert_eq!(proof.address.0, request.address);
+                    self.last_put_quote_hash = hex::encode(proof.winner_pool.hash());
+                } else {
+                    let (proof, _) = ant_protocol::payment::deserialize_proof(
+                        request.payment_proof.as_deref().unwrap(),
+                    )
+                    .unwrap();
+                    let mut quotes = proof
+                        .peer_quotes
+                        .iter()
+                        .map(|(_, quote)| quote)
+                        .collect::<Vec<_>>();
+                    quotes.sort_by_key(|quote| quote.price);
+                    self.last_put_quote_hash = hex::encode(quotes[quotes.len() / 2].hash());
+                }
                 Body::PutResponse(match &self.put_error {
                     Some((code, message)) => ChunkPutResponse::Error(match code.as_str() {
                         "storage_full" => {

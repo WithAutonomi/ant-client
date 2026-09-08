@@ -123,7 +123,7 @@ pub enum BrowserError {
 /// the native chunk protocol.
 #[must_use]
 pub fn content_address(content: &[u8]) -> String {
-    blake3::hash(content).to_hex().to_string()
+    hex::encode(ant_protocol::compute_address(content))
 }
 
 /// Verify raw record bytes against a lowercase or uppercase hexadecimal BLAKE3
@@ -156,14 +156,19 @@ pub fn encrypt_public_file(content: &[u8]) -> Result<BrowserEncryptedFile, Brows
         )));
     }
 
-    let whole_file_hash = content_address(content);
+    let whole_file_hash = blake3::hash(content).to_hex().to_string();
     let (published_data_map, encrypted_chunks) =
         self_encryption::encrypt(Bytes::copy_from_slice(content))
             .map_err(|error| BrowserError::SelfEncryption(error.to_string()))?;
     let root_data_map = {
         let encrypted_by_address = encrypted_chunks
             .iter()
-            .map(|chunk| (*blake3::hash(&chunk.content).as_bytes(), &chunk.content))
+            .map(|chunk| {
+                (
+                    ant_protocol::compute_address(&chunk.content),
+                    &chunk.content,
+                )
+            })
             .collect::<std::collections::HashMap<_, _>>();
         let mut get_local_chunk = |address: self_encryption::XorName| {
             encrypted_by_address
@@ -188,13 +193,14 @@ pub fn encrypt_public_file(content: &[u8]) -> Result<BrowserEncryptedFile, Brows
             content: chunk.content.to_vec(),
         })
         .collect();
-    let encoded_data_map = rmp_serde::to_vec(&published_data_map)
-        .map_err(|error| BrowserError::DataMap(error.to_string()))?;
-    let address = content_address(&encoded_data_map);
+    let (address, encoded_data_map) =
+        crate::client_engine::files::public_map_record(&published_data_map)
+            .map_err(BrowserError::DataMap)?;
+    let address = hex::encode(address);
     let data_map_size = encoded_data_map.len();
     records.push(BrowserRecord {
         address: address.clone(),
-        content: encoded_data_map,
+        content: encoded_data_map.to_vec(),
     });
 
     Ok(BrowserEncryptedFile {
@@ -223,7 +229,7 @@ pub fn decrypt_public_file(
         .map_err(|error| BrowserError::DataMap(error.to_string()))?;
     let available = encrypted_contents
         .iter()
-        .map(|content| *blake3::hash(content).as_bytes())
+        .map(|content| ant_protocol::compute_address(content))
         .collect::<HashSet<_>>();
     for info in data_map.infos() {
         if !available.contains(&info.dst_hash.0) {
@@ -645,6 +651,22 @@ mod wasm {
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
+    /// Decode a confirmed vault event using the native ABI and prepared request.
+    #[wasm_bindgen(js_name = decodeMerklePaymentReceipt)]
+    pub fn decode_merkle_payment_receipt(
+        request: JsValue,
+        vault: &str,
+        logs: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let request = serde_wasm_bindgen::from_value(request)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let logs: Vec<super::payment::PaymentLog> =
+            serde_wasm_bindgen::from_value(logs).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let result = super::payment::decode_merkle_receipt(&request, vault, &logs)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Native `self_encryption` plus public DataMap generation.
     #[wasm_bindgen(js_name = encryptPublicFile)]
     pub fn encrypt_public_file_wasm(content: &[u8]) -> Result<JsValue, JsValue> {
@@ -775,18 +797,18 @@ mod wasm {
                 if self.stream.datamap().is_some() {
                     self.data_map_records.insert(hash.0, content.clone());
                 }
-                return self.serialize_record(hex::encode(hash.0), content.to_vec());
+                return self.serialize_record(content_address(&content), content.to_vec());
             }
 
             let published_data_map = self.stream.datamap().ok_or_else(|| {
                 JsValue::from_str("self-encryption ended before producing a DataMap")
             })?;
-            let encoded = rmp_serde::to_vec(published_data_map).map_err(|error| {
-                JsValue::from_str(&format!("DataMap serialization failed: {error}"))
-            })?;
-            let address = content_address(&encoded);
+            let (address, encoded) =
+                crate::client_engine::files::public_map_record(published_data_map)
+                    .map_err(|error| JsValue::from_str(&error))?;
+            let address = hex::encode(address);
             self.data_map_record_yielded = true;
-            self.serialize_record(address, encoded)
+            self.serialize_record(address, encoded.to_vec())
         }
 
         /// Return upload metadata after `nextRecord` has reached `undefined`.

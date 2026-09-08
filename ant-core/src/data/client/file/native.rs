@@ -1,6 +1,3 @@
-// Copyright 2026 Saorsa Labs Limited
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! File operations using streaming self-encryption.
 //!
 //! Upload files directly from disk without loading them entirely into memory.
@@ -15,17 +12,20 @@
 
 use super::*;
 use crate::data::client::adaptive::observe_op;
-use crate::data::client::batch::{PaymentIntent, WaveAggregateStats};
-use crate::data::client::chunk::ChunkPeerGetResult;
+use crate::data::client::batch::{
+    finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk, WaveAggregateStats, WaveResult,
+};
+use crate::data::client::chunk::{ChunkFetchDiagnostics, ChunkPeerGetResult};
 use crate::data::client::classify_error;
+use crate::data::client::diagnostics::DownloadDiagnosticsSender;
 use crate::data::client::merkle::{
-    chunk_contents_for_upload_addresses, merkle_batch_sizes, merkle_billable_leaves,
+    finalize_merkle_batch, merge_merkle_batch_results, merkle_batch_sizes, merkle_billable_leaves,
     merkle_deferred_retry, merkle_store_with_retry, should_use_merkle, MerkleBatchPaymentResult,
-    PaymentMode, DEFERRED_ROUND_DELAYS_SECS,
+    PaymentMode, PreparedMerkleBatch, DEFERRED_ROUND_DELAYS_SECS,
 };
 use crate::data::client::Client;
 use crate::data::error::{Error, PartialUploadSpend, Result};
-use ant_protocol::evm::{Amount, PaymentQuote};
+use ant_protocol::evm::{Amount, PaymentQuote, QuoteHash, TxHash, MAX_LEAVES};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{compute_address, XorName as ChunkAddress, DATA_TYPE_CHUNK};
 use bytes::Bytes;
@@ -72,10 +72,14 @@ struct FileDownloadFetchContext {
     fetched_ref: Arc<std::sync::atomic::AtomicUsize>,
     progress_ref: Option<mpsc::Sender<DownloadEvent>>,
     peer_reports: Option<Arc<Mutex<Vec<RecordedFileChunkPeerSweep>>>>,
+    /// Optional runtime-gated download diagnostics sender. `None` when
+    /// `--download-diagnostics` was not passed, so the chunk-fetch path
+    /// skips all record construction and allocation.
+    diagnostics: Option<DownloadDiagnosticsSender>,
 }
 
 /// Number of chunks per upload wave (matches batch.rs PAYMENT_WAVE_SIZE).
-const UPLOAD_WAVE_SIZE: usize = 64;
+const UPLOAD_WAVE_SIZE: usize = super::super::batch::PAYMENT_WAVE_SIZE;
 
 /// Hard ceiling on chunk bodies held in memory at once by the merkle whole-file
 /// store fan-out (`upload_merkle_from_spill`). Each in-flight store holds one
@@ -85,10 +89,12 @@ const UPLOAD_WAVE_SIZE: usize = 64;
 /// permits `adaptive.max.store` above 64), so the fan-out clamps its cap here to
 /// keep a high configured max from pinning gigabytes of chunk bodies (PR #137
 /// review). Throughput is unaffected at the default cap, which is already 64.
+#[cfg(test)]
 const MERKLE_STORE_MAX_IN_FLIGHT: usize = 64;
 
 /// The merkle whole-file store fan-out concurrency: the adaptive store cap,
 /// clamped to [`MERKLE_STORE_MAX_IN_FLIGHT`] (memory bound) and floored at 1.
+#[cfg(test)]
 fn merkle_store_cap(limiter_current: usize) -> usize {
     limiter_current.clamp(1, MERKLE_STORE_MAX_IN_FLIGHT)
 }
@@ -113,6 +119,12 @@ const DOWNLOAD_STREAM_BATCH_BYTES_PER_CHUNK_MULTIPLIER: u64 = 3;
 /// `AlreadyStored` retry path, which only matters when many leading chunks
 /// of a file already live on the network.
 const ESTIMATE_SAMPLE_CAP: usize = 5;
+
+/// First normal-path diagnostic fetch attempt.
+const FIRST_DIAGNOSTIC_FETCH_ATTEMPT: usize = 1;
+
+/// Deferred retry attempt number for retry round 0.
+const DEFERRED_RETRY_ATTEMPT_OFFSET: usize = 2;
 
 /// Pick up to `cap` chunk indices spread evenly across `[0, total)`, always
 /// including the first and last chunk.
@@ -509,6 +521,16 @@ impl ChunkSpill {
         Ok(Bytes::from(data))
     }
 
+    /// Read the bodies for `addresses` back from disk, in the given order.
+    fn read_chunks(&self, addresses: &[[u8; 32]]) -> Result<Vec<Bytes>> {
+        addresses.iter().map(|addr| self.read_chunk(addr)).collect()
+    }
+
+    /// Read every spilled body back, in insertion order.
+    fn read_all_chunks(&self) -> Result<Vec<Bytes>> {
+        self.read_chunks(&self.addresses)
+    }
+
     /// Clean up the spill directory.
     fn cleanup(&self) {
         if let Err(e) = std::fs::remove_dir_all(&self.dir) {
@@ -526,6 +548,7 @@ impl Drop for ChunkSpill {
     }
 }
 
+#[cfg(test)]
 fn cached_merkle_covers_addresses(
     cached: &MerkleBatchPaymentResult,
     addresses: &[[u8; 32]],
@@ -539,11 +562,13 @@ fn cached_merkle_covers_addresses(
 /// proof in `proofs`, and those that don't.
 ///
 /// A partial [`MerkleBatchPaymentResult`] (from a `pay_for_merkle_multi_batch`
-/// where a later sub-batch's payment failed) carries proofs only for the
-/// already-paid sub-batches, so unpaid chunks reach the upload path with no
-/// proof. `upload_merkle_from_spill` reports those as failed via
+/// where a later sub-batch failed) carries proofs only for the sub-batches that
+/// both settled AND produced proofs, so chunks reach the upload path with no
+/// proof. Usually that means they were never paid for, but not always: a
+/// sub-batch settles on-chain before its proofs are generated. `upload_merkle_from_spill` reports those as failed via
 /// [`Error::PartialUpload`] rather than aborting the whole file. Order within
 /// each group follows `addresses`.
+#[cfg(test)]
 fn partition_addresses_by_proof(
     addresses: &[[u8; 32]],
     proofs: &HashMap<[u8; 32], Vec<u8>>,
@@ -552,6 +577,78 @@ fn partition_addresses_by_proof(
         .iter()
         .copied()
         .partition(|addr| proofs.contains_key(addr))
+}
+
+/// The clause naming chunks that reached the store path with no merkle proof,
+/// or `None` when every chunk had one.
+///
+/// `payment_refusal` is the storers' verdict when one stopped this upload's
+/// own payment. It goes last, and is scoped before it is quoted: the refusal's
+/// own wording says nothing was charged, which is true of the sub-batch it
+/// refused and false of an upload whose earlier sub-batches already settled —
+/// the CLI prints that spend on the same line. Mirrors
+/// [`settlement_refusal_after_paid_waves`], which does the same job for the
+/// single-node wave path.
+///
+/// Says only that the proof is absent, never that the chunk went unpaid: a
+/// sub-batch settles on-chain before its proofs are generated, so a
+/// proof-generation failure leaves chunks that were charged for and still have
+/// no proof.
+fn proofless_clause(proofless_count: usize, payment_refusal: Option<&str>) -> Option<String> {
+    if proofless_count == 0 {
+        return None;
+    }
+    Some(match payment_refusal {
+        Some(refusal) => format!(
+            "{proofless_count} chunk(s) have no merkle proof because storers refused this \
+             client's settlement version during payment. That refusal covers those chunks; \
+             any spend reported here settled for earlier sub-batches. {refusal}"
+        ),
+        None => format!("{proofless_count} chunk(s) have no merkle proof"),
+    })
+}
+
+/// The `PartialUpload` reason for a merkle upload that ends with failed chunks.
+///
+/// Chunks with no proof were never attempted, so folding them into "short of
+/// quorum after N attempts" reports a failure they did not have and, when a
+/// settlement refusal stopped the payment, replaces the one instruction that
+/// makes the next attempt work. The two groups are reported separately so the
+/// counts still add up to `failed_count`.
+fn merkle_partial_reason(
+    failed_count: usize,
+    proofless_count: usize,
+    total_attempts: usize,
+    payment_refusal: Option<&str>,
+) -> String {
+    let quorum = |n: usize| format!("{n} chunk(s) short of quorum after {total_attempts} attempts");
+    match proofless_clause(proofless_count, payment_refusal) {
+        None => quorum(failed_count),
+        // Saturating because the proof-less chunks are a subset of the failed
+        // ones by construction; if that ever stops holding, under-reporting the
+        // shortfall beats an underflow panic on the error path.
+        Some(proofless) => match failed_count.saturating_sub(proofless_count) {
+            0 => proofless,
+            short => format!("{}; {proofless}", quorum(short)),
+        },
+    }
+}
+
+/// The `PartialUpload` reason for a merkle upload that a store failure aborted.
+///
+/// The abort is the immediate cause and leads, but chunks that arrived with no
+/// proof are a second, independent failure with its own remedy. Reporting only
+/// the abort leaves that remedy in the per-chunk messages, which the CLI does
+/// not print.
+fn merkle_fatal_reason(
+    abort: &str,
+    proofless_count: usize,
+    payment_refusal: Option<&str>,
+) -> String {
+    match proofless_clause(proofless_count, payment_refusal) {
+        Some(proofless) => format!("{abort}; {proofless}"),
+        None => abort.to_string(),
+    }
 }
 
 /// Build a `PartialUpload` after a fatal merkle store error, with accurate
@@ -601,9 +698,243 @@ fn partial_upload_after_fatal(
     }
 }
 
+/// Require every sub-batch of a *resumable* merkle finalize to be paid.
+///
+/// A [`MerkleFinalizeResume`] re-drives storage against the proofs folded at
+/// finalize time and accepts no new payment material, so a chunk whose
+/// sub-batch was never paid could never acquire a proof on resume: every
+/// [`Client::finalize_resume`] call would report it as missing-proof again and
+/// the handle would never drain to [`FinalizeOutcome::Complete`]. Rejecting
+/// partial payment up front keeps resume handles always drainable. A caller
+/// that intends to pay only some sub-batches must use the non-resumable
+/// [`Client::finalize_upload_merkle_multi`], which surfaces the unpaid chunks
+/// through [`Error::PartialUpload`] (ADR-0003).
+fn require_fully_paid_for_resumable(winner_pool_hashes: &[Option<[u8; 32]>]) -> Result<()> {
+    let unpaid = winner_pool_hashes.iter().filter(|h| h.is_none()).count();
+    if unpaid > 0 {
+        return Err(Error::Payment(format!(
+            "{unpaid}/{} sub-batch(es) unpaid: the resumable finalize requires every \
+             sub-batch to be paid, because a resume handle cannot acquire proofs for \
+             unpaid chunks and would never drain to Complete. Pay every sub-batch, or \
+             use finalize_upload_merkle_multi() to finalize a partial payment (its \
+             unpaid chunks are reported through PartialUpload).",
+            winner_pool_hashes.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Fold the per-batch winner hashes of an external merkle upload into one
+/// combined payment receipt.
+///
+/// Validates that `winner_pool_hashes` aligns with `prepared_batches` (one
+/// entry per batch, in order), requires at least one paid batch, finalizes
+/// each paid batch, and merges the receipts the way the wallet path folds
+/// its sub-batch payments. Unpaid (`None`) batches contribute no proofs, so
+/// the store phase reports their chunks through [`Error::PartialUpload`]
+/// (ADR-0003) — the resumable path rejects them up front instead
+/// ([`require_fully_paid_for_resumable`]).
+fn fold_external_merkle_payments(
+    prepared_batches: Vec<PreparedMerkleBatch>,
+    winner_pool_hashes: Vec<Option<[u8; 32]>>,
+) -> Result<MerkleBatchPaymentResult> {
+    let batch_count = prepared_batches.len();
+    if winner_pool_hashes.len() != batch_count {
+        return Err(Error::Payment(format!(
+            "Expected {batch_count} winner pool hash entries (one per \
+             prepared sub-batch), got {}.",
+            winner_pool_hashes.len()
+        )));
+    }
+
+    let mut paid = Vec::with_capacity(batch_count);
+    let mut unpaid_batches = 0usize;
+    for (batch, hash) in prepared_batches.into_iter().zip(winner_pool_hashes) {
+        match hash {
+            Some(h) => paid.push(finalize_merkle_batch(batch, h)?),
+            None => unpaid_batches += 1,
+        }
+    }
+    if paid.is_empty() {
+        return Err(Error::Payment(
+            "No merkle sub-batch was paid — nothing to finalize. \
+             Pay at least one batch or drop the prepared upload."
+                .to_string(),
+        ));
+    }
+    if unpaid_batches > 0 {
+        warn!(
+            "External merkle finalize: {unpaid_batches}/{batch_count} sub-batch(es) \
+             unpaid; their chunks will be reported as failed"
+        );
+    }
+    Ok(merge_merkle_batch_results(paid))
+}
+
+/// Assemble the outcome of one external-signer merkle store pass into
+/// [`FinalizeOutcome`]. Pure (no `self`/network) so the resume-handoff contract
+/// is unit-testable.
+///
+/// `Ok` from the store becomes [`FinalizeOutcome::Complete`]. A recoverable
+/// [`Error::PartialUpload`] becomes [`FinalizeOutcome::Partial`], moving the
+/// retained spill and proofs into a [`MerkleFinalizeResume`] whose
+/// `unstored_addresses` are the failed chunks (to store next) and whose
+/// `stored_addresses` is the cumulative stored set (carried forward as the next
+/// attempt's already-stored input). Any other error is fatal and propagates
+/// unchanged.
+fn assemble_merkle_finalize_outcome(
+    store_result: Result<(usize, String, u128, WaveAggregateStats)>,
+    data_map: DataMap,
+    data_map_address: Option<[u8; 32]>,
+    total_chunks: usize,
+    chunk_store: ExternalChunkStore,
+    batch_result: MerkleBatchPaymentResult,
+) -> Result<FinalizeOutcome> {
+    match store_result {
+        Ok((chunks_stored, _storage_cost, _gas_cost, stats)) => {
+            info!("External-signer merkle upload finalized: {chunks_stored} chunks stored");
+            Ok(FinalizeOutcome::Complete(FileUploadResult {
+                data_map,
+                chunks_stored,
+                chunks_failed: 0,
+                total_chunks,
+                payment_mode_used: PaymentMode::Merkle,
+                // The external signer pays on-chain out-of-band, so the spend
+                // is unknown to the library here.
+                storage_cost_atto: "0".into(),
+                gas_cost_wei: 0,
+                data_map_address,
+                chunk_attempts_total: stats.chunk_attempts_total,
+                store_durations_ms: stats.store_durations_ms,
+                retries_histogram: stats.retries_histogram,
+            }))
+        }
+        Err(Error::PartialUpload {
+            stored,
+            stored_count,
+            failed,
+            failed_count,
+            spend,
+            ..
+        }) => {
+            // Recoverable: retain the spill and the already-signed proofs so the
+            // caller can drain the remainder against the same payment.
+            let unstored_addresses: Vec<[u8; 32]> = failed.iter().map(|(addr, _)| *addr).collect();
+            let result = FileUploadResult {
+                data_map: data_map.clone(),
+                chunks_stored: stored_count,
+                chunks_failed: failed_count,
+                total_chunks,
+                payment_mode_used: PaymentMode::Merkle,
+                storage_cost_atto: spend.storage_cost_atto.clone(),
+                gas_cost_wei: spend.gas_cost_wei,
+                data_map_address,
+                // Per-attempt store telemetry is not carried on a partial.
+                chunk_attempts_total: 0,
+                store_durations_ms: Vec::new(),
+                retries_histogram: [0; 4],
+            };
+            let resume = MerkleFinalizeResume {
+                data_map,
+                data_map_address,
+                total_chunks,
+                chunk_store,
+                unstored_addresses,
+                batch_result,
+                // Cumulative stored set (already-stored + stored this pass),
+                // carried forward as the next attempt's already-stored input.
+                stored_addresses: stored,
+            };
+            Ok(FinalizeOutcome::Partial {
+                result,
+                resume: FinalizeResume::Merkle(Box::new(resume)),
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Assemble the outcome of one wave-batch external store pass into
+/// [`FinalizeOutcome`]. Pure (no `self`/network) so the resume-handoff contract
+/// is unit-testable.
+///
+/// `retained` maps every paid chunk's address to its [`PaidChunk`] (body +
+/// proof + PUT targets). If [`WaveResult`] reports no failures the result is
+/// [`FinalizeOutcome::Complete`]; otherwise the failed chunks' [`PaidChunk`]s
+/// are pulled out of `retained` into a [`WaveFinalizeResume`] so the caller can
+/// re-store just those against the same payment — the store never returns an
+/// `Err` for a partial, so this function is infallible.
+fn assemble_wave_finalize_outcome(
+    wave_result: WaveResult,
+    mut retained: HashMap<[u8; 32], PaidChunk>,
+    data_map: DataMap,
+    data_map_address: Option<[u8; 32]>,
+    total_chunks: usize,
+    already_stored_count: usize,
+    storage_cost_atto: String,
+) -> FinalizeOutcome {
+    let stored_count = already_stored_count + wave_result.stored.len();
+    if wave_result.failed.is_empty() {
+        info!("External-signer upload finalized: {stored_count} chunks stored");
+        let mut stats = WaveAggregateStats::default();
+        stats.absorb(&wave_result);
+        return FinalizeOutcome::Complete(FileUploadResult {
+            data_map,
+            chunks_stored: stored_count,
+            chunks_failed: 0,
+            total_chunks,
+            payment_mode_used: PaymentMode::Single,
+            // Storage spend is known from the payment intent; gas is paid by the
+            // external signer out-of-band (unknown here).
+            storage_cost_atto,
+            gas_cost_wei: 0,
+            data_map_address,
+            chunk_attempts_total: stats.chunk_attempts_total,
+            store_durations_ms: stats.store_durations_ms,
+            retries_histogram: stats.retries_histogram,
+        });
+    }
+
+    // Recoverable: pull the already-paid chunks that still need storing back out
+    // so the caller can re-store them against the same payment.
+    let failed_count = wave_result.failed.len();
+    let failed_paid_chunks: Vec<PaidChunk> = wave_result
+        .failed
+        .iter()
+        .filter_map(|(addr, _)| retained.remove(addr))
+        .collect();
+    let result = FileUploadResult {
+        data_map: data_map.clone(),
+        chunks_stored: stored_count,
+        chunks_failed: failed_count,
+        total_chunks,
+        payment_mode_used: PaymentMode::Single,
+        storage_cost_atto: storage_cost_atto.clone(),
+        gas_cost_wei: 0,
+        data_map_address,
+        // Per-attempt store telemetry is not carried on a partial.
+        chunk_attempts_total: 0,
+        store_durations_ms: Vec::new(),
+        retries_histogram: [0; 4],
+    };
+    let resume = WaveFinalizeResume {
+        data_map,
+        data_map_address,
+        total_chunks,
+        stored_count,
+        failed_paid_chunks,
+        storage_cost_atto,
+    };
+    FinalizeOutcome::Partial {
+        result,
+        resume: FinalizeResume::Wave(Box::new(resume)),
+    }
+}
+
 /// One wave's contribution to a single-node upload, distilled from its
 /// `batch_upload_chunks_with_events` result.
 #[derive(Debug)]
+#[cfg(test)]
 struct SingleWaveOutcome {
     /// Addresses confirmed stored in this wave.
     stored: Vec<[u8; 32]>,
@@ -628,6 +959,7 @@ struct SingleWaveOutcome {
 /// returned via `Err` to abort the file. Because `UPLOAD_WAVE_SIZE ==
 /// PAYMENT_WAVE_SIZE`, each batch call is exactly one payment wave, so folding a
 /// `PartialUpload` leaves nothing un-attempted within the wave.
+#[cfg(test)]
 fn fold_single_wave(
     result: Result<(Vec<[u8; 32]>, String, u128, WaveAggregateStats)>,
 ) -> Result<SingleWaveOutcome> {
@@ -652,6 +984,56 @@ fn fold_single_wave(
             stats: WaveAggregateStats::default(),
         }),
         Err(e) => Err(e),
+    }
+}
+
+/// Shape a corroborated settlement refusal that landed on a wave **after** an
+/// earlier wave had already paid and stored.
+///
+/// The refusal is terminal for this build, but by wave two or later it is no
+/// longer true that nothing was charged: the single-node path pays each wave
+/// before storing it, so the earlier waves' spend has settled on-chain. Bare
+/// `ClientUpdateRequired` would report the upload as costing nothing and drop
+/// the stored set a resume needs, so the refusal is surfaced as a
+/// `PartialUpload` carrying the real spend and the stored chunks, with the
+/// storer's upgrade instruction kept in the reason. Every remaining chunk is
+/// listed as failed: none of it was quoted, let alone paid for.
+#[allow(clippy::too_many_arguments)]
+fn settlement_refusal_after_paid_waves(
+    refusal: &str,
+    wave_num: usize,
+    wave_count: usize,
+    stored_addresses: Vec<[u8; 32]>,
+    total_stored: usize,
+    remaining: &[[u8; 32]],
+    total_chunks: usize,
+    total_storage: Amount,
+    total_gas: u128,
+) -> Error {
+    let remaining_count = remaining.len();
+    let refused_note = format!(
+        "not quoted: storers refused this client's settlement version at wave \
+         {wave_num}/{wave_count}"
+    );
+    let failed: Vec<([u8; 32], String)> = remaining
+        .iter()
+        .map(|addr| (*addr, refused_note.clone()))
+        .collect();
+    Error::PartialUpload {
+        stored: stored_addresses,
+        stored_count: total_stored,
+        failed,
+        failed_count: remaining_count,
+        total_chunks,
+        spend: Box::new(PartialUploadSpend {
+            storage_cost_atto: total_storage.to_string(),
+            gas_cost_wei: total_gas,
+        }),
+        reason: format!(
+            "storers refused this client's settlement version at wave {wave_num}/{wave_count}: \
+             the {total_stored} chunk(s) in earlier wave(s) were already paid for and stored, \
+             and the remaining {remaining_count} chunk(s) were neither quoted nor paid. {refusal}"
+        ),
     }
 }
 
@@ -762,6 +1144,221 @@ fn adaptive_stream_decrypt_batch_size(
     };
 
     requested.min(total_chunks.max(1)).max(1)
+}
+
+/// Payment information for external signing — either wave-batch or merkle.
+// ADR-0004 added the signed commitment fields (`committed_key_count`,
+// `commitment_pin`) to the merkle candidate quotes carried inside
+// `PreparedMerkleBatch`, which grew the `Merkle` variant past the
+// `large_enum_variant` threshold. This enum is constructed one-off per payment
+// (never held in bulk collections), so the size delta is harmless; allow it
+// rather than box a field on the security-sensitive merkle-finalize path.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum ExternalPaymentInfo {
+    /// Wave-batch: individual (quote_hash, rewards_address, amount) tuples.
+    WaveBatch {
+        /// Chunks ready for payment (needed for finalize).
+        prepared_chunks: Vec<PreparedChunk>,
+        /// Payment intent for external signing.
+        payment_intent: PaymentIntent,
+    },
+    /// Merkle: one on-chain payment call per prepared sub-batch.
+    Merkle {
+        /// The prepared merkle sub-batches, in address order (public fields
+        /// sent to the frontend, private fields stay in Rust). The external
+        /// signer submits one `payForMerkleTree` transaction per batch;
+        /// finalize takes one winner hash per batch in the same order
+        /// (ADR-0003). A fresh upload below `MAX_LEAVES` chunks prepares as
+        /// exactly one batch, so single-payment consumers keep working
+        /// until they exceed it.
+        prepared_batches: Vec<PreparedMerkleBatch>,
+        /// Bodies of the chunks that still need upload, held in the
+        /// encryption spill on disk — NOT resident in memory (ADR-0003).
+        chunk_store: ExternalChunkStore,
+        /// Chunk addresses that still need upload after the preflight check.
+        chunk_addresses: Vec<[u8; 32]>,
+    },
+}
+
+/// Opaque on-disk store of the chunk bodies carried by a prepared external
+/// merkle upload.
+///
+/// Wraps the encryption spill: bodies stay on disk from prepare until
+/// finalize reads them back ≤ store-cap at a time, so peak RAM for the
+/// external path matches the wallet path's ~256 MB bound instead of the file
+/// size (ADR-0003). The spill directory lives exactly as long as this value:
+/// dropping the `PreparedUpload` (e.g. a consumer's session TTL expiring or
+/// an explicit cancel) removes it from disk.
+pub struct ExternalChunkStore(ChunkSpill);
+
+impl ExternalChunkStore {
+    fn from_spill(spill: ChunkSpill) -> Self {
+        Self(spill)
+    }
+
+    fn spill(&self) -> &ChunkSpill {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ExternalChunkStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalChunkStore")
+            .field("chunks", &self.0.len())
+            .field("bytes", &self.0.total_bytes())
+            .finish()
+    }
+}
+
+/// Prepared upload ready for external payment.
+///
+/// Contains everything needed to construct the on-chain payment transaction
+/// externally (e.g. via WalletConnect in a desktop app) and then finalize
+/// the upload without a Rust-side wallet.
+///
+/// Note: This struct stays in Rust memory — only the public fields of
+/// `payment_info` are sent to the frontend. `PreparedChunk` contains
+/// non-serializable network types, so the full struct cannot derive `Serialize`.
+///
+/// Marked `#[non_exhaustive]` so adding a new field in future is not a
+/// breaking change for downstream consumers.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct PreparedUpload {
+    /// The data map for later retrieval.
+    pub data_map: DataMap,
+    /// Payment information for chunks that still need payment after the
+    /// already-stored preflight. This may be wave-batch even when the original
+    /// chunk count was merkle-eligible if the remaining count is below the
+    /// merkle threshold.
+    pub payment_info: ExternalPaymentInfo,
+    /// Chunk address of the serialized `DataMap` when this upload was
+    /// prepared with [`Visibility::Public`]. `Some` means the address is
+    /// retrievable on the network after finalization — either because this
+    /// upload paid to store the chunk in `payment_info`, or because the
+    /// chunk was already on the network (deterministic self-encryption).
+    /// Carried through to [`FileUploadResult::data_map_address`].
+    pub data_map_address: Option<[u8; 32]>,
+    /// Chunk addresses already present on the network when this upload was
+    /// prepared. These do not require payment or PUT during finalization.
+    pub already_stored_addresses: Vec<[u8; 32]>,
+    /// Total chunk count for the upload, including already-stored chunks.
+    pub total_chunks: usize,
+}
+
+/// Outcome of a resumable external-signer finalize
+/// ([`Client::finalize_upload_resumable`] /
+/// [`Client::finalize_upload_merkle_multi_resumable`] /
+/// [`Client::finalize_resume`]).
+///
+/// `Complete` means every chunk is stored. `Partial` means some chunks are
+/// still unstored after retries — short of quorum, or cut off by a store
+/// abort; its [`FinalizeResume`] handle owns the retained payment material, so
+/// the caller can store the remainder against the **same** on-chain payment
+/// without re-quoting or re-signing (issue #140). Persistent store failures
+/// also surface as `Partial`, so loops that retry a handle must bound their
+/// attempts (see [`Client::finalize_resume`]).
+#[derive(Debug)]
+pub enum FinalizeOutcome {
+    /// All chunks stored; the file is fully retrievable.
+    Complete(FileUploadResult),
+    /// Some chunks remain unstored after retries.
+    Partial {
+        /// Progress snapshot for this attempt (stored/failed counts, on-chain
+        /// spend, `data_map_address`). Per-attempt store telemetry
+        /// (`chunk_attempts_total`, `store_durations_ms`, `retries_histogram`)
+        /// is not carried on a partial and reads as empty/zero.
+        result: FileUploadResult,
+        /// Hand back to [`Client::finalize_resume`] to store the still-unstored
+        /// chunks against the same payment.
+        resume: FinalizeResume,
+    },
+}
+
+/// Opaque handle to resume an external-signer finalize that stored some but not
+/// all chunks after retries, carrying the material needed to store the
+/// remainder against the original, already-signed payment — no new quote, no
+/// second signature, no double payment (issue #140).
+///
+/// One variant per external payment path; a caller obtains it from
+/// [`FinalizeOutcome::Partial`] and passes it back to [`Client::finalize_resume`]
+/// without needing to know which path produced it. Boxed variants keep the enum
+/// small. Dropping it abandons the upload (the wave path frees its retained
+/// chunk bodies; the merkle path removes its spill directory from disk).
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum FinalizeResume {
+    /// Resume a wave-batch (single-payment) external finalize.
+    Wave(Box<WaveFinalizeResume>),
+    /// Resume a merkle (multi-batch) external finalize.
+    Merkle(Box<MerkleFinalizeResume>),
+}
+
+/// Opaque handle to resume a wave-batch external finalize that stored some but
+/// not all chunks after retries.
+///
+/// Owns the already-paid [`PaidChunk`]s (body + payment proof + PUT targets)
+/// that still need storing; re-storing reuses those proofs, so the same
+/// on-chain payment is honoured without re-signing. Dropping it frees the
+/// retained chunk bodies (the upload is abandoned).
+///
+/// `#[non_exhaustive]` so future fields are not a breaking change. `Debug` is
+/// redacted to counts only — it never prints chunk bodies, proofs, or the data
+/// map.
+#[non_exhaustive]
+pub struct WaveFinalizeResume {
+    data_map: DataMap,
+    data_map_address: Option<[u8; 32]>,
+    total_chunks: usize,
+    stored_count: usize,
+    failed_paid_chunks: Vec<PaidChunk>,
+    storage_cost_atto: String,
+}
+
+impl std::fmt::Debug for WaveFinalizeResume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaveFinalizeResume")
+            .field("total_chunks", &self.total_chunks)
+            .field("stored", &self.stored_count)
+            .field("unstored", &self.failed_paid_chunks.len())
+            .field("public", &self.data_map_address.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque handle to resume an external-signer merkle finalize that stored some
+/// but not all chunks after retries.
+///
+/// Owns the on-disk chunk spill and the merkle proofs from the original,
+/// already-signed payment, plus the addresses still to store. Passing it to
+/// [`Client::finalize_resume`] re-drives storage for only those chunks — no new
+/// quote, no second signature, no double payment (issue #140). Dropping it
+/// removes the spill directory from disk (the upload is abandoned).
+///
+/// `#[non_exhaustive]` so future fields are not a breaking change. `Debug` is
+/// redacted to counts only — it never prints chunk bodies, the data map, or
+/// merkle proof material.
+#[non_exhaustive]
+pub struct MerkleFinalizeResume {
+    data_map: DataMap,
+    data_map_address: Option<[u8; 32]>,
+    total_chunks: usize,
+    chunk_store: ExternalChunkStore,
+    unstored_addresses: Vec<[u8; 32]>,
+    batch_result: MerkleBatchPaymentResult,
+    stored_addresses: Vec<[u8; 32]>,
+}
+
+impl std::fmt::Debug for MerkleFinalizeResume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MerkleFinalizeResume")
+            .field("total_chunks", &self.total_chunks)
+            .field("stored", &self.stored_addresses.len())
+            .field("unstored", &self.unstored_addresses.len())
+            .field("public", &self.data_map_address.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Return type for [`spawn_file_encryption`]: chunk receiver, `DataMap` oneshot, join handle.
@@ -896,6 +1493,76 @@ impl Drop for TempDownload {
                     );
                 }
             }
+        }
+    }
+}
+
+struct SpillUploadAdapter<'a> {
+    client: &'a Client,
+    spill: &'a ChunkSpill,
+    progress: Option<&'a mpsc::Sender<UploadEvent>>,
+    checkpoint: &'a Path,
+}
+
+#[async_trait::async_trait]
+impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
+    async fn load(&self, record: super::super::upload::UploadRecord) -> Result<Bytes> {
+        self.spill.read_chunk(&record.address)
+    }
+    async fn pay(
+        &self,
+        plans: &[crate::data::client::batch::ChunkPaymentPlan],
+    ) -> Result<super::super::upload::UploadPayment> {
+        let adapter = super::super::upload::MemoryUploadAdapter {
+            client: self.client,
+            chunks: &[],
+            progress: self.progress,
+            stored_offset: 0,
+            file_total: self.spill.len(),
+            resume_key: None,
+        };
+        adapter.pay(plans).await
+    }
+    async fn pay_merkle(
+        &self,
+        batch: &PreparedMerkleBatch,
+    ) -> Result<super::super::upload::MerkleUploadPayment> {
+        let adapter = super::super::upload::MemoryUploadAdapter {
+            client: self.client,
+            chunks: &[],
+            progress: self.progress,
+            stored_offset: 0,
+            file_total: self.spill.len(),
+            resume_key: None,
+        };
+        adapter.pay_merkle(batch).await
+    }
+    async fn checkpoint(
+        &self,
+        state: &super::super::upload_state::UploadState,
+        _: Option<&super::super::upload::UploadPayment>,
+    ) -> Result<()> {
+        use std::io::Write;
+        let bytes = state.checkpoint()?;
+        let directory = self
+            .checkpoint
+            .parent()
+            .ok_or_else(|| Error::Config("missing checkpoint directory".into()))?;
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        file.write_all(&bytes)?;
+        file.as_file().sync_all()?;
+        file.persist(self.checkpoint)
+            .map_err(|e| Error::Io(e.error))?;
+        Ok(())
+    }
+    fn stored(&self, stored: usize, total: usize) {
+        if let Some(progress) = self.progress {
+            let _ = progress.try_send(UploadEvent::ChunkStored { stored, total });
+        }
+    }
+    fn quoted(&self, quoted: usize, total: usize) {
+        if let Some(progress) = self.progress {
+            let _ = progress.try_send(UploadEvent::ChunkQuoted { quoted, total });
         }
     }
 }
@@ -1159,10 +1826,31 @@ impl Client {
 
     /// Phase 1 of external-signer upload with progress events.
     ///
+    /// Equivalent to [`Client::file_prepare_upload_with_mode`] with
+    /// [`PaymentMode::Auto`] — see that method for details.
+    pub async fn file_prepare_upload_with_progress(
+        &self,
+        path: &Path,
+        visibility: Visibility,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<PreparedUpload> {
+        self.file_prepare_upload_with_mode(path, visibility, PaymentMode::Auto, progress)
+            .await
+    }
+
+    /// Phase 1 of external-signer upload with an explicit [`PaymentMode`].
+    ///
     /// Requires an EVM network (for contract price queries) but NOT a wallet.
-    /// Returns a [`PreparedUpload`] containing the data map, prepared chunks,
-    /// and a [`PaymentIntent`] that the external signer uses to construct
-    /// and submit the on-chain payment transaction.
+    /// Returns a [`PreparedUpload`] containing the data map and either a
+    /// [`PaymentIntent`] (wave-batch) or prepared merkle sub-batches that
+    /// the external signer uses to construct and submit the on-chain payment
+    /// transaction(s) — one per sub-batch (ADR-0003).
+    ///
+    /// `mode` mirrors the wallet path's [`Client::file_upload_with_mode`]:
+    /// [`PaymentMode::Auto`] picks merkle at the chunk threshold,
+    /// [`PaymentMode::Merkle`] forces merkle for ≥ 2 upload chunks (this is
+    /// how tests exercise the external merkle flow with small files), and
+    /// [`PaymentMode::Single`] forces wave-batch.
     ///
     /// When `visibility` is [`Visibility::Public`], the serialized `DataMap`
     /// is bundled into the payment batch as an additional chunk and its
@@ -1177,32 +1865,35 @@ impl Client {
     /// emitted later by [`Client::finalize_upload_with_progress`] /
     /// [`Client::finalize_upload_merkle_with_progress`].
     ///
-    /// **Memory note:** Encryption uses disk spilling for bounded memory, but
-    /// the returned [`PreparedUpload`] holds all chunk content in memory (each
-    /// [`PreparedChunk`] contains a `Bytes` with the full chunk data). This is
-    /// inherent to the two-phase external-signer protocol — the chunks must
-    /// stay in memory until [`Client::finalize_upload`] stores them. For very
-    /// large files, prefer [`Client::file_upload`] which streams directly.
+    /// **Memory note:** on the merkle path, chunk bodies stay in the on-disk
+    /// encryption spill inside the returned [`PreparedUpload`] and are read
+    /// back ≤ store-cap at a time during finalize, so peak RAM stays bounded
+    /// (~256 MB) regardless of file size (ADR-0003). The spill directory
+    /// lives as long as the `PreparedUpload` does. The wave-batch path —
+    /// below the merkle threshold, so < ~64 × 4 MiB of chunks (unless
+    /// [`PaymentMode::Single`] forces it for a larger file) — still holds
+    /// its chunk bodies resident.
     ///
     /// # Errors
     ///
     /// Returns an error if there is insufficient disk space, the file cannot
     /// be read, encryption fails, or quote collection fails.
-    pub async fn file_prepare_upload_with_progress(
+    pub async fn file_prepare_upload_with_mode(
         &self,
         path: &Path,
         visibility: Visibility,
+        mode: PaymentMode,
         progress: Option<mpsc::Sender<UploadEvent>>,
     ) -> Result<PreparedUpload> {
         debug!(
-            "Preparing file upload for external signing (visibility={visibility:?}): {}",
+            "Preparing file upload for external signing (visibility={visibility:?}, mode={mode:?}): {}",
             path.display()
         );
 
         let file_size = std::fs::metadata(path)?.len();
         check_disk_space_for_spill(file_size)?;
 
-        let (spill, data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
+        let (mut spill, data_map) = self.encrypt_file_to_spill(path, progress.as_ref()).await?;
 
         info!(
             "Encrypted {} into {} chunks for external signing (spilled to disk)",
@@ -1210,39 +1901,28 @@ impl Client {
             spill.len()
         );
 
-        // Read each chunk from disk and collect quotes concurrently.
-        // Note: all PreparedChunks accumulate in memory because the external-signer
-        // protocol requires them for finalize_upload. NOT memory-bounded for large files.
-        let mut chunk_data: Vec<Bytes> = spill
-            .addresses
-            .iter()
-            .map(|addr| spill.read_chunk(addr))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
         // For public uploads, bundle the serialized DataMap as an extra chunk
         // in the same payment batch. This lets the external signer pay for
         // the data chunks and the DataMap chunk in one flow, and lets the
         // finalize step return the DataMap's chunk address as the shareable
-        // retrieval address.
+        // retrieval address. It joins the spill like any data chunk so the
+        // merkle path stays disk-backed; `push` dedups by address.
         let data_map_address = match visibility {
             Visibility::Private => None,
             Visibility::Public => {
-                let serialized = rmp_serde::to_vec(&data_map).map_err(|e| {
-                    Error::Serialization(format!("Failed to serialize DataMap: {e}"))
-                })?;
-                let bytes = Bytes::from(serialized);
-                let address = compute_address(&bytes);
+                let (address, serialized) = crate::client_engine::files::public_map_record(&data_map)
+                    .map_err(Error::Serialization)?;
                 info!(
                     "Public upload: bundling DataMap chunk ({} bytes) at address {}",
-                    bytes.len(),
+                    serialized.len(),
                     hex::encode(address)
                 );
-                chunk_data.push(bytes);
+                spill.push(&serialized)?;
                 Some(address)
             }
         };
 
-        let chunk_count = chunk_data.len();
+        let chunk_count = spill.len();
 
         if let Some(ref tx) = progress {
             let _ = tx
@@ -1252,21 +1932,12 @@ impl Client {
                 .await;
         }
 
-        let (payment_info, already_stored_addresses) = if should_use_merkle(
-            chunk_count,
-            PaymentMode::Auto,
-        ) {
-            // Merkle path: build tree, collect candidate pools, return for external payment.
+        let (payment_info, already_stored_addresses) = if should_use_merkle(chunk_count, mode) {
+            // Merkle path: build tree(s), collect candidate pools, return for
+            // external payment. Chunk bodies stay in the spill on disk.
             info!("Using merkle batch preparation for {chunk_count} file chunks");
 
-            let chunk_entries: Vec<([u8; 32], u64)> = chunk_data
-                .iter()
-                .map(|chunk| {
-                    let size = u64::try_from(chunk.len())
-                        .map_err(|e| Error::InvalidData(format!("chunk size too large: {e}")))?;
-                    Ok((compute_address(chunk), size))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let chunk_entries = spill.chunk_entries()?;
 
             let merkle_plan = self
                 .plan_merkle_upload(chunk_entries, DATA_TYPE_CHUNK, progress.as_ref())
@@ -1281,76 +1952,72 @@ impl Client {
                     },
                     merkle_plan.already_stored,
                 )
+            } else if !should_use_merkle(merkle_plan.to_upload.len(), mode) {
+                info!(
+                    "{} file chunks need upload after merkle preflight; preparing wave-batch payment",
+                    merkle_plan.to_upload.len()
+                );
+                let chunk_data = spill.read_chunks(&merkle_plan.to_upload)?;
+                let (payment_info, mut wave_already_stored) = self
+                    .prepare_wave_batch_external_chunks(chunk_data, progress.as_ref(), chunk_count)
+                    .await?;
+                let mut already_stored = merkle_plan.already_stored;
+                already_stored.append(&mut wave_already_stored);
+                (payment_info, already_stored)
             } else {
-                let chunk_data =
-                    chunk_contents_for_upload_addresses(chunk_data, &merkle_plan.to_upload)?;
+                // One signature pays one tree, so the to-upload set is
+                // partitioned into `MerkleTree`-sized sub-batches and the
+                // signer pays each — the external equivalent of the wallet
+                // path's multi-transaction split (ADR-0003).
+                match self
+                    .prepare_merkle_batches_external(
+                        &merkle_plan.to_upload,
+                        DATA_TYPE_CHUNK,
+                        merkle_plan.to_upload_avg_size(),
+                        self.merkle_external_batch_cap(),
+                    )
+                    .await
+                {
+                    Ok(prepared_batches) => {
+                        info!(
+                            "File prepared for external merkle signing: {} chunks in {} sub-batch(es) ({})",
+                            merkle_plan.to_upload.len(),
+                            prepared_batches.len(),
+                            path.display()
+                        );
 
-                if !should_use_merkle(merkle_plan.to_upload.len(), PaymentMode::Auto) {
-                    info!(
-                        "{} file chunks need upload after merkle preflight; preparing wave-batch payment",
-                        merkle_plan.to_upload.len()
-                    );
-                    let (payment_info, mut wave_already_stored) = self
-                        .prepare_wave_batch_external_chunks(
-                            chunk_data,
-                            progress.as_ref(),
-                            chunk_count,
+                        (
+                            ExternalPaymentInfo::Merkle {
+                                prepared_batches,
+                                chunk_store: ExternalChunkStore::from_spill(spill),
+                                chunk_addresses: merkle_plan.to_upload,
+                            },
+                            merkle_plan.already_stored,
                         )
-                        .await?;
-                    let mut already_stored = merkle_plan.already_stored;
-                    already_stored.append(&mut wave_already_stored);
-                    (payment_info, already_stored)
-                } else {
-                    // One prepared batch is one signature and one payment, so
-                    // more than MAX_LEAVES addresses is refused with
-                    // `MerkleBatchTooLarge` before any candidate collection —
-                    // the wallet path's multi-transaction split has no
-                    // external-signing equivalent to fall back on.
-                    match self
-                        .prepare_merkle_batch_external(
-                            &merkle_plan.to_upload,
-                            DATA_TYPE_CHUNK,
-                            merkle_plan.to_upload_avg_size(),
-                        )
-                        .await
-                    {
-                        Ok(prepared_batch) => {
-                            info!(
-                                "File prepared for external merkle signing: {} chunks, depth={} ({})",
-                                merkle_plan.to_upload.len(),
-                                prepared_batch.depth,
-                                path.display()
-                            );
-
-                            (
-                                ExternalPaymentInfo::Merkle {
-                                    prepared_batch,
-                                    chunk_contents: chunk_data,
-                                    chunk_addresses: merkle_plan.to_upload,
-                                },
-                                merkle_plan.already_stored,
-                            )
-                        }
-                        Err(Error::InsufficientPeers(ref msg)) => {
-                            info!(
-                                "External merkle preparation needs more peers ({msg}); preparing wave-batch payment"
-                            );
-                            let (payment_info, mut wave_already_stored) = self
-                                .prepare_wave_batch_external_chunks(
-                                    chunk_data,
-                                    progress.as_ref(),
-                                    chunk_count,
-                                )
-                                .await?;
-                            let mut already_stored = merkle_plan.already_stored;
-                            already_stored.append(&mut wave_already_stored);
-                            (payment_info, already_stored)
-                        }
-                        Err(e) => return Err(e),
                     }
+                    Err(Error::InsufficientPeers(ref msg)) => {
+                        info!(
+                            "External merkle preparation needs more peers ({msg}); preparing wave-batch payment"
+                        );
+                        let chunk_data = spill.read_chunks(&merkle_plan.to_upload)?;
+                        let (payment_info, mut wave_already_stored) = self
+                            .prepare_wave_batch_external_chunks(
+                                chunk_data,
+                                progress.as_ref(),
+                                chunk_count,
+                            )
+                            .await?;
+                        let mut already_stored = merkle_plan.already_stored;
+                        already_stored.append(&mut wave_already_stored);
+                        (payment_info, already_stored)
+                    }
+                    Err(e) => return Err(e),
                 }
             }
         } else {
+            // Wave path: below the merkle threshold (or PaymentMode::Single),
+            // chunk bodies come back resident for per-chunk quoting.
+            let chunk_data = spill.read_all_chunks()?;
             self.prepare_wave_batch_external_chunks(chunk_data, progress.as_ref(), chunk_count)
                 .await?
         };
@@ -1457,6 +2124,607 @@ impl Client {
             already_stored,
         ))
     }
+
+    /// Phase 2 of external-signer upload (wave-batch): finalize with externally-signed tx hashes.
+    ///
+    /// Takes a [`PreparedUpload`] that used wave-batch payment and a map
+    /// of `quote_hash -> tx_hash` provided by the external signer after on-chain
+    /// payment. Builds payment proofs and stores chunks on the network.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the prepared upload used merkle payment (use
+    /// [`Client::finalize_upload_merkle`] instead), proof construction fails,
+    /// or any chunk cannot be stored.
+    pub async fn finalize_upload(
+        &self,
+        prepared: PreparedUpload,
+        tx_hash_map: &HashMap<QuoteHash, TxHash>,
+    ) -> Result<FileUploadResult> {
+        self.finalize_upload_with_progress(prepared, tx_hash_map, None)
+            .await
+    }
+
+    /// Phase 2 of external-signer upload (wave-batch) with progress events.
+    ///
+    /// Same as [`Client::finalize_upload`] but emits [`UploadEvent::ChunkStored`]
+    /// on the provided channel as each chunk is successfully stored.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Client::finalize_upload`].
+    pub async fn finalize_upload_with_progress(
+        &self,
+        prepared: PreparedUpload,
+        tx_hash_map: &HashMap<QuoteHash, TxHash>,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
+        let data_map_address = prepared.data_map_address;
+        let already_stored_addresses = prepared.already_stored_addresses;
+        let already_stored_count = already_stored_addresses.len();
+        let total_chunks = prepared.total_chunks;
+        match prepared.payment_info {
+            ExternalPaymentInfo::WaveBatch {
+                prepared_chunks,
+                payment_intent,
+            } => {
+                let paid_chunks = finalize_batch_payment(prepared_chunks, tx_hash_map)?;
+                let wave_result = self
+                    .store_paid_chunks_with_events(
+                        paid_chunks,
+                        progress.as_ref(),
+                        already_stored_count,
+                        total_chunks,
+                    )
+                    .await;
+                if !wave_result.failed.is_empty() {
+                    let failed_count = wave_result.failed.len();
+                    let stored_count = already_stored_count + wave_result.stored.len();
+                    let mut stored = already_stored_addresses;
+                    stored.extend(wave_result.stored);
+                    return Err(Error::PartialUpload {
+                        stored,
+                        stored_count,
+                        failed: wave_result.failed,
+                        failed_count,
+                        total_chunks,
+                        // Report the storage spend known from the payment intent
+                        // the external signer was handed. Gas is paid by the
+                        // signer out-of-band, so it stays unknown (0).
+                        spend: Box::new(PartialUploadSpend {
+                            storage_cost_atto: payment_intent.total_amount.to_string(),
+                            gas_cost_wei: 0,
+                        }),
+                        reason: "finalize_upload: chunk storage failed after retries".into(),
+                    });
+                }
+                let chunks_stored = already_stored_count + wave_result.stored.len();
+
+                info!("External-signer upload finalized: {chunks_stored} chunks stored");
+
+                let mut stats = WaveAggregateStats::default();
+                stats.absorb(&wave_result);
+
+                Ok(FileUploadResult {
+                    data_map: prepared.data_map,
+                    chunks_stored,
+                    chunks_failed: 0,
+                    total_chunks,
+                    payment_mode_used: PaymentMode::Single,
+                    // Storage spend is known from the payment intent; gas is
+                    // paid by the external signer out-of-band (unknown here).
+                    storage_cost_atto: payment_intent.total_amount.to_string(),
+                    gas_cost_wei: 0,
+                    data_map_address,
+                    chunk_attempts_total: stats.chunk_attempts_total,
+                    store_durations_ms: stats.store_durations_ms,
+                    retries_histogram: stats.retries_histogram,
+                })
+            }
+            ExternalPaymentInfo::Merkle { .. } => Err(Error::Payment(
+                "Cannot finalize merkle upload with wave-batch tx hashes. \
+                 Use finalize_upload_merkle() instead."
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Per-batch leaf cap for external merkle preparation: the configured
+    /// test override clamped to `3..=MAX_LEAVES` (see
+    /// [`merkle_batch_sizes_with_cap`] for why 3 is the floor), or
+    /// `MAX_LEAVES` (ADR-0003).
+    fn merkle_external_batch_cap(&self) -> usize {
+        self.config()
+            .merkle_external_batch_cap
+            .map_or(MAX_LEAVES, |cap| cap.clamp(3, MAX_LEAVES))
+    }
+
+    /// Phase 2 of external-signer upload (merkle): finalize with winner pool hash.
+    ///
+    /// The single-batch special case of
+    /// [`Client::finalize_upload_merkle_multi`]: valid only for uploads that
+    /// prepared as exactly one merkle sub-batch (any fresh upload below
+    /// `MAX_LEAVES` chunks). Generates proofs and stores chunks on the
+    /// network.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the prepared upload used wave-batch payment (use
+    /// [`Client::finalize_upload`] instead), was prepared as more than one
+    /// sub-batch (use [`Client::finalize_upload_merkle_multi`]), or proof
+    /// generation fails. Chunks still short of quorum after all retries
+    /// surface as [`Error::PartialUpload`] carrying the stored and failed
+    /// addresses — the same contract as [`Client::finalize_upload`].
+    /// Re-preparing the same file skips chunks that are already stored.
+    pub async fn finalize_upload_merkle(
+        &self,
+        prepared: PreparedUpload,
+        winner_pool_hash: [u8; 32],
+    ) -> Result<FileUploadResult> {
+        self.finalize_upload_merkle_with_progress(prepared, winner_pool_hash, None)
+            .await
+    }
+
+    /// Phase 2 of external-signer upload (merkle) with progress events.
+    ///
+    /// Same as [`Client::finalize_upload_merkle`] but emits [`UploadEvent::ChunkStored`]
+    /// on the provided channel as each chunk is successfully stored.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Client::finalize_upload_merkle`].
+    pub async fn finalize_upload_merkle_with_progress(
+        &self,
+        prepared: PreparedUpload,
+        winner_pool_hash: [u8; 32],
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
+        if let ExternalPaymentInfo::Merkle {
+            prepared_batches, ..
+        } = &prepared.payment_info
+        {
+            let batches = prepared_batches.len();
+            if batches != 1 {
+                return Err(Error::Payment(format!(
+                    "This upload was prepared as {batches} merkle sub-batches; \
+                     pay each and call finalize_upload_merkle_multi() with one \
+                     winner hash per batch."
+                )));
+            }
+        }
+        self.finalize_upload_merkle_multi_with_progress(
+            prepared,
+            vec![Some(winner_pool_hash)],
+            progress,
+        )
+        .await
+    }
+
+    /// Phase 2 of external-signer upload (merkle): finalize with one winner
+    /// pool hash per prepared sub-batch.
+    ///
+    /// `winner_pool_hashes` aligns with
+    /// [`ExternalPaymentInfo::Merkle::prepared_batches`]: entry `i` is the
+    /// `MerklePaymentMade` winner hash of batch `i`'s on-chain payment, or
+    /// `None` if the signer never paid that batch (e.g. the user abandoned
+    /// the flow midway). Paid batches make forward progress: their proofs
+    /// are folded — mirroring the wallet path's multi-batch fold — and their
+    /// chunks stored from the on-disk spill in a bounded fan-out; chunks of
+    /// unpaid batches are reported through [`Error::PartialUpload`]
+    /// (ADR-0003).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the prepared upload used wave-batch payment, the
+    /// hash count does not match the batch count, every entry is `None`, or
+    /// proof generation fails. Chunks short of quorum after all retries —
+    /// and all chunks of unpaid batches — surface as
+    /// [`Error::PartialUpload`] carrying the stored and failed addresses.
+    /// Re-preparing the same file skips chunks that are already stored.
+    pub async fn finalize_upload_merkle_multi(
+        &self,
+        prepared: PreparedUpload,
+        winner_pool_hashes: Vec<Option<[u8; 32]>>,
+    ) -> Result<FileUploadResult> {
+        self.finalize_upload_merkle_multi_with_progress(prepared, winner_pool_hashes, None)
+            .await
+    }
+
+    /// Same as [`Client::finalize_upload_merkle_multi`] but emits
+    /// [`UploadEvent::ChunkStored`] on the provided channel as each chunk is
+    /// successfully stored.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Client::finalize_upload_merkle_multi`].
+    pub async fn finalize_upload_merkle_multi_with_progress(
+        &self,
+        prepared: PreparedUpload,
+        winner_pool_hashes: Vec<Option<[u8; 32]>>,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FileUploadResult> {
+        let data_map_address = prepared.data_map_address;
+        let already_stored_addresses = prepared.already_stored_addresses;
+        let total_chunks = prepared.total_chunks;
+        match prepared.payment_info {
+            ExternalPaymentInfo::Merkle {
+                prepared_batches,
+                chunk_store,
+                chunk_addresses,
+            } => {
+                let batch_result =
+                    fold_external_merkle_payments(prepared_batches, winner_pool_hashes)?;
+
+                let (chunks_stored, _storage_cost, _gas_cost, stats) = self
+                    .upload_merkle_from_spill(
+                        chunk_store.spill(),
+                        &chunk_addresses,
+                        &batch_result,
+                        &already_stored_addresses,
+                        progress.as_ref(),
+                        // The external signer chose which sub-batches to pay.
+                        // A refusal latched by some other operation on this
+                        // client did not cause the gaps it left, and saying so
+                        // would blame the wrong thing.
+                        None,
+                    )
+                    .await?;
+
+                info!("External-signer merkle upload finalized: {chunks_stored} chunks stored");
+
+                Ok(FileUploadResult {
+                    data_map: prepared.data_map,
+                    chunks_stored,
+                    chunks_failed: 0,
+                    total_chunks,
+                    payment_mode_used: PaymentMode::Merkle,
+                    // The external signer pays on-chain out-of-band, so the
+                    // spend is unknown to the library here.
+                    storage_cost_atto: "0".into(),
+                    gas_cost_wei: 0,
+                    data_map_address,
+                    chunk_attempts_total: stats.chunk_attempts_total,
+                    store_durations_ms: stats.store_durations_ms,
+                    retries_histogram: stats.retries_histogram,
+                })
+            }
+            ExternalPaymentInfo::WaveBatch { .. } => Err(Error::Payment(
+                "Cannot finalize wave-batch upload with merkle winner hashes. \
+                 Use finalize_upload() instead."
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Finalize an external-signer merkle upload, returning a resume handle if
+    /// some chunks remain unstored after retries.
+    ///
+    /// Behaves like [`Client::finalize_upload_merkle_multi`], but instead of
+    /// surfacing a quorum shortfall as [`Error::PartialUpload`] it returns
+    /// [`FinalizeOutcome::Partial`], carrying a [`MerkleFinalizeResume`] (inside
+    /// [`FinalizeResume::Merkle`]) that owns the on-disk chunk spill and the
+    /// already-signed payment proofs. The caller can hand that handle to
+    /// [`Client::finalize_resume`] to store only the still-unstored chunks
+    /// against the **same** on-chain payment — no re-quoting, no second
+    /// signature, no double payment (#140).
+    ///
+    /// Unlike the non-resumable method, **every sub-batch must be paid**
+    /// (`winner_pool_hashes` all `Some`). A resume handle cannot acquire proofs
+    /// for unpaid chunks, so a partially-paid finalize could never drain to
+    /// [`FinalizeOutcome::Complete`]; partial payment is rejected up front. To
+    /// finalize a partial payment, use [`Client::finalize_upload_merkle_multi`],
+    /// which reports the unpaid chunks through [`Error::PartialUpload`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any sub-batch is unpaid, the winner-hash count does
+    /// not match the prepared batches, the payment info is wave-batch rather
+    /// than merkle, or payment finalization fails. Store failures are **not**
+    /// errors here: a quorum shortfall — and a fatal store abort, which keeps
+    /// its progress the same way — comes back as [`FinalizeOutcome::Partial`].
+    pub async fn finalize_upload_merkle_multi_resumable(
+        &self,
+        prepared: PreparedUpload,
+        winner_pool_hashes: Vec<Option<[u8; 32]>>,
+    ) -> Result<FinalizeOutcome> {
+        self.finalize_upload_merkle_multi_resumable_with_progress(
+            prepared,
+            winner_pool_hashes,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`Client::finalize_upload_merkle_multi_resumable`] but emits
+    /// [`UploadEvent::ChunkStored`] on the provided channel as each chunk is
+    /// stored.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Client::finalize_upload_merkle_multi_resumable`].
+    pub async fn finalize_upload_merkle_multi_resumable_with_progress(
+        &self,
+        prepared: PreparedUpload,
+        winner_pool_hashes: Vec<Option<[u8; 32]>>,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FinalizeOutcome> {
+        let data_map_address = prepared.data_map_address;
+        let already_stored_addresses = prepared.already_stored_addresses;
+        let total_chunks = prepared.total_chunks;
+        let data_map = prepared.data_map;
+        match prepared.payment_info {
+            ExternalPaymentInfo::Merkle {
+                prepared_batches,
+                chunk_store,
+                chunk_addresses,
+            } => {
+                require_fully_paid_for_resumable(&winner_pool_hashes)?;
+                let batch_result =
+                    fold_external_merkle_payments(prepared_batches, winner_pool_hashes)?;
+                self.drive_merkle_finalize(
+                    data_map,
+                    data_map_address,
+                    total_chunks,
+                    chunk_store,
+                    chunk_addresses,
+                    batch_result,
+                    already_stored_addresses,
+                    progress.as_ref(),
+                )
+                .await
+            }
+            ExternalPaymentInfo::WaveBatch { .. } => Err(Error::Payment(
+                "Cannot finalize wave-batch upload with merkle winner hashes. \
+                 Use finalize_upload_resumable() instead."
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Finalize an external-signer wave-batch upload, returning a resume handle
+    /// if some chunks remain unstored after retries.
+    ///
+    /// Behaves like [`Client::finalize_upload`], but instead of surfacing a
+    /// storage failure as [`Error::PartialUpload`] it returns
+    /// [`FinalizeOutcome::Partial`], carrying a [`WaveFinalizeResume`] (inside
+    /// [`FinalizeResume::Wave`]) that owns the already-paid chunks still needing
+    /// storage. The caller can hand that handle to [`Client::finalize_resume`]
+    /// to re-store only those chunks against the **same** on-chain payment — no
+    /// re-quoting, no second signature, no double payment (#140).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a `tx_hash` is missing for a quote, the payment info
+    /// is merkle rather than wave-batch, or payment finalization fails. A plain
+    /// storage shortfall is **not** an error — it comes back as
+    /// [`FinalizeOutcome::Partial`].
+    pub async fn finalize_upload_resumable(
+        &self,
+        prepared: PreparedUpload,
+        tx_hash_map: &HashMap<QuoteHash, TxHash>,
+    ) -> Result<FinalizeOutcome> {
+        self.finalize_upload_resumable_with_progress(prepared, tx_hash_map, None)
+            .await
+    }
+
+    /// Same as [`Client::finalize_upload_resumable`] but emits
+    /// [`UploadEvent::ChunkStored`] on the provided channel as each chunk is
+    /// stored.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Client::finalize_upload_resumable`].
+    pub async fn finalize_upload_resumable_with_progress(
+        &self,
+        prepared: PreparedUpload,
+        tx_hash_map: &HashMap<QuoteHash, TxHash>,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FinalizeOutcome> {
+        let data_map_address = prepared.data_map_address;
+        let already_stored_count = prepared.already_stored_addresses.len();
+        let total_chunks = prepared.total_chunks;
+        let data_map = prepared.data_map;
+        match prepared.payment_info {
+            ExternalPaymentInfo::WaveBatch {
+                prepared_chunks,
+                payment_intent,
+            } => {
+                let paid_chunks = finalize_batch_payment(prepared_chunks, tx_hash_map)?;
+                let storage_cost_atto = payment_intent.total_amount.to_string();
+                Ok(self
+                    .drive_wave_finalize(
+                        data_map,
+                        data_map_address,
+                        total_chunks,
+                        already_stored_count,
+                        paid_chunks,
+                        storage_cost_atto,
+                        progress.as_ref(),
+                    )
+                    .await)
+            }
+            ExternalPaymentInfo::Merkle { .. } => Err(Error::Payment(
+                "Cannot finalize merkle upload with wave-batch tx hashes. \
+                 Use finalize_upload_merkle_multi_resumable() instead."
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Resume an external-signer finalize that returned
+    /// [`FinalizeOutcome::Partial`], storing only the still-unstored chunks
+    /// against the already-signed payment carried by the [`FinalizeResume`]
+    /// handle.
+    ///
+    /// No re-quoting and no new signature: the handle owns the retained chunk
+    /// bodies (wave path) or the spill + merkle proofs (merkle path). Every
+    /// chunk in the handle has its payment material, so the upload always
+    /// *can* complete once the network cooperates. Safe to call repeatedly —
+    /// each call stores what it can and either completes the upload
+    /// ([`FinalizeOutcome::Complete`]) or hands back the remainder, so a
+    /// caller can loop until it drains or gives up (#140).
+    ///
+    /// **Bound that loop.** Store failures — including persistent ones, such
+    /// as a chunk whose close group stays unreachable — surface as
+    /// [`FinalizeOutcome::Partial`] on every call, never as `Err`, so an
+    /// unbounded `while let Partial` loop will spin for as long as the
+    /// failure persists. Cap the attempts (or apply backoff between them) and
+    /// treat a handle that stops shrinking as stuck.
+    ///
+    /// # Errors
+    ///
+    /// Store failures are not errors — every store-side outcome, fatal aborts
+    /// included, comes back as [`FinalizeOutcome::Partial`] with the payment
+    /// material retained for retry. `Err` is reserved for failures outside
+    /// the chunk store itself.
+    pub async fn finalize_resume(&self, resume: FinalizeResume) -> Result<FinalizeOutcome> {
+        self.finalize_resume_with_progress(resume, None).await
+    }
+
+    /// Same as [`Client::finalize_resume`] but emits [`UploadEvent::ChunkStored`]
+    /// as each remaining chunk is stored.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Client::finalize_resume`].
+    pub async fn finalize_resume_with_progress(
+        &self,
+        resume: FinalizeResume,
+        progress: Option<mpsc::Sender<UploadEvent>>,
+    ) -> Result<FinalizeOutcome> {
+        match resume {
+            FinalizeResume::Wave(w) => {
+                let WaveFinalizeResume {
+                    data_map,
+                    data_map_address,
+                    total_chunks,
+                    stored_count,
+                    failed_paid_chunks,
+                    storage_cost_atto,
+                } = *w;
+                Ok(self
+                    .drive_wave_finalize(
+                        data_map,
+                        data_map_address,
+                        total_chunks,
+                        stored_count,
+                        failed_paid_chunks,
+                        storage_cost_atto,
+                        progress.as_ref(),
+                    )
+                    .await)
+            }
+            FinalizeResume::Merkle(m) => {
+                let MerkleFinalizeResume {
+                    data_map,
+                    data_map_address,
+                    total_chunks,
+                    chunk_store,
+                    unstored_addresses,
+                    batch_result,
+                    stored_addresses,
+                } = *m;
+                self.drive_merkle_finalize(
+                    data_map,
+                    data_map_address,
+                    total_chunks,
+                    chunk_store,
+                    unstored_addresses,
+                    batch_result,
+                    stored_addresses,
+                    progress.as_ref(),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Drive one merkle store pass over `to_store` (reading bodies from the
+    /// spill on demand and re-attaching proofs from `batch_result`), shared by
+    /// the initial resumable finalize and [`Client::finalize_resume`].
+    ///
+    /// On a quorum shortfall — or a fatal store abort, which
+    /// `upload_merkle_from_spill` folds into [`Error::PartialUpload`] with its
+    /// progress preserved — it captures the retained spill, proofs, and the
+    /// cumulative stored/unstored sets into a [`MerkleFinalizeResume`] and
+    /// returns [`FinalizeOutcome::Partial`], so the same on-chain payment can
+    /// be retried without re-signing. `Err` is reserved for failures outside
+    /// the store fan-out (e.g. invalid payment material).
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_merkle_finalize(
+        &self,
+        data_map: DataMap,
+        data_map_address: Option<[u8; 32]>,
+        total_chunks: usize,
+        chunk_store: ExternalChunkStore,
+        to_store: Vec<[u8; 32]>,
+        batch_result: MerkleBatchPaymentResult,
+        stored_addresses: Vec<[u8; 32]>,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+    ) -> Result<FinalizeOutcome> {
+        let store_result = self
+            .upload_merkle_from_spill(
+                chunk_store.spill(),
+                &to_store,
+                &batch_result,
+                &stored_addresses,
+                progress,
+                // External-signer payment material; see above.
+                None,
+            )
+            .await;
+        assemble_merkle_finalize_outcome(
+            store_result,
+            data_map,
+            data_map_address,
+            total_chunks,
+            chunk_store,
+            batch_result,
+        )
+    }
+
+    /// Drive one wave-batch store pass over `paid_chunks`, shared by the initial
+    /// resumable finalize and [`Client::finalize_resume`].
+    ///
+    /// Retains each paid chunk (cheaply — bodies are ref-counted `Bytes`) so a
+    /// storage shortfall can hand the failed subset back in a
+    /// [`WaveFinalizeResume`] ([`FinalizeOutcome::Partial`]) for re-store against
+    /// the same payment, instead of the shortfall being dropped. The store never
+    /// errors on a partial, so this is infallible.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_wave_finalize(
+        &self,
+        data_map: DataMap,
+        data_map_address: Option<[u8; 32]>,
+        total_chunks: usize,
+        already_stored_count: usize,
+        paid_chunks: Vec<PaidChunk>,
+        storage_cost_atto: String,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+    ) -> FinalizeOutcome {
+        // Retain address -> paid chunk so the failed subset can be re-stored on
+        // resume; cloning is cheap since the chunk body is a ref-counted `Bytes`.
+        let retained: HashMap<[u8; 32], PaidChunk> =
+            paid_chunks.iter().map(|c| (c.address, c.clone())).collect();
+        let wave_result = self
+            .store_paid_chunks_with_events(
+                paid_chunks,
+                progress,
+                already_stored_count,
+                total_chunks,
+            )
+            .await;
+        assemble_wave_finalize_outcome(
+            wave_result,
+            retained,
+            data_map,
+            data_map_address,
+            total_chunks,
+            already_stored_count,
+            storage_cost_atto,
+        )
+    }
+
     /// Upload a file with a specific payment mode.
     ///
     /// Before encryption, checks that the temp directory has enough free
@@ -1548,10 +2816,9 @@ impl Client {
         let data_map_address = match visibility {
             Visibility::Private => None,
             Visibility::Public => {
-                let serialized = rmp_serde::to_vec(&data_map).map_err(|e| {
-                    Error::Serialization(format!("Failed to serialize DataMap: {e}"))
-                })?;
-                let address = compute_address(&serialized);
+                let (address, serialized) =
+                    crate::client_engine::files::public_map_record(&data_map)
+                        .map_err(Error::Serialization)?;
                 info!(
                     "Public upload: adding DataMap chunk ({} bytes) at address {} to payment batch",
                     serialized.len(),
@@ -1575,277 +2842,97 @@ impl Client {
                 .await;
         }
 
-        // Phase 2: Decide payment mode and upload in waves from disk.
-        //
-        // For the merkle path, attempt to resume from a cached
-        // receipt before paying again. The cache is keyed by the
-        // CANONICAL source path so `./foo`, `/abs/foo`, and any
-        // symlink alias all resolve to the same cache entry — a
-        // crash-and-retry from a different cwd or via a different
-        // alias still hits the receipt. Canonicalize may fail (the
-        // file could have been moved between phase 1 and here); we
-        // fall back to the display string in that case, which
-        // preserves pre-fix behaviour rather than dropping cache
-        // resume entirely.
         let file_path_key = std::fs::canonicalize(path)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| path.display().to_string());
-        let (chunks_stored, actual_mode, storage_cost_atto, gas_cost_wei, stats) = if self
-            .should_use_merkle(chunk_count, mode)
-        {
-            info!("Using merkle batch payment for {chunk_count} file chunks");
-
-            let cached_merkle =
-                crate::data::client::cached_merkle::try_load_for_file(&file_path_key)
-                    .map(|(_cache_path, cached)| cached);
-
-            let merkle_plan = match self
-                .plan_merkle_upload(spill.chunk_entries()?, DATA_TYPE_CHUNK, progress.as_ref())
-                .await
-            {
-                Ok(plan) => plan,
-                Err(e) => {
-                    if let Some(cached) = cached_merkle
-                        .as_ref()
-                        .filter(|cached| cached_merkle_covers_addresses(cached, &spill.addresses))
-                    {
-                        info!(
-                            "Merkle preflight failed ({e}); \
-                             resuming with cached merkle proofs"
-                        );
-                        let (stored, sc, gc, stats) = self
-                            .upload_merkle_from_spill(
-                                &spill,
-                                &spill.addresses,
-                                cached,
-                                &[],
-                                progress.as_ref(),
-                            )
-                            .await?;
-                        crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
-                        return Ok(FileUploadResult {
-                            data_map,
-                            chunks_stored: stored,
-                            chunks_failed: 0,
-                            total_chunks: chunk_count,
-                            payment_mode_used: PaymentMode::Merkle,
-                            storage_cost_atto: sc,
-                            gas_cost_wei: gc,
-                            data_map_address,
-                            chunk_attempts_total: stats.chunk_attempts_total,
-                            store_durations_ms: stats.store_durations_ms,
-                            retries_histogram: stats.retries_histogram,
-                        });
-                    }
-                    match &e {
-                        Error::InsufficientPeers(msg) if mode == PaymentMode::Auto => {
-                            info!(
-                                "Merkle preflight needs more peers ({msg}), \
-                                 falling back to wave-batch"
-                            );
-                            let (stored, sc, gc, fb_stats) = self
-                                .upload_waves_single(
-                                    &spill,
-                                    progress.as_ref(),
-                                    Some(&file_path_key),
-                                )
-                                .await?;
-                            crate::data::client::cached_single::try_delete_for_file(&file_path_key);
-                            return Ok(FileUploadResult {
-                                data_map,
-                                chunks_stored: stored,
-                                chunks_failed: 0,
-                                total_chunks: chunk_count,
-                                payment_mode_used: PaymentMode::Single,
-                                storage_cost_atto: sc,
-                                gas_cost_wei: gc,
-                                data_map_address,
-                                chunk_attempts_total: fb_stats.chunk_attempts_total,
-                                store_durations_ms: fb_stats.store_durations_ms,
-                                retries_histogram: fb_stats.retries_histogram,
-                            });
-                        }
-                        _ => return Err(e),
-                    }
-                }
-            };
-
-            if merkle_plan.to_upload.is_empty() {
-                info!("All {chunk_count} merkle chunks already stored; skipping payment");
-                crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
-                crate::data::client::cached_single::try_delete_for_file(&file_path_key);
-                (
-                    chunk_count,
-                    PaymentMode::Merkle,
-                    "0".to_string(),
-                    0,
-                    WaveAggregateStats::default(),
-                )
-            } else if !self.should_use_merkle(merkle_plan.to_upload.len(), mode) {
-                let remaining_chunks = merkle_plan.to_upload.len();
-                if let Some(cached) = cached_merkle
-                    .as_ref()
-                    .filter(|cached| cached_merkle_covers_addresses(cached, &merkle_plan.to_upload))
+        let records = spill
+            .chunk_entries()?
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, (address, size))| super::super::upload::UploadRecord {
+                    address,
+                    size,
+                    index,
+                },
+            )
+            .collect::<Vec<_>>();
+        let wallet = self.require_wallet()?;
+        let scope = rmp_serde::to_vec(&(
+            wallet.network(),
+            records
+                .iter()
+                .map(|r| (r.address, r.size))
+                .collect::<Vec<_>>(),
+        ))
+        .map_err(|e| Error::Serialization(e.to_string()))?;
+        let cache_dir = crate::config::data_dir()
+            .map_err(|e| Error::Config(e.to_string()))?
+            .join("payments/upload");
+        std::fs::create_dir_all(&cache_dir)?;
+        let cache_path = cache_dir.join(format!(
+            "{}.msgpack",
+            hex::encode(blake3::hash(&scope).as_bytes())
+        ));
+        let lock_path = cache_path.with_extension("lock");
+        let _lock = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(lock_path)?;
+            fs2::FileExt::lock_exclusive(&file)?;
+            Ok(file)
+        })
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))??;
+        let mut state = match std::fs::read(&cache_path) {
+            Ok(bytes) => super::super::upload_state::UploadState::restore(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut proofs =
+                    crate::data::client::cached_single::try_load_for_file(&file_path_key)
+                        .map(|(_, receipt)| receipt.proofs)
+                        .unwrap_or_default();
+                if let Some((_, receipt)) =
+                    crate::data::client::cached_merkle::try_load_for_file(&file_path_key)
                 {
-                    info!(
-                        "{remaining_chunks} chunks remain below merkle threshold; \
-                         reusing cached merkle proofs"
-                    );
-                    let (stored, sc, gc, stats) = self
-                        .upload_merkle_from_spill(
-                            &spill,
-                            &merkle_plan.to_upload,
-                            cached,
-                            &merkle_plan.already_stored,
-                            progress.as_ref(),
-                        )
-                        .await?;
-                    crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
-                    (stored, PaymentMode::Merkle, sc, gc, stats)
-                } else {
-                    if cached_merkle.is_some() {
-                        info!(
-                            "{remaining_chunks} chunks remain below merkle threshold, \
-                             and the cached merkle receipt does not cover them. \
-                             Discarding cache and using single-node payment."
-                        );
-                        crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
-                    } else {
-                        info!(
-                            "{remaining_chunks} chunks need upload after merkle preflight; \
-                             using single-node payment"
-                        );
-                    }
-                    let (stored, sc, gc, stats) = self
-                        .upload_spill_addresses_single(
-                            &spill,
-                            &merkle_plan.to_upload,
-                            progress.as_ref(),
-                            &merkle_plan.already_stored,
-                            chunk_count,
-                            Some(&file_path_key),
-                        )
-                        .await?;
-                    crate::data::client::cached_single::try_delete_for_file(&file_path_key);
-                    (stored, PaymentMode::Single, sc, gc, stats)
+                    proofs.extend(receipt.proofs);
                 }
-            } else {
-                let batch_result = if let Some(cached) = cached_merkle.as_ref() {
-                    // Validate the cache against the chunks that still need
-                    // storage. Extra proofs are harmless: a previous attempt
-                    // may have paid for chunks that are now already stored.
-                    if cached_merkle_covers_addresses(cached, &merkle_plan.to_upload) {
-                        info!(
-                            "Skipping merkle payment phase; resuming with \
-                             cached proofs for {} remaining chunks",
-                            merkle_plan.to_upload.len()
-                        );
-                        Ok(cached.clone())
-                    } else {
-                        info!(
-                            "Cached merkle receipt does not cover the current \
-                             remaining chunks (cached={}, remaining={}). \
-                             Discarding cache and paying fresh.",
-                            cached.proofs.len(),
-                            merkle_plan.to_upload.len()
-                        );
-                        crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
-                        self.pay_for_merkle_batch(
-                            &merkle_plan.to_upload,
-                            DATA_TYPE_CHUNK,
-                            merkle_plan.to_upload_avg_size(),
-                        )
-                        .await
-                        .inspect(|result| {
-                            crate::data::client::cached_merkle::try_save(&file_path_key, result);
-                        })
-                    }
-                } else {
-                    self.pay_for_merkle_batch(
-                        &merkle_plan.to_upload,
-                        DATA_TYPE_CHUNK,
-                        merkle_plan.to_upload_avg_size(),
-                    )
-                    .await
-                    .inspect(|result| {
-                        // Save BEFORE the store phase so a crash
-                        // mid-upload leaves a resumable receipt.
-                        crate::data::client::cached_merkle::try_save(&file_path_key, result);
-                    })
-                };
-
-                let batch_result = match batch_result {
-                    Ok(result) => result,
-                    Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
-                        info!("Merkle needs more peers ({msg}), falling back to wave-batch");
-                        let (stored, sc, gc, fb_stats) = self
-                            .upload_spill_addresses_single(
-                                &spill,
-                                &merkle_plan.to_upload,
-                                progress.as_ref(),
-                                &merkle_plan.already_stored,
-                                chunk_count,
-                                Some(&file_path_key),
-                            )
-                            .await?;
-                        crate::data::client::cached_single::try_delete_for_file(&file_path_key);
-                        return Ok(FileUploadResult {
-                            data_map,
-                            chunks_stored: stored,
-                            chunks_failed: 0,
-                            total_chunks: chunk_count,
-                            payment_mode_used: PaymentMode::Single,
-                            storage_cost_atto: sc,
-                            gas_cost_wei: gc,
-                            data_map_address,
-                            chunk_attempts_total: fb_stats.chunk_attempts_total,
-                            store_durations_ms: fb_stats.store_durations_ms,
-                            retries_histogram: fb_stats.retries_histogram,
-                        });
-                    }
-                    Err(e) => return Err(e),
-                };
-
-                let (stored, sc, gc, stats) = self
-                    .upload_merkle_from_spill(
-                        &spill,
-                        &merkle_plan.to_upload,
-                        &batch_result,
-                        &merkle_plan.already_stored,
-                        progress.as_ref(),
-                    )
-                    .await?;
-                // Upload succeeded end-to-end; the cached receipt is
-                // no longer needed.
-                crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
-                (stored, PaymentMode::Merkle, sc, gc, stats)
+                super::super::upload_state::UploadState::from_proofs(proofs)
             }
-        } else {
-            let (stored, sc, gc, stats) = self
-                .upload_waves_single(&spill, progress.as_ref(), Some(&file_path_key))
-                .await?;
-            // Full file success: drop any cached single-node receipt.
-            crate::data::client::cached_single::try_delete_for_file(&file_path_key);
-            (stored, PaymentMode::Single, sc, gc, stats)
+            Err(error) => return Err(Error::Io(error)),
         };
-
-        info!(
-            "File uploaded with {actual_mode:?}: {chunks_stored} chunks stored ({})",
-            path.display()
-        );
-
+        let adapter = SpillUploadAdapter {
+            client: self,
+            spill: &spill,
+            progress: progress.as_ref(),
+            checkpoint: &cache_path,
+        };
+        let result = self
+            .upload_records(records, &mut state, &adapter, mode)
+            .await?;
+        std::fs::remove_file(&cache_path).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })?;
+        crate::data::client::cached_single::try_delete_for_file(&file_path_key);
+        crate::data::client::cached_merkle::try_delete_for_file(&file_path_key);
         Ok(FileUploadResult {
             data_map,
-            chunks_stored,
+            chunks_stored: result.addresses.len(),
             chunks_failed: 0,
             total_chunks: chunk_count,
-            payment_mode_used: actual_mode,
-            storage_cost_atto,
-            gas_cost_wei,
+            payment_mode_used: result.mode,
+            storage_cost_atto: result.amount.to_string(),
+            gas_cost_wei: result.gas,
             data_map_address,
-            chunk_attempts_total: stats.chunk_attempts_total,
-            store_durations_ms: stats.store_durations_ms,
-            retries_histogram: stats.retries_histogram,
+            chunk_attempts_total: result.stats.chunk_attempts_total,
+            store_durations_ms: result.stats.store_durations_ms,
+            retries_histogram: result.stats.retries_histogram,
         })
     }
 
@@ -1893,455 +2980,11 @@ impl Client {
         Ok((spill, data_map))
     }
 
-    /// Upload chunks from a spill using wave-based per-chunk (single) payments.
-    ///
-    /// Reads one wave at a time from disk, prepares quotes, pays, and stores.
-    /// Peak memory: ~`UPLOAD_WAVE_SIZE × MAX_CHUNK_SIZE` (~256 MB).
-    ///
-    /// Returns `(chunks_stored, storage_cost_atto, gas_cost_wei)`.
-    async fn upload_waves_single(
-        &self,
-        spill: &ChunkSpill,
-        progress: Option<&mpsc::Sender<UploadEvent>>,
-        resume_key: Option<&str>,
-    ) -> Result<(usize, String, u128, WaveAggregateStats)> {
-        self.upload_spill_addresses_single(
-            spill,
-            &spill.addresses,
-            progress,
-            &[],
-            spill.len(),
-            resume_key,
-        )
-        .await
-    }
-
-    async fn upload_spill_addresses_single(
-        &self,
-        spill: &ChunkSpill,
-        addresses: &[[u8; 32]],
-        progress: Option<&mpsc::Sender<UploadEvent>>,
-        already_stored_addresses: &[[u8; 32]],
-        total_chunks: usize,
-        resume_key: Option<&str>,
-    ) -> Result<(usize, String, u128, WaveAggregateStats)> {
-        let mut total_stored = already_stored_addresses.len();
-        let mut total_storage = Amount::ZERO;
-        let mut total_gas: u128 = 0;
-        let mut agg_stats = WaveAggregateStats::default();
-        // A wave whose chunks fall short of quorum after retries must not abort
-        // the file: its failures are accumulated here and surfaced as a single
-        // `PartialUpload` only after every wave has been attempted, mirroring
-        // `upload_merkle_from_spill`. Aborting on the first failed wave (the old `?`)
-        // discarded all later waves' progress — already self-encrypted, spilled,
-        // and in some cases already paid for — converting high per-chunk success
-        // into 0% per-file success.
-        // Seed with the addresses a preflight already confirmed stored (e.g.
-        // the merkle-fallback path passes `merkle_plan.already_stored`), so a
-        // returned `PartialUpload.stored` lists every stored chunk and
-        // `stored_count == stored.len()` holds for programmatic callers.
-        let mut stored_addresses: Vec<[u8; 32]> = already_stored_addresses.to_vec();
-        let mut failed: Vec<([u8; 32], String)> = Vec::new();
-        let waves: Vec<&[[u8; 32]]> = addresses.chunks(UPLOAD_WAVE_SIZE).collect();
-        let wave_count = waves.len();
-
-        // Unconditional breadcrumb: lets a clean run confirm the continue-on-
-        // partial single-node path is in effect (the old path aborted the file
-        // on the first failed wave instead of continuing across all waves).
-        info!(
-            "single-node upload: {} chunk(s) in {wave_count} wave(s) (continue-on-partial)",
-            addresses.len()
-        );
-
-        for (wave_idx, wave_addrs) in waves.into_iter().enumerate() {
-            let wave_num = wave_idx + 1;
-            let wave_data: Vec<Bytes> = wave_addrs
-                .iter()
-                .map(|addr| spill.read_chunk(addr))
-                .collect::<Result<Vec<_>>>()?;
-
-            info!(
-                "Wave {wave_num}/{wave_count}: quoting {} chunks — {total_stored}/{total_chunks} stored so far",
-                wave_data.len()
-            );
-            if let Some(tx) = progress {
-                let _ = tx
-                    .send(UploadEvent::QuotingChunks {
-                        wave: wave_num,
-                        total_waves: wave_count,
-                        chunks_in_wave: wave_data.len(),
-                    })
-                    .await;
-            }
-            // Fold this wave's result. A quorum shortfall (`PartialUpload`) is
-            // recoverable and its parts are returned to be recorded here;
-            // genuinely fatal errors propagate via `?` and abort the file, as in
-            // `upload_merkle_from_spill`.
-            let outcome = fold_single_wave(
-                self.batch_upload_chunks_with_events(
-                    wave_data,
-                    progress,
-                    total_stored,
-                    total_chunks,
-                    resume_key,
-                )
-                .await,
-            )?;
-
-            if !outcome.failed.is_empty() {
-                warn!(
-                    "Wave {wave_num}/{wave_count}: {} chunk(s) failed to store after retries; \
-                     continuing with remaining waves",
-                    outcome.failed.len()
-                );
-            }
-
-            total_stored += outcome.stored.len();
-            stored_addresses.extend(outcome.stored);
-            failed.extend(outcome.failed);
-            total_storage += outcome.storage_atto;
-            total_gas = total_gas.saturating_add(outcome.gas_wei);
-            // Merge per-wave stats (a quorum-short wave contributes none, since
-            // `PartialUpload` carries no stats).
-            agg_stats.chunk_attempts_total = agg_stats
-                .chunk_attempts_total
-                .saturating_add(outcome.stats.chunk_attempts_total);
-            agg_stats
-                .store_durations_ms
-                .extend(outcome.stats.store_durations_ms);
-            for (slot, count) in agg_stats
-                .retries_histogram
-                .iter_mut()
-                .zip(outcome.stats.retries_histogram.iter())
-            {
-                *slot = slot.saturating_add(*count);
-            }
-        }
-
-        // Any chunk still failed after every wave was attempted means the file
-        // is not fully stored — surface it as `PartialUpload` (never silently
-        // succeed with missing chunks), carrying the real on-chain spend.
-        if !failed.is_empty() {
-            let failed_count = failed.len();
-            warn!(
-                "single-node upload incomplete: {failed_count}/{total_chunks} chunks failed after retries"
-            );
-            return Err(Error::PartialUpload {
-                stored: stored_addresses,
-                stored_count: total_stored,
-                failed,
-                failed_count,
-                total_chunks,
-                spend: Box::new(PartialUploadSpend {
-                    storage_cost_atto: total_storage.to_string(),
-                    gas_cost_wei: total_gas,
-                }),
-                reason: format!("{failed_count} chunk(s) failed to store after retries"),
-            });
-        }
-
-        Ok((
-            total_stored,
-            total_storage.to_string(),
-            total_gas,
-            agg_stats,
-        ))
-    }
-
-    /// Upload chunks from a spill using pre-computed merkle proofs.
-    ///
-    /// Stores the whole file as a **single cap-bounded fan-out** — not in fixed
-    /// waves. The store concurrency limiter is the only throttle: `store_one`
-    /// reads each chunk's body from the on-disk spill on demand, so at most
-    /// `store_cap` (≤ 64) bodies are ever resident, giving the same
-    /// `~store_cap × MAX_CHUNK_SIZE` peak-memory bound the old 64-chunk waves
-    /// gave — but with **no wave barrier**, so a slow straggler (e.g. a chunk
-    /// whose close-group peers are stale relayed addresses that take minutes to
-    /// revalidate) no longer stalls the rest of the file behind it.
-    ///
-    /// A chunk that is transiently short of quorum (`InsufficientPeers` /
-    /// `CloseGroupShortfall` / `RemotePut`) does **not** abort the file, nor
-    /// block the pass: the store pass is a **single attempt** (no in-pass
-    /// backoff), and quorum-short chunks are collected into a deferred set. After
-    /// the pass, [`merkle_deferred_retry`] retries that set in concurrent rounds
-    /// ([`DEFERRED_ROUND_DELAYS_SECS`] delays), re-reading each body from the
-    /// spill and reusing its proof. Non-quorum errors (e.g. a missing proof)
-    /// stay fatal and abort immediately.
-    ///
-    /// Returns `(chunks_stored, storage_cost_atto, gas_cost_wei)` on success.
-    /// Costs come from the `batch_result` which was populated during payment.
+    /// Download and decrypt a file, returning the number of bytes written.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::PartialUpload`] if any chunk is still short of quorum
-    /// after the store pass and every deferred round (other chunks remain
-    /// stored), or the underlying error for a non-quorum failure.
-    async fn upload_merkle_from_spill(
-        &self,
-        spill: &ChunkSpill,
-        addresses: &[[u8; 32]],
-        batch_result: &MerkleBatchPaymentResult,
-        already_stored_addresses: &[[u8; 32]],
-        progress: Option<&mpsc::Sender<UploadEvent>>,
-    ) -> Result<(usize, String, u128, WaveAggregateStats)> {
-        let mut total_stored = already_stored_addresses.len();
-        let total_chunks = total_stored + addresses.len();
-        let mut stored_addresses: Vec<[u8; 32]> = already_stored_addresses.to_vec();
-        let mut failed: Vec<([u8; 32], String)> = Vec::new();
-        let mut agg_stats = WaveAggregateStats::default();
-
-        // Chunks without a merkle proof were never paid for: a partial
-        // `pay_for_merkle_multi_batch` result carries proofs only for the
-        // sub-batches whose on-chain payment succeeded. Such a chunk cannot be
-        // stored, so record it as failed (surfaced via `PartialUpload` once the
-        // storable chunks have been attempted) rather than letting its
-        // "missing proof" error abort the whole file and discard every other
-        // chunk's progress.
-        let (to_store, missing_proof) =
-            partition_addresses_by_proof(addresses, &batch_result.proofs);
-        if !missing_proof.is_empty() {
-            warn!(
-                "{} chunk(s) lack a merkle proof (partial payment); reporting them as failed",
-                missing_proof.len()
-            );
-            for addr in &missing_proof {
-                failed.push((
-                    *addr,
-                    format!("Missing merkle proof for chunk {}", hex::encode(addr)),
-                ));
-            }
-        }
-
-        let store_limiter = self.controller().store.clone();
-
-        // Store one chunk to its (freshly re-collected) close group, reusing the
-        // chunk's merkle proof. Reads the body from the on-disk spill on demand,
-        // so the whole-file store runs as ONE cap-bounded fan-out with no per-wave
-        // barrier: a slow straggler (e.g. a chunk whose close-group peers are
-        // stale relayed addresses that take minutes to revalidate) no longer
-        // holds back the rest of the file. Only the ≤cap in-flight stores hold a
-        // body, so peak resident memory is `cap × MAX_CHUNK_SIZE`; the cap is
-        // clamped to `MERKLE_STORE_MAX_IN_FLIGHT` (below) so it stays within the
-        // ~256 MiB bound the fixed 64-chunk waves gave even if `adaptive.max.store`
-        // is configured above 64.
-        // Shared across every deferred round so a converged routing table yields
-        // a fresh group. Only a quorum shortfall is recoverable; a missing proof
-        // or a failed spill read stays fatal. Mirrors `merkle_upload_chunks`.
-        let store_one = |addr: [u8; 32]| {
-            let limiter = store_limiter.clone();
-            let proof_bytes = batch_result.proofs.get(&addr).cloned();
-            async move {
-                let started = web_time::Instant::now();
-                let proof = proof_bytes.ok_or_else(|| {
-                    Error::Payment(format!(
-                        "Missing merkle proof for chunk {}",
-                        hex::encode(addr)
-                    ))
-                })?;
-                let content = spill.read_chunk(&addr)?;
-                let peers = self.put_target_peers(&addr).await?;
-                observe_op(
-                    &limiter,
-                    || async move { self.chunk_put_to_close_group(content, proof, &peers).await },
-                    classify_error,
-                )
-                .await
-                .map(|_| started)
-            }
-        };
-
-        info!(
-            "Storing {} chunks (merkle) as a single cap-bounded pass — {total_stored}/{total_chunks} stored so far",
-            to_store.len()
-        );
-
-        // Store the WHOLE file in one cap-bounded fan-out (`max_attempts = 1`, no
-        // backoff): no wave barrier, so a slow straggler (dead-relay peers) can't
-        // hold back the rest of the file. The store cap re-reads the limiter per
-        // slot, so it maxes at 64 → ≤64 bodies resident (bodies read from spill on
-        // demand by `store_one`), the same peak-memory bound the fixed 64-chunk
-        // waves gave. Quorum-short chunks are collected and deferred to the
-        // post-pass concurrent retry rather than parking slots behind a backoff.
-        // `merkle_store_cap` clamps to `MERKLE_STORE_MAX_IN_FLIGHT` so a high
-        // configured `adaptive.max.store` can't hold more than the wave-era
-        // ~256 MB of spilled bodies resident (PR #137 review).
-        let cap = || merkle_store_cap(store_limiter.current());
-        let outcome = merkle_store_with_retry(
-            to_store.clone(),
-            cap,
-            1,
-            std::time::Duration::ZERO,
-            progress,
-            total_stored,
-            total_chunks,
-            &store_one,
-        )
-        .await?;
-
-        // Record confirmed stores from the explicit set the store helper reports.
-        // Using that set (rather than inferring "chunks minus failed") keeps
-        // `stored_addresses` correct even when a fatal abort leaves some chunks
-        // neither stored nor reported short of quorum.
-        stored_addresses.extend(&outcome.stored_addresses);
-        total_stored = outcome.stored;
-
-        // Merge store stats (durations, attempts, per-round histogram).
-        agg_stats.chunk_attempts_total = agg_stats
-            .chunk_attempts_total
-            .saturating_add(outcome.stats.chunk_attempts_total);
-        agg_stats
-            .store_durations_ms
-            .extend(outcome.stats.store_durations_ms);
-        for (slot, count) in agg_stats
-            .retries_histogram
-            .iter_mut()
-            .zip(outcome.stats.retries_histogram.iter())
-        {
-            *slot = slot.saturating_add(*count);
-        }
-
-        if let Some(e) = outcome.fatal {
-            // A non-quorum store error is fatal (missing proofs were filtered out
-            // above, so this is a genuine network/store failure). Preserve every
-            // chunk stored so far and report every not-stored chunk as failed, so
-            // the `PartialUpload` counts are accurate.
-            warn!("merkle store aborted: {e}");
-            let mut known_failed = failed;
-            known_failed.extend(outcome.failed_addresses);
-            return Err(partial_upload_after_fatal(
-                addresses,
-                stored_addresses,
-                total_stored,
-                total_chunks,
-                known_failed,
-                PartialUploadSpend {
-                    storage_cost_atto: batch_result.storage_cost_atto.clone(),
-                    gas_cost_wei: batch_result.gas_cost_wei,
-                },
-                format!("merkle chunk store aborted: {e}"),
-            ));
-        }
-
-        // Non-fatal: quorum-short chunks are deferred (not failed yet) for the
-        // post-pass concurrent retry. A deferred chunk joins `stored_addresses`
-        // only if/when a later round stores it.
-        let deferred: Vec<([u8; 32], String)> = outcome.failed_addresses;
-
-        // The store pass never blocked on backoff; now retry the deferred set in
-        // concurrent rounds. Bodies are re-read from the spill by `store_one`
-        // (peak RAM unchanged) and proofs re-attached. Chunks still short after
-        // the final round become `failed`; a non-quorum error aborts as
-        // `PartialUpload`.
-        if !deferred.is_empty() {
-            info!(
-                "Deferring {} merkle chunk(s) short of quorum for concurrent retry after the store pass",
-                deferred.len()
-            );
-            let dr = merkle_deferred_retry(
-                deferred,
-                &DEFERRED_ROUND_DELAYS_SECS,
-                |n: usize| merkle_store_cap(store_limiter.current()).min(n.max(1)),
-                progress,
-                total_stored,
-                total_chunks,
-                &store_one,
-            )
-            .await?;
-
-            stored_addresses.extend(dr.stored_addresses);
-            total_stored = dr.stored;
-
-            // Merge the deferred pass's stats — its histogram is already mapped
-            // to the right per-round slots — into the file aggregate.
-            agg_stats.chunk_attempts_total = agg_stats
-                .chunk_attempts_total
-                .saturating_add(dr.stats.chunk_attempts_total);
-            agg_stats
-                .store_durations_ms
-                .extend(dr.stats.store_durations_ms);
-            for (slot, count) in agg_stats
-                .retries_histogram
-                .iter_mut()
-                .zip(dr.stats.retries_histogram.iter())
-            {
-                *slot = slot.saturating_add(*count);
-            }
-
-            if let Some(reason) = dr.fatal {
-                // A non-quorum store error during a deferred round is fatal, the
-                // same as in the wave path: preserve everything stored so far and
-                // report every not-stored chunk as failed.
-                warn!("merkle deferred retry aborted: {reason}");
-                let mut known_failed = failed;
-                known_failed.extend(dr.failed_addresses);
-                return Err(partial_upload_after_fatal(
-                    addresses,
-                    stored_addresses,
-                    total_stored,
-                    total_chunks,
-                    known_failed,
-                    PartialUploadSpend {
-                        storage_cost_atto: batch_result.storage_cost_atto.clone(),
-                        gas_cost_wei: batch_result.gas_cost_wei,
-                    },
-                    format!("merkle chunk store aborted: {reason}"),
-                ));
-            }
-            failed.extend(dr.failed_addresses);
-        }
-
-        // A file with any permanently-failed chunk is not fully stored — surface
-        // it as `PartialUpload`, but only after the store pass and every deferred
-        // retry round are exhausted (never silently succeed with missing chunks).
-        if !failed.is_empty() {
-            let failed_count = failed.len();
-            let total_attempts = 1 + DEFERRED_ROUND_DELAYS_SECS.len();
-            warn!(
-                "merkle upload incomplete: {failed_count}/{total_chunks} chunks short of quorum after retries"
-            );
-            return Err(Error::PartialUpload {
-                stored: stored_addresses,
-                stored_count: total_stored,
-                failed,
-                failed_count,
-                total_chunks,
-                spend: Box::new(PartialUploadSpend {
-                    storage_cost_atto: batch_result.storage_cost_atto.clone(),
-                    gas_cost_wei: batch_result.gas_cost_wei,
-                }),
-                reason: format!(
-                    "{failed_count} chunk(s) short of quorum after {total_attempts} attempts"
-                ),
-            });
-        }
-
-        Ok((
-            total_stored,
-            batch_result.storage_cost_atto.clone(),
-            batch_result.gas_cost_wei,
-            agg_stats,
-        ))
-    }
-
-    /// Download and decrypt a file from the network, writing it to disk.
-    ///
-    /// Uses `streaming_decrypt` so that only one batch of chunks lives in
-    /// memory at a time, avoiding OOM on large files. Chunks are fetched
-    /// concurrently within each batch, then decrypted data is written to
-    /// disk incrementally.
-    ///
-    /// Returns the number of bytes written.
-    ///
-    /// # Panics
-    ///
-    /// Requires a multi-threaded Tokio runtime (`flavor = "multi_thread"`).
-    /// Will panic if called from a `current_thread` runtime because
-    /// `streaming_decrypt` takes a synchronous callback that must bridge
-    /// back to async via `block_in_place`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any chunk cannot be retrieved, decryption fails,
+    /// Returns an error if a chunk cannot be retrieved, decryption fails,
     /// or the file cannot be written.
     pub async fn file_download(&self, data_map: &DataMap, output: &Path) -> Result<u64> {
         self.file_download_with_progress(data_map, output, None)
@@ -2363,7 +3006,7 @@ impl Client {
         output: &Path,
         peer_count: NonZeroUsize,
     ) -> Result<u64> {
-        self.file_download_with_progress_using_peer_count(data_map, output, None, peer_count.get())
+        self.file_download_with_progress_from_closest_peers(data_map, output, None, peer_count)
             .await
     }
 
@@ -2389,6 +3032,28 @@ impl Client {
             output,
             progress,
             peer_count.get(),
+            None,
+        )
+        .await
+    }
+
+    /// Download a file with progress and optional per-attempt JSONL diagnostics.
+    ///
+    /// Passing `None` preserves the standard path without diagnostic records.
+    pub async fn file_download_with_progress_and_diagnostics_from_closest_peers(
+        &self,
+        data_map: &DataMap,
+        output: &Path,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
+        peer_count: NonZeroUsize,
+        diagnostics: Option<DownloadDiagnosticsSender>,
+    ) -> Result<u64> {
+        self.file_download_with_progress_using_peer_count(
+            data_map,
+            output,
+            progress,
+            peer_count.get(),
+            diagnostics,
         )
         .await
     }
@@ -2420,6 +3085,7 @@ impl Client {
                 progress,
                 peer_count.get(),
                 Some(chunk_reports.clone()),
+                None,
             )
             .await?;
 
@@ -2499,8 +3165,21 @@ impl Client {
                 }
             }
         } else {
+            // Normal path: early-return after the first peer that has the
+            // chunk. When diagnostics are enabled we thread a per-chunk
+            // diagnostics context through so each peer attempt in the sweep
+            // is recorded; when disabled (`None`) this is a zero-cost pass.
+            let diag = context.diagnostics.as_ref().map(|sender| {
+                ChunkFetchDiagnostics::new(
+                    sender,
+                    attempt,
+                    idx + 1,
+                    addr,
+                    self.controller().fetch.current(),
+                )
+            });
             match self
-                .chunk_get_observed_from_closest_peers(&addr, context.peer_count)
+                .chunk_get_observed_from_closest_peers(&addr, context.peer_count, diag.as_ref())
                 .await
             {
                 Ok(Some(chunk)) => Some(chunk.content),
@@ -2567,6 +3246,7 @@ impl Client {
         progress: Option<mpsc::Sender<DownloadEvent>>,
         peer_count: usize,
         peer_reports: Option<Arc<Mutex<Vec<RecordedFileChunkPeerSweep>>>>,
+        diagnostics: Option<DownloadDiagnosticsSender>,
         mut on_chunk: F,
     ) -> Result<u64>
     where
@@ -2612,7 +3292,7 @@ impl Client {
                 &|| self.controller().fetch.current(),
             )
             .await
-            .map_err(crate::data::client::data::map_read_error)?;
+            .map_err(super::super::data::map_read_error)?;
 
             info!(
                 "Resolved hierarchical DataMap: {} data chunks",
@@ -2634,6 +3314,7 @@ impl Client {
         let fetched_for_closure = fetched_counter.clone();
         let progress_for_closure = progress.clone();
         let peer_reports_for_closure = peer_reports.clone();
+        let diagnostics_for_closure = diagnostics.clone();
 
         let fetch_limiter_outer = self.controller().fetch.clone();
         let usable_memory = usable_memory_bytes();
@@ -2664,6 +3345,7 @@ impl Client {
                     fetched_ref: fetched_for_closure.clone(),
                     progress_ref: progress_for_closure.clone(),
                     peer_reports: peer_reports_for_closure.clone(),
+                    diagnostics: diagnostics_for_closure.clone(),
                 };
                 let fetch_limiter = fetch_limiter_outer.clone();
 
@@ -2681,7 +3363,7 @@ impl Client {
                                 )
                             },
                             || fetch_limiter.current(),
-                            crate::runtime::sleep,
+                            tokio::time::sleep,
                             |hash: XorName| {
                                 self_encryption::Error::Generic(format!(
                                     "Chunk not found after 3 deferred retry rounds: {}",
@@ -2728,6 +3410,7 @@ impl Client {
             output,
             progress,
             self.config().close_group_size,
+            None,
         )
         .await
     }
@@ -2743,9 +3426,15 @@ impl Client {
         output: &Path,
         progress: Option<mpsc::Sender<DownloadEvent>>,
         peer_count: usize,
+        diagnostics: Option<DownloadDiagnosticsSender>,
     ) -> Result<u64> {
         self.file_download_with_progress_using_peer_count_and_reports(
-            data_map, output, progress, peer_count, None,
+            data_map,
+            output,
+            progress,
+            peer_count,
+            None,
+            diagnostics,
         )
         .await
     }
@@ -2757,6 +3446,7 @@ impl Client {
         progress: Option<mpsc::Sender<DownloadEvent>>,
         peer_count: usize,
         peer_reports: Option<Arc<Mutex<Vec<RecordedFileChunkPeerSweep>>>>,
+        diagnostics: Option<DownloadDiagnosticsSender>,
     ) -> Result<u64> {
         debug!("Downloading file to {}", output.display());
 
@@ -2772,10 +3462,17 @@ impl Client {
         let mut file = std::fs::File::create(tmp.path())?;
 
         let bytes_written = self
-            .download_decrypted_chunks(data_map, progress, peer_count, peer_reports, |bytes| {
-                let r = file.write_all(&bytes).map_err(Error::from);
-                std::future::ready(r)
-            })
+            .download_decrypted_chunks(
+                data_map,
+                progress,
+                peer_count,
+                peer_reports,
+                diagnostics,
+                |bytes| {
+                    let r = file.write_all(&bytes).map_err(Error::from);
+                    std::future::ready(r)
+                },
+            )
             .await?;
         file.flush()?;
         drop(file); // close the handle before rename (Windows won't rename an open file)
@@ -2814,7 +3511,7 @@ impl Client {
         progress: Option<mpsc::Sender<DownloadEvent>>,
     ) -> Result<u64> {
         let peer_count = self.config().close_group_size;
-        self.download_decrypted_chunks(data_map, progress, peer_count, None, |bytes| {
+        self.download_decrypted_chunks(data_map, progress, peer_count, None, None, |bytes| {
             let sink = sink.clone();
             async move {
                 sink.send(Ok(bytes))
@@ -2830,6 +3527,288 @@ impl Client {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Throwaway payment result — the assembler only moves it into the resume
+    /// handle, never inspects it.
+    fn dummy_batch_result() -> MerkleBatchPaymentResult {
+        MerkleBatchPaymentResult {
+            proofs: HashMap::new(),
+            chunk_count: 0,
+            storage_cost_atto: "0".into(),
+            gas_cost_wei: 0,
+            merkle_payment_timestamp: 0,
+        }
+    }
+
+    fn empty_chunk_store() -> ExternalChunkStore {
+        ExternalChunkStore::from_spill(ChunkSpill::new().unwrap())
+    }
+
+    /// A minimal already-paid chunk — the wave assembler only moves it and reads
+    /// its `address`, so the body/proof/targets can be trivial.
+    fn paid_chunk(address: [u8; 32]) -> PaidChunk {
+        PaidChunk {
+            content: Bytes::from_static(b"x"),
+            address,
+            quoted_peers: Vec::new(),
+            proof_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn assemble_complete_on_full_store() {
+        let outcome = assemble_merkle_finalize_outcome(
+            Ok((3, "0".into(), 0, WaveAggregateStats::default())),
+            DataMap::new(vec![]),
+            Some([9u8; 32]),
+            3,
+            empty_chunk_store(),
+            dummy_batch_result(),
+        )
+        .expect("a fully-stored pass is not an error");
+        match outcome {
+            FinalizeOutcome::Complete(result) => {
+                assert_eq!(result.chunks_stored, 3);
+                assert_eq!(result.chunks_failed, 0);
+                assert_eq!(result.total_chunks, 3);
+                assert_eq!(result.data_map_address, Some([9u8; 32]));
+                assert!(matches!(result.payment_mode_used, PaymentMode::Merkle));
+            }
+            FinalizeOutcome::Partial { .. } => panic!("expected Complete"),
+        }
+    }
+
+    #[test]
+    fn assemble_partial_retains_resume_for_unstored() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
+        // One chunk stored, two still short of quorum after retries.
+        let store_result = Err(Error::PartialUpload {
+            stored: vec![a],
+            stored_count: 1,
+            failed: vec![(b, "quorum".into()), (c, "quorum".into())],
+            failed_count: 2,
+            total_chunks: 3,
+            spend: Box::new(PartialUploadSpend {
+                storage_cost_atto: "777".into(),
+                gas_cost_wei: 0,
+            }),
+            reason: "merkle chunk store aborted".into(),
+        });
+        let outcome = assemble_merkle_finalize_outcome(
+            store_result,
+            DataMap::new(vec![]),
+            Some([9u8; 32]),
+            3,
+            empty_chunk_store(),
+            dummy_batch_result(),
+        )
+        .expect("a quorum shortfall is Ok(Partial), never Err");
+        match outcome {
+            FinalizeOutcome::Partial { result, resume } => {
+                // Snapshot reports real progress + spend from the payment.
+                assert_eq!(result.chunks_stored, 1);
+                assert_eq!(result.chunks_failed, 2);
+                assert_eq!(result.total_chunks, 3);
+                assert_eq!(result.storage_cost_atto, "777");
+                let FinalizeResume::Merkle(m) = resume else {
+                    panic!("expected a merkle resume handle");
+                };
+                // Resume targets exactly the unstored chunks, carries the stored
+                // set forward as already-stored, and preserves public + total.
+                assert_eq!(m.unstored_addresses, vec![b, c]);
+                assert_eq!(m.stored_addresses, vec![a]);
+                assert_eq!(m.total_chunks, 3);
+                assert_eq!(m.data_map_address, Some([9u8; 32]));
+            }
+            FinalizeOutcome::Complete(_) => panic!("expected Partial"),
+        }
+    }
+
+    #[test]
+    fn resumable_guard_rejects_partial_payment() {
+        // Regression for the PR #172 review: a Some/None mix must not reach the
+        // resumable path — its resume handle could never acquire proofs for the
+        // unpaid chunks, so repeated finalize_resume calls would return Partial
+        // forever instead of draining to Complete.
+        let err = require_fully_paid_for_resumable(&[Some([1u8; 32]), None, Some([2u8; 32])])
+            .expect_err("a mix of paid and unpaid sub-batches must be rejected");
+        match err {
+            Error::Payment(msg) => {
+                assert!(msg.contains("1/3"), "counts unpaid batches: {msg}");
+                assert!(
+                    msg.contains("finalize_upload_merkle_multi()"),
+                    "points at the non-resumable path: {msg}"
+                );
+            }
+            other => panic!("expected Error::Payment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resumable_guard_accepts_fully_paid() {
+        require_fully_paid_for_resumable(&[Some([1u8; 32]), Some([2u8; 32])])
+            .expect("fully-paid winner hashes pass the guard");
+        require_fully_paid_for_resumable(&[]).expect(
+            "an empty set has no unpaid batch — fold_external_merkle_payments \
+             rejects it as nothing-to-finalize",
+        );
+    }
+
+    #[test]
+    fn merkle_resume_handle_drains_to_complete() {
+        // Regression for the PR #172 review: drive the resume-handoff contract
+        // through two passes and prove the handle drains. Pass 1 stores one of
+        // three chunks; the Partial handle carries the unstored set plus the
+        // original payment. Pass 2 re-drives exactly that handle's material and
+        // stores the rest, reaching Complete with whole-file counts.
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
+        let first_pass = Err(Error::PartialUpload {
+            stored: vec![a],
+            stored_count: 1,
+            failed: vec![(b, "quorum".into()), (c, "quorum".into())],
+            failed_count: 2,
+            total_chunks: 3,
+            spend: Box::new(PartialUploadSpend {
+                storage_cost_atto: "777".into(),
+                gas_cost_wei: 0,
+            }),
+            reason: "quorum shortfall".into(),
+        });
+        let outcome = assemble_merkle_finalize_outcome(
+            first_pass,
+            DataMap::new(vec![]),
+            Some([9u8; 32]),
+            3,
+            empty_chunk_store(),
+            dummy_batch_result(),
+        )
+        .expect("a quorum shortfall is Ok(Partial), never Err");
+        let FinalizeOutcome::Partial { resume, .. } = outcome else {
+            panic!("expected Partial after a shortfall pass");
+        };
+        let FinalizeResume::Merkle(m) = resume else {
+            panic!("expected a merkle resume handle");
+        };
+        assert_eq!(m.unstored_addresses, vec![b, c]);
+
+        // Second pass: finalize_resume feeds the handle's own fields back into
+        // the drive; simulate its store pass succeeding for the remainder.
+        let second_pass = Ok((3, "0".into(), 0, WaveAggregateStats::default()));
+        let outcome = assemble_merkle_finalize_outcome(
+            second_pass,
+            m.data_map,
+            m.data_map_address,
+            m.total_chunks,
+            m.chunk_store,
+            m.batch_result,
+        )
+        .expect("a fully-stored resume pass is not an error");
+        match outcome {
+            FinalizeOutcome::Complete(result) => {
+                assert_eq!(result.chunks_stored, 3);
+                assert_eq!(result.chunks_failed, 0);
+                assert_eq!(result.total_chunks, 3);
+                assert_eq!(result.data_map_address, Some([9u8; 32]));
+            }
+            FinalizeOutcome::Partial { .. } => panic!("expected Complete after the drain pass"),
+        }
+    }
+
+    #[test]
+    fn assemble_propagates_fatal_error() {
+        // A non-recoverable error is not folded into a resumable outcome.
+        let outcome = assemble_merkle_finalize_outcome(
+            Err(Error::Payment("on-chain call reverted".into())),
+            DataMap::new(vec![]),
+            None,
+            3,
+            empty_chunk_store(),
+            dummy_batch_result(),
+        );
+        assert!(matches!(outcome, Err(Error::Payment(_))));
+    }
+
+    #[test]
+    fn assemble_wave_complete_when_all_stored() {
+        let a = [1u8; 32];
+        let wave_result = WaveResult {
+            stored: vec![a],
+            failed: Vec::new(),
+            chunk_attempts_total: 1,
+            store_durations_ms: vec![5],
+            retries_per_chunk: vec![0],
+        };
+        let mut retained = HashMap::new();
+        retained.insert(a, paid_chunk(a));
+        let outcome = assemble_wave_finalize_outcome(
+            wave_result,
+            retained,
+            DataMap::new(vec![]),
+            Some([9u8; 32]),
+            1,
+            0,
+            "500".into(),
+        );
+        match outcome {
+            FinalizeOutcome::Complete(result) => {
+                assert_eq!(result.chunks_stored, 1);
+                assert_eq!(result.chunks_failed, 0);
+                assert_eq!(result.storage_cost_atto, "500");
+                assert!(matches!(result.payment_mode_used, PaymentMode::Single));
+            }
+            FinalizeOutcome::Partial { .. } => panic!("expected Complete"),
+        }
+    }
+
+    #[test]
+    fn assemble_wave_partial_retains_failed_paid_chunks() {
+        let a = [1u8; 32]; // stored
+        let b = [2u8; 32]; // failed
+        let c = [3u8; 32]; // failed
+        let wave_result = WaveResult {
+            stored: vec![a],
+            failed: vec![(b, "quorum".into()), (c, "quorum".into())],
+            chunk_attempts_total: 3,
+            store_durations_ms: vec![5],
+            retries_per_chunk: vec![0],
+        };
+        // All three were paid; only the two failures should be retained.
+        let mut retained = HashMap::new();
+        for addr in [a, b, c] {
+            retained.insert(addr, paid_chunk(addr));
+        }
+        let outcome = assemble_wave_finalize_outcome(
+            wave_result,
+            retained,
+            DataMap::new(vec![]),
+            Some([9u8; 32]),
+            3,
+            0,
+            "500".into(),
+        );
+        match outcome {
+            FinalizeOutcome::Partial { result, resume } => {
+                assert_eq!(result.chunks_stored, 1);
+                assert_eq!(result.chunks_failed, 2);
+                assert_eq!(result.storage_cost_atto, "500");
+                let FinalizeResume::Wave(w) = resume else {
+                    panic!("expected a wave resume handle");
+                };
+                // Exactly the two failed chunks are kept for re-store — no re-pay.
+                let mut got: Vec<[u8; 32]> =
+                    w.failed_paid_chunks.iter().map(|pc| pc.address).collect();
+                got.sort();
+                assert_eq!(got, vec![b, c]);
+                assert_eq!(w.stored_count, 1);
+                assert_eq!(w.total_chunks, 3);
+            }
+            FinalizeOutcome::Complete(_) => panic!("expected Partial"),
+        }
+    }
 
     #[test]
     fn merkle_store_cap_clamps_to_memory_bound() {
@@ -2905,6 +3884,50 @@ mod tests {
             matches!(err, Error::InsufficientDiskSpace(_)),
             "expected InsufficientDiskSpace, got: {err}"
         );
+    }
+
+    /// External multi-batch payment fold: winner-hash validation and
+    /// paid/unpaid mixes (ADR-0003).
+    mod external_merkle_fold {
+        use super::*;
+        use crate::data::client::merkle::test_support::{
+            make_prepared_merkle_batch, winner_hash_for,
+        };
+
+        #[test]
+        fn hash_count_mismatch_is_rejected() {
+            let batches = vec![make_prepared_merkle_batch(2), make_prepared_merkle_batch(3)];
+            let err = fold_external_merkle_payments(batches, vec![None]).unwrap_err();
+            assert!(
+                err.to_string().contains("winner pool hash entries"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn all_unpaid_is_rejected() {
+            let batches = vec![make_prepared_merkle_batch(2)];
+            let err = fold_external_merkle_payments(batches, vec![None]).unwrap_err();
+            assert!(
+                err.to_string().contains("No merkle sub-batch was paid"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// A k-of-N payment makes forward progress: the paid batch's proofs
+        /// fold in, the unpaid batch contributes none — so the store phase
+        /// reports its chunks via `PartialUpload` instead of aborting.
+        #[test]
+        fn paid_batches_fold_and_unpaid_contribute_no_proofs() {
+            let paid = make_prepared_merkle_batch(2);
+            let unpaid = make_prepared_merkle_batch(3);
+            let winner = winner_hash_for(&paid);
+            let merged =
+                fold_external_merkle_payments(vec![paid, unpaid], vec![Some(winner), None])
+                    .unwrap();
+            assert_eq!(merged.proofs.len(), 2, "proofs cover only the paid batch");
+            assert_eq!(merged.chunk_count, 2);
+        }
     }
 
     #[test]
@@ -2996,6 +4019,135 @@ mod tests {
         assert_eq!(missing, vec![unpaid_b, unpaid_d]);
     }
 
+    /// The real storer wording, as `ant_protocol::client_update_required_message`
+    /// builds it. Used verbatim so the tests exercise the "nothing was charged"
+    /// clause that has to be scoped before it is quoted.
+    fn real_refusal() -> String {
+        ant_protocol::client_update_required_message(1, 2)
+    }
+
+    /// The defect: a multi-batch merkle payment stops when storers refuse this
+    /// client's settlement version, and the chunks its later sub-batches never
+    /// covered reach the store path with no proof. The CLI prints this reason
+    /// and nothing else, so calling them short of quorum after N attempts
+    /// reports a failure they never had and drops the storer's upgrade
+    /// instruction, which is the only thing that makes the next attempt work.
+    #[test]
+    fn the_partial_reason_carries_a_refusal_instead_of_a_bogus_shortfall() {
+        let refusal = real_refusal();
+        assert!(
+            refusal.contains("ant update"),
+            "the storer wording must carry the instruction: {refusal}"
+        );
+
+        // Every failed chunk is one the payment never covered.
+        let all_proofless = merkle_partial_reason(3, 3, 4, Some(&refusal));
+        assert!(all_proofless.contains("ant update"), "{all_proofless}");
+        assert!(
+            !all_proofless.contains("short of quorum"),
+            "{all_proofless}"
+        );
+
+        // Mixed: two with no proof, one genuinely short of quorum. Both halves
+        // survive and the counts still add up to the three that failed.
+        let mixed = merkle_partial_reason(3, 2, 4, Some(&refusal));
+        assert!(mixed.contains("ant update"), "{mixed}");
+        assert!(mixed.contains("2 chunk(s) have no merkle proof"), "{mixed}");
+        assert!(
+            mixed.contains("1 chunk(s) short of quorum after 4 attempts"),
+            "{mixed}"
+        );
+
+        // No refusal: still not a quorum shortfall, just no proof.
+        let silent = merkle_partial_reason(2, 2, 4, None);
+        assert!(!silent.contains("short of quorum"), "{silent}");
+        assert!(
+            silent.contains("2 chunk(s) have no merkle proof"),
+            "{silent}"
+        );
+        assert!(!silent.contains("refused"), "{silent}");
+    }
+
+    /// The storer's wording says nothing was charged. That is true of the
+    /// sub-batch it refused and false of the upload, whose earlier sub-batches
+    /// settled — and the CLI prints that spend on the same line. Quoting it
+    /// unscoped would read as "spent X ... nothing was charged".
+    #[test]
+    fn the_refusal_is_scoped_before_its_nothing_was_charged_clause_is_quoted() {
+        let refusal = real_refusal();
+        assert!(
+            refusal.contains("nothing was charged"),
+            "precondition: {refusal}"
+        );
+
+        let reason = merkle_partial_reason(2, 2, 4, Some(&refusal));
+
+        // The scope has to come BEFORE the quoted refusal, or the reader hits
+        // "nothing was charged" with no qualification.
+        let scope = reason
+            .find("settled for earlier sub-batches")
+            .expect("the reason must scope the refusal");
+        let charged = reason
+            .find("nothing was charged")
+            .expect("the storer wording must still be quoted in full");
+        assert!(scope < charged, "scope must precede the claim: {reason}");
+    }
+
+    /// The ordinary case — every chunk had a proof and simply could not reach
+    /// quorum — must read exactly as it did before.
+    #[test]
+    fn the_partial_reason_is_unchanged_when_every_chunk_had_a_proof() {
+        assert_eq!(
+            merkle_partial_reason(2, 0, 4, None),
+            "2 chunk(s) short of quorum after 4 attempts"
+        );
+        // A refusal is irrelevant when nothing is missing a proof: the
+        // failures really are quorum shortfalls.
+        assert_eq!(
+            merkle_partial_reason(2, 0, 4, Some(&real_refusal())),
+            "2 chunk(s) short of quorum after 4 attempts"
+        );
+    }
+
+    /// A sub-batch settles on-chain BEFORE its proofs are generated, so a
+    /// proof-generation failure leaves chunks that were charged for and have
+    /// no proof. The wording must never claim a proof-less chunk went unpaid,
+    /// or it tells the user their money is safe when it is not.
+    #[test]
+    fn the_reason_never_claims_a_proofless_chunk_went_unpaid() {
+        // The clause the store path contributes, with no storer wording mixed
+        // in, so this asserts on our own words only.
+        let ours = proofless_clause(2, None).expect("two proofless chunks produce a clause");
+        assert_eq!(ours, "2 chunk(s) have no merkle proof");
+        assert!(!ours.contains("paid"), "{ours}");
+        assert!(!ours.contains("charged"), "{ours}");
+
+        assert!(proofless_clause(0, None).is_none());
+        assert!(
+            proofless_clause(0, Some(&real_refusal())).is_none(),
+            "no proofless chunks means no clause, refusal or not"
+        );
+    }
+
+    /// A store abort and a refusal that stopped the payment are independent
+    /// failures with different remedies. The abort is the immediate cause and
+    /// leads, but dropping the other leaves its remedy only in the per-chunk
+    /// messages, which the CLI does not print.
+    #[test]
+    fn a_fatal_store_abort_still_reports_the_refusal() {
+        let abort = "merkle chunk store aborted: connection reset";
+        let refusal = real_refusal();
+
+        let both = merkle_fatal_reason(abort, 5, Some(&refusal));
+        assert!(both.starts_with(abort), "the abort leads: {both}");
+        assert!(both.contains("ant update"), "{both}");
+        assert!(both.contains("5 chunk(s) have no merkle proof"), "{both}");
+
+        // Every chunk had a proof, so there is nothing to add.
+        assert_eq!(merkle_fatal_reason(abort, 0, Some(&refusal)), abort);
+        assert_eq!(merkle_fatal_reason(abort, 0, None), abort);
+    }
+
     /// A wave that returns `Ok` contributes its stored chunks, parsed cost, and
     /// stats; nothing is recorded as failed.
     #[test]
@@ -3056,6 +4208,65 @@ mod tests {
             matches!(result, Err(Error::Payment(_))),
             "fatal payment error must propagate, got: {result:?}"
         );
+    }
+
+    /// A settlement refusal on a later wave must not be reported as if nothing
+    /// was charged: the earlier waves paid before storing. The refusal is
+    /// reshaped into a `PartialUpload` that carries the real spend, the stored
+    /// set (for resume), every un-quoted chunk as failed, and the storer's
+    /// upgrade instruction in the reason.
+    #[test]
+    fn settlement_refusal_after_paid_waves_carries_spend_and_upgrade_instruction() {
+        let refusal = "your client is too old to pay the current storage rate. Run `ant update`";
+        let stored = vec![[1u8; 32], [2u8; 32]];
+        let remaining = [[3u8; 32], [4u8; 32], [5u8; 32]];
+
+        let err = settlement_refusal_after_paid_waves(
+            refusal,
+            2,
+            3,
+            stored.clone(),
+            stored.len(),
+            &remaining,
+            5,
+            Amount::from(700u64),
+            13,
+        );
+
+        let Error::PartialUpload {
+            stored: got_stored,
+            stored_count,
+            failed,
+            failed_count,
+            total_chunks,
+            spend,
+            reason,
+        } = err
+        else {
+            panic!("expected PartialUpload, got: {err:?}");
+        };
+        assert_eq!(got_stored, stored);
+        assert_eq!(stored_count, 2);
+        assert_eq!(failed_count, 3);
+        assert_eq!(total_chunks, 5);
+        // Every un-quoted chunk is listed, none of them as "stored".
+        let failed_addrs: Vec<[u8; 32]> = failed.iter().map(|(a, _)| *a).collect();
+        assert_eq!(failed_addrs, remaining.to_vec());
+        assert!(failed.iter().all(|(_, why)| why.contains("not quoted")));
+        // The spend is what the earlier waves actually paid, not zero.
+        assert_eq!(spend.storage_cost_atto, "700");
+        assert_eq!(spend.gas_cost_wei, 13);
+        // The user learns both facts: earlier waves paid, and how to upgrade.
+        assert!(reason.contains("wave 2/3"), "reason: {reason}");
+        assert!(
+            reason.contains("2 chunk(s) in earlier wave(s) were already paid"),
+            "reason: {reason}"
+        );
+        assert!(
+            reason.contains("3 chunk(s) were neither quoted nor paid"),
+            "reason: {reason}"
+        );
+        assert!(reason.contains(refusal), "reason: {reason}");
     }
 
     #[test]
