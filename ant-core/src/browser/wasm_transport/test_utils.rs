@@ -8,7 +8,7 @@ use fips204::{
     ml_dsa_65,
     traits::{KeyGen, SerDes, Signer},
 };
-use saorsa_webrtc::{
+use saorsa_transport::webrtc::{
     accept_pq_session, encode_response_frame, parse_request_frame, BrowserResponse,
 };
 
@@ -183,11 +183,13 @@ impl BrowserTestNode {
                 self.last_method = "quote_chunk".into();
                 let content: [u8; 32] = hex::decode(&address).unwrap().try_into().unwrap();
                 let count = self.committed_key_count;
-                let price = saorsa_webrtc::calculate_price_wei(count);
+                let price = saorsa_transport::webrtc::calculate_price_wei(count);
                 let commitment = self.storage_commitment();
-                let pin = commitment.as_ref().and_then(saorsa_webrtc::commitment_hash);
+                let pin = commitment
+                    .as_ref()
+                    .and_then(saorsa_transport::webrtc::commitment_hash);
                 let timestamp = (js_sys::Date::now() / 1000.0) as u64;
-                let signed = saorsa_webrtc::payment_quote_bytes_for_signing(
+                let signed = saorsa_transport::webrtc::payment_quote_bytes_for_signing(
                     &content,
                     timestamp,
                     price,
@@ -199,7 +201,8 @@ impl BrowserTestNode {
                     .secret
                     .try_sign_with_seed(&[8; 32], &signed, b"")
                     .unwrap();
-                let hash = saorsa_webrtc::payment_quote_hash(&signed, &self.public, &signature);
+                let hash =
+                    saorsa_transport::webrtc::payment_quote_hash(&signed, &self.public, &signature);
                 BrowserResponseBody::StorageQuote {
                     address: address.clone(),
                     already_stored: self.already_stored,
@@ -320,18 +323,18 @@ pub async fn test_put_failure_kind(endpoint: &str) -> Result<String, JsValue> {
 }
 
 impl BrowserTestNode {
-    fn storage_commitment(&self) -> Option<saorsa_webrtc::StorageCommitment> {
+    fn storage_commitment(&self) -> Option<saorsa_transport::webrtc::StorageCommitment> {
         if self.committed_key_count == 0 {
             return None;
         }
-        let mut commitment = saorsa_webrtc::StorageCommitment {
+        let mut commitment = saorsa_transport::webrtc::StorageCommitment {
             root: [0x53; 32],
             key_count: self.committed_key_count,
             sender_peer_id: self.peer,
             sender_public_key: self.public.clone(),
             signature: Vec::new(),
         };
-        let payload = saorsa_webrtc::storage_commitment_bytes_for_signing(
+        let payload = saorsa_transport::webrtc::storage_commitment_bytes_for_signing(
             &commitment.root,
             commitment.key_count,
             &self.peer,
@@ -339,7 +342,11 @@ impl BrowserTestNode {
         );
         commitment.signature = self
             .secret
-            .try_sign_with_seed(&[9; 32], &payload, saorsa_webrtc::DOMAIN_COMMITMENT)
+            .try_sign_with_seed(
+                &[9; 32],
+                &payload,
+                saorsa_transport::webrtc::DOMAIN_COMMITMENT,
+            )
             .unwrap()
             .to_vec();
         Some(commitment)
@@ -407,12 +414,14 @@ impl BrowserTestNode {
             Body::QuoteRequest(request) => {
                 self.last_method = "quote_chunk".into();
                 let commitment = self.storage_commitment();
-                let pin = commitment.as_ref().and_then(saorsa_webrtc::commitment_hash);
+                let pin = commitment
+                    .as_ref()
+                    .and_then(saorsa_transport::webrtc::commitment_hash);
                 let mut quote = PaymentQuote {
                     content: xor_name::XorName(request.address),
                     timestamp: std::time::UNIX_EPOCH
                         + Duration::from_secs((js_sys::Date::now() / 1000.0) as u64),
-                    price: Amount::from(saorsa_webrtc::calculate_price_wei(
+                    price: Amount::from(saorsa_transport::webrtc::calculate_price_wei(
                         self.committed_key_count,
                     )),
                     rewards_address: RewardsAddress::from([0x44; 20]),
