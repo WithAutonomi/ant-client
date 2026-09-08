@@ -38,6 +38,6 @@ on a current-thread runtime, verified records, and range boundaries. Generated
 WASM additionally downloads a native shrunk DataMap through the mock network and
 checks media ranges across chunk boundaries and EOF.
 
-Upload discovery regressions also reproduce five responders plus two transient
-FIND_NODE failures, verify fresh discovery succeeds before a single payment,
-and reject persistent five-peer results without any payment or PUT.
+Upload discovery regressions verify native's twenty-to-seven fallback, reject
+persistent five-peer results without payment or PUT, and ensure the browser
+adapter does not bypass endpoint suppression on the fallback attempt.
