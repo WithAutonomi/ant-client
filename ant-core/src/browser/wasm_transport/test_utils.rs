@@ -169,7 +169,11 @@ impl BrowserTestNode {
                     },
                 }
             }
-            BrowserRequestBody::FindNode { target, count } => {
+            BrowserRequestBody::FindNode {
+                target,
+                count,
+                with_address_records,
+            } => {
                 self.last_method = "find_node".into();
                 let key = parse_lookup_key(&target, "target").unwrap();
                 let mut nodes = self.closest_peers.clone();
@@ -177,6 +181,16 @@ impl BrowserTestNode {
                     xor_distance(&parse_lookup_key(&node.peer_id, "peer").unwrap(), &key)
                 });
                 nodes.truncate(count.unwrap_or(20));
+                if with_address_records {
+                    for node in &mut nodes {
+                        if let Some(encoded) = node.address_record.take() {
+                            // Deliberately forward even bad proofs so tests exercise the client verifier.
+                            let bytes = hex::decode(encoded).unwrap();
+                            protocol_content.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                            protocol_content.extend_from_slice(&bytes);
+                        }
+                    }
+                }
                 BrowserResponseBody::Nodes { target, nodes }
             }
             BrowserRequestBody::QuoteChunk { address, .. } => {
@@ -579,4 +593,20 @@ pub async fn test_shared_identity_and_timers() {
             .unwrap(),
         42
     );
+}
+
+/// Build a real owner proof for browser forwarding and freshness regressions.
+#[wasm_bindgen]
+pub fn test_signed_address_node(age_seconds: u32) -> JsValue {
+    use ant_protocol::transport::signed_address::SignedAddressRecord;
+    use ant_protocol::transport::{KnownReachability, NodeIdentity, TransportAddressRecord};
+    let identity = NodeIdentity::from_seed(&[255; 32]).unwrap();
+    let issued = (js_sys::Date::now() / 1000.0) as u64 - u64::from(age_seconds);
+    let address = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
+    let record = TransportAddressRecord::from_multiaddr(&address, KnownReachability::Direct)
+        .unwrap()
+        .unwrap();
+    let signed = SignedAddressRecord::sign(&identity, 10, issued, vec![record]).unwrap();
+    let node = shared::browser_record(signed.verify(issued).unwrap().peer_record(1.0)).unwrap();
+    serde_wasm_bindgen::to_value(&node).unwrap()
 }
