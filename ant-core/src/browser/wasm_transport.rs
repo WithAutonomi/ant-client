@@ -1,5 +1,8 @@
 //! `web-sys` WebRTC Direct transport and typed node operations.
 
+use ant_protocol::transport::DEFAULT_K_VALUE as DEFAULT_LOOKUP_K;
+use ant_protocol::CLOSE_GROUP_MAJORITY;
+
 use super::manifest::{
     assert_upload_node, validate_browser_payment_network, BrowserPaymentNetwork,
     PublicFileDescriptor,
@@ -31,7 +34,7 @@ use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Promise, Uint8Array};
 use saorsa_transport::webrtc::{
     decode_pq_frame, encode_pq_frame, pq_frame_length, transfer_timeout, PqClientHandshake,
-    PqSession, CLOSE_GROUP_MAJORITY, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_SERVER_ACCEPT_BYTES,
+    PqSession, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_SERVER_ACCEPT_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
@@ -51,8 +54,6 @@ use web_sys::{
 const REQUEST_TIMEOUT_MS: u32 = 10_000;
 const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 const DEFAULT_MAX_POOLED_CLIENTS: usize = 32;
-const DEFAULT_LOOKUP_K: usize = 20;
-const LOOKUP_GRACE_TIMEOUT_MS: u32 = 5_000;
 const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const MAX_BROWSER_ROUTING_ENTRIES: usize = 256;
 const MAX_BROWSER_ENDPOINT_FAILURES: usize = 256;
@@ -1130,9 +1131,12 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                 }
             })
             .collect();
-        let mut outcomes =
-            collect_after_first_with_grace(futures, || TimeoutFuture::new(LOOKUP_GRACE_TIMEOUT_MS))
-                .await;
+        let mut outcomes = collect_after_first_with_grace(futures, || {
+            crate::runtime::sleep(Duration::from_secs(
+                ant_protocol::transport::ITERATION_GRACE_TIMEOUT_SECS,
+            ))
+        })
+        .await;
         let responded = outcomes
             .iter()
             .map(|outcome| *outcome.responder())

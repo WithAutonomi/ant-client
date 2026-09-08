@@ -42,3 +42,26 @@ It does not change browser file/range limits, expose native filesystem APIs, or
 add Merkle payment selection to the browser facade. The native Merkle workflow
 continues to use its existing shared payment implementation and native file
 adapter.
+
+## Protocol definitions used by browser adapters
+
+The WebRTC transport has no payment-policy module. Native and WASM clients
+import the same definitions at their original application-protocol layer:
+
+| Concern | Canonical definition |
+| --- | --- |
+| Close-group size and majority | `ant_protocol::{CLOSE_GROUP_SIZE, CLOSE_GROUP_MAJORITY}` |
+| Lookup K, concurrency and iteration grace defaults | `saorsa_core::dht_lookup` (re-exported by `ant_protocol::transport`) |
+| Pricing curve | `ant_protocol::payment::calculate_price` |
+| Commitment type, limits, domains, signature bytes, verification and pin | `ant_protocol::payment::commitment` |
+| Quote signing bytes and hash | `ant_protocol::evm::PaymentQuote` (from evmlib) |
+| ML-DSA public-key size | `ant_protocol::pqc::api::MlDsaVariant::MlDsa65.public_key_size()` |
+
+Browser quote envelopes only translate JSON/hex fields and check that duplicated
+envelope fields match their native encoded payload. Browser test-node fixtures
+also construct native quotes and commitments. Native commitment signing uses
+the same canonical payload function as verification.
+
+WebRTC frame limits, DataChannel chunk sizes and transfer deadlines remain in
+transport: these describe the transport profile, not close-group or payment
+policy. Browser memory and connection-pool limits remain adapter settings.

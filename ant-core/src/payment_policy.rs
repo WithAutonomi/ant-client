@@ -4,7 +4,7 @@
 //! discovery, signature verification, wallet submission, and proof encoding
 //! remain the responsibility of the adapters.
 
-use saorsa_transport::webrtc::CLOSE_GROUP_SIZE;
+use ant_protocol::CLOSE_GROUP_SIZE;
 
 pub(crate) const SINGLE_NODE_PAYMENT_MULTIPLIER: u64 = 3;
 
@@ -179,7 +179,6 @@ mod tests {
     #[test]
     fn preserves_full_native_amount_range_and_protocol_constants() {
         use ant_protocol::evm::Amount;
-        assert_eq!(CLOSE_GROUP_SIZE, ant_protocol::CLOSE_GROUP_SIZE);
         let price = Amount::from(u128::MAX) + Amount::from(1);
         assert_eq!(
             SingleNodePaymentPlan::from_prices(&[price])
