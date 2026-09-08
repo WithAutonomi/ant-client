@@ -136,6 +136,7 @@ impl BrowserNetwork for SharedNetworkAdapter {
         for endpoint in &self.inner.seeds {
             if let Ok(parsed) = parse_webrtc_direct_multiaddr(&endpoint.multiaddr) {
                 if let Ok(node) = peer_record(&BrowserNode {
+                    address_record: None,
                     peer_record: None,
                     peer_id: parsed.peer_id,
                     native_addresses: Vec::new(),
@@ -226,6 +227,7 @@ impl BrowserNetwork for SharedNetworkAdapter {
                 self.sources.borrow_mut().put(
                     *address,
                     BrowserNode {
+                        address_record: None,
                         peer_record: None,
                         peer_id: peer.to_hex(),
                         native_addresses: Vec::new(),

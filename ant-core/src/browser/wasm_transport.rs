@@ -716,6 +716,7 @@ impl BrowserNodeClientCore {
         let response = self
             .request(
                 BrowserRequestBody::FindNode {
+                    with_address_records: true,
                     target: target.clone(),
                     count: Some(count),
                 },
@@ -724,13 +725,51 @@ impl BrowserNodeClientCore {
             .await?;
         let BrowserResponseBody::Nodes {
             target: response_target,
-            nodes,
+            mut nodes,
         } = response.header.body
         else {
             return Err("expected a NODES response".to_string());
         };
         if response_target.to_ascii_lowercase() != target {
             return Err("node returned results for a different lookup target".to_string());
+        }
+        let now = crate::runtime::system_time()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs();
+        if nodes.len() > count {
+            return Err("node returned more peers than requested".into());
+        }
+        let mut owners = HashSet::new();
+        for node in &mut nodes {
+            node.peer_id = super::protocol::normalize_hex(&node.peer_id, 32)?;
+            if !owners.insert(node.peer_id.clone()) {
+                return Err("duplicate peer in lookup response".into());
+            }
+        }
+        let proofs = ant_protocol::transport::signed_address::decode_record_bundle(
+            &response.content,
+            nodes.len(),
+        )?;
+        let mut by_owner = HashMap::new();
+        for proof in proofs {
+            let verified = proof.verify(now)?;
+            let owner = verified.owner().to_hex();
+            if by_owner
+                .insert(owner, hex::encode(proof.encode()?))
+                .is_some()
+            {
+                return Err("duplicate signed address owner".into());
+            }
+        }
+        for node in &mut nodes {
+            // A JSON field cannot bypass the bounded binary proof decoder.
+            node.address_record = by_owner.remove(&node.peer_id);
+            let verified_view = shared::peer_record(node).map_err(|e| e.to_string())?;
+            *node = shared::browser_record(verified_view).map_err(|e| e.to_string())?;
+        }
+        if !by_owner.is_empty() {
+            return Err("signed address owner absent from lookup response".into());
         }
         for node in &nodes {
             let peer_id = super::protocol::normalize_hex(&node.peer_id, 32)?;
@@ -924,6 +963,7 @@ impl BrowserNetworkCore {
                     let hello = client.hello().await?;
                     progress.report(&format!("Connected seed {}", hello.peer_id));
                     BrowserLookupCandidate::parse(BrowserNode {
+                        address_record: None,
                         peer_record: None,
                         peer_id: hello.peer_id,
                         native_addresses: Vec::new(),
@@ -945,7 +985,13 @@ impl BrowserNetworkCore {
                 }
             }
         });
-        let mut initial_candidates = self.routing.borrow().values().cloned().collect::<Vec<_>>();
+        let mut initial_candidates = self
+            .routing
+            .borrow()
+            .values()
+            .filter(|candidate| candidate.wire.webrtc_direct.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
         if initial_candidates.is_empty() {
             initial_candidates.extend(join_all(seed_futures).await.into_iter().flatten());
         }
@@ -1164,9 +1210,19 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
             {
                 let responder = PeerId::from_bytes(*responder);
                 candidates.retain_mut(|candidate| {
-                    let Ok(record) = shared::peer_record(&candidate.wire) else {
+                    let Ok(mut record) = shared::peer_record(&candidate.wire) else {
                         return false;
                     };
+                    let known = self
+                        .routing
+                        .borrow()
+                        .get(&candidate.peer_id)
+                        .and_then(|current| shared::peer_record(&current.wire).ok());
+                    if let Some(known) = known
+                        .filter(|known| !client_routing::may_replace_owner_view(known, &record))
+                    {
+                        record = known;
+                    }
                     let subject = record.peer_id;
                     let reports = self.reports.entry(subject).or_default();
                     reports.insert(responder, record);
@@ -1178,14 +1234,15 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                         return false;
                     };
                     candidate.wire = wire;
-                    // A missing endpoint affects dialing, never the witness transcript above.
+                    // Keep owner provenance even if this replacement has no browser endpoint.
+                    self.routing
+                        .borrow_mut()
+                        .insert(candidate.peer_id, candidate.clone());
                     if let Some(endpoint) = candidate.wire.webrtc_direct.clone() {
                         self.known_endpoints.insert(candidate.peer_id, endpoint);
-                        self.routing
-                            .borrow_mut()
-                            .insert(candidate.peer_id, candidate.clone());
                         true
                     } else {
+                        self.known_endpoints.remove(&candidate.peer_id);
                         false
                     }
                 });

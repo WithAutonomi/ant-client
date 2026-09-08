@@ -52,3 +52,9 @@ WebRTC frames, signs canonical evmlib quotes, and decodes the native payment
 proof on PUT. The fixtures also exercise saorsa-core identity generation,
 export/import, signing, tamper rejection, and browser deadlines without Tokio.
 Native GET's immediate integrity-failure behavior applies to the browser too.
+
+Forwarded address-record tests carry real owner signatures in encrypted binary
+lookup responses. They check byte-for-byte proof preservation, reject tampered
+and expired proofs, and confirm that unsigned outer address metadata cannot
+replace the owner's signed addresses. Legacy mock responses exercise the
+compatible unsequenced discovery-hint path throughout the existing suite.

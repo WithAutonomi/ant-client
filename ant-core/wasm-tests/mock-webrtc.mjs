@@ -82,7 +82,7 @@ export function mockWebRtc(nodes = [{}]) {
       this.channel.server.set_invalid_quote(this.channel.options.invalidQuote ?? false);
       this.channel.server.set_committed_key_count(this.channel.options.keyCount ?? 0);
       const view = this.channel.options.view ?? nodes.map((_, i) => i);
-      this.channel.server.set_closest_peers(view.map(i => ({
+      this.channel.server.set_closest_peers(this.channel.options.peers ?? view.map(i => ({
         peer_id: parseWebRtcDirectMultiaddr(endpoints[i]).peerId,
         native_addresses: [], reliability: 1, webrtc_direct: { multiaddr: endpoints[i] },
       })));
