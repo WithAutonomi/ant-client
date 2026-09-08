@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::channel::version_matches_channel;
 use crate::error::{Error, Result};
+use crate::install::{self, InstallMethod};
 use crate::node::binary::{extract_tar_gz, extract_zip, ProgressReporter};
 use crate::node::types::UpgradeChannel;
 
@@ -200,6 +201,40 @@ pub struct UpdateResult {
     pub new_version: String,
 }
 
+/// Outcome of an update declined because a package manager owns this installation.
+///
+/// Reported instead of [`UpdateResult`] when `ant` was installed by a package manager: the
+/// version check still runs, so the caller learns whether an update exists, but the binary is
+/// left alone and `update_command` says how to get it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeferredUpdate {
+    pub current_version: String,
+    pub latest_version: String,
+    pub update_available: bool,
+    pub channel: UpgradeChannel,
+    /// How this copy of `ant` was installed.
+    pub install_method: InstallMethod,
+    /// The command that will perform the update.
+    pub update_command: String,
+}
+
+impl DeferredUpdate {
+    /// Build the deferral report for `check` under `method`.
+    ///
+    /// Returns `None` for an install `ant update` may replace itself.
+    #[must_use]
+    pub fn new(check: &UpdateCheck, method: InstallMethod) -> Option<Self> {
+        Some(Self {
+            current_version: check.current_version.clone(),
+            latest_version: check.latest_version.clone(),
+            update_available: check.update_available,
+            channel: check.channel,
+            install_method: method,
+            update_command: method.update_command()?,
+        })
+    }
+}
+
 /// Check whether a newer version is available on GitHub Releases.
 ///
 /// Compares `current_version` against the highest release tag eligible for `channel`,
@@ -238,6 +273,22 @@ pub async fn perform_update(
     check: &UpdateCheck,
     progress: &dyn ProgressReporter,
 ) -> Result<UpdateResult> {
+    // Defence in depth. `ant update` checks this before it gets here and prints the right
+    // instruction, but any other consumer of this crate reaches self-replacement through this
+    // function, and overwriting a package-manager-owned binary leaves that manager's metadata
+    // describing a file that no longer exists — the next `npm update` would then silently roll
+    // the user back to the older build.
+    let method = install::detect();
+    if !method.can_self_replace() {
+        let command = method
+            .update_command()
+            .unwrap_or_else(|| "your package manager".to_string());
+        return Err(Error::UpdateFailed(format!(
+            "this ant was installed by a package manager, so it cannot replace itself. \
+             Update it with: {command}"
+        )));
+    }
+
     let download_url = check.download_url.as_deref().ok_or_else(|| {
         Error::UpdateFailed("no download URL — are you already on the latest version?".to_string())
     })?;
