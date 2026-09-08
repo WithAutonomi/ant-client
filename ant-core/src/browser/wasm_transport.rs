@@ -57,8 +57,6 @@ const REQUEST_TIMEOUT_MS: u32 = 10_000;
 const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 const DEFAULT_MAX_POOLED_CLIENTS: usize = 32;
 const DEFAULT_LOOKUP_K: usize = 20;
-const DEFAULT_LOOKUP_ALPHA: usize = 3;
-const DEFAULT_MAX_LOOKUP_ITERATIONS: usize = 20;
 const LOOKUP_GRACE_TIMEOUT_MS: u32 = 5_000;
 const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const MAX_BROWSER_ROUTING_ENTRIES: usize = 256;
@@ -856,16 +854,15 @@ impl BrowserNetworkCore {
         target: &str,
         progress: &ProgressReporter,
     ) -> Result<BrowserLookupResult, String> {
-        self.find_closest_pass(target, progress, DEFAULT_LOOKUP_K, false)
+        self.find_closest_with_count(target, progress, DEFAULT_LOOKUP_K)
             .await
     }
 
-    async fn find_closest_pass(
+    async fn find_closest_with_count(
         &self,
         target: &str,
         progress: &ProgressReporter,
         count: usize,
-        fresh: bool,
     ) -> Result<BrowserLookupResult, String> {
         let target_key = parse_lookup_key(target, "lookup target")?;
         let failures = Rc::new(RefCell::new(Vec::new()));
@@ -902,7 +899,7 @@ impl BrowserNetworkCore {
             }
         });
         let mut initial_candidates = self.routing.borrow().values().cloned().collect::<Vec<_>>();
-        if initial_candidates.is_empty() || fresh {
+        if initial_candidates.is_empty() {
             initial_candidates.extend(join_all(seed_futures).await.into_iter().flatten());
         }
         if initial_candidates.is_empty() {
@@ -917,12 +914,7 @@ impl BrowserNetworkCore {
             ));
         }
 
-        let config = LookupConfig {
-            count,
-            alpha: DEFAULT_LOOKUP_ALPHA,
-            max_iterations: DEFAULT_MAX_LOOKUP_ITERATIONS,
-            ..LookupConfig::saorsa(count)
-        };
+        let config = LookupConfig::saorsa(count);
         let mut lookup =
             IterativeLookup::new(target_key, config).map_err(|error| error.to_string())?;
         let mut known_endpoints = self
@@ -947,7 +939,6 @@ impl BrowserNetworkCore {
             }
         }
         let mut query = BrowserNetworkLookupQuery {
-            fresh,
             pool: Rc::clone(&self.pool),
             progress: progress.clone(),
             failures: Rc::clone(&failures),
@@ -1094,7 +1085,6 @@ impl BrowserNetworkCore {
 }
 
 struct BrowserNetworkLookupQuery {
-    fresh: bool,
     pool: Rc<BrowserClientPool>,
     progress: ProgressReporter,
     failures: Rc<RefCell<Vec<BrowserLookupFailure>>>,
@@ -1114,11 +1104,10 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
         let Some(endpoint) = candidate.wire.webrtc_direct.as_ref() else {
             return Ok(false);
         };
-        Ok(self.fresh
-            || !self
-                .failed_endpoints
-                .borrow_mut()
-                .is_suppressed(&candidate.peer_id, &endpoint.multiaddr))
+        Ok(!self
+            .failed_endpoints
+            .borrow_mut()
+            .is_suppressed(&candidate.peer_id, &endpoint.multiaddr))
     }
 
     async fn query_batch(
@@ -1212,14 +1201,9 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                 }
             })
             .collect();
-        let mut outcomes = if self.fresh {
-            // Each RPC already has its own deadline. A recovery probe waits
-            // for it instead of applying the shorter fast-lookup grace period.
-            futures.collect::<Vec<_>>().await
-        } else {
+        let mut outcomes =
             collect_after_first_with_grace(futures, || TimeoutFuture::new(LOOKUP_GRACE_TIMEOUT_MS))
-                .await
-        };
+                .await;
         let responded = outcomes
             .iter()
             .map(|outcome| *outcome.responder())
@@ -2090,37 +2074,15 @@ impl BrowserNetworkClient {
         progress.report(&format!("Finding closest nodes for {}", record.address));
         let record_address = &record.address;
         let mut lookup = crate::quote_policy::discover_put_peers(
-            |width, fresh| async move {
-                if fresh {
-                    progress.report(
-                        "Upload discovery is incomplete; rechecking known peers before payment",
-                    );
-                }
-                self.inner
-                    .find_closest_pass(record_address, progress, width, fresh)
-                    .await
-            },
+            |width| self.inner.find_closest_with_count(record_address, progress, width),
             |lookup| lookup.nodes.len(),
+            |found, width| format!("Witnessed close group returned only {found}/{width} initial PUT peers before payment."),
         )
         .await?;
         let address = parse_lookup_key(&record.address, "record address")?;
-        // Native first requests the wider PUT neighbourhood, falling back to
-        // seven initial peers if the full width is unavailable.
-        let width = if lookup.nodes.len() >= crate::quote_policy::PUT_TARGET_WIDTH {
-            crate::quote_policy::PUT_TARGET_WIDTH
-        } else {
-            CLOSE_GROUP_SIZE
-        };
-        let initial = lookup.nodes.iter().take(width).cloned().collect::<Vec<_>>();
-        if let Err(error) = crate::quote_policy::validate_initial_peers(initial.len()) {
-            for failure in &lookup.failures {
-                progress.report(&format!(
-                    "Upload discovery {}: {}",
-                    failure.peer_id, failure.message
-                ));
-            }
-            return Err(error);
-        }
+        // The shared discovery policy has already validated the requested
+        // responder count (20 or the native fallback of 7).
+        let initial = lookup.nodes.clone();
         // Reuse authenticated FIND_NODE transcripts. As native does, ask only
         // initial peers whose views were missing from the iterative lookup.
         let missing = initial.iter().filter(|node| {

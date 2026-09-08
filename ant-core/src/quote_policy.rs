@@ -88,21 +88,34 @@ pub(crate) fn validate_witnessed_peers(
     validate_initial_peers(initial_count)
 }
 
-/// Native wide-to-close-group discovery fallback, also used by browser uploads.
-/// A partial successful lookup is inconclusive when it has fewer than seven
-/// initial peers. The second pass requests a fresh transport probe, never a
-/// weaker payment quorum or an unverified cached replacement for a responder.
+/// Native witnessed-discovery contract: the requested initial responder count
+/// must be satisfied. Try the 20-peer PUT neighbourhood, falling back to seven
+/// on failure. Both attempts use the same transport lookup behavior.
 pub(crate) async fn discover_put_peers<T, E, F, Fut>(
     discover: F,
     count: impl Fn(&T) -> usize,
+    insufficient: impl Fn(usize, usize) -> E,
 ) -> Result<T, E>
 where
-    F: Fn(usize, bool) -> Fut,
+    F: Fn(usize) -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
 {
-    match discover(PUT_TARGET_WIDTH, false).await {
-        Ok(result) if count(&result) >= CLOSE_GROUP_SIZE => Ok(result),
-        _ => discover(CLOSE_GROUP_SIZE, true).await,
+    let validate = |result: T, width| {
+        let found = count(&result);
+        if found < width {
+            Err(insufficient(found, width))
+        } else {
+            Ok(result)
+        }
+    };
+    match discover(PUT_TARGET_WIDTH)
+        .await
+        .and_then(|result| validate(result, PUT_TARGET_WIDTH))
+    {
+        Ok(result) => Ok(result),
+        Err(_) => discover(CLOSE_GROUP_SIZE)
+            .await
+            .and_then(|result| validate(result, CLOSE_GROUP_SIZE)),
     }
 }
 
@@ -256,29 +269,32 @@ pub(crate) fn order_put_peers<K: Peer>(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn upload_discovery_retries_errors_and_thin_successes_without_lowering_minimum() {
-        for first in [Ok(5usize), Err("lookup failed"), Ok(7), Ok(20)] {
+    fn upload_discovery_matches_native_requested_width_contract() {
+        for first in [Ok(5usize), Err("lookup failed"), Ok(7), Ok(19), Ok(20)] {
             let calls = std::cell::RefCell::new(Vec::new());
             let result = futures::executor::block_on(super::discover_put_peers(
-                |width, fresh| {
-                    calls.borrow_mut().push((width, fresh));
-                    std::future::ready(if fresh { Ok(7) } else { first })
+                |width| {
+                    calls.borrow_mut().push(width);
+                    std::future::ready(if width == 7 { Ok(7) } else { first })
                 },
                 |count| *count,
+                |_, _| "insufficient peers",
             ))
             .unwrap();
-            assert!(result >= 7);
-            let expected = if matches!(first, Ok(count) if count >= 7) {
-                1
+            if first == Ok(20) {
+                assert_eq!(result, 20);
+                assert_eq!(*calls.borrow(), [20]);
             } else {
-                2
-            };
-            assert_eq!(calls.borrow().len(), expected);
-            if expected == 2 {
-                assert_eq!(calls.borrow()[1], (7, true));
+                assert_eq!(result, 7);
+                assert_eq!(*calls.borrow(), [20, 7]);
             }
         }
-        assert!(super::validate_initial_peers(5).is_err());
+        let result = futures::executor::block_on(super::discover_put_peers(
+            |_| std::future::ready(Ok(5usize)),
+            |count| *count,
+            |found, width| (found, width),
+        ));
+        assert_eq!(result, Err((5, 7)));
     }
 
     use super::*;
