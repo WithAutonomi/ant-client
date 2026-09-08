@@ -63,6 +63,7 @@ const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 mod inbox;
 mod shared;
+use ant_protocol::transport::{client_routing, PeerId};
 use shared::{native_quote_artifact, SharedNetworkAdapter};
 #[cfg(feature = "test-utils")]
 mod test_utils;
@@ -921,6 +922,7 @@ impl BrowserNetworkCore {
                     let hello = client.hello().await?;
                     progress.report(&format!("Connected seed {}", hello.peer_id));
                     BrowserLookupCandidate::parse(BrowserNode {
+                        peer_record: None,
                         peer_id: hello.peer_id,
                         native_addresses: Vec::new(),
                         reliability: 1.0,
@@ -988,6 +990,7 @@ impl BrowserNetworkCore {
             views: Rc::clone(&views),
             known_endpoints,
             routing: Rc::clone(&self.routing),
+            reports: HashMap::new(),
         };
         run_iterative_lookup(&mut lookup, &mut query)
             .await
@@ -1001,11 +1004,22 @@ impl BrowserNetworkCore {
             }
         }
         drop(routes);
-        let nodes = lookup
+        let records = lookup
             .results()
-            .into_iter()
-            .map(|candidate| candidate.wire)
-            .collect();
+            .iter()
+            .map(|candidate| shared::peer_record(&candidate.wire))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let nodes = client_routing::apply_lookup_report_winners(
+            records,
+            &query.reports,
+            &target_key,
+            count,
+        )
+        .into_iter()
+        .map(shared::browser_record)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
         let queried = lookup.queried_peers().iter().map(hex::encode).collect();
         let failures = failures.borrow().clone();
         let views = views.borrow().clone();
@@ -1024,6 +1038,7 @@ struct BrowserNetworkLookupQuery {
     failures: Rc<RefCell<Vec<BrowserLookupFailure>>>,
     views: Rc<RefCell<HashMap<LookupKey, Vec<BrowserNode>>>>,
     known_endpoints: HashMap<LookupKey, BrowserEndpoint>,
+    reports: HashMap<PeerId, client_routing::SubjectReports>,
     routing: Rc<RefCell<HashMap<LookupKey, BrowserLookupCandidate>>>,
 }
 
@@ -1137,14 +1152,30 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
             }
         }
         for outcome in &mut outcomes {
-            if let LookupQueryOutcome::Succeeded { candidates, .. } = outcome {
+            if let LookupQueryOutcome::Succeeded {
+                responder,
+                candidates,
+            } = outcome
+            {
+                let responder = PeerId::from_bytes(*responder);
                 candidates.retain_mut(|candidate| {
+                    let Ok(record) = shared::peer_record(&candidate.wire) else {
+                        return false;
+                    };
+                    let subject = record.peer_id;
+                    let reports = self.reports.entry(subject).or_default();
+                    reports.insert(responder, record);
+                    let Some((_, winner)) = client_routing::compute_winner(&subject, reports)
+                    else {
+                        return false;
+                    };
+                    let Ok(wire) = shared::browser_record(winner.clone()) else {
+                        return false;
+                    };
+                    candidate.wire = wire;
+                    // A missing endpoint affects dialing, never the witness transcript above.
                     if let Some(endpoint) = candidate.wire.webrtc_direct.clone() {
                         self.known_endpoints.insert(candidate.peer_id, endpoint);
-                    } else if let Some(endpoint) = self.known_endpoints.get(&candidate.peer_id) {
-                        candidate.wire.webrtc_direct = Some(endpoint.clone());
-                    }
-                    if candidate.wire.webrtc_direct.is_some() {
                         self.routing
                             .borrow_mut()
                             .insert(candidate.peer_id, candidate.clone());
@@ -1247,6 +1278,8 @@ impl From<BrowserRecordInfo> for UploadRecord {
 
 #[derive(Debug, Deserialize)]
 struct BrowserPaymentSubmission {
+    #[serde(default, rename = "transactionHashes")]
+    transaction_hashes: HashMap<String, String>,
     #[serde(rename = "transactionHash")]
     transaction_hash: Option<String>,
     #[serde(rename = "totalAmount")]
@@ -1330,6 +1363,60 @@ impl BrowserFileReader {
             .await
             .map(|bytes| bytes.to_vec())
             .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Default)]
+struct UploadCheckpoint {
+    snapshot: Option<String>,
+    callback: Option<js_sys::Function>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct UploadCheckpointEnvelope {
+    scope: String,
+    state: String,
+}
+
+impl UploadCheckpoint {
+    fn restore(
+        &self,
+        scope: &str,
+    ) -> Result<crate::data::client::upload_state::UploadState, String> {
+        let Some(snapshot) = &self.snapshot else {
+            return Ok(Default::default());
+        };
+        if snapshot.len() > 128 * 1024 * 1024 {
+            return Err("upload checkpoint too large".into());
+        }
+        let envelope: UploadCheckpointEnvelope =
+            serde_json::from_str(snapshot).map_err(|e| e.to_string())?;
+        if envelope.scope != scope {
+            return Err("upload checkpoint belongs to a different file or payment network".into());
+        }
+        let bytes = hex::decode(&envelope.state).map_err(|e| e.to_string())?;
+        crate::data::client::upload_state::UploadState::restore(&bytes).map_err(|e| e.to_string())
+    }
+
+    async fn save(
+        &self,
+        scope: &str,
+        state: &crate::data::client::upload_state::UploadState,
+    ) -> Result<(), String> {
+        if let Some(callback) = &self.callback {
+            let envelope = UploadCheckpointEnvelope {
+                scope: scope.into(),
+                state: hex::encode(state.checkpoint().map_err(|e| e.to_string())?),
+            };
+            let value = serde_json::to_string(&envelope).map_err(|e| e.to_string())?;
+            let result = callback
+                .call1(&JsValue::NULL, &JsValue::from_str(&value))
+                .map_err(js_error_message)?;
+            JsFuture::from(Promise::resolve(&result))
+                .await
+                .map_err(js_error_message)?;
+        }
+        Ok(())
     }
 }
 
@@ -1423,6 +1510,7 @@ impl BrowserNetworkClient {
 
     /// Self-encrypt, quote, pay through a wallet callback, and store a public file.
     #[wasm_bindgen(js_name = uploadPublicFile)]
+    #[allow(clippy::too_many_arguments)] // Preserve the existing JS argument order; recovery is additive.
     pub async fn upload_public_file(
         &self,
         content: &[u8],
@@ -1431,6 +1519,8 @@ impl BrowserNetworkClient {
         payment_network: JsValue,
         pay_for_quotes: js_sys::Function,
         on_progress: Option<js_sys::Function>,
+        checkpoint: Option<String>,
+        on_checkpoint: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
         let payment_network: BrowserPaymentNetwork =
             serde_wasm_bindgen::from_value(payment_network)
@@ -1438,6 +1528,10 @@ impl BrowserNetworkClient {
         let payment_network = validate_browser_payment_network(payment_network)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let progress = ProgressReporter::from_js(on_progress);
+        let checkpoint = UploadCheckpoint {
+            snapshot: checkpoint,
+            callback: on_checkpoint,
+        };
         let result = self
             .upload_public_file_inner(
                 content,
@@ -1446,6 +1540,7 @@ impl BrowserNetworkClient {
                 payment_network,
                 &pay_for_quotes,
                 &progress,
+                &checkpoint,
             )
             .await
             .map_err(|error| JsValue::from_str(&error))?;
@@ -1457,6 +1552,7 @@ impl BrowserNetworkClient {
     /// Record bytes are requested lazily from the asynchronous JavaScript
     /// callback, allowing the page to keep them in IndexedDB rather than WASM.
     #[wasm_bindgen(js_name = uploadStagedPublicFile)]
+    #[allow(clippy::too_many_arguments)] // Preserve the existing JS argument order; recovery is additive.
     pub async fn upload_staged_public_file(
         &self,
         staged: JsValue,
@@ -1464,6 +1560,8 @@ impl BrowserNetworkClient {
         load_record: js_sys::Function,
         pay_for_quotes: js_sys::Function,
         on_progress: Option<js_sys::Function>,
+        checkpoint: Option<String>,
+        on_checkpoint: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
         let staged: BrowserStagedFile = serde_wasm_bindgen::from_value(staged)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
@@ -1473,6 +1571,10 @@ impl BrowserNetworkClient {
         let payment_network = validate_browser_payment_network(payment_network)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let progress = ProgressReporter::from_js(on_progress);
+        let checkpoint = UploadCheckpoint {
+            snapshot: checkpoint,
+            callback: on_checkpoint,
+        };
         let result = self
             .upload_staged_public_file_inner(
                 staged,
@@ -1480,6 +1582,7 @@ impl BrowserNetworkClient {
                 &load_record,
                 &pay_for_quotes,
                 &progress,
+                &checkpoint,
             )
             .await
             .map_err(|error| JsValue::from_str(&error))?;
@@ -1698,6 +1801,7 @@ impl BrowserNetworkClient {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // Preserve the existing JS argument order; recovery is additive.
     async fn upload_public_file_inner(
         &self,
         content: &[u8],
@@ -1706,6 +1810,7 @@ impl BrowserNetworkClient {
         payment_network: BrowserPaymentNetwork,
         pay_for_quotes: &js_sys::Function,
         progress: &ProgressReporter,
+        checkpoint: &UploadCheckpoint,
     ) -> Result<BrowserUploadResult, String> {
         if name.is_empty() {
             return Err("upload file has no name".to_string());
@@ -1727,6 +1832,7 @@ impl BrowserNetworkClient {
                 None,
                 pay_for_quotes,
                 progress,
+                checkpoint,
             )
             .await?;
         let descriptor = PublicFileDescriptor {
@@ -1754,6 +1860,7 @@ impl BrowserNetworkClient {
         load_record: &js_sys::Function,
         pay_for_quotes: &js_sys::Function,
         progress: &ProgressReporter,
+        checkpoint: &UploadCheckpoint,
     ) -> Result<BrowserUploadResult, String> {
         validate_staged_file(&mut staged)?;
         progress.report(&format!(
@@ -1774,6 +1881,7 @@ impl BrowserNetworkClient {
                 Some(load_record),
                 pay_for_quotes,
                 progress,
+                checkpoint,
             )
             .await?;
         let descriptor = PublicFileDescriptor {
@@ -1801,10 +1909,26 @@ impl BrowserNetworkClient {
         load_record: Option<&js_sys::Function>,
         pay_for_quotes: &js_sys::Function,
         progress: &ProgressReporter,
+        checkpoint: &UploadCheckpoint,
     ) -> Result<BrowserStoredRecords, String> {
-        use crate::data::client::batch::finalize_batch_payment;
+        use crate::data::client::adaptive::observe_op;
+        use crate::data::client::classify_error;
         use ant_protocol::evm::{Amount, QuoteHash, TxHash};
         let count = records.len();
+        let scope = hex::encode(
+            blake3::hash(
+                &serde_json::to_vec(&(
+                    payment_network,
+                    records
+                        .iter()
+                        .map(|r| (&r.address, r.size))
+                        .collect::<Vec<_>>(),
+                ))
+                .map_err(|e| e.to_string())?,
+            )
+            .as_bytes(),
+        );
+        let mut state = checkpoint.restore(&scope)?;
         let max_size = records.iter().map(|record| record.size).max().unwrap_or(0);
         // The wallet/network selection belongs to this upload, so concurrent
         // uploads cannot overwrite each other's admission configuration.
@@ -1818,13 +1942,24 @@ impl BrowserNetworkClient {
             records.into_iter().enumerate(),
             |(index, record)| {
                 let client = &client;
+                let state = &state;
                 async move {
                     progress.report(&format!("Preparing record {}/{}", index + 1, count));
                     let address = parse_lookup_key(&record.address, "record address")?;
-                    let mut plan = client
-                        .prepare_chunk_payment_plan(address, record.size as u64)
+                    let mut plan = match state.retained_plan(
+                        &address,
+                        record.size as u64,
+                        crate::runtime::system_time(),
+                    ) {
+                        Some(plan) => Some(plan),
+                        None => observe_op(
+                            &client.controller().quote,
+                            || client.prepare_chunk_payment_plan(address, record.size as u64),
+                            classify_error,
+                        )
                         .await
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| e.to_string())?,
+                    };
                     if let Some(plan) = plan.as_mut() {
                         let eligible = join_all(plan.quoted_peers.iter().map(
                             |(peer, addresses)| async move {
@@ -1871,12 +2006,24 @@ impl BrowserNetworkClient {
         .await;
         let mut plans = plans.into_iter().collect::<Result<Vec<_>, _>>()?;
         plans.sort_by_key(|(index, _, _)| *index);
+        for (_, _, plan) in &plans {
+            if let Some(plan) = plan {
+                if !state.is_paid(&plan.address, crate::runtime::system_time()) {
+                    state.prepare(plan.clone());
+                }
+            }
+        }
+        // Retain the exact quotes before the wallet can submit a transaction.
+        checkpoint.save(&scope, &state).await?;
         let mut verified = Vec::new();
         let mut total = Amount::ZERO;
         for (_, _, plan) in &plans {
             let Some(plan) = plan else {
                 continue;
             };
+            if state.is_paid(&plan.address, crate::runtime::system_time()) {
+                continue;
+            }
             let payable = plan
                 .payment
                 .quotes
@@ -1900,6 +2047,7 @@ impl BrowserNetworkClient {
         }
         let mut payment = if verified.is_empty() {
             BrowserPaymentSubmission {
+                transaction_hashes: HashMap::new(),
                 transaction_hash: None,
                 total_amount: "0".into(),
             }
@@ -1910,27 +2058,44 @@ impl BrowserNetworkClient {
             return Err("wallet reported a different payment total".into());
         }
         let mut transactions = HashMap::<QuoteHash, TxHash>::new();
-        if !verified.is_empty() {
-            let hash = payment
-                .transaction_hash
-                .as_mut()
-                .ok_or("wallet returned no payment transaction")?;
+        if let Some(hash) = payment.transaction_hash.as_mut() {
             *hash = super::protocol::normalize_hex(hash, 32)?;
-            let tx = TxHash::from(parse_lookup_key(hash, "transaction hash")?);
-            for quote in &verified {
-                transactions.insert(
-                    QuoteHash::from(parse_lookup_key(&quote.quote_hash, "quote hash")?),
-                    tx,
-                );
-            }
         }
+        for quote in &verified {
+            let hash = if payment.transaction_hashes.is_empty() {
+                payment.transaction_hash.as_ref()
+            } else {
+                payment
+                    .transaction_hashes
+                    .get(&quote.quote_hash)
+                    .or_else(|| {
+                        payment
+                            .transaction_hashes
+                            .get(&format!("0x{}", quote.quote_hash))
+                    })
+            }
+            .ok_or("wallet returned no transaction for a paid quote")?;
+            transactions.insert(
+                QuoteHash::from(parse_lookup_key(&quote.quote_hash, "quote hash")?),
+                TxHash::from(parse_lookup_key(hash, "transaction hash")?),
+            );
+        }
+        let addresses = plans
+            .iter()
+            .filter_map(|(_, _, plan)| plan.as_ref().map(|plan| plan.address))
+            .collect::<Vec<_>>();
+        state
+            .confirm(&addresses, &transactions, crate::runtime::system_time())
+            .map_err(|e| e.to_string())?;
+        // Confirmed proofs survive loader failures and partial PUT completion.
+        checkpoint.save(&scope, &state).await?;
         // Stage only a bounded window of bytes; proof construction and all
         // per-record retries/quorums are the ordinary native client methods.
         let stores = crate::client_engine::rolling_unordered(
             plans,
             |(index, record, plan)| {
-                let transactions = &transactions;
                 let client = &client;
+                let state = &state;
                 async move {
                     let Some(plan) = plan else {
                         return Ok::<_, String>(());
@@ -1939,10 +2104,11 @@ impl BrowserNetworkClient {
                     let prepared = plan
                         .with_content(bytes::Bytes::copy_from_slice(bytes.as_slice()))
                         .map_err(|e| e.to_string())?;
-                    let paid = finalize_batch_payment(vec![prepared], transactions)
-                        .map_err(|e| e.to_string())?;
+                    let paid = state
+                        .reuse_prepared(&prepared, crate::runtime::system_time())
+                        .ok_or("paid proof expired before storage")?;
                     let result = client
-                        .store_paid_chunks_with_events(paid, None, index, count)
+                        .store_paid_chunks_with_events(vec![paid], None, index, count)
                         .await;
                     if !result.failed.is_empty() {
                         return Err(result

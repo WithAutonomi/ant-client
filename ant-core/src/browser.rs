@@ -8,6 +8,8 @@
 
 pub mod manifest;
 pub mod payment;
+#[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
+mod peer_records;
 pub mod protocol;
 
 pub use manifest::{
