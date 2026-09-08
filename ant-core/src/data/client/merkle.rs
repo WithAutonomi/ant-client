@@ -29,7 +29,9 @@ use ant_protocol::{
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::Rng;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+#[cfg(any(feature = "native", test))]
+use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -202,6 +204,7 @@ pub struct MerkleBatchPaymentResult {
 ///
 /// Contains everything needed to submit the on-chain merkle payment
 /// and then finalize proof generation without a wallet.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PreparedMerkleBatch {
     /// Merkle tree depth (needed for the on-chain call).
     pub depth: u8,
@@ -215,6 +218,63 @@ pub struct PreparedMerkleBatch {
     tree: MerkleTree,
     /// Internal: chunk addresses in order.
     addresses: Vec<[u8; 32]>,
+}
+
+impl PreparedMerkleBatch {
+    pub(crate) fn addresses(&self) -> &[[u8; 32]] {
+        &self.addresses
+    }
+
+    pub(crate) fn validate_checkpoint(&self) -> Result<()> {
+        if self.depth != self.tree.depth()
+            || self.addresses.len() != self.tree.leaf_count()
+            || self.candidate_pools.is_empty()
+        {
+            return Err(Error::InvalidData(
+                "invalid prepared Merkle dimensions".into(),
+            ));
+        }
+        for (i, address) in self.addresses.iter().enumerate() {
+            if !self
+                .tree
+                .generate_address_proof(i, XorName(*address))
+                .map_err(|e| Error::InvalidData(e.to_string()))?
+                .verify()
+            {
+                return Err(Error::InvalidData(
+                    "Merkle checkpoint address does not match tree".into(),
+                ));
+            }
+        }
+        let midpoints = self
+            .tree
+            .reward_candidates(self.merkle_payment_timestamp)
+            .map_err(|e| Error::InvalidData(e.to_string()))?;
+        if midpoints.len() != self.candidate_pools.len()
+            || self.pool_commitments.len() != self.candidate_pools.len()
+        {
+            return Err(Error::InvalidData("invalid Merkle pool count".into()));
+        }
+        let mut midpoints = midpoints
+            .into_iter()
+            .map(|proof| (proof.hash(), proof))
+            .collect::<HashMap<_, _>>();
+        for (pool, commitment) in self.candidate_pools.iter().zip(&self.pool_commitments) {
+            if midpoints.remove(&pool.midpoint_proof.hash()).as_ref() != Some(&pool.midpoint_proof)
+                || pool_commitment_with_payment_multiplier(pool)? != *commitment
+                || pool.candidate_nodes.iter().any(|candidate| {
+                    !verify_merkle_candidate_signature(candidate)
+                        || candidate.merkle_payment_timestamp != self.merkle_payment_timestamp
+                        || candidate.committed_key_count > MAX_COMMITMENT_KEY_COUNT
+                        || candidate.price
+                            != calculate_price(candidate.committed_key_count as usize)
+                })
+            {
+                return Err(Error::InvalidData("invalid Merkle checkpoint pool".into()));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Result of checking a merkle upload batch before payment.
@@ -256,6 +316,7 @@ impl std::fmt::Debug for PreparedMerkleBatch {
 ///
 /// Extra chunk contents are ignored; missing contents for any requested address
 /// are treated as corrupted upload state.
+#[cfg(any(feature = "native", test))]
 pub(crate) fn chunk_contents_for_upload_addresses(
     chunk_contents: Vec<Bytes>,
     addresses: &[[u8; 32]],
@@ -1431,7 +1492,6 @@ where
 /// Only chunks that survive a round get a longer back-off before the next, so a
 /// genuinely saturated/diverged group still gets time to settle. Mirrors the
 /// download path's `DEFERRED_ROUND_DELAYS_SECS`.
-#[cfg(any(feature = "native", test))]
 pub(crate) const DEFERRED_ROUND_DELAYS_SECS: [u64; 3] = [0, 15, 45];
 
 /// Histogram slot for a deferred-retry round's successes.
@@ -1440,14 +1500,12 @@ pub(crate) const DEFERRED_ROUND_DELAYS_SECS: [u64; 3] = [0, 15, 45];
 /// slot `r + 1`, clamped to the last slot so the four-slot
 /// [`WaveAggregateStats::retries_histogram`] keeps recording "which round a
 /// chunk landed on" under the post-wave deferred structure.
-#[cfg(any(feature = "native", test))]
 pub(crate) fn deferred_round_histogram_slot(round: usize, hist_len: usize) -> usize {
     (round + 1).min(hist_len.saturating_sub(1))
 }
 
 /// Outcome of the post-wave deferred-retry pass.
 #[derive(Debug, Default)]
-#[cfg(any(feature = "native", test))]
 pub(crate) struct DeferredRetryOutcome {
     /// Running total of stored chunks, seeded with the `stored_offset` passed in
     /// (i.e. everything the wave passes already stored) and advanced by each
@@ -1489,7 +1547,6 @@ pub(crate) struct DeferredRetryOutcome {
 /// `store_one`, `progress`, `stored_offset` and `total` mirror
 /// [`merkle_store_with_retry`].
 #[allow(clippy::too_many_arguments)]
-#[cfg(any(feature = "native", test))]
 pub(crate) async fn merkle_deferred_retry<CF, SF, Fut>(
     deferred: Vec<([u8; 32], String)>,
     round_delays_secs: &[u64],

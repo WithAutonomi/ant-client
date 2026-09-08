@@ -64,6 +64,7 @@ const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 mod inbox;
 mod shared;
+mod upload_adapter;
 use ant_protocol::transport::{client_routing, PeerId};
 use shared::{native_quote_artifact, SharedNetworkAdapter};
 #[cfg(feature = "test-utils")]
@@ -1372,6 +1373,8 @@ impl BrowserFileReader {
 
 #[derive(Default)]
 struct UploadCheckpoint {
+    mode: crate::data::client::merkle::PaymentMode,
+    merkle_wallet: Option<js_sys::Function>,
     snapshot: Option<String>,
     callback: Option<js_sys::Function>,
 }
@@ -1525,6 +1528,8 @@ impl BrowserNetworkClient {
         on_progress: Option<js_sys::Function>,
         checkpoint: Option<String>,
         on_checkpoint: Option<js_sys::Function>,
+        payment_mode: Option<String>,
+        pay_for_merkle: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
         let payment_network: BrowserPaymentNetwork =
             serde_wasm_bindgen::from_value(payment_network)
@@ -1533,6 +1538,13 @@ impl BrowserNetworkClient {
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let progress = ProgressReporter::from_js(on_progress);
         let checkpoint = UploadCheckpoint {
+            mode: match payment_mode.as_deref().unwrap_or("auto") {
+                "auto" => crate::data::client::merkle::PaymentMode::Auto,
+                "single" => crate::data::client::merkle::PaymentMode::Single,
+                "merkle" => crate::data::client::merkle::PaymentMode::Merkle,
+                _ => return Err(JsValue::from_str("unknown payment mode")),
+            },
+            merkle_wallet: pay_for_merkle,
             snapshot: checkpoint,
             callback: on_checkpoint,
         };
@@ -1566,6 +1578,8 @@ impl BrowserNetworkClient {
         on_progress: Option<js_sys::Function>,
         checkpoint: Option<String>,
         on_checkpoint: Option<js_sys::Function>,
+        payment_mode: Option<String>,
+        pay_for_merkle: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
         let staged: BrowserStagedFile = serde_wasm_bindgen::from_value(staged)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
@@ -1576,6 +1590,13 @@ impl BrowserNetworkClient {
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let progress = ProgressReporter::from_js(on_progress);
         let checkpoint = UploadCheckpoint {
+            mode: match payment_mode.as_deref().unwrap_or("auto") {
+                "auto" => crate::data::client::merkle::PaymentMode::Auto,
+                "single" => crate::data::client::merkle::PaymentMode::Single,
+                "merkle" => crate::data::client::merkle::PaymentMode::Merkle,
+                _ => return Err(JsValue::from_str("unknown payment mode")),
+            },
+            merkle_wallet: pay_for_merkle,
             snapshot: checkpoint,
             callback: on_checkpoint,
         };
@@ -1915,9 +1936,6 @@ impl BrowserNetworkClient {
         progress: &ProgressReporter,
         checkpoint: &UploadCheckpoint,
     ) -> Result<BrowserStoredRecords, String> {
-        use crate::data::client::adaptive::observe_op;
-        use crate::data::client::classify_error;
-        use ant_protocol::evm::{Amount, QuoteHash, TxHash};
         let count = records.len();
         let scope = hex::encode(
             blake3::hash(
@@ -1933,212 +1951,46 @@ impl BrowserNetworkClient {
             .as_bytes(),
         );
         let mut state = checkpoint.restore(&scope)?;
-        let max_size = records.iter().map(|record| record.size).max().unwrap_or(0);
-        // The wallet/network selection belongs to this upload, so concurrent
-        // uploads cannot overwrite each other's admission configuration.
-        let mut adapter = SharedNetworkAdapter::new(Rc::clone(&self.inner));
-        adapter.payment_network = Some(payment_network.clone());
+        let mut network = SharedNetworkAdapter::new(Rc::clone(&self.inner));
+        network.payment_network = Some(payment_network.clone());
         let client = crate::data::Client::from_network(
-            crate::data::Network::from_browser(Rc::new(adapter)),
+            crate::data::Network::from_browser(Rc::new(network)),
             crate::data::ClientConfig::default(),
         );
-        let plans = crate::client_engine::rolling_unordered(
-            records.into_iter().enumerate(),
-            |(index, record)| {
-                let client = &client;
-                let state = &state;
-                async move {
-                    progress.report(&format!("Preparing record {}/{}", index + 1, count));
-                    let address = parse_lookup_key(&record.address, "record address")?;
-                    let mut plan = match state.retained_plan(
-                        &address,
-                        record.size as u64,
-                        crate::runtime::system_time(),
-                    ) {
-                        Some(plan) => Some(plan),
-                        None => observe_op(
-                            &client.controller().quote,
-                            || client.prepare_chunk_payment_plan(address, record.size as u64),
-                            classify_error,
-                        )
-                        .await
-                        .map_err(|e| e.to_string())?,
-                    };
-                    if let Some(plan) = plan.as_mut() {
-                        let eligible = join_all(plan.quoted_peers.iter().map(
-                            |(peer, addresses)| async move {
-                                let endpoint = addresses
-                                    .iter()
-                                    .find(|address| address.is_webrtc_direct())?;
-                                let endpoint = BrowserEndpoint {
-                                    multiaddr: endpoint.to_string(),
-                                };
-                                let node = self.inner.pool.client(&endpoint).await.ok()?;
-                                let hello = node.hello().await.ok()?;
-                                assert_upload_node(&hello, payment_network).ok()?;
-                                if !hello.capabilities.iter().any(|cap| cap == "chunk_protocol") {
-                                    return None;
-                                }
-                                Some((*peer, addresses.clone()))
-                            },
-                        ))
-                        .await
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>();
-                        let required = crate::quote_policy::witness_quorum(0);
-                        if eligible.len() < required {
-                            return Err(format!(
-                                "Fewer than {required} eligible initial witness PUT peers: got {}",
-                                eligible.len()
-                            ));
-                        }
-                        plan.quoted_peers = eligible;
-                    }
-                    Ok::<_, String>((index, record, plan))
-                }
-            },
-            || {
-                client
-                    .controller()
-                    .quote
-                    .current()
-                    .min(DEFAULT_BROWSER_QUOTE_CONCURRENCY)
-            },
-        )
-        .collect::<Vec<_>>()
-        .await;
-        let mut plans = plans.into_iter().collect::<Result<Vec<_>, _>>()?;
-        plans.sort_by_key(|(index, _, _)| *index);
-        for (_, _, plan) in &plans {
-            if let Some(plan) = plan {
-                if !state.is_paid(&plan.address, crate::runtime::system_time()) {
-                    state.prepare(plan.clone());
-                }
-            }
-        }
-        // Retain the exact quotes before the wallet can submit a transaction.
-        checkpoint.save(&scope, &state).await?;
-        let mut verified = Vec::new();
-        let mut total = Amount::ZERO;
-        for (_, _, plan) in &plans {
-            let Some(plan) = plan else {
-                continue;
-            };
-            if state.is_paid(&plan.address, crate::runtime::system_time()) {
-                continue;
-            }
-            let payable = plan
-                .payment
-                .quotes
-                .iter()
-                .find(|quote| !quote.amount.is_zero())
-                .ok_or("payment plan has no paid quote")?;
-            let (_, quote) = plan
-                .peer_quotes
-                .iter()
-                .find(|(_, quote)| quote.hash() == payable.quote_hash)
-                .ok_or("paid quote missing from plan")?;
-            total = total
-                .checked_add(payable.amount)
-                .ok_or("payment total overflow")?;
-            verified.push(VerifiedStorageQuote {
-                quote: native_quote_artifact(quote, &plan.commitment_sidecars)?,
-                quote_hash: hex::encode(payable.quote_hash),
-                rewards_address: format!("0x{}", hex::encode(payable.rewards_address)),
-                amount: payable.amount.to_string(),
-            });
-        }
-        let mut payment = if verified.is_empty() {
-            BrowserPaymentSubmission {
-                transaction_hashes: HashMap::new(),
-                transaction_hash: None,
-                total_amount: "0".into(),
-            }
-        } else {
-            invoke_payment(pay_for_quotes, payment_network, &verified).await?
-        };
-        if payment.total_amount != total.to_string() {
-            return Err("wallet reported a different payment total".into());
-        }
-        let mut transactions = HashMap::<QuoteHash, TxHash>::new();
-        if let Some(hash) = payment.transaction_hash.as_mut() {
-            *hash = super::protocol::normalize_hex(hash, 32)?;
-        }
-        for quote in &verified {
-            let hash = if payment.transaction_hashes.is_empty() {
-                payment.transaction_hash.as_ref()
-            } else {
-                payment
-                    .transaction_hashes
-                    .get(&quote.quote_hash)
-                    .or_else(|| {
-                        payment
-                            .transaction_hashes
-                            .get(&format!("0x{}", quote.quote_hash))
-                    })
-            }
-            .ok_or("wallet returned no transaction for a paid quote")?;
-            transactions.insert(
-                QuoteHash::from(parse_lookup_key(&quote.quote_hash, "quote hash")?),
-                TxHash::from(parse_lookup_key(hash, "transaction hash")?),
-            );
-        }
-        let addresses = plans
+        let metadata = records
             .iter()
-            .filter_map(|(_, _, plan)| plan.as_ref().map(|plan| plan.address))
-            .collect::<Vec<_>>();
-        state
-            .confirm(&addresses, &transactions, crate::runtime::system_time())
-            .map_err(|e| e.to_string())?;
-        // Confirmed proofs survive loader failures and partial PUT completion.
-        checkpoint.save(&scope, &state).await?;
-        // Stage only a bounded window of bytes; proof construction and all
-        // per-record retries/quorums are the ordinary native client methods.
-        let stores = crate::client_engine::rolling_unordered(
-            plans,
-            |(index, record, plan)| {
-                let client = &client;
-                let state = &state;
-                async move {
-                    let Some(plan) = plan else {
-                        return Ok::<_, String>(());
-                    };
-                    let bytes = load_upload_record(index, &record, load_record).await?;
-                    let prepared = plan
-                        .with_content(bytes::Bytes::copy_from_slice(bytes.as_slice()))
-                        .map_err(|e| e.to_string())?;
-                    let paid = state
-                        .reuse_prepared(&prepared, crate::runtime::system_time())
-                        .ok_or("paid proof expired before storage")?;
-                    let result = client
-                        .store_paid_chunks_with_events(vec![paid], None, index, count)
-                        .await;
-                    if !result.failed.is_empty() {
-                        return Err(result
-                            .failed
-                            .into_iter()
-                            .map(|(_, message)| message)
-                            .collect::<Vec<_>>()
-                            .join("; "));
-                    }
-                    progress.report(&format!("Stored record {}/{}", index + 1, count));
-                    Ok(())
-                }
-            },
-            || {
-                client
-                    .controller()
-                    .store
-                    .current()
-                    .min(crate::client_engine::store_byte_bound(max_size))
-            },
-        )
-        .collect::<Vec<_>>()
-        .await;
-        stores.into_iter().collect::<Result<Vec<_>, _>>()?;
+            .enumerate()
+            .map(|(index, record)| {
+                Ok(crate::data::client::upload::UploadRecord {
+                    address: parse_lookup_key(&record.address, "record address")?,
+                    size: record.size as u64,
+                    index,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let adapter = upload_adapter::BrowserUploadAdapter {
+            network: self,
+            records: &records,
+            payment_network,
+            loader: load_record,
+            wallet: pay_for_quotes,
+            merkle_wallet: checkpoint.merkle_wallet.as_ref(),
+            progress,
+            checkpoint,
+            scope: &scope,
+            last_transaction: RefCell::new(None),
+        };
+        let result = client
+            .upload_records(metadata, &mut state, &adapter, checkpoint.mode)
+            .await
+            .map_err(|error| error.to_string())?;
+        let transaction_hash = adapter.last_transaction.into_inner();
         Ok(BrowserStoredRecords {
-            payment,
+            payment: BrowserPaymentSubmission {
+                transaction_hash,
+                transaction_hashes: HashMap::new(),
+                total_amount: result.amount.to_string(),
+            },
             replicas: CLOSE_GROUP_MAJORITY,
             records: count,
         })

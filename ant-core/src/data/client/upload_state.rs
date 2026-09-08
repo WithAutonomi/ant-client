@@ -24,10 +24,21 @@ use std::{
 pub struct UploadState {
     plans: HashMap<XorName, ChunkPaymentPlan>,
     proofs: HashMap<XorName, Vec<u8>>,
+    #[serde(default)]
+    pub(crate) pending_merkle: Option<super::merkle::PreparedMerkleBatch>,
 }
 
 /// Native proof expiry and future-clock tolerance, shared by every client adapter.
 pub fn reusable_proof(address: &XorName, bytes: &[u8], now: SystemTime) -> bool {
+    if let Ok(proof) = ant_protocol::payment::deserialize_merkle_proof(bytes) {
+        return proof.address.0 == *address
+            && proof.data_proof.verify()
+            && proof.data_proof.root() == proof.winner_pool.midpoint_proof.root()
+            && merkle_fresh(
+                proof.winner_pool.midpoint_proof.merkle_payment_timestamp,
+                now,
+            );
+    }
     let Ok((proof, _)) = deserialize_proof(bytes) else {
         return false;
     };
@@ -47,7 +58,29 @@ pub fn reusable_proof(address: &XorName, bytes: &[u8], now: SystemTime) -> bool 
         )
 }
 
+pub(crate) fn merkle_fresh(timestamp: u64, now: SystemTime) -> bool {
+    now.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .is_some_and(|now| {
+            timestamp <= now.as_secs()
+                && now.as_secs() - timestamp < ant_protocol::evm::MERKLE_PAYMENT_EXPIRATION
+        })
+}
+
 impl UploadState {
+    pub(crate) fn insert_merkle(&mut self, result: super::merkle::MerkleBatchPaymentResult) {
+        self.proofs.extend(result.proofs);
+        self.pending_merkle = None;
+    }
+    pub(crate) fn proof(&self, address: &XorName) -> Option<&Vec<u8>> {
+        self.proofs.get(address)
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn proofs(&self) -> &HashMap<XorName, Vec<u8>> {
+        &self.proofs
+    }
+
     /// Confirm a native prepared chunk through the same state transition as browser checkpoints.
     pub(super) fn pay_prepared(
         chunk: PreparedChunk,
@@ -84,6 +117,7 @@ impl UploadState {
         Self {
             plans: HashMap::new(),
             proofs,
+            pending_merkle: None,
         }
     }
 
@@ -210,7 +244,22 @@ impl UploadState {
                 ));
             }
         }
+        if let Some(prepared) = &state.pending_merkle {
+            prepared.validate_checkpoint()?;
+        }
         for (address, bytes) in &state.proofs {
+            if let Ok(proof) = ant_protocol::payment::deserialize_merkle_proof(bytes) {
+                if proof.address.0 != *address
+                    || !proof.data_proof.verify()
+                    || proof.data_proof.root() != proof.winner_pool.midpoint_proof.root()
+                    || proof.winner_pool.candidate_nodes.iter().any(|candidate| {
+                        !ant_protocol::payment::verify_merkle_candidate_signature(candidate)
+                    })
+                {
+                    return Err(Error::InvalidData("invalid checkpoint Merkle proof".into()));
+                }
+                continue;
+            }
             let proof = ant_protocol::payment::proof::deserialize_single_node_proof(bytes)
                 .map_err(Error::InvalidData)?;
             if proof.tx_hashes.is_empty()
