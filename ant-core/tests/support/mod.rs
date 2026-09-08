@@ -25,7 +25,7 @@ use ant_node::payment::{
     QuotingMetricsTracker,
 };
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
-use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
+use ant_node::storage::{AntProtocol, ChunkStore, ChunkStoreConfig, MigrationConfig};
 // Wire / transport / EVM types: route through ant-protocol so the test
 // harness exercises the same surface the client does.
 use ant_protocol::evm::{testnet::Testnet, Network as EvmNetwork, RewardsAddress, Wallet};
@@ -315,15 +315,20 @@ impl MiniTestnet {
         let node = Arc::new(P2PNode::new(core_config).await.expect("create P2P node"));
         node.start().await.expect("start P2P node");
 
-        // Create LMDB storage
-        let storage_config = LmdbStorageConfig {
+        // Create the chunk store. ant-node #216 replaced the LMDB chunk store
+        // with one file per chunk; `AntProtocol::new` now takes an
+        // `Arc<ChunkStore>`. These nodes start with no legacy environment, so
+        // the store comes up directly on the file backend and the migration
+        // never runs — this harness gives no LMDB-to-file migration coverage.
+        let storage_config = ChunkStoreConfig {
             root_dir: data_dir.to_path_buf(),
             verify_on_read: true,
             max_map_size: 0,
             disk_reserve: 0,
+            migration: MigrationConfig::default(),
         };
         let storage = Arc::new(
-            LmdbStorage::new(storage_config)
+            ChunkStore::new(storage_config)
                 .await
                 .expect("create storage"),
         );

@@ -67,7 +67,14 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # `ant-protocol` pin above points at a released version, this ant-node must
 # track the matching released version carrying the same saorsa-core /
 # ant-protocol lineage.
-ant-node = { version = "0.18.1", optional = true }
+#
+# Temporarily pinned to the ant-node `main` commit that merged the file-per-chunk
+# chunk store (WithAutonomi/ant-node#216, V2-1033). That change replaced
+# `LmdbStorage` with `ChunkStore` in `AntProtocol::new`, which the test harness
+# in tests/support/mod.rs constructs, so 0.18.1 no longer compiles against it.
+# A rev, not a branch, so the pin is immutable. Swap back to a published
+# version pin (`ant-node = "0.19.0"`) once the release train publishes it.
+ant-node = { git = "https://github.com/WithAutonomi/ant-node", rev = "31fcbae", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -98,7 +105,9 @@ test-utils = []
 # always compile even without the `devnet` feature. Pinned to the same
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
-ant-node = { version = "0.18.1", features = ["test-utils"] }
+ant-node = { git = "https://github.com/WithAutonomi/ant-node", rev = "31fcbae", features = [
+    "test-utils",
+] }
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
