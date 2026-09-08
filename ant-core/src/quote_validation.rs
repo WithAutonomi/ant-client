@@ -5,16 +5,11 @@
 
 use std::fmt::Display;
 
-pub(crate) const ML_DSA_PUB_KEY_LEN: usize = 1952;
+pub(crate) const ML_DSA_PUB_KEY_LEN: usize =
+    ant_protocol::pqc::api::MlDsaVariant::MlDsa65.public_key_size();
 
 pub(crate) trait QuotePrice: Copy + Eq + Display {
     fn for_key_count(count: u32) -> Self;
-}
-
-impl QuotePrice for u128 {
-    fn for_key_count(count: u32) -> Self {
-        saorsa_transport::webrtc::calculate_price_wei(count)
-    }
 }
 
 impl QuotePrice for ant_protocol::evm::Amount {
@@ -57,11 +52,6 @@ macro_rules! commitment_adapter {
             }
         }
     };
-}
-
-mod portable {
-    use super::Commitment;
-    commitment_adapter!(saorsa_transport::webrtc);
 }
 
 mod native {
@@ -182,23 +172,4 @@ pub(crate) fn validate_commitment_binding<P: QuotePrice, C: Commitment>(
         ));
     }
     Ok(())
-}
-
-#[cfg(all(test, feature = "native"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn portable_protocol_parameters_match_native_validation() {
-        use ant_protocol::{evm::Amount, payment::commitment::StorageCommitment as Native};
-        use saorsa_transport::webrtc::StorageCommitment as Portable;
-        assert_eq!(Portable::MAX_KEY_COUNT, Native::MAX_KEY_COUNT);
-        assert_eq!(Portable::MAX_SIDECAR_BYTES, Native::MAX_SIDECAR_BYTES);
-        for count in [0, 1, 23, 5999, 6000, Native::MAX_KEY_COUNT] {
-            assert_eq!(
-                Amount::from(u128::for_key_count(count)),
-                Amount::for_key_count(count)
-            );
-        }
-    }
 }

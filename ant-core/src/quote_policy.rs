@@ -1,6 +1,6 @@
 //! Native witnessed quote and storage-target policy, shared with browser I/O.
 
-use saorsa_transport::webrtc::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
+use ant_protocol::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
