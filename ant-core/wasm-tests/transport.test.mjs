@@ -80,3 +80,44 @@ test("an actual PUT response deadline remains a network capacity signal", async 
   const rtc = mockWebRtc([{ respond: (_, method) => method !== "put_chunk" }]);
   assert.equal(await test_put_failure_kind(rtc.endpoints[0]), "Network");
 });
+
+
+test("browser verifies forwarded owner proofs and ignores substituted metadata", async () => {
+  const { test_signed_address_node } = await import("./pkg/ant_core.js");
+  const owner = test_signed_address_node(0);
+  const original = owner.address_record;
+  owner.native_addresses = ["/ip4/1.1.1.1/udp/9000/quic"];
+  const rtc = mockWebRtc([{ peers: [owner] }]);
+  const client = new BrowserNodeClient(rtc.endpoints[0]);
+  try {
+    const nodes = await client.findNode("11".repeat(32), 20);
+    assert.deepEqual(nodes[0].native_addresses, ["/ip4/9.9.9.9/udp/9000/quic"]);
+    assert.equal(nodes[0].address_record, original);
+  } finally { client.close(); }
+});
+
+for (const scenario of ["tampered", "expired"]) {
+  test(`browser rejects ${scenario} forwarded owner proofs`, async () => {
+    const { test_signed_address_node } = await import("./pkg/ant_core.js");
+    const owner = test_signed_address_node(scenario === "expired" ? 3600 : 0);
+    if (scenario === "tampered") {
+      const bytes = Buffer.from(owner.address_record, "hex");
+      bytes[bytes.length - 1] ^= 1;
+      owner.address_record = bytes.toString("hex");
+    }
+    const rtc = mockWebRtc([{ peers: [owner] }]);
+    const client = new BrowserNodeClient(rtc.endpoints[0]);
+    try { await assert.rejects(client.findNode("11".repeat(32), 20), /signature|expired/); }
+    finally { client.close(); }
+  });
+}
+
+
+test("browser rejects duplicate owners before accepting lookup proofs", async () => {
+  const { test_signed_address_node } = await import("./pkg/ant_core.js");
+  const owner = test_signed_address_node(0);
+  const rtc = mockWebRtc([{ peers: [owner, owner] }]);
+  const client = new BrowserNodeClient(rtc.endpoints[0]);
+  try { await assert.rejects(client.findNode("11".repeat(32), 20), /duplicate peer/); }
+  finally { client.close(); }
+});

@@ -10,6 +10,30 @@ use ant_protocol::transport::{DHTNode, MultiAddr, PeerId};
 pub(crate) fn peer_record(node: &BrowserNode) -> DataResult<DHTNode> {
     use ant_protocol::transport::AddressType;
     let peer_id = PeerId::from_hex(&node.peer_id).map_err(|e| DataError::Network(e.to_string()))?;
+    if let Some(encoded) = &node.address_record {
+        use ant_protocol::transport::signed_address::{
+            SignedAddressRecord, MAX_SIGNED_ADDRESS_BYTES,
+        };
+        if encoded.len() > MAX_SIGNED_ADDRESS_BYTES * 2 {
+            return Err(DataError::Protocol(
+                "signed address record exceeds limit".into(),
+            ));
+        }
+        let bytes = hex::decode(encoded).map_err(|e| DataError::Protocol(e.to_string()))?;
+        let now = crate::runtime::system_time()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| DataError::Protocol(e.to_string()))?
+            .as_secs();
+        let proof = SignedAddressRecord::decode(&bytes)
+            .and_then(|record| record.verify(now))
+            .map_err(DataError::Protocol)?;
+        if proof.owner() != peer_id {
+            return Err(DataError::Protocol(
+                "signed address record owner mismatch".into(),
+            ));
+        }
+        return Ok(proof.peer_record(node.reliability));
+    }
     let mut record = if let Some(encoded) = &node.peer_record {
         let bytes = hex::decode(encoded).map_err(|e| DataError::Protocol(e.to_string()))?;
         let record: DHTNode =
@@ -30,8 +54,11 @@ pub(crate) fn peer_record(node: &BrowserNode) -> DataResult<DHTNode> {
             address_types: Vec::new(),
             distance: None,
             reliability: node.reliability,
+            address_authority: None,
         }
     };
+    // Neither legacy metadata nor a forwarded JSON object proves ownership.
+    record.address_authority = None;
     // Dialability is an adapter concern. Keep native-only records in witness views.
     if let Some(endpoint) = &node.webrtc_direct {
         let address = endpoint
@@ -60,6 +87,12 @@ pub(crate) fn browser_record(record: DHTNode) -> DataResult<BrowserNode> {
     let encoded =
         rmp_serde::to_vec_named(&record).map_err(|e| DataError::Protocol(e.to_string()))?;
     Ok(BrowserNode {
+        address_record: match &record.address_authority {
+            Some(ant_protocol::transport::signed_address::AddressAuthority::Signed(proof)) => Some(
+                hex::encode(proof.signed().encode().map_err(DataError::Protocol)?),
+            ),
+            _ => None,
+        },
         peer_record: Some(hex::encode(encoded)),
         peer_id: record.peer_id.to_hex(),
         native_addresses: record
@@ -92,6 +125,7 @@ mod tests {
             address_types: vec![AddressType::Relay],
             distance: Some(vec![4, 5, 6]),
             reliability: 0.3,
+            address_authority: None,
         };
         let wire = browser_record(record.clone()).unwrap();
         assert!(wire.webrtc_direct.is_none());
@@ -121,6 +155,7 @@ mod tests {
     #[test]
     fn metadata_cannot_change_the_advertised_peer_identity() {
         let original = BrowserNode {
+            address_record: None,
             peer_record: None,
             peer_id: hex::encode([1; 32]),
             native_addresses: Vec::new(),
@@ -129,6 +164,48 @@ mod tests {
         };
         let mut wire = browser_record(peer_record(&original).unwrap()).unwrap();
         wire.peer_id = hex::encode([2; 32]);
+        assert!(peer_record(&wire).is_err());
+    }
+    #[test]
+    fn owner_proof_survives_browser_adaptation_and_rejects_substitution() {
+        use ant_protocol::transport::signed_address::{AddressAuthority, SignedAddressRecord};
+        use ant_protocol::transport::{KnownReachability, NodeIdentity, TransportAddressRecord};
+        let identity = NodeIdentity::generate().unwrap();
+        let now = crate::runtime::system_time()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let address: MultiAddr = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
+        let signed = SignedAddressRecord::sign(
+            &identity,
+            10,
+            now,
+            vec![
+                TransportAddressRecord::from_multiaddr(&address, KnownReachability::Direct)
+                    .unwrap()
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let original = signed.verify(now).unwrap().peer_record(1.0);
+        let mut wire = browser_record(original.clone()).unwrap();
+        wire.native_addresses = vec!["/ip4/1.1.1.1/udp/9000/quic".into()];
+        let restored = peer_record(&wire).unwrap();
+        assert_eq!(restored.addresses, vec![address]);
+        assert!(matches!(
+            restored.address_authority,
+            Some(AddressAuthority::Signed(_))
+        ));
+        assert_eq!(
+            browser_record(restored).unwrap().address_record,
+            wire.address_record
+        );
+        wire.address_record = None;
+        let hint = peer_record(&wire).unwrap();
+        assert!(hint.address_authority.is_none());
+        assert!(!client_routing::may_replace_owner_view(&original, &hint));
+        wire.address_record = Some(hex::encode(signed.encode().unwrap()));
+        wire.peer_id = PeerId::from_bytes([9; 32]).to_hex();
         assert!(peer_record(&wire).is_err());
     }
 }

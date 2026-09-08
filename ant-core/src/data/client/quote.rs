@@ -1490,6 +1490,7 @@ mod tests {
             address_types: Vec::new(),
             distance: None,
             reliability: 1.0,
+            address_authority: None,
         }
     }
 
