@@ -12,6 +12,7 @@ exclude = ["wasm-tests"]
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+async-trait = "0.1"
 # Cross-platform data primitives. These are the only dependencies compiled for
 # the browser-WASM target; native networking and node management stay behind
 # the `native` feature below.
@@ -78,7 +79,7 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"], o
 # `MultiAddr` mutually incompatible in `node/devnet.rs`. The draft node
 # revision below carries the same reviewed core/transport pins as this
 # workspace and uses the same released ant-protocol lineage.
-ant-node = { version = "0.18.1", git = "https://github.com/WithAutonomi/ant-node.git", rev = "6950570d6d44bc84b05c9766baa15f6ce8747120", optional = true }
+ant-node = { version = "0.18.1", git = "https://github.com/WithAutonomi/ant-node.git", rev = "e1e3f789b17ddbfd1ed24dd3a1f87bf2182c8d89", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # Browser bindings are optional so ordinary native consumers do not pull the
@@ -168,7 +169,7 @@ test-utils = ["dep:fips204"]
 # always compile even without the `devnet` feature. Pinned to the same
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
-ant-node = { version = "0.18.1", git = "https://github.com/WithAutonomi/ant-node.git", rev = "6950570d6d44bc84b05c9766baa15f6ce8747120", features = ["test-utils"] }
+ant-node = { version = "0.18.1", git = "https://github.com/WithAutonomi/ant-node.git", rev = "e1e3f789b17ddbfd1ed24dd3a1f87bf2182c8d89", features = ["test-utils"] }
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }

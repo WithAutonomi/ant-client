@@ -37,11 +37,24 @@ disk receipts. Pending wallet submissions still require settlement observation
 and the existing `onPaymentSubmitted` reconciliation path: an unpaid/prepared
 checkpoint alone is not evidence that a transaction confirmed.
 
-This change shares the existing single-node upload state and recovery policy.
-It does not change browser file/range limits, expose native filesystem APIs, or
-add Merkle payment selection to the browser facade. The native Merkle workflow
-continues to use its existing shared payment implementation and native file
-adapter.
+`data::client::upload::Client::upload_records` coordinates native memory uploads,
+native spilled files, and browser buffered/staged uploads. It selects Auto,
+Single, or Merkle payment with native thresholds, partitions batches, pipelines
+single-node waves, and applies the same store retry and recovery policies.
+Platform adapters supply bytes, wallet settlement, checkpoint persistence, and
+progress callbacks. Browser transport admission checks remain in its adapter.
+
+Prepared Merkle checkpoints preserve the exact salted tree and payment request;
+confirmed checkpoints retain native tagged proofs. Native file checkpoints are
+atomically persisted under a file/payment-network scope and protected by a file
+lock. Browser applications persist checkpoints with the awaited callback.
+The SDK ethers and wagmi providers submit calldata encoded by evmlib and decode
+settlement with its canonical event ABI. Custom providers can implement
+`payMerkle`; applications using only single-node payments can select `single`.
+
+Content addresses call `ant_protocol::compute_address`. Public DataMap records
+use `client_engine::files::public_map_record` for both serialization and address
+calculation. Whole-file BLAKE3 checksums retain their separate checksum meaning.
 
 ## Protocol definitions used by browser adapters
 

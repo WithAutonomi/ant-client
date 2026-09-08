@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   BrowserNetworkClient,
+  contentAddress,
   encryptPublicFile,
   parseWebRtcDirectMultiaddr,
 } from "./pkg/ant_core.js";
@@ -459,5 +460,111 @@ test("wallet may return separate transactions for each prepared record", async (
       transactionHashes: Object.fromEntries(quotes.map((quote, index) => [quote.quoteHash, (index + 1).toString(16).padStart(64, "0")])),
     }));
     assert.equal(result.file.replicas, 4);
+  } finally { client.close(); }
+});
+
+function stagedFixture() {
+  const encrypted = encryptPublicFile(content);
+  return { encrypted, staged: {
+    ...encrypted, name: "shared.txt", content_type: "text/plain", size: content.length,
+    records: encrypted.records.map(record => ({ address: record.address, size: record.content.length })),
+  }};
+}
+
+const merkleReceipt = request => ({
+  transactionHash: `0x${"cd".repeat(32)}`,
+  winnerPoolHash: request.poolHashes[0],
+  totalAmount: request.maximumAmount,
+});
+
+test("forced Merkle uses native candidate quotes and tagged record proofs", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 16 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let request;
+  try {
+    const result = await client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
+      async () => { throw new Error("single payment must not run"); }, undefined, undefined, undefined, "merkle",
+      async (_, value) => { request = value; return merkleReceipt(value); });
+    assert.match(request.calldata, /^0x[0-9a-f]+$/);
+    assert(rtc.requests.some(request => request.method === "merkle_quote"));
+    assert.equal(result.storageCostAtto, request.maximumAmount);
+    for (const put of rtc.requests.filter(request => request.method === "put_chunk")) {
+      assert.equal(put.quoteHash, request.poolHashes[0]);
+    }
+  } finally { client.close(); }
+});
+
+test("forced Merkle fails before payment when candidate pools cannot be filled", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let payments = 0;
+  try {
+    await assert.rejects(client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
+      async () => { payments++; }, undefined, undefined, undefined, "merkle", async () => { payments++; }));
+    assert.equal(payments, 0);
+  } finally { client.close(); }
+});
+
+test("prepared Merkle checkpoint preserves the exact salted tree and wallet request", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 16 }, () => ({})));
+  let client = new BrowserNetworkClient(rtc.endpoints);
+  let checkpoint, original;
+  try {
+    await assert.rejects(client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
+      async () => { throw new Error("unexpected single payment"); }, undefined, undefined,
+      value => { checkpoint = value; }, "merkle", async (_, request) => {
+        original = request; throw new Error("wallet interrupted");
+      }), /wallet interrupted/);
+    client.close();
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    client = new BrowserNetworkClient(rtc.endpoints);
+    await client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
+      async () => { throw new Error("unexpected single payment"); }, undefined, checkpoint, undefined, "merkle",
+      async (_, request) => { assert.deepEqual(request, original); return merkleReceipt(request); });
+  } finally { client.close(); }
+});
+
+test("paid Merkle checkpoint survives byte-loader failure without repaying", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 16 }, () => ({})));
+  const {encrypted, staged} = stagedFixture();
+  let client = new BrowserNetworkClient(rtc.endpoints);
+  let checkpoint, payments = 0;
+  const noSingle = async () => { throw new Error("unexpected single payment"); };
+  try {
+    await assert.rejects(client.uploadStagedPublicFile(staged, paymentNetwork,
+      async () => { throw new Error("loader unavailable"); }, noSingle, undefined, undefined,
+      value => { checkpoint = value; }, "merkle", async (_, request) => {
+        payments++; return merkleReceipt(request);
+      }), /loader unavailable/);
+    assert.equal(payments, 1);
+    client.close();
+    client = new BrowserNetworkClient(rtc.endpoints);
+    const result = await client.uploadStagedPublicFile(staged, paymentNetwork,
+      async index => encrypted.records[index].content, noSingle, undefined, checkpoint, undefined, "merkle",
+      async () => { throw new Error("Merkle payment must be reused"); });
+    assert.equal(result.storageCostAtto, "0");
+    assert.equal(result.records, staged.records.length);
+  } finally { client.close(); }
+});
+
+
+test("Auto fallback shares single-node payment waves and deduplicates records", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const {encrypted, staged} = stagedFixture();
+  const records = encrypted.records.slice(0, -1);
+  while (records.length < 64) {
+    const bytes = new TextEncoder().encode(`Additional record ${records.length}`);
+    records.push({address: contentAddress(bytes), content: bytes});
+  }
+  records.push(records[0], encrypted.records.at(-1));
+  staged.records = records.map(record => ({address: record.address, size: record.content.length}));
+  const signer = wallet();
+  try {
+    const result = await client.uploadStagedPublicFile(staged, paymentNetwork,
+      async index => records[index].content, signer.pay, undefined, undefined, undefined, "auto");
+    assert.equal(result.records, 66);
+    assert.deepEqual(signer.calls.map(call => call.quotes.length), [64, 1]);
+    assert.equal(rtc.requests.filter(request => request.method === "put_chunk").length, 65 * 4);
   } finally { client.close(); }
 });
