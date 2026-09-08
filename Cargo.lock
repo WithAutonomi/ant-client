@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.3.6"
+version = "0.3.7-rc.1"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.8.1"
+version = "0.9.0-rc.1"
 dependencies = [
  "alloy",
  "ant-node",
@@ -892,8 +892,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.18.1"
-source = "git+https://github.com/WithAutonomi/ant-node?rev=31fcbae#31fcbae2688a1d81008ef1b57fe09eda4b13817b"
+version = "0.19.0-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.9.2#094367a7413993fd4b912972c1cfaabbb0ac6bca"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -942,8 +942,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.3.5"
-source = "git+https://github.com/WithAutonomi/ant-protocol.git?rev=88ad3f1#88ad3f17dfd165448be29b7ec1ed5bc1669c7b4f"
+version = "2.4.0-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.9.2#b52d5fa4cec1932c5c9bd34cd86aca823eaf5dde"
 dependencies = [
  "blake3",
  "bytes",
@@ -3303,7 +3303,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -5247,8 +5247,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.27.3"
-source = "git+https://github.com/WithAutonomi/saorsa-core.git?branch=feat%2Fv2-903-download-route-diagnostics#53ec4ba02144c142c666aed0e2e59cf82c4295f2"
+version = "0.27.4-rc.1"
+source = "git+https://github.com/WithAutonomi/saorsa-core?branch=rc-2026.9.2#6806ded8fdb829f41f3cd735a2a8d8fe09e3222d"
 dependencies = [
  "anyhow",
  "async-trait",
