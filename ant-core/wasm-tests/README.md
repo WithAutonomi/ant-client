@@ -58,3 +58,9 @@ lookup responses. They check byte-for-byte proof preservation, reject tampered
 and expired proofs, and confirm that unsigned outer address metadata cannot
 replace the owner's signed addresses. Legacy mock responses exercise the
 compatible unsequenced discovery-hint path throughout the existing suite.
+
+Address V2 is signed by definition. Browser tests verify that an authenticated
+`addr-v2` capability makes every returned peer proof mandatory; an omitted proof
+is rejected. Servers without that capability exercise the V1-era discovery-hint
+fallback. The capability token is imported from portable saorsa-core by both
+node and client adapters.

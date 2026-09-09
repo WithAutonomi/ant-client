@@ -25,6 +25,7 @@ pub struct BrowserTestNode {
     chunk: Vec<u8>,
     records: HashMap<String, Vec<u8>>,
     uploads_enabled: bool,
+    address_v2: bool,
     invalid_quote: bool,
     committed_key_count: u32,
     last_put_address: String,
@@ -68,6 +69,7 @@ impl BrowserTestNode {
             chunk: Vec::new(),
             records: HashMap::new(),
             uploads_enabled: true,
+            address_v2: false,
             invalid_quote: false,
             committed_key_count: 0,
             last_put_address: String::new(),
@@ -81,6 +83,9 @@ impl BrowserTestNode {
     }
     pub fn last_method(&self) -> String {
         self.last_method.clone()
+    }
+    pub fn set_address_v2(&mut self, enabled: bool) {
+        self.address_v2 = enabled;
     }
     pub fn set_uploads_enabled(&mut self, enabled: bool) {
         self.uploads_enabled = enabled;
@@ -152,20 +157,22 @@ impl BrowserTestNode {
                         multiaddr: self.endpoint.clone(),
                     },
                     payment: network(),
-                    capabilities: if self.uploads_enabled {
-                        vec![
+                    capabilities: {
+                        let mut capabilities = vec![
                             "chunk_protocol".into(),
                             "find_node".into(),
                             "get_chunk".into(),
-                            "quote_chunk".into(),
-                            "put_chunk".into(),
-                        ]
-                    } else {
-                        vec![
-                            "chunk_protocol".into(),
-                            "find_node".into(),
-                            "get_chunk".into(),
-                        ]
+                        ];
+                        if self.uploads_enabled {
+                            capabilities.extend(["quote_chunk".into(), "put_chunk".into()]);
+                        }
+                        if self.address_v2 {
+                            capabilities.push(
+                                ant_protocol::transport::signed_address::ADDRESS_V2_CAPABILITY
+                                    .into(),
+                            );
+                        }
+                        capabilities
                     },
                 }
             }

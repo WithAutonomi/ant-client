@@ -78,6 +78,7 @@ export function mockWebRtc(nodes = [{}]) {
       for (const [address, content] of stores[seed - 1]) {
         this.channel.server.set_record(address, content);
       }
+      this.channel.server.set_address_v2(this.channel.options.addressV2 ?? false);
       this.channel.server.set_uploads_enabled(this.channel.options.uploads ?? true);
       this.channel.server.set_invalid_quote(this.channel.options.invalidQuote ?? false);
       this.channel.server.set_committed_key_count(this.channel.options.keyCount ?? 0);

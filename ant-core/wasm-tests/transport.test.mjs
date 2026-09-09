@@ -87,7 +87,7 @@ test("browser verifies forwarded owner proofs and ignores substituted metadata",
   const owner = test_signed_address_node(0);
   const original = owner.address_record;
   owner.native_addresses = ["/ip4/1.1.1.1/udp/9000/quic"];
-  const rtc = mockWebRtc([{ peers: [owner] }]);
+  const rtc = mockWebRtc([{ peers: [owner], addressV2: true }]);
   const client = new BrowserNodeClient(rtc.endpoints[0]);
   try {
     const nodes = await client.findNode("11".repeat(32), 20);
@@ -105,7 +105,7 @@ for (const scenario of ["tampered", "expired"]) {
       bytes[bytes.length - 1] ^= 1;
       owner.address_record = bytes.toString("hex");
     }
-    const rtc = mockWebRtc([{ peers: [owner] }]);
+    const rtc = mockWebRtc([{ peers: [owner], addressV2: true }]);
     const client = new BrowserNodeClient(rtc.endpoints[0]);
     try { await assert.rejects(client.findNode("11".repeat(32), 20), /signature|expired/); }
     finally { client.close(); }
@@ -116,8 +116,26 @@ for (const scenario of ["tampered", "expired"]) {
 test("browser rejects duplicate owners before accepting lookup proofs", async () => {
   const { test_signed_address_node } = await import("./pkg/ant_core.js");
   const owner = test_signed_address_node(0);
-  const rtc = mockWebRtc([{ peers: [owner, owner] }]);
+  const rtc = mockWebRtc([{ peers: [owner, owner], addressV2: true }]);
   const client = new BrowserNodeClient(rtc.endpoints[0]);
   try { await assert.rejects(client.findNode("11".repeat(32), 20), /duplicate peer/); }
   finally { client.close(); }
+});
+
+
+test("V2-capable browser lookup rejects an omitted owner proof", async () => {
+  const rtc = mockWebRtc([{ addressV2: true }]);
+  const client = new BrowserNodeClient(rtc.endpoints[0]);
+  try { await assert.rejects(client.findNode("11".repeat(32), 20), /missing its owner proof/); }
+  finally { client.close(); }
+});
+
+test("legacy browser lookup still accepts unsigned discovery hints", async () => {
+  const rtc = mockWebRtc();
+  const client = new BrowserNodeClient(rtc.endpoints[0]);
+  try {
+    const nodes = await client.findNode("11".repeat(32), 20);
+    assert.equal(nodes.length, 1);
+    assert.equal(nodes[0].address_record, undefined);
+  } finally { client.close(); }
 });
