@@ -713,6 +713,9 @@ impl BrowserNodeClientCore {
         count: usize,
     ) -> Result<Vec<BrowserNode>, String> {
         let target = super::protocol::normalize_hex(target, 32)?;
+        let require_owner_proofs = self.hello().await?.capabilities.iter().any(|capability| {
+            capability == ant_protocol::transport::signed_address::ADDRESS_V2_CAPABILITY
+        });
         let response = self
             .request(
                 BrowserRequestBody::FindNode {
@@ -765,6 +768,9 @@ impl BrowserNodeClientCore {
         for node in &mut nodes {
             // A JSON field cannot bypass the bounded binary proof decoder.
             node.address_record = by_owner.remove(&node.peer_id);
+            if require_owner_proofs && node.address_record.is_none() {
+                return Err("V2 lookup peer is missing its owner proof".into());
+            }
             let verified_view = shared::peer_record(node).map_err(|e| e.to_string())?;
             *node = shared::browser_record(verified_view).map_err(|e| e.to_string())?;
         }
