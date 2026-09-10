@@ -7,7 +7,7 @@
 - **Reviewers:** <pending>
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** ant-node ADR-0009; Saorsa WebRTC Direct transport; ant-client-browser-sdk
+- **Related:** [ant-node ADR-0013](https://github.com/WithAutonomi/ant-node/blob/web-support/docs/adr/ADR-0013-direct-browser-clients-over-webrtc-direct.md); Saorsa WebRTC Direct transport; ant-client-browser-sdk
 
 ## Context
 

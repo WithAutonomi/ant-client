@@ -908,7 +908,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.18.1"
-source = "git+https://github.com/WithAutonomi/ant-node.git?rev=0cb2433e8ae26583d5525e84b7b452b7bdabd2fa#0cb2433e8ae26583d5525e84b7b452b7bdabd2fa"
+source = "git+https://github.com/WithAutonomi/ant-node.git?rev=3e7dafcc167958b6647dcf896340ae1bb3c3f85f#3e7dafcc167958b6647dcf896340ae1bb3c3f85f"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -960,7 +960,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.5"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=7d40a94017264a10c72d20e645205143aab0c1e2#7d40a94017264a10c72d20e645205143aab0c1e2"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=f87a4e65874d162b5d29aabb22c6e3ac7040238d#f87a4e65874d162b5d29aabb22c6e3ac7040238d"
 dependencies = [
  "blake3",
  "bytes",
@@ -5469,7 +5469,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.27.3"
-source = "git+https://github.com/WithAutonomi/saorsa-core?rev=68a4a16f813aa78c154bde768c6f749143cfc335#68a4a16f813aa78c154bde768c6f749143cfc335"
+source = "git+https://github.com/WithAutonomi/saorsa-core?rev=2f70b7a1502f1be1fa78a407dfaf74ff4e796415#2f70b7a1502f1be1fa78a407dfaf74ff4e796415"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5537,7 +5537,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.36.3"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=c6e3ee21d41caf332b3a64dd15d32123e486f8ac#c6e3ee21d41caf332b3a64dd15d32123e486f8ac"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=c079c8aa839feb6684a9a79f0557703a41c6d6b7#c079c8aa839feb6684a9a79f0557703a41c6d6b7"
 dependencies = [
  "anyhow",
  "async-trait",
