@@ -406,10 +406,16 @@ mod wasm {
                 callback: query_batch,
                 known_endpoints: &mut self.known_endpoints,
             };
-            run_iterative_lookup(&mut self.lookup, &mut query)
-                .await
-                .map(|termination| format!("{termination:?}"))
-                .map_err(|error| JsValue::from_str(&error.to_string()))
+            run_iterative_lookup(
+                &mut self.lookup,
+                &mut query,
+                gloo_timers::future::TimeoutFuture::new(
+                    ant_protocol::transport::LOOKUP_TIMEOUT_SECS * 1_000,
+                ),
+            )
+            .await
+            .map(|termination| format!("{termination:?}"))
+            .map_err(|error| JsValue::from_str(&error.to_string()))
         }
 
         /// Successful responders in final closest-first order.
