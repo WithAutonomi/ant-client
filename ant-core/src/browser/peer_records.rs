@@ -20,12 +20,8 @@ pub(crate) fn peer_record(node: &BrowserNode) -> DataResult<DHTNode> {
             ));
         }
         let bytes = hex::decode(encoded).map_err(|e| DataError::Protocol(e.to_string()))?;
-        let now = crate::runtime::system_time()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| DataError::Protocol(e.to_string()))?
-            .as_secs();
         let proof = SignedAddressRecord::decode(&bytes)
-            .and_then(|record| record.verify(now))
+            .and_then(|record| record.verify())
             .map_err(DataError::Protocol)?;
         if proof.owner() != peer_id {
             return Err(DataError::Protocol(
@@ -171,15 +167,10 @@ mod tests {
         use ant_protocol::transport::signed_address::{AddressAuthority, SignedAddressRecord};
         use ant_protocol::transport::{KnownReachability, NodeIdentity, TransportAddressRecord};
         let identity = NodeIdentity::generate().unwrap();
-        let now = crate::runtime::system_time()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         let address: MultiAddr = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
         let signed = SignedAddressRecord::sign(
             &identity,
             10,
-            now,
             vec![
                 TransportAddressRecord::from_multiaddr(&address, KnownReachability::Direct)
                     .unwrap()
@@ -187,7 +178,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let original = signed.verify(now).unwrap().peer_record(1.0);
+        let original = signed.verify().unwrap().peer_record(1.0);
         let mut wire = browser_record(original.clone()).unwrap();
         wire.native_addresses = vec!["/ip4/1.1.1.1/udp/9000/quic".into()];
         let restored = peer_record(&wire).unwrap();

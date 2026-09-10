@@ -167,10 +167,8 @@ impl BrowserTestNode {
                             capabilities.extend(["quote_chunk".into(), "put_chunk".into()]);
                         }
                         if self.address_v2 {
-                            capabilities.push(
-                                ant_protocol::transport::signed_address::ADDRESS_V2_CAPABILITY
-                                    .into(),
-                            );
+                            capabilities
+                                .push(ant_protocol::transport::ADDRESS_V2_CAPABILITY.into());
                         }
                         capabilities
                     },
@@ -602,18 +600,17 @@ pub async fn test_shared_identity_and_timers() {
     );
 }
 
-/// Build a real owner proof for browser forwarding and freshness regressions.
+/// Build a real, non-expiring owner proof for browser forwarding regressions.
 #[wasm_bindgen]
-pub fn test_signed_address_node(age_seconds: u32) -> JsValue {
+pub fn test_signed_address_node() -> JsValue {
     use ant_protocol::transport::signed_address::SignedAddressRecord;
     use ant_protocol::transport::{KnownReachability, NodeIdentity, TransportAddressRecord};
     let identity = NodeIdentity::from_seed(&[255; 32]).unwrap();
-    let issued = (js_sys::Date::now() / 1000.0) as u64 - u64::from(age_seconds);
     let address = "/ip4/9.9.9.9/udp/9000/quic".parse().unwrap();
     let record = TransportAddressRecord::from_multiaddr(&address, KnownReachability::Direct)
         .unwrap()
         .unwrap();
-    let signed = SignedAddressRecord::sign(&identity, 10, issued, vec![record]).unwrap();
-    let node = shared::browser_record(signed.verify(issued).unwrap().peer_record(1.0)).unwrap();
+    let signed = SignedAddressRecord::sign(&identity, 10, vec![record]).unwrap();
+    let node = shared::browser_record(signed.verify().unwrap().peer_record(1.0)).unwrap();
     serde_wasm_bindgen::to_value(&node).unwrap()
 }

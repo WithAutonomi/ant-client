@@ -179,3 +179,31 @@ test("streaming WASM encryption emits one externally stageable record at a time"
 test("WASM uses saorsa-core identity and browser deadlines without a Tokio runtime", async () => {
   await test_shared_identity_and_timers();
 });
+
+
+test("zero-count WASM lookup completes without calling the adapter", async () => {
+  const lookup = new BrowserIterativeLookup("00".repeat(32), 0, 2, 20);
+  lookup.addCandidates([lookupNode(1)]);
+  assert.equal(await lookup.run(() => { throw new Error("unexpected query"); }), "Converged");
+  assert.deepEqual(lookup.results(), []);
+  assert.deepEqual(lookup.queriedPeers(), []);
+});
+
+test("WASM lookup deadline rejects an adapter that never responds", async () => {
+  const lookup = new BrowserIterativeLookup("00".repeat(32), 2, 2, 20);
+  lookup.addCandidates([lookupNode(1)]);
+  const original = globalThis.setTimeout;
+  let deadlineScheduled = false;
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    if (delay === 120_000) {
+      deadlineScheduled = true;
+      return original(callback, 0, ...args);
+    }
+    return original(callback, delay, ...args);
+  };
+  try {
+    await assert.rejects(lookup.run(() => new Promise(() => {})), /lookup deadline elapsed/);
+    assert(deadlineScheduled);
+    assert.deepEqual(lookup.results(), []);
+  } finally { globalThis.setTimeout = original; }
+});
