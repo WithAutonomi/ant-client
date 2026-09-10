@@ -84,7 +84,7 @@ test("an actual PUT response deadline remains a network capacity signal", async 
 
 test("browser verifies forwarded owner proofs and ignores substituted metadata", async () => {
   const { test_signed_address_node } = await import("./pkg/ant_core.js");
-  const owner = test_signed_address_node(0);
+  const owner = test_signed_address_node();
   const original = owner.address_record;
   owner.native_addresses = ["/ip4/1.1.1.1/udp/9000/quic"];
   const rtc = mockWebRtc([{ peers: [owner], addressV2: true }]);
@@ -96,26 +96,34 @@ test("browser verifies forwarded owner proofs and ignores substituted metadata",
   } finally { client.close(); }
 });
 
-for (const scenario of ["tampered", "expired"]) {
-  test(`browser rejects ${scenario} forwarded owner proofs`, async () => {
-    const { test_signed_address_node } = await import("./pkg/ant_core.js");
-    const owner = test_signed_address_node(scenario === "expired" ? 3600 : 0);
-    if (scenario === "tampered") {
-      const bytes = Buffer.from(owner.address_record, "hex");
-      bytes[bytes.length - 1] ^= 1;
-      owner.address_record = bytes.toString("hex");
-    }
-    const rtc = mockWebRtc([{ peers: [owner], addressV2: true }]);
-    const client = new BrowserNodeClient(rtc.endpoints[0]);
-    try { await assert.rejects(client.findNode("11".repeat(32), 20), /signature|expired/); }
-    finally { client.close(); }
-  });
-}
+test("browser rejects tampered forwarded owner proofs", async () => {
+  const { test_signed_address_node } = await import("./pkg/ant_core.js");
+  const owner = test_signed_address_node();
+  const bytes = Buffer.from(owner.address_record, "hex");
+  bytes[bytes.length - 1] ^= 1;
+  owner.address_record = bytes.toString("hex");
+  const rtc = mockWebRtc([{ peers: [owner], addressV2: true }]);
+  const client = new BrowserNodeClient(rtc.endpoints[0]);
+  try { await assert.rejects(client.findNode("11".repeat(32), 20), /signature/); }
+  finally { client.close(); }
+});
 
+test("browser retains owner proofs after the old expiry window", async () => {
+  const { test_signed_address_node } = await import("./pkg/ant_core.js");
+  const owner = test_signed_address_node();
+  const rtc = mockWebRtc([{ peers: [owner], addressV2: true }]);
+  const client = new BrowserNodeClient(rtc.endpoints[0]);
+  const now = Date.now;
+  Date.now = () => now() + 3_600_000;
+  try {
+    const nodes = await client.findNode("11".repeat(32), 20);
+    assert.equal(nodes[0].address_record, owner.address_record);
+  } finally { Date.now = now; client.close(); }
+});
 
 test("browser rejects duplicate owners before accepting lookup proofs", async () => {
   const { test_signed_address_node } = await import("./pkg/ant_core.js");
-  const owner = test_signed_address_node(0);
+  const owner = test_signed_address_node();
   const rtc = mockWebRtc([{ peers: [owner, owner], addressV2: true }]);
   const client = new BrowserNodeClient(rtc.endpoints[0]);
   try { await assert.rejects(client.findNode("11".repeat(32), 20), /duplicate peer/); }

@@ -713,9 +713,12 @@ impl BrowserNodeClientCore {
         count: usize,
     ) -> Result<Vec<BrowserNode>, String> {
         let target = super::protocol::normalize_hex(target, 32)?;
-        let require_owner_proofs = self.hello().await?.capabilities.iter().any(|capability| {
-            capability == ant_protocol::transport::signed_address::ADDRESS_V2_CAPABILITY
-        });
+        let require_owner_proofs = self
+            .hello()
+            .await?
+            .capabilities
+            .iter()
+            .any(|capability| capability == ant_protocol::transport::ADDRESS_V2_CAPABILITY);
         let response = self
             .request(
                 BrowserRequestBody::FindNode {
@@ -736,10 +739,6 @@ impl BrowserNodeClientCore {
         if response_target.to_ascii_lowercase() != target {
             return Err("node returned results for a different lookup target".to_string());
         }
-        let now = crate::runtime::system_time()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_secs();
         if nodes.len() > count {
             return Err("node returned more peers than requested".into());
         }
@@ -756,7 +755,7 @@ impl BrowserNodeClientCore {
         )?;
         let mut by_owner = HashMap::new();
         for proof in proofs {
-            let verified = proof.verify(now)?;
+            let verified = proof.verify()?;
             let owner = verified.owner().to_hex();
             if by_owner
                 .insert(owner, hex::encode(proof.encode()?))
@@ -1046,9 +1045,13 @@ impl BrowserNetworkCore {
             routing: Rc::clone(&self.routing),
             reports: HashMap::new(),
         };
-        run_iterative_lookup(&mut lookup, &mut query)
-            .await
-            .map_err(|error| error.to_string())?;
+        run_iterative_lookup(
+            &mut lookup,
+            &mut query,
+            TimeoutFuture::new(ant_protocol::transport::LOOKUP_TIMEOUT_SECS * 1_000),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         let mut routes = self.routing.borrow_mut();
         if routes.len() > MAX_BROWSER_ROUTING_ENTRIES {
             let mut peers = routes.keys().copied().collect::<Vec<_>>();
