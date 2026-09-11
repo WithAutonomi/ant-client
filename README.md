@@ -61,7 +61,7 @@ There is no browser-specific recovery probe or relaxed payment threshold.
 The requested responder count must be satisfied before quote witnessing and
 storage-majority checks proceed.
 
-Browser protocol v5 and browser manifest v6 advertise only the payment chain ID
+Browser protocol v6 and browser manifest v6 advertise only the payment chain ID
 and token/vault addresses. RPC providers belong to the application or wallet;
 the node's verification RPC URL is never sent to the browser. Paid uploads
 check that every selected node advertises the same chain and contracts. Deploy
