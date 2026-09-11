@@ -37,7 +37,7 @@ test("Rust/WASM parses stable certificate-pinned WebRTC Direct addresses", () =>
 test("Rust/WASM validates response framing with a raw binary body", () => {
   const header = new TextEncoder().encode(
     JSON.stringify({
-      version: 5,
+      version: 6,
       request_id: 9,
       status: "ok",
       content_length: 3,
@@ -46,10 +46,9 @@ test("Rust/WASM validates response framing with a raw binary body", () => {
       size: 3,
     }),
   );
-  const frame = new Uint8Array(4 + header.length + 3);
-  new DataView(frame.buffer).setUint32(0, header.length, false);
-  frame.set(header, 4);
-  frame.set([1, 2, 3], 4 + header.length);
+  const frame = new Uint8Array(header.length + 3);
+  frame.set(header, 0);
+  frame.set([1, 2, 3], header.length);
 
   const parsed = parseResponseFrame(frame);
   assert.equal(parsed.header.request_id, 9);
