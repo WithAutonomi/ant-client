@@ -65,7 +65,7 @@ The Rust/WASM implementation owns:
 - browser `RTCPeerConnection` and ordered `RTCDataChannel` management through
   `web-sys`, including framing, fragmentation, backpressure, deadlines, and
   bounded connection reuse;
-- authenticated protocol-v6 session establishment using ephemeral ML-KEM-768,
+- authenticated protocol-v5 session establishment using ephemeral ML-KEM-768,
   ML-DSA-65 transcript authentication, peer-ID/public-key binding, independent
   direction keys, and ordered ChaCha20-Poly1305 records from `saorsa_transport::webrtc`
   using `saorsa-pqc`;
@@ -236,13 +236,15 @@ wallet callback. Application record limits remain 4 MiB; encoded native messages
 allow 5 MiB for proof overhead. This capability is additive to browser v5 and
 requires a node advertising `chunk_protocol` for the shared Client facade.
 
-Browser protocol v6 removes the inner four-byte JSON-header length. Frames are
-one JSON object followed immediately by raw binary content; the shared codec
-uses the parsed JSON byte offset to locate the body. It rejects frames exceeding
+The browser protocol is unreleased and retains its v5 identifiers. Frames are
+one JSON object followed immediately by raw binary content, with no inner
+length prefix; the shared codec uses the parsed JSON byte offset to locate the
+body. It rejects frames exceeding
 5 MiB + 64 KiB before parsing and caps JSON parsing at a fixed 64 KiB shared with
 the node. This accommodates paid upload quotes with full signed commitments.
 The node cannot lower this header limit. The encrypted-record length prefix
-still provides bounded DataChannel reassembly. Both endpoints must use v6.
+still provides bounded DataChannel reassembly. This revises the unreleased
+format in place without a protocol-version bump.
 
 The browser facade retains JS wallet callbacks and staged content loaders.
 `ChunkPaymentPlan` separates payment metadata from bytes, so staging can load
