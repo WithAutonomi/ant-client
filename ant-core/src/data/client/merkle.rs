@@ -24,15 +24,15 @@ use ant_protocol::payment::{
 };
 use ant_protocol::transport::PeerId;
 use ant_protocol::{
-    compute_address, ChunkMessage, ChunkMessageBody,
-    MerkleCandidateQuoteRequest, MerkleCandidateQuoteRequestV2, MerkleCandidateQuoteResponse,
-    ProtocolError,
+    compute_address, ChunkMessage, ChunkMessageBody, MerkleCandidateQuoteRequest,
+    MerkleCandidateQuoteRequestV2, MerkleCandidateQuoteResponse, ProtocolError,
 };
+#[cfg(test)]
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::Rng;
 use std::collections::HashMap;
-#[cfg(any(feature = "native", test))]
+#[cfg(test)]
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -444,7 +444,7 @@ impl std::fmt::Debug for PreparedMerkleBatch {
 ///
 /// Extra chunk contents are ignored; missing contents for any requested address
 /// are treated as corrupted upload state.
-#[cfg(any(feature = "native", test))]
+#[cfg(test)]
 pub(crate) fn chunk_contents_for_upload_addresses(
     chunk_contents: Vec<Bytes>,
     addresses: &[[u8; 32]],
@@ -628,6 +628,7 @@ pub fn merkle_batch_partitions_with_cap(addresses: &[[u8; 32]], cap: usize) -> V
 /// do not appear in `results` — their chunks end up with no proof, which the
 /// store path reports through `PartialUpload` (ADR-0003).
 #[must_use]
+#[cfg(any(feature = "native", test))]
 pub(crate) fn merge_merkle_batch_results(
     results: Vec<MerkleBatchPaymentResult>,
 ) -> MerkleBatchPaymentResult {
@@ -1611,6 +1612,7 @@ impl Client {
     /// Returns an error only for non-quorum failures (e.g. a missing proof, or a
     /// chunk-count/address mismatch); quorum shortfalls are reported via
     /// [`MerkleStoreOutcome::failed`].
+    #[cfg(test)]
     pub(crate) async fn merkle_upload_chunks(
         &self,
         chunk_contents: Vec<Bytes>,
@@ -1710,6 +1712,7 @@ impl Client {
 /// converges within minutes. Per-chunk proofs are reusable, so retrying the
 /// same proof after a short backoff recovers these shortfalls for free — no
 /// re-payment and no new pool.
+#[cfg(test)]
 pub(crate) const MERKLE_STORE_MAX_ATTEMPTS: usize = 4;
 
 /// Base backoff between merkle store attempts. The routing-table divergence
@@ -1717,6 +1720,7 @@ pub(crate) const MERKLE_STORE_MAX_ATTEMPTS: usize = 4;
 /// sleep between rounds is enough to land on a converged close group. The
 /// actual wait is jittered by [`MERKLE_RETRY_JITTER`] so a large failed set
 /// does not re-fire against the same divergent nodes in lockstep.
+#[cfg(test)]
 pub(crate) const MERKLE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Fractional jitter applied to [`MERKLE_RETRY_BACKOFF`] (±10%), spreading the

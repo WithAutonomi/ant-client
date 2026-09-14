@@ -66,6 +66,7 @@ impl NetworkHealth {
 
 /// Read-only DHT context captured for one diagnostics-enabled closest-peer
 /// selection. None of these fields influence selection or dialing.
+#[cfg(feature = "native")]
 pub(crate) struct ClosestPeerDiagnostics {
     pub peer_id: PeerId,
     pub addresses: Vec<MultiAddr>,
@@ -242,6 +243,7 @@ impl Network {
 
     /// Find the same peers, in the same order, while capturing read-only DHT
     /// context for the explicitly enabled download diagnostics sidecar.
+    #[cfg(feature = "native")]
     pub(crate) async fn find_closest_peers_with_diagnostics(
         &self,
         target: &[u8; 32],
@@ -351,58 +353,11 @@ impl Network {
     /// Do not substitute `is_bootstrapped()` (sticky true — it stays true
     /// through a total outage) or saorsa's `health_check()` (an
     /// over-connection guard, despite the name) for this.
+    #[cfg(feature = "native")]
     pub async fn health(&self) -> NetworkHealth {
         let connected_peers = self.node.peer_count().await;
         let routing_table_size = self.node.dht_manager().get_routing_table_size().await;
         NetworkHealth::from_counts(connected_peers, routing_table_size)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn write_ready_false_with_no_peers() {
-        let h = NetworkHealth::from_counts(0, 0);
-        assert!(!h.write_ready);
-        assert_eq!(h.connected_peers, 0);
-        assert_eq!(h.routing_table_size, 0);
-        assert_eq!(h.rebootstrap_threshold, REBOOTSTRAP_THRESHOLD as u32);
-    }
-
-    #[test]
-    fn write_ready_false_below_threshold_on_both_signals() {
-        // The reporter's incident shape (ant-sdk#232): ~1 reachable peer,
-        // empty routing table, stores failing.
-        assert!(!NetworkHealth::from_counts(1, 0).write_ready);
-        assert!(!NetworkHealth::from_counts(2, 2).write_ready);
-    }
-
-    #[test]
-    fn write_ready_true_via_connections_despite_low_routing_table() {
-        // Client-mode under-reporting observed live on a LAN devnet:
-        // rt pinned at 2 with 10 verified connections and stores succeeding.
-        // The max() in the formula exists for exactly this state.
-        assert!(NetworkHealth::from_counts(10, 2).write_ready);
-    }
-
-    #[test]
-    fn write_ready_true_via_routing_table_alone() {
-        assert!(NetworkHealth::from_counts(0, REBOOTSTRAP_THRESHOLD).write_ready);
-    }
-
-    #[test]
-    fn write_ready_true_at_exact_threshold_on_connections() {
-        assert!(NetworkHealth::from_counts(REBOOTSTRAP_THRESHOLD, 0).write_ready);
-    }
-
-    #[test]
-    fn counts_saturate_at_u32_max() {
-        let h = NetworkHealth::from_counts(usize::MAX, usize::MAX);
-        assert_eq!(h.connected_peers, u32::MAX);
-        assert_eq!(h.routing_table_size, u32::MAX);
-        assert!(h.write_ready);
     }
 }
 
@@ -513,5 +468,53 @@ pub(crate) async fn send_and_await_chunk_response<T, E>(
             return Err(timeout_error());
         }
         response_handler(response.body).unwrap_or_else(|| Err(timeout_error()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_ready_false_with_no_peers() {
+        let h = NetworkHealth::from_counts(0, 0);
+        assert!(!h.write_ready);
+        assert_eq!(h.connected_peers, 0);
+        assert_eq!(h.routing_table_size, 0);
+        assert_eq!(h.rebootstrap_threshold, REBOOTSTRAP_THRESHOLD as u32);
+    }
+
+    #[test]
+    fn write_ready_false_below_threshold_on_both_signals() {
+        // The reporter's incident shape (ant-sdk#232): ~1 reachable peer,
+        // empty routing table, stores failing.
+        assert!(!NetworkHealth::from_counts(1, 0).write_ready);
+        assert!(!NetworkHealth::from_counts(2, 2).write_ready);
+    }
+
+    #[test]
+    fn write_ready_true_via_connections_despite_low_routing_table() {
+        // Client-mode under-reporting observed live on a LAN devnet:
+        // rt pinned at 2 with 10 verified connections and stores succeeding.
+        // The max() in the formula exists for exactly this state.
+        assert!(NetworkHealth::from_counts(10, 2).write_ready);
+    }
+
+    #[test]
+    fn write_ready_true_via_routing_table_alone() {
+        assert!(NetworkHealth::from_counts(0, REBOOTSTRAP_THRESHOLD).write_ready);
+    }
+
+    #[test]
+    fn write_ready_true_at_exact_threshold_on_connections() {
+        assert!(NetworkHealth::from_counts(REBOOTSTRAP_THRESHOLD, 0).write_ready);
+    }
+
+    #[test]
+    fn counts_saturate_at_u32_max() {
+        let h = NetworkHealth::from_counts(usize::MAX, usize::MAX);
+        assert_eq!(h.connected_peers, u32::MAX);
+        assert_eq!(h.routing_table_size, u32::MAX);
+        assert!(h.write_ready);
     }
 }

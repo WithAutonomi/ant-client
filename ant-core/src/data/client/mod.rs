@@ -14,6 +14,7 @@ pub(crate) mod cached_merkle;
 pub(crate) mod cached_single;
 pub mod chunk;
 pub mod data;
+#[cfg(feature = "native")]
 pub mod diagnostics;
 pub mod file;
 pub mod merkle;
@@ -25,7 +26,9 @@ pub mod upload_state;
 use crate::data::client::adaptive::{AdaptiveConfig, AdaptiveController, ChannelStart, Outcome};
 use crate::data::client::cache::ChunkCache;
 use crate::data::error::{Error, Result};
-use crate::data::network::{Network, NetworkHealth};
+use crate::data::network::Network;
+#[cfg(feature = "native")]
+use crate::data::network::NetworkHealth;
 #[cfg(feature = "native")]
 use crate::data::peer_cache;
 use ant_protocol::evm::Wallet;
@@ -709,6 +712,9 @@ impl Client {
             persist_path: _persist_path,
             #[cfg(feature = "native")]
             peer_cache_path: None,
+            unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
+            versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
+            settlement_refusals: SettlementRefusals::default(),
         }
     }
 
@@ -846,6 +852,7 @@ impl Client {
     /// Convenience pass-through to [`Network::health`] — the single
     /// write-readiness implementation shared by all embedded-client
     /// consumers (antd, ant-gui, ant-ffi, ant-tui).
+    #[cfg(feature = "native")]
     pub async fn network_health(&self) -> NetworkHealth {
         self.network.health().await
     }

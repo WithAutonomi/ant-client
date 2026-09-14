@@ -23,9 +23,9 @@ use ant_protocol::payment::commitment::{
 use ant_protocol::payment::verify_quote_signature;
 use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, ResponderView, WitnessedCloseGroup};
 use ant_protocol::{
-    client_update_required_message, ChunkMessage,
-    ChunkMessageBody, ChunkQuoteRequest, ChunkQuoteRequestV2, ChunkQuoteResponse, ProtocolError,
-    CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE, CURRENT_SETTLEMENT_VERSION,
+    client_update_required_message, ChunkMessage, ChunkMessageBody, ChunkQuoteRequest,
+    ChunkQuoteRequestV2, ChunkQuoteResponse, ProtocolError, CLOSE_GROUP_SIZE,
+    CURRENT_SETTLEMENT_VERSION,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};

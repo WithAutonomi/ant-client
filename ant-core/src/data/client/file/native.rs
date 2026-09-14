@@ -89,12 +89,10 @@ const UPLOAD_WAVE_SIZE: usize = super::super::batch::PAYMENT_WAVE_SIZE;
 /// permits `adaptive.max.store` above 64), so the fan-out clamps its cap here to
 /// keep a high configured max from pinning gigabytes of chunk bodies (PR #137
 /// review). Throughput is unaffected at the default cap, which is already 64.
-#[cfg(test)]
 const MERKLE_STORE_MAX_IN_FLIGHT: usize = 64;
 
 /// The merkle whole-file store fan-out concurrency: the adaptive store cap,
 /// clamped to [`MERKLE_STORE_MAX_IN_FLIGHT`] (memory bound) and floored at 1.
-#[cfg(test)]
 fn merkle_store_cap(limiter_current: usize) -> usize {
     limiter_current.clamp(1, MERKLE_STORE_MAX_IN_FLIGHT)
 }
@@ -122,9 +120,6 @@ const ESTIMATE_SAMPLE_CAP: usize = 5;
 
 /// First normal-path diagnostic fetch attempt.
 const FIRST_DIAGNOSTIC_FETCH_ATTEMPT: usize = 1;
-
-/// Deferred retry attempt number for retry round 0.
-const DEFERRED_RETRY_ATTEMPT_OFFSET: usize = 2;
 
 /// Pick up to `cap` chunk indices spread evenly across `[0, total)`, always
 /// including the first and last chunk.
@@ -568,7 +563,6 @@ fn cached_merkle_covers_addresses(
 /// sub-batch settles on-chain before its proofs are generated. `upload_merkle_from_spill` reports those as failed via
 /// [`Error::PartialUpload`] rather than aborting the whole file. Order within
 /// each group follows `addresses`.
-#[cfg(test)]
 fn partition_addresses_by_proof(
     addresses: &[[u8; 32]],
     proofs: &HashMap<[u8; 32], Vec<u8>>,
@@ -999,6 +993,7 @@ fn fold_single_wave(
 /// storer's upgrade instruction kept in the reason. Every remaining chunk is
 /// listed as failed: none of it was quoted, let alone paid for.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn settlement_refusal_after_paid_waves(
     refusal: &str,
     wave_num: usize,
@@ -1910,8 +1905,9 @@ impl Client {
         let data_map_address = match visibility {
             Visibility::Private => None,
             Visibility::Public => {
-                let (address, serialized) = crate::client_engine::files::public_map_record(&data_map)
-                    .map_err(Error::Serialization)?;
+                let (address, serialized) =
+                    crate::client_engine::files::public_map_record(&data_map)
+                        .map_err(Error::Serialization)?;
                 info!(
                     "Public upload: bundling DataMap chunk ({} bytes) at address {}",
                     serialized.len(),
@@ -3271,9 +3267,23 @@ impl Client {
                 &|address| {
                     let resolve_counter = &resolve_counter;
                     let progress = &progress;
+                    let diagnostics = &diagnostics;
                     async move {
+                        let diag = diagnostics.as_ref().map(|sender| {
+                            ChunkFetchDiagnostics::new(
+                                sender,
+                                FIRST_DIAGNOSTIC_FETCH_ATTEMPT,
+                                0,
+                                address,
+                                self.controller().fetch.current(),
+                            )
+                        });
                         let chunk = self
-                            .chunk_get_observed_from_closest_peers(&address, peer_count)
+                            .chunk_get_observed_from_closest_peers(
+                                &address,
+                                peer_count,
+                                diag.as_ref(),
+                            )
                             .await?
                             .ok_or_else(|| {
                                 Error::NotFound(format!(
@@ -4379,5 +4389,277 @@ mod send_assertions {
         let dm: DataMap = todo!();
         let fut = client.file_download(&dm, Path::new("/dev/null"));
         _assert_send(&fut);
+    }
+}
+
+impl Client {
+    async fn upload_merkle_from_spill(
+        &self,
+        spill: &ChunkSpill,
+        addresses: &[[u8; 32]],
+        batch_result: &MerkleBatchPaymentResult,
+        already_stored_addresses: &[[u8; 32]],
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+        payment_refusal: Option<&str>,
+    ) -> Result<(usize, String, u128, WaveAggregateStats)> {
+        let mut total_stored = already_stored_addresses.len();
+        let total_chunks = total_stored + addresses.len();
+        let mut stored_addresses: Vec<[u8; 32]> = already_stored_addresses.to_vec();
+        let mut failed: Vec<([u8; 32], String)> = Vec::new();
+        let mut agg_stats = WaveAggregateStats::default();
+
+        // Chunks without a merkle proof cannot be stored: a partial
+        // `pay_for_merkle_multi_batch` result carries proofs only for the
+        // sub-batches that both settled and produced proofs. Record them as
+        // failed (surfaced via `PartialUpload` once the
+        // storable chunks have been attempted) rather than letting its
+        // "missing proof" error abort the whole file and discard every other
+        // chunk's progress.
+        let (to_store, missing_proof) =
+            partition_addresses_by_proof(addresses, &batch_result.proofs);
+        if !missing_proof.is_empty() {
+            match payment_refusal {
+                Some(reason) => warn!(
+                    "{} chunk(s) lack a merkle proof ({reason}); reporting them as failed",
+                    missing_proof.len()
+                ),
+                None => warn!(
+                    "{} chunk(s) lack a merkle proof (partial payment); reporting them as failed",
+                    missing_proof.len()
+                ),
+            }
+            for addr in &missing_proof {
+                let hex_addr = hex::encode(addr);
+                failed.push((
+                    *addr,
+                    match payment_refusal {
+                        Some(reason) => format!("No merkle proof for chunk {hex_addr}: {reason}"),
+                        None => format!("Missing merkle proof for chunk {hex_addr}"),
+                    },
+                ));
+            }
+        }
+
+        let store_limiter = self.controller().store.clone();
+
+        // Store one chunk to its (freshly re-collected) close group, reusing the
+        // chunk's merkle proof. Reads the body from the on-disk spill on demand,
+        // so the whole-file store runs as ONE cap-bounded fan-out with no per-wave
+        // barrier: a slow straggler (e.g. a chunk whose close-group peers are
+        // stale relayed addresses that take minutes to revalidate) no longer
+        // holds back the rest of the file. Only the ≤cap in-flight stores hold a
+        // body, so peak resident memory is `cap × MAX_CHUNK_SIZE`; the cap is
+        // clamped to `MERKLE_STORE_MAX_IN_FLIGHT` (below) so it stays within the
+        // ~256 MiB bound the fixed 64-chunk waves gave even if `adaptive.max.store`
+        // is configured above 64.
+        // Shared across every deferred round so a converged routing table yields
+        // a fresh group. Only a quorum shortfall is recoverable; a missing proof
+        // or a failed spill read stays fatal. Mirrors `merkle_upload_chunks`.
+        let store_one = |addr: [u8; 32]| {
+            let limiter = store_limiter.clone();
+            let proof_bytes = batch_result.proofs.get(&addr).cloned();
+            async move {
+                let started = std::time::Instant::now();
+                let proof = proof_bytes.ok_or_else(|| {
+                    Error::Payment(format!(
+                        "Missing merkle proof for chunk {}",
+                        hex::encode(addr)
+                    ))
+                })?;
+                let content = spill.read_chunk(&addr)?;
+                let peers = self.put_target_peers(&addr).await?;
+                observe_op(
+                    &limiter,
+                    || async move { self.chunk_put_to_close_group(content, proof, &peers).await },
+                    classify_error,
+                )
+                .await
+                .map(|_| started)
+            }
+        };
+
+        info!(
+            "Storing {} chunks (merkle) as a single cap-bounded pass — {total_stored}/{total_chunks} stored so far",
+            to_store.len()
+        );
+
+        // Store the WHOLE file in one cap-bounded fan-out (`max_attempts = 1`, no
+        // backoff): no wave barrier, so a slow straggler (dead-relay peers) can't
+        // hold back the rest of the file. The store cap re-reads the limiter per
+        // slot, so it maxes at 64 → ≤64 bodies resident (bodies read from spill on
+        // demand by `store_one`), the same peak-memory bound the fixed 64-chunk
+        // waves gave. Quorum-short chunks are collected and deferred to the
+        // post-pass concurrent retry rather than parking slots behind a backoff.
+        // `merkle_store_cap` clamps to `MERKLE_STORE_MAX_IN_FLIGHT` so a high
+        // configured `adaptive.max.store` can't hold more than the wave-era
+        // ~256 MB of spilled bodies resident (PR #137 review).
+        let cap = || merkle_store_cap(store_limiter.current());
+        let outcome = merkle_store_with_retry(
+            to_store.clone(),
+            cap,
+            1,
+            std::time::Duration::ZERO,
+            progress,
+            total_stored,
+            total_chunks,
+            &store_one,
+        )
+        .await?;
+
+        // Record confirmed stores from the explicit set the store helper reports.
+        // Using that set (rather than inferring "chunks minus failed") keeps
+        // `stored_addresses` correct even when a fatal abort leaves some chunks
+        // neither stored nor reported short of quorum.
+        stored_addresses.extend(&outcome.stored_addresses);
+        total_stored = outcome.stored;
+
+        // Merge store stats (durations, attempts, per-round histogram).
+        agg_stats.chunk_attempts_total = agg_stats
+            .chunk_attempts_total
+            .saturating_add(outcome.stats.chunk_attempts_total);
+        agg_stats
+            .store_durations_ms
+            .extend(outcome.stats.store_durations_ms);
+        for (slot, count) in agg_stats
+            .retries_histogram
+            .iter_mut()
+            .zip(outcome.stats.retries_histogram.iter())
+        {
+            *slot = slot.saturating_add(*count);
+        }
+
+        if let Some(e) = outcome.fatal {
+            // A non-quorum store error is fatal (missing proofs were filtered out
+            // above, so this is a genuine network/store failure). Preserve every
+            // chunk stored so far and report every not-stored chunk as failed, so
+            // the `PartialUpload` counts are accurate.
+            warn!("merkle store aborted: {e}");
+            let mut known_failed = failed;
+            known_failed.extend(outcome.failed_addresses);
+            return Err(partial_upload_after_fatal(
+                addresses,
+                stored_addresses,
+                total_stored,
+                total_chunks,
+                known_failed,
+                PartialUploadSpend {
+                    storage_cost_atto: batch_result.storage_cost_atto.clone(),
+                    gas_cost_wei: batch_result.gas_cost_wei,
+                },
+                merkle_fatal_reason(
+                    &format!("merkle chunk store aborted: {e}"),
+                    missing_proof.len(),
+                    payment_refusal,
+                ),
+            ));
+        }
+
+        // Non-fatal: quorum-short chunks are deferred (not failed yet) for the
+        // post-pass concurrent retry. A deferred chunk joins `stored_addresses`
+        // only if/when a later round stores it.
+        let deferred: Vec<([u8; 32], String)> = outcome.failed_addresses;
+
+        // The store pass never blocked on backoff; now retry the deferred set in
+        // concurrent rounds. Bodies are re-read from the spill by `store_one`
+        // (peak RAM unchanged) and proofs re-attached. Chunks still short after
+        // the final round become `failed`; a non-quorum error aborts as
+        // `PartialUpload`.
+        if !deferred.is_empty() {
+            info!(
+                "Deferring {} merkle chunk(s) short of quorum for concurrent retry after the store pass",
+                deferred.len()
+            );
+            let dr = merkle_deferred_retry(
+                deferred,
+                &DEFERRED_ROUND_DELAYS_SECS,
+                |n: usize| merkle_store_cap(store_limiter.current()).min(n.max(1)),
+                progress,
+                total_stored,
+                total_chunks,
+                &store_one,
+            )
+            .await?;
+
+            stored_addresses.extend(dr.stored_addresses);
+            total_stored = dr.stored;
+
+            // Merge the deferred pass's stats — its histogram is already mapped
+            // to the right per-round slots — into the file aggregate.
+            agg_stats.chunk_attempts_total = agg_stats
+                .chunk_attempts_total
+                .saturating_add(dr.stats.chunk_attempts_total);
+            agg_stats
+                .store_durations_ms
+                .extend(dr.stats.store_durations_ms);
+            for (slot, count) in agg_stats
+                .retries_histogram
+                .iter_mut()
+                .zip(dr.stats.retries_histogram.iter())
+            {
+                *slot = slot.saturating_add(*count);
+            }
+
+            if let Some(reason) = dr.fatal {
+                // A non-quorum store error during a deferred round is fatal, the
+                // same as in the wave path: preserve everything stored so far and
+                // report every not-stored chunk as failed.
+                warn!("merkle deferred retry aborted: {reason}");
+                let mut known_failed = failed;
+                known_failed.extend(dr.failed_addresses);
+                return Err(partial_upload_after_fatal(
+                    addresses,
+                    stored_addresses,
+                    total_stored,
+                    total_chunks,
+                    known_failed,
+                    PartialUploadSpend {
+                        storage_cost_atto: batch_result.storage_cost_atto.clone(),
+                        gas_cost_wei: batch_result.gas_cost_wei,
+                    },
+                    merkle_fatal_reason(
+                        &format!("merkle chunk store aborted: {reason}"),
+                        missing_proof.len(),
+                        payment_refusal,
+                    ),
+                ));
+            }
+            failed.extend(dr.failed_addresses);
+        }
+
+        // A file with any permanently-failed chunk is not fully stored — surface
+        // it as `PartialUpload`, but only after the store pass and every deferred
+        // retry round are exhausted (never silently succeed with missing chunks).
+        if !failed.is_empty() {
+            let failed_count = failed.len();
+            let total_attempts = 1 + DEFERRED_ROUND_DELAYS_SECS.len();
+            let reason = merkle_partial_reason(
+                failed_count,
+                missing_proof.len(),
+                total_attempts,
+                payment_refusal,
+            );
+            warn!(
+                "merkle upload incomplete: {failed_count}/{total_chunks} chunks failed — {reason}"
+            );
+            return Err(Error::PartialUpload {
+                stored: stored_addresses,
+                stored_count: total_stored,
+                failed,
+                failed_count,
+                total_chunks,
+                spend: Box::new(PartialUploadSpend {
+                    storage_cost_atto: batch_result.storage_cost_atto.clone(),
+                    gas_cost_wei: batch_result.gas_cost_wei,
+                }),
+                reason,
+            });
+        }
+
+        Ok((
+            total_stored,
+            batch_result.storage_cost_atto.clone(),
+            batch_result.gas_cost_wei,
+            agg_stats,
+        ))
     }
 }

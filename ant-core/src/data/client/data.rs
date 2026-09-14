@@ -6,15 +6,20 @@
 //! For file-based streaming uploads that avoid loading the entire
 //! file into memory, see the `file` module.
 
+#[cfg(feature = "native")]
 use crate::data::client::adaptive::observe_op;
+#[cfg(feature = "native")]
 use crate::data::client::batch::{PaymentIntent, PreparedChunk};
+#[cfg(feature = "native")]
 use crate::data::client::classify_error;
+#[cfg(feature = "native")]
 use crate::data::client::file::{ExternalPaymentInfo, PreparedUpload, Visibility};
 use crate::data::client::merkle::PaymentMode;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::compute_address;
 use bytes::Bytes;
+#[cfg(feature = "native")]
 use futures::stream::StreamExt;
 use self_encryption::{encrypt, DataMap};
 use std::num::NonZeroUsize;
@@ -119,6 +124,7 @@ impl Client {
     ///
     /// Equivalent to [`Client::data_prepare_upload_with_visibility`] with
     /// [`Visibility::Private`] — see that method for details.
+    #[cfg(feature = "native")]
     pub async fn data_prepare_upload(&self, content: Bytes) -> Result<PreparedUpload> {
         self.data_prepare_upload_with_visibility(content, Visibility::Private)
             .await
@@ -150,6 +156,7 @@ impl Client {
     ///
     /// Returns an error if encryption fails, DataMap serialization fails
     /// (public only), or quote collection fails.
+    #[cfg(feature = "native")]
     pub async fn data_prepare_upload_with_visibility(
         &self,
         content: Bytes,
