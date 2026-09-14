@@ -1,0 +1,5 @@
+{
+  "name": "ant-core-browser-tests", "private": true, "type": "module",
+  "scripts": { "test": "playwright test", "serve": "vite --host 127.0.0.1 --port 35173" },
+  "devDependencies": { "@playwright/test": "1.62.1", "ethers": "6.17.0", "vite": "8.2.0" }
+}
