@@ -3,8 +3,8 @@ members = ["ant-core", "ant-cli"]
 resolver = "2"
 
 [patch.crates-io]
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "c6bbf1768e2a62d4f58a4618a86eec840e16cb47" }
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "e1680b7b759ad337674d84920c0d283b1d99dab8" }
-saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "f583dd053dab331fb424b67da8600c4259b2c9dc" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "b259d0a3891a9fd6abe5bbdf6d62a0fc3666b58f" }
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "a6a9fbb8f876a3d388d23d3d86a7f37f22240faf" }
+saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "a35d5b2a083f7fe18016d7b63ea89e2d796b5bfb" }
 saorsa-pqc = { git = "https://github.com/saorsa-labs/saorsa-pqc", rev = "6d57e9dd73d537182fe85b0050e809a224f21154" }
-evmlib = { git = "https://github.com/WithAutonomi/evmlib", rev = "c80b7c7aee11bb62503b00d8b41e08da1a13039d" }
+evmlib = { git = "https://github.com/WithAutonomi/evmlib", rev = "a5f3d6179a9be86f78874030d1514df6cf62fef9" }
