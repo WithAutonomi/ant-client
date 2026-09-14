@@ -1,6 +1,7 @@
+import { BrowserNetworkClient } from "./client-fixture.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BrowserNetworkClient, encryptPublicFile } from "./pkg/ant_core.js";
+import { encryptPublicFile } from "./pkg/ant_core.js";
 import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 
 const content = new TextEncoder().encode("Discoverable storage holder regression.".repeat(100));
