@@ -201,7 +201,7 @@ impl BrowserNetwork for SharedNetworkAdapter {
                 .map_err(|e| DataError::Protocol(e.to_string()))?;
             let response = crate::runtime::timeout(
                 timeout,
-                client.request_typed(BrowserRequestBody::ChunkProtocol, &bytes),
+                client.request_with_timeout(BrowserRequestBody::ChunkProtocol, &bytes, timeout),
             )
             .await
             .map_err(|_| DataError::Timeout("chunk protocol response deadline expired".into()))?
