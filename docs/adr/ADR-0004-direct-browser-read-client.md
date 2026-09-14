@@ -1,4 +1,4 @@
-# ADR-0003: Direct browser immutable-data client over WebRTC Direct
+# ADR-0004: Direct browser immutable-data client over WebRTC Direct
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
@@ -7,7 +7,7 @@
 - **Reviewers:** <pending>
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [ant-node ADR-0013](https://github.com/WithAutonomi/ant-node/blob/web-support/docs/adr/ADR-0013-direct-browser-clients-over-webrtc-direct.md); Saorsa WebRTC Direct transport; ant-client-browser-sdk
+- **Related:** [ant-node ADR-0013](https://github.com/WithAutonomi/ant-node/blob/web-support/docs/adr/ADR-0015-direct-browser-clients-over-webrtc-direct.md); Saorsa WebRTC Direct transport; ant-client-browser-sdk
 
 ## Context
 
