@@ -1302,6 +1302,13 @@ struct BrowserDownloadResult {
 enum BrowserPublicFileInput {
     Descriptor(PublicFileDescriptor),
     Address(String),
+    Reference {
+        address: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        content_type: String,
+    },
 }
 
 impl BrowserPublicFileInput {
@@ -1309,6 +1316,27 @@ impl BrowserPublicFileInput {
         match self {
             Self::Descriptor(file) => (file.address.clone(), Some(file)),
             Self::Address(address) => (address, None),
+            Self::Reference {
+                address,
+                name,
+                content_type,
+            } => (
+                address.clone(),
+                Some(PublicFileDescriptor {
+                    name: if name.is_empty() {
+                        fallback_public_file_name(&address)
+                    } else {
+                        name
+                    },
+                    address,
+                    content_type,
+                    size: 0,
+                    blake3: String::new(),
+                    chunks: Vec::new(),
+                    data_map_size: 0,
+                    replicas: 0,
+                }),
+            ),
         }
     }
 }
@@ -1832,61 +1860,23 @@ impl BrowserNetworkClient {
             return Err(format!("invalid public file size {resolved_size}"));
         }
 
-        let (file, expected_hash) = if let Some(mut file) = descriptor {
-            file.address = super::protocol::normalize_hex(&file.address, 32)?;
-            file.blake3 = super::protocol::normalize_hex(&file.blake3, 32)?;
-            if file.name.is_empty() {
-                return Err("public file has no name".to_string());
-            }
-            if file.data_map_size != encoded_data_map.len() {
-                return Err(format!(
-                    "public DataMap has {} bytes, expected {}",
-                    encoded_data_map.len(),
-                    file.data_map_size
-                ));
-            }
-            let mut expected_chunks = file
-                .chunks
-                .iter()
-                .map(|chunk| super::BrowserChunkInfo {
-                    index: chunk.index,
-                    dst_hash: chunk.dst_hash.to_ascii_lowercase(),
-                    src_hash: chunk.src_hash.to_ascii_lowercase(),
-                    src_size: chunk.src_size,
-                })
-                .collect::<Vec<_>>();
-            expected_chunks.sort_by_key(|chunk| chunk.index);
-            if actual_chunks != expected_chunks {
-                return Err(
-                    "resolved root DataMap does not match the public file descriptor".to_string(),
-                );
-            }
-            if resolved_size != file.size {
-                return Err(format!(
-                    "resolved public file has {resolved_size} bytes, expected {}",
-                    file.size
-                ));
-            }
-            file.content_type = normalized_content_type(&file.content_type);
-            file.chunks = actual_chunks;
-            let expected_hash = file.blake3.clone();
-            (file, Some(expected_hash))
-        } else {
-            (
-                PublicFileDescriptor {
-                    name: fallback_public_file_name(&address),
-                    address,
-                    size: resolved_size,
-                    content_type: "application/octet-stream".to_string(),
-                    blake3: String::new(),
-                    data_map_size: encoded_data_map.len(),
-                    chunks: actual_chunks,
-                    replicas: 0,
-                },
-                None,
-            )
-        };
-
+        let mut file = descriptor.unwrap_or_else(|| PublicFileDescriptor {
+            name: fallback_public_file_name(&address),
+            address: address.clone(),
+            size: 0,
+            content_type: "application/octet-stream".into(),
+            blake3: String::new(),
+            data_map_size: 0,
+            chunks: Vec::new(),
+            replicas: 0,
+        });
+        file.address = address;
+        file.size = resolved_size;
+        file.chunks = actual_chunks;
+        file.data_map_size = encoded_data_map.len();
+        file.blake3.clear(); // Computed when plaintext is read; not a second content identity.
+        file.content_type = normalized_content_type(&file.content_type);
+        let expected_hash = None;
         Ok(ResolvedBrowserPublicFile {
             file,
             expected_hash,
@@ -1957,6 +1947,54 @@ impl BrowserNetworkClient {
         checkpoint: &UploadCheckpoint,
     ) -> Result<BrowserUploadResult, String> {
         validate_staged_file(&mut staged)?;
+        let records = staged
+            .records
+            .iter()
+            .cloned()
+            .map(UploadRecord::from)
+            .collect::<Vec<_>>();
+        let fetch = |address: [u8; 32]| {
+            let records = &records;
+            async move {
+                let key = hex::encode(address);
+                let (index, record) = records
+                    .iter()
+                    .enumerate()
+                    .find(|(_, record)| record.address == key)
+                    .ok_or_else(|| format!("DataMap references missing staged record {key}"))?;
+                load_upload_record(index, record, Some(load_record))
+                    .await
+                    .map(|bytes| bytes::Bytes::copy_from_slice(&bytes))
+            }
+        };
+        let encoded_map = fetch(parse_lookup_key(&staged.address, "DataMap address")?).await?;
+        let map = crate::client_engine::files::decode_map(&encoded_map)?;
+        let root = crate::client_engine::files::resolve(&map, &fetch, &|| 1)
+            .await
+            .map_err(|error| error.to_string())?;
+        staged.chunks = super::chunk_infos(&root);
+        staged.size = staged.chunks.iter().try_fold(0usize, |size, chunk| {
+            size.checked_add(chunk.src_size).ok_or("file size overflow")
+        })?;
+        if !(self_encryption::MIN_ENCRYPTABLE_BYTES..=super::MAX_BROWSER_FILE_BYTES)
+            .contains(&staged.size)
+        {
+            return Err("invalid staged DataMap file size".into());
+        }
+        for chunk in &staged.chunks {
+            if !staged
+                .records
+                .iter()
+                .any(|record| record.address == chunk.dst_hash)
+            {
+                return Err(format!(
+                    "DataMap references missing staged chunk {}",
+                    chunk.dst_hash
+                ));
+            }
+        }
+        staged.data_map_size = encoded_map.len();
+        staged.blake3.clear();
         progress.report(&format!(
             "Preparing paid upload for staged {} ({} bytes, {} records)",
             staged.name,
@@ -2085,11 +2123,6 @@ fn validate_staged_file(staged: &mut BrowserStagedFile) -> Result<(), String> {
         return Err("upload file has no name".to_string());
     }
     staged.content_type = normalized_content_type(&staged.content_type);
-    if staged.size < self_encryption::MIN_ENCRYPTABLE_BYTES
-        || staged.size > super::MAX_BROWSER_FILE_BYTES
-    {
-        return Err(format!("invalid staged file size {}", staged.size));
-    }
     if staged.records.is_empty() {
         return Err("staged upload contains no records".to_string());
     }
@@ -2100,7 +2133,6 @@ fn validate_staged_file(staged: &mut BrowserStagedFile) -> Result<(), String> {
     }
 
     staged.address = super::protocol::normalize_hex(&staged.address, 32)?;
-    staged.blake3 = super::protocol::normalize_hex(&staged.blake3, 32)?;
     for record in &mut staged.records {
         record.address = super::protocol::normalize_hex(&record.address, 32)?;
         if record.size == 0 || record.size > MAX_BROWSER_RECORD_BYTES {
@@ -2114,12 +2146,8 @@ fn validate_staged_file(staged: &mut BrowserStagedFile) -> Result<(), String> {
         .records
         .last()
         .ok_or_else(|| "staged upload contains no public DataMap".to_string())?;
-    if public_data_map.address != staged.address || public_data_map.size != staged.data_map_size {
+    if public_data_map.address != staged.address {
         return Err("staged public DataMap metadata does not match its record".to_string());
-    }
-    for chunk in &mut staged.chunks {
-        chunk.dst_hash = super::protocol::normalize_hex(&chunk.dst_hash, 32)?;
-        chunk.src_hash = super::protocol::normalize_hex(&chunk.src_hash, 32)?;
     }
     Ok(())
 }
