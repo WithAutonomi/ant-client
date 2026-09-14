@@ -1,7 +1,7 @@
-#[cfg(feature = "native")]
-pub mod channel;
 /// Cross-platform Autonomi client logic and browser WASM bindings.
 pub mod browser;
+#[cfg(feature = "native")]
+pub mod channel;
 
 mod payment_policy;
 mod quote_policy;

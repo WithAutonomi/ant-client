@@ -5,14 +5,15 @@
 
 #[cfg(feature = "native")]
 mod native;
-#[cfg(feature = "native")]
-pub use native::{ExternalChunkStore, ExternalPaymentInfo, PreparedUpload, FinalizeOutcome, FinalizeResume, WaveFinalizeResume, MerkleFinalizeResume};
 use crate::data::client::merkle::PaymentMode;
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::XorName as ChunkAddress;
+#[cfg(feature = "native")]
+pub use native::{
+    ExternalChunkStore, ExternalPaymentInfo, FinalizeOutcome, FinalizeResume, MerkleFinalizeResume,
+    PreparedUpload, WaveFinalizeResume,
+};
 use self_encryption::DataMap;
-
-
 
 /// Progress events emitted during file upload for UI feedback.
 #[derive(Debug, Clone)]
@@ -34,7 +35,6 @@ pub enum UploadEvent {
     ChunkStored { stored: usize, total: usize },
 }
 
-
 /// Progress events emitted during file download for UI feedback.
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
@@ -48,7 +48,6 @@ pub enum DownloadEvent {
     ChunksFetched { fetched: usize, total: usize },
 }
 
-
 /// File download result when peer-health diagnostics are enabled.
 #[derive(Debug, Clone)]
 pub struct FileDownloadWithPeerReport {
@@ -57,7 +56,6 @@ pub struct FileDownloadWithPeerReport {
     /// Per-file-chunk closest-peer GET results collected during the actual download.
     pub chunk_reports: Vec<FileChunkPeerReport>,
 }
-
 
 /// Closest-peer GET results for one file chunk.
 #[derive(Debug, Clone)]
@@ -69,7 +67,6 @@ pub struct FileChunkPeerReport {
     /// All diagnostic GET sweeps attempted for this chunk.
     pub sweeps: Vec<FileChunkPeerSweepReport>,
 }
-
 
 /// One all-peer diagnostic GET sweep for a file chunk.
 #[derive(Debug, Clone)]
@@ -84,7 +81,6 @@ pub struct FileChunkPeerSweepReport {
     pub peers: Vec<FileChunkPeerReportPeer>,
 }
 
-
 /// One peer result in a [`FileChunkPeerReport`].
 #[derive(Debug, Clone)]
 pub struct FileChunkPeerReportPeer {
@@ -97,7 +93,6 @@ pub struct FileChunkPeerReportPeer {
     /// Whether this peer returned the chunk or why it did not.
     pub status: FileChunkPeerStatus,
 }
-
 
 /// Peer-level file chunk GET diagnostic status.
 #[derive(Debug, Clone)]
@@ -113,7 +108,6 @@ pub enum FileChunkPeerStatus {
     /// Any other per-peer error.
     Error { message: String },
 }
-
 
 /// Whether the data map is published to the network for address-based retrieval.
 ///
@@ -131,7 +125,6 @@ pub enum Visibility {
     /// address can retrieve and decrypt the file.
     Public,
 }
-
 
 /// Confidence attached to an [`UploadCostEstimate`]'s `storage_cost_atto`.
 ///
@@ -158,7 +151,6 @@ pub enum CostEstimateConfidence {
     AllSamplesAlreadyStoredIncomplete,
 }
 
-
 /// Estimated cost of uploading a file, returned by
 /// [`Client::estimate_upload_cost`].
 ///
@@ -183,7 +175,6 @@ pub struct UploadCostEstimate {
     #[serde(default)]
     pub confidence: CostEstimateConfidence,
 }
-
 
 /// Result of a file upload: the `DataMap` needed to retrieve the file.
 ///

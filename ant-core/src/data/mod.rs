@@ -27,16 +27,20 @@ pub use client::batch::{
     finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk, SingleNodeQuotePayment,
 };
 pub use client::data::DataUploadResult;
+#[cfg(feature = "native")]
 pub use client::diagnostics::{
     spawn_download_diagnostics_writer, DownloadDiagnosticsOutcome, DownloadDiagnosticsRecord,
     DownloadDiagnosticsSender,
 };
 pub use client::file::{
-    CostEstimateConfidence, DownloadEvent, ExternalChunkStore, ExternalPaymentInfo,
-    FileChunkPeerReport, FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport,
-    FileDownloadWithPeerReport, FileUploadResult, FinalizeOutcome, FinalizeResume,
-    MerkleFinalizeResume, PreparedUpload, UploadCostEstimate, UploadEvent, Visibility,
-    WaveFinalizeResume,
+    CostEstimateConfidence, DownloadEvent, FileChunkPeerReport, FileChunkPeerReportPeer,
+    FileChunkPeerStatus, FileChunkPeerSweepReport, FileDownloadWithPeerReport, FileUploadResult,
+    UploadCostEstimate, UploadEvent, Visibility,
+};
+#[cfg(feature = "native")]
+pub use client::file::{
+    ExternalChunkStore, ExternalPaymentInfo, FinalizeOutcome, FinalizeResume, MerkleFinalizeResume,
+    PreparedUpload, WaveFinalizeResume,
 };
 pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
