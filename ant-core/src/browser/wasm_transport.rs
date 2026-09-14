@@ -2150,7 +2150,8 @@ impl BrowserNetworkClient {
         let client = crate::data::Client::from_network(
             crate::data::Network::from_browser(Rc::new(network)),
             crate::data::ClientConfig::default(),
-        );
+        )
+        .with_shared_quote_state(&self.shared);
         let metadata = records
             .iter()
             .enumerate()

@@ -443,7 +443,23 @@ impl BrowserTestNode {
             ChunkQuoteResponse,
         };
         let request = ChunkMessage::decode(bytes).unwrap();
-        let body = match request.body {
+        let request_body = match request.body {
+            Body::QuoteRequestV2(r) => Body::QuoteRequest(ant_protocol::ChunkQuoteRequest {
+                address: r.address,
+                data_size: r.data_size,
+                data_type: r.data_type,
+            }),
+            Body::MerkleCandidateQuoteRequestV2(r) => {
+                Body::MerkleCandidateQuoteRequest(ant_protocol::MerkleCandidateQuoteRequest {
+                    address: r.address,
+                    data_size: r.data_size,
+                    data_type: r.data_type,
+                    merkle_payment_timestamp: r.merkle_payment_timestamp,
+                })
+            }
+            body => body,
+        };
+        let body = match request_body {
             Body::QuoteRequest(request) => {
                 self.last_method = "quote_chunk".into();
                 let commitment = self.storage_commitment();
@@ -689,4 +705,17 @@ pub async fn test_operation_timeout(endpoint: &str, timeout_ms: u32) -> Result<(
     result
         .map(|_| ())
         .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+#[wasm_bindgen]
+impl BrowserNetworkClient {
+    /// Simulate a refusal corroborated by other concurrent quote requests.
+    pub fn test_refuse_settlement(&self) {
+        for seed in 1..=crate::data::client::SETTLEMENT_REFUSAL_QUORUM {
+            self.shared.note_settlement_refusal(
+                ant_protocol::transport::PeerId::from_bytes([seed as u8; 32]),
+                "test settlement refusal: update required",
+            );
+        }
+    }
 }

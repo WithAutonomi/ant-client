@@ -718,6 +718,16 @@ impl Client {
         }
     }
 
+    /// Keep compatibility decisions across browser operations whose network adapter
+    /// carries a per-operation payment network identity.
+    #[cfg(not(feature = "native"))]
+    pub(crate) fn with_shared_quote_state(mut self, session: &Self) -> Self {
+        self.unversioned_quote_peers = Arc::clone(&session.unversioned_quote_peers);
+        self.versioned_capable_peers = Arc::clone(&session.versioned_capable_peers);
+        self.settlement_refusals = session.settlement_refusals.clone();
+        self
+    }
+
     /// Create a client connected to the given P2P node.
     #[must_use]
     #[cfg(feature = "native")]

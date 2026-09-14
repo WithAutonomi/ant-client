@@ -576,3 +576,20 @@ test("Auto fallback shares single-node payment waves and deduplicates records", 
     assert.equal(rtc.requests.filter(request => request.method === "put_chunk").length, 65 * 4);
   } finally { client.close(); }
 });
+
+test("a settlement refusal arriving during checkpoint stops the browser wallet", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  let checkpoints = 0;
+  try {
+    await assert.rejects(client.uploadPublicFile(content, "fixture.txt", "text/plain", paymentNetwork,
+      signer.pay, undefined, undefined, () => {
+        checkpoints++;
+        client.test_refuse_settlement();
+      }), /settlement refusal|update required/i);
+    assert.ok(checkpoints > 0, "refusal must arrive after preparation");
+    assert.equal(signer.calls.length, 0);
+    assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, 0);
+  } finally { client.close(); }
+});

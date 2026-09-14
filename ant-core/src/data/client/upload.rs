@@ -148,6 +148,13 @@ pub struct UploadOutcome {
 }
 
 impl Client {
+    fn ensure_upload_payment_allowed(&self) -> Result<()> {
+        match self.corroborated_settlement_refusal() {
+            Some(refusal) => Err(Error::ClientUpdateRequired(refusal)),
+            None => Ok(()),
+        }
+    }
+
     /// Drive record uploads using platform adapters and portable recovery state.
     pub async fn upload_records<A: UploadAdapter>(
         &self,
@@ -232,10 +239,46 @@ impl Client {
         adapter: &A,
         mode: PaymentMode,
     ) -> Result<UploadOutcome> {
+        let mut outcome = UploadOutcome {
+            mode: PaymentMode::Single,
+            ..Default::default()
+        };
+        match self
+            .upload_unique_records_inner(&records, state, adapter, mode, &mut outcome)
+            .await
+        {
+            Err(Error::ClientUpdateRequired(reason))
+                if outcome.amount != Amount::ZERO || !outcome.addresses.is_empty() =>
+            {
+                let stored = outcome.addresses.iter().copied().collect::<HashSet<_>>();
+                let failed = records
+                    .iter()
+                    .filter(|r| !stored.contains(&r.address))
+                    .map(|r| (r.address, reason.clone()))
+                    .collect::<Vec<_>>();
+                Err(Error::PartialUpload {
+                    stored_count: outcome.addresses.len(), stored: outcome.addresses,
+                    failed_count: failed.len(), failed, total_chunks: records.len(),
+                    spend: Box::new(PartialUploadSpend { storage_cost_atto: outcome.amount.to_string(), gas_cost_wei: outcome.gas }),
+                    reason: format!("Further payment refused; reported spend covers earlier settled batches. {reason}"),
+                })
+            }
+            result => result,
+        }
+    }
+
+    async fn upload_unique_records_inner<A: UploadAdapter>(
+        &self,
+        records: &[UploadRecord],
+        state: &mut UploadState,
+        adapter: &A,
+        mode: PaymentMode,
+        outcome: &mut UploadOutcome,
+    ) -> Result<UploadOutcome> {
         // Preflight every byte source before any payment, including Merkle batches.
         // Read one record at a time so files remain bounded by record size, not file size.
         // The adapter retains its staging session for the lifetime of this operation.
-        for record in &records {
+        for record in records {
             let bytes = adapter.load(*record).await?;
             if bytes.len() as u64 != record.size {
                 return Err(Error::InvalidData(
@@ -245,10 +288,6 @@ impl Client {
             crate::record::verify(&record.address, &bytes).map_err(Error::InvalidData)?;
         }
         let total = records.len();
-        let mut outcome = UploadOutcome {
-            mode: PaymentMode::Single,
-            ..Default::default()
-        };
         if let Some(attempt) = state.pending_payment.clone() {
             if attempt.merkle {
                 let batch = state
@@ -271,11 +310,16 @@ impl Client {
             }
             adapter.checkpoint(state, None).await?;
         }
-        let mut unique = records;
-        self.prepare_upload_merkle(&mut unique, state, adapter, mode, &mut outcome)
-            .await?;
-        self.store_upload_merkle(&mut unique, state, adapter, &mut outcome, total)
-            .await?;
+        let mut unique = records.to_vec();
+        let preparation = self
+            .prepare_upload_merkle(&mut unique, state, adapter, mode, outcome)
+            .await;
+        // Already paid batches remain storable when newer quotes refuse further payment.
+        if preparation.is_ok() || matches!(&preparation, Err(Error::ClientUpdateRequired(_))) {
+            self.store_upload_merkle(&mut unique, state, adapter, outcome, total)
+                .await?;
+        }
+        preparation?;
         let waves = unique
             .chunks(super::batch::PAYMENT_WAVE_SIZE)
             .collect::<Vec<_>>();
@@ -304,8 +348,14 @@ impl Client {
             let payment = if payable.is_empty() {
                 UploadPayment::default()
             } else {
+                self.ensure_upload_payment_allowed()?;
                 state.start_payment(false, payable.iter().map(|plan| plan.address).collect())?;
                 adapter.checkpoint(state, None).await?;
+                if let Err(error) = self.ensure_upload_payment_allowed() {
+                    state.pending_payment = None;
+                    adapter.checkpoint(state, None).await?;
+                    return Err(error);
+                }
                 adapter.pay_tracked(&payable, state).await?
             };
             let expected = payable.iter().try_fold(Amount::ZERO, |sum, plan| {
@@ -386,7 +436,7 @@ impl Client {
             if !failed.is_empty() {
                 return Err(Error::PartialUpload {
                     stored_count: outcome.addresses.len(),
-                    stored: outcome.addresses,
+                    stored: outcome.addresses.clone(),
                     failed_count: failed.len(),
                     reason: failed
                         .iter()
@@ -402,7 +452,7 @@ impl Client {
                 });
             }
         }
-        Ok(outcome)
+        Ok(std::mem::take(outcome))
     }
     async fn prepare_upload_wave<A: UploadAdapter>(
         &self,
@@ -615,8 +665,14 @@ impl Client {
                 ));
             }
             state.pending_merkle = Some(batch);
+            self.ensure_upload_payment_allowed()?;
             state.start_payment(true, Vec::new())?;
             adapter.checkpoint(state, None).await?;
+            if let Err(error) = self.ensure_upload_payment_allowed() {
+                state.pending_payment = None;
+                adapter.checkpoint(state, None).await?;
+                return Err(error);
+            }
             let batch = state
                 .pending_merkle
                 .as_ref()
@@ -678,8 +734,14 @@ impl Client {
             };
             state.pending_merkle = Some(batch);
             adapter.checkpoint(state, None).await?;
+            self.ensure_upload_payment_allowed()?;
             state.start_payment(true, Vec::new())?;
             adapter.checkpoint(state, None).await?;
+            if let Err(error) = self.ensure_upload_payment_allowed() {
+                state.pending_payment = None;
+                adapter.checkpoint(state, None).await?;
+                return Err(error);
+            }
             let batch = state
                 .pending_merkle
                 .as_ref()

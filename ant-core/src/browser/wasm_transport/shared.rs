@@ -190,7 +190,11 @@ impl BrowserNetwork for SharedNetworkAdapter {
             let payment_network = self.payment_network.clone();
             if matches!(
                 request.body,
-                ChunkMessageBody::QuoteRequest(_) | ChunkMessageBody::PutRequest(_)
+                ChunkMessageBody::QuoteRequest(_)
+                    | ChunkMessageBody::QuoteRequestV2(_)
+                    | ChunkMessageBody::MerkleCandidateQuoteRequest(_)
+                    | ChunkMessageBody::MerkleCandidateQuoteRequestV2(_)
+                    | ChunkMessageBody::PutRequest(_)
             ) {
                 if let Some(network) = payment_network {
                     assert_upload_node(&hello, &network).map_err(DataError::Network)?;
