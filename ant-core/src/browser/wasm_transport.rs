@@ -26,17 +26,17 @@ use ant_protocol::transport::{
     collect_after_first_with_grace, run_iterative_lookup, IterativeLookup, LookupConfig, LookupKey,
     LookupNode, LookupQuery, LookupQueryOutcome,
 };
-use futures_channel::{mpsc, oneshot};
+use futures_channel::oneshot;
 use futures_util::{
     future::{join_all, select, Either},
     lock::Mutex,
-    stream::{FuturesUnordered, StreamExt as _},
+    stream::FuturesUnordered,
 };
 use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Promise, Uint8Array};
 use saorsa_transport::webrtc::{
     decode_pq_frame, encode_pq_frame, pq_frame_length, transfer_timeout, PqClientHandshake,
-    PqSession, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_SERVER_ACCEPT_BYTES,
+    PqSession, TransferDeadline, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_SERVER_ACCEPT_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
@@ -45,6 +45,7 @@ use std::future::Future;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::time::Duration;
+use tokio::sync::watch;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -122,7 +123,6 @@ struct BrowserClientPool {
     clients: RefCell<HashMap<String, PoolEntry>>,
     clock: Cell<u64>,
     availability: Rc<PoolAvailability>,
-    availability_rx: Mutex<mpsc::Receiver<()>>,
 }
 
 struct BrowserClientLease {
@@ -132,27 +132,22 @@ struct BrowserClientLease {
 
 struct PoolAvailability {
     closed: Cell<bool>,
-    sender: mpsc::Sender<()>,
+    sender: watch::Sender<()>,
 }
 
 impl PoolAvailability {
-    fn notify_one(&self) {
+    fn notify_waiters(&self) {
         if self.closed.get() {
             return;
         }
-        // The capacity-one channel coalesces repeated lease drops. Normal use
-        // can retain at most one wake token, including when a blocked client
-        // future is canceled before it consumes the notification.
-        let mut sender = self.sender.clone();
-        let _ = sender.try_send(());
+        // A watch notification has no backlog. Every registered waiter rechecks
+        // capacity, including when several leases are released together.
+        self.sender.send_replace(());
     }
 
     fn close(&self) {
         self.closed.set(true);
-        // Wake the one receiver that may currently hold the async mutex. Any
-        // additional waiters observe `closed` when they acquire that mutex.
-        let mut sender = self.sender.clone();
-        let _ = sender.try_send(());
+        self.sender.send_replace(());
     }
 }
 
@@ -166,7 +161,7 @@ impl Deref for BrowserClientLease {
 
 impl Drop for BrowserClientLease {
     fn drop(&mut self) {
-        self.availability.notify_one();
+        self.availability.notify_waiters();
     }
 }
 
@@ -175,7 +170,7 @@ impl BrowserClientPool {
         if max_clients == 0 {
             return Err("WebRTC client pool size must be a positive integer".to_string());
         }
-        let (availability_tx, availability_rx) = mpsc::channel(1);
+        let (availability_tx, _) = watch::channel(());
         Ok(Self {
             dial_failures: Rc::new(RefCell::new(
                 crate::client_engine::EndpointFailureCache::new(
@@ -190,28 +185,15 @@ impl BrowserClientPool {
                 closed: Cell::new(false),
                 sender: availability_tx,
             }),
-            availability_rx: Mutex::new(availability_rx),
         })
-    }
-
-    async fn wait_for_availability(&self) -> Result<(), String> {
-        if self.availability.closed.get() {
-            return Err("WebRTC client pool is closed".to_string());
-        }
-        let mut receiver = self.availability_rx.lock().await;
-        if self.availability.closed.get() {
-            return Err("WebRTC client pool is closed".to_string());
-        }
-        if receiver.next().await.is_none() || self.availability.closed.get() {
-            return Err("WebRTC client pool closed while waiting for capacity".to_string());
-        }
-        Ok(())
     }
 
     async fn client(&self, endpoint: &BrowserEndpoint) -> Result<BrowserClientLease, String> {
         let endpoint = parse_webrtc_direct_multiaddr(&endpoint.multiaddr)
             .map_err(|error| error.to_string())?;
         let key = endpoint.multiaddr.clone();
+        // Subscribe before checking the predicate so a release cannot be missed.
+        let mut availability = self.availability.sender.subscribe();
         loop {
             if self.availability.closed.get() {
                 return Err("WebRTC client pool is closed".to_string());
@@ -259,7 +241,10 @@ impl BrowserClientPool {
                     availability: Rc::clone(&self.availability),
                 });
             }
-            self.wait_for_availability().await?;
+            availability
+                .changed()
+                .await
+                .map_err(|_| "WebRTC client pool closed".to_string())?;
         }
     }
 
@@ -456,6 +441,7 @@ pub(super) struct BrowserNodeClientCore {
     connection: RefCell<Option<Connection>>,
     request_lock: Mutex<()>,
     next_request_id: Cell<u64>,
+    generation: Cell<u64>,
     hello: RefCell<Option<BrowserHello>>,
     peer_id: RefCell<Option<String>>,
 }
@@ -484,6 +470,7 @@ impl BrowserNodeClientCore {
             connection: RefCell::new(None),
             request_lock: Mutex::new(()),
             next_request_id: Cell::new(1),
+            generation: Cell::new(0),
             hello: RefCell::new(None),
             peer_id: RefCell::new(None),
         }
@@ -546,7 +533,28 @@ impl BrowserNodeClientCore {
         body: BrowserRequestBody,
         content: &[u8],
     ) -> Result<BrowserResponseFrame, RpcError> {
+        self.request_with_timeout(
+            body,
+            content,
+            Duration::from_millis(u64::from(REQUEST_TIMEOUT_MS)),
+        )
+        .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        body: BrowserRequestBody,
+        content: &[u8],
+        response_timeout: Duration,
+    ) -> Result<BrowserResponseFrame, RpcError> {
         let _guard = self.request_lock.lock().await;
+        if !matches!(&body, BrowserRequestBody::Hello)
+            && (!self.is_connected() || self.hello.borrow().is_none())
+        {
+            return Err("authenticated session required; call connect() again"
+                .to_string()
+                .into());
+        }
         self.ensure_connected().await?;
         let mut pending = PendingRequest {
             client: self,
@@ -603,7 +611,9 @@ impl BrowserNodeClientCore {
         let encrypted_response = match read_pq_payload_typed(
             receiver,
             MAX_BROWSER_RESPONSE_BYTES + PQ_ENCRYPTED_OVERHEAD_BYTES,
-            transfer_timeout_ms,
+            u32::try_from(response_timeout.as_millis())
+                .unwrap_or(i32::MAX as u32)
+                .min(i32::MAX as u32),
         )
         .await
         {
@@ -905,6 +915,7 @@ impl BrowserNodeClientCore {
     }
 
     pub(super) fn close(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
         if let Some(connection) = self.connection.borrow_mut().take() {
             connection.close();
         }
@@ -2291,23 +2302,54 @@ impl BrowserNodeClient {
         })
     }
 
-    /// Authenticated peer ID, when HELLO has completed.
+    /// Complete PQ authentication and HELLO, returning a session for application RPCs.
+    pub async fn connect(&self) -> Result<BrowserNodeSession, JsValue> {
+        // Each returned capability owns a distinct association. Old handles cannot
+        // close or issue requests on a later connection created by this connector.
+        let inner = Rc::new(BrowserNodeClientCore::new(self.inner.endpoint.clone()));
+        inner
+            .hello()
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
+        Ok(BrowserNodeSession {
+            generation: inner.generation.get(),
+            inner,
+        })
+    }
+}
+
+/// Authenticated application session. Reconnect through `BrowserNodeClient` after closure.
+#[wasm_bindgen(js_name = BrowserNodeSession)]
+pub struct BrowserNodeSession {
+    inner: Rc<BrowserNodeClientCore>,
+    generation: u64,
+}
+
+impl BrowserNodeSession {
+    fn ensure_active(&self) -> Result<(), JsValue> {
+        if self.generation != self.inner.generation.get()
+            || !self.inner.is_connected()
+            || self.inner.hello.borrow().is_none()
+        {
+            return Err(JsValue::from_str(
+                "session closed; call BrowserNodeClient.connect() again",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[wasm_bindgen(js_class = BrowserNodeSession)]
+impl BrowserNodeSession {
+    /// Authenticated remote peer identity.
     #[wasm_bindgen(getter, js_name = peerId)]
     pub fn peer_id(&self) -> Option<String> {
         self.inner.peer_id()
     }
 
-    /// Open the direct DataChannel without issuing an application request.
-    pub async fn connect(&self) -> Result<(), JsValue> {
-        let _guard = self.inner.request_lock.lock().await;
-        self.inner
-            .ensure_connected()
-            .await
-            .map_err(|error| JsValue::from_str(&error))
-    }
-
     /// Authenticate the connected node.
     pub async fn hello(&self) -> Result<JsValue, JsValue> {
+        self.ensure_active()?;
         let hello = self
             .inner
             .hello()
@@ -2321,6 +2363,7 @@ impl BrowserNodeClient {
     /// Request nodes closest to a 32-byte target.
     #[wasm_bindgen(js_name = findNode)]
     pub async fn find_node(&self, target: &str, count: usize) -> Result<JsValue, JsValue> {
+        self.ensure_active()?;
         let nodes = self
             .inner
             .find_node(target, count)
@@ -2332,6 +2375,7 @@ impl BrowserNodeClient {
     /// Retrieve and BLAKE3-verify one content-addressed record.
     #[wasm_bindgen(js_name = getChunk)]
     pub async fn get_chunk(&self, address: &str) -> Result<JsValue, JsValue> {
+        self.ensure_active()?;
         let (content, hash) = self
             .inner
             .get_chunk(address)
@@ -2344,6 +2388,7 @@ impl BrowserNodeClient {
     /// Request a signed storage quote.
     #[wasm_bindgen(js_name = quoteChunk)]
     pub async fn quote_chunk(&self, address: &str, size: usize) -> Result<JsValue, JsValue> {
+        self.ensure_active()?;
         let (quote, already_stored) = self
             .inner
             .quote_chunk(address, size)
@@ -2365,6 +2410,7 @@ impl BrowserNodeClient {
         quote: JsValue,
         transaction_hash: &str,
     ) -> Result<JsValue, JsValue> {
+        self.ensure_active()?;
         let quote: BrowserQuoteArtifact = serde_wasm_bindgen::from_value(quote)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let (address, already_stored) = self
@@ -2416,9 +2462,12 @@ async fn send_data_channel_frame(
     frame: &[u8],
     timeout_ms: u32,
 ) -> Result<(), String> {
-    let send_deadline_ms = js_sys::Date::now() + f64::from(timeout_ms);
+    let deadline = TransferDeadline::new(Duration::from_millis(u64::from(timeout_ms)));
     for message in frame.chunks(WEBRTC_WRITE_CHUNK_BYTES) {
-        wait_for_capacity(channel, remaining_timeout_ms(send_deadline_ms)).await?;
+        if deadline.remaining().is_zero() {
+            return Err("WebRTC frame send timed out".into());
+        }
+        wait_for_capacity(channel, deadline.remaining_ms()).await?;
         channel
             .send_with_u8_array(message)
             .map_err(js_error_message)?;
@@ -2443,10 +2492,10 @@ async fn read_pq_payload_typed(
 ) -> Result<Vec<u8>, RpcError> {
     let mut frame = Vec::with_capacity(8 * 1024);
     let mut expected_length = None;
-    let response_started_ms = js_sys::Date::now();
-    let mut response_deadline_ms = response_started_ms + f64::from(initial_timeout_ms);
+    let mut deadline = TransferDeadline::new(Duration::from_millis(u64::from(initial_timeout_ms)));
+    let mut frame_started = false;
     loop {
-        let remaining_ms = remaining_timeout_ms(response_deadline_ms);
+        let remaining_ms = deadline.remaining_ms();
         let message = match select(
             Box::pin(receiver.next()),
             Box::pin(TimeoutFuture::new(remaining_ms)),
@@ -2458,6 +2507,10 @@ async fn read_pq_payload_typed(
                 return Err(RpcError::Timeout("WebRTC request timed out".into()))
             }
         };
+        if !frame_started {
+            deadline = TransferDeadline::for_frame(saorsa_transport::webrtc::PQ_FRAME_PREFIX_BYTES);
+            frame_started = true;
+        }
         let next_length = frame
             .len()
             .checked_add(message.len())
@@ -2475,8 +2528,7 @@ async fn read_pq_payload_typed(
             expected_length =
                 pq_frame_length(&frame, max_payload_bytes).map_err(|error| error.to_string())?;
             if let Some(expected) = expected_length {
-                response_deadline_ms = response_deadline_ms
-                    .max(response_started_ms + f64::from(transfer_timeout_ms(expected)));
+                deadline.extend_for_frame(expected);
             }
         }
         if let Some(expected) = expected_length {
@@ -2573,17 +2625,6 @@ where
 
 fn transfer_timeout_ms(content_bytes: usize) -> u32 {
     u32::try_from(transfer_timeout(content_bytes).as_millis()).unwrap_or(u32::MAX)
-}
-
-fn remaining_timeout_ms(deadline_ms: f64) -> u32 {
-    let remaining_ms = (deadline_ms - js_sys::Date::now()).ceil();
-    if !remaining_ms.is_finite() || remaining_ms <= 0.0 {
-        0
-    } else if remaining_ms >= f64::from(u32::MAX) {
-        u32::MAX
-    } else {
-        remaining_ms as u32
-    }
 }
 
 fn js_error_message(value: JsValue) -> String {
