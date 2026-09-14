@@ -1,7 +1,7 @@
+import { BrowserNetworkClient } from "./client-fixture.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  BrowserNetworkClient,
   contentAddress,
   encryptPublicFile,
   parseWebRtcDirectMultiaddr,
@@ -395,7 +395,7 @@ test("paid checkpoint survives a staged-loader failure and restores on a new cli
   let client = new BrowserNetworkClient(rtc.endpoints);
   try {
     await assert.rejects(client.uploadStagedPublicFile(staged, paymentNetwork,
-      async () => { throw new Error("staged storage temporarily unavailable"); }, signer.pay,
+      async index => { if (signer.calls.length) throw new Error("staged storage temporarily unavailable"); return encrypted.records[index].content; }, signer.pay,
       undefined, undefined, value => { checkpoint = value; }), /staged storage temporarily unavailable/);
     assert.equal(signer.calls.length, 1);
     assert.equal(typeof checkpoint, "string");
@@ -427,9 +427,15 @@ test("prepared checkpoint retains the exact wallet intent after callback interru
     client.close();
     await new Promise(resolve => setTimeout(resolve, 1100));
     client = new BrowserNetworkClient(rtc.endpoints);
-    const signer = wallet();
-    await client.uploadPublicFile(content, "recovery.txt", "text/plain", paymentNetwork, signer.pay, undefined, checkpoint);
-    assert.deepEqual(signer.calls[0].quotes, original);
+    let recovered = false;
+    const pay = Object.assign(async () => { throw new Error("must not submit again"); }, {
+      recover: async (_, quotes) => {
+        recovered = true; assert.deepEqual(quotes, original);
+        return { transactionHash: `0x${"ab".repeat(32)}`, totalAmount: quotes.reduce((sum, quote) => sum + BigInt(quote.amount), 0n).toString() };
+      },
+    });
+    await client.uploadPublicFile(content, "recovery.txt", "text/plain", paymentNetwork, pay, undefined, checkpoint);
+    assert.equal(recovered, true);
   } finally { client.close(); }
 });
 
@@ -520,7 +526,9 @@ test("prepared Merkle checkpoint preserves the exact salted tree and wallet requ
     client = new BrowserNetworkClient(rtc.endpoints);
     await client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
       async () => { throw new Error("unexpected single payment"); }, undefined, checkpoint, undefined, "merkle",
-      async (_, request) => { assert.deepEqual(request, original); return merkleReceipt(request); });
+      Object.assign(async () => { throw new Error("must not submit again"); }, {
+        recover: async (_, request) => { assert.deepEqual(request, original); return merkleReceipt(request); },
+      }));
   } finally { client.close(); }
 });
 
@@ -532,7 +540,7 @@ test("paid Merkle checkpoint survives byte-loader failure without repaying", asy
   const noSingle = async () => { throw new Error("unexpected single payment"); };
   try {
     await assert.rejects(client.uploadStagedPublicFile(staged, paymentNetwork,
-      async () => { throw new Error("loader unavailable"); }, noSingle, undefined, undefined,
+      async index => { if (payments) throw new Error("loader unavailable"); return encrypted.records[index].content; }, noSingle, undefined, undefined,
       value => { checkpoint = value; }, "merkle", async (_, request) => {
         payments++; return merkleReceipt(request);
       }), /loader unavailable/);

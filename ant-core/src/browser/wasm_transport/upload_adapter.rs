@@ -20,6 +20,101 @@ pub(super) struct BrowserUploadAdapter<'a> {
     pub checkpoint: &'a UploadCheckpoint,
     pub scope: &'a str,
     pub last_transaction: RefCell<Option<String>>,
+    pub payment_state: RefCell<Option<UploadState>>,
+    pub recovering: Cell<bool>,
+}
+
+impl BrowserUploadAdapter<'_> {
+    async fn invoke(&self, callback: &js_sys::Function, input: JsValue) -> DataResult<JsValue> {
+        let state = self
+            .payment_state
+            .borrow()
+            .clone()
+            .ok_or_else(|| Error::Payment("payment attempt was not checkpointed".into()))?;
+        let journal = Rc::new(RefCell::new(state));
+        let pending = Rc::new(RefCell::new(Vec::<Promise>::new()));
+        let lock = Rc::new(Mutex::new(()));
+        let callback = if self.recovering.get() {
+            js_sys::Reflect::get(callback, &JsValue::from_str("recover")).ok()
+                .and_then(|value| value.dyn_into::<js_sys::Function>().ok())
+                .ok_or_else(|| Error::Payment("payment outcome unknown; provide wallet.recover to observe the existing transaction without paying again".into()))?
+        } else {
+            callback.clone()
+        };
+        let checkpoint = self.checkpoint.clone();
+        let scope = self.scope.to_owned();
+        let on_submission = {
+            let journal = Rc::clone(&journal);
+            let pending = Rc::clone(&pending);
+            let lock = Rc::clone(&lock);
+            Closure::<dyn FnMut(JsValue) -> Promise>::new(move |value: JsValue| {
+                let journal = Rc::clone(&journal);
+                let lock = Rc::clone(&lock);
+                let checkpoint = checkpoint.clone();
+                let scope = scope.clone();
+                let promise = wasm_bindgen_futures::future_to_promise(async move {
+                    let _guard = lock.lock().await;
+                    let value: serde_json::Value = serde_wasm_bindgen::from_value(value)
+                        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+                    {
+                        let mut state = journal.borrow_mut();
+                        let attempt = state
+                            .pending_payment
+                            .as_mut()
+                            .ok_or_else(|| JsValue::from_str("no pending payment"))?;
+                        if attempt.submissions.len() >= 256 {
+                            return Err(JsValue::from_str("too many payment submissions"));
+                        }
+                        attempt.submissions.push(value);
+                    }
+                    let snapshot = journal.borrow().clone();
+                    checkpoint
+                        .save(&scope, &snapshot)
+                        .await
+                        .map_err(|e| JsValue::from_str(&e))?;
+                    Ok(JsValue::UNDEFINED)
+                });
+                pending.borrow_mut().push(promise.clone());
+                promise
+            })
+        };
+        // JS owns the callback while a cancelled wallet may still finish broadcasting.
+        let on_submission = on_submission.into_js_value();
+        let network = serde_wasm_bindgen::to_value(self.payment_network)
+            .map_err(|e| Error::Payment(e.to_string()))?;
+        let attempt = journal
+            .borrow()
+            .pending_payment
+            .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
+            .map_err(|e| Error::Payment(e.to_string()))?;
+        let returned = callback
+            .call4(&JsValue::NULL, &network, &input, &on_submission, &attempt)
+            .map_err(|e| Error::Payment(js_error_message(e)));
+        let result = match returned {
+            Ok(value) => JsFuture::from(Promise::resolve(&value))
+                .await
+                .map_err(|e| Error::Payment(js_error_message(e))),
+            Err(error) => Err(error),
+        };
+        let writes = pending.borrow().clone();
+        for write in writes {
+            JsFuture::from(write)
+                .await
+                .map_err(|e| Error::Payment(js_error_message(e)))?;
+        }
+        let value = result?;
+        let raw: serde_json::Value = serde_wasm_bindgen::from_value(value.clone())
+            .map_err(|e| Error::Payment(e.to_string()))?;
+        if let Some(attempt) = journal.borrow_mut().pending_payment.as_mut() {
+            attempt.receipt = Some(raw);
+        }
+        let snapshot = journal.borrow().clone();
+        self.checkpoint
+            .save(self.scope, &snapshot)
+            .await
+            .map_err(Error::Payment)?;
+        Ok(value)
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -90,9 +185,11 @@ impl UploadAdapter for BrowserUploadAdapter<'_> {
                 })
             })
             .collect::<DataResult<Vec<_>>>()?;
-        let payment = invoke_payment(self.wallet, self.payment_network, &verified)
-            .await
-            .map_err(Error::Payment)?;
+        let input =
+            serde_wasm_bindgen::to_value(&verified).map_err(|e| Error::Payment(e.to_string()))?;
+        let value = self.invoke(self.wallet, input).await?;
+        let payment: BrowserPaymentSubmission =
+            serde_wasm_bindgen::from_value(value).map_err(|e| Error::Payment(e.to_string()))?;
         let mut transactions = HashMap::new();
         for quote in &verified {
             let hash = if payment.transaction_hashes.is_empty() {
@@ -133,16 +230,9 @@ impl UploadAdapter for BrowserUploadAdapter<'_> {
     ) -> DataResult<crate::data::client::upload::MerkleUploadPayment> {
         let callback = self.merkle_wallet.ok_or_else(|| Error::Payment("wallet adapter does not support Merkle payments; provide payMerkle or select single mode".into()))?;
         let request = super::super::payment::MerklePaymentRequest::from_batch(batch);
-        let network = serde_wasm_bindgen::to_value(self.payment_network)
-            .map_err(|e| Error::Serialization(e.to_string()))?;
-        let value = serde_wasm_bindgen::to_value(&request)
-            .map_err(|e| Error::Serialization(e.to_string()))?;
-        let returned = callback
-            .call2(&JsValue::NULL, &network, &value)
-            .map_err(|e| Error::Payment(js_error_message(e)))?;
-        let returned = JsFuture::from(Promise::resolve(&returned))
-            .await
-            .map_err(|e| Error::Payment(js_error_message(e)))?;
+        let value =
+            serde_wasm_bindgen::to_value(&request).map_err(|e| Error::Payment(e.to_string()))?;
+        let returned = self.invoke(callback, value).await?;
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Receipt {
@@ -181,6 +271,42 @@ impl UploadAdapter for BrowserUploadAdapter<'_> {
             amount,
             gas: 0,
         })
+    }
+    async fn pay_tracked(
+        &self,
+        plans: &[ChunkPaymentPlan],
+        state: &UploadState,
+    ) -> DataResult<UploadPayment> {
+        self.payment_state.replace(Some(state.clone()));
+        self.recovering.set(false);
+        self.pay(plans).await
+    }
+    async fn recover_payment(
+        &self,
+        plans: &[ChunkPaymentPlan],
+        state: &UploadState,
+    ) -> DataResult<UploadPayment> {
+        self.payment_state.replace(Some(state.clone()));
+        self.recovering.set(true);
+        self.pay(plans).await
+    }
+    async fn pay_merkle_tracked(
+        &self,
+        batch: &crate::data::client::merkle::PreparedMerkleBatch,
+        state: &UploadState,
+    ) -> DataResult<crate::data::client::upload::MerkleUploadPayment> {
+        self.payment_state.replace(Some(state.clone()));
+        self.recovering.set(false);
+        self.pay_merkle(batch).await
+    }
+    async fn recover_merkle(
+        &self,
+        batch: &crate::data::client::merkle::PreparedMerkleBatch,
+        state: &UploadState,
+    ) -> DataResult<crate::data::client::upload::MerkleUploadPayment> {
+        self.payment_state.replace(Some(state.clone()));
+        self.recovering.set(true);
+        self.pay_merkle(batch).await
     }
     async fn checkpoint(&self, state: &UploadState, _: Option<&UploadPayment>) -> DataResult<()> {
         self.checkpoint
