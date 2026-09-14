@@ -149,10 +149,11 @@ download authorization source. A client can start from one complete endpoint,
 authenticate it, obtain public payment configuration, discover peers, and
 resolve any public DataMap address from the network. Production bootstrap
 distribution and certificate-rotation recovery remain operational concerns
-described by ant-node ADR-0009.
+described by ant-node ADR-0013.
 
-Browser protocol v4 requires a matching v4 node listener. Plaintext v3 and
-encrypted v4 deliberately fail closed. This browser wire change does not alter
+Browser clients and node listeners must agree on the shared
+`BROWSER_PROTOCOL_VERSION`, `BROWSER_PROTOCOL_NAME`, and DataChannel identifier
+exported by `saorsa_transport::webrtc`. Mismatched versions fail closed. This browser wire change does not alter
 native QUIC, stored chunk/DataMap formats, quote commitments, payment proofs, or
 public file addresses.
 
@@ -189,7 +190,7 @@ public file addresses.
 
 - WebRTC and service-worker consumers require a secure browser context;
   localhost qualifies for development.
-- Browser protocol v4 clients and node listeners must be deployed together.
+- Deploy browser clients and node listeners using the same shared wire contract.
 - The SDK owns real-browser compatibility testing for current Chrome, Firefox,
   and Safari.
 
@@ -258,3 +259,28 @@ transport tests mock the WebRTC host while exercising the shared Client and
 real PQ session, signature, proof, framing, and encryption code. The node devnet
 test sends the same native quote/PUT/GET messages through real WebRTC endpoints
 and pays against a local Anvil chain.
+
+### Browser API and recovery boundaries
+
+`BrowserNodeClient.connect()` completes the PQ handshake and HELLO and returns
+`BrowserNodeSession`. Application RPC methods belong to that session. Closing
+it invalidates the handle; reconnect explicitly to obtain another session.
+
+Public file identity is its canonical DataMap address. Browser descriptor fields
+are display hints or derived metadata, not another source of content identity.
+Staged uploads resolve their map and preflight the staged records before payment.
+The whole-file digest is computed after reading plaintext; it is not required to
+retrieve a public file. Native Rust public-file APIs and the stored format are
+unchanged by this browser API contract.
+
+Uploads journal prepared attempts before wallet invocation, submission evidence
+as it arrives, and the raw receipt before validation. A failed observation is
+not permission to submit again. The optional wallet `recover` callback observes
+the original payment; it must never broadcast another transaction. Browser
+callers supply a checkpoint persistence callback before any paid submission.
+
+The callback lookup facade adapts caller-supplied queries for embedding and
+algorithm tests. The production network adapter additionally owns authenticated
+sessions, ownership records, endpoint health, and live routing cache admission.
+Both use the same Saorsa lookup engine; production failure cases are tested
+through `BrowserNetworkClient` rather than inferred from facade tests.

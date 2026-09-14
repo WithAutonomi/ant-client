@@ -19,23 +19,34 @@ and browser confirmation share its transition and proof builder. Native disk
 receipts import their proofs into the same state for reuse. Quote expiry and
 future-clock tolerance use the native constants on both platforms.
 
-Browser upload checkpoints are emitted before requesting payment and again
-before loading/storing bytes. A failed wallet callback can resume with the exact
-retained quote hashes. After confirmed payment, a retry refreshes peers and quotes
-but attaches the original paid proof to current PUT targets, without paying for
-the replacement quotes. Missing per-quote transactions fail confirmation
-atomically. Content is verified against its address and quoted length when
-staged bytes are attached.
+The shared coordinator preflights every staged record's bytes, length, and
+content address before payment. It reads one record at a time and retains the
+adapter's staging session through storage and recovery.
 
-Checkpoints contain plans/proofs, not file bytes or wallet secrets. The WASM
-adapter binds them to record addresses/sizes and payment-network identity. SDK
-`upload({ checkpoint, onCheckpoint })` can restore a saved checkpoint with the
-same input; `onCheckpoint` may asynchronously persist it and is awaited before
-payment or PUTs proceed. The SDK also retains it for `resumeUpload` in the current
-page. Applications own durable checkpoint/input storage, as native adapters own
-disk receipts. Pending wallet submissions still require settlement observation
-and the existing `onPaymentSubmitted` reconciliation path: an unpaid/prepared
-checkpoint alone is not evidence that a transaction confirmed.
+Before invoking a wallet, the coordinator checkpoints the exact payment intent
+as an unresolved attempt. Browser adapters journal submission evidence and the
+raw wallet result before validating it. An interrupted or malformed result
+cannot trigger another submission: recovery observes the original transaction
+through the wallet's separate `recover`/`recoverMerkle` methods. Ethers and wagmi
+check the application-owned chain, vault, transaction calldata, and confirmed
+receipt. Without usable transaction evidence the attempt remains unresolved.
+Native adapters without a recovery observer also stop on an unresolved attempt;
+this change does not add automatic chain reconciliation to native wallets.
+
+After confirmed payment, a retry refreshes peers and quotes but attaches the
+original paid proof to current PUT targets. Missing per-quote transactions fail
+confirmation atomically.
+
+Checkpoints contain plans, proofs, and wallet evidence, not file bytes or wallet
+secrets. The WASM adapter binds them to record addresses/sizes and payment-network
+identity. Raw paid WASM uploads require an awaited checkpoint persistence
+callback. The SDK persists checkpoints to IndexedDB by default; an application
+can replace that storage with `onCheckpoint`. After a reload,
+`storedUploadCheckpoints()` retrieves the saved journals; reselect the original
+input and pass its checkpoint to `upload({ checkpoint })`. The page-owned
+`resumeUpload` handle additionally retains staged input and settlement observers.
+Applications remain responsible for retaining the original input across reloads.
+An unresolved checkpoint alone is not evidence that a transaction confirmed.
 
 `data::client::upload::Client::upload_records` coordinates native memory uploads,
 native spilled files, and browser buffered/staged uploads. It selects Auto,
@@ -47,7 +58,7 @@ progress callbacks. Browser transport admission checks remain in its adapter.
 Prepared Merkle checkpoints preserve the exact salted tree and payment request;
 confirmed checkpoints retain native tagged proofs. Native file checkpoints are
 atomically persisted under a file/payment-network scope and protected by a file
-lock. Browser applications persist checkpoints with the awaited callback.
+lock. Browser adapters use the awaited persistence callback described above.
 The SDK ethers and wagmi providers submit calldata encoded by evmlib and decode
 settlement with its canonical event ABI. Custom providers can implement
 `payMerkle`; applications using only single-node payments can select `single`.
