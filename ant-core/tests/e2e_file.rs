@@ -414,3 +414,47 @@ async fn test_public_file_upload_direct_batches_datamap() {
     drop(client);
     testnet.teardown().await;
 }
+
+/// A failed wallet preflight must not permanently poison the file's checkpoint.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_file_retry_after_funding_uses_existing_checkpoint() {
+    use ant_protocol::evm::{Amount, Wallet};
+    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
+    let node = testnet.node(3).unwrap();
+    let wallet = Wallet::new_with_random_wallet(testnet.evm_network().clone());
+    let address = wallet.address();
+    let client = Client::from_node(Arc::clone(&node), test_client_config()).with_wallet(wallet);
+    let mut input = NamedTempFile::new().unwrap();
+    let data = vec![0x76; 4096];
+    input.write_all(&data).unwrap();
+    input.flush().unwrap();
+    let error = client
+        .file_upload_with_mode(input.path(), PaymentMode::Single)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().to_lowercase().contains("insufficient"),
+        "{error}"
+    );
+    testnet
+        .wallet()
+        .transfer_tokens(address, Amount::from(100_000_000_000_000_000_000u128))
+        .await
+        .unwrap();
+    testnet
+        .wallet()
+        .transfer_gas_tokens(address, Amount::from(1_000_000_000_000_000_000u64))
+        .await
+        .unwrap();
+    let result = client
+        .file_upload_with_mode(input.path(), PaymentMode::Single)
+        .await
+        .unwrap();
+    let output = TempDir::new().unwrap();
+    let path = output.path().join("recovered.bin");
+    client.file_download(&result.data_map, &path).await.unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), data);
+    drop(client);
+    testnet.teardown().await;
+}

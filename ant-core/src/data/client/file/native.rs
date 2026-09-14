@@ -1501,6 +1501,42 @@ struct SpillUploadAdapter<'a> {
 
 #[async_trait::async_trait]
 impl super::super::upload::UploadAdapter for SpillUploadAdapter<'_> {
+    #[cfg(feature = "native")]
+    fn initialize_payment_attempt(&self, attempt: &mut super::super::upload_state::PaymentAttempt) {
+        super::super::native_payment::initialize(attempt);
+    }
+    #[cfg(feature = "native")]
+    async fn submit_payment(
+        &self,
+        plans: &[crate::data::client::batch::ChunkPaymentPlan],
+        state: &mut crate::data::client::upload_state::UploadState,
+    ) -> Result<super::super::upload::UploadPayment> {
+        super::super::native_payment::pay(self.client, self, plans, state).await
+    }
+    #[cfg(feature = "native")]
+    async fn reconcile_payment(
+        &self,
+        plans: &[crate::data::client::batch::ChunkPaymentPlan],
+        state: &mut crate::data::client::upload_state::UploadState,
+    ) -> Result<super::super::upload::UploadPayment> {
+        super::super::native_payment::pay(self.client, self, plans, state).await
+    }
+    #[cfg(feature = "native")]
+    async fn submit_merkle_payment(
+        &self,
+        batch: &super::super::merkle::PreparedMerkleBatch,
+        state: &mut crate::data::client::upload_state::UploadState,
+    ) -> Result<super::super::upload::MerkleUploadPayment> {
+        super::super::native_payment::pay_merkle(self.client, self, batch, state).await
+    }
+    #[cfg(feature = "native")]
+    async fn reconcile_merkle_payment(
+        &self,
+        batch: &super::super::merkle::PreparedMerkleBatch,
+        state: &mut crate::data::client::upload_state::UploadState,
+    ) -> Result<super::super::upload::MerkleUploadPayment> {
+        super::super::native_payment::pay_merkle(self.client, self, batch, state).await
+    }
     async fn load(&self, record: super::super::upload::UploadRecord) -> Result<Bytes> {
         self.spill.read_chunk(&record.address)
     }
