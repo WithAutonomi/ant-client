@@ -18,6 +18,8 @@ pub mod data;
 pub mod diagnostics;
 pub mod file;
 pub mod merkle;
+#[cfg(feature = "native")]
+mod native_payment;
 pub mod payment;
 pub mod quote;
 pub mod upload;

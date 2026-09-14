@@ -110,6 +110,40 @@ pub trait UploadAdapter: AdapterBounds {
             "Merkle payment outcome unknown; wallet reconciliation is required".into(),
         ))
     }
+    /// Initialize adapter-owned recovery evidence before persisting an attempt.
+    fn initialize_payment_attempt(&self, _attempt: &mut super::upload_state::PaymentAttempt) {}
+    /// Submit while updating the shared journal. Existing adapters may keep their callback journal.
+    async fn submit_payment(
+        &self,
+        plans: &[ChunkPaymentPlan],
+        state: &mut UploadState,
+    ) -> Result<UploadPayment> {
+        self.pay_tracked(plans, state).await
+    }
+    /// Reconcile a previous submission while updating its journal.
+    async fn reconcile_payment(
+        &self,
+        plans: &[ChunkPaymentPlan],
+        state: &mut UploadState,
+    ) -> Result<UploadPayment> {
+        self.recover_payment(plans, state).await
+    }
+    /// Submit a Merkle payment with mutable recovery evidence.
+    async fn submit_merkle_payment(
+        &self,
+        batch: &super::merkle::PreparedMerkleBatch,
+        state: &mut UploadState,
+    ) -> Result<MerkleUploadPayment> {
+        self.pay_merkle_tracked(batch, state).await
+    }
+    /// Reconcile a Merkle payment without creating a new transaction.
+    async fn reconcile_merkle_payment(
+        &self,
+        batch: &super::merkle::PreparedMerkleBatch,
+        state: &mut UploadState,
+    ) -> Result<MerkleUploadPayment> {
+        self.recover_merkle(batch, state).await
+    }
     /// Check transport-specific endpoint capabilities before payment.
     async fn admit(&self, _plan: &mut ChunkPaymentPlan) -> Result<()> {
         Ok(())
@@ -292,15 +326,14 @@ impl Client {
             if attempt.merkle {
                 let batch = state
                     .pending_merkle
-                    .as_ref()
+                    .clone()
                     .ok_or_else(|| Error::Payment("missing pending Merkle intent".into()))?;
-                let payment = adapter.recover_merkle(batch, state).await?;
-                let paid =
-                    super::merkle::finalize_merkle_batch(batch.clone(), payment.winner_pool)?;
+                let payment = adapter.reconcile_merkle_payment(&batch, state).await?;
+                let paid = super::merkle::finalize_merkle_batch(batch, payment.winner_pool)?;
                 state.insert_merkle(paid);
             } else {
                 let plans = state.pending_plans()?;
-                let payment = adapter.recover_payment(&plans, state).await?;
+                let payment = adapter.reconcile_payment(&plans, state).await?;
                 validate_payment_total(&plans, &payment)?;
                 state.confirm(
                     &attempt.addresses,
@@ -350,13 +383,16 @@ impl Client {
             } else {
                 self.ensure_upload_payment_allowed()?;
                 state.start_payment(false, payable.iter().map(|plan| plan.address).collect())?;
+                if let Some(attempt) = &mut state.pending_payment {
+                    adapter.initialize_payment_attempt(attempt);
+                }
                 adapter.checkpoint(state, None).await?;
                 if let Err(error) = self.ensure_upload_payment_allowed() {
                     state.pending_payment = None;
                     adapter.checkpoint(state, None).await?;
                     return Err(error);
                 }
-                adapter.pay_tracked(&payable, state).await?
+                adapter.submit_payment(&payable, state).await?
             };
             let expected = payable.iter().try_fold(Amount::ZERO, |sum, plan| {
                 sum.checked_add(plan.payment.total_amount())
@@ -667,6 +703,9 @@ impl Client {
             state.pending_merkle = Some(batch);
             self.ensure_upload_payment_allowed()?;
             state.start_payment(true, Vec::new())?;
+            if let Some(attempt) = &mut state.pending_payment {
+                adapter.initialize_payment_attempt(attempt);
+            }
             adapter.checkpoint(state, None).await?;
             if let Err(error) = self.ensure_upload_payment_allowed() {
                 state.pending_payment = None;
@@ -675,10 +714,10 @@ impl Client {
             }
             let batch = state
                 .pending_merkle
-                .as_ref()
+                .clone()
                 .ok_or_else(|| Error::Payment("missing pending Merkle batch".into()))?;
-            let payment = adapter.pay_merkle_tracked(batch, state).await?;
-            let paid = finalize_merkle_batch(batch.clone(), payment.winner_pool)?;
+            let payment = adapter.submit_merkle_payment(&batch, state).await?;
+            let paid = finalize_merkle_batch(batch, payment.winner_pool)?;
             state.insert_merkle(paid);
             let receipt = UploadPayment {
                 amount: payment.amount,
@@ -736,6 +775,9 @@ impl Client {
             adapter.checkpoint(state, None).await?;
             self.ensure_upload_payment_allowed()?;
             state.start_payment(true, Vec::new())?;
+            if let Some(attempt) = &mut state.pending_payment {
+                adapter.initialize_payment_attempt(attempt);
+            }
             adapter.checkpoint(state, None).await?;
             if let Err(error) = self.ensure_upload_payment_allowed() {
                 state.pending_payment = None;
@@ -744,10 +786,10 @@ impl Client {
             }
             let batch = state
                 .pending_merkle
-                .as_ref()
+                .clone()
                 .ok_or_else(|| Error::Payment("missing prepared Merkle batch".into()))?;
-            let payment = adapter.pay_merkle_tracked(batch, state).await?;
-            let paid = finalize_merkle_batch(batch.clone(), payment.winner_pool)?;
+            let payment = adapter.submit_merkle_payment(&batch, state).await?;
+            let paid = finalize_merkle_batch(batch, payment.winner_pool)?;
             state.insert_merkle(paid);
             let receipt = UploadPayment {
                 amount: payment.amount,
@@ -792,6 +834,42 @@ pub(crate) struct MemoryUploadAdapter<'a> {
 #[cfg_attr(not(feature = "native"), async_trait::async_trait(?Send))]
 #[cfg_attr(feature = "native", async_trait::async_trait)]
 impl UploadAdapter for MemoryUploadAdapter<'_> {
+    #[cfg(feature = "native")]
+    fn initialize_payment_attempt(&self, attempt: &mut super::upload_state::PaymentAttempt) {
+        super::native_payment::initialize(attempt);
+    }
+    #[cfg(feature = "native")]
+    async fn submit_payment(
+        &self,
+        plans: &[ChunkPaymentPlan],
+        state: &mut UploadState,
+    ) -> Result<UploadPayment> {
+        super::native_payment::pay(self.client, self, plans, state).await
+    }
+    #[cfg(feature = "native")]
+    async fn reconcile_payment(
+        &self,
+        plans: &[ChunkPaymentPlan],
+        state: &mut UploadState,
+    ) -> Result<UploadPayment> {
+        super::native_payment::pay(self.client, self, plans, state).await
+    }
+    #[cfg(feature = "native")]
+    async fn submit_merkle_payment(
+        &self,
+        batch: &super::merkle::PreparedMerkleBatch,
+        state: &mut UploadState,
+    ) -> Result<MerkleUploadPayment> {
+        super::native_payment::pay_merkle(self.client, self, batch, state).await
+    }
+    #[cfg(feature = "native")]
+    async fn reconcile_merkle_payment(
+        &self,
+        batch: &super::merkle::PreparedMerkleBatch,
+        state: &mut UploadState,
+    ) -> Result<MerkleUploadPayment> {
+        super::native_payment::pay_merkle(self.client, self, batch, state).await
+    }
     async fn load(&self, record: UploadRecord) -> Result<Bytes> {
         self.chunks
             .get(record.index)
