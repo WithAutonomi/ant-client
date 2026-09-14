@@ -79,12 +79,16 @@ pub struct BrowserStagedFile {
     /// Public DataMap record address.
     pub address: String,
     /// Whole-file plaintext BLAKE3 hash.
+    #[serde(default)]
     pub blake3: String,
     /// Plaintext file size.
+    #[serde(default)]
     pub size: usize,
     /// Serialized public DataMap size.
+    #[serde(default)]
     pub data_map_size: usize,
     /// Native root DataMap chunk descriptors.
+    #[serde(default)]
     pub chunks: Vec<BrowserChunkInfo>,
     /// Staged encrypted records followed by the public DataMap record.
     pub records: Vec<BrowserRecordInfo>,
