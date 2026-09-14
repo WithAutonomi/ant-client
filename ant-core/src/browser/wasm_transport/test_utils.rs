@@ -19,6 +19,7 @@ pub struct BrowserTestNode {
     peer: [u8; 32],
     endpoint: String,
     session: Option<PqSession>,
+    hello_received: bool,
     received: Vec<u8>,
     already_stored: bool,
     last_method: String,
@@ -63,6 +64,7 @@ impl BrowserTestNode {
             peer,
             endpoint,
             session: None,
+            hello_received: false,
             received: Vec::new(),
             already_stored,
             last_method: String::new(),
@@ -141,6 +143,16 @@ impl BrowserTestNode {
         }
         let plaintext = self.session.as_mut().unwrap().open(&payload).unwrap();
         let request = parse_request_frame(&plaintext).unwrap();
+        if !self.hello_received && !matches!(&request.request.body, BrowserRequestBody::Hello) {
+            let response = BrowserResponse::error(
+                request.request.request_id,
+                "authentication_required",
+                "HELLO must be the first request",
+            );
+            let plaintext = encode_response_frame(&response, &[]).unwrap();
+            let encrypted = self.session.as_mut().unwrap().seal(&plaintext).unwrap();
+            return encode_pq_frame(&encrypted).unwrap();
+        }
         let mut protocol_content = Vec::new();
         let body = match request.request.body {
             BrowserRequestBody::ChunkProtocol => {
@@ -148,6 +160,7 @@ impl BrowserTestNode {
                 BrowserResponseBody::ChunkProtocol
             }
             BrowserRequestBody::Hello => {
+                self.hello_received = true;
                 self.last_method = "hello".into();
                 BrowserResponseBody::Hello {
                     protocol: super::super::protocol::BROWSER_PROTOCOL_NAME.into(),
@@ -315,6 +328,7 @@ pub async fn test_put_failure_kind(endpoint: &str) -> Result<String, JsValue> {
     let endpoint = parse_webrtc_direct_multiaddr(endpoint)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     let client = BrowserNodeClientCore::new(endpoint);
+    client.hello().await.map_err(|e| JsValue::from_str(&e))?;
     let content = b"structured PUT rejection fixture";
     let address = super::super::content_address(content);
     let (quote, _) = client
@@ -613,4 +627,66 @@ pub fn test_signed_address_node() -> JsValue {
     let signed = SignedAddressRecord::sign(&identity, 10, vec![record]).unwrap();
     let node = shared::browser_record(signed.verify().unwrap().peer_record(1.0)).unwrap();
     serde_wasm_bindgen::to_value(&node).unwrap()
+}
+
+/// Exercise capacity release, cancellation, and close with multiple pool waiters.
+#[wasm_bindgen]
+pub async fn test_pool_waiters(endpoints: JsValue) -> Result<(), JsValue> {
+    let endpoints: Vec<BrowserEndpoint> = serde_wasm_bindgen::from_value(endpoints).unwrap();
+    let pool = BrowserClientPool::new(2).unwrap();
+    let first = pool.client(&endpoints[0]).await.unwrap();
+    let second = pool.client(&endpoints[1]).await.unwrap();
+    let mut waiting_a = Box::pin(pool.client(&endpoints[2]));
+    let mut waiting_b = Box::pin(pool.client(&endpoints[3]));
+    assert!(futures::poll!(&mut waiting_a).is_pending());
+    assert!(futures::poll!(&mut waiting_b).is_pending());
+    drop(first);
+    drop(second);
+    let (a, b) = timeout_with_ms(
+        async { Ok(futures::future::join(waiting_a, waiting_b).await) },
+        "pool did not wake both waiters",
+        1000,
+    )
+    .await
+    .map_err(|error| JsValue::from_str(&error))?;
+    let (a, b) = (a.unwrap(), b.unwrap());
+    let mut cancelled = Box::pin(pool.client(&endpoints[0]));
+    assert!(futures::poll!(&mut cancelled).is_pending());
+    drop(cancelled);
+    let mut waiting = Box::pin(pool.client(&endpoints[1]));
+    assert!(futures::poll!(&mut waiting).is_pending());
+    pool.close();
+    assert!(matches!(waiting.await, Err(error) if error.contains("closed")));
+    drop((a, b));
+    Ok(())
+}
+
+/// Send through the production adapter with the native operation's response timeout.
+#[wasm_bindgen]
+pub async fn test_operation_timeout(endpoint: &str, timeout_ms: u32) -> Result<(), JsValue> {
+    use crate::data::network::BrowserNetwork;
+    use ant_protocol::{ChunkGetRequest, ChunkMessage, ChunkMessageBody};
+    let parsed = parse_webrtc_direct_multiaddr(endpoint).unwrap();
+    let endpoint = BrowserEndpoint {
+        multiaddr: parsed.multiaddr.clone(),
+    };
+    let core = Rc::new(BrowserNetworkCore::new(vec![endpoint]).unwrap());
+    let adapter = shared::SharedNetworkAdapter::new(Rc::clone(&core));
+    let peer = ant_protocol::transport::PeerId::from_hex(&parsed.peer_id).unwrap();
+    let addresses = vec![parsed.multiaddr.parse().unwrap()];
+    let result = adapter
+        .request(
+            &peer,
+            &addresses,
+            ChunkMessage {
+                request_id: 42,
+                body: ChunkMessageBody::GetRequest(ChunkGetRequest::new([1; 32])),
+            },
+            Duration::from_millis(u64::from(timeout_ms)),
+        )
+        .await;
+    core.pool.close();
+    result
+        .map(|_| ())
+        .map_err(|error| JsValue::from_str(&error.to_string()))
 }
