@@ -1437,7 +1437,7 @@ impl BrowserFileReader {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct UploadCheckpoint {
     mode: crate::data::client::merkle::PaymentMode,
     merkle_wallet: Option<js_sys::Function>,
@@ -1476,6 +1476,9 @@ impl UploadCheckpoint {
         scope: &str,
         state: &crate::data::client::upload_state::UploadState,
     ) -> Result<(), String> {
+        if self.callback.is_none() && state.pending_payment.is_some() {
+            return Err("paid uploads require a checkpoint persistence callback".into());
+        }
         if let Some(callback) = &self.callback {
             let envelope = UploadCheckpointEnvelope {
                 scope: scope.into(),
@@ -2045,6 +2048,8 @@ impl BrowserNetworkClient {
             checkpoint,
             scope: &scope,
             last_transaction: RefCell::new(None),
+            payment_state: RefCell::new(None),
+            recovering: Cell::new(false),
         };
         let result = client
             .upload_records(metadata, &mut state, &adapter, checkpoint.mode)
@@ -2160,24 +2165,6 @@ async fn load_upload_record(
     };
     super::verify_record(&record.address, content.as_slice()).map_err(|error| error.to_string())?;
     Ok(content)
-}
-
-async fn invoke_payment(
-    callback: &js_sys::Function,
-    payment_network: &BrowserPaymentNetwork,
-    quotes: &[VerifiedStorageQuote],
-) -> Result<BrowserPaymentSubmission, String> {
-    let payment_network =
-        serde_wasm_bindgen::to_value(payment_network).map_err(|error| error.to_string())?;
-    let quotes = serde_wasm_bindgen::to_value(quotes).map_err(|error| error.to_string())?;
-    let returned = callback
-        .call2(&JsValue::NULL, &payment_network, &quotes)
-        .map_err(js_error_message)?;
-    let returned = JsFuture::from(Promise::resolve(&returned))
-        .await
-        .map_err(js_error_message)?;
-    serde_wasm_bindgen::from_value(returned)
-        .map_err(|error| format!("wallet callback returned an invalid payment result: {error}"))
 }
 
 /// One authenticated browser-to-node WebRTC Direct client implemented in Rust.

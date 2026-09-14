@@ -74,6 +74,42 @@ pub trait UploadAdapter: AdapterBounds {
             "wallet adapter does not support Merkle payments".into(),
         ))
     }
+    /// Submit with a durable attempt already recorded; adapters can journal broadcast evidence.
+    async fn pay_tracked(
+        &self,
+        plans: &[ChunkPaymentPlan],
+        _state: &UploadState,
+    ) -> Result<UploadPayment> {
+        self.pay(plans).await
+    }
+    /// Observe an existing attempt without broadcasting another transaction.
+    async fn recover_payment(
+        &self,
+        _plans: &[ChunkPaymentPlan],
+        _state: &UploadState,
+    ) -> Result<UploadPayment> {
+        Err(Error::Payment(
+            "payment outcome unknown; wallet reconciliation is required".into(),
+        ))
+    }
+    /// Submit a Merkle payment with the prepared attempt already persisted.
+    async fn pay_merkle_tracked(
+        &self,
+        batch: &super::merkle::PreparedMerkleBatch,
+        _state: &UploadState,
+    ) -> Result<MerkleUploadPayment> {
+        self.pay_merkle(batch).await
+    }
+    /// Observe an existing Merkle attempt without broadcasting.
+    async fn recover_merkle(
+        &self,
+        _batch: &super::merkle::PreparedMerkleBatch,
+        _state: &UploadState,
+    ) -> Result<MerkleUploadPayment> {
+        Err(Error::Payment(
+            "Merkle payment outcome unknown; wallet reconciliation is required".into(),
+        ))
+    }
     /// Check transport-specific endpoint capabilities before payment.
     async fn admit(&self, _plan: &mut ChunkPaymentPlan) -> Result<()> {
         Ok(())
@@ -196,11 +232,45 @@ impl Client {
         adapter: &A,
         mode: PaymentMode,
     ) -> Result<UploadOutcome> {
+        // Preflight every byte source before any payment, including Merkle batches.
+        // Read one record at a time so files remain bounded by record size, not file size.
+        // The adapter retains its staging session for the lifetime of this operation.
+        for record in &records {
+            let bytes = adapter.load(*record).await?;
+            if bytes.len() as u64 != record.size {
+                return Err(Error::InvalidData(
+                    "staged record size changed before payment".into(),
+                ));
+            }
+            crate::record::verify(&record.address, &bytes).map_err(Error::InvalidData)?;
+        }
         let total = records.len();
         let mut outcome = UploadOutcome {
             mode: PaymentMode::Single,
             ..Default::default()
         };
+        if let Some(attempt) = state.pending_payment.clone() {
+            if attempt.merkle {
+                let batch = state
+                    .pending_merkle
+                    .as_ref()
+                    .ok_or_else(|| Error::Payment("missing pending Merkle intent".into()))?;
+                let payment = adapter.recover_merkle(batch, state).await?;
+                let paid =
+                    super::merkle::finalize_merkle_batch(batch.clone(), payment.winner_pool)?;
+                state.insert_merkle(paid);
+            } else {
+                let plans = state.pending_plans()?;
+                let payment = adapter.recover_payment(&plans, state).await?;
+                validate_payment_total(&plans, &payment)?;
+                state.confirm(
+                    &attempt.addresses,
+                    &payment.transactions,
+                    crate::runtime::system_time(),
+                )?;
+            }
+            adapter.checkpoint(state, None).await?;
+        }
         let mut unique = records;
         self.prepare_upload_merkle(&mut unique, state, adapter, mode, &mut outcome)
             .await?;
@@ -234,7 +304,9 @@ impl Client {
             let payment = if payable.is_empty() {
                 UploadPayment::default()
             } else {
-                adapter.pay(&payable).await?
+                state.start_payment(false, payable.iter().map(|plan| plan.address).collect())?;
+                adapter.checkpoint(state, None).await?;
+                adapter.pay_tracked(&payable, state).await?
             };
             let expected = payable.iter().try_fold(Amount::ZERO, |sum, plan| {
                 sum.checked_add(plan.payment.total_amount())
@@ -543,11 +615,13 @@ impl Client {
                 ));
             }
             state.pending_merkle = Some(batch);
+            state.start_payment(true, Vec::new())?;
+            adapter.checkpoint(state, None).await?;
             let batch = state
                 .pending_merkle
                 .as_ref()
                 .ok_or_else(|| Error::Payment("missing pending Merkle batch".into()))?;
-            let payment = adapter.pay_merkle(batch).await?;
+            let payment = adapter.pay_merkle_tracked(batch, state).await?;
             let paid = finalize_merkle_batch(batch.clone(), payment.winner_pool)?;
             state.insert_merkle(paid);
             let receipt = UploadPayment {
@@ -604,11 +678,13 @@ impl Client {
             };
             state.pending_merkle = Some(batch);
             adapter.checkpoint(state, None).await?;
+            state.start_payment(true, Vec::new())?;
+            adapter.checkpoint(state, None).await?;
             let batch = state
                 .pending_merkle
                 .as_ref()
                 .ok_or_else(|| Error::Payment("missing prepared Merkle batch".into()))?;
-            let payment = adapter.pay_merkle(batch).await?;
+            let payment = adapter.pay_merkle_tracked(batch, state).await?;
             let paid = finalize_merkle_batch(batch.clone(), payment.winner_pool)?;
             state.insert_merkle(paid);
             let receipt = UploadPayment {
@@ -626,6 +702,19 @@ impl Client {
         }
         Ok(())
     }
+}
+
+fn validate_payment_total(plans: &[ChunkPaymentPlan], payment: &UploadPayment) -> Result<()> {
+    let expected = plans.iter().try_fold(Amount::ZERO, |sum, plan| {
+        sum.checked_add(plan.payment.total_amount())
+            .ok_or_else(|| Error::Payment("payment total overflow".into()))
+    })?;
+    if expected != payment.amount {
+        return Err(Error::Payment(
+            "wallet reported a different payment total".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Native wallet and in-memory byte source for the shared upload coordinator.

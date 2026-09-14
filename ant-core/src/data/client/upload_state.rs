@@ -18,6 +18,21 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+/// A payment may have reached the wallet or chain. Never submit it again merely
+/// because receipt parsing or observation failed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentAttempt {
+    /// True for a prepared Merkle transaction.
+    pub merkle: bool,
+    /// Records bound to the prepared single-payment intent.
+    pub addresses: Vec<XorName>,
+    /// Wallet submission evidence retained before awaiting confirmation.
+    #[serde(default)]
+    pub submissions: Vec<serde_json::Value>,
+    /// Unparsed wallet result, retained even if validation later fails.
+    pub receipt: Option<serde_json::Value>,
+}
+
 /// Prepared plans and confirmed proofs keyed by content address.
 /// Checkpoints contain no file bytes or wallet secrets.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -26,6 +41,9 @@ pub struct UploadState {
     proofs: HashMap<XorName, Vec<u8>>,
     #[serde(default)]
     pub(crate) pending_merkle: Option<super::merkle::PreparedMerkleBatch>,
+    /// Submission journal; an unresolved attempt must be reconciled before another payment.
+    #[serde(default)]
+    pub pending_payment: Option<PaymentAttempt>,
 }
 
 /// Native proof expiry and future-clock tolerance, shared by every client adapter.
@@ -68,9 +86,41 @@ pub(crate) fn merkle_fresh(timestamp: u64, now: SystemTime) -> bool {
 }
 
 impl UploadState {
+    pub(crate) fn start_payment(&mut self, merkle: bool, addresses: Vec<XorName>) -> Result<()> {
+        if self.pending_payment.is_some() {
+            return Err(Error::Payment(
+                "payment outcome unknown; reconcile before submitting again".into(),
+            ));
+        }
+        self.pending_payment = Some(PaymentAttempt {
+            merkle,
+            addresses,
+            submissions: Vec::new(),
+            receipt: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn pending_plans(&self) -> Result<Vec<ChunkPaymentPlan>> {
+        let attempt = self
+            .pending_payment
+            .as_ref()
+            .ok_or_else(|| Error::Payment("no pending payment".into()))?;
+        attempt
+            .addresses
+            .iter()
+            .map(|address| {
+                self.plans.get(address).cloned().ok_or_else(|| {
+                    Error::InvalidData("pending payment is missing its prepared plan".into())
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn insert_merkle(&mut self, result: super::merkle::MerkleBatchPaymentResult) {
         self.proofs.extend(result.proofs);
         self.pending_merkle = None;
+        self.pending_payment = None;
     }
     pub(crate) fn proof(&self, address: &XorName) -> Option<&Vec<u8>> {
         self.proofs.get(address)
@@ -118,6 +168,7 @@ impl UploadState {
             plans: HashMap::new(),
             proofs,
             pending_merkle: None,
+            pending_payment: None,
         }
     }
 
@@ -183,6 +234,15 @@ impl UploadState {
             })
             .collect::<Result<Vec<_>>>()?;
         self.proofs.extend(proofs);
+        if self.pending_payment.as_ref().is_some_and(|attempt| {
+            !attempt.merkle
+                && attempt
+                    .addresses
+                    .iter()
+                    .all(|address| self.proofs.contains_key(address))
+        }) {
+            self.pending_payment = None;
+        }
         for address in addresses {
             self.plans.remove(address);
         }
@@ -246,6 +306,15 @@ impl UploadState {
         }
         if let Some(prepared) = &state.pending_merkle {
             prepared.validate_checkpoint()?;
+        }
+        if let Some(attempt) = &state.pending_payment {
+            if attempt.submissions.len() > 256 || (attempt.merkle && state.pending_merkle.is_none())
+            {
+                return Err(Error::InvalidData("invalid payment journal".into()));
+            }
+            if !attempt.merkle {
+                state.pending_plans()?;
+            }
         }
         for (address, bytes) in &state.proofs {
             if let Ok(proof) = ant_protocol::payment::deserialize_merkle_proof(bytes) {
