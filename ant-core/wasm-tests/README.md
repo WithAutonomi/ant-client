@@ -64,3 +64,10 @@ Address V2 is signed by definition. Browser tests verify that an authenticated
 is rejected. Servers without that capability exercise the V1-era discovery-hint
 fallback. The capability token is imported from portable saorsa-core by both
 node and client adapters.
+
+Review regressions also exercise durable payment intent/submission/receipt
+journals, malformed wallet results without duplicate payment, staged-data
+preflight, canonical DataMap metadata, live-route caching with seed fallback,
+monotonic frame deadlines, operation-specific response timeouts, and pool
+capacity wakeups after cancellation. See `../browser-tests/README.md` for the
+Chromium integration against real nodes and Anvil.

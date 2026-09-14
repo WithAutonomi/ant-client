@@ -5,7 +5,7 @@ import { mockWebRtc } from "./mock-webrtc.mjs";
 
 test("idle pooled connections reject unsolicited messages immediately", async () => {
   const rtc = mockWebRtc();
-  const client = new BrowserNodeClient(rtc.endpoints[0]);
+  let client = await new BrowserNodeClient(rtc.endpoints[0]).connect();
   try {
     await client.hello();
     const connection = rtc.connections[0];
@@ -14,7 +14,8 @@ test("idle pooled connections reject unsolicited messages immediately", async ()
     }
     assert.equal(connection.closed, true);
     // The failed association must not poison subsequent requests.
-    await client.hello();
+    await assert.rejects(client.hello(), /session closed/);
+    client = await new BrowserNodeClient(rtc.endpoints[0]).connect();
     assert.equal(rtc.connections.length, 2);
   } finally {
     client.close();
@@ -37,7 +38,7 @@ for (const scenario of ["oversized", "byte budget", "tiny messages", "empty"]) {
         return false;
       },
     }]);
-    const client = new BrowserNodeClient(rtc.endpoints[0]);
+    let client = await new BrowserNodeClient(rtc.endpoints[0]).connect();
     try {
       await client.hello();
       await assert.rejects(
@@ -54,7 +55,7 @@ for (const scenario of ["oversized", "byte budget", "tiny messages", "empty"]) {
 test("fragmented authenticated responses preserve normal connection reuse", async () => {
   const chunk = new Uint8Array(4 * 1024 * 1024).fill(0xab);
   const rtc = mockWebRtc([{ chunk }]);
-  const client = new BrowserNodeClient(rtc.endpoints[0]);
+  let client = await new BrowserNodeClient(rtc.endpoints[0]).connect();
   try {
     await client.hello();
     const result = await client.getChunk(contentAddress(chunk));
@@ -88,7 +89,7 @@ test("browser verifies forwarded owner proofs and ignores substituted metadata",
   const original = owner.address_record;
   owner.native_addresses = ["/ip4/1.1.1.1/udp/9000/quic"];
   const rtc = mockWebRtc([{ peers: [owner], addressV2: true }]);
-  const client = new BrowserNodeClient(rtc.endpoints[0]);
+  let client = await new BrowserNodeClient(rtc.endpoints[0]).connect();
   try {
     const nodes = await client.findNode("11".repeat(32), 20);
     assert.deepEqual(nodes[0].native_addresses, ["/ip4/9.9.9.9/udp/9000/quic"]);
@@ -103,7 +104,7 @@ test("browser rejects tampered forwarded owner proofs", async () => {
   bytes[bytes.length - 1] ^= 1;
   owner.address_record = bytes.toString("hex");
   const rtc = mockWebRtc([{ peers: [owner], addressV2: true }]);
-  const client = new BrowserNodeClient(rtc.endpoints[0]);
+  let client = await new BrowserNodeClient(rtc.endpoints[0]).connect();
   try { await assert.rejects(client.findNode("11".repeat(32), 20), /signature/); }
   finally { client.close(); }
 });
@@ -112,7 +113,7 @@ test("browser retains owner proofs after the old expiry window", async () => {
   const { test_signed_address_node } = await import("./pkg/ant_core.js");
   const owner = test_signed_address_node();
   const rtc = mockWebRtc([{ peers: [owner], addressV2: true }]);
-  const client = new BrowserNodeClient(rtc.endpoints[0]);
+  let client = await new BrowserNodeClient(rtc.endpoints[0]).connect();
   const now = Date.now;
   Date.now = () => now() + 3_600_000;
   try {
@@ -125,7 +126,7 @@ test("browser rejects duplicate owners before accepting lookup proofs", async ()
   const { test_signed_address_node } = await import("./pkg/ant_core.js");
   const owner = test_signed_address_node();
   const rtc = mockWebRtc([{ peers: [owner, owner], addressV2: true }]);
-  const client = new BrowserNodeClient(rtc.endpoints[0]);
+  let client = await new BrowserNodeClient(rtc.endpoints[0]).connect();
   try { await assert.rejects(client.findNode("11".repeat(32), 20), /duplicate peer/); }
   finally { client.close(); }
 });
@@ -133,14 +134,14 @@ test("browser rejects duplicate owners before accepting lookup proofs", async ()
 
 test("V2-capable browser lookup rejects an omitted owner proof", async () => {
   const rtc = mockWebRtc([{ addressV2: true }]);
-  const client = new BrowserNodeClient(rtc.endpoints[0]);
+  let client = await new BrowserNodeClient(rtc.endpoints[0]).connect();
   try { await assert.rejects(client.findNode("11".repeat(32), 20), /missing its owner proof/); }
   finally { client.close(); }
 });
 
 test("legacy browser lookup still accepts unsigned discovery hints", async () => {
   const rtc = mockWebRtc();
-  const client = new BrowserNodeClient(rtc.endpoints[0]);
+  let client = await new BrowserNodeClient(rtc.endpoints[0]).connect();
   try {
     const nodes = await client.findNode("11".repeat(32), 20);
     assert.equal(nodes.length, 1);
