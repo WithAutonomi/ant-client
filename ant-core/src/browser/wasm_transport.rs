@@ -20,9 +20,11 @@ use super::{BrowserRecord, BrowserRecordInfo, BrowserStagedFile};
 #[cfg(feature = "test-utils")]
 use crate::transfer_policy::PutRejection;
 use crate::transfer_policy::RpcError;
+#[cfg(feature = "test-utils")]
+use ant_protocol::transport::xor_distance;
 use ant_protocol::transport::{
-    collect_after_first_with_grace, run_iterative_lookup, xor_distance, IterativeLookup,
-    LookupConfig, LookupKey, LookupNode, LookupQuery, LookupQueryOutcome,
+    collect_after_first_with_grace, run_iterative_lookup, IterativeLookup, LookupConfig, LookupKey,
+    LookupNode, LookupQuery, LookupQueryOutcome,
 };
 use futures_channel::{mpsc, oneshot};
 use futures_util::{
@@ -915,6 +917,8 @@ struct BrowserNetworkCore {
     seeds: Vec<BrowserEndpoint>,
     pool: Rc<BrowserClientPool>,
     routing: Rc<RefCell<HashMap<LookupKey, BrowserLookupCandidate>>>,
+    contacted: Rc<RefCell<HashMap<LookupKey, web_time::Instant>>>,
+    owner_views: Rc<RefCell<lru::LruCache<LookupKey, BrowserLookupCandidate>>>,
 }
 
 impl BrowserNetworkCore {
@@ -936,6 +940,11 @@ impl BrowserNetworkCore {
             seeds,
             pool: Rc::new(BrowserClientPool::new(DEFAULT_MAX_POOLED_CLIENTS)?),
             routing: Rc::new(RefCell::new(HashMap::new())),
+            contacted: Rc::new(RefCell::new(HashMap::new())),
+            owner_views: Rc::new(RefCell::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_BROWSER_ROUTING_ENTRIES)
+                    .ok_or("routing cache must be nonempty")?,
+            ))),
         })
     }
 
@@ -953,6 +962,47 @@ impl BrowserNetworkCore {
         target: &str,
         progress: &ProgressReporter,
         count: usize,
+    ) -> Result<BrowserLookupResult, String> {
+        // Only authenticated, recently contacted endpoints bootstrap another walk.
+        self.routing.borrow_mut().retain(|peer, _| {
+            self.contacted
+                .borrow()
+                .get(peer)
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(15 * 60))
+        });
+        let cached = !self.routing.borrow().is_empty();
+        if !cached {
+            return self
+                .find_closest_attempt(target, progress, count, true)
+                .await;
+        }
+        let first = self
+            .find_closest_attempt(target, progress, count, false)
+            .await;
+        if first
+            .as_ref()
+            .is_ok_and(|result| result.nodes.len() >= count)
+        {
+            return first;
+        }
+        progress.report("Retrying lookup through configured seeds");
+        let seeded = self
+            .find_closest_attempt(target, progress, count, true)
+            .await;
+        match (first, seeded) {
+            (Ok(first), Ok(second)) if first.nodes.len() > second.nodes.len() => Ok(first),
+            (_, Ok(second)) => Ok(second),
+            (Ok(first), Err(_)) if !first.nodes.is_empty() => Ok(first),
+            (_, Err(error)) => Err(error),
+        }
+    }
+
+    async fn find_closest_attempt(
+        &self,
+        target: &str,
+        progress: &ProgressReporter,
+        count: usize,
+        use_seeds: bool,
     ) -> Result<BrowserLookupResult, String> {
         let target_key = parse_lookup_key(target, "lookup target")?;
         let failures = Rc::new(RefCell::new(Vec::new()));
@@ -997,7 +1047,8 @@ impl BrowserNetworkCore {
             .filter(|candidate| candidate.wire.webrtc_direct.is_some())
             .cloned()
             .collect::<Vec<_>>();
-        if initial_candidates.is_empty() {
+        if use_seeds {
+            initial_candidates.clear();
             initial_candidates.extend(join_all(seed_futures).await.into_iter().flatten());
         }
         if initial_candidates.is_empty() {
@@ -1030,9 +1081,6 @@ impl BrowserNetworkCore {
         for candidate in initial_candidates {
             if let Some(endpoint) = candidate.wire.webrtc_direct.clone() {
                 known_endpoints.insert(candidate.peer_id, endpoint);
-                self.routing
-                    .borrow_mut()
-                    .insert(candidate.peer_id, candidate.clone());
                 let _ = lookup.add_candidate(candidate);
             }
         }
@@ -1043,23 +1091,30 @@ impl BrowserNetworkCore {
             views: Rc::clone(&views),
             known_endpoints,
             routing: Rc::clone(&self.routing),
+            contacted: Rc::clone(&self.contacted),
+            owner_views: Rc::clone(&self.owner_views),
             reports: HashMap::new(),
         };
         run_iterative_lookup(
             &mut lookup,
             &mut query,
-            TimeoutFuture::new(ant_protocol::transport::LOOKUP_TIMEOUT_SECS * 1_000),
+            TimeoutFuture::new(
+                ant_protocol::transport::LOOKUP_TIMEOUT_SECS * if use_seeds { 1_000 } else { 500 },
+            ),
         )
         .await
         .map_err(|error| error.to_string())?;
         let mut routes = self.routing.borrow_mut();
         if routes.len() > MAX_BROWSER_ROUTING_ENTRIES {
             let mut peers = routes.keys().copied().collect::<Vec<_>>();
-            peers.sort_by_key(|peer| xor_distance(peer, &target_key));
+            peers.sort_by_key(|peer| std::cmp::Reverse(self.contacted.borrow().get(peer).copied()));
             for peer in peers.into_iter().skip(MAX_BROWSER_ROUTING_ENTRIES) {
                 routes.remove(&peer);
             }
         }
+        self.contacted
+            .borrow_mut()
+            .retain(|peer, _| routes.contains_key(peer));
         drop(routes);
         let records = lookup
             .results()
@@ -1097,6 +1152,8 @@ struct BrowserNetworkLookupQuery {
     known_endpoints: HashMap<LookupKey, BrowserEndpoint>,
     reports: HashMap<PeerId, client_routing::SubjectReports>,
     routing: Rc<RefCell<HashMap<LookupKey, BrowserLookupCandidate>>>,
+    contacted: Rc<RefCell<HashMap<LookupKey, web_time::Instant>>>,
+    owner_views: Rc<RefCell<lru::LruCache<LookupKey, BrowserLookupCandidate>>>,
 }
 
 impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
@@ -1133,6 +1190,8 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                 let progress = self.progress.clone();
                 let failures = Rc::clone(&self.failures);
                 let views = Rc::clone(&self.views);
+                let routing = Rc::clone(&self.routing);
+                let contacted = Rc::clone(&self.contacted);
                 let target = target.clone();
                 async move {
                     let responder = candidate.peer_id;
@@ -1153,6 +1212,10 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                     .await;
                     match result {
                         Ok(nodes) => {
+                            routing.borrow_mut().insert(responder, candidate.clone());
+                            contacted
+                                .borrow_mut()
+                                .insert(responder, web_time::Instant::now());
                             views.borrow_mut().insert(responder, nodes.clone());
                             progress.report(&format!(
                                 "Iteration {iteration}: {peer_id} returned {} nodes",
@@ -1176,6 +1239,8 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                             }
                         }
                         Err(error) => {
+                            routing.borrow_mut().remove(&responder);
+                            contacted.borrow_mut().remove(&responder);
                             progress.report(&format!("Query {peer_id} failed: {error}"));
                             failures.borrow_mut().push(BrowserLookupFailure {
                                 peer_id,
@@ -1223,8 +1288,8 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                         return false;
                     };
                     let known = self
-                        .routing
-                        .borrow()
+                        .owner_views
+                        .borrow_mut()
                         .get(&candidate.peer_id)
                         .and_then(|current| shared::peer_record(&current.wire).ok());
                     if let Some(known) = known
@@ -1243,10 +1308,21 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                         return false;
                     };
                     candidate.wire = wire;
-                    // Keep owner provenance even if this replacement has no browser endpoint.
-                    self.routing
+                    // Ownership history prevents rollback, but is not a live routing entry.
+                    self.owner_views
                         .borrow_mut()
-                        .insert(candidate.peer_id, candidate.clone());
+                        .put(candidate.peer_id, candidate.clone());
+                    if self
+                        .routing
+                        .borrow()
+                        .get(&candidate.peer_id)
+                        .is_some_and(|known| {
+                            known.wire.webrtc_direct != candidate.wire.webrtc_direct
+                        })
+                    {
+                        self.routing.borrow_mut().remove(&candidate.peer_id);
+                        self.contacted.borrow_mut().remove(&candidate.peer_id);
+                    }
                     if let Some(endpoint) = candidate.wire.webrtc_direct.clone() {
                         self.known_endpoints.insert(candidate.peer_id, endpoint);
                         true
