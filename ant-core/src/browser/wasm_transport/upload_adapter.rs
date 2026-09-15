@@ -87,6 +87,20 @@ impl BrowserUploadAdapter<'_> {
             .pending_payment
             .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
             .map_err(|e| Error::Payment(e.to_string()))?;
+        // Persistence above can yield to close(). No new wallet request may
+        // start afterwards, but observation of an existing submission is safe.
+        if !self.recovering.get() && self.network.inner.pool.availability.closed.get() {
+            journal.borrow_mut().pending_payment = None;
+            let snapshot = journal.borrow().clone();
+            self.payment_state.replace(Some(snapshot.clone()));
+            self.checkpoint
+                .save(self.scope, &snapshot)
+                .await
+                .map_err(Error::Payment)?;
+            return Err(Error::Payment(
+                "browser client is closed; payment was not submitted".into(),
+            ));
+        }
         let returned = callback
             .call4(&JsValue::NULL, &network, &input, &on_submission, &attempt)
             .map_err(|e| Error::Payment(js_error_message(e)));
@@ -97,10 +111,15 @@ impl BrowserUploadAdapter<'_> {
             Err(error) => Err(error),
         };
         let writes = pending.borrow().clone();
+        let mut write_error = None;
         for write in writes {
-            JsFuture::from(write)
-                .await
-                .map_err(|e| Error::Payment(js_error_message(e)))?;
+            if let Err(error) = JsFuture::from(write).await {
+                write_error.get_or_insert_with(|| Error::Payment(js_error_message(error)));
+            }
+        }
+        self.payment_state.replace(Some(journal.borrow().clone()));
+        if let Some(error) = write_error {
+            return Err(error);
         }
         let value = result?;
         let raw: serde_json::Value = serde_wasm_bindgen::from_value(value.clone())
@@ -109,11 +128,18 @@ impl BrowserUploadAdapter<'_> {
             attempt.receipt = Some(raw);
         }
         let snapshot = journal.borrow().clone();
+        self.payment_state.replace(Some(snapshot.clone()));
         self.checkpoint
             .save(self.scope, &snapshot)
             .await
             .map_err(Error::Payment)?;
         Ok(value)
+    }
+
+    fn update_journal(&self, state: &mut UploadState) {
+        if let Some(journal) = self.payment_state.take() {
+            *state = journal;
+        }
     }
 }
 
@@ -272,41 +298,49 @@ impl UploadAdapter for BrowserUploadAdapter<'_> {
             gas: 0,
         })
     }
-    async fn pay_tracked(
+    async fn submit_payment(
         &self,
         plans: &[ChunkPaymentPlan],
-        state: &UploadState,
+        state: &mut UploadState,
     ) -> DataResult<UploadPayment> {
         self.payment_state.replace(Some(state.clone()));
         self.recovering.set(false);
-        self.pay(plans).await
+        let result = self.pay(plans).await;
+        self.update_journal(state);
+        result
     }
-    async fn recover_payment(
+    async fn reconcile_payment(
         &self,
         plans: &[ChunkPaymentPlan],
-        state: &UploadState,
+        state: &mut UploadState,
     ) -> DataResult<UploadPayment> {
         self.payment_state.replace(Some(state.clone()));
         self.recovering.set(true);
-        self.pay(plans).await
+        let result = self.pay(plans).await;
+        self.update_journal(state);
+        result
     }
-    async fn pay_merkle_tracked(
+    async fn submit_merkle_payment(
         &self,
         batch: &crate::data::client::merkle::PreparedMerkleBatch,
-        state: &UploadState,
+        state: &mut UploadState,
     ) -> DataResult<crate::data::client::upload::MerkleUploadPayment> {
         self.payment_state.replace(Some(state.clone()));
         self.recovering.set(false);
-        self.pay_merkle(batch).await
+        let result = self.pay_merkle(batch).await;
+        self.update_journal(state);
+        result
     }
-    async fn recover_merkle(
+    async fn reconcile_merkle_payment(
         &self,
         batch: &crate::data::client::merkle::PreparedMerkleBatch,
-        state: &UploadState,
+        state: &mut UploadState,
     ) -> DataResult<crate::data::client::upload::MerkleUploadPayment> {
         self.payment_state.replace(Some(state.clone()));
         self.recovering.set(true);
-        self.pay_merkle(batch).await
+        let result = self.pay_merkle(batch).await;
+        self.update_journal(state);
+        result
     }
     async fn checkpoint(&self, state: &UploadState, _: Option<&UploadPayment>) -> DataResult<()> {
         self.checkpoint

@@ -33,6 +33,13 @@ pub struct PaymentAttempt {
     pub receipt: Option<serde_json::Value>,
 }
 
+/// Evidence retained when an explicit wallet verifier establishes terminal failure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FailedPaymentAttempt {
+    attempt: PaymentAttempt,
+    resolution: serde_json::Value,
+}
+
 /// Prepared plans and confirmed proofs keyed by content address.
 /// Checkpoints contain no file bytes or wallet secrets.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -44,6 +51,8 @@ pub struct UploadState {
     /// Submission journal; an unresolved attempt must be reconciled before another payment.
     #[serde(default)]
     pub pending_payment: Option<PaymentAttempt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    failed_payments: Vec<FailedPaymentAttempt>,
 }
 
 /// Native proof expiry and future-clock tolerance, shared by every client adapter.
@@ -86,6 +95,19 @@ pub(crate) fn merkle_fresh(timestamp: u64, now: SystemTime) -> bool {
 }
 
 impl UploadState {
+    #[cfg(all(target_arch = "wasm32", feature = "browser-wasm"))]
+    pub(crate) fn record_failed_payment(&mut self, resolution: serde_json::Value) -> Result<()> {
+        let attempt = self
+            .pending_payment
+            .take()
+            .ok_or_else(|| Error::Payment("no pending payment".into()))?;
+        self.failed_payments.push(FailedPaymentAttempt {
+            attempt,
+            resolution,
+        });
+        Ok(())
+    }
+
     pub(crate) fn start_payment(&mut self, merkle: bool, addresses: Vec<XorName>) -> Result<()> {
         if self.pending_payment.is_some() {
             return Err(Error::Payment(
@@ -169,6 +191,7 @@ impl UploadState {
             proofs,
             pending_merkle: None,
             pending_payment: None,
+            failed_payments: Vec::new(),
         }
     }
 

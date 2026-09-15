@@ -281,9 +281,18 @@ impl Client {
             .upload_unique_records_inner(&records, state, adapter, mode, &mut outcome)
             .await
         {
-            Err(Error::ClientUpdateRequired(reason))
-                if outcome.amount != Amount::ZERO || !outcome.addresses.is_empty() =>
+            Err(error @ Error::PartialUpload { .. }) => Err(error),
+            Err(error)
+                if outcome.amount != Amount::ZERO
+                    || outcome.gas != 0
+                    || !outcome.addresses.is_empty() =>
             {
+                let reason = match error {
+                    Error::ClientUpdateRequired(reason) => format!(
+                        "Further payment refused; reported spend covers earlier settled batches. {reason}"
+                    ),
+                    error => error.to_string(),
+                };
                 let stored = outcome.addresses.iter().copied().collect::<HashSet<_>>();
                 let failed = records
                     .iter()
@@ -291,10 +300,16 @@ impl Client {
                     .map(|r| (r.address, reason.clone()))
                     .collect::<Vec<_>>();
                 Err(Error::PartialUpload {
-                    stored_count: outcome.addresses.len(), stored: outcome.addresses,
-                    failed_count: failed.len(), failed, total_chunks: records.len(),
-                    spend: Box::new(PartialUploadSpend { storage_cost_atto: outcome.amount.to_string(), gas_cost_wei: outcome.gas }),
-                    reason: format!("Further payment refused; reported spend covers earlier settled batches. {reason}"),
+                    stored_count: outcome.addresses.len(),
+                    stored: outcome.addresses,
+                    failed_count: failed.len(),
+                    failed,
+                    total_chunks: records.len(),
+                    spend: Box::new(PartialUploadSpend {
+                        storage_cost_atto: outcome.amount.to_string(),
+                        gas_cost_wei: outcome.gas,
+                    }),
+                    reason,
                 })
             }
             result => result,
@@ -322,37 +337,50 @@ impl Client {
             crate::record::verify(&record.address, &bytes).map_err(Error::InvalidData)?;
         }
         let total = records.len();
-        if let Some(attempt) = state.pending_payment.clone() {
-            if attempt.merkle {
-                let batch = state
-                    .pending_merkle
-                    .clone()
-                    .ok_or_else(|| Error::Payment("missing pending Merkle intent".into()))?;
-                let payment = adapter.reconcile_merkle_payment(&batch, state).await?;
-                let paid = super::merkle::finalize_merkle_batch(batch, payment.winner_pool)?;
-                state.insert_merkle(paid);
-            } else {
-                let plans = state.pending_plans()?;
-                let payment = adapter.reconcile_payment(&plans, state).await?;
-                validate_payment_total(&plans, &payment)?;
-                state.confirm(
-                    &attempt.addresses,
-                    &payment.transactions,
-                    crate::runtime::system_time(),
-                )?;
-            }
-            adapter.checkpoint(state, None).await?;
-        }
         let mut unique = records.to_vec();
-        let preparation = self
-            .prepare_upload_merkle(&mut unique, state, adapter, mode, outcome)
-            .await;
-        // Already paid batches remain storable when newer quotes refuse further payment.
-        if preparation.is_ok() || matches!(&preparation, Err(Error::ClientUpdateRequired(_))) {
-            self.store_upload_merkle(&mut unique, state, adapter, outcome, total)
-                .await?;
+        let preparation = async {
+            self.reconcile_upload_payment(state, adapter).await?;
+            self.prepare_upload_merkle(&mut unique, state, adapter, mode, outcome)
+                .await
         }
-        preparation?;
+        .await;
+        // A later payment (including its recovery) must not strand earlier paid
+        // batches. Preflight above and proof freshness checks still gate every PUT.
+        if let Err(Error::InvalidData(reason)) = &preparation {
+            return Err(Error::InvalidData(reason.clone()));
+        }
+        let storage = self
+            .store_upload_merkle(&mut unique, state, adapter, outcome, total)
+            .await;
+        match (preparation, storage) {
+            (
+                Err(payment_error),
+                Err(Error::PartialUpload {
+                    stored,
+                    stored_count,
+                    failed,
+                    failed_count,
+                    total_chunks,
+                    spend,
+                    reason,
+                }),
+            ) => {
+                return Err(Error::PartialUpload {
+                    stored,
+                    stored_count,
+                    failed,
+                    failed_count,
+                    total_chunks,
+                    spend,
+                    reason: format!("{payment_error}; {reason}"),
+                });
+            }
+            (Err(payment_error), Err(storage_error)) => {
+                return Err(Error::Payment(format!("{payment_error}; {storage_error}")));
+            }
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+            (Ok(()), Ok(())) => {}
+        }
         let waves = unique
             .chunks(super::batch::PAYMENT_WAVE_SIZE)
             .collect::<Vec<_>>();
@@ -497,6 +525,36 @@ impl Client {
         }
         Ok(std::mem::take(outcome))
     }
+    async fn reconcile_upload_payment<A: UploadAdapter>(
+        &self,
+        state: &mut UploadState,
+        adapter: &A,
+    ) -> Result<()> {
+        if let Some(attempt) = state.pending_payment.clone() {
+            if attempt.merkle {
+                let batch = state
+                    .pending_merkle
+                    .clone()
+                    .ok_or_else(|| Error::Payment("missing pending Merkle intent".into()))?;
+                let payment = adapter.reconcile_merkle_payment(&batch, state).await?;
+                let paid = super::merkle::finalize_merkle_batch(batch, payment.winner_pool)?;
+                state.insert_merkle(paid);
+            } else {
+                let plans = state.pending_plans()?;
+                let payment = adapter.reconcile_payment(&plans, state).await?;
+                validate_payment_total(&plans, &payment)?;
+                state.confirm(
+                    &attempt.addresses,
+                    &payment.transactions,
+                    crate::runtime::system_time(),
+                )?;
+            }
+            // Recovered receipts are previous spend, not new payments by this invocation.
+            adapter.checkpoint(state, None).await?;
+        }
+        Ok(())
+    }
+
     async fn prepare_upload_wave<A: UploadAdapter>(
         &self,
         wave: &[UploadRecord],

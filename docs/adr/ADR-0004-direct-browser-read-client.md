@@ -279,6 +279,35 @@ not permission to submit again. The optional wallet `recover` callback observes
 the original payment; it must never broadcast another transaction. Browser
 callers supply a checkpoint persistence callback before any paid submission.
 
+Definitively unsuccessful payments can be resolved separately with
+`BrowserNetworkClient.reconcileFailedUploadPayment(checkpoint, verifyFailure,
+onCheckpoint)`. The caller waits for the original upload and wallet request to
+finish, then passes the latest checkpoint. The trusted verifier receives
+`(attempt, scope)` and checks the complete attempt against its original wallet
+and payment network. It must never submit a transaction. Its result is either:
+
+- `{ status: "notSubmitted", evidence: {...} }`, establishing that the wallet
+  never submitted the payment and cannot still submit it. Rust also requires
+  that the journal contain no submission or receipt evidence.
+- `{ status: "reverted", transactionHashes: [...], evidence: {...} }`, after
+  establishing final on-chain failure of every transaction. The hashes must
+  cover all journaled transactions; a partial failure cannot release the attempt.
+
+The nonempty evidence object records the verifier's wallet or chain observations.
+Rust validates the journal/result consistency; wallet and chain verification
+belongs to this trusted callback, as confirmation does for payment callbacks.
+Timeouts, missing receipts, and unresolved outcomes must reject verification.
+The method archives the failed attempt and its evidence while preserving prepared
+plans and confirmed proofs. It awaits `onCheckpoint` before returning the updated
+checkpoint. The caller then explicitly resumes the ordinary upload with that
+checkpoint. A persistence or verification failure does not authorize payment.
+
+Confirmed Merkle batches remain eligible for storage if a later payment or
+recovery fails. Partial results retain both the original error and current-call
+spend/progress. Closing the browser client before wallet invocation clears and
+persists that definitely unsubmitted intent; already submitted payments retain
+their journal for observation.
+
 The callback lookup facade adapts caller-supplied queries for embedding and
 algorithm tests. The production network adapter additionally owns authenticated
 sessions, ownership records, endpoint health, and live routing cache admission.

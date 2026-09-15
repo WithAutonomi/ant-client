@@ -71,3 +71,8 @@ preflight, canonical DataMap metadata, live-route caching with seed fallback,
 monotonic frame deadlines, operation-specific response timeouts, and pool
 capacity wakeups after cancellation. See `../browser-tests/README.md` for the
 Chromium integration against real nodes and Anvil.
+
+`payment-recovery.test.mjs` covers storing earlier paid Merkle batches after a
+later payment/recovery failure, explicit reconciliation of rejected and reverted
+payments, preservation of paid proofs, failed verification/persistence, and client
+closure during asynchronous prepayment checkpoints for both payment modes.
