@@ -115,7 +115,7 @@ pub enum FileChunkPeerStatus {
 /// the caller — only someone holding that `DataMap` can reconstruct the file.
 /// A public upload additionally stores the serialized `DataMap` as a chunk on
 /// the network, yielding a single chunk address that anyone can use to
-/// retrieve the `DataMap` (via [`Client::data_map_fetch`]) and then the file.
+/// retrieve the `DataMap` (via [`crate::data::Client::data_map_fetch`]) and then the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Visibility {
     /// Keep the data map local; only the holder can retrieve the file.
@@ -152,7 +152,7 @@ pub enum CostEstimateConfidence {
 }
 
 /// Estimated cost of uploading a file, returned by
-/// [`Client::estimate_upload_cost`].
+/// [`crate::data::Client::estimate_upload_cost`].
 ///
 /// Marked `#[non_exhaustive]` so adding a field later is not a breaking change
 /// for downstream consumers that construct or pattern-match on this struct.
@@ -203,7 +203,7 @@ pub struct FileUploadResult {
     pub gas_cost_wei: u128,
     /// Chunk address of the serialized `DataMap`, set only for
     /// [`Visibility::Public`] uploads. **`Some` means this address is
-    /// retrievable from the network (via [`Client::data_map_fetch`])**, not
+    /// retrievable from the network (via [`crate::data::Client::data_map_fetch`])**, not
     /// necessarily that *this* upload paid to store it — if the serialized
     /// `DataMap` hashed to a chunk that was already on the network (same
     /// file uploaded before; deterministic via self-encryption), the address

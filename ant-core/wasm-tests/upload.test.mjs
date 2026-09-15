@@ -593,3 +593,58 @@ test("a settlement refusal arriving during checkpoint stops the browser wallet",
     assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, 0);
   } finally { client.close(); }
 });
+
+function twoWaveFixture() {
+  const { encrypted, staged } = stagedFixture();
+  const records = encrypted.records.slice(0, -1);
+  while (records.length < 64) {
+    const bytes = new TextEncoder().encode(`Wave continuation record ${records.length}`);
+    records.push({ address: contentAddress(bytes), content: bytes });
+  }
+  records.push(encrypted.records.at(-1));
+  staged.records = records.map(record => ({ address: record.address, size: record.content.length }));
+  return { records, staged };
+}
+
+test("partial storage in the first wave still pays and stores the second wave", async () => {
+  const options = Array.from({ length: 7 }, () => ({
+    putError: { code: "put_failed", message: "injected storage rejection" },
+  }));
+  const rtc = mockWebRtc(options);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const { records, staged } = twoWaveFixture();
+  const signer = wallet();
+  const pay = async (network, quotes) => {
+    const receipt = await signer.pay(network, quotes);
+    if (signer.calls.length === 2) {
+      for (const option of options) delete option.putError;
+      for (const connection of rtc.connections) {
+        connection.channel.server?.set_put_error("", "");
+      }
+    }
+    return receipt;
+  };
+  try {
+    await assert.rejects(client.uploadStagedPublicFile(staged, paymentNetwork,
+      index => records[index].content, pay, undefined, undefined, undefined, "single"),
+      /partial upload: 1\/65 stored, 64 failed/);
+    assert.deepEqual(signer.calls.map(call => call.quotes.length), [64, 1]);
+    assert.equal(rtc.stores.filter(store => store.has(records.at(-1).address)).length, 4);
+  } finally { client.close(); }
+});
+
+test("fatal staged-byte failure stops before paying for the next wave", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const { records, staged } = twoWaveFixture();
+  const signer = wallet();
+  try {
+    await assert.rejects(client.uploadStagedPublicFile(staged, paymentNetwork,
+      index => {
+        if (signer.calls.length) throw new Error("staged input unavailable");
+        return records[index].content;
+      }, signer.pay, undefined, undefined, undefined, "single"), /staged input unavailable/);
+    assert.equal(signer.calls.length, 1);
+    assert.equal(rtc.requests.filter(request => request.method === "put_chunk").length, 0);
+  } finally { client.close(); }
+});

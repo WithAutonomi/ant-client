@@ -242,3 +242,8 @@ path = "tests/e2e_upload_costs.rs"
 [[test]]
 name = "datamap_file"
 path = "tests/datamap_file.rs"
+
+[[test]]
+name = "e2e_native_payment"
+path = "tests/e2e_native_payment.rs"
+required-features = ["native", "test-utils"]
