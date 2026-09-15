@@ -1,5 +1,5 @@
+use ant_core::data::MultiAddr;
 use clap::{ArgAction, Parser, Subcommand};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use crate::commands::data::{ChunkAction, FileAction, WalletAction};
@@ -19,9 +19,9 @@ pub struct Cli {
     pub json: bool,
 
     /// Bootstrap peer addresses (for data operations).
-    /// Comma-separated or repeated: -b 1.2.3.4:10000,5.6.7.8:10000
-    #[arg(long, short, value_delimiter = ',')]
-    pub bootstrap: Vec<SocketAddr>,
+    /// QUIC multiaddresses, comma-separated or repeated. Legacy ip:port is accepted.
+    #[arg(long, short, value_delimiter = ',', value_parser = ant_core::network_defaults::parse_quic_seed)]
+    pub bootstrap: Vec<MultiAddr>,
 
     /// Path to devnet manifest JSON (for data operations).
     #[arg(long)]
@@ -125,4 +125,37 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
         return Err("must be > 0".to_string());
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_multiaddresses_and_legacy_sockets_without_losing_pins() {
+        let pin = format!("/ip6/::1/udp/10000/quic/p2p/{}", "ab".repeat(32));
+        let cli = Cli::try_parse_from([
+            "ant",
+            "--bootstrap",
+            &pin,
+            "-b",
+            "127.0.0.1:10001",
+            "wallet",
+            "address",
+        ])
+        .unwrap();
+        assert_eq!(cli.bootstrap[0].to_string(), pin);
+        assert_eq!(
+            cli.bootstrap[1].to_string(),
+            "/ip4/127.0.0.1/udp/10001/quic"
+        );
+        assert!(Cli::try_parse_from([
+            "ant",
+            "--bootstrap",
+            "/ip4/127.0.0.1/tcp/10000",
+            "wallet",
+            "address"
+        ])
+        .is_err());
+    }
 }

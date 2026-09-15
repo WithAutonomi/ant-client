@@ -779,13 +779,28 @@ impl Client {
         bootstrap_peers: &[std::net::SocketAddr],
         config: ClientConfig,
     ) -> Result<Self> {
+        let seeds: Vec<_> = bootstrap_peers
+            .iter()
+            .copied()
+            .map(ant_protocol::transport::MultiAddr::quic)
+            .collect();
+        Self::connect_multiaddrs(&seeds, config).await
+    }
+
+    /// Connect using native QUIC multiaddresses without discarding peer pins.
+    #[cfg(feature = "native")]
+    pub async fn connect_multiaddrs(
+        bootstrap_peers: &[ant_protocol::transport::MultiAddr],
+        config: ClientConfig,
+    ) -> Result<Self> {
         debug!(
             "Connecting to Autonomi network with {} bootstrap peers (allow_loopback={}, ipv6={})",
             bootstrap_peers.len(),
             config.allow_loopback,
             config.ipv6,
         );
-        let network = Network::new(bootstrap_peers, config.allow_loopback, config.ipv6).await?;
+        let network =
+            Network::new_multiaddrs(bootstrap_peers, config.allow_loopback, config.ipv6).await?;
         let (controller, persist_path) = build_controller(&config);
         Ok(Self {
             config,

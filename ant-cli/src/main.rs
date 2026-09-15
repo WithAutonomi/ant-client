@@ -2,7 +2,6 @@ mod cli;
 mod commands;
 mod progress;
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -176,7 +175,7 @@ async fn run() -> anyhow::Result<()> {
 
 /// Shared context for data commands extracted from CLI args.
 struct DataCliContext {
-    bootstrap: Vec<SocketAddr>,
+    bootstrap: Vec<MultiAddr>,
     devnet_manifest: Option<PathBuf>,
     allow_loopback: bool,
     ipv4_only: bool,
@@ -212,7 +211,8 @@ async fn build_data_client(
     }
 
     let manifest = load_manifest(ctx)?;
-    let bootstrap = ant_core::config::resolve_bootstrap_peers(&ctx.bootstrap, manifest.as_ref())?;
+    let bootstrap =
+        ant_core::config::resolve_bootstrap_multiaddrs(&ctx.bootstrap, manifest.as_ref())?;
     // Explicit network selectors should be isolated from the general client
     // peer cache. `--bootstrap` and `--devnet-manifest` both mean "use exactly
     // this network entrypoint", so cached public-network peers must not be
@@ -441,7 +441,7 @@ fn resolve_evm_network(
 }
 
 async fn create_client_node(
-    bootstrap: &[SocketAddr],
+    bootstrap: &[MultiAddr],
     allow_loopback: bool,
     ipv4_only: bool,
     use_peer_cache: bool,
@@ -458,7 +458,7 @@ async fn create_client_node(
 
 /// Create a P2P node without starting it (for spinner polling during start).
 async fn create_client_node_raw(
-    bootstrap: &[SocketAddr],
+    bootstrap: &[MultiAddr],
     allow_loopback: bool,
     ipv4_only: bool,
     use_peer_cache: bool,
@@ -492,10 +492,8 @@ async fn create_client_node_raw(
         })
         .unwrap_or_default();
 
-    core_config.bootstrap_peers = peer_cache::select_bootstrap_peers(
-        cached_bootstrap_peers,
-        bootstrap.iter().map(|addr| MultiAddr::quic(*addr)),
-    );
+    core_config.bootstrap_peers =
+        peer_cache::select_bootstrap_peers(cached_bootstrap_peers, bootstrap.iter().cloned());
 
     let node = P2PNode::new(core_config)
         .await
