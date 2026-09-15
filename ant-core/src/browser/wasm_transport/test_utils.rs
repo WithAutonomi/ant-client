@@ -111,7 +111,7 @@ impl BrowserTestNode {
         self.closest_peers = serde_wasm_bindgen::from_value(peers).unwrap();
     }
     pub fn set_put_error(&mut self, code: String, message: String) {
-        self.put_error = Some((code, message));
+        self.put_error = (!code.is_empty()).then_some((code, message));
     }
     pub fn last_put_address(&self) -> String {
         self.last_put_address.clone()

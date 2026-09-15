@@ -357,6 +357,7 @@ impl Client {
             .chunks(super::batch::PAYMENT_WAVE_SIZE)
             .collect::<Vec<_>>();
         let mut prefetched = None;
+        let mut failed = Vec::new();
         for (wave_index, wave) in waves.iter().enumerate() {
             let plans = match prefetched.take() {
                 Some(plans) => plans?,
@@ -455,11 +456,14 @@ impl Client {
                 }
             });
             prefetched = next;
-            let mut failed = Vec::new();
+            let mut fatal = false;
             for (address, result) in results {
                 let result = match result {
                     Ok(result) => result,
                     Err(error) => {
+                        // Preserve this wave's settled spend and completed stores,
+                        // but do not pay another wave after a local byte/proof failure.
+                        fatal = true;
                         failed.push((address, error.to_string()));
                         continue;
                     }
@@ -469,24 +473,27 @@ impl Client {
                 failed.extend(result.failed);
                 adapter.stored(outcome.addresses.len(), total);
             }
-            if !failed.is_empty() {
-                return Err(Error::PartialUpload {
-                    stored_count: outcome.addresses.len(),
-                    stored: outcome.addresses.clone(),
-                    failed_count: failed.len(),
-                    reason: failed
-                        .iter()
-                        .map(|(_, error)| error.as_str())
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                    failed,
-                    total_chunks: total,
-                    spend: Box::new(PartialUploadSpend {
-                        storage_cost_atto: outcome.amount.to_string(),
-                        gas_cost_wei: outcome.gas,
-                    }),
-                });
+            if fatal {
+                break;
             }
+        }
+        if !failed.is_empty() {
+            return Err(Error::PartialUpload {
+                stored_count: outcome.addresses.len(),
+                stored: outcome.addresses.clone(),
+                failed_count: failed.len(),
+                reason: failed
+                    .iter()
+                    .map(|(_, error)| error.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                failed,
+                total_chunks: total,
+                spend: Box::new(PartialUploadSpend {
+                    storage_cost_atto: outcome.amount.to_string(),
+                    gas_cost_wei: outcome.gas,
+                }),
+            });
         }
         Ok(std::mem::take(outcome))
     }

@@ -180,7 +180,7 @@ impl UploadState {
         size: u64,
         now: SystemTime,
     ) -> Option<ChunkPaymentPlan> {
-        if self.proofs.contains_key(address) {
+        if self.is_paid(address, now) {
             return None;
         }
         let plan = self.plans.get(address)?;
@@ -454,5 +454,31 @@ mod tests {
         a.payment.quotes[0].amount += Amount::from(1);
         state.prepare(a);
         assert!(UploadState::restore(&state.checkpoint().unwrap()).is_err());
+    }
+    #[test]
+    fn expired_proof_allows_a_fresh_plan_without_discarding_payment_evidence() {
+        let issued = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let old = plan(b"expired upload", issued);
+        let mut state = UploadState::default();
+        state.prepare(old.clone());
+        state
+            .confirm(
+                &[old.address],
+                &HashMap::from([(old.payment.quotes[0].quote_hash, TxHash::from([7; 32]))]),
+                issued,
+            )
+            .unwrap();
+        let evidence = state.proof(&old.address).cloned().unwrap();
+        let now = issued + Duration::from_secs(25 * 60 * 60);
+        let fresh = plan(b"expired upload", now);
+        state.prepare(fresh.clone());
+        let state = UploadState::restore(&state.checkpoint().unwrap()).unwrap();
+        assert!(state
+            .retained_plan(&old.address, old.data_size, issued)
+            .is_none());
+        assert!(state
+            .retained_plan(&fresh.address, fresh.data_size, now)
+            .is_some());
+        assert_eq!(state.proof(&old.address), Some(&evidence));
     }
 }
