@@ -909,7 +909,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.18.1"
-source = "git+https://github.com/WithAutonomi/ant-node.git?rev=cf8a84ccc8a572c81654450632739bec27c8e00d#cf8a84ccc8a572c81654450632739bec27c8e00d"
+source = "git+https://github.com/WithAutonomi/ant-node.git?rev=4c1509ddfaf1d626594c63d791a3a63dfee3e102#4c1509ddfaf1d626594c63d791a3a63dfee3e102"
 dependencies = [
  "ant-protocol",
  "bao",
