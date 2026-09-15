@@ -64,7 +64,9 @@ const DEFAULT_BROWSER_QUOTE_CONCURRENCY: usize = 4;
 const MAX_DOWNLOAD_CONCURRENCY: usize = 6;
 const MAX_BROWSER_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_UPLOAD_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
 
+mod failed_payment;
 mod inbox;
 mod shared;
 mod upload_adapter;
@@ -1567,6 +1569,28 @@ struct UploadCheckpointEnvelope {
 }
 
 impl UploadCheckpoint {
+    fn envelope(snapshot: &str) -> Result<UploadCheckpointEnvelope, String> {
+        if snapshot.len() > MAX_UPLOAD_CHECKPOINT_BYTES {
+            return Err("upload checkpoint too large".into());
+        }
+        serde_json::from_str(snapshot).map_err(|e| e.to_string())
+    }
+
+    fn encode(
+        scope: &str,
+        state: &crate::data::client::upload_state::UploadState,
+    ) -> Result<String, String> {
+        let snapshot = serde_json::to_string(&UploadCheckpointEnvelope {
+            scope: scope.into(),
+            state: hex::encode(state.checkpoint().map_err(|e| e.to_string())?),
+        })
+        .map_err(|e| e.to_string())?;
+        if snapshot.len() > MAX_UPLOAD_CHECKPOINT_BYTES {
+            return Err("upload checkpoint too large".into());
+        }
+        Ok(snapshot)
+    }
+
     fn restore(
         &self,
         scope: &str,
@@ -1574,11 +1598,7 @@ impl UploadCheckpoint {
         let Some(snapshot) = &self.snapshot else {
             return Ok(Default::default());
         };
-        if snapshot.len() > 128 * 1024 * 1024 {
-            return Err("upload checkpoint too large".into());
-        }
-        let envelope: UploadCheckpointEnvelope =
-            serde_json::from_str(snapshot).map_err(|e| e.to_string())?;
+        let envelope = Self::envelope(snapshot)?;
         if envelope.scope != scope {
             return Err("upload checkpoint belongs to a different file or payment network".into());
         }
@@ -1595,11 +1615,7 @@ impl UploadCheckpoint {
             return Err("paid uploads require a checkpoint persistence callback".into());
         }
         if let Some(callback) = &self.callback {
-            let envelope = UploadCheckpointEnvelope {
-                scope: scope.into(),
-                state: hex::encode(state.checkpoint().map_err(|e| e.to_string())?),
-            };
-            let value = serde_json::to_string(&envelope).map_err(|e| e.to_string())?;
+            let value = Self::encode(scope, state)?;
             let result = callback
                 .call1(&JsValue::NULL, &JsValue::from_str(&value))
                 .map_err(js_error_message)?;
