@@ -177,6 +177,19 @@ async fn execute<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Sync>(
                         "payment reverted on-chain; retry is safe".into(),
                     ));
                 }
+                PaymentStatus::Finalizing => {
+                    return Err(Error::Payment(
+                        "payment outcome is awaiting chain finality; retain its journal and retry later"
+                            .into(),
+                    ));
+                }
+                PaymentStatus::Replaced { transaction_hash } => {
+                    state.pending_payment = None;
+                    adapter.checkpoint(state, None).await?;
+                    return Err(Error::Payment(format!(
+                        "payment nonce was finalized by transaction {transaction_hash}; retry is safe"
+                    )));
+                }
                 PaymentStatus::Pending => {
                     if !broadcast {
                         if let Some(refusal) = client.corroborated_settlement_refusal() {
