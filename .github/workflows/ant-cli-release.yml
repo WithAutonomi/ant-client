@@ -75,7 +75,7 @@ jobs:
           staging="ant-${{ steps.version.outputs.version }}-${{ matrix.target }}"
           mkdir "$staging"
           cp "target/${{ matrix.target }}/release/ant" "$staging/"
-          cp "resources/bootstrap_peers.toml" "$staging/"
+          cp "ant-core/resources/bootstrap_peers.toml" "$staging/"
           tar czf "$staging.tar.gz" "$staging"
           echo "ASSET=$staging.tar.gz" >> $GITHUB_ENV
 
@@ -86,7 +86,7 @@ jobs:
           staging="ant-${{ steps.version.outputs.version }}-${{ matrix.target }}"
           mkdir "$staging"
           cp "target/${{ matrix.target }}/release/ant.exe" "$staging/"
-          cp "resources/bootstrap_peers.toml" "$staging/"
+          cp "ant-core/resources/bootstrap_peers.toml" "$staging/"
           7z a "$staging.zip" "$staging"
           echo "ASSET=$staging.zip" >> $GITHUB_ENV
 
@@ -194,7 +194,7 @@ jobs:
           rm -rf "$staging"
           mkdir "$staging"
           cp artifacts/ant.exe "$staging/"
-          cp resources/bootstrap_peers.toml "$staging/"
+          cp ant-core/resources/bootstrap_peers.toml "$staging/"
           7z a "$staging.zip" "$staging"
 
       - uses: actions/upload-artifact@v4

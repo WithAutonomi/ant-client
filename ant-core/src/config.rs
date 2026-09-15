@@ -62,22 +62,47 @@ pub fn log_dir() -> Result<PathBuf> {
 /// Returns `Ok(Some(peers))` if the file exists and parses successfully,
 /// `Ok(None)` if the file does not exist, or `Err` on parse/IO failures.
 pub fn load_bootstrap_peers() -> Result<Option<Vec<SocketAddr>>> {
+    Ok(load_bootstrap_multiaddrs()?
+        .map(|peers| peers.iter().filter_map(MultiAddr::socket_addr).collect()))
+}
+
+/// Load native QUIC bootstrap multiaddresses, preserving optional peer pins.
+pub fn load_bootstrap_multiaddrs() -> Result<Option<Vec<MultiAddr>>> {
     let path = config_dir()?.join("bootstrap_peers.toml");
     if !path.exists() {
         return Ok(None);
     }
+    let seeds = crate::network_defaults::parse_bootstrap_seeds(&std::fs::read_to_string(path)?)
+        .map_err(|e| Error::BootstrapConfigParse(e.to_string()))?;
+    Ok((!seeds.quic.is_empty()).then_some(seeds.quic))
+}
 
-    let contents = std::fs::read_to_string(&path)?;
-    let config: BootstrapConfig =
-        toml::from_str(&contents).map_err(|e| Error::BootstrapConfigParse(e.to_string()))?;
-
-    let addrs: Vec<SocketAddr> = config.peers.iter().filter_map(|s| s.parse().ok()).collect();
-
-    if addrs.is_empty() {
-        return Ok(None);
+/// Resolve native QUIC bootstrap addresses without losing peer identity suffixes.
+/// Explicit input and selected manifests are authoritative; neither falls back.
+pub fn resolve_bootstrap_multiaddrs(
+    explicit: &[MultiAddr],
+    manifest: Option<&DevnetManifest>,
+) -> Result<Vec<MultiAddr>> {
+    let peers = if !explicit.is_empty() {
+        explicit
+            .iter()
+            .map(|addr| crate::network_defaults::parse_quic_seed(&addr.to_string()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::BootstrapConfigParse(e.to_string()))?
+    } else if let Some(manifest) = manifest {
+        manifest
+            .bootstrap
+            .iter()
+            .filter(|addr| addr.is_quic())
+            .cloned()
+            .collect()
+    } else {
+        load_bootstrap_multiaddrs()?.ok_or(Error::NoBootstrapPeers)?
+    };
+    if peers.is_empty() {
+        return Err(Error::NoBootstrapPeers);
     }
-
-    Ok(Some(addrs))
+    Ok(peers)
 }
 
 /// Resolve the bootstrap peers for a client connection.
@@ -97,31 +122,11 @@ pub fn resolve_bootstrap_peers(
     explicit: &[SocketAddr],
     manifest: Option<&DevnetManifest>,
 ) -> Result<Vec<SocketAddr>> {
-    if !explicit.is_empty() {
-        return Ok(explicit.to_vec());
-    }
-
-    if let Some(m) = manifest {
-        let peers: Vec<SocketAddr> = m
-            .bootstrap
-            .iter()
-            .filter_map(MultiAddr::socket_addr)
-            .collect();
-        // An explicitly selected manifest never falls back to the public
-        // config: an empty (or fully filtered) manifest is an error here,
-        // not later when the first data operation fails.
-        if peers.is_empty() {
-            return Err(Error::NoBootstrapPeers);
-        }
-        return Ok(peers);
-    }
-
-    if let Some(peers) = load_bootstrap_peers()? {
-        tracing::info!("Loaded {} bootstrap peer(s) from config file", peers.len());
-        return Ok(peers);
-    }
-
-    Err(Error::NoBootstrapPeers)
+    let explicit: Vec<_> = explicit.iter().copied().map(MultiAddr::quic).collect();
+    Ok(resolve_bootstrap_multiaddrs(&explicit, manifest)?
+        .iter()
+        .filter_map(MultiAddr::socket_addr)
+        .collect())
 }
 
 /// Resolve the EVM network for payment operations.
@@ -176,11 +181,6 @@ pub fn resolve_evm_network(
         }
         Some(other) => Err(Error::UnsupportedEvmNetwork(other.to_string())),
     }
-}
-
-#[derive(serde::Deserialize)]
-struct BootstrapConfig {
-    peers: Vec<String>,
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -369,9 +369,30 @@ peers = [
     "134.199.138.183:10000",
 ]
 "#;
-        let config: BootstrapConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.peers.len(), 2);
-        let addr: SocketAddr = config.peers[0].parse().unwrap();
+        let config = crate::network_defaults::parse_bootstrap_seeds(toml_str).unwrap();
+        assert_eq!(config.quic.len(), 2);
+        let addr = config.quic[0].socket_addr().unwrap();
         assert_eq!(addr.port(), 10000);
+    }
+
+    #[test]
+    fn multiaddr_resolution_preserves_pins_and_never_falls_back_from_manifest() {
+        let pin = format!("/ip4/127.0.0.1/udp/10000/quic/p2p/{}", "ab".repeat(32));
+        let seed: MultiAddr = pin.parse().unwrap();
+        let mut manifest = test_manifest(vec![]);
+        manifest.bootstrap = vec![seed.clone()];
+        assert_eq!(
+            resolve_bootstrap_multiaddrs(&[], Some(&manifest)).unwrap()[0].to_string(),
+            pin
+        );
+        assert_eq!(
+            resolve_bootstrap_multiaddrs(&[seed], Some(&test_manifest(vec![]))).unwrap()[0]
+                .to_string(),
+            pin
+        );
+        assert!(matches!(
+            resolve_bootstrap_multiaddrs(&[], Some(&test_manifest(vec![]))),
+            Err(Error::NoBootstrapPeers)
+        ));
     }
 }

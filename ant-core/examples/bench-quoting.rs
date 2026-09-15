@@ -10,7 +10,7 @@
 //!
 //! ```bash
 //! # Bench both modes, 10 reps each, against bootstrap peers in
-//! # resources/bootstrap_peers.toml.
+//! # ant-core/resources/bootstrap_peers.toml.
 //! cargo run --release --example bench-quoting -- --reps 10
 //!
 //! # Only single-node quoting:
@@ -188,27 +188,19 @@ impl Args {
 }
 
 fn load_default_bootstrap() -> Vec<SocketAddr> {
-    // Prefer the file shipped with the repo so the bench is self-contained.
-    let repo_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(|p| p.join("resources/bootstrap_peers.toml"))
-        .expect("parent");
-    if let Ok(text) = std::fs::read_to_string(&repo_file) {
-        let parsed: toml::Value = toml::from_str(&text).expect("valid toml");
-        if let Some(list) = parsed.get("peers").and_then(toml::Value::as_array) {
-            return list
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .filter_map(|s: &str| s.parse::<SocketAddr>().ok())
-                .collect();
-        }
+    if let Ok(seeds) = ant_core::network_defaults::bundled_bootstrap_seeds() {
+        return seeds
+            .quic
+            .iter()
+            .filter_map(|addr| addr.socket_addr())
+            .collect();
     }
     // Fall back to the platform config dir.
     match ant_core::config::load_bootstrap_peers() {
         Ok(Some(peers)) if !peers.is_empty() => peers,
         _ => panic!(
             "no bootstrap peers: pass --bootstrap ip:port[,ip:port...] or ensure \
-             resources/bootstrap_peers.toml is readable."
+             ant-core/resources/bootstrap_peers.toml is readable."
         ),
     }
 }

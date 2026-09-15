@@ -624,6 +624,15 @@ mod wasm {
         v2_server_ice_credential(&password).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
+    /// Read bundled mainnet WebRTC seeds and evmlib payment defaults without I/O.
+    #[wasm_bindgen(js_name = mainnetNetworkDefaults)]
+    pub fn mainnet_network_defaults_wasm() -> Result<JsValue, JsValue> {
+        let defaults = crate::network_defaults::browser_mainnet_defaults()
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        serde_wasm_bindgen::to_value(&defaults)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
     /// Validate and normalize browser bootstrap and public-file metadata.
     #[wasm_bindgen(js_name = parseBrowserManifest)]
     pub fn parse_browser_manifest_wasm(value: JsValue) -> Result<JsValue, JsValue> {

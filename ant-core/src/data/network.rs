@@ -151,6 +151,26 @@ impl Network {
         allow_loopback: bool,
         ipv6: bool,
     ) -> Result<Self> {
+        let seeds: Vec<_> = bootstrap_peers
+            .iter()
+            .copied()
+            .map(MultiAddr::quic)
+            .collect();
+        Self::new_multiaddrs(&seeds, allow_loopback, ipv6).await
+    }
+
+    /// Connect using QUIC multiaddresses, preserving optional peer identity pins.
+    #[cfg(feature = "native")]
+    pub async fn new_multiaddrs(
+        bootstrap_peers: &[MultiAddr],
+        allow_loopback: bool,
+        ipv6: bool,
+    ) -> Result<Self> {
+        let seeds = bootstrap_peers
+            .iter()
+            .map(|addr| crate::network_defaults::parse_quic_seed(&addr.to_string()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Network(e.to_string()))?;
         let mut core_config = CoreNodeConfig::builder()
             .port(0)
             .ipv6(ipv6)
@@ -166,10 +186,7 @@ impl Network {
         // silently drop legitimate testnet peers that share an IP or /24.
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
-        core_config.bootstrap_peers = bootstrap_peers
-            .iter()
-            .map(|addr| MultiAddr::quic(*addr))
-            .collect();
+        core_config.bootstrap_peers = seeds;
 
         let node = P2PNode::new(core_config)
             .await

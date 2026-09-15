@@ -983,3 +983,27 @@ at your option.
 ### Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+## Bootstrap multiaddresses and browser defaults
+
+`ant-core/resources/bootstrap_peers.toml` is the shared release resource. Its
+`quic` list contains native multiaddresses; its `webrtc` list contains complete
+WebRTC Direct multiaddresses with certificate and peer identity pins. The
+WebRTC list is intentionally empty until production seeds are deployed.
+
+The CLI accepts `--bootstrap /ip4/127.0.0.1/udp/10000/quic` (including optional
+`/p2p/<peer-id>`). Legacy `ip:port` arguments and installed `peers = [...]`
+configuration remain readable. Explicit peers take precedence over a selected
+devnet manifest, which takes precedence over the installed bootstrap file.
+Only QUIC seeds are selected for native dialing. Existing installed configuration
+is preserved by the installer; replace it explicitly to adopt new bundled seeds.
+
+Native library callers can use `config::resolve_bootstrap_multiaddrs()` and
+`Client::connect_multiaddrs()` to retain peer pins. Existing socket-address APIs
+remain available. `network_defaults::browser_mainnet_defaults()` and the WASM
+`mainnetNetworkDefaults()` export return only WebRTC seeds, the expected payment
+identity, and evmlib's mainnet RPC URL without connecting to any network.
+
+Add verified WebRTC seeds to the shared TOML resource, commit the source, and
+regenerate the browser SDK's WASM artifact to activate its mainnet defaults.
+See [ADR-0005](docs/adr/ADR-0005-bootstrap-multiaddresses.md).

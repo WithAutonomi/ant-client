@@ -44,7 +44,7 @@ semver = { version = "1", optional = true }
 reqwest = { version = "0.12", features = ["json", "stream"], optional = true }
 tar = { version = "0.4", optional = true }
 tempfile = { version = "3", optional = true }
-toml = { version = "0.8", optional = true }
+toml = { version = "0.8" }
 tokio = { version = "1", features = ["sync", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
@@ -139,7 +139,6 @@ native = [
     "dep:tempfile",
     "tokio/full",
     "dep:tokio-util",
-    "dep:toml",
     "dep:tower-http",
     "dep:tracing-subscriber",
     "dep:utoipa",

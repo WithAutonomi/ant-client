@@ -2,6 +2,7 @@
 pub mod browser;
 #[cfg(feature = "native")]
 pub mod channel;
+pub mod network_defaults;
 
 mod payment_policy;
 mod quote_policy;
