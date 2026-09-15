@@ -909,7 +909,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.18.1"
-source = "git+https://github.com/WithAutonomi/ant-node.git?rev=3ce1e9b147aa9074300c861aee7c1c7400710c24#3ce1e9b147aa9074300c861aee7c1c7400710c24"
+source = "git+https://github.com/WithAutonomi/ant-node.git?rev=cf8a84ccc8a572c81654450632739bec27c8e00d#cf8a84ccc8a572c81654450632739bec27c8e00d"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -961,7 +961,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.5"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=b259d0a3891a9fd6abe5bbdf6d62a0fc3666b58f#b259d0a3891a9fd6abe5bbdf6d62a0fc3666b58f"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=72f4565671cc7522891d6a7a6dcd08a444a60c69#72f4565671cc7522891d6a7a6dcd08a444a60c69"
 dependencies = [
  "blake3",
  "bytes",
@@ -5546,7 +5546,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.27.3"
-source = "git+https://github.com/WithAutonomi/saorsa-core?rev=a6a9fbb8f876a3d388d23d3d86a7f37f22240faf#a6a9fbb8f876a3d388d23d3d86a7f37f22240faf"
+source = "git+https://github.com/WithAutonomi/saorsa-core?rev=dc00a2c1a653d6b20666d0b3d89ba8a17b86ff96#dc00a2c1a653d6b20666d0b3d89ba8a17b86ff96"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5578,7 +5578,7 @@ dependencies = [
 [[package]]
 name = "saorsa-pqc"
 version = "0.5.1"
-source = "git+https://github.com/saorsa-labs/saorsa-pqc?rev=6d57e9dd73d537182fe85b0050e809a224f21154#6d57e9dd73d537182fe85b0050e809a224f21154"
+source = "git+https://github.com/saorsa-labs/saorsa-pqc?rev=29a2b272c4ee8b72c17102da00033dbfe1ddcd37#29a2b272c4ee8b72c17102da00033dbfe1ddcd37"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -5614,7 +5614,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.36.3"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=a35d5b2a083f7fe18016d7b63ea89e2d796b5bfb#a35d5b2a083f7fe18016d7b63ea89e2d796b5bfb"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=bc6dcd80aa26ea6a4a557c05dd1af1ff2adf279f#bc6dcd80aa26ea6a4a557c05dd1af1ff2adf279f"
 dependencies = [
  "anyhow",
  "async-trait",
