@@ -12,9 +12,14 @@ use wasm_bindgen::{JsCast as _, JsValue};
 // bounds queue overhead when a peer fragments a response into tiny messages.
 const MAX_QUEUED_MESSAGES: usize = 512;
 
+pub(super) struct ReceivedMessage {
+    pub(super) bytes: Vec<u8>,
+    pub(super) received_at: web_time::Instant,
+}
+
 pub(super) struct ResponseInbox {
-    sender: RefCell<mpsc::Sender<Vec<u8>>>,
-    receiver: Mutex<mpsc::Receiver<Vec<u8>>>,
+    sender: RefCell<mpsc::Sender<ReceivedMessage>>,
+    receiver: Mutex<mpsc::Receiver<ReceivedMessage>>,
     remaining: Cell<Option<usize>>,
     queued: Cell<usize>,
     failure: RefCell<Option<String>>,
@@ -76,14 +81,17 @@ impl ResponseInbox {
         }
         self.sender
             .borrow_mut()
-            .try_send(view.to_vec())
+            .try_send(ReceivedMessage {
+                bytes: view.to_vec(),
+                received_at: web_time::Instant::now(),
+            })
             .map_err(|_| "WebRTC response inbox is full or closed".to_string())?;
         self.remaining.set(Some(remaining));
         self.queued.set(self.queued.get() + 1);
         Ok(())
     }
 
-    pub(super) async fn next(&self) -> Result<Vec<u8>, String> {
+    pub(super) async fn next(&self) -> Result<ReceivedMessage, String> {
         self.check_failure()?;
         let next = self.receiver.lock().await.next().await;
         self.check_failure()?;
@@ -116,7 +124,7 @@ impl ResponseInbox {
         }
     }
 
-    fn check_failure(&self) -> Result<(), String> {
+    pub(super) fn check_failure(&self) -> Result<(), String> {
         match self.failure.borrow().as_ref() {
             Some(error) => Err(error.clone()),
             None => Ok(()),

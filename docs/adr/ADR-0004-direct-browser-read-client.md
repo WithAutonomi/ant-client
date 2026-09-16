@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-09-08
+- **Last amended:** 2026-09-16
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -116,6 +116,37 @@ and its ability to store another issuer's proof are separate checks.
 discard externally staged encrypted records, report progress, and submit an
 already verified payment plan. Those callbacks expose browser capabilities;
 they do not reimplement Autonomi protocol behavior.
+
+### Browser RPC ownership and deadlines
+
+A pooled operation owns the peer mutex from connection/PQ/HELLO authentication
+through capability and payment-network validation and the complete application
+exchange. The private locked client is the only entry point to wire requests.
+Queued operations recheck authentication under that lock and may reconnect after
+a failed predecessor. An explicit `BrowserNodeSession` instead checks its captured
+generation under the lock and remains invalid after closure.
+
+Pool and peer admission share one monotonic 400-second ceiling. This allows one
+maximum request/response transfer (180 seconds each) plus bounded setup; it is a
+queue limit, not a replacement for the operation's response allowance. Existing
+parent cancellation still wins. Connection setup, including SDP and PQ, has a
+30-second ceiling and HELLO has its own 10-second ceiling. Application request
+transfer retains the shared size-based deadline, including the final DataChannel
+buffer drain. Only then does the caller's response allowance begin. Response
+fragment arrival timestamps preserve the existing size-based frame deadline even
+when ingress was buffered during the outgoing drain.
+
+Queue expiry does not close an active association. Abandoning an encrypted
+exchange retires its generation because encryption has already advanced the PQ
+sequence, even if backpressure prevented transmission. A closed pool cannot
+publish an in-flight connection. Admission, transfer and response timeout messages
+survive the browser data adapter and keep their timeout classification.
+
+This repairs the September 8 outer-response-timer regression and September 14
+stale-authentication regression without changing wire messages, native transport,
+payment proofs, or quorum. Browser lookup's five-second batch grace policy dates
+to August 31 and is unchanged by this repair. Bounded global dial/byte scheduling
+and discovery-policy changes require separate evidence and review.
 
 ### Responsibilities of ant-client-browser-sdk
 

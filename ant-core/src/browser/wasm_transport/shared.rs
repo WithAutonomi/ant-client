@@ -87,7 +87,6 @@ impl BrowserNetwork for SharedNetworkAdapter {
                     .as_ref()
                     .ok_or("missing WebRTC endpoint")?;
                 let client = self.inner.pool.client(endpoint).await?;
-                client.hello().await?;
                 Ok::<_, String>((peer, client.find_node(&target_hex, view_count).await?))
             }))
             .await;
@@ -178,10 +177,15 @@ impl BrowserNetwork for SharedNetworkAdapter {
             let client = self
                 .inner
                 .pool
-                .client(&endpoint)
+                .client_before(&endpoint, TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
                 .await
-                .map_err(DataError::Network)?;
-            let hello = client.hello().await.map_err(DataError::Network)?;
+                .map_err(rpc_data_error)?;
+            let client = client.authenticated().await.map_err(rpc_data_error)?;
+            let hello = client
+                .hello
+                .borrow()
+                .clone()
+                .ok_or_else(|| DataError::Network("authenticated session required".into()))?;
             if !hello.capabilities.iter().any(|cap| cap == "chunk_protocol") {
                 return Err(DataError::Network(
                     "node does not support shared ant-protocol RPC".into(),
@@ -203,16 +207,10 @@ impl BrowserNetwork for SharedNetworkAdapter {
             let bytes = request
                 .encode()
                 .map_err(|e| DataError::Protocol(e.to_string()))?;
-            let response = crate::runtime::timeout(
-                timeout,
-                client.request_with_timeout(BrowserRequestBody::ChunkProtocol, &bytes, timeout),
-            )
-            .await
-            .map_err(|_| DataError::Timeout("chunk protocol response deadline expired".into()))?
-            .map_err(|error| match error {
-                RpcError::Timeout(message) => DataError::Timeout(message),
-                other => DataError::Network(other.to_string()),
-            })?;
+            let response = client
+                .request_with_timeout(BrowserRequestBody::ChunkProtocol, &bytes, timeout)
+                .await
+                .map_err(rpc_data_error)?;
             if !matches!(response.header.body, BrowserResponseBody::ChunkProtocol) {
                 return Err(DataError::Protocol(
                     "expected chunk_protocol response".into(),
@@ -282,4 +280,11 @@ pub(super) fn native_quote_artifact(
         quote_hash: hex::encode(quote.hash()),
         commitment,
     })
+}
+
+fn rpc_data_error(error: RpcError) -> DataError {
+    match error {
+        RpcError::Timeout(message) => DataError::Timeout(message),
+        other => DataError::Network(other.to_string()),
+    }
 }

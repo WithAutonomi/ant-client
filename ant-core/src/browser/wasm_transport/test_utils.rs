@@ -332,10 +332,16 @@ pub async fn test_put_failure_kind(endpoint: &str) -> Result<String, JsValue> {
     let content = b"structured PUT rejection fixture";
     let address = super::super::content_address(content);
     let (quote, _) = client
+        .authenticated()
+        .await
+        .unwrap()
         .quote_chunk(&address, content.len())
         .await
         .map_err(|error| JsValue::from_str(&error))?;
     let result = client
+        .authenticated()
+        .await
+        .unwrap()
         .put_chunk_typed(&address, content, quote, &"ab".repeat(32))
         .await;
     client.close();
@@ -718,4 +724,107 @@ impl BrowserNetworkClient {
             );
         }
     }
+}
+
+/// Exercise concurrent requests through the production pooled adapter.
+#[wasm_bindgen]
+pub async fn test_pooled_requests(
+    endpoint: &str,
+    timeout_ms: u32,
+    warm: bool,
+    payment: JsValue,
+    before: js_sys::Function,
+) -> Result<JsValue, JsValue> {
+    use crate::data::network::BrowserNetwork;
+    use ant_protocol::{ChunkGetRequest, ChunkMessage, ChunkMessageBody};
+    let parsed = parse_webrtc_direct_multiaddr(endpoint).unwrap();
+    let endpoint = BrowserEndpoint {
+        multiaddr: parsed.multiaddr.clone(),
+    };
+    let core = Rc::new(BrowserNetworkCore::new(vec![endpoint.clone()]).unwrap());
+    let mut adapter = shared::SharedNetworkAdapter::new(Rc::clone(&core));
+    let upload = !payment.is_undefined();
+    if upload {
+        adapter.payment_network = Some(serde_wasm_bindgen::from_value(payment).unwrap());
+    }
+    let peer = ant_protocol::transport::PeerId::from_hex(&parsed.peer_id).unwrap();
+    let addresses = vec![parsed.multiaddr.parse().unwrap()];
+    if warm {
+        core.pool
+            .client(&endpoint)
+            .await
+            .unwrap()
+            .hello()
+            .await
+            .unwrap();
+    }
+    before.call0(&JsValue::NULL)?;
+    let started = web_time::Instant::now();
+    let requests = [0_u32, 0, timeout_ms / 10].into_iter().enumerate().map(|(i, delay)| {
+        let adapter = &adapter;
+        let peer = &peer;
+        let addresses = &addresses;
+        async move {
+            if delay > 0 { crate::runtime::sleep(Duration::from_millis(u64::from(delay))).await; }
+            let result = adapter.request(peer, addresses, ChunkMessage {
+                request_id: i as u64 + 42,
+                body: if upload {
+                    ChunkMessageBody::QuoteRequest(ant_protocol::ChunkQuoteRequest {
+                        address: [1; 32], data_size: 100, data_type: 0,
+                    })
+                } else { ChunkMessageBody::GetRequest(ChunkGetRequest::new([1; 32])) },
+            }, Duration::from_millis(u64::from(timeout_ms))).await;
+            serde_json::json!({ "request": i, "startedMs": delay, "finishedMs": started.elapsed().as_millis() as u64,
+                "result": result.map(|_| "ok".to_string()).unwrap_or_else(|error| error.to_string()) })
+        }
+    });
+    let result = futures::future::join_all(requests).await;
+    core.pool.close();
+    serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// A local admission timeout must not cancel the RPC holding the peer lock.
+#[wasm_bindgen]
+pub async fn test_admission_deadlines(endpoints: JsValue) {
+    let endpoints: Vec<BrowserEndpoint> = serde_wasm_bindgen::from_value(endpoints).unwrap();
+    let pool = BrowserClientPool::new(1).unwrap();
+    let lease = pool.client(&endpoints[0]).await.unwrap();
+    lease.hello().await.unwrap();
+    let target = "11".repeat(32);
+    let active = lease.find_node(&target, 20);
+    let waiter = async {
+        TimeoutFuture::new(1).await;
+        let deadline = TransferDeadline::new(Duration::from_millis(20));
+        assert!(matches!(lease.client.authenticated_before(&deadline).await,
+            Err(RpcError::Timeout(message)) if message.contains("admission")));
+    };
+    let (result, ()) = futures::future::join(active, waiter).await;
+    result.unwrap();
+    assert!(lease.is_connected());
+    let deadline = TransferDeadline::new(Duration::from_millis(20));
+    assert!(matches!(pool.client_before(&endpoints[1], deadline).await,
+        Err(RpcError::Timeout(message)) if message.contains("pool capacity")));
+    lease.find_node(&target, 20).await.unwrap();
+    pool.close();
+}
+
+/// Closing the pool during an outstanding browser setup must be terminal.
+#[wasm_bindgen]
+pub async fn test_close_pool_during_connect(endpoint: &str) {
+    let pool = BrowserClientPool::new(1).unwrap();
+    let lease = pool
+        .client(&BrowserEndpoint {
+            multiaddr: endpoint.into(),
+        })
+        .await
+        .unwrap();
+    let connect = lease.hello();
+    let close = async {
+        TimeoutFuture::new(5).await;
+        pool.close();
+    };
+    let (result, ()) = futures::future::join(connect, close).await;
+    assert!(result.unwrap_err().contains("closed"));
+    assert!(!lease.is_connected());
+    assert!(lease.hello().await.unwrap_err().contains("closed"));
 }
