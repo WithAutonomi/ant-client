@@ -29,7 +29,7 @@ use ant_protocol::transport::{
 use futures_channel::oneshot;
 use futures_util::{
     future::{join_all, select, Either},
-    lock::Mutex,
+    lock::{Mutex, MutexGuard},
     stream::FuturesUnordered,
 };
 use gloo_timers::future::TimeoutFuture;
@@ -55,6 +55,11 @@ use web_sys::{
 };
 
 const REQUEST_TIMEOUT_MS: u32 = 10_000;
+// A queued operation may wait behind a maximum-sized request and response
+// (180 seconds each), plus connection/authentication setup. Admission has its
+// own ceiling and never spends the caller's response allowance.
+const RPC_ADMISSION_TIMEOUT: Duration = Duration::from_secs(400);
+const CONNECTION_SETUP_TIMEOUT_MS: u32 = 30_000;
 const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 const DEFAULT_MAX_POOLED_CLIENTS: usize = 32;
 const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
@@ -130,6 +135,7 @@ struct BrowserClientPool {
 struct BrowserClientLease {
     client: Rc<BrowserNodeClientCore>,
     availability: Rc<PoolAvailability>,
+    admission: TransferDeadline,
 }
 
 struct PoolAvailability {
@@ -158,6 +164,27 @@ impl Deref for BrowserClientLease {
 
     fn deref(&self) -> &Self::Target {
         &self.client
+    }
+}
+
+impl BrowserClientLease {
+    async fn authenticated(&self) -> Result<LockedBrowserClient<'_>, RpcError> {
+        self.client.authenticated_before(&self.admission).await
+    }
+
+    async fn hello(&self) -> Result<BrowserHello, String> {
+        self.authenticated()
+            .await
+            .map(|client| client.hello.borrow().clone().unwrap())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn find_node(&self, target: &str, count: usize) -> Result<Vec<BrowserNode>, String> {
+        self.authenticated()
+            .await
+            .map_err(|error| error.to_string())?
+            .find_node(target, count)
+            .await
     }
 }
 
@@ -191,6 +218,37 @@ impl BrowserClientPool {
     }
 
     async fn client(&self, endpoint: &BrowserEndpoint) -> Result<BrowserClientLease, String> {
+        self.client_before(endpoint, TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn client_before(
+        &self,
+        endpoint: &BrowserEndpoint,
+        admission: TransferDeadline,
+    ) -> Result<BrowserClientLease, RpcError> {
+        if admission.remaining().is_zero() {
+            return Err(RpcError::Timeout(
+                "WebRTC pool admission deadline expired".into(),
+            ));
+        }
+        crate::runtime::timeout(
+            admission.remaining(),
+            self.wait_for_client(endpoint, admission),
+        )
+        .await
+        .map_err(|_| {
+            RpcError::Timeout("WebRTC admission timed out waiting for pool capacity".into())
+        })?
+        .map_err(RpcError::Transport)
+    }
+
+    async fn wait_for_client(
+        &self,
+        endpoint: &BrowserEndpoint,
+        admission: TransferDeadline,
+    ) -> Result<BrowserClientLease, String> {
         let endpoint = parse_webrtc_direct_multiaddr(&endpoint.multiaddr)
             .map_err(|error| error.to_string())?;
         let key = endpoint.multiaddr.clone();
@@ -223,6 +281,7 @@ impl BrowserClientPool {
                     if clients.len() < self.max_clients {
                         let mut client = BrowserNodeClientCore::new(endpoint.clone());
                         client.dial_failures = Some(Rc::clone(&self.dial_failures));
+                        client.pool_availability = Some(Rc::clone(&self.availability));
                         let client = Rc::new(client);
                         clients.insert(
                             key.clone(),
@@ -241,6 +300,7 @@ impl BrowserClientPool {
                 return Ok(BrowserClientLease {
                     client,
                     availability: Rc::clone(&self.availability),
+                    admission,
                 });
             }
             availability
@@ -439,6 +499,7 @@ impl Drop for Connection {
 
 pub(super) struct BrowserNodeClientCore {
     dial_failures: Option<DialFailures>,
+    pool_availability: Option<Rc<PoolAvailability>>,
     endpoint: WebRtcDirectEndpoint,
     connection: RefCell<Option<Connection>>,
     request_lock: Mutex<()>,
@@ -453,12 +514,13 @@ pub(super) struct BrowserNodeClientCore {
 // Declare this guard after the lock so it closes the association first.
 struct PendingRequest<'a> {
     client: &'a BrowserNodeClientCore,
+    generation: u64,
     completed: bool,
 }
 
 impl Drop for PendingRequest<'_> {
     fn drop(&mut self) {
-        if !self.completed {
+        if !self.completed && self.client.generation.get() == self.generation {
             self.client.close();
         }
     }
@@ -468,6 +530,7 @@ impl BrowserNodeClientCore {
     pub(super) fn new(endpoint: WebRtcDirectEndpoint) -> Self {
         Self {
             dial_failures: None,
+            pool_availability: None,
             endpoint,
             connection: RefCell::new(None),
             request_lock: Mutex::new(()),
@@ -501,7 +564,14 @@ impl BrowserNodeClientCore {
                 return Err("WebRTC endpoint is in the failed-connection cache".to_string());
             }
         }
-        let connection = match Connection::open(&self.endpoint).await {
+        let generation = self.generation.get();
+        let connection = match timeout_with_ms(
+            Connection::open(&self.endpoint),
+            "WebRTC connection/authentication setup timed out",
+            CONNECTION_SETUP_TIMEOUT_MS,
+        )
+        .await
+        {
             Ok(connection) => connection,
             Err(error) => {
                 if let Some(cache) = &self.dial_failures {
@@ -513,6 +583,12 @@ impl BrowserNodeClientCore {
                 return Err(error);
             }
         };
+        // close() can run while SDP, ICE or PQ authentication is awaiting JS.
+        // Never publish a connection belonging to an invalidated generation.
+        if generation != self.generation.get() || self.pool_is_closed() {
+            connection.close();
+            return Err("WebRTC client closed during connection setup".into());
+        }
         if let Some(cache) = &self.dial_failures {
             cache.borrow_mut().record_success(&self.endpoint.peer_id);
         }
@@ -520,6 +596,88 @@ impl BrowserNodeClientCore {
         Ok(())
     }
 
+    fn pool_is_closed(&self) -> bool {
+        self.pool_availability
+            .as_ref()
+            .is_some_and(|pool| pool.closed.get())
+    }
+
+    async fn lock_before(
+        &self,
+        admission: &TransferDeadline,
+    ) -> Result<LockedBrowserClient<'_>, RpcError> {
+        if admission.remaining().is_zero() {
+            return Err(RpcError::Timeout(
+                "WebRTC peer admission deadline expired".into(),
+            ));
+        }
+        let guard = crate::runtime::timeout(admission.remaining(), self.request_lock.lock())
+            .await
+            .map_err(|_| RpcError::Timeout("WebRTC admission timed out waiting for peer".into()))?;
+        if self.pool_is_closed() {
+            return Err("WebRTC client pool is closed".to_string().into());
+        }
+        Ok(LockedBrowserClient {
+            client: self,
+            _guard: guard,
+        })
+    }
+
+    async fn authenticated_before(
+        &self,
+        admission: &TransferDeadline,
+    ) -> Result<LockedBrowserClient<'_>, RpcError> {
+        let client = self.lock_before(admission).await?;
+        client.hello().await?;
+        Ok(client)
+    }
+
+    async fn authenticated(&self) -> Result<LockedBrowserClient<'_>, RpcError> {
+        self.authenticated_before(&TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
+            .await
+    }
+
+    pub(super) async fn hello(&self) -> Result<BrowserHello, String> {
+        self.authenticated()
+            .await
+            .map(|client| client.hello.borrow().clone().unwrap())
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "test-utils")]
+    async fn find_node(&self, target: &str, count: usize) -> Result<Vec<BrowserNode>, String> {
+        self.authenticated()
+            .await
+            .map_err(|error| error.to_string())?
+            .find_node(target, count)
+            .await
+    }
+
+    pub(super) fn close(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        if let Some(connection) = self.connection.borrow_mut().take() {
+            connection.close();
+        }
+        self.hello.borrow_mut().take();
+        self.peer_id.borrow_mut().take();
+    }
+}
+
+// Only this guard can issue an exchange. Pooled callers retain it from HELLO
+// through capability/payment validation and the complete application response.
+struct LockedBrowserClient<'a> {
+    client: &'a BrowserNodeClientCore,
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl Deref for LockedBrowserClient<'_> {
+    type Target = BrowserNodeClientCore;
+    fn deref(&self) -> &Self::Target {
+        self.client
+    }
+}
+
+impl LockedBrowserClient<'_> {
     async fn request(
         &self,
         body: BrowserRequestBody,
@@ -549,7 +707,6 @@ impl BrowserNodeClientCore {
         content: &[u8],
         response_timeout: Duration,
     ) -> Result<BrowserResponseFrame, RpcError> {
-        let _guard = self.request_lock.lock().await;
         if !matches!(&body, BrowserRequestBody::Hello)
             && (!self.is_connected() || self.hello.borrow().is_none())
         {
@@ -560,6 +717,7 @@ impl BrowserNodeClientCore {
         self.ensure_connected().await?;
         let mut pending = PendingRequest {
             client: self,
+            generation: self.generation.get(),
             completed: false,
         };
         let request_id = self.next_request_id.get();
@@ -597,8 +755,18 @@ impl BrowserNodeClientCore {
         };
         let send_result = send_data_channel_frame(&channel, &frame, transfer_timeout_ms).await;
         if let Err(error) = send_result {
+            // A malformed early response can close the channel during drain.
+            // Preserve that first ingress failure instead of hiding it behind
+            // the resulting channel-closed error.
+            let error = self
+                .connection
+                .borrow()
+                .as_ref()
+                .and_then(|connection| connection.inbox.check_failure().err())
+                .map(RpcError::Transport)
+                .unwrap_or(error);
             self.close();
-            return Err(error.into());
+            return Err(error);
         }
         let receiver = {
             let connection = self.connection.borrow();
@@ -687,7 +855,12 @@ impl BrowserNodeClientCore {
                 return Ok(hello);
             }
         }
-        let response = self.request(BrowserRequestBody::Hello, &[]).await?;
+        self.ensure_connected().await?;
+        let response = timeout(
+            self.request(BrowserRequestBody::Hello, &[]),
+            "WebRTC HELLO authentication timed out",
+        )
+        .await?;
         let BrowserResponseBody::Hello {
             protocol,
             peer_id,
@@ -728,8 +901,10 @@ impl BrowserNodeClientCore {
     ) -> Result<Vec<BrowserNode>, String> {
         let target = super::protocol::normalize_hex(target, 32)?;
         let require_owner_proofs = self
-            .hello()
-            .await?
+            .hello
+            .borrow()
+            .as_ref()
+            .ok_or("authenticated session required")?
             .capabilities
             .iter()
             .any(|capability| capability == ant_protocol::transport::ADDRESS_V2_CAPABILITY);
@@ -912,15 +1087,6 @@ impl BrowserNodeClientCore {
             return Err("node stored a different chunk address".to_string().into());
         }
         Ok((address, already_stored))
-    }
-
-    pub(super) fn close(&self) {
-        self.generation.set(self.generation.get().wrapping_add(1));
-        if let Some(connection) = self.connection.borrow_mut().take() {
-            connection.close();
-        }
-        self.hello.borrow_mut().take();
-        self.peer_id.borrow_mut().take();
     }
 }
 
@@ -1212,7 +1378,6 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                             "lookup candidate has no WebRTC Direct endpoint".to_string()
                         })?;
                         let client = pool.client(endpoint).await?;
-                        client.hello().await?;
                         client
                             .find_node(
                                 &target,
@@ -2341,7 +2506,12 @@ pub struct BrowserNodeSession {
 }
 
 impl BrowserNodeSession {
-    fn ensure_active(&self) -> Result<(), JsValue> {
+    async fn active(&self) -> Result<LockedBrowserClient<'_>, JsValue> {
+        let client = self
+            .inner
+            .lock_before(&TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
+            .await
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
         if self.generation != self.inner.generation.get()
             || !self.inner.is_connected()
             || self.inner.hello.borrow().is_none()
@@ -2350,7 +2520,7 @@ impl BrowserNodeSession {
                 "session closed; call BrowserNodeClient.connect() again",
             ));
         }
-        Ok(())
+        Ok(client)
     }
 }
 
@@ -2364,9 +2534,9 @@ impl BrowserNodeSession {
 
     /// Authenticate the connected node.
     pub async fn hello(&self) -> Result<JsValue, JsValue> {
-        self.ensure_active()?;
         let hello = self
-            .inner
+            .active()
+            .await?
             .hello()
             .await
             .map_err(|error| JsValue::from_str(&error))?;
@@ -2378,9 +2548,9 @@ impl BrowserNodeSession {
     /// Request nodes closest to a 32-byte target.
     #[wasm_bindgen(js_name = findNode)]
     pub async fn find_node(&self, target: &str, count: usize) -> Result<JsValue, JsValue> {
-        self.ensure_active()?;
         let nodes = self
-            .inner
+            .active()
+            .await?
             .find_node(target, count)
             .await
             .map_err(|error| JsValue::from_str(&error))?;
@@ -2390,9 +2560,9 @@ impl BrowserNodeSession {
     /// Retrieve and BLAKE3-verify one content-addressed record.
     #[wasm_bindgen(js_name = getChunk)]
     pub async fn get_chunk(&self, address: &str) -> Result<JsValue, JsValue> {
-        self.ensure_active()?;
         let (content, hash) = self
-            .inner
+            .active()
+            .await?
             .get_chunk(address)
             .await
             .map_err(|error| JsValue::from_str(&error))?;
@@ -2403,9 +2573,9 @@ impl BrowserNodeSession {
     /// Request a signed storage quote.
     #[wasm_bindgen(js_name = quoteChunk)]
     pub async fn quote_chunk(&self, address: &str, size: usize) -> Result<JsValue, JsValue> {
-        self.ensure_active()?;
         let (quote, already_stored) = self
-            .inner
+            .active()
+            .await?
             .quote_chunk(address, size)
             .await
             .map_err(|error| JsValue::from_str(&error))?;
@@ -2425,11 +2595,11 @@ impl BrowserNodeSession {
         quote: JsValue,
         transaction_hash: &str,
     ) -> Result<JsValue, JsValue> {
-        self.ensure_active()?;
         let quote: BrowserQuoteArtifact = serde_wasm_bindgen::from_value(quote)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let (address, already_stored) = self
-            .inner
+            .active()
+            .await?
             .put_chunk(address, content, quote, transaction_hash)
             .await
             .map_err(|error| JsValue::from_str(&error))?;
@@ -2460,7 +2630,9 @@ async fn establish_pq_session(
         PqClientHandshake::start().map_err(|error| error.to_string())?;
     let client_hello = encode_pq_frame(&client_hello).map_err(|error| error.to_string())?;
     connection.inbox.expect_response(PQ_SERVER_ACCEPT_BYTES)?;
-    send_data_channel_frame(&connection.data_channel, &client_hello, REQUEST_TIMEOUT_MS).await?;
+    send_data_channel_frame(&connection.data_channel, &client_hello, REQUEST_TIMEOUT_MS)
+        .await
+        .map_err(|error| error.to_string())?;
     let server_accept = read_pq_payload(
         Rc::clone(&connection.inbox),
         PQ_SERVER_ACCEPT_BYTES,
@@ -2476,18 +2648,22 @@ async fn send_data_channel_frame(
     channel: &RtcDataChannel,
     frame: &[u8],
     timeout_ms: u32,
-) -> Result<(), String> {
+) -> Result<(), RpcError> {
     let deadline = TransferDeadline::new(Duration::from_millis(u64::from(timeout_ms)));
     for message in frame.chunks(WEBRTC_WRITE_CHUNK_BYTES) {
         if deadline.remaining().is_zero() {
-            return Err("WebRTC frame send timed out".into());
+            return Err(RpcError::Timeout(
+                "WebRTC request transfer timed out".into(),
+            ));
         }
-        wait_for_capacity(channel, deadline.remaining_ms()).await?;
+        wait_for_buffer(channel, MAX_BUFFERED_AMOUNT, deadline.remaining_ms()).await?;
         channel
             .send_with_u8_array(message)
             .map_err(js_error_message)?;
     }
-    Ok(())
+    // send() enqueues bytes. Give the final tail the same transfer deadline;
+    // the operation-specific response allowance begins only after this drain.
+    wait_for_buffer(channel, 0, deadline.remaining_ms()).await
 }
 
 async fn read_pq_payload(
@@ -2507,10 +2683,14 @@ async fn read_pq_payload_typed(
 ) -> Result<Vec<u8>, RpcError> {
     let mut frame = Vec::with_capacity(8 * 1024);
     let mut expected_length = None;
-    let mut deadline = TransferDeadline::new(Duration::from_millis(u64::from(initial_timeout_ms)));
-    let mut frame_started = false;
+    let deadline = TransferDeadline::new(Duration::from_millis(u64::from(initial_timeout_ms)));
+    let mut frame_started: Option<web_time::Instant> = None;
+    let mut frame_budget = transfer_timeout(saorsa_transport::webrtc::PQ_FRAME_PREFIX_BYTES);
     loop {
-        let remaining_ms = deadline.remaining_ms();
+        let remaining_ms = frame_started.map_or_else(
+            || deadline.remaining_ms(),
+            |started| duration_ms(frame_budget.saturating_sub(started.elapsed())),
+        );
         let message = match select(
             Box::pin(receiver.next()),
             Box::pin(TimeoutFuture::new(remaining_ms)),
@@ -2519,13 +2699,21 @@ async fn read_pq_payload_typed(
         {
             Either::Left((result, _)) => result?,
             Either::Right(((), _)) => {
-                return Err(RpcError::Timeout("WebRTC request timed out".into()))
+                return Err(RpcError::Timeout(
+                    if frame_started.is_some() {
+                        "WebRTC response frame transfer timed out"
+                    } else {
+                        "WebRTC response timed out"
+                    }
+                    .into(),
+                ))
             }
         };
-        if !frame_started {
-            deadline = TransferDeadline::for_frame(saorsa_transport::webrtc::PQ_FRAME_PREFIX_BYTES);
-            frame_started = true;
-        }
+        // Ingress is timestamped because a response may arrive during the
+        // final outgoing drain. Buffered bytes do not restart the frame timer.
+        let started = *frame_started.get_or_insert(message.received_at);
+        let received_at = message.received_at;
+        let message = message.bytes;
         let next_length = frame
             .len()
             .checked_add(message.len())
@@ -2543,8 +2731,13 @@ async fn read_pq_payload_typed(
             expected_length =
                 pq_frame_length(&frame, max_payload_bytes).map_err(|error| error.to_string())?;
             if let Some(expected) = expected_length {
-                deadline.extend_for_frame(expected);
+                frame_budget = frame_budget.max(transfer_timeout(expected));
             }
+        }
+        if received_at.duration_since(started) > frame_budget {
+            return Err(RpcError::Timeout(
+                "WebRTC response frame transfer timed out".into(),
+            ));
         }
         if let Some(expected) = expected_length {
             if frame.len() > expected {
@@ -2571,17 +2764,30 @@ impl Drop for CapacityListener {
         // This also runs when the send future is canceled while draining.
         // Detach before the Rust closure is freed.
         self.channel.set_onbufferedamountlow(None);
+        for event in ["close", "error"] {
+            let _ = self
+                .channel
+                .remove_event_listener_with_callback(event, self.callback.as_ref().unchecked_ref());
+        }
     }
 }
 
-async fn wait_for_capacity(channel: &RtcDataChannel, timeout_ms: u32) -> Result<(), String> {
+async fn wait_for_buffer(
+    channel: &RtcDataChannel,
+    threshold: u32,
+    timeout_ms: u32,
+) -> Result<(), RpcError> {
     if channel.ready_state() != RtcDataChannelState::Open {
-        return Err("WebRTC DataChannel closed while draining".to_string());
+        return Err("WebRTC DataChannel closed while transmitting"
+            .to_string()
+            .into());
     }
-    if channel.buffered_amount() <= MAX_BUFFERED_AMOUNT {
+    if channel.buffered_amount() <= threshold {
         return Ok(());
     }
-    channel.set_buffered_amount_low_threshold(MAX_BUFFERED_AMOUNT / 2);
+    // Keep the existing high/low watermarks for ordinary fragmentation; the
+    // final drain uses zero for both.
+    channel.set_buffered_amount_low_threshold(threshold / 2);
     let (sender, receiver) = oneshot::channel::<()>();
     let sender = Rc::new(RefCell::new(Some(sender)));
     let ready_sender = Rc::clone(&sender);
@@ -2595,24 +2801,37 @@ async fn wait_for_capacity(channel: &RtcDataChannel, timeout_ms: u32) -> Result<
         callback: on_ready,
     };
     channel.set_onbufferedamountlow(Some(listener.callback.as_ref().unchecked_ref()));
-    // The buffer can cross the threshold between the first check and callback
-    // installation. Re-check after installing it so that race cannot turn a
-    // completed drain into a full transfer-timeout wait.
-    if channel.buffered_amount() <= MAX_BUFFERED_AMOUNT {
+    for event in ["close", "error"] {
+        channel
+            .add_event_listener_with_callback(event, listener.callback.as_ref().unchecked_ref())
+            .map_err(js_error_message)?;
+    }
+    // Cover threshold/closure races while installing listeners.
+    if channel.buffered_amount() <= threshold || channel.ready_state() != RtcDataChannelState::Open
+    {
         if let Some(sender) = sender.borrow_mut().take() {
             let _ = sender.send(());
         }
     }
-    timeout_with_ms(
-        async move {
-            receiver
-                .await
-                .map_err(|_| "WebRTC DataChannel closed while draining".to_string())
-        },
-        "WebRTC DataChannel drain timed out",
-        timeout_ms,
-    )
-    .await
+    crate::runtime::timeout(Duration::from_millis(u64::from(timeout_ms)), receiver)
+        .await
+        .map_err(|_| {
+            RpcError::Timeout("WebRTC request transfer timed out draining send buffer".into())
+        })?
+        .map_err(|_| "WebRTC DataChannel closed while transmitting".to_string())?;
+    if channel.ready_state() != RtcDataChannelState::Open || channel.buffered_amount() > threshold {
+        return Err("WebRTC DataChannel failed while transmitting"
+            .to_string()
+            .into());
+    }
+    Ok(())
+}
+
+fn duration_ms(duration: Duration) -> u32 {
+    duration
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .min(i32::MAX as u128) as u32
 }
 
 async fn timeout<T, F>(future: F, message: &'static str) -> Result<T, String>

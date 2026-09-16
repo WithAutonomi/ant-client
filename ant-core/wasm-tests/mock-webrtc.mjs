@@ -19,7 +19,7 @@ export function mockWebRtc(nodes = [{}]) {
     return endpoint;
   });
 
-  class Channel {
+  class Channel extends EventTarget {
     readyState = "open";
     bufferedAmount = 0;
     emit(data) {
@@ -47,6 +47,8 @@ export function mockWebRtc(nodes = [{}]) {
     }
     close() {
       this.readyState = "closed";
+      this.dispatchEvent(new Event("close"));
+      this.onclose?.({});
     }
   }
 
@@ -90,6 +92,7 @@ export function mockWebRtc(nodes = [{}]) {
       if (this.channel.options.putError) {
         this.channel.server.set_put_error(this.channel.options.putError.code, this.channel.options.putError.message);
       }
+      if (this.channel.options.connectDelay) await new Promise(resolve => setTimeout(resolve, this.channel.options.connectDelay));
       setTimeout(() => this.channel.onopen?.({}), 0);
     }
     close() {

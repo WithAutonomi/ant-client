@@ -76,3 +76,8 @@ Chromium integration against real nodes and Anvil.
 later payment/recovery failure, explicit reconciliation of rejected and reverted
 payments, preservation of paid proofs, failed verification/persistence, and client
 closure during asynchronous prepayment checkpoints for both payment modes.
+
+`rpc-deadlines.test.mjs` covers independent queue/send/response budgets, a final
+buffer drain with early responses, one HELLO for concurrent cold operations,
+reauthentication and capability checks after timeout, bounded admission without
+closing active work, pool closure during setup, and strict queued session handles.

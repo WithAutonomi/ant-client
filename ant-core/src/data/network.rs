@@ -439,7 +439,7 @@ impl Network {
 
 /// Execute a request through the platform adapter and apply the shared response handler.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn send_and_await_chunk_response<T, E>(
+pub(crate) async fn send_and_await_chunk_response<T, E: From<crate::data::error::Error>>(
     network: &Network,
     target_peer: &PeerId,
     message_bytes: Vec<u8>,
@@ -478,7 +478,9 @@ pub(crate) async fn send_and_await_chunk_response<T, E>(
         };
         let response = match response {
             Ok(response) => response,
-            Err(crate::data::error::Error::Timeout(_)) => return Err(timeout_error()),
+            // Preserve browser phase diagnostics and timeout classification. Queue
+            // and send expiry must not be reported as a ten-second store wait.
+            Err(error @ crate::data::error::Error::Timeout(_)) => return Err(error.into()),
             Err(error) => return Err(send_error(error.to_string())),
         };
         if response.request_id != request_id {
