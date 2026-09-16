@@ -97,9 +97,15 @@ test("browser verifies forwarded owner proofs and ignores substituted metadata",
   } finally { client.close(); }
 });
 
-test("browser rejects tampered forwarded owner proofs", async () => {
+test("browser rejects tampered forwarded owner proofs even after caching the valid proof", async () => {
   const { test_signed_address_node } = await import("./pkg/ant_core.js");
   const owner = test_signed_address_node();
+  const warm = mockWebRtc([{ peers: [owner], addressV2: true }]);
+  const firstClient = await new BrowserNodeClient(warm.endpoints[0]).connect();
+  try {
+    const nodes = await firstClient.findNode("11".repeat(32), 20);
+    assert.equal(nodes[0].address_record, owner.address_record);
+  } finally { firstClient.close(); }
   const bytes = Buffer.from(owner.address_record, "hex");
   bytes[bytes.length - 1] ^= 1;
   owner.address_record = bytes.toString("hex");
