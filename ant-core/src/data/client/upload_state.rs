@@ -55,7 +55,7 @@ pub struct UploadState {
     failed_payments: Vec<FailedPaymentAttempt>,
 }
 
-/// Native proof expiry and future-clock tolerance, shared by every client adapter.
+/// Native proof expiry, shared by every client adapter.
 pub fn reusable_proof(address: &XorName, bytes: &[u8], now: SystemTime) -> bool {
     if let Ok(proof) = ant_protocol::payment::deserialize_merkle_proof(bytes) {
         return proof.address.0 == *address
@@ -81,7 +81,6 @@ pub fn reusable_proof(address: &XorName, bytes: &[u8], now: SystemTime) -> bool 
                 super::batch::CACHED_PROOF_MAX_AGE_SECS
                     - super::batch::CACHED_PROOF_SAFETY_MARGIN_SECS,
             ),
-            Duration::from_secs(super::batch::CACHED_PROOF_FUTURE_SKEW_TOLERANCE_SECS),
         )
 }
 
@@ -220,7 +219,6 @@ impl UploadState {
                 super::batch::CACHED_PROOF_MAX_AGE_SECS
                     - super::batch::CACHED_PROOF_SAFETY_MARGIN_SECS,
             ),
-            Duration::from_secs(super::batch::CACHED_PROOF_FUTURE_SKEW_TOLERANCE_SECS),
         )
         .then(|| plan.clone())
     }
