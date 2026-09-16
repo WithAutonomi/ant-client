@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "alloy",
  "ant-node",
@@ -892,8 +892,9 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.18.1"
-source = "git+https://github.com/WithAutonomi/ant-node?rev=31fcbae#31fcbae2688a1d81008ef1b57fe09eda4b13817b"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7076156f259d863278edc52843dfd6ea7f4714f3052630c75cf60b1cb9d3c778"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -942,8 +943,9 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.3.5"
-source = "git+https://github.com/WithAutonomi/ant-protocol.git?rev=88ad3f1#88ad3f17dfd165448be29b7ec1ed5bc1669c7b4f"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "804f04e96808a1689a4393652900752980ae7be467b393ae2d8d161306b91301"
 dependencies = [
  "blake3",
  "bytes",
@@ -3303,7 +3305,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -5247,8 +5249,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.27.3"
-source = "git+https://github.com/WithAutonomi/saorsa-core.git?branch=feat%2Fv2-903-download-route-diagnostics#53ec4ba02144c142c666aed0e2e59cf82c4295f2"
+version = "0.27.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a68d3373bbd731bcc099fe9e0a2c587cff5b73d31fe3d4e74d2d81da4dd2bb99"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5319,9 +5322,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.36.3"
+version = "0.36.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cd4be74fa8b82e0321b338bbfbc084c66170614245660b85bb8b041ea808bc4"
+checksum = "6b3126de218e3e0912256caee2b179380a68f835b34ca775e0e2882acf62f838"
 dependencies = [
  "anyhow",
  "async-trait",
