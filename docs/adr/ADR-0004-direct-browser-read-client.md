@@ -313,3 +313,12 @@ algorithm tests. The production network adapter additionally owns authenticated
 sessions, ownership records, endpoint health, and live routing cache admission.
 Both use the same Saorsa lookup engine; production failure cases are tested
 through `BrowserNetworkClient` rather than inferred from facade tests.
+
+Browser wire adaptation reuses verified address publications through a bounded
+256-entry LRU cache per WASM thread/instance. Keys are the complete encoded
+publication, including its signature, identity key and sequence; only successful
+shared-core verification enters the cache. Repeated lookup responses and local
+wire/typed conversions can reuse the immutable verified object. The cache is
+not an owner-view store: every use still checks the advertised peer identity,
+derives fresh local reliability metadata, and follows the shared monotonic
+replacement and witness policy. Failed verification never evicts a valid entry.

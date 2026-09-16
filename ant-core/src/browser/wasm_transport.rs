@@ -769,12 +769,10 @@ impl BrowserNodeClientCore {
         )?;
         let mut by_owner = HashMap::new();
         for proof in proofs {
-            let verified = proof.verify()?;
+            let encoded = hex::encode(proof.encode()?);
+            let verified = super::peer_records::verified_address_record(&encoded)?;
             let owner = verified.owner().to_hex();
-            if by_owner
-                .insert(owner, hex::encode(proof.encode()?))
-                .is_some()
-            {
+            if by_owner.insert(owner, encoded).is_some() {
                 return Err("duplicate signed address owner".into());
             }
         }
