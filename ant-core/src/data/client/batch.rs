@@ -814,18 +814,6 @@ pub(super) const CACHED_PROOF_SAFETY_MARGIN_SECS: u64 = 300;
 /// Either way, no payment is double-spent or stranded.
 pub(super) const CACHED_PROOF_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
-/// How far a cached quote's `timestamp` may be in the future before we
-/// classify it as too-skewed-to-trust and prune.
-///
-/// Mirrors `QUOTE_FUTURE_SKEW_TOLERANCE_SECS = 300` in
-/// `ant-node/src/payment/verifier.rs`. If the client's clock runs
-/// slow relative to the storer that issued the quote, a perfectly
-/// valid proof can appear future-dated to the client — rejecting any
-/// forward drift would re-pay those chunks on every retry. Allow the
-/// same 5-minute window the storer does so the client and node agree
-/// on which proofs are fresh.
-pub(super) const CACHED_PROOF_FUTURE_SKEW_TOLERANCE_SECS: u64 = 300;
-
 /// Drop cached `proof_bytes` whose quote timestamps are too close to
 /// the storer's expiry window to safely reuse.
 ///
@@ -858,7 +846,6 @@ fn prune_locally_expired_proofs(
     let max_safe_age = Duration::from_secs(
         CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS),
     );
-    let max_future_skew = Duration::from_secs(CACHED_PROOF_FUTURE_SKEW_TOLERANCE_SECS);
     let mut kept: HashMap<XorName, Vec<u8>> = HashMap::with_capacity(proofs.len());
     // Pair each expired address with the EXACT bytes we observed at
     // load time. The cache-side drop only removes the entry if those
@@ -869,7 +856,7 @@ fn prune_locally_expired_proofs(
     for (addr, bytes) in proofs {
         match deserialize_proof(&bytes) {
             Ok((proof, _tx_hashes)) => {
-                if proof_is_safely_fresh(&proof, now, max_safe_age, max_future_skew) {
+                if proof_is_safely_fresh(&proof, now, max_safe_age) {
                     kept.insert(addr, bytes);
                 } else {
                     expired.push((addr, bytes));
@@ -894,32 +881,28 @@ fn prune_locally_expired_proofs(
 }
 
 /// True iff every quote in the proof has a timestamp not older than
-/// `now - max_safe_age` AND not further in the future than
-/// `max_future_skew`. The forward-skew check mirrors the storer's
-/// `QUOTE_FUTURE_SKEW_TOLERANCE_SECS` (300s) so a slow-running client
-/// clock doesn't cause us to wrongly prune perfectly fresh proofs
-/// that the storer would still accept.
+/// `now - max_safe_age`.
+///
+/// A quote timestamp is stamped by the *issuing node's* clock, and the
+/// storer never rejects a quote for being future-dated (see
+/// `test_future_quote_uses_storage_delta_not_timestamp` in
+/// `ant-node/src/payment/verifier.rs`), so a quote from a peer whose clock
+/// runs ahead of ours is simply "not yet old" here. This function used to
+/// carry a 300s forward-skew bound as well, which made every proof
+/// containing a quote from such a peer unusable: on a staging network with
+/// one node VM deliberately skewed +3h, ~10% of chunks (a 7-peer close group
+/// drawn from 15 skewed nodes in 990) failed on every single-payment upload
+/// path — before payment natively ("unsubmitted payment quotes expired"),
+/// after payment in the browser ("paid proof expired before storage").
 pub(super) fn proof_is_safely_fresh(
     proof: &ProofOfPayment,
     now: std::time::SystemTime,
     max_safe_age: Duration,
-    max_future_skew: Duration,
 ) -> bool {
-    for (_peer, quote) in &proof.peer_quotes {
-        match now.duration_since(quote.timestamp) {
-            Ok(age) => {
-                if age > max_safe_age {
-                    return false;
-                }
-            }
-            Err(future) => {
-                if future.duration() > max_future_skew {
-                    return false;
-                }
-            }
-        }
-    }
-    true
+    proof.peer_quotes.iter().all(|(_peer, quote)| {
+        now.duration_since(quote.timestamp)
+            .map_or(true, |age| age <= max_safe_age)
+    })
 }
 
 /// Compile-time assertions that batch method futures are Send.
@@ -1188,10 +1171,6 @@ mod tests {
         ProofOfPayment { peer_quotes }
     }
 
-    fn default_max_future_skew() -> Duration {
-        Duration::from_secs(CACHED_PROOF_FUTURE_SKEW_TOLERANCE_SECS)
-    }
-
     #[test]
     #[cfg(any(feature = "native", test))]
     fn proof_is_safely_fresh_accepts_recent_quote() {
@@ -1200,7 +1179,6 @@ mod tests {
             &proof,
             std::time::SystemTime::now(),
             Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS),
-            default_max_future_skew(),
         ));
     }
 
@@ -1217,12 +1195,7 @@ mod tests {
             CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS),
         );
         assert!(
-            !proof_is_safely_fresh(
-                &proof,
-                std::time::SystemTime::now(),
-                max_safe,
-                default_max_future_skew(),
-            ),
+            !proof_is_safely_fresh(&proof, std::time::SystemTime::now(), max_safe),
             "23h57m-old quote must fail safe-reuse check (limit is 24h - 5min margin)"
         );
     }
@@ -1239,47 +1212,45 @@ mod tests {
         let max_safe = Duration::from_secs(
             CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS),
         );
-        assert!(!proof_is_safely_fresh(
-            &proof,
-            now,
-            max_safe,
-            default_max_future_skew(),
-        ));
+        assert!(!proof_is_safely_fresh(&proof, now, max_safe));
     }
 
     #[test]
     #[cfg(any(feature = "native", test))]
-    fn proof_is_safely_fresh_accepts_slight_future_skew_within_node_tolerance() {
+    fn proof_is_safely_fresh_accepts_slight_future_skew() {
         // Client clock 60s slow. Quote claims 60s in the future of
-        // our local view. Node tolerates 300s forward skew, so the
-        // storer would accept this quote — we must too, or we'd
-        // wrongly prune fresh proofs and force re-payment.
+        // our local view. The storer accepts it, so we must too, or
+        // we'd wrongly prune fresh proofs and force re-payment.
         let now = std::time::SystemTime::now();
         let slight_future = now + Duration::from_secs(60);
         let proof = make_proof_with_timestamps(&[slight_future]);
         let max_safe = Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS);
         assert!(
-            proof_is_safely_fresh(&proof, now, max_safe, default_max_future_skew()),
-            "60s-future quote must be accepted (within node's 300s skew tolerance)"
+            proof_is_safely_fresh(&proof, now, max_safe),
+            "60s-future quote must be accepted"
         );
     }
 
     #[test]
     #[cfg(any(feature = "native", test))]
-    fn proof_is_safely_fresh_rejects_far_future_dated_quote() {
-        // 1 hour in the future of our local clock. Exceeds the
-        // node's 300s forward-skew tolerance and the storer would
-        // reject it — we drop it locally to avoid a round trip.
+    fn proof_is_safely_fresh_accepts_quote_from_peer_clock_hours_ahead() {
+        // A quote is stamped by the issuing node's clock, not ours. A node
+        // running 3h ahead (the staging profile skews one VM by exactly
+        // that) produces quotes 3h in our future for every chunk whose
+        // close group includes it, and the storer accepts them. Rejecting
+        // them here failed ~10% of chunks on every single-payment upload
+        // against that network (DEV-03 run 588, 2026-09-16), so a fresh
+        // quote from a fast peer must not read as "expired".
         let now = std::time::SystemTime::now();
-        let far_future = now + Duration::from_secs(3600);
-        let proof = make_proof_with_timestamps(&[far_future]);
-        let max_safe = Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS);
-        assert!(!proof_is_safely_fresh(
-            &proof,
-            now,
-            max_safe,
-            default_max_future_skew(),
-        ));
+        let peer_ahead = now + Duration::from_secs(3 * 60 * 60);
+        let proof = make_proof_with_timestamps(&[now, peer_ahead, now]);
+        let max_safe = Duration::from_secs(
+            CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS),
+        );
+        assert!(
+            proof_is_safely_fresh(&proof, now, max_safe),
+            "a quote from a peer whose clock is ahead is fresh, not expired"
+        );
     }
 
     #[test]
@@ -1294,7 +1265,6 @@ mod tests {
             &proof,
             std::time::SystemTime::now(),
             Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS),
-            default_max_future_skew(),
         ));
     }
 }
