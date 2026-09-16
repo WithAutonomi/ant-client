@@ -94,12 +94,41 @@ pub(super) async fn pay_merkle<A: UploadAdapter>(
     })
 }
 
+/// The network refused the nonce of a payment signed in this call. Those bytes
+/// never left the process, so nothing was paid and preparing again is safe.
+const STALE_UNSENT_NONCE: &str = "stale nonce on an unsent payment; preparing again";
+
+/// A definitive nonce rejection from the endpoint, as opposed to a transport
+/// failure (which `broadcast_payment` has already retried).
+fn is_stale_nonce(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("nonce too low")
+}
+
 async fn execute<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Sync>(
     client: &Client,
     adapter: &A,
     request: &PaymentRequest,
     state: &mut UploadState,
     fresh: F,
+) -> Result<PaymentReceipt> {
+    // A nonce is read from a public endpoint whose replicas lag each other, so
+    // a freshly signed payment can carry a nonce the chain already consumed
+    // (measured 1 in 150 reads on Arbitrum Sepolia, DEV-03 run 589). Such bytes
+    // can never be mined and were never sent, so one re-preparation is the fix.
+    match execute_once(client, adapter, request, state, &fresh).await {
+        Err(Error::Payment(message)) if message == STALE_UNSENT_NONCE => {
+            execute_once(client, adapter, request, state, &fresh).await
+        }
+        outcome => outcome,
+    }
+}
+
+async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Sync>(
+    client: &Client,
+    adapter: &A,
+    request: &PaymentRequest,
+    state: &mut UploadState,
+    fresh: &F,
 ) -> Result<PaymentReceipt> {
     let attempt = state
         .pending_payment
@@ -119,6 +148,9 @@ async fn execute<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Sync>(
         };
     let wallet = client.require_wallet()?;
     let _wallet_lock = wallet.lock().await;
+    // True only for bytes signed below, in this call: they have never been
+    // broadcast, so there is nothing on chain to observe before sending them.
+    let mut unsent = false;
     let signed = match journal {
         Journal::Signed(signed) => signed,
         Journal::Preparing => {
@@ -149,12 +181,30 @@ async fn execute<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Sync>(
                 attempt.submissions = vec![value];
             }
             adapter.checkpoint(state, None).await?;
+            unsent = true;
             signed
         }
     };
     let mut broadcast = false;
     let observation = async {
         loop {
+            if unsent && !broadcast {
+                // Freshness and settlement refusal were checked moments ago,
+                // before signing. A rejected nonce here can only be a stale
+                // nonce read: discard the journal and let `execute` prepare
+                // again. Any other rejection is final for this attempt.
+                match wallet.broadcast_payment(&signed, request).await {
+                    Ok(_) => broadcast = true,
+                    Err(message) if is_stale_nonce(&message) => {
+                        if let Some(attempt) = &mut state.pending_payment {
+                            initialize(attempt);
+                        }
+                        adapter.checkpoint(state, None).await?;
+                        return Err(Error::Payment(STALE_UNSENT_NONCE.into()));
+                    }
+                    Err(message) => return Err(Error::Payment(message)),
+                }
+            }
             match wallet
                 .observe_payment(&signed, request)
                 .await

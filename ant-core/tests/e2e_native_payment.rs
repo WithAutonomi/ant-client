@@ -19,6 +19,11 @@ use std::sync::{Arc, Mutex};
 struct Checkpoints {
     last: Mutex<Option<UploadState>>,
     stop_after_signed: bool,
+    /// Consume the wallet's next nonce the first time a signed journal is
+    /// checkpointed — i.e. after signing, before the broadcast — the way a
+    /// stale `pending` read from a lagging RPC replica does.
+    consume_nonce_once: Option<Wallet>,
+    consumed: Mutex<bool>,
 }
 #[async_trait::async_trait]
 impl UploadAdapter for Checkpoints {
@@ -30,16 +35,24 @@ impl UploadAdapter for Checkpoints {
     }
     async fn checkpoint(&self, state: &UploadState, _: Option<&UploadPayment>) -> Result<()> {
         *self.last.lock().unwrap() = Some(state.clone());
-        if self.stop_after_signed
-            && state.pending_payment.as_ref().is_some_and(|p| {
-                p.submissions
-                    .first()
-                    .is_some_and(|v| v["native_payment_v1"] == "signed")
-            })
-        {
+        let signed = state.pending_payment.as_ref().is_some_and(|p| {
+            p.submissions
+                .first()
+                .is_some_and(|v| v["native_payment_v1"] == "signed")
+        });
+        if self.stop_after_signed && signed {
             return Err(Error::Storage(
                 "simulated interruption after durable signing".into(),
             ));
+        }
+        if signed {
+            let first = !std::mem::replace(&mut *self.consumed.lock().unwrap(), true);
+            if let (true, Some(wallet)) = (first, &self.consume_nonce_once) {
+                wallet
+                    .transfer_gas_tokens([23; 20].into(), Amount::from(1))
+                    .await
+                    .unwrap();
+            }
         }
         Ok(())
     }
@@ -165,15 +178,17 @@ async fn replaced_nonce_retains_journal_until_finality_then_allows_retry() {
         .await
         .unwrap();
 
+    // Before finality a consumed nonce with no receipt reads as `Pending`
+    // (indistinguishable from a stale read on a load-balanced endpoint), so
+    // the journaled bytes are re-sent and the node refuses them; the journal
+    // is retained for reconciliation, and nothing is paid.
     let error = client
         .test_execute_native_payment(&adapter, &request, &mut state, true)
         .await
         .unwrap_err();
-    assert!(
-        error.to_string().contains("awaiting chain finality"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("nonce too low"), "{error}");
     assert!(state.pending_payment.is_some());
+    assert_eq!(wallet.balance_of_tokens().await.unwrap(), before);
     wallet
         .to_provider()
         .anvil_mine(Some(96), None)
@@ -203,4 +218,42 @@ async fn replaced_nonce_retains_journal_until_finality_then_allows_retry() {
         wallet.balance_of_tokens().await.unwrap(),
         before - Amount::from(100)
     );
+}
+
+#[tokio::test]
+async fn stale_nonce_on_an_unsent_payment_is_prepared_again_and_pays_once() {
+    // DEV-03 run 589 (2026-09-16): a public RPC's replicas lag each other, so
+    // `prepare_payment` can sign a nonce the chain has already consumed. Those
+    // bytes never left the process, so the client must discard them and
+    // prepare again — not report "awaiting chain finality" and fail the upload.
+    let chain = Testnet::new().await.unwrap();
+    let wallet = Wallet::new_from_private_key(
+        chain.to_network(),
+        &chain.default_wallet_private_key().unwrap(),
+    )
+    .unwrap();
+    let client = client(wallet.clone()).await;
+    let before = wallet.balance_of_tokens().await.unwrap();
+    let request =
+        PaymentRequest::Quotes(vec![([24; 32].into(), [25; 20].into(), Amount::from(100))]);
+    let adapter = Checkpoints {
+        consume_nonce_once: Some(wallet.clone()),
+        ..Default::default()
+    };
+    let mut state = UploadState::default();
+    let receipt = client
+        .test_execute_native_payment(&adapter, &request, &mut state, true)
+        .await
+        .unwrap();
+    assert!(
+        *adapter.consumed.lock().unwrap(),
+        "the hook must have fired"
+    );
+    assert_eq!(receipt.amount, Amount::from(100));
+    assert_eq!(
+        wallet.balance_of_tokens().await.unwrap(),
+        before - Amount::from(100),
+        "exactly one payment, despite the first signed nonce being consumed"
+    );
+    assert!(state.pending_payment.is_some_and(|p| p.receipt.is_some()));
 }
