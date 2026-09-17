@@ -1,0 +1,650 @@
+import { BrowserNetworkClient } from "./client-fixture.mjs";
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  contentAddress,
+  encryptPublicFile,
+  parseWebRtcDirectMultiaddr,
+} from "./pkg/ant_core.js";
+import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
+
+const content = new TextEncoder().encode("Upload quorum regression fixture.".repeat(100));
+
+function wallet() {
+  const calls = [];
+  return {
+    calls,
+    async pay(network, quotes) {
+      calls.push({ network, quotes });
+      return {
+        transactionHash: `0x${"ab".repeat(32)}`,
+        totalAmount: quotes.reduce((sum, quote) => sum + BigInt(quote.amount), 0n).toString(),
+      };
+    },
+  };
+}
+
+async function upload(client, signer) {
+  return client.uploadPublicFile(content, "fixture.txt", "text/plain", paymentNetwork, signer.pay);
+}
+
+for (const existing of [1, 3]) {
+  test(`${existing} already-stored votes still require majority replication`, async () => {
+    const rtc = mockWebRtc(Array.from({ length: 7 }, (_, i) => ({ alreadyStored: i < existing })));
+    const client = new BrowserNetworkClient(rtc.endpoints);
+    const signer = wallet();
+    try {
+      const result = await upload(client, signer);
+      assert.equal(signer.calls.length, 1);
+      assert.equal(result.file.replicas, 4);
+      assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, result.records * 4);
+    } finally {
+      client.close();
+    }
+  });
+}
+
+test("four distinct already-stored votes skip both payment and PUTs", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, (_, i) => ({ alreadyStored: i < 4 })));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    const result = await upload(client, signer);
+    assert.equal(signer.calls.length, 0);
+    assert.equal(result.storageCostAtto, "0");
+    assert.equal(result.file.replicas, 4);
+    assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, 0);
+  } finally {
+    client.close();
+  }
+});
+
+for (const count of [1, 2, 3, 4, 5, 6]) {
+  test(`${count} discovered targets fail before any payment`, async () => {
+    const rtc = mockWebRtc(Array.from({ length: count }, () => ({})));
+    const client = new BrowserNetworkClient(rtc.endpoints);
+    const signer = wallet();
+    try {
+      await assert.rejects(upload(client, signer), /initial lookup found [1-6] peers, need 7/);
+      assert.equal(signer.calls.length, 0);
+      assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, 0);
+    } finally {
+      client.close();
+    }
+  });
+}
+
+test("duplicate endpoints cannot satisfy the distinct-peer minimum", async () => {
+  const rtc = mockWebRtc([{ alreadyStored: true }]);
+  const client = new BrowserNetworkClient(Array(4).fill(rtc.endpoints[0]));
+  const signer = wallet();
+  try {
+    await assert.rejects(upload(client, signer), /initial lookup found 1 peers, need 7/);
+    assert.equal(signer.calls.length, 0);
+    assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, 0);
+  } finally {
+    client.close();
+  }
+});
+
+test("insufficient eligible witness PUT peers prevents payment", async () => {
+  const rtc = mockWebRtc([{}, {}, {}, {}, { uploads: false }, { uploads: false }, { uploads: false }]);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    await assert.rejects(upload(client, signer), /Fewer than 5 eligible initial witness PUT peers/);
+    assert.equal(signer.calls.length, 0);
+    assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, 0);
+  } finally { client.close(); }
+});
+
+test("an unsupported peer is excluded when enough witness PUT targets remain", async () => {
+  const rtc = mockWebRtc([{}, {}, {}, {}, {}, {}, { uploads: false }]);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    const result = await upload(client, signer);
+    assert.equal(result.file.replicas, 4);
+    assert.equal(signer.calls.length, 1);
+    assert.equal(rtc.requests.filter(({ node, method }) => node === 6 && method === "put_chunk").length, 0);
+  } finally { client.close(); }
+});
+
+const priceCases = [
+  { name: "expensive closest peer", nodes: Array.from({ length: 7 }, () => ({})), closestCount: 1_000_000, expectedCount: 0 },
+  { name: "cheap closest peer", nodes: Array.from({ length: 7 }, () => ({ keyCount: 6000 })), closestCount: 0, expectedCount: 6000 },
+  { name: "seven different prices", nodes: [7000, 1000, 6000, 2000, 5000, 3000, 4000].map(keyCount => ({ keyCount })), expectedCount: 4000 },
+  { name: "upper median of four", nodes: [6000, 1000, 4000, 2000].map(keyCount => ({ keyCount })), expectedCount: 4000 },
+  { name: "stable ties", nodes: Array.from({ length: 4 }, () => ({ keyCount: 23 })), expectedCount: 23, tied: true },
+  { name: "already-stored quote is excluded", nodes: [1000, 2000, 3000, 4000].map(keyCount => ({ keyCount, alreadyStored: keyCount === 3000 })), expectedCount: 2000 },
+  { name: "invalid cheap quote is excluded", nodes: [{ keyCount: 0, invalidQuote: true }, ...[1000, 2000, 4000, 6000].map(keyCount => ({ keyCount }))], expectedCount: 4000 },
+];
+
+for (const scenario of priceCases) {
+  for (const staged of [false, true]) {
+    test(`${staged ? "staged" : "buffered"} upload pays the shared median: ${scenario.name}`, async () => {
+      const encrypted = encryptPublicFile(content);
+      const options = scenario.nodes.map(node => ({ ...node }));
+      // Native requires seven initial witnesses. Invalid quote fillers keep
+      // the four-quote median cases independent of that discovery minimum.
+      while (options.length < 7) options.push({ invalidQuote: true });
+      const rtc = mockWebRtc(options);
+      const peerIds = rtc.endpoints.map(endpoint => parseWebRtcDirectMultiaddr(endpoint).peerId);
+      const closestFirst = address => peerIds.map((peer, index) => ({
+        index,
+        distance: BigInt(`0x${peer}`) ^ BigInt(`0x${address}`),
+      })).sort((a, b) => a.distance < b.distance ? -1 : a.distance > b.distance ? 1 : 0);
+      if (scenario.closestCount !== undefined) {
+        // Reproduce the original defect for the first record regardless of
+        // the deterministic mock peers' positions in XOR space.
+        options[closestFirst(encrypted.records[0].address)[0].index].keyCount = scenario.closestCount;
+      }
+      const client = new BrowserNetworkClient(rtc.endpoints);
+      const signer = wallet();
+      try {
+        const result = staged
+          ? await client.uploadStagedPublicFile({
+            ...encrypted,
+            name: "fixture.txt",
+            content_type: "text/plain",
+            size: content.length,
+            records: encrypted.records.map(record => ({ address: record.address, size: record.content.length })),
+          }, paymentNetwork, async index => encrypted.records[index].content, signer.pay)
+          : await upload(client, signer);
+        assert.equal(signer.calls.length, 1);
+        assert.equal(result.file.replicas, 4);
+        const quotes = signer.calls[0].quotes;
+        assert.equal(quotes.length, result.records);
+        // Fixed native price curve, independent of the implementation's
+        // selected amount and reported total.
+        const count = BigInt(scenario.expectedCount);
+        const expectedAmount = 3n * (3_906_250_000_000_000n + count * count * 35_156_250_000_000_000n / 36_000_000n);
+        assert.equal(result.storageCostAtto, (expectedAmount * BigInt(result.records)).toString());
+        for (const paid of quotes) {
+          assert.equal(paid.quote.committed_key_count, scenario.expectedCount);
+          assert.equal(paid.amount, expectedAmount.toString());
+          if (scenario.tied) {
+            assert.equal(paid.quote.peer_id, peerIds[closestFirst(paid.quote.content).filter(peer => !options[peer.index].invalidQuote)[2].index]);
+          }
+          const puts = rtc.requests.filter(request => request.method === "put_chunk" && request.address === paid.quote.content);
+          assert.equal(puts.length, 4);
+          // The four primary stores run concurrently, so their observed RPC
+          // arrival order can differ from the target order.
+          for (const put of puts) {
+            assert.equal(put.quoteHash, paid.quoteHash, "storage proof must use the paid quote");
+            assert.notEqual(options[put.node].uploads, false);
+          }
+        }
+      } finally {
+        client.close();
+      }
+    });
+  }
+}
+
+for (const staged of [false, true]) {
+  const run = async (client, signer) => {
+    if (!staged) return upload(client, signer);
+    const encrypted = encryptPublicFile(content);
+    return client.uploadStagedPublicFile({
+      ...encrypted, name: "fixture.txt", content_type: "text/plain", size: content.length,
+      records: encrypted.records.map(record => ({ address: record.address, size: record.content.length })),
+    }, paymentNetwork, async index => encrypted.records[index].content, signer.pay);
+  };
+  const label = staged ? "staged" : "buffered";
+
+  test(`${label} upload rejects inconsistent witness views before quoting or paying`, async () => {
+    const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({ view: [] })));
+    const client = new BrowserNetworkClient(rtc.endpoints);
+    const signer = wallet();
+    try {
+      await assert.rejects(run(client, signer), /inconclusive before payment.*quorum-recognised peers/);
+      assert.equal(signer.calls.length, 0);
+      assert.equal(rtc.requests.filter(({ method }) => method === "quote_chunk" || method === "put_chunk").length, 0);
+    } finally { client.close(); }
+  });
+
+  test(`${label} upload accepts one payable quote with native witness support`, async () => {
+    const rtc = mockWebRtc(Array.from({ length: 7 }, (_, i) => ({ view: [0], invalidQuote: i !== 0 })));
+    const client = new BrowserNetworkClient(rtc.endpoints);
+    const signer = wallet();
+    try {
+      const result = await run(client, signer);
+      assert.equal(result.file.replicas, 4);
+      assert.equal(signer.calls.length, 1);
+      const paidPeer = parseWebRtcDirectMultiaddr(rtc.endpoints[0]).peerId;
+      assert.ok(signer.calls[0].quotes.every(quote => quote.quote.peer_id === paidPeer));
+      assert.ok(rtc.requests.filter(({ method }) => method === "quote_chunk").every(request => request.node === 0));
+    } finally { client.close(); }
+  });
+
+  test(`${label} upload falls back past seven peers with the same paid proof`, async () => {
+    const encrypted = encryptPublicFile(content);
+    const options = Array.from({ length: 20 }, () => ({}));
+    const rtc = mockWebRtc(options);
+    const address = encrypted.records[0].address;
+    const order = rtc.endpoints.map((endpoint, index) => ({ index,
+      distance: BigInt(`0x${parseWebRtcDirectMultiaddr(endpoint).peerId}`) ^ BigInt(`0x${address}`),
+    })).sort((a, b) => a.distance < b.distance ? -1 : a.distance > b.distance ? 1 : 0);
+    const rejecting = new Set(order.slice(0, 7).map(peer => peer.index));
+    for (const index of rejecting) options[index].putError = { code: "put_failed", message: "price below local floor" };
+    const client = new BrowserNetworkClient(rtc.endpoints);
+    const signer = wallet();
+    try {
+      const result = await run(client, signer);
+      assert.equal(result.file.replicas, 4);
+      assert.equal(signer.calls.length, 1, "fallback must reuse the existing payment");
+      const paid = signer.calls[0].quotes.find(quote => quote.quote.content === address);
+      const puts = rtc.requests.filter(request => request.method === "put_chunk" && request.address === address);
+      assert.equal(puts.length, 11, "seven declines followed by four successful fallback stores");
+      assert.equal(puts.filter(request => !rejecting.has(request.node)).length, 4);
+      assert.ok(puts.every(request => request.quoteHash === paid.quoteHash));
+    } finally { client.close(); }
+  });
+
+  test(`${label} upload rejects unauthenticated existing-holder votes`, async () => {
+    const rtc = mockWebRtc(Array.from({ length: 7 }, (_, i) => ({ alreadyStored: i < 4, invalidQuote: i === 0 })));
+    const client = new BrowserNetworkClient(rtc.endpoints);
+    const signer = wallet();
+    try {
+      const result = await run(client, signer);
+      assert.equal(result.file.replicas, 4);
+      assert.equal(signer.calls.length, 1);
+      assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, result.records * 4);
+    } finally { client.close(); }
+  });
+}
+
+test("RPC failures remain eligible on native fallback without a special recovery probe", async () => {
+  const failures = new Set();
+  const nodes = Array.from({ length: 7 }, (_, index) => ({
+    respond(channel, method) {
+      if (index < 2 && method === "find_node" && !failures.has(index)) {
+        failures.add(index);
+        channel.emit(new ArrayBuffer(0));
+        return false;
+      }
+    },
+  }));
+  const rtc = mockWebRtc(nodes);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  const progress = [];
+  try {
+    const result = await client.uploadPublicFile(content, "retry.txt", "text/plain", paymentNetwork, signer.pay, message => progress.push(message));
+    assert.equal(failures.size, 2);
+    assert(!progress.some(message => message.includes("rechecking known peers before payment")));
+    assert.equal(signer.calls.length, 1);
+    assert.equal(result.file.replicas, 4);
+    for (const node of failures) {
+      assert(rtc.requests.filter(request => request.node === node && request.method === "find_node").length >= 2);
+    }
+  } finally { client.close(); }
+});
+
+test("cached endpoints alone never turn a persistent five-peer lookup into payment authorization", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, (_, index) => ({
+    respond(channel, method) {
+      if (index < 2 && method === "find_node") {
+        channel.emit(new ArrayBuffer(0));
+        return false;
+      }
+    },
+  })));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    await assert.rejects(upload(client, signer), /initial lookup found 5 peers, need 7/);
+    assert.equal(signer.calls.length, 0);
+    assert.equal(rtc.requests.filter(request => request.method === "put_chunk").length, 0);
+  } finally { client.close(); }
+});
+
+
+test("native seven-peer fallback succeeds when the twenty-peer neighbourhood is unavailable", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    const result = await upload(client, signer);
+    assert.equal(signer.calls.length, 1);
+    assert.equal(result.file.replicas, 4);
+    // Every record first tries width 20, then performs native's width-7
+    // fallback. Both walks use the normal iterative lookup adapter.
+    const lookups = rtc.requests.filter(request => request.method === "find_node");
+    assert.equal(lookups.length, result.records * 14);
+  } finally { client.close(); }
+});
+
+test("a second upload survives four transient FIND_NODE failures without poisoning the client", async () => {
+  const nodes = Array.from({ length: 7 }, () => ({}));
+  const rtc = mockWebRtc(nodes);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    await upload(client, signer);
+    const failed = new Set();
+    for (let index = 0; index < 4; index++) {
+      nodes[index].respond = (channel, method) => {
+        if (method === "find_node" && !failed.has(index)) {
+          failed.add(index);
+          channel.emit(new ArrayBuffer(0));
+          return false;
+        }
+      };
+    }
+    const secondContent = content.slice();
+    secondContent[0] ^= 1;
+    const second = await client.uploadPublicFile(secondContent, "second.txt", "text/plain", paymentNetwork, signer.pay);
+    assert.equal(failed.size, 4);
+    assert.equal(second.file.replicas, 4);
+    assert.equal(signer.calls.length, 2);
+  } finally { client.close(); }
+});
+
+
+test("actual failed connections remain suppressed across upload attempts", async () => {
+  const nodes = Array.from({ length: 7 }, (_, index) => index < 4 ? { connectError: "connection establishment failed" } : {});
+  const rtc = mockWebRtc(nodes);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await assert.rejects(upload(client, signer), /initial lookup found 3 peers, need 7/);
+    }
+    for (let node = 0; node < 4; node++) {
+      assert.equal(rtc.connections.filter(connection => connection.channel.index === node).length, 1);
+    }
+    assert.equal(signer.calls.length, 0);
+  } finally { client.close(); }
+});
+
+
+test("a cancelled discovery batch does not suppress reachable endpoints for the next upload", async () => {
+  const nodes = Array.from({ length: 7 }, () => ({}));
+  const rtc = mockWebRtc(nodes);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    await upload(client, signer);
+    let cancelled = false;
+    nodes[0].respond = (channel, method) => {
+      if (method === "find_node" && !cancelled) { cancelled = true; return false; }
+    };
+    // One slow FIND_NODE is cancelled at the normal native five-second grace
+    // deadline. Later normal lookups must still be allowed to dial that peer.
+    await client.findClosest("00".repeat(32));
+    const secondContent = content.slice();
+    secondContent[0] ^= 2;
+    const second = await client.uploadPublicFile(secondContent, "after-grace.txt", "text/plain", paymentNetwork, signer.pay);
+    assert(cancelled);
+    assert.equal(second.file.replicas, 4);
+    assert.equal(signer.calls.length, 2);
+  } finally { client.close(); }
+});
+
+test("paid checkpoint survives a staged-loader failure and restores on a new client without paying fresh quotes", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const encrypted = encryptPublicFile(content);
+  const staged = {
+    ...encrypted, name: "recovery.txt", content_type: "text/plain", size: content.length,
+    records: encrypted.records.map(record => ({ address: record.address, size: record.content.length })),
+  };
+  const signer = wallet();
+  let checkpoint;
+  let client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    await assert.rejects(client.uploadStagedPublicFile(staged, paymentNetwork,
+      async index => { if (signer.calls.length) throw new Error("staged storage temporarily unavailable"); return encrypted.records[index].content; }, signer.pay,
+      undefined, undefined, value => { checkpoint = value; }), /staged storage temporarily unavailable/);
+    assert.equal(signer.calls.length, 1);
+    assert.equal(typeof checkpoint, "string");
+    client.close();
+    // Fresh discovery now issues quotes with a different signed timestamp.
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    client = new BrowserNetworkClient(rtc.endpoints);
+    const result = await client.uploadStagedPublicFile(staged, paymentNetwork,
+      async index => encrypted.records[index].content,
+      async () => { throw new Error("already paid records must not request payment"); },
+      undefined, checkpoint);
+    assert.equal(result.storageCostAtto, "0");
+    assert.equal(result.records, encrypted.records.length);
+    const original = new Map(signer.calls[0].quotes.map(quote => [quote.quote.content, quote.quoteHash]));
+    for (const request of rtc.requests.filter(request => request.method === "put_chunk")) {
+      assert.equal(request.quoteHash.replace(/^0x/, ""), original.get(request.address).replace(/^0x/, ""));
+    }
+  } finally { client.close(); }
+});
+
+test("prepared checkpoint retains the exact wallet intent after callback interruption", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  let client = new BrowserNetworkClient(rtc.endpoints);
+  let checkpoint, original;
+  try {
+    await assert.rejects(client.uploadPublicFile(content, "recovery.txt", "text/plain", paymentNetwork,
+      async (_, quotes) => { original = quotes; throw new Error("wallet observer interrupted"); },
+      undefined, undefined, value => { checkpoint = value; }), /wallet observer interrupted/);
+    client.close();
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    client = new BrowserNetworkClient(rtc.endpoints);
+    let recovered = false;
+    const pay = Object.assign(async () => { throw new Error("must not submit again"); }, {
+      recover: async (_, quotes) => {
+        recovered = true; assert.deepEqual(quotes, original);
+        return { transactionHash: `0x${"ab".repeat(32)}`, totalAmount: quotes.reduce((sum, quote) => sum + BigInt(quote.amount), 0n).toString() };
+      },
+    });
+    await client.uploadPublicFile(content, "recovery.txt", "text/plain", paymentNetwork, pay, undefined, checkpoint);
+    assert.equal(recovered, true);
+  } finally { client.close(); }
+});
+
+test("checkpoint persistence failure prevents payment and checkpoints are bound to content and network", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  let checkpoint;
+  try {
+    await assert.rejects(client.uploadPublicFile(content, "recovery.txt", "text/plain", paymentNetwork, signer.pay,
+      undefined, undefined, value => { checkpoint = value; throw new Error("checkpoint disk full"); }), /checkpoint disk full/);
+    assert.equal(signer.calls.length, 0);
+    const different = new Uint8Array(content); different[0] ^= 1;
+    await assert.rejects(client.uploadPublicFile(different, "recovery.txt", "text/plain", paymentNetwork, signer.pay,
+      undefined, checkpoint), /different file or payment network/);
+    await assert.rejects(client.uploadPublicFile(content, "recovery.txt", "text/plain", {...paymentNetwork, chain_id: 1}, signer.pay,
+      undefined, checkpoint), /different file or payment network/);
+    assert.equal(signer.calls.length, 0);
+  } finally { client.close(); }
+});
+
+test("wallet may return separate transactions for each prepared record", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const result = await client.uploadPublicFile(content, "split.txt", "text/plain", paymentNetwork, async (_, quotes) => ({
+      totalAmount: quotes.reduce((sum, quote) => sum + BigInt(quote.amount), 0n).toString(),
+      transactionHashes: Object.fromEntries(quotes.map((quote, index) => [quote.quoteHash, (index + 1).toString(16).padStart(64, "0")])),
+    }));
+    assert.equal(result.file.replicas, 4);
+  } finally { client.close(); }
+});
+
+function stagedFixture() {
+  const encrypted = encryptPublicFile(content);
+  return { encrypted, staged: {
+    ...encrypted, name: "shared.txt", content_type: "text/plain", size: content.length,
+    records: encrypted.records.map(record => ({ address: record.address, size: record.content.length })),
+  }};
+}
+
+const merkleReceipt = request => ({
+  transactionHash: `0x${"cd".repeat(32)}`,
+  winnerPoolHash: request.poolHashes[0],
+  totalAmount: request.maximumAmount,
+});
+
+test("forced Merkle uses native candidate quotes and tagged record proofs", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 16 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let request;
+  try {
+    const result = await client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
+      async () => { throw new Error("single payment must not run"); }, undefined, undefined, undefined, "merkle",
+      async (_, value) => { request = value; return merkleReceipt(value); });
+    assert.match(request.calldata, /^0x[0-9a-f]+$/);
+    assert(rtc.requests.some(request => request.method === "merkle_quote"));
+    assert.equal(result.storageCostAtto, request.maximumAmount);
+    for (const put of rtc.requests.filter(request => request.method === "put_chunk")) {
+      assert.equal(put.quoteHash, request.poolHashes[0]);
+    }
+  } finally { client.close(); }
+});
+
+test("forced Merkle fails before payment when candidate pools cannot be filled", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let payments = 0;
+  try {
+    await assert.rejects(client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
+      async () => { payments++; }, undefined, undefined, undefined, "merkle", async () => { payments++; }));
+    assert.equal(payments, 0);
+  } finally { client.close(); }
+});
+
+test("prepared Merkle checkpoint preserves the exact salted tree and wallet request", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 16 }, () => ({})));
+  let client = new BrowserNetworkClient(rtc.endpoints);
+  let checkpoint, original;
+  try {
+    await assert.rejects(client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
+      async () => { throw new Error("unexpected single payment"); }, undefined, undefined,
+      value => { checkpoint = value; }, "merkle", async (_, request) => {
+        original = request; throw new Error("wallet interrupted");
+      }), /wallet interrupted/);
+    client.close();
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    client = new BrowserNetworkClient(rtc.endpoints);
+    await client.uploadPublicFile(content, "merkle.txt", "text/plain", paymentNetwork,
+      async () => { throw new Error("unexpected single payment"); }, undefined, checkpoint, undefined, "merkle",
+      Object.assign(async () => { throw new Error("must not submit again"); }, {
+        recover: async (_, request) => { assert.deepEqual(request, original); return merkleReceipt(request); },
+      }));
+  } finally { client.close(); }
+});
+
+test("paid Merkle checkpoint survives byte-loader failure without repaying", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 16 }, () => ({})));
+  const {encrypted, staged} = stagedFixture();
+  let client = new BrowserNetworkClient(rtc.endpoints);
+  let checkpoint, payments = 0;
+  const noSingle = async () => { throw new Error("unexpected single payment"); };
+  try {
+    await assert.rejects(client.uploadStagedPublicFile(staged, paymentNetwork,
+      async index => { if (payments) throw new Error("loader unavailable"); return encrypted.records[index].content; }, noSingle, undefined, undefined,
+      value => { checkpoint = value; }, "merkle", async (_, request) => {
+        payments++; return merkleReceipt(request);
+      }), /loader unavailable/);
+    assert.equal(payments, 1);
+    client.close();
+    client = new BrowserNetworkClient(rtc.endpoints);
+    const result = await client.uploadStagedPublicFile(staged, paymentNetwork,
+      async index => encrypted.records[index].content, noSingle, undefined, checkpoint, undefined, "merkle",
+      async () => { throw new Error("Merkle payment must be reused"); });
+    assert.equal(result.storageCostAtto, "0");
+    assert.equal(result.records, staged.records.length);
+  } finally { client.close(); }
+});
+
+
+test("Auto fallback shares single-node payment waves and deduplicates records", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const {encrypted, staged} = stagedFixture();
+  const records = encrypted.records.slice(0, -1);
+  while (records.length < 64) {
+    const bytes = new TextEncoder().encode(`Additional record ${records.length}`);
+    records.push({address: contentAddress(bytes), content: bytes});
+  }
+  records.push(records[0], encrypted.records.at(-1));
+  staged.records = records.map(record => ({address: record.address, size: record.content.length}));
+  const signer = wallet();
+  try {
+    const result = await client.uploadStagedPublicFile(staged, paymentNetwork,
+      async index => records[index].content, signer.pay, undefined, undefined, undefined, "auto");
+    assert.equal(result.records, 66);
+    assert.deepEqual(signer.calls.map(call => call.quotes.length), [64, 1]);
+    assert.equal(rtc.requests.filter(request => request.method === "put_chunk").length, 65 * 4);
+  } finally { client.close(); }
+});
+
+test("a settlement refusal arriving during checkpoint stops the browser wallet", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  let checkpoints = 0;
+  try {
+    await assert.rejects(client.uploadPublicFile(content, "fixture.txt", "text/plain", paymentNetwork,
+      signer.pay, undefined, undefined, () => {
+        checkpoints++;
+        client.test_refuse_settlement();
+      }), /settlement refusal|update required/i);
+    assert.ok(checkpoints > 0, "refusal must arrive after preparation");
+    assert.equal(signer.calls.length, 0);
+    assert.equal(rtc.requests.filter(({ method }) => method === "put_chunk").length, 0);
+  } finally { client.close(); }
+});
+
+function twoWaveFixture() {
+  const { encrypted, staged } = stagedFixture();
+  const records = encrypted.records.slice(0, -1);
+  while (records.length < 64) {
+    const bytes = new TextEncoder().encode(`Wave continuation record ${records.length}`);
+    records.push({ address: contentAddress(bytes), content: bytes });
+  }
+  records.push(encrypted.records.at(-1));
+  staged.records = records.map(record => ({ address: record.address, size: record.content.length }));
+  return { records, staged };
+}
+
+test("partial storage in the first wave still pays and stores the second wave", async () => {
+  const options = Array.from({ length: 7 }, () => ({
+    putError: { code: "put_failed", message: "injected storage rejection" },
+  }));
+  const rtc = mockWebRtc(options);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const { records, staged } = twoWaveFixture();
+  const signer = wallet();
+  const pay = async (network, quotes) => {
+    const receipt = await signer.pay(network, quotes);
+    if (signer.calls.length === 2) {
+      for (const option of options) delete option.putError;
+      for (const connection of rtc.connections) {
+        connection.channel.server?.set_put_error("", "");
+      }
+    }
+    return receipt;
+  };
+  try {
+    await assert.rejects(client.uploadStagedPublicFile(staged, paymentNetwork,
+      index => records[index].content, pay, undefined, undefined, undefined, "single"),
+      /partial upload: 1\/65 stored, 64 failed/);
+    assert.deepEqual(signer.calls.map(call => call.quotes.length), [64, 1]);
+    assert.equal(rtc.stores.filter(store => store.has(records.at(-1).address)).length, 4);
+  } finally { client.close(); }
+});
+
+test("fatal staged-byte failure stops before paying for the next wave", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const { records, staged } = twoWaveFixture();
+  const signer = wallet();
+  try {
+    await assert.rejects(client.uploadStagedPublicFile(staged, paymentNetwork,
+      index => {
+        if (signer.calls.length) throw new Error("staged input unavailable");
+        return records[index].content;
+      }, signer.pay, undefined, undefined, undefined, "single"), /staged input unavailable/);
+    assert.equal(signer.calls.length, 1);
+    assert.equal(rtc.requests.filter(request => request.method === "put_chunk").length, 0);
+  } finally { client.close(); }
+});

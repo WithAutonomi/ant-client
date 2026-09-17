@@ -4,12 +4,68 @@ A unified CLI and Rust library for storing data on the Autonomi decentralized ne
 
 ## Overview
 
-This project provides two crates:
+This project provides two Rust crates:
 
-- **ant-core** — A headless Rust library containing all business logic: data storage/retrieval with self-encryption and EVM payments, node lifecycle management, and local devnet tooling. Designed to be consumed by any frontend (CLI, GUI, AI agents, REST clients).
+- **ant-core** — A headless Rust library containing the Autonomi business logic: data storage/retrieval with self-encryption and EVM payments, node lifecycle management, and local devnet tooling. Its `browser` module shares manifest validation, protocol framing, authenticated WebRTC Direct access, lookup, quote verification, and complete public-file workflows with browser applications through the `browser-wasm` feature.
 - **ant-cli** — A thin CLI binary (`ant`) built on `ant-core`.
 
 Data on Autonomi is **content-addressed**. Files are split into encrypted chunks (via [self-encryption](https://en.wikipedia.org/wiki/Convergent_encryption)), each stored at an XOR address derived from its content. A `DataMap` tracks which chunks belong to a file. Payments for storage are made on an EVM-compatible blockchain (Arbitrum).
+
+### Browser WebAssembly client
+
+Build `ant-core` for browsers without changing native callers:
+
+```bash
+wasm-pack build --target web ant-core \
+  --no-default-features --features browser-wasm
+```
+
+This produces the low-level `wasm-bindgen` API backed by the shared Rust
+implementation. The companion
+[`ant-client-browser-sdk`](https://github.com/WithAutonomi/ant-client-browser-sdk)
+project owns the TypeScript API, wallet adapters, browser storage and worker
+integration, media streaming bridge, runnable examples, and browser end-to-end
+tests.
+
+Native and WASM reads share `ant-core/src/client_engine/read.rs` and
+`client_engine/files.rs`. The engine owns XOR-ordered peer selection, bounded
+known-peer fallback, close-group retries, adaptive batch scheduling, deferred
+file retries, recursive DataMap resolution, and plaintext range reads. Both
+transports use `record.rs` for BLAKE3 verification. Native
+`Client::data_download_range` and the browser media reader call the same range
+implementation.
+
+The adapters supply QUIC or WebRTC discovery/GET requests, runtime timers,
+caches, progress callbacks, and output handling. Browser descriptors and wallet
+callbacks remain browser API concerns. Native filesystem streaming still uses
+its synchronous self-encryption iterator bridge, but its map resolution and
+batch retry policy now come from the shared engine. In-memory downloads and
+DataMap resolution no longer require a multi-threaded Tokio runtime.
+
+Reads retry an inconclusive close-group sweep after one second. Each sweep
+tries the discovered peers followed by at most twenty additional known peers;
+failed discovery does not exclude a known holder from direct GET. File batches
+retry only missing records, immediately once and then after 15 and 45 seconds,
+as native file downloads do. Browser concurrency and range-memory limits remain
+platform-specific ceilings on the shared adaptive scheduler.
+
+Upload discovery follows native's witnessed lookup contract: request twenty
+initial responders and, if that lookup fails, retry at seven. Both attempts
+use normal iterative lookup, endpoint failure handling, and grace deadlines.
+The endpoint cache records only connection-establishment failures, matching
+native's dial-failure semantics. A failed FIND_NODE or a request dropped at the
+lookup grace deadline does not suppress that endpoint for future uploads.
+Established connections remain eligible and successful connection establishment
+clears the failure entry.
+There is no browser-specific recovery probe or relaxed payment threshold.
+The requested responder count must be satisfied before quote witnessing and
+storage-majority checks proceed.
+
+Browser protocol v5 and browser manifest v6 advertise only the payment chain ID
+and token/vault addresses. RPC providers belong to the application or wallet;
+the node's verification RPC URL is never sent to the browser. Paid uploads
+check that every selected node advertises the same chain and contracts. Deploy
+matching node, Rust/WASM client, and SDK versions together.
 
 ## Installation
 
@@ -927,3 +983,27 @@ at your option.
 ### Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+## Bootstrap multiaddresses and browser defaults
+
+`ant-core/resources/bootstrap_peers.toml` is the shared release resource. Its
+`quic` list contains native multiaddresses; its `webrtc` list contains complete
+WebRTC Direct multiaddresses with certificate and peer identity pins. The
+WebRTC list is intentionally empty until production seeds are deployed.
+
+The CLI accepts `--bootstrap /ip4/127.0.0.1/udp/10000/quic` (including optional
+`/p2p/<peer-id>`). Legacy `ip:port` arguments and installed `peers = [...]`
+configuration remain readable. Explicit peers take precedence over a selected
+devnet manifest, which takes precedence over the installed bootstrap file.
+Only QUIC seeds are selected for native dialing. Existing installed configuration
+is preserved by the installer; replace it explicitly to adopt new bundled seeds.
+
+Native library callers can use `config::resolve_bootstrap_multiaddrs()` and
+`Client::connect_multiaddrs()` to retain peer pins. Existing socket-address APIs
+remain available. `network_defaults::browser_mainnet_defaults()` and the WASM
+`mainnetNetworkDefaults()` export return only WebRTC seeds, the expected payment
+identity, and evmlib's mainnet RPC URL without connecting to any network.
+
+Add verified WebRTC seeds to the shared TOML resource, commit the source, and
+regenerate the browser SDK's WASM artifact to activate its mainnet defaults.
+See [ADR-0005](docs/adr/ADR-0005-bootstrap-multiaddresses.md).

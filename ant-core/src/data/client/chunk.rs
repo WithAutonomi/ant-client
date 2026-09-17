@@ -3,41 +3,29 @@
 //! Chunks are immutable, content-addressed data blocks where the address
 //! is the BLAKE3 hash of the content.
 
-use crate::data::client::adaptive::Outcome;
-use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
+#[cfg(feature = "native")]
 use crate::data::client::diagnostics::{
     bounded_error, unix_now_ms, DownloadDiagnosticsOutcome, DownloadDiagnosticsRecord,
     DownloadDiagnosticsSender, DownloadRequestCorrelation,
 };
-use crate::data::client::peer_xor_distance;
-use crate::data::client::Client;
-use crate::data::error::{Error, Result};
+#[cfg(feature = "native")]
 use crate::data::network::ClosestPeerDiagnostics;
-use ant_protocol::evm::{QuoteHash, TxHash};
-use ant_protocol::transport::{MultiAddr, PeerId, PeerRouteKind};
+#[cfg(feature = "native")]
 use ant_protocol::{
-    compute_address, detect_proof_type, send_and_await_chunk_response,
-    send_and_await_chunk_response_with_metadata, ChunkGetRequest, ChunkGetResponse, ChunkMessage,
-    ChunkMessageBody, ChunkProtocolResponse, ChunkPutRequest, ChunkPutResponse, DataChunk,
-    ProofType, ProtocolError, XorName, CLOSE_GROUP_MAJORITY,
+    send_and_await_chunk_response_with_metadata, transport::PeerRouteKind, ChunkProtocolResponse,
 };
-use bytes::Bytes;
-use futures::stream::{self, FuturesUnordered, StreamExt};
-use std::collections::HashMap;
+#[cfg(feature = "native")]
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
-
-/// Data type identifier for chunks (used in quote requests).
-const CHUNK_DATA_TYPE: u32 = 0;
-
-/// Number of diagnostics-enabled peer requests currently in flight in this
-/// process. The counter is untouched when runtime diagnostics are disabled.
+#[cfg(feature = "native")]
 static ACTIVE_DIAGNOSTIC_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "native")]
 static NEXT_DIAGNOSTIC_LOOKUP_ID: AtomicUsize = AtomicUsize::new(1);
 
+#[cfg(feature = "native")]
 struct ActiveDiagnosticRequestGuard;
 
+#[cfg(feature = "native")]
 impl ActiveDiagnosticRequestGuard {
     fn enter() -> (Self, usize) {
         let active = ACTIVE_DIAGNOSTIC_REQUESTS.fetch_add(1, AtomicOrdering::Relaxed) + 1;
@@ -45,12 +33,14 @@ impl ActiveDiagnosticRequestGuard {
     }
 }
 
+#[cfg(feature = "native")]
 impl Drop for ActiveDiagnosticRequestGuard {
     fn drop(&mut self) {
         ACTIVE_DIAGNOSTIC_REQUESTS.fetch_sub(1, AtomicOrdering::Relaxed);
     }
 }
 
+#[cfg(feature = "native")]
 fn encode_diagnostic_chunk_get_request(
     address: &XorName,
     correlation: &DownloadRequestCorrelation,
@@ -63,184 +53,7 @@ fn encode_diagnostic_chunk_get_request(
     .map_err(|e| Error::Protocol(format!("Failed to encode GET request: {e}")))
 }
 
-/// Why a single-peer PUT was declined. Drives the surfaced aggregate error
-/// and keeps the store AIMD limiter honest — only genuine local backpressure
-/// (a PUT-response `Timeout`) is a "client is sending too fast" signal; a node
-/// that responds with a structured rejection is an application-level decline
-/// (ADR-0002 / V2-468), and a bare dial/relay failure is remote peer churn,
-/// not local capacity (V2-554).
-#[derive(Clone, Copy)]
-enum PutRejection {
-    /// Node is out of storage (`ProtocolError::StorageFailed`) — try a
-    /// further peer.
-    Full,
-    /// Payment did not clear the node's local price floor, or the proof's
-    /// issuers are not close enough in this peer's view
-    /// (`ProtocolError::PaymentFailed`), or the node asked for more than was
-    /// paid (`ChunkPutResponse::PaymentRequired` → [`Error::Payment`]) — skip
-    /// this peer, do not re-quote.
-    PriceFloor,
-    /// Some other structured remote rejection.
-    OtherRemote,
-    /// The peer accepted the connection but did not answer the PUT within the
-    /// deadline (`Error::Timeout`). This is the genuine local-backpressure
-    /// signal: under real congestion the client's own requests time out, so a
-    /// shortfall carrying any timeout stays a capacity signal (V2-554).
-    Timeout,
-    /// A dial/relay/transport failure — the peer could not be reached at all
-    /// (`Error::Network` and other non-response errors), typically a dead or
-    /// stale relayed DHT address. This is remote peer churn, not local
-    /// backpressure, so a shortfall made up purely of these must not push the
-    /// store AIMD limiter down (V2-554).
-    Dial,
-}
-
-/// Classify a failed single-peer PUT (ADR-0002 / V2-468 / V2-554). A
-/// `RemotePut` carries the node's structured `ProtocolError`; a
-/// `PaymentRequired` response surfaces as [`Error::Payment`]; a
-/// [`Error::Timeout`] is genuine local backpressure; anything else is a
-/// dial/relay failure (remote churn).
-fn classify_put_failure(error: &Error) -> PutRejection {
-    match error {
-        Error::RemotePut { source, .. } => match source {
-            ProtocolError::StorageFailed(_) => PutRejection::Full,
-            ProtocolError::PaymentFailed(_) => PutRejection::PriceFloor,
-            _ => PutRejection::OtherRemote,
-        },
-        // A `PaymentRequired` PUT response (the node wants more than was paid)
-        // arrives as `Error::Payment`. It is a structured application-level
-        // decline — skip the peer and advance fallback, exactly like a
-        // price-floor `PaymentFailed` — not a transport shortfall, so it must
-        // not push the store AIMD limiter down (ADR-0002 / V2-468).
-        Error::Payment(_) => PutRejection::PriceFloor,
-        // The peer did not answer in time: genuine local backpressure.
-        Error::Timeout(_) => PutRejection::Timeout,
-        // Could not reach the peer at all: dial/relay churn (remote), not a
-        // local-capacity signal.
-        _ => PutRejection::Dial,
-    }
-}
-
-/// Decide the error for a close-group store that fell short of quorum.
-///
-/// Only genuine local backpressure should push the store AIMD limiter down.
-/// The failure mix decides which signal to surface:
-///
-/// 1. **Any PUT-response timeout** (`timeout > 0`): the client's own requests
-///    are timing out — genuine local congestion. Surface `InsufficientPeers`
-///    (classified `NetworkError`) so the limiter still backs off (V2-554).
-/// 2. **No timeouts, no dial failures** — every failure was an application
-///    decline (full / price-floor / `PaymentRequired` / other remote
-///    rejection): surface the representative application error so the shortfall
-///    classifies `ApplicationError` and does not suppress the limiter
-///    (ADR-0002 / V2-468).
-/// 3. **No timeouts, but dial/relay failures present**: the shortfall is
-///    close-group dial churn (dead/stale relayed peer addresses) — remote peer
-///    churn, not local capacity. Surface [`Error::CloseGroupShortfall`]
-///    (classified `ApplicationError`) so it does NOT push the limiter down
-///    (V2-554). Still recoverable/retryable.
-fn put_shortfall_error(
-    timeout: usize,
-    dial: usize,
-    first_app_rejection: Option<Error>,
-    shortfall_message: String,
-) -> Error {
-    if timeout > 0 {
-        return Error::InsufficientPeers(shortfall_message);
-    }
-    if dial == 0 {
-        if let Some(app_rejection) = first_app_rejection {
-            return app_rejection;
-        }
-    }
-    Error::CloseGroupShortfall(shortfall_message)
-}
-
-/// Result of one sweep over a chunk's close group.
-///
-/// Either we got the chunk from some peer, or every peer in the group
-/// returned NotFound, timed out, or hit a transport / protocol error.
-/// The counts feed the retry decision (`is_authoritative_not_found`):
-/// only a *unanimous* NotFound from a *well-sampled* close group counts
-/// as authoritative data absence — anything else (a non-unanimous
-/// result, or a thin/under-sampled DHT walk) leaves room for the actual
-/// storer to be in the timeout / network-error / protocol-error bucket
-/// or outside the sampled view, and is worth a retry against a freshly
-/// re-walked close group.
-struct CloseGroupOutcome {
-    chunk: Option<DataChunk>,
-    queried: usize,
-    not_found: usize,
-    timeout: usize,
-    network_err: usize,
-    /// Counts peers that responded with a remote `Error` (e.g.
-    /// "Chunk verification failed") or any other protocol-level error
-    /// that classifies as `Error::Protocol`. Treated the same as
-    /// `timeout` / `network_err` for retry decisions: one peer's bad
-    /// response must not abort the whole close-group sweep — the
-    /// remaining peers might still have a clean copy.
-    protocol_err: usize,
-}
-
-/// `true` if the close-group sweep is strong enough evidence to
-/// conclude the chunk is genuinely absent, so retrying is pointless.
-///
-/// Two conditions, both required:
-///
-/// 1. *Unanimous*: every peer we managed to query responded with an
-///    authoritative NotFound (`not_found == queried`). An earlier
-///    version used a majority quorum (`not_found >= close_group_size /
-///    2 + 1`), but production traffic disproved that: storage
-///    replicates to `CLOSE_GROUP_MAJORITY` (4) of the K=7 close-group
-///    peers, so up to 3 peers legitimately don't store any given chunk
-///    and a `not_found=4 timeout=3` result is "3 storers we couldn't
-///    reach" plus "4 non-storers," not data loss.
-///
-/// 2. *Well-sampled*: at least `CLOSE_GROUP_MAJORITY` peers were
-///    queried. `closest_peers` (via `find_closest_peers`) accepts
-///    any non-empty DHT result, so a thin/under-sampled walk can return
-///    1 or 2 peers. A `1/1` or `3/3` NotFound from such a walk is NOT
-///    authoritative — the real replica majority may sit entirely
-///    outside that narrow view. Requiring a majority-sized sample means
-///    a thin lookup falls through to the retry (which re-walks the DHT)
-///    instead of being declared a final absence.
-fn is_authoritative_not_found(not_found: usize, queried: usize) -> bool {
-    queried >= CLOSE_GROUP_MAJORITY && not_found == queried
-}
-
-/// Store-response timeout for non-merkle chunk PUTs.
-const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Extra waves allowed after the computed diagnostic peer-sweep deadline.
-const DIAGNOSTIC_TIMEOUT_PADDING_WAVES: usize = 1;
-
-/// Result of fetching one chunk address from one close-group peer.
-pub struct ChunkPeerGetResult {
-    /// Peer queried for the chunk.
-    pub peer_id: PeerId,
-    /// Known network addresses used for the peer.
-    pub peer_addrs: Vec<MultiAddr>,
-    /// XOR distance from `peer_id` to the chunk address.
-    pub xor_distance: [u8; 32],
-    /// Per-peer fetch result.
-    pub chunk_result: Result<Option<DataChunk>>,
-}
-
-#[derive(Clone)]
-struct ChunkPeerGetTarget {
-    index: usize,
-    peer_id: PeerId,
-    peer_addrs: Vec<MultiAddr>,
-    xor_distance: [u8; 32],
-}
-
-/// Shared context for emitting per-chunk download diagnostics records from
-/// the normal-path chunk fetch. Constructed only when the caller supplied a
-/// [`DownloadDiagnosticsSender`] (i.e. `--download-diagnostics` was passed);
-/// otherwise `None` and no records are allocated.
-///
-/// `sweep` is set per `chunk_get_try_closest_peers` call: `"initial"` for the
-/// first close-group sweep, `"retry"` for the internal retry sweep.
+#[cfg(feature = "native")]
 pub(crate) struct ChunkFetchDiagnostics<'a> {
     sender: &'a DownloadDiagnosticsSender,
     file_attempt: usize,
@@ -249,6 +62,7 @@ pub(crate) struct ChunkFetchDiagnostics<'a> {
     fetch_cap: usize,
 }
 
+#[cfg(feature = "native")]
 impl<'a> ChunkFetchDiagnostics<'a> {
     pub(crate) fn new(
         sender: &'a DownloadDiagnosticsSender,
@@ -348,10 +162,7 @@ impl<'a> ChunkFetchDiagnostics<'a> {
     }
 }
 
-/// Classify a `chunk_get_from_peer` result into a diagnostics outcome plus the
-/// returned byte count and whether a response was received (so `source_peer`
-/// can be attributed). No secrets: the bounded error string uses only the
-/// error's `Display` form.
+#[cfg(feature = "native")]
 fn classify_peer_attempt(
     result: &Result<Option<DataChunk>>,
 ) -> (DownloadDiagnosticsOutcome, u64, bool, Option<String>) {
@@ -399,6 +210,117 @@ fn classify_peer_attempt(
             Some(bounded_error("protocol", &e.to_string())),
         ),
     }
+}
+use crate::data::client::adaptive::Outcome;
+use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
+use crate::data::client::peer_xor_distance;
+use crate::data::client::Client;
+use crate::data::error::{Error, Result};
+use crate::data::network::send_and_await_chunk_response;
+use ant_protocol::evm::{QuoteHash, TxHash};
+use ant_protocol::transport::{MultiAddr, PeerId};
+use ant_protocol::{
+    compute_address, detect_proof_type, ChunkGetRequest, ChunkGetResponse, ChunkMessage,
+    ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, DataChunk, ProofType, ProtocolError,
+    XorName, CLOSE_GROUP_MAJORITY,
+};
+use bytes::Bytes;
+use futures::stream::{self, StreamExt};
+use std::collections::HashMap;
+use tracing::{debug, info, warn};
+use web_time::{Duration, Instant};
+
+/// Data type identifier for chunks (used in quote requests).
+const CHUNK_DATA_TYPE: u32 = 0;
+
+use crate::transfer_policy::{PutRejection, PutShortfall};
+
+/// Classify a failed single-peer PUT (ADR-0002 / V2-468 / V2-554). A
+/// `RemotePut` carries the node's structured `ProtocolError`; a
+/// `PaymentRequired` response surfaces as [`Error::Payment`]; a
+/// [`Error::Timeout`] is genuine local backpressure; anything else is a
+/// dial/relay failure (remote churn).
+fn classify_put_failure(error: &Error) -> PutRejection {
+    match error {
+        Error::RemotePut { source, .. } => match source {
+            ProtocolError::StorageFailed(_) => PutRejection::Full,
+            ProtocolError::PaymentFailed(_) => PutRejection::PriceFloor,
+            _ => PutRejection::OtherRemote,
+        },
+        // A `PaymentRequired` PUT response (the node wants more than was paid)
+        // arrives as `Error::Payment`. It is a structured application-level
+        // decline — skip the peer and advance fallback, exactly like a
+        // price-floor `PaymentFailed` — not a transport shortfall, so it must
+        // not push the store AIMD limiter down (ADR-0002 / V2-468).
+        Error::Payment(_) => PutRejection::PriceFloor,
+        // The peer did not answer in time: genuine local backpressure.
+        Error::Timeout(_) => PutRejection::Timeout,
+        // Could not reach the peer at all: dial/relay churn (remote), not a
+        // local-capacity signal.
+        _ => PutRejection::Dial,
+    }
+}
+
+/// Decide the error for a close-group store that fell short of quorum.
+///
+/// Only genuine local backpressure should push the store AIMD limiter down.
+/// The failure mix decides which signal to surface:
+///
+/// 1. **Any PUT-response timeout** (`timeout > 0`): the client's own requests
+///    are timing out — genuine local congestion. Surface `InsufficientPeers`
+///    (classified `NetworkError`) so the limiter still backs off (V2-554).
+/// 2. **No timeouts, no dial failures** — every failure was an application
+///    decline (full / price-floor / `PaymentRequired` / other remote
+///    rejection): surface the representative application error so the shortfall
+///    classifies `ApplicationError` and does not suppress the limiter
+///    (ADR-0002 / V2-468).
+/// 3. **No timeouts, but dial/relay failures present**: the shortfall is
+///    close-group dial churn (dead/stale relayed peer addresses) — remote peer
+///    churn, not local capacity. Surface [`Error::CloseGroupShortfall`]
+///    (classified `ApplicationError`) so it does NOT push the limiter down
+///    (V2-554). Still recoverable/retryable.
+fn put_shortfall_error(
+    timeout: usize,
+    dial: usize,
+    first_app_rejection: Option<Error>,
+    shortfall_message: String,
+) -> Error {
+    match crate::transfer_policy::put_shortfall(timeout, dial, first_app_rejection.is_some()) {
+        PutShortfall::ResponseTimeout => Error::InsufficientPeers(shortfall_message),
+        PutShortfall::RemoteRejection => {
+            first_app_rejection.unwrap_or(Error::CloseGroupShortfall(shortfall_message))
+        }
+        PutShortfall::PeerChurn => Error::CloseGroupShortfall(shortfall_message),
+    }
+}
+
+#[cfg(test)]
+use crate::client_engine::read::is_authoritative_not_found;
+
+/// Store-response timeout for non-merkle chunk PUTs.
+const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Extra waves allowed after the computed diagnostic peer-sweep deadline.
+const DIAGNOSTIC_TIMEOUT_PADDING_WAVES: usize = 1;
+
+/// Result of fetching one chunk address from one close-group peer.
+pub struct ChunkPeerGetResult {
+    /// Peer queried for the chunk.
+    pub peer_id: PeerId,
+    /// Known network addresses used for the peer.
+    pub peer_addrs: Vec<MultiAddr>,
+    /// XOR distance from `peer_id` to the chunk address.
+    pub xor_distance: [u8; 32],
+    /// Per-peer fetch result.
+    pub chunk_result: Result<Option<DataChunk>>,
+}
+
+#[derive(Clone)]
+struct ChunkPeerGetTarget {
+    index: usize,
+    peer_id: PeerId,
+    peer_addrs: Vec<MultiAddr>,
+    xor_distance: [u8; 32],
 }
 
 fn chunk_peer_get_targets(
@@ -475,19 +397,29 @@ impl Client {
     /// sustained run of close-group exhaustions correctly drives the
     /// cap down rather than silently inflating it.
     pub(crate) async fn chunk_get_observed(&self, address: &XorName) -> Result<Option<DataChunk>> {
-        self.chunk_get_observed_from_closest_peers(address, self.config().close_group_size, None)
-            .await
+        self.chunk_get_observed_from_closest_peers(
+            address,
+            self.config().close_group_size,
+            #[cfg(feature = "native")]
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn chunk_get_observed_from_closest_peers(
         &self,
         address: &XorName,
         peer_count: usize,
-        diag: Option<&ChunkFetchDiagnostics<'_>>,
+        #[cfg(feature = "native")] diag: Option<&ChunkFetchDiagnostics<'_>>,
     ) -> Result<Option<DataChunk>> {
         let started = Instant::now();
         let result = self
-            .chunk_get_from_closest_peers_with_diagnostics(address, peer_count, diag)
+            .chunk_get_from_closest_peers_with_diagnostics(
+                address,
+                peer_count,
+                #[cfg(feature = "native")]
+                diag,
+            )
             .await;
         let latency = started.elapsed();
         let bytes = result
@@ -618,21 +550,17 @@ impl Client {
     ) -> Result<XorName> {
         let address = compute_address(&content);
 
-        let initial_count = peers.len().min(CLOSE_GROUP_MAJORITY);
-        let (initial_peers, fallback_peers) = peers.split_at(initial_count);
-        let mut fallback_iter = fallback_peers.iter();
-
-        let mut put_futures = FuturesUnordered::new();
-        for (peer_id, addrs) in initial_peers {
-            put_futures.push(self.spawn_chunk_put(
-                content.clone(),
-                proof.clone(),
-                *peer_id,
-                addrs.clone(),
-            ));
-        }
-
-        let mut success_count = 0usize;
+        let outcome = crate::client_engine::quorum_with_fallback(
+            peers.iter().cloned(),
+            CLOSE_GROUP_MAJORITY,
+            |(peer_id, addrs)| {
+                let content = content.clone();
+                let proof = proof.clone();
+                async move { self.spawn_chunk_put(content, proof, peer_id, addrs).await.1 }
+            },
+        )
+        .await;
+        let success_count = outcome.successful_targets.len();
         let mut failures: Vec<String> = Vec::new();
         // Tally the *cause* of each failure. The store AIMD limiter must only be
         // pushed down by a transport shortfall (V2-468): a node that responds —
@@ -648,55 +576,33 @@ impl Client {
         let mut dial = 0usize;
         let mut first_app_rejection: Option<Error> = None;
 
-        while let Some((peer_id, result)) = put_futures.next().await {
-            match result {
-                Ok(_) => {
-                    success_count += 1;
-                    if success_count >= CLOSE_GROUP_MAJORITY {
-                        debug!(
-                            "Chunk {} stored on {success_count} peers (majority reached)",
-                            hex::encode(address)
-                        );
-                        return Ok(address);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to store chunk on {peer_id}: {e}");
-                    failures.push(format!("{peer_id}: {e}"));
-                    match classify_put_failure(&e) {
-                        PutRejection::Full => full += 1,
-                        PutRejection::PriceFloor => price_floor += 1,
-                        PutRejection::OtherRemote => other_remote += 1,
-                        PutRejection::Timeout => timeout += 1,
-                        PutRejection::Dial => dial += 1,
-                    }
-                    // An application-level decline is `RemotePut` (a structured
-                    // node rejection) or `Error::Payment` (`PaymentRequired`):
-                    // capture the first so an all-application shortfall surfaces
-                    // as `ApplicationError`, not `InsufficientPeers`
-                    // (`NetworkError`), and never suppresses the limiter.
-                    if matches!(e, Error::RemotePut { .. } | Error::Payment(_))
-                        && first_app_rejection.is_none()
-                    {
-                        first_app_rejection = Some(e);
-                    }
-
-                    // Advance to the next peer in the put-target set, reusing
-                    // the same proof.
-                    if let Some((fb_peer, fb_addrs)) = fallback_iter.next() {
-                        debug!(
-                            "Falling back to peer {fb_peer} for chunk {}",
-                            hex::encode(address)
-                        );
-                        put_futures.push(self.spawn_chunk_put(
-                            content.clone(),
-                            proof.clone(),
-                            *fb_peer,
-                            fb_addrs.clone(),
-                        ));
-                    }
-                }
+        for ((peer_id, _), error) in outcome.failures {
+            warn!("Failed to store chunk on {peer_id}: {error}");
+            failures.push(format!("{peer_id}: {error}"));
+            match classify_put_failure(&error) {
+                PutRejection::Full => full += 1,
+                PutRejection::PriceFloor => price_floor += 1,
+                PutRejection::OtherRemote => other_remote += 1,
+                PutRejection::Timeout => timeout += 1,
+                PutRejection::Dial => dial += 1,
             }
+            // An application-level decline is `RemotePut` (a structured node
+            // rejection) or `Error::Payment` (`PaymentRequired`): capture the
+            // first so an all-application shortfall surfaces as
+            // `ApplicationError`, not `InsufficientPeers` (`NetworkError`).
+            if matches!(error, Error::RemotePut { .. } | Error::Payment(_))
+                && first_app_rejection.is_none()
+            {
+                first_app_rejection = Some(error);
+            }
+        }
+
+        if outcome.reached {
+            debug!(
+                "Chunk {} stored on {success_count} peers (majority reached)",
+                hex::encode(address)
+            );
+            return Ok(address);
         }
 
         // Quorum not reached. A timeout-bearing shortfall is genuine local
@@ -748,7 +654,7 @@ impl Client {
         peer_addrs: &[MultiAddr],
     ) -> Result<XorName> {
         let address = compute_address(&content);
-        let node = self.network().node();
+        let node = self.network();
         let timeout =
             store_response_timeout_for_proof(&proof, self.config().merkle_store_timeout_secs);
         let timeout_secs = timeout.as_secs();
@@ -823,17 +729,9 @@ impl Client {
     ///
     /// ## Adaptive controller feedback
     ///
-    /// Each per-peer GET attempt is fed individually to the adaptive
-    /// fetch limiter via `controller().fetch.observe(...)`. This is
-    /// deliberately finer-grained than wrapping the outer `chunk_get`
-    /// with `observe_op`: when a chunk takes 6 peer tries to land,
-    /// 5 of them are real capacity signals (timeouts / network errors)
-    /// that should pull the cap down even if the chunk eventually
-    /// succeeds. The outer `Ok(_)` would mask all five as a single
-    /// `Outcome::Success`. See `adaptive::Outcome` for the per-attempt
-    /// classification rules used below.
-    ///
-    /// Callers should therefore NOT wrap `chunk_get` in `observe_op`.
+    /// Download workflows use `chunk_get_observed` to feed the adaptive fetch
+    /// limiter once per completed retrieval, including exhausted close groups.
+    /// Internal peer failures are handled by the shared read policy.
     ///
     /// # Errors
     ///
@@ -858,21 +756,26 @@ impl Client {
         address: &XorName,
         peer_count: usize,
     ) -> Result<Option<DataChunk>> {
-        self.chunk_get_from_closest_peers_with_diagnostics(address, peer_count, None)
-            .await
+        self.chunk_get_from_closest_peers_with_diagnostics(
+            address,
+            peer_count,
+            #[cfg(feature = "native")]
+            None,
+        )
+        .await
     }
 
     async fn chunk_get_from_closest_peers_with_diagnostics(
         &self,
         address: &XorName,
         peer_count: usize,
-        diag: Option<&ChunkFetchDiagnostics<'_>>,
+        #[cfg(feature = "native")] diag: Option<&ChunkFetchDiagnostics<'_>>,
     ) -> Result<Option<DataChunk>> {
         // Check cache first, with integrity verification.
         if let Some(cached) = self.chunk_cache().get(address) {
-            let computed = compute_address(&cached);
-            if computed == *address {
+            if crate::record::verify(address, &cached).is_ok() {
                 debug!("Cache hit for chunk {}", hex::encode(address));
+                #[cfg(feature = "native")]
                 if let Some(diag) = diag {
                     diag.emit_chunk_level(
                         "initial",
@@ -891,323 +794,118 @@ impl Client {
             self.chunk_cache().remove(address);
         }
 
-        let addr_hex = hex::encode(address);
-
-        // First attempt against the current close-group view. A
-        // lookup/transport error here (e.g. closest_peers' DHT walk
-        // momentarily returning an error, or InsufficientPeers from a
-        // thin routing table) is NOT fatal: fall through to the retry
-        // path exactly as a non-authoritative miss would. Otherwise one
-        // transient error on the *initial* close-group walk for a single
-        // chunk would fail an entire multi-hundred-chunk download. A
-        // zeroed outcome (queried=0) is never authoritative, so it flows
-        // straight to the retry below.
-        let first = match self
-            .chunk_get_try_closest_peers(address, peer_count, diag, "initial")
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                info!("chunk_get first close-group lookup failed for {addr_hex}: {e}; will retry");
-                CloseGroupOutcome {
-                    chunk: None,
-                    queried: 0,
-                    not_found: 0,
-                    timeout: 0,
-                    network_err: 0,
-                    protocol_err: 0,
-                }
-            }
-        };
-        if let Some(chunk) = first.chunk {
-            self.chunk_cache().put(chunk.address, chunk.content.clone());
-            return Ok(Some(chunk));
-        }
-
-        // Only treat as authoritative absence when *every* queried peer
-        // responded NotFound. Anything less leaves the actual storer
-        // possibly in the timeout / network-error bucket, which a retry
-        // could reach.
-        if is_authoritative_not_found(first.not_found, first.queried) {
-            info!(
-                "chunk_get giving up on {addr_hex} (unanimous NotFound): \
-                 queried={} not_found={} timeout={} network_err={} protocol_err={}",
-                first.queried,
-                first.not_found,
-                first.timeout,
-                first.network_err,
-                first.protocol_err,
-            );
-            return Ok(None);
-        }
-
-        // Otherwise the failure looks like reachability (most peers timed out
-        // or hit transport errors). The chunk is most likely still on the
-        // network but the current close-group view either (a) caught a
-        // transient transport blip or (b) converged on the wrong neighbourhood
-        // because the routing table is thin. One retry against a freshly
-        // re-walked close group is the cheapest defence against both.
-        info!(
-            "chunk_get retrying {addr_hex} after reachability failure: \
-             queried={} not_found={} timeout={} network_err={} protocol_err={}",
-            first.queried, first.not_found, first.timeout, first.network_err, first.protocol_err,
-        );
-
-        // Brief settle so any in-flight transport state can quiesce before
-        // we re-walk the DHT. Keep this small so we don't add meaningful
-        // latency to the genuinely-lost case (we already paid for one full
-        // close-group sweep before getting here).
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // If the retry's DHT lookup itself fails, treat that as "still
-        // couldn't find" rather than escalating the error — matches the
-        // semantics of the first attempt when peers are unreachable.
-        let retry = match self
-            .chunk_get_try_closest_peers(address, peer_count, diag, "retry")
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                info!(
-                    "chunk_get retry close-group lookup failed for {addr_hex}: {e}; \
-                     first(queried={} not_found={} timeout={} network_err={} protocol_err={})",
-                    first.queried,
-                    first.not_found,
-                    first.timeout,
-                    first.network_err,
-                    first.protocol_err,
-                );
-                return Ok(None);
-            }
-        };
-        if let Some(chunk) = retry.chunk {
-            info!("chunk_get retry succeeded for {addr_hex}");
-            self.chunk_cache().put(chunk.address, chunk.content.clone());
-            return Ok(Some(chunk));
-        }
-
-        info!(
-            "chunk_get exhausted close group after retry for {addr_hex}: \
-             first(queried={} not_found={} timeout={} network_err={} protocol_err={}) \
-             retry(queried={} not_found={} timeout={} network_err={} protocol_err={})",
-            first.queried,
-            first.not_found,
-            first.timeout,
-            first.network_err,
-            first.protocol_err,
-            retry.queried,
-            retry.not_found,
-            retry.timeout,
-            retry.network_err,
-            retry.protocol_err,
-        );
-        Ok(None)
-    }
-
-    /// One sweep of the requested closest peers: fetch the closest peers
-    /// for `address` from the DHT and ask each for the chunk in turn,
-    /// returning on the first success.
-    ///
-    /// `sweep` is `"initial"` for the first close-group attempt and
-    /// `"retry"` for the internal retry sweep; it is only used as a label
-    /// on diagnostic records when `diag` is `Some`.
-    async fn chunk_get_try_closest_peers(
-        &self,
-        address: &XorName,
-        peer_count: usize,
-        diag: Option<&ChunkFetchDiagnostics<'_>>,
-        sweep: &'static str,
-    ) -> Result<CloseGroupOutcome> {
-        let lookup_start = Instant::now();
-        let (peers, peer_contexts) = if diag.is_some() {
-            match self
-                .network()
-                .find_closest_peers_with_diagnostics(address, peer_count)
-                .await
-            {
-                Ok(contexts) => {
-                    let peers = contexts
-                        .iter()
-                        .map(|context| (context.peer_id, context.addresses.clone()))
-                        .collect();
-                    (peers, Some(contexts))
-                }
-                Err(e) => {
-                    if let Some(diag) = diag {
+        #[cfg(feature = "native")]
+        let observation = diag.map(|_| std::sync::Mutex::new(ReadObservation::default()));
+        let result = crate::client_engine::read::retrieve(
+            *address,
+            || async {
+                #[cfg(feature = "native")]
+                let lookup_started = Instant::now();
+                #[cfg(feature = "native")]
+                let mut contexts = Vec::new();
+                #[cfg(feature = "native")]
+                let closest_result = if diag.is_some() {
+                    self.network()
+                        .find_closest_peers_with_diagnostics(address, peer_count)
+                        .await
+                        .map(|found| {
+                            let peers = found
+                                .iter()
+                                .map(|c| (c.peer_id, c.addresses.clone()))
+                                .collect();
+                            contexts = found;
+                            peers
+                        })
+                } else {
+                    self.closest_peers(address, peer_count).await
+                };
+                #[cfg(not(feature = "native"))]
+                let closest_result = self.closest_peers(address, peer_count).await;
+                let closest = closest_result.unwrap_or_else(|e| {
+                    #[cfg(feature = "native")]
+                    if let (Some(diag), Some(observation)) = (diag, &observation) {
+                        let round = observation.lock().unwrap_or_else(|e| e.into_inner()).round;
                         diag.emit_chunk_level(
-                            sweep,
+                            if round == 0 { "initial" } else { "retry" },
                             0,
                             DownloadDiagnosticsOutcome::LookupError,
                             Some(bounded_error("lookup", &e.to_string())),
                         );
                     }
-                    return Err(e);
-                }
-            }
-        } else {
-            // Preserve the pre-instrumentation lookup path exactly when
-            // diagnostics are disabled.
-            match self.closest_peers(address, peer_count).await {
-                Ok(peers) => (peers, None),
-                Err(e) => return Err(e),
-            }
-        };
-        let lookup_duration_ms =
-            u64::try_from(lookup_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let lookup_duration_opt = Some(lookup_duration_ms);
-        let addr_hex = hex::encode(address);
-        let lookup_correlation_id = diag.map(|diag| {
-            let sequence = NEXT_DIAGNOSTIC_LOOKUP_ID.fetch_add(1, AtomicOrdering::Relaxed);
-            format!(
-                "{}-{}-{}-{}-{sequence}",
-                diag.file_attempt, diag.chunk_index, sweep, addr_hex
-            )
-        });
-        let queried = peers.len();
-        let mut not_found = 0usize;
-        let mut timeout = 0usize;
-        let mut network_err = 0usize;
-        let mut protocol_err = 0usize;
-
-        for (peer_attempt, (peer, addrs)) in peers.iter().enumerate() {
-            let peer_attempt_no = peer_attempt + 1;
-            let result = if let Some(diag) = diag {
-                let Some(peer_context) = peer_contexts
-                    .as_ref()
-                    .and_then(|contexts| contexts.get(peer_attempt))
-                else {
-                    return Err(Error::Network(
-                        "diagnostics peer context missing for selected peer".to_string(),
-                    ));
-                };
-                let Some(lookup_correlation_id) = lookup_correlation_id.as_deref() else {
-                    return Err(Error::Network(
-                        "diagnostics lookup correlation ID missing".to_string(),
-                    ));
-                };
-                let node = self.network().node();
-                let peer_connected_before_request = node.is_peer_connected(peer).await;
-                let (active_guard, active_requests_at_start) =
-                    ActiveDiagnosticRequestGuard::enter();
-                let request_started_unix_ms = unix_now_ms();
-                let resp_start = Instant::now();
-                let correlation =
-                    DownloadRequestCorrelation::new(self.next_request_id(), node.peer_id());
-                let observed = self
-                    .chunk_get_from_peer_with_metadata(address, peer, addrs, &correlation)
-                    .await;
-                let response_elapsed_ms =
-                    u64::try_from(resp_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                let request_completed_unix_ms = unix_now_ms();
-                // Count only the network request itself; route classification
-                // and sidecar emission are diagnostic bookkeeping.
-                drop(active_guard);
-
-                let (result, source_peer, transport_source, route) = match observed {
-                    Ok(response) => {
-                        let route = node
-                            .classify_peer_transport_route(
-                                &response.source_peer,
-                                response.transport_source.as_ref(),
-                            )
-                            .await;
-                        (
-                            response.result,
-                            Some(response.source_peer),
-                            response.transport_source,
-                            route,
-                        )
-                    }
-                    Err(error) => (Err(error), None, None, PeerRouteKind::Unknown),
-                };
-                let (outcome, bytes, _got_response, error) = classify_peer_attempt(&result);
-                let lookup = if peer_attempt_no == 1 {
-                    lookup_duration_opt
-                } else {
-                    None
-                };
-                diag.emit_peer_attempt(
-                    sweep,
-                    peer_attempt_no,
-                    lookup,
-                    lookup_correlation_id,
-                    peer_context,
-                    peer,
-                    source_peer.as_ref(),
-                    transport_source.as_ref(),
-                    route,
-                    peer_connected_before_request,
-                    active_requests_at_start,
-                    request_started_unix_ms,
-                    request_completed_unix_ms,
-                    &correlation,
-                    response_elapsed_ms,
-                    bytes,
-                    outcome,
-                    error,
-                );
-                result
-            } else {
-                // Preserve the existing request path exactly when diagnostics
-                // are disabled: no metadata lookup, clock read, or counter.
-                self.chunk_get_from_peer(address, peer, addrs).await
-            };
-            match result {
-                Ok(Some(chunk)) => {
-                    return Ok(CloseGroupOutcome {
-                        chunk: Some(chunk),
-                        queried,
-                        not_found,
-                        timeout,
-                        network_err,
-                        protocol_err,
-                    });
-                }
-                Ok(None) => {
-                    not_found += 1;
-                    debug!("Chunk {addr_hex} not found on peer {peer}, trying next");
-                }
-                Err(Error::Timeout(_)) => {
-                    timeout += 1;
-                    debug!("Peer {peer} timed out for chunk {addr_hex}, trying next");
-                }
-                Err(Error::Network(_)) => {
-                    network_err += 1;
-                    debug!("Peer {peer} unreachable for chunk {addr_hex}, trying next");
-                }
-                // A `Protocol` error here is the storer responding with
-                // `ChunkGetResponse::Error(...)` — e.g. "Chunk verification
-                // failed" from a peer that has a corrupted local copy.
-                // That's a per-peer problem, not a per-chunk one: the
-                // remaining peers might still have a clean copy, so
-                // continue the sweep rather than aborting it. Counted
-                // separately from network_err so the summary log still
-                // distinguishes "peer corrupted" from "peer unreachable".
-                Err(Error::Protocol(ref e)) => {
-                    protocol_err += 1;
-                    debug!(
-                        "Peer {peer} returned protocol error for chunk {addr_hex} ({e}), trying next"
+                    info!(
+                        "Chunk discovery failed for {}: {e}; trying known peers",
+                        hex::encode(address)
                     );
+                    Vec::new()
+                });
+                let known = self
+                    .network()
+                    .known_peers()
+                    .await
+                    .into_iter()
+                    .filter(|node| node.peer_id != *self.network().peer_id())
+                    .map(|node| {
+                        let addrs = node.addresses_by_priority();
+                        (node.peer_id, addrs)
+                    })
+                    .collect();
+                #[cfg(feature = "native")]
+                if let (Some(diag), Some(observation)) = (diag, &observation) {
+                    let mut state = observation.lock().unwrap_or_else(|e| e.into_inner());
+                    state.round += 1;
+                    state.peer_attempt = 0;
+                    state.lookup_ms =
+                        u64::try_from(lookup_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    state.lookup_id = format!(
+                        "{}-{}-{}-{}",
+                        diag.file_attempt,
+                        diag.chunk_index,
+                        hex::encode(address),
+                        NEXT_DIAGNOSTIC_LOOKUP_ID.fetch_add(1, AtomicOrdering::Relaxed)
+                    );
+                    state.contexts = contexts.into_iter().map(|c| (c.peer_id, c)).collect();
                 }
-                Err(e) => return Err(e),
+                crate::client_engine::read::ReadCandidates { closest, known }
+            },
+            |(peer, _)| *peer.as_bytes(),
+            |(peer, addrs)| {
+                #[cfg(feature = "native")]
+                let observation = &observation;
+                async move {
+                    #[cfg(feature = "native")]
+                    if let (Some(diag), Some(observation)) = (diag, observation) {
+                        return self
+                            .chunk_get_diagnostic_attempt(address, &peer, &addrs, diag, observation)
+                            .await;
+                    }
+                    self.chunk_get_from_peer(address, &peer, &addrs).await
+                }
+            },
+            |error| {
+                matches!(
+                    error,
+                    Error::Timeout(_) | Error::Network(_) | Error::Protocol(_)
+                )
+            },
+            crate::runtime::sleep,
+        )
+        .await?;
+        #[cfg(feature = "native")]
+        if result.is_none() {
+            if let (Some(diag), Some(observation)) = (diag, &observation) {
+                let round = observation.lock().unwrap_or_else(|e| e.into_inner()).round;
+                diag.emit_chunk_level(
+                    if round == 1 { "initial" } else { "retry" },
+                    0,
+                    DownloadDiagnosticsOutcome::Exhausted,
+                    None,
+                );
             }
         }
-
-        // The sweep queried every selected peer without success. Emit an
-        // explicit exhausted record so the peer-set exhaustion is a record
-        // rather than a silent gap.
-        if let Some(diag) = diag {
-            diag.emit_chunk_level(sweep, 0, DownloadDiagnosticsOutcome::Exhausted, None);
+        if let Some(chunk) = &result {
+            self.chunk_cache().put(chunk.address, chunk.content.clone());
         }
-
-        Ok(CloseGroupOutcome {
-            chunk: None,
-            queried,
-            not_found,
-            timeout,
-            network_err,
-            protocol_err,
-        })
+        Ok(result)
     }
 
     /// Retrieve a chunk from every peer in the close group.
@@ -1281,7 +979,7 @@ impl Client {
             }
         };
 
-        if tokio::time::timeout(overall_timeout, collect_results)
+        if crate::runtime::timeout(overall_timeout, collect_results)
             .await
             .is_err()
         {
@@ -1307,7 +1005,7 @@ impl Client {
         peer: &PeerId,
         peer_addrs: &[MultiAddr],
     ) -> Result<Option<DataChunk>> {
-        let node = self.network().node();
+        let node = self.network();
         let request_id = self.next_request_id();
         let request = ChunkGetRequest::new(*address);
         let message = ChunkMessage {
@@ -1341,12 +1039,8 @@ impl Client {
                         ))));
                     }
 
-                    let computed = compute_address(&content);
-                    if computed != addr {
-                        return Some(Err(Error::InvalidData(format!(
-                            "Invalid chunk content: expected hash {addr_hex}, got {}",
-                            hex::encode(computed)
-                        ))));
+                    if let Err(error) = crate::record::verify(&addr, &content) {
+                        return Some(Err(Error::InvalidData(error)));
                     }
 
                     debug!(
@@ -1372,72 +1066,6 @@ impl Client {
         .await;
 
         result
-    }
-
-    /// Diagnostics-only variant of [`Self::chunk_get_from_peer`] that retains
-    /// the authenticated response peer and observed transport source. Request
-    /// construction, validation, timeouts, and error mapping mirror the normal
-    /// helper exactly.
-    async fn chunk_get_from_peer_with_metadata(
-        &self,
-        address: &XorName,
-        peer: &PeerId,
-        peer_addrs: &[MultiAddr],
-        correlation: &DownloadRequestCorrelation,
-    ) -> Result<ChunkProtocolResponse<Option<DataChunk>, Error>> {
-        let node = self.network().node();
-        let message_bytes = encode_diagnostic_chunk_get_request(address, correlation)?;
-
-        let timeout = Duration::from_secs(self.config().chunk_get_timeout_secs);
-        let addr_hex = hex::encode(address);
-        let timeout_secs = self.config().chunk_get_timeout_secs;
-
-        send_and_await_chunk_response_with_metadata(
-            node,
-            peer,
-            message_bytes,
-            correlation.request_id,
-            timeout,
-            peer_addrs,
-            |body| match body {
-                ChunkMessageBody::GetResponse(ChunkGetResponse::Success {
-                    address: addr,
-                    content,
-                }) => {
-                    if addr != *address {
-                        return Some(Err(Error::InvalidData(format!(
-                            "Mismatched chunk address: expected {addr_hex}, got {}",
-                            hex::encode(addr)
-                        ))));
-                    }
-                    let computed = compute_address(&content);
-                    if computed != addr {
-                        return Some(Err(Error::InvalidData(format!(
-                            "Invalid chunk content: expected hash {addr_hex}, got {}",
-                            hex::encode(computed)
-                        ))));
-                    }
-                    debug!(
-                        "Retrieved chunk {} ({} bytes) from peer {peer}",
-                        hex::encode(addr),
-                        content.len()
-                    );
-                    Some(Ok(Some(DataChunk::new(addr, Bytes::from(content)))))
-                }
-                ChunkMessageBody::GetResponse(ChunkGetResponse::NotFound { .. }) => Some(Ok(None)),
-                ChunkMessageBody::GetResponse(ChunkGetResponse::Error(e)) => Some(Err(
-                    Error::Protocol(format!("Remote GET error for {addr_hex}: {e}")),
-                )),
-                _ => None,
-            },
-            |e| Error::Network(format!("Failed to send GET to peer {peer}: {e}")),
-            || {
-                Error::Timeout(format!(
-                    "Timeout waiting for chunk {addr_hex} from {peer} after {timeout_secs}s"
-                ))
-            },
-        )
-        .await
     }
 
     /// Check if a chunk exists on the network.
@@ -1492,15 +1120,7 @@ mod tests {
     use super::*;
     use ant_protocol::{PROOF_TAG_MERKLE, PROOF_TAG_SINGLE_NODE};
 
-    /// Arbitrary configured Merkle store timeout used by the timeout-selection tests.
-    const TEST_MERKLE_TIMEOUT_SECS: u64 = 60;
-    /// Sentinel byte used to represent an unknown/unrecognized proof tag.
-    const UNKNOWN_PROOF_TAG: u8 = 0xff;
-    /// XorName byte width used by test peer IDs and distances.
-    const TEST_XORNAME_BYTE_LEN: usize = 32;
-    /// Last byte position in the test XOR distance arrays.
-    const TEST_DISTANCE_TAIL_INDEX: usize = TEST_XORNAME_BYTE_LEN - 1;
-
+    #[cfg(feature = "native")]
     #[test]
     fn diagnostic_correlation_is_identical_on_wire_and_in_record() {
         let address = [7u8; 32];
@@ -1545,7 +1165,7 @@ mod tests {
         assert_eq!(record.request_id, Some(wire.request_id));
         assert_eq!(record.local_peer_id, Some(correlation.local_peer_id));
     }
-
+    #[cfg(feature = "native")]
     #[test]
     fn classify_peer_attempt_pins_outcomes_and_response_attribution() {
         let chunk = DataChunk::new([0u8; 32], Bytes::from_static(b"payload"));
@@ -1602,6 +1222,14 @@ mod tests {
             assert_eq!(error.as_deref(), expected_error);
         }
     }
+    /// Arbitrary configured Merkle store timeout used by the timeout-selection tests.
+    const TEST_MERKLE_TIMEOUT_SECS: u64 = 60;
+    /// Sentinel byte used to represent an unknown/unrecognized proof tag.
+    const UNKNOWN_PROOF_TAG: u8 = 0xff;
+    /// XorName byte width used by test peer IDs and distances.
+    const TEST_XORNAME_BYTE_LEN: usize = 32;
+    /// Last byte position in the test XOR distance arrays.
+    const TEST_DISTANCE_TAIL_INDEX: usize = TEST_XORNAME_BYTE_LEN - 1;
 
     #[test]
     fn classify_put_failure_maps_remote_timeout_and_dial_reasons() {
@@ -1883,5 +1511,174 @@ mod tests {
                 "non-merkle proof tag {tag:#x} should ignore merkle timeout {absurd_merkle_timeout}",
             );
         }
+    }
+}
+
+#[cfg(feature = "native")]
+impl Client {
+    async fn chunk_get_from_peer_with_metadata(
+        &self,
+        address: &XorName,
+        peer: &PeerId,
+        peer_addrs: &[MultiAddr],
+        correlation: &DownloadRequestCorrelation,
+    ) -> Result<ChunkProtocolResponse<Option<DataChunk>, Error>> {
+        let node = self.network().node();
+        let message_bytes = encode_diagnostic_chunk_get_request(address, correlation)?;
+
+        let timeout = Duration::from_secs(self.config().chunk_get_timeout_secs);
+        let addr_hex = hex::encode(address);
+        let timeout_secs = self.config().chunk_get_timeout_secs;
+
+        send_and_await_chunk_response_with_metadata(
+            node,
+            peer,
+            message_bytes,
+            correlation.request_id,
+            timeout,
+            peer_addrs,
+            |body| match body {
+                ChunkMessageBody::GetResponse(ChunkGetResponse::Success {
+                    address: addr,
+                    content,
+                }) => {
+                    if addr != *address {
+                        return Some(Err(Error::InvalidData(format!(
+                            "Mismatched chunk address: expected {addr_hex}, got {}",
+                            hex::encode(addr)
+                        ))));
+                    }
+                    let computed = compute_address(&content);
+                    if computed != addr {
+                        return Some(Err(Error::InvalidData(format!(
+                            "Invalid chunk content: expected hash {addr_hex}, got {}",
+                            hex::encode(computed)
+                        ))));
+                    }
+                    debug!(
+                        "Retrieved chunk {} ({} bytes) from peer {peer}",
+                        hex::encode(addr),
+                        content.len()
+                    );
+                    Some(Ok(Some(DataChunk::new(addr, Bytes::from(content)))))
+                }
+                ChunkMessageBody::GetResponse(ChunkGetResponse::NotFound { .. }) => Some(Ok(None)),
+                ChunkMessageBody::GetResponse(ChunkGetResponse::Error(e)) => Some(Err(
+                    Error::Protocol(format!("Remote GET error for {addr_hex}: {e}")),
+                )),
+                _ => None,
+            },
+            |e| Error::Network(format!("Failed to send GET to peer {peer}: {e}")),
+            || {
+                Error::Timeout(format!(
+                    "Timeout waiting for chunk {addr_hex} from {peer} after {timeout_secs}s"
+                ))
+            },
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "native")]
+#[derive(Default)]
+struct ReadObservation {
+    round: usize,
+    peer_attempt: usize,
+    lookup_ms: u64,
+    lookup_id: String,
+    contexts: std::collections::HashMap<PeerId, ClosestPeerDiagnostics>,
+}
+#[cfg(feature = "native")]
+impl Client {
+    async fn chunk_get_diagnostic_attempt(
+        &self,
+        address: &XorName,
+        peer: &PeerId,
+        addrs: &[MultiAddr],
+        diag: &ChunkFetchDiagnostics<'_>,
+        observation: &std::sync::Mutex<ReadObservation>,
+    ) -> Result<Option<DataChunk>> {
+        let (sweep, peer_attempt_no, lookup_duration_opt, lookup_correlation_id, peer_context) = {
+            let mut state = observation.lock().unwrap_or_else(|e| e.into_inner());
+            state.peer_attempt += 1;
+            let context = state
+                .contexts
+                .remove(peer)
+                .unwrap_or_else(|| ClosestPeerDiagnostics {
+                    peer_id: *peer,
+                    addresses: addrs.to_vec(),
+                    address_types: Vec::new(),
+                    local_last_seen_age_ms: None,
+                    publisher_address_set_age_ms: None,
+                    publisher_address_set_unix_ns: None,
+                });
+            (
+                if state.round == 1 { "initial" } else { "retry" },
+                state.peer_attempt,
+                Some(state.lookup_ms),
+                state.lookup_id.clone(),
+                context,
+            )
+        };
+        let node = self.network().node();
+        let peer_connected_before_request = node.is_peer_connected(peer).await;
+        let (active_guard, active_requests_at_start) = ActiveDiagnosticRequestGuard::enter();
+        let request_started_unix_ms = unix_now_ms();
+        let resp_start = Instant::now();
+        let correlation = DownloadRequestCorrelation::new(self.next_request_id(), node.peer_id());
+        let observed = self
+            .chunk_get_from_peer_with_metadata(address, peer, addrs, &correlation)
+            .await;
+        let response_elapsed_ms =
+            u64::try_from(resp_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let request_completed_unix_ms = unix_now_ms();
+        // Count only the network request itself; route classification
+        // and sidecar emission are diagnostic bookkeeping.
+        drop(active_guard);
+
+        let (result, source_peer, transport_source, route) = match observed {
+            Ok(response) => {
+                let route = node
+                    .classify_peer_transport_route(
+                        &response.source_peer,
+                        response.transport_source.as_ref(),
+                    )
+                    .await;
+                (
+                    response.result,
+                    Some(response.source_peer),
+                    response.transport_source,
+                    route,
+                )
+            }
+            Err(error) => (Err(error), None, None, PeerRouteKind::Unknown),
+        };
+        let (outcome, bytes, _got_response, error) = classify_peer_attempt(&result);
+        let lookup = if peer_attempt_no == 1 {
+            lookup_duration_opt
+        } else {
+            None
+        };
+        diag.emit_peer_attempt(
+            sweep,
+            peer_attempt_no,
+            lookup,
+            &lookup_correlation_id,
+            &peer_context,
+            peer,
+            source_peer.as_ref(),
+            transport_source.as_ref(),
+            route,
+            peer_connected_before_request,
+            active_requests_at_start,
+            request_started_unix_ms,
+            request_completed_unix_ms,
+            &correlation,
+            response_elapsed_ms,
+            bytes,
+            outcome,
+            error,
+        );
+        result
     }
 }

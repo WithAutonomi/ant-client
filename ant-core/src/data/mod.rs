@@ -6,6 +6,7 @@
 pub mod client;
 pub mod error;
 pub mod network;
+#[cfg(feature = "native")]
 pub mod peer_cache;
 
 pub use client::cache::ChunkCache;
@@ -26,16 +27,20 @@ pub use client::batch::{
     finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk, SingleNodeQuotePayment,
 };
 pub use client::data::DataUploadResult;
+#[cfg(feature = "native")]
 pub use client::diagnostics::{
     spawn_download_diagnostics_writer, DownloadDiagnosticsOutcome, DownloadDiagnosticsRecord,
     DownloadDiagnosticsSender,
 };
 pub use client::file::{
-    CostEstimateConfidence, DownloadEvent, ExternalChunkStore, ExternalPaymentInfo,
-    FileChunkPeerReport, FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport,
-    FileDownloadWithPeerReport, FileUploadResult, FinalizeOutcome, FinalizeResume,
-    MerkleFinalizeResume, PreparedUpload, UploadCostEstimate, UploadEvent, Visibility,
-    WaveFinalizeResume,
+    CostEstimateConfidence, DownloadEvent, FileChunkPeerReport, FileChunkPeerReportPeer,
+    FileChunkPeerStatus, FileChunkPeerSweepReport, FileDownloadWithPeerReport, FileUploadResult,
+    UploadCostEstimate, UploadEvent, Visibility,
+};
+#[cfg(feature = "native")]
+pub use client::file::{
+    ExternalChunkStore, ExternalPaymentInfo, FinalizeOutcome, FinalizeResume, MerkleFinalizeResume,
+    PreparedUpload, WaveFinalizeResume,
 };
 pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
@@ -48,6 +53,7 @@ pub use self_encryption::DataMap;
 // Datamap file persistence helpers. Canonical path is
 // `ant_core::datamap_file::*`; these convenience re-exports let existing
 // `ant_core::data` callers reach them without an extra import.
+#[cfg(feature = "native")]
 pub use crate::datamap_file::{
     datamap_filename_for, original_name_from_datamap, read_datamap, write_datamap, CollisionPolicy,
     DATAMAP_EXTENSION,
@@ -57,6 +63,7 @@ pub use crate::datamap_file::{
 // devnet manifest types live in ant-protocol because both the node
 // (writer) and the CLI (reader) need them; they are always available
 // regardless of the `devnet` feature.
+#[cfg(feature = "native")]
 pub use ant_protocol::transport::{
     CoreNodeConfig, IPDiversityConfig, MultiAddr, NodeMode, P2PNode,
 };

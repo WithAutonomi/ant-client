@@ -1,4 +1,5 @@
 /target
+/ant-core/wasm-tests/pkg/
 .cargo/config.toml
 .cache/
 *.orig

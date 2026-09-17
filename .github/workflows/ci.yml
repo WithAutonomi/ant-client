@@ -33,6 +33,109 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  browser-wasm:
+    name: Browser WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check the portable Rust library
+        run: >-
+          cargo check -p ant-core
+          --target wasm32-unknown-unknown
+          --no-default-features
+          --features browser-wasm
+      - name: Lint the portable Rust library
+        run: >-
+          cargo clippy -p ant-core
+          --target wasm32-unknown-unknown
+          --no-default-features
+          --features browser-wasm
+          -- -D warnings
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.15.0 --locked
+      - name: Generate the browser bindings
+        working-directory: ant-core
+        run: >-
+          wasm-pack build
+          --target web
+          --out-dir wasm-tests/pkg
+          --release
+          .
+          --no-default-features
+          --features browser-wasm,test-utils
+      - name: Test the generated browser bindings
+        working-directory: ant-core
+        run: >-
+          node --import ./wasm-tests/setup-wasm.mjs
+          --test ./wasm-tests/*.test.mjs
+
+  browser-integration:
+    name: Real Chromium and local nodes
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Foundry (direct release download)
+        # foundry-rs/foundry-toolchain calls foundryup which curls
+        # api.github.com unauthenticated to resolve the nightly tag.
+        # macOS runners on shared egress IPs hit the 60/h anonymous
+        # rate limit and the install 403s. Setting GITHUB_TOKEN does
+        # NOT help because foundryup ignores it. Instead: pull the
+        # pinned release tarball directly from the GitHub Releases CDN
+        # (no API call, no rate limit) and unpack to /usr/local/bin.
+        shell: bash
+        env:
+          FOUNDRY_VERSION: v1.7.1
+        run: |
+          set -euo pipefail
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m)"
+          case "$os-$arch" in
+            linux-x86_64)  asset="foundry_${FOUNDRY_VERSION}_linux_amd64.tar.gz" ;;
+            darwin-arm64)  asset="foundry_${FOUNDRY_VERSION}_darwin_arm64.tar.gz" ;;
+            darwin-x86_64) asset="foundry_${FOUNDRY_VERSION}_darwin_amd64.tar.gz" ;;
+            *) echo "unsupported runner: $os-$arch"; exit 1 ;;
+          esac
+          url="https://github.com/foundry-rs/foundry/releases/download/${FOUNDRY_VERSION}/${asset}"
+          echo "downloading $url"
+          curl -sSL --retry 5 --retry-delay 5 "$url" -o /tmp/foundry.tar.gz
+          sudo tar -xzf /tmp/foundry.tar.gz -C /usr/local/bin anvil forge cast chisel
+          anvil --version
+          forge --version
+      - name: Check out the node revision pinned by ant-core
+        shell: bash
+        run: |
+          node_revision=$(python3 -c 'import tomllib; print(tomllib.load(open("ant-core/Cargo.toml", "rb"))["dependencies"]["ant-node"]["rev"])')
+          git clone https://github.com/WithAutonomi/ant-node.git ../ant-node-web-support
+          git -C ../ant-node-web-support checkout "$node_revision"
+      - run: cargo install wasm-pack --version 0.15.0 --locked
+      - name: Build production browser bindings
+        working-directory: ant-core
+        run: wasm-pack build --target web --out-dir wasm-tests/pkg --release . --no-default-features --features browser-wasm
+      - name: Install browser test dependencies
+        working-directory: ant-core/browser-tests
+        run: npm ci
+      - name: Install Chromium
+        working-directory: ant-core/browser-tests
+        run: npx playwright install --with-deps chromium
+      - name: Exercise real paid browser storage and recovery
+        working-directory: ant-core/browser-tests
+        run: npm test
+
   test-unit:
     name: Unit Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -92,7 +195,7 @@ jobs:
           anvil --version
           forge --version
       - name: Run E2E tests (serial)
-        run: cargo test -p ant-core --features test-utils --test e2e_chunk --test e2e_data --test e2e_file --test e2e_payment --test e2e_security --test e2e_cost_estimate --test e2e_adr0004 -- --test-threads=1
+        run: cargo test -p ant-core --features test-utils --test e2e_chunk --test e2e_data --test e2e_file --test e2e_payment --test e2e_native_payment --test e2e_security --test e2e_cost_estimate --test e2e_adr0004 -- --test-threads=1
 
   test-merkle:
     name: Merkle E2E (${{ matrix.os }})

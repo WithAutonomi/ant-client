@@ -3,32 +3,47 @@
 //! Provides high-level APIs for storing and retrieving data
 //! on the Autonomi decentralized network.
 
-pub mod adaptive;
+pub mod adaptive {
+    pub use crate::client_engine::adaptive::*;
+}
 pub mod batch;
 pub mod cache;
+#[cfg(feature = "native")]
 pub(crate) mod cached_merkle;
+#[cfg(feature = "native")]
 pub(crate) mod cached_single;
 pub mod chunk;
 pub mod data;
+#[cfg(feature = "native")]
 pub mod diagnostics;
 pub mod file;
 pub mod merkle;
+#[cfg(feature = "native")]
+mod native_payment;
 pub mod payment;
 pub mod quote;
+pub mod upload;
+pub mod upload_state;
 
 use crate::data::client::adaptive::{AdaptiveConfig, AdaptiveController, ChannelStart, Outcome};
 use crate::data::client::cache::ChunkCache;
 use crate::data::error::{Error, Result};
-use crate::data::network::{Network, NetworkHealth};
+use crate::data::network::Network;
+#[cfg(feature = "native")]
+use crate::data::network::NetworkHealth;
+#[cfg(feature = "native")]
 use crate::data::peer_cache;
 use ant_protocol::evm::Wallet;
-use ant_protocol::transport::{MultiAddr, P2PNode, PeerId};
+#[cfg(feature = "native")]
+use ant_protocol::transport::P2PNode;
+use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{XorName, CLOSE_GROUP_SIZE};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(feature = "native")]
 use tracing::debug;
 
 /// Width of the chunk PUT-target set (initial writes plus fallback): the
@@ -38,7 +53,7 @@ use tracing::debug;
 /// (20): a node accepts a reused payment proof only when one of the proof's
 /// closest-`CLOSE_GROUP_SIZE` quote issuers is within its own local 20-closest,
 /// so trying peers past this width is pointless.
-pub(crate) const PUT_TARGET_WIDTH: usize = 20;
+pub(crate) use crate::quote_policy::PUT_TARGET_WIDTH;
 
 /// Ceiling on how long to wait for a peer to answer a settlement-versioned
 /// quote request before falling back to the unversioned shape.
@@ -297,13 +312,13 @@ mod settlement_refusal_tests {
 ///   cuts the cap — V2-554)
 pub(crate) fn classify_error(err: &Error) -> Outcome {
     match err {
-        Error::Timeout(_) => Outcome::Timeout,
+        Error::Timeout(_) => crate::transfer_policy::FailureKind::Timeout,
         Error::Network(_)
         | Error::InsufficientPeers(_)
         | Error::Io(_)
         | Error::Protocol(_)
         | Error::Storage(_)
-        | Error::PartialUpload { .. } => Outcome::NetworkError,
+        | Error::PartialUpload { .. } => crate::transfer_policy::FailureKind::Network,
         Error::AlreadyStored
         | Error::Encryption(_)
         | Error::Crypto(_)
@@ -342,8 +357,9 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         // "client sending too fast" — must not push the limiter down
         // (V2-554). A shortfall that DID time out keeps `InsufficientPeers`
         // (`NetworkError`) so real congestion still cuts the cap.
-        | Error::CloseGroupShortfall(_) => Outcome::ApplicationError,
+        | Error::CloseGroupShortfall(_) => crate::transfer_policy::FailureKind::Application,
     }
+    .outcome()
 }
 
 /// Compute XOR distance between a peer's ID bytes and a target address.
@@ -563,6 +579,7 @@ fn build_controller(config: &ClientConfig) -> (AdaptiveController, Option<PathBu
     start.store = start.store.min(adaptive_cfg.max.store);
     start.fetch = start.fetch.min(adaptive_cfg.max.fetch);
 
+    #[cfg(feature = "native")]
     let adaptive_enabled = adaptive_cfg.enabled;
     let controller = AdaptiveController::new(start, adaptive_cfg);
     // Skip disk warm-start entirely when adaptation is disabled —
@@ -570,6 +587,7 @@ fn build_controller(config: &ClientConfig) -> (AdaptiveController, Option<PathBu
     // start, no surprises from prior runs. (warm_start is also a
     // no-op when disabled, but skipping the load avoids file I/O
     // and the path-resolution side effects.)
+    #[cfg(feature = "native")]
     let persist_path = if adaptive_enabled {
         let p = adaptive::default_persist_path();
         if let Some(ref path) = p {
@@ -593,6 +611,8 @@ fn build_controller(config: &ClientConfig) -> (AdaptiveController, Option<PathBu
     // still drives fan-out inside each batch by re-reading
     // `controller.fetch.current()` in the decrypt callback.
 
+    #[cfg(not(feature = "native"))]
+    let persist_path = None;
     (controller, persist_path)
 }
 
@@ -612,8 +632,10 @@ pub struct Client {
     controller: AdaptiveController,
     /// Path the controller persists its snapshot to. `None` disables
     /// persistence (useful for tests / non-disk environments).
+    #[cfg(feature = "native")]
     persist_path: Option<PathBuf>,
     /// Path for the persistent client peer cache. `None` disables the cache.
+    #[cfg(feature = "native")]
     peer_cache_path: Option<PathBuf>,
     /// Peers that did not answer a settlement-versioned quote request, and are
     /// therefore asked in the legacy shape from now on.
@@ -676,8 +698,41 @@ pub struct Client {
 }
 
 impl Client {
+    /// Create a client using a platform network adapter.
+    #[must_use]
+    pub fn from_network(network: Network, config: ClientConfig) -> Self {
+        let (controller, _persist_path) = build_controller(&config);
+        Self {
+            config,
+            network,
+            wallet: None,
+            evm_network: None,
+            chunk_cache: ChunkCache::default(),
+            next_request_id: AtomicU64::new(1),
+            controller,
+            #[cfg(feature = "native")]
+            persist_path: _persist_path,
+            #[cfg(feature = "native")]
+            peer_cache_path: None,
+            unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
+            versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
+            settlement_refusals: SettlementRefusals::default(),
+        }
+    }
+
+    /// Keep compatibility decisions across browser operations whose network adapter
+    /// carries a per-operation payment network identity.
+    #[cfg(not(feature = "native"))]
+    pub(crate) fn with_shared_quote_state(mut self, session: &Self) -> Self {
+        self.unversioned_quote_peers = Arc::clone(&session.unversioned_quote_peers);
+        self.versioned_capable_peers = Arc::clone(&session.versioned_capable_peers);
+        self.settlement_refusals = session.settlement_refusals.clone();
+        self
+    }
+
     /// Create a client connected to the given P2P node.
     #[must_use]
+    #[cfg(feature = "native")]
     pub fn from_node(node: Arc<P2PNode>, config: ClientConfig) -> Self {
         Self::from_node_with_peer_cache(node, config, None)
     }
@@ -685,10 +740,11 @@ impl Client {
     /// Create a client connected to the given P2P node and attach an optional
     /// persistent peer cache path.
     #[must_use]
+    #[cfg(feature = "native")]
     pub fn from_node_with_peer_cache(
         node: Arc<P2PNode>,
         config: ClientConfig,
-        peer_cache_path: Option<PathBuf>,
+        #[cfg(feature = "native")] peer_cache_path: Option<PathBuf>,
     ) -> Self {
         let network = Network::from_node(node);
         let (controller, persist_path) = build_controller(&config);
@@ -718,8 +774,23 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if the P2P node cannot be created or bootstrapping fails.
+    #[cfg(feature = "native")]
     pub async fn connect(
         bootstrap_peers: &[std::net::SocketAddr],
+        config: ClientConfig,
+    ) -> Result<Self> {
+        let seeds: Vec<_> = bootstrap_peers
+            .iter()
+            .copied()
+            .map(ant_protocol::transport::MultiAddr::quic)
+            .collect();
+        Self::connect_multiaddrs(&seeds, config).await
+    }
+
+    /// Connect using native QUIC multiaddresses without discarding peer pins.
+    #[cfg(feature = "native")]
+    pub async fn connect_multiaddrs(
+        bootstrap_peers: &[ant_protocol::transport::MultiAddr],
         config: ClientConfig,
     ) -> Result<Self> {
         debug!(
@@ -728,7 +799,8 @@ impl Client {
             config.allow_loopback,
             config.ipv6,
         );
-        let network = Network::new(bootstrap_peers, config.allow_loopback, config.ipv6).await?;
+        let network =
+            Network::new_multiaddrs(bootstrap_peers, config.allow_loopback, config.ipv6).await?;
         let (controller, persist_path) = build_controller(&config);
         Ok(Self {
             config,
@@ -807,6 +879,7 @@ impl Client {
     /// Convenience pass-through to [`Network::health`] — the single
     /// write-readiness implementation shared by all embedded-client
     /// consumers (antd, ant-gui, ant-ffi, ant-tui).
+    #[cfg(feature = "native")]
     pub async fn network_health(&self) -> NetworkHealth {
         self.network.health().await
     }
@@ -815,6 +888,13 @@ impl Client {
     #[must_use]
     pub fn wallet(&self) -> Option<&Arc<Wallet>> {
         self.wallet.as_ref()
+    }
+
+    /// Set the in-memory cache budget for this client.
+    #[must_use]
+    pub fn with_chunk_cache(mut self, cache: ChunkCache) -> Self {
+        self.chunk_cache = cache;
+        self
     }
 
     /// Get a reference to the chunk cache.
@@ -836,6 +916,7 @@ impl Client {
     /// cold defaults. Best effort — failures log and are discarded.
     /// Idempotent. Safe to call from a Drop impl or an explicit
     /// shutdown hook.
+    #[cfg(feature = "native")]
     pub fn save_adaptive_snapshot(&self) {
         if let Some(ref path) = self.persist_path {
             adaptive::save_snapshot(path, self.controller.snapshot());
@@ -845,6 +926,7 @@ impl Client {
     /// Persist currently connected peers that have Direct-tagged addresses in
     /// the DHT. Best effort; failures are logged and do not affect the client
     /// operation that just completed.
+    #[cfg(feature = "native")]
     pub async fn save_peer_cache(&self) {
         if let Some(ref path) = self.peer_cache_path {
             let node = self.network().node();
@@ -950,8 +1032,10 @@ impl Client {
 /// write of ~50 bytes) is the right tradeoff for guaranteed
 /// persistence — BOUNDED by `DROP_SAVE_TIMEOUT` so a stalled
 /// network-mounted data dir cannot block process shutdown.
+#[cfg(feature = "native")]
 const DROP_SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+#[cfg(feature = "native")]
 impl Drop for Client {
     fn drop(&mut self) {
         let Some(path) = self.persist_path.clone() else {
