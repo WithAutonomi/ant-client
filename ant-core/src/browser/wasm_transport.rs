@@ -69,7 +69,12 @@ const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const MAX_BROWSER_ROUTING_ENTRIES: usize = 256;
 const MAX_BROWSER_ENDPOINT_FAILURES: usize = 256;
 const DEFAULT_BROWSER_QUOTE_CONCURRENCY: usize = 4;
-const MAX_DOWNLOAD_CONCURRENCY: usize = 6;
+// Reserve encrypted input, decrypted frame and decoded content for every
+// physical GET, including speculative reads. This bounds transient response
+// memory; full-file retention is a separate API-level cost.
+const MAX_READ_RESPONSE_MEMORY: usize = 128 * 1024 * 1024;
+const READ_RESPONSE_RESERVATION: usize =
+    3 * (MAX_BROWSER_RESPONSE_BYTES + PQ_ENCRYPTED_OVERHEAD_BYTES);
 const MAX_BROWSER_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_UPLOAD_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
@@ -129,6 +134,8 @@ struct PoolEntry {
 type DialFailures = Rc<RefCell<crate::client_engine::EndpointFailureCache<String>>>;
 
 struct BrowserClientPool {
+    read_budget: std::sync::Arc<crate::client_engine::read_budget::ReadBudget>,
+    fetch_limiter: RefCell<Option<crate::data::client::adaptive::Limiter>>,
     dial_failures: DialFailures,
     max_clients: usize,
     clients: RefCell<HashMap<String, PoolEntry>>,
@@ -254,6 +261,11 @@ impl BrowserClientPool {
         }
         let (availability_tx, _) = watch::channel(());
         Ok(Self {
+            read_budget: crate::client_engine::read_budget::ReadBudget::new(
+                MAX_READ_RESPONSE_MEMORY,
+                READ_RESPONSE_RESERVATION,
+            ),
+            fetch_limiter: RefCell::new(None),
             dial_failures: Rc::new(RefCell::new(
                 crate::client_engine::EndpointFailureCache::new(
                     ENDPOINT_FAILURE_COOLDOWN,
@@ -487,7 +499,16 @@ impl BrowserClientPool {
         }
     }
 
+    fn read_limit(&self) -> usize {
+        let desired = self.fetch_limiter.borrow().as_ref().map_or_else(
+            || crate::data::client::adaptive::ChannelStart::default().fetch,
+            |limiter| limiter.current(),
+        );
+        self.read_budget.limit(desired)
+    }
+
     fn close(&self) {
+        self.read_budget.close();
         self.availability.close();
         for (_, entry) in self.clients.borrow_mut().drain() {
             entry.client.close();
@@ -741,6 +762,7 @@ pub(super) struct BrowserNodeClientCore {
     association: SharedAssociation,
     connection: RefCell<Option<Connection>>,
     request_lock: Mutex<()>,
+    response_processing: Cell<Duration>,
     next_request_id: Cell<u64>,
     generation: Cell<u64>,
     hello: RefCell<Option<BrowserHello>>,
@@ -773,6 +795,7 @@ impl BrowserNodeClientCore {
             association: Rc::new(Mutex::new(Weak::new())),
             connection: RefCell::new(None),
             request_lock: Mutex::new(()),
+            response_processing: Cell::new(Duration::ZERO),
             next_request_id: Cell::new(1),
             generation: Cell::new(0),
             hello: RefCell::new(None),
@@ -1033,6 +1056,7 @@ impl LockedBrowserClient<'_> {
                 return Err(error);
             }
         };
+        let processing_started = web_time::Instant::now();
         let decrypt_result = {
             let connection = self.connection.borrow();
             let Some(connection) = connection.as_ref() else {
@@ -1067,6 +1091,7 @@ impl LockedBrowserClient<'_> {
             self.close();
             return Err(error.into());
         }
+        self.response_processing.set(processing_started.elapsed());
         // The complete response has been consumed and authenticated. An
         // ordinary application error can safely retain the session too.
         pending.completed = true;
@@ -2094,6 +2119,7 @@ impl BrowserNetworkClient {
                     MAX_RANGE_CACHE_BYTES / MAX_BROWSER_RECORD_BYTES,
                 )),
         );
+        *inner.pool.fetch_limiter.borrow_mut() = Some(shared.controller().fetch.clone());
         Ok(Self {
             inner,
             shared,
@@ -2122,14 +2148,14 @@ impl BrowserNetworkClient {
     pub async fn download_public_file(
         &self,
         file: JsValue,
-        concurrency: usize,
+        concurrency: Option<usize>,
         on_progress: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
         let file: BrowserPublicFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let progress = ProgressReporter::from_js(on_progress);
         let result = self
-            .download_public_file_inner(file, concurrency, &progress)
+            .download_public_file_inner(file, concurrency.unwrap_or(usize::MAX), &progress)
             .await
             .map_err(|error| JsValue::from_str(&error))?;
         serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
@@ -2314,13 +2340,16 @@ impl BrowserNetworkClient {
         if concurrency == 0 {
             return Err("download concurrency must be a positive integer".to_string());
         }
-        let concurrency = concurrency.min(MAX_DOWNLOAD_CONCURRENCY);
         let mut resolved = self.resolve_public_file(file, progress).await?;
         let content = self
             .shared
-            .data_download_with_progress(&resolved.root_data_map, concurrency, &|completed, total| {
-                progress.report(&format!("Downloaded chunk {completed}/{total}"));
-            })
+            .data_download_with_progress(
+                &resolved.root_data_map,
+                concurrency,
+                &|completed, total| {
+                    progress.report(&format!("Downloaded chunk {completed}/{total}"));
+                },
+            )
             .await
             .map_err(|error| error.to_string())?
             .to_vec();
@@ -2373,13 +2402,7 @@ impl BrowserNetworkClient {
                     .await
                     .map(|(content, _)| bytes::Bytes::from(content))
             },
-            &|| {
-                self.shared
-                    .controller()
-                    .fetch
-                    .current()
-                    .min(MAX_DOWNLOAD_CONCURRENCY)
-            },
+            &|| self.shared.controller().fetch.current(),
         )
         .await
         .map_err(|error| error.to_string())?;

@@ -83,7 +83,12 @@ test("shared Client rejects corrupt content immediately, matching native GET", a
   try {
     await assert.rejects(client.openPublicFile(datamap.address), /BLAKE3 mismatch/);
     const gets = rtc.requests.filter(request => request.method === "get_chunk");
-    assert.equal(gets.length, 1, "native GET treats a verified integrity failure as fatal");
+    // Discovery can finish while the first response yields to the event loop.
+    // The shared policy then permits one ordinary GET alongside the early GET.
+    assert.ok(gets.length >= 1 && gets.length <= 2, "at most the already-racing GETs may run");
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(rtc.requests.filter(request => request.method === "get_chunk").length, gets.length,
+      "integrity failure must cancel the race without fallback or retry");
   } finally { client.close(); }
 });
 
@@ -129,4 +134,14 @@ test("native shrunk DataMaps download and stream through the shared async engine
     reader.close();
     await assert.rejects(reader.readRange(0, 1), /closed/);
   } finally { reader?.close(); client.close(); }
+});
+
+test("omitting the download cap selects the shared adaptive scheduler", async () => {
+  const rtc = mockWebRtc([{}]);
+  for (const record of encrypted.records) rtc.stores[0].set(record.address, record.content);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const result = await client.downloadPublicFile(datamap.address, undefined);
+    assert.deepEqual(result.content, content);
+  } finally { client.close(); }
 });

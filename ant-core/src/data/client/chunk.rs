@@ -412,6 +412,7 @@ impl Client {
         peer_count: usize,
         #[cfg(feature = "native")] diag: Option<&ChunkFetchDiagnostics<'_>>,
     ) -> Result<Option<DataChunk>> {
+        let epoch = self.controller().fetch.observation_epoch();
         let started = Instant::now();
         let result = self
             .chunk_get_from_closest_peers_with_diagnostics(
@@ -427,9 +428,12 @@ impl Client {
             .ok()
             .and_then(Option::as_ref)
             .map_or(0, |chunk| chunk.content.len() as u64);
-        self.controller()
-            .fetch
-            .observe_with_bytes(chunk_get_outcome(&result), latency, bytes);
+        self.controller().fetch.observe_fetch_in_epoch(
+            chunk_get_outcome(&result),
+            latency,
+            bytes,
+            epoch,
+        );
         result
     }
 }

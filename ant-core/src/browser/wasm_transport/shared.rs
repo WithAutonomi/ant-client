@@ -250,6 +250,25 @@ impl BrowserNetwork for SharedNetworkAdapter {
                     assert_upload_node(&hello, &network).map_err(DataError::Network)?;
                 }
             }
+            let is_read = matches!(&request.body, ChunkMessageBody::GetRequest(_));
+            // Reserve after taking the peer lock, so requests queued behind
+            // the same peer cannot monopolize all physical read reservations.
+            let _read_permit = if is_read {
+                Some(
+                    crate::runtime::timeout(
+                        admission.remaining(),
+                        self.inner
+                            .pool
+                            .read_budget
+                            .acquire(|| self.inner.pool.read_limit()),
+                    )
+                    .await
+                    .map_err(|_| DataError::Timeout("read admission timed out".into()))?
+                    .map_err(|error| DataError::Network(error.into()))?,
+                )
+            } else {
+                None
+            };
             let bytes = request
                 .encode()
                 .map_err(|e| DataError::Protocol(e.to_string()))?;
@@ -262,6 +281,8 @@ impl BrowserNetwork for SharedNetworkAdapter {
                     "expected chunk_protocol response".into(),
                 ));
             }
+            let transport_processing = client.response_processing.get();
+            let decode_started = web_time::Instant::now();
             let response = ChunkMessage::decode(&response.content)
                 .map_err(|e| DataError::Protocol(e.to_string()))?;
             if response.request_id != request.request_id {
@@ -282,6 +303,18 @@ impl BrowserNetwork for SharedNetworkAdapter {
                         reliability: 1.0,
                         webrtc_direct: Some(endpoint),
                     },
+                );
+            }
+            if is_read {
+                let processing = transport_processing + decode_started.elapsed();
+                drop(client);
+                // Yield between bulk responses, then measure local event-loop
+                // lateness separately from network/discovery service time.
+                let yielded = web_time::Instant::now();
+                TimeoutFuture::new(0).await;
+                self.inner.pool.read_budget.observe_processing(
+                    processing.max(yielded.elapsed()),
+                    self.inner.pool.read_limit(),
                 );
             }
             Ok(response)

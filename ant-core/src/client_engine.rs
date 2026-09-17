@@ -2,6 +2,8 @@
 
 pub(crate) mod files;
 pub(crate) mod read;
+#[cfg(any(test, not(feature = "native")))]
+pub(crate) mod read_budget;
 
 use futures_util::{stream, stream::FuturesUnordered, Stream, StreamExt as _};
 #[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]

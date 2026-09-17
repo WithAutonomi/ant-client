@@ -12,6 +12,55 @@ use saorsa_transport::webrtc::{
     accept_pq_session, encode_response_frame, parse_request_frame, BrowserResponse,
 };
 
+/// Run independent peer reads through the real adapter's physical GET gate.
+#[wasm_bindgen]
+pub async fn test_budgeted_reads(endpoints: JsValue, close_early: bool) -> JsValue {
+    use crate::data::network::BrowserNetwork;
+    let endpoints: Vec<String> = serde_wasm_bindgen::from_value(endpoints).unwrap();
+    let core = Rc::new(
+        BrowserNetworkCore::new(
+            endpoints
+                .iter()
+                .map(|endpoint| BrowserEndpoint {
+                    multiaddr: endpoint.clone(),
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let adapter = SharedNetworkAdapter::new(Rc::clone(&core));
+    let requests = endpoints.iter().map(|endpoint| {
+        let adapter = &adapter;
+        async move {
+            let parsed = parse_webrtc_direct_multiaddr(endpoint).unwrap();
+            let peer = PeerId::from_hex(&parsed.peer_id).unwrap();
+            adapter
+                .request(
+                    &peer,
+                    &[endpoint.parse().unwrap()],
+                    ant_protocol::ChunkMessage {
+                        request_id: 1,
+                        body: ant_protocol::ChunkMessageBody::GetRequest(
+                            ant_protocol::ChunkGetRequest::new([1; 32]),
+                        ),
+                    },
+                    Duration::from_secs(1),
+                )
+                .await
+                .is_ok()
+        }
+    });
+    let close = async {
+        if close_early {
+            crate::runtime::sleep(Duration::from_millis(50)).await;
+            core.pool.close();
+        }
+    };
+    let (results, ()) = futures::future::join(futures::future::join_all(requests), close).await;
+    core.pool.close();
+    serde_wasm_bindgen::to_value(&results).unwrap()
+}
+
 /// Exercise independent RPC lanes, channel-local cancellation and reuse of the
 /// shared association. Each lane authenticates its own PQ session and HELLO.
 #[wasm_bindgen]

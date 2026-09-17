@@ -99,6 +99,10 @@ const HILL_STRESS_DECREASE_DIVISOR: usize = 2;
 /// a partial higher-cap wave.
 const HILL_EPOCH_FULL_WAVES: usize = 2;
 
+// Slow links must not wait for 32 completed chunks before learning. A timed
+// epoch still needs the minimum evidence and two full waves at its current cap.
+const HILL_EPOCH_MAX_DURATION: Duration = Duration::from_secs(2);
+
 /// Lock helper matching the project pattern (see `cache::ChunkCache`):
 /// poisoned mutexes still yield the inner state rather than panicking.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -466,6 +470,7 @@ pub struct Limiter {
 
 #[derive(Debug)]
 struct LimiterInner {
+    observation_epoch: u64,
     /// Current concurrency cap returned by `current()`.
     current: usize,
     /// Sliding window of recent outcomes.
@@ -512,6 +517,7 @@ impl Limiter {
         let window_cap = config.window_ops;
         Self {
             inner: Arc::new(Mutex::new(LimiterInner {
+                observation_epoch: 0,
                 current: clamped,
                 window: VecDeque::with_capacity(window_cap),
                 samples_since_increase: 0,
@@ -547,6 +553,27 @@ impl Limiter {
         self.observe_with_timing(outcome, latency, bytes, operation_started);
     }
 
+    pub(crate) fn observation_epoch(&self) -> u64 {
+        lock(&self.inner).observation_epoch
+    }
+
+    pub(crate) fn observe_fetch_in_epoch(
+        &self,
+        outcome: Outcome,
+        latency: Duration,
+        bytes: u64,
+        epoch: u64,
+    ) {
+        let now = Instant::now();
+        self.observe_with_timing_in_epoch(
+            outcome,
+            latency,
+            bytes,
+            now.checked_sub(latency).unwrap_or(now),
+            Some(epoch),
+        );
+    }
+
     fn observe_with_timing(
         &self,
         outcome: Outcome,
@@ -554,15 +581,34 @@ impl Limiter {
         bytes: u64,
         operation_started: Instant,
     ) {
+        self.observe_with_timing_in_epoch(outcome, latency, bytes, operation_started, None);
+    }
+
+    fn observe_with_timing_in_epoch(
+        &self,
+        outcome: Outcome,
+        latency: Duration,
+        bytes: u64,
+        operation_started: Instant,
+        expected_epoch: Option<u64>,
+    ) {
         if !self.config.enabled {
             return;
         }
         let mut g = lock(&self.inner);
+        // Work launched at a different concurrency cannot train this probe.
+        // Cancellation remains unobserved, and epochs change only with the cap.
+        if self.algorithm == LimiterAlgorithm::ThroughputHillClimb
+            && expected_epoch.is_some_and(|epoch| epoch != g.observation_epoch)
+        {
+            return;
+        }
         if g.window.len() == self.config.window_ops {
             g.window.pop_front();
         }
         g.window.push_back(Sample { outcome, latency });
         if self.algorithm == LimiterAlgorithm::ThroughputHillClimb {
+            let previous_cap = g.current;
             observe_hill_climb(
                 &mut g,
                 outcome,
@@ -571,6 +617,9 @@ impl Limiter {
                 operation_started,
                 &self.config,
             );
+            if g.current != previous_cap {
+                g.observation_epoch = g.observation_epoch.wrapping_add(1);
+            }
             return;
         }
         g.samples_since_increase = g.samples_since_increase.saturating_add(1);
@@ -611,6 +660,7 @@ impl Limiter {
         );
         let mut g = lock(&self.inner);
         g.current = clamped;
+        g.observation_epoch = g.observation_epoch.wrapping_add(1);
         g.left_slow_start = clamped >= self.config.slow_start_ramp_threshold;
         g.hill = HillClimbState::new(clamped, self.config.window_ops);
     }
@@ -832,7 +882,15 @@ fn observe_hill_climb(
         return;
     }
 
-    if inner.hill.epoch_samples < hill_epoch_target_samples(inner.current, cfg) {
+    let minimum = cfg
+        .min_window_ops
+        .max(inner.current.saturating_mul(HILL_EPOCH_FULL_WAVES));
+    let timed_epoch = inner.hill.epoch_samples >= minimum
+        && inner
+            .hill
+            .epoch_started
+            .is_some_and(|started| started.elapsed() >= HILL_EPOCH_MAX_DURATION);
+    if !timed_epoch && inner.hill.epoch_samples < hill_epoch_target_samples(inner.current, cfg) {
         return;
     }
 
@@ -1257,6 +1315,7 @@ impl Default for AdaptiveController {
 /// cancel, observe on completion" — callers that need to keep
 /// fail-fast batches drained for full signal use `rebucketed`.
 struct ObserveGuard<'a> {
+    epoch: u64,
     limiter: &'a Limiter,
     started: Instant,
     outcome: Option<(Outcome, Duration, u64)>,
@@ -1265,6 +1324,7 @@ struct ObserveGuard<'a> {
 impl<'a> ObserveGuard<'a> {
     fn new(limiter: &'a Limiter) -> Self {
         Self {
+            epoch: limiter.observation_epoch(),
             limiter,
             started: Instant::now(),
             outcome: None,
@@ -1282,8 +1342,13 @@ impl<'a> ObserveGuard<'a> {
 impl Drop for ObserveGuard<'_> {
     fn drop(&mut self) {
         if let Some((outcome, latency, bytes)) = self.outcome.take() {
-            self.limiter
-                .observe_with_timing(outcome, latency, bytes, self.started);
+            self.limiter.observe_with_timing_in_epoch(
+                outcome,
+                latency,
+                bytes,
+                self.started,
+                Some(self.epoch),
+            );
         }
     }
 }
@@ -1731,6 +1796,51 @@ mod tests {
             latency_inflation_factor: l.latency_inflation_factor,
             latency_ewma_alpha: l.latency_ewma_alpha,
         }
+    }
+
+    #[test]
+    fn timed_fetch_epochs_require_evidence_and_ignore_previous_caps() {
+        let limiter = AdaptiveController::default().fetch;
+        let initial = limiter.observation_epoch();
+        for _ in 0..7 {
+            limiter.observe_fetch_in_epoch(
+                Outcome::Success,
+                Duration::from_secs(3),
+                1024 * 1024,
+                initial,
+            );
+        }
+        assert_eq!(limiter.current(), 4);
+        limiter.observe_fetch_in_epoch(
+            Outcome::Success,
+            Duration::from_secs(3),
+            1024 * 1024,
+            initial,
+        );
+        assert_eq!(
+            limiter.current(),
+            5,
+            "a slow epoch must learn before 32 completions"
+        );
+        let next = limiter.observation_epoch();
+        assert_ne!(next, initial);
+        limiter.observe_fetch_in_epoch(Outcome::Timeout, Duration::from_secs(10), 0, initial);
+        assert_eq!(
+            lock(&limiter.inner).hill.epoch_samples,
+            0,
+            "old work cannot train the new probe"
+        );
+        limiter.observe_fetch_in_epoch(Outcome::Success, Duration::from_secs(3), 1024 * 1024, next);
+        assert_eq!(lock(&limiter.inner).hill.epoch_samples, 1);
+    }
+
+    #[test]
+    fn fast_fetch_epochs_keep_the_full_sample_window() {
+        let limiter = AdaptiveController::default().fetch;
+        for _ in 0..8 {
+            limiter.observe_with_bytes(Outcome::Success, Duration::from_millis(1), 1024);
+        }
+        assert_eq!(limiter.current(), 4);
     }
 
     #[test]

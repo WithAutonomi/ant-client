@@ -48,6 +48,15 @@ failed discovery does not exclude a known holder from direct GET. File batches
 retry only missing records, immediately once and then after 15 and 45 seconds,
 as native file downloads do. Browser concurrency and range-memory limits remain
 platform-specific ceilings on the shared adaptive scheduler.
+Omitting the WASM download concurrency uses that scheduler automatically;
+an explicit value remains a ceiling. Fetch epochs can learn after two seconds
+and at least two completed waves (minimum eight samples), on both native and
+WASM. In-flight work from a previous concurrency does not train a new probe.
+Browser physical GETs, including speculative reads, also reserve worst-case
+response bytes from a 128 MiB transient budget. Response processing and event-loop
+lateness above 50 ms reduce local admission, with gradual recovery after healthy
+responses. This does not bound complete-file storage or reconstruction memory;
+range reads remain preferable for large media.
 
 Upload discovery follows native's witnessed lookup contract: request twenty
 initial responders and, if that lookup fails, retry at seven. Both attempts
