@@ -53,9 +53,10 @@ an explicit value remains a ceiling. Fetch epochs can learn after two seconds
 and at least two completed waves (minimum eight samples), on both native and
 WASM. In-flight work from a previous concurrency does not train a new probe.
 Browser physical GETs, including speculative reads, also reserve worst-case
-response bytes from a 128 MiB transient budget. Response processing and event-loop
-lateness above 50 ms reduce local admission, with gradual recovery after healthy
-responses. This does not bound complete-file storage or reconstruction memory;
+response bytes from a 128 MiB transient budget. Sustained GET processing above half
+the event loop, with repeated processing or scheduling stalls above 50 ms, reduces
+local admission. Eight-response windows avoid reacting to isolated slow responses
+or background timer clamping; healthy windows recover gradually. This does not bound complete-file storage or reconstruction memory;
 range reads remain preferable for large media.
 
 Upload discovery follows native's witnessed lookup contract: request twenty

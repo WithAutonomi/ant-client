@@ -3,17 +3,21 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
+use web_time::Instant;
 
 // A responsiveness target, not a device throughput assumption. Recovery needs
 // several healthy observations so a single small response cannot undo stress.
 const PROCESSING_TARGET: Duration = Duration::from_millis(50);
-const HEALTHY_RECOVERY_SAMPLES: usize = 8;
+const PROCESSING_WINDOW_SAMPLES: usize = 8;
 
 struct State {
     active: usize,
     queued: usize,
     processing_cap: usize,
-    healthy: usize,
+    processing_started: Option<Instant>,
+    processing_time: Duration,
+    processing_samples: usize,
+    slow_samples: usize,
     closed: bool,
 }
 
@@ -32,7 +36,10 @@ impl ReadBudget {
                 active: 0,
                 queued: 0,
                 processing_cap: capacity,
-                healthy: 0,
+                processing_started: None,
+                processing_time: Duration::ZERO,
+                processing_samples: 0,
+                slow_samples: 0,
                 closed: false,
             }),
             capacity,
@@ -62,6 +69,7 @@ impl ReadBudget {
                     return Err("read admission is closed");
                 }
                 if state.active < cap {
+                    state.processing_started.get_or_insert_with(Instant::now);
                     state.active += 1;
                     drop(state);
                     drop(queued);
@@ -77,20 +85,48 @@ impl ReadBudget {
         }
     }
 
-    /// CPU work and event-loop lateness are local pressure. Service/lookup
-    /// latency is deliberately not used: a slow remote peer is not a slow CPU.
-    pub(crate) fn observe_processing(&self, processing: Duration, desired: usize) {
+    /// Reduce concurrency only for sustained CPU occupation with responsiveness
+    /// stalls. A single slow response cannot get cheaper by serializing network
+    /// waits, and timer clamping alone is not evidence of CPU saturation.
+    pub(crate) fn observe_processing(
+        &self,
+        processing: Duration,
+        event_loop_delay: Duration,
+        desired: usize,
+    ) {
+        self.observe_processing_at(processing, event_loop_delay, desired, Instant::now());
+    }
+
+    fn observe_processing_at(
+        &self,
+        processing: Duration,
+        event_loop_delay: Duration,
+        desired: usize,
+        now: Instant,
+    ) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if processing > PROCESSING_TARGET {
-            state.processing_cap = (desired.min(state.processing_cap).max(1) / 2).max(1);
-            state.healthy = 0;
-        } else {
-            state.healthy += 1;
-            if state.healthy >= HEALTHY_RECOVERY_SAMPLES {
-                state.processing_cap = (state.processing_cap + 1).min(self.capacity);
-                state.healthy = 0;
-            }
+        let started = *state.processing_started.get_or_insert(now);
+        state.processing_time = state.processing_time.saturating_add(processing);
+        state.processing_samples += 1;
+        if processing.max(event_loop_delay) > PROCESSING_TARGET {
+            state.slow_samples += 1;
         }
+        if state.processing_samples < PROCESSING_WINDOW_SAMPLES {
+            return;
+        }
+        // Reserve at least half the event loop for other browser work when GET
+        // processing is actually busy. Eight observations prevent one burst
+        // from repeatedly halving the cap using the same in-flight cohort.
+        let busy = state.processing_time > now.saturating_duration_since(started) / 2;
+        if busy && state.slow_samples >= 2 {
+            state.processing_cap = (desired.min(state.processing_cap).max(1) / 2).max(1);
+        } else {
+            state.processing_cap = (state.processing_cap + 1).min(self.capacity);
+        }
+        state.processing_started = (state.active > 1).then_some(now);
+        state.processing_time = Duration::ZERO;
+        state.processing_samples = 0;
+        state.slow_samples = 0;
         drop(state);
         self.changed.send_replace(());
     }
@@ -155,19 +191,51 @@ mod tests {
         assert_eq!(budget.state.lock().unwrap().active, 0);
     }
 
+    fn processing_window(
+        budget: &ReadBudget,
+        cpu_ms: u64,
+        interval_ms: u64,
+        delay_ms: u64,
+        desired: usize,
+    ) {
+        let started = Instant::now();
+        budget.state.lock().unwrap().processing_started = Some(started);
+        for i in 1..=PROCESSING_WINDOW_SAMPLES {
+            budget.observe_processing_at(
+                Duration::from_millis(cpu_ms),
+                Duration::from_millis(delay_ms),
+                desired,
+                started + Duration::from_millis(interval_ms * i as u64),
+            );
+        }
+    }
+
     #[test]
     fn processing_pressure_can_reduce_to_one_and_recovers_gradually() {
         let budget = ReadBudget::new(100, 10);
-        budget.observe_processing(Duration::from_millis(80), 4);
+        processing_window(&budget, 80, 100, 0, 4);
         assert_eq!(budget.limit(256), 2);
-        budget.observe_processing(Duration::from_millis(80), 4);
+        processing_window(&budget, 80, 100, 0, 4);
         assert_eq!(budget.limit(256), 1);
         for _ in 0..7 {
-            budget.observe_processing(Duration::from_millis(2), 4);
+            budget.observe_processing(Duration::from_millis(2), Duration::ZERO, 4);
         }
         assert_eq!(budget.limit(256), 1);
-        budget.observe_processing(Duration::from_millis(2), 4);
+        budget.observe_processing(Duration::from_millis(2), Duration::ZERO, 4);
         assert_eq!(budget.limit(256), 2);
+    }
+
+    #[test]
+    fn isolated_slow_responses_and_timer_clamping_do_not_serialize_network_waits() {
+        let budget = ReadBudget::new(100, 10);
+        processing_window(&budget, 80, 1000, 0, 4);
+        assert_eq!(
+            budget.limit(4),
+            4,
+            "8% CPU occupancy leaves room for concurrent I/O"
+        );
+        processing_window(&budget, 2, 1000, 1000, 4);
+        assert_eq!(budget.limit(4), 4, "a clamped timer is not CPU saturation");
     }
 
     #[test]
@@ -175,7 +243,7 @@ mod tests {
         let budget = ReadBudget::new(100, 10);
         let a = block_on(budget.acquire(|| 2)).unwrap();
         let b = block_on(budget.acquire(|| 2)).unwrap();
-        budget.observe_processing(Duration::from_millis(80), 2);
+        processing_window(&budget, 80, 100, 0, 2);
         assert_eq!(budget.state.lock().unwrap().active, 2);
         let mut wait = Box::pin(budget.acquire(|| 2));
         assert!(wait.as_mut().now_or_never().is_none());

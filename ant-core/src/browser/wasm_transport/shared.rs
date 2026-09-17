@@ -313,7 +313,8 @@ impl BrowserNetwork for SharedNetworkAdapter {
                 let yielded = web_time::Instant::now();
                 TimeoutFuture::new(0).await;
                 self.inner.pool.read_budget.observe_processing(
-                    processing.max(yielded.elapsed()),
+                    processing,
+                    yielded.elapsed(),
                     self.inner.pool.read_limit(),
                 );
             }
