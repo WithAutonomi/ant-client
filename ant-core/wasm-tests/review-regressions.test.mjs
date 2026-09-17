@@ -66,7 +66,7 @@ test("dead discovered candidates never starve the authenticated seed cache", asy
         const peer = (round * 20 + i + 1).toString(16).padStart(64, "0");
         return { peer_id: peer, native_addresses: [], reliability: 1, webrtc_direct: { multiaddr: prefix + peer } };
       });
-      for (const connection of rtc.connections) if (connection.channel?.index === 0) connection.channel.server?.set_closest_peers(options[0].peers);
+      for (const connection of rtc.connections) for (const channel of connection.channels) if (channel.index === 0) channel.server?.set_closest_peers(options[0].peers);
       const previous = rtc.requests.filter(request => request.method === "find_node" && request.node === 0).length;
       const result = await client.findClosest("00".repeat(32));
       assert.ok(result.nodes.length > 0);

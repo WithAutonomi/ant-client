@@ -619,7 +619,7 @@ test("partial storage in the first wave still pays and stores the second wave", 
     if (signer.calls.length === 2) {
       for (const option of options) delete option.putError;
       for (const connection of rtc.connections) {
-        connection.channel.server?.set_put_error("", "");
+        for (const channel of connection.channels) channel.server?.set_put_error("", "");
       }
     }
     return receipt;

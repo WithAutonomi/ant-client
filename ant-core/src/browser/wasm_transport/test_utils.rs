@@ -12,6 +12,107 @@ use saorsa_transport::webrtc::{
     accept_pq_session, encode_response_frame, parse_request_frame, BrowserResponse,
 };
 
+/// Exercise independent RPC lanes, channel-local cancellation and reuse of the
+/// shared association. Each lane authenticates its own PQ session and HELLO.
+#[wasm_bindgen]
+pub async fn test_parallel_lanes(endpoint: &str, cancel_lane: &str) -> JsValue {
+    let pool = BrowserClientPool::new(1).unwrap();
+    let endpoint = BrowserEndpoint {
+        multiaddr: endpoint.into(),
+    };
+    let control = pool.client(&endpoint).await.unwrap();
+    if cancel_lane != "cold" {
+        control.hello().await.unwrap();
+    }
+    let data = pool
+        .data_client_before(&endpoint, TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
+        .await
+        .unwrap();
+    if cancel_lane != "cold" {
+        data.hello().await.unwrap();
+    }
+    let start = web_time::Instant::now();
+    let get = || async {
+        data.authenticated()
+            .await
+            .map_err(|e| e.to_string())?
+            .request(
+                BrowserRequestBody::GetChunk {
+                    address: "11".repeat(32),
+                },
+                &[],
+            )
+            .await
+            .map(|_| ())
+    };
+    let first_control = async {
+        let target = "11".repeat(32);
+        let call = control.find_node(&target, 20);
+        let result = if cancel_lane == "control" {
+            crate::runtime::timeout(Duration::from_millis(20), call)
+                .await
+                .map_err(|_| "cancelled".to_string())
+                .and_then(|value| value)
+        } else {
+            call.await
+        };
+        serde_json::json!({ "ms": start.elapsed().as_millis() as u64, "result": result.map(|_| "ok".to_string()).unwrap_or_else(|e| e) })
+    };
+    let first_data = async {
+        let result = if cancel_lane == "data" {
+            crate::runtime::timeout(Duration::from_millis(20), get())
+                .await
+                .map_err(|_| "cancelled".to_string())
+                .and_then(|value| value)
+        } else {
+            get().await
+        };
+        serde_json::json!({ "ms": start.elapsed().as_millis() as u64, "result": result.map(|_| "ok".to_string()).unwrap_or_else(|e| e) })
+    };
+    let closer = async {
+        if cancel_lane == "close" {
+            crate::runtime::sleep(Duration::from_millis(20)).await;
+            pool.close();
+        }
+    };
+    let ((control_result, data_result), ()) =
+        futures::future::join(futures::future::join(first_control, first_data), closer).await;
+    if cancel_lane != "close" {
+        control.find_node(&"22".repeat(32), 20).await.unwrap();
+        get().await.unwrap();
+    }
+    pool.close();
+    serde_wasm_bindgen::to_value(
+        &serde_json::json!({ "control": control_result, "data": data_result }),
+    )
+    .unwrap()
+}
+
+#[wasm_bindgen]
+pub async fn test_active_data_lane_capacity(endpoints: JsValue) {
+    let endpoints: Vec<String> = serde_wasm_bindgen::from_value(endpoints).unwrap();
+    let pool = BrowserClientPool::new(1).unwrap();
+    let first = BrowserEndpoint {
+        multiaddr: endpoints[0].clone(),
+    };
+    let second = BrowserEndpoint {
+        multiaddr: endpoints[1].clone(),
+    };
+    let data = pool
+        .data_client_before(&first, TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
+        .await
+        .unwrap();
+    data.hello().await.unwrap();
+    assert!(pool
+        .client_before(&second, TransferDeadline::new(Duration::from_millis(20)))
+        .await
+        .is_err());
+    data.hello().await.unwrap();
+    drop(data);
+    pool.client(&second).await.unwrap().hello().await.unwrap();
+    pool.close();
+}
+
 /// Abandon an admitted lookup exactly as the iterative lookup grace timer does.
 /// A subsequent lookup must reuse the drained session or the actual dial error.
 #[wasm_bindgen]
@@ -855,13 +956,15 @@ pub async fn test_pooled_requests(
     let peer = ant_protocol::transport::PeerId::from_hex(&parsed.peer_id).unwrap();
     let addresses = vec![parsed.multiaddr.parse().unwrap()];
     if warm {
-        core.pool
-            .client(&endpoint)
-            .await
-            .unwrap()
-            .hello()
-            .await
-            .unwrap();
+        let lease = if upload {
+            core.pool.client(&endpoint).await.unwrap()
+        } else {
+            core.pool
+                .data_client_before(&endpoint, TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
+                .await
+                .unwrap()
+        };
+        lease.hello().await.unwrap();
     }
     before.call0(&JsValue::NULL)?;
     let started = web_time::Instant::now();

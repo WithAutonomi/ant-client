@@ -210,12 +210,22 @@ impl BrowserNetwork for SharedNetworkAdapter {
             if parsed.peer_id != peer.to_hex() {
                 return Err(DataError::Network("endpoint peer mismatch".into()));
             }
-            let client = self
-                .inner
-                .pool
-                .client_before(&endpoint, TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
-                .await
-                .map_err(rpc_data_error)?;
+            // Bulk records cannot hold the discovery/quote lane's RPC lock.
+            // The node already accepts two independently authenticated channels
+            // on one association; application request/witness semantics stay intact.
+            let admission = TransferDeadline::new(RPC_ADMISSION_TIMEOUT);
+            let client = if matches!(
+                &request.body,
+                ChunkMessageBody::GetRequest(_) | ChunkMessageBody::PutRequest(_)
+            ) {
+                self.inner
+                    .pool
+                    .data_client_before(&endpoint, admission)
+                    .await
+            } else {
+                self.inner.pool.client_before(&endpoint, admission).await
+            }
+            .map_err(rpc_data_error)?;
             let client = client.authenticated().await.map_err(rpc_data_error)?;
             let hello = client
                 .hello

@@ -96,3 +96,10 @@ Early misses do not establish absence, peers are deduplicated within a round,
 and a slow early GET can race a different final holder. Native seeds this shared
 policy from its routing table; WebRTC also publishes validated lookup replies
 as they arrive. Write discovery and witness admission remain unchanged.
+
+`parallel-lanes.test.mjs` checks the two-channel transport profile: discovery and
+quotes use the control channel; GET/PUT use an independent authenticated data
+channel on the same ICE association. Slow transfers, cancellation and malformed
+frames cannot consume the other channel's response or invalidate its PQ session.
+Pool limits count peers with up to two live channels each; eviction checks active
+leases on both lanes. Nodes must allow the standard two channels per connection.

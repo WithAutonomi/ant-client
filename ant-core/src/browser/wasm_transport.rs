@@ -43,7 +43,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Deref;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
 use tokio::sync::watch;
 use wasm_bindgen::prelude::*;
@@ -122,6 +122,7 @@ impl BrowserLookupCandidate {
 
 struct PoolEntry {
     client: Rc<BrowserNodeClientCore>,
+    data_client: Rc<BrowserNodeClientCore>,
     last_used: u64,
 }
 
@@ -283,6 +284,23 @@ impl BrowserClientPool {
         endpoint: &BrowserEndpoint,
         admission: TransferDeadline,
     ) -> Result<BrowserClientLease, RpcError> {
+        self.client_on_lane(endpoint, admission, false).await
+    }
+
+    async fn data_client_before(
+        &self,
+        endpoint: &BrowserEndpoint,
+        admission: TransferDeadline,
+    ) -> Result<BrowserClientLease, RpcError> {
+        self.client_on_lane(endpoint, admission, true).await
+    }
+
+    async fn client_on_lane(
+        &self,
+        endpoint: &BrowserEndpoint,
+        admission: TransferDeadline,
+        data_lane: bool,
+    ) -> Result<BrowserClientLease, RpcError> {
         if admission.remaining().is_zero() {
             return Err(RpcError::Timeout(
                 "WebRTC pool admission deadline expired".into(),
@@ -290,7 +308,7 @@ impl BrowserClientPool {
         }
         crate::runtime::timeout(
             admission.remaining(),
-            self.wait_for_client(endpoint, admission),
+            self.wait_for_client(endpoint, admission, data_lane),
         )
         .await
         .map_err(|_| {
@@ -303,6 +321,7 @@ impl BrowserClientPool {
         &self,
         endpoint: &BrowserEndpoint,
         admission: TransferDeadline,
+        data_lane: bool,
     ) -> Result<BrowserClientLease, String> {
         let endpoint = parse_webrtc_direct_multiaddr(&endpoint.multiaddr)
             .map_err(|error| error.to_string())?;
@@ -319,17 +338,25 @@ impl BrowserClientPool {
                 let mut clients = self.clients.borrow_mut();
                 if let Some(entry) = clients.get_mut(&key) {
                     entry.last_used = now;
-                    Some(Rc::clone(&entry.client))
+                    Some(Rc::clone(if data_lane {
+                        &entry.data_client
+                    } else {
+                        &entry.client
+                    }))
                 } else {
                     if clients.len() >= self.max_clients {
                         let evict = clients
                             .iter()
-                            .filter(|(_, entry)| Rc::strong_count(&entry.client) == 1)
+                            .filter(|(_, entry)| {
+                                Rc::strong_count(&entry.client) == 1
+                                    && Rc::strong_count(&entry.data_client) == 1
+                            })
                             .min_by_key(|(_, entry)| entry.last_used)
                             .map(|(key, _)| key.clone());
                         if let Some(evict) = evict {
                             if let Some(entry) = clients.remove(&evict) {
                                 entry.client.close();
+                                entry.data_client.close();
                             }
                         }
                     }
@@ -337,15 +364,21 @@ impl BrowserClientPool {
                         let mut client = BrowserNodeClientCore::new(endpoint.clone());
                         client.dial_failures = Some(Rc::clone(&self.dial_failures));
                         client.pool_availability = Some(Rc::clone(&self.availability));
+                        let mut data_client = BrowserNodeClientCore::new(endpoint.clone());
+                        data_client.association = Rc::clone(&client.association);
+                        data_client.dial_failures = Some(Rc::clone(&self.dial_failures));
+                        data_client.pool_availability = Some(Rc::clone(&self.availability));
+                        let data_client = Rc::new(data_client);
                         let client = Rc::new(client);
                         clients.insert(
                             key.clone(),
                             PoolEntry {
                                 client: Rc::clone(&client),
+                                data_client: Rc::clone(&data_client),
                                 last_used: now,
                             },
                         );
-                        Some(client)
+                        Some(if data_lane { data_client } else { client })
                     } else {
                         None
                     }
@@ -458,6 +491,7 @@ impl BrowserClientPool {
         self.availability.close();
         for (_, entry) in self.clients.borrow_mut().drain() {
             entry.client.close();
+            entry.data_client.close();
         }
     }
 }
@@ -483,8 +517,39 @@ struct BrowserPutResponse {
     already_stored: bool,
 }
 
+/// Two independent authenticated channels share ICE/DTLS/SCTP. Dropping a
+/// cancelled exchange retires only its channel; the other lane remains usable.
+struct PeerAssociation {
+    connection: RtcPeerConnection,
+    channels: RefCell<Vec<RtcDataChannel>>,
+}
+
+impl Deref for PeerAssociation {
+    type Target = RtcPeerConnection;
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl PeerAssociation {
+    fn has_open_channel(&self) -> bool {
+        self.channels
+            .borrow()
+            .iter()
+            .any(|channel| channel.ready_state() == RtcDataChannelState::Open)
+    }
+}
+
+impl Drop for PeerAssociation {
+    fn drop(&mut self) {
+        self.connection.close();
+    }
+}
+
+type SharedAssociation = Rc<Mutex<Weak<PeerAssociation>>>;
+
 struct Connection {
-    peer_connection: RtcPeerConnection,
+    peer_connection: Rc<PeerAssociation>,
     data_channel: RtcDataChannel,
     inbox: Rc<ResponseInbox>,
     pq_session: RefCell<Option<PqSession>>,
@@ -495,11 +560,42 @@ struct Connection {
 }
 
 impl Connection {
-    async fn open(endpoint: &WebRtcDirectEndpoint) -> Result<Self, String> {
-        let configuration = RtcConfiguration::new();
-        configuration.set_ice_servers(&Array::new());
-        let peer_connection =
-            RtcPeerConnection::new_with_configuration(&configuration).map_err(js_error_message)?;
+    async fn open(
+        endpoint: &WebRtcDirectEndpoint,
+        source: &SharedAssociation,
+        attempted_dial: &Cell<bool>,
+    ) -> Result<Self, String> {
+        // Serialize only setup. Each lane has its own RPC lock, inbox, request
+        // IDs and PQ session; no stream cipher/response state is shared.
+        let mut association = source.lock().await;
+        let existing = association
+            .upgrade()
+            .filter(|connection| connection.has_open_channel());
+        let fresh = existing.is_none();
+        attempted_dial.set(fresh);
+        let peer_connection = if let Some(existing) = existing {
+            existing
+        } else {
+            let configuration = RtcConfiguration::new();
+            configuration.set_ice_servers(&Array::new());
+            Rc::new(PeerAssociation {
+                connection: RtcPeerConnection::new_with_configuration(&configuration)
+                    .map_err(js_error_message)?,
+                channels: RefCell::new(Vec::new()),
+            })
+        };
+        // Wait for a retired lane to finish closing before replacing it. The
+        // server admits two channels, including channels still unwinding.
+        while peer_connection
+            .channels
+            .borrow()
+            .iter()
+            .filter(|channel| channel.ready_state() != RtcDataChannelState::Closed)
+            .count()
+            >= 2
+        {
+            crate::runtime::sleep(Duration::from_millis(10)).await;
+        }
         let channel_configuration = RtcDataChannelInit::new();
         channel_configuration.set_ordered(true);
         let data_channel = peer_connection.create_data_channel_with_data_channel_dict(
@@ -507,37 +603,48 @@ impl Connection {
             &channel_configuration,
         );
         data_channel.set_binary_type(RtcDataChannelType::Arraybuffer);
+        {
+            let mut channels = peer_connection.channels.borrow_mut();
+            channels.retain(|channel| channel.ready_state() != RtcDataChannelState::Closed);
+            channels.push(data_channel.clone());
+        }
 
         let inbox = ResponseInbox::new();
+        let (open_tx, open_rx) = oneshot::channel::<Result<(), String>>();
+        let open_tx = Rc::new(RefCell::new(Some(open_tx)));
         let message_inbox = Rc::clone(&inbox);
         let message_channel = data_channel.clone();
-        let message_connection = peer_connection.clone();
         let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             if let Err(error) = message_inbox.push(event.data()) {
                 message_inbox.fail(error);
                 message_channel.close();
-                message_connection.close();
             }
         });
         data_channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
         let error_inbox = Rc::clone(&inbox);
+        let error_open = Rc::clone(&open_tx);
         let on_error = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
             error_inbox.fail("WebRTC DataChannel failed".to_string());
+            if let Some(sender) = error_open.borrow_mut().take() {
+                let _ = sender.send(Err("WebRTC DataChannel failed before opening".into()));
+            }
         });
         data_channel.set_onerror(Some(on_error.as_ref().unchecked_ref()));
         let close_inbox = Rc::clone(&inbox);
+        let close_open = Rc::clone(&open_tx);
         let on_close = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
             close_inbox.fail("WebRTC DataChannel closed".to_string());
+            if let Some(sender) = close_open.borrow_mut().take() {
+                let _ = sender.send(Err("WebRTC DataChannel closed before opening".into()));
+            }
         });
         data_channel.set_onclose(Some(on_close.as_ref().unchecked_ref()));
 
-        let (open_tx, open_rx) = oneshot::channel::<()>();
-        let open_tx = Rc::new(RefCell::new(Some(open_tx)));
         let open_sender = Rc::clone(&open_tx);
         let on_open = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
             if let Some(sender) = open_sender.borrow_mut().take() {
-                let _ = sender.send(());
+                let _ = sender.send(Ok(()));
             }
         });
         data_channel.set_onopen(Some(on_open.as_ref().unchecked_ref()));
@@ -556,44 +663,47 @@ impl Connection {
             _on_open: on_open,
         };
 
-        let offer = JsFuture::from(connection.peer_connection.create_offer())
-            .await
-            .map_err(js_error_message)?;
-        // `RTCSessionDescriptionInit` is a Web IDL dictionary, not a branded
-        // interface. Chromium returns a plain object here, so `dyn_into` can
-        // reject a perfectly valid offer because there is no `instanceof`
-        // identity to test. Read the dictionary member structurally instead.
-        let offer_sdp = js_sys::Reflect::get(&offer, &JsValue::from_str("sdp"))
-            .map_err(js_error_message)?
-            .as_string()
-            .filter(|sdp| !sdp.is_empty())
-            .ok_or_else(|| "browser created an empty WebRTC offer".to_string())?;
-        let local = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
-        local.set_sdp(&offer_sdp);
-        JsFuture::from(connection.peer_connection.set_local_description(&local))
-            .await
-            .map_err(js_error_message)?;
-        let local_sdp = connection
-            .peer_connection
-            .local_description()
-            .ok_or_else(|| "browser did not retain its local WebRTC offer".to_string())?
-            .sdp();
-        let client_pwd = ice_password_from_sdp(&local_sdp).map_err(|error| error.to_string())?;
-        let server_credential =
-            v2_server_ice_credential(&client_pwd).map_err(|error| error.to_string())?;
-        let answer_sdp =
-            server_answer_sdp(endpoint, &server_credential).map_err(|error| error.to_string())?;
-        let remote = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
-        remote.set_sdp(&answer_sdp);
-        JsFuture::from(connection.peer_connection.set_remote_description(&remote))
-            .await
-            .map_err(js_error_message)?;
+        if fresh {
+            let offer = JsFuture::from(connection.peer_connection.create_offer())
+                .await
+                .map_err(js_error_message)?;
+            // `RTCSessionDescriptionInit` is a Web IDL dictionary, not a branded
+            // interface. Chromium returns a plain object here, so `dyn_into` can
+            // reject a perfectly valid offer because there is no `instanceof`
+            // identity to test. Read the dictionary member structurally instead.
+            let offer_sdp = js_sys::Reflect::get(&offer, &JsValue::from_str("sdp"))
+                .map_err(js_error_message)?
+                .as_string()
+                .filter(|sdp| !sdp.is_empty())
+                .ok_or_else(|| "browser created an empty WebRTC offer".to_string())?;
+            let local = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
+            local.set_sdp(&offer_sdp);
+            JsFuture::from(connection.peer_connection.set_local_description(&local))
+                .await
+                .map_err(js_error_message)?;
+            let local_sdp = connection
+                .peer_connection
+                .local_description()
+                .ok_or_else(|| "browser did not retain its local WebRTC offer".to_string())?
+                .sdp();
+            let client_pwd =
+                ice_password_from_sdp(&local_sdp).map_err(|error| error.to_string())?;
+            let server_credential =
+                v2_server_ice_credential(&client_pwd).map_err(|error| error.to_string())?;
+            let answer_sdp = server_answer_sdp(endpoint, &server_credential)
+                .map_err(|error| error.to_string())?;
+            let remote = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
+            remote.set_sdp(&answer_sdp);
+            JsFuture::from(connection.peer_connection.set_remote_description(&remote))
+                .await
+                .map_err(js_error_message)?;
+        }
 
         timeout(
             async move {
                 open_rx
                     .await
-                    .map_err(|_| "WebRTC DataChannel closed before opening".to_string())
+                    .map_err(|_| "WebRTC DataChannel closed before opening".to_string())?
             },
             "WebRTC DataChannel opening timed out",
         )
@@ -602,6 +712,7 @@ impl Connection {
 
         let session = establish_pq_session(&connection, endpoint).await?;
         connection.pq_session.replace(Some(session));
+        *association = Rc::downgrade(&connection.peer_connection);
 
         Ok(connection)
     }
@@ -620,7 +731,6 @@ impl Drop for Connection {
         self.data_channel.set_onopen(None);
         self.data_channel.set_onbufferedamountlow(None);
         self.data_channel.close();
-        self.peer_connection.close();
     }
 }
 
@@ -628,6 +738,7 @@ pub(super) struct BrowserNodeClientCore {
     dial_failures: Option<DialFailures>,
     pool_availability: Option<Rc<PoolAvailability>>,
     endpoint: WebRtcDirectEndpoint,
+    association: SharedAssociation,
     connection: RefCell<Option<Connection>>,
     request_lock: Mutex<()>,
     next_request_id: Cell<u64>,
@@ -659,6 +770,7 @@ impl BrowserNodeClientCore {
             dial_failures: None,
             pool_availability: None,
             endpoint,
+            association: Rc::new(Mutex::new(Weak::new())),
             connection: RefCell::new(None),
             request_lock: Mutex::new(()),
             next_request_id: Cell::new(1),
@@ -692,8 +804,9 @@ impl BrowserNodeClientCore {
             }
         }
         let generation = self.generation.get();
+        let attempted_dial = Cell::new(false);
         let connection = match timeout_with_ms(
-            Connection::open(&self.endpoint),
+            Connection::open(&self.endpoint, &self.association, &attempted_dial),
             "WebRTC connection/authentication setup timed out",
             CONNECTION_SETUP_TIMEOUT_MS,
         )
@@ -701,7 +814,7 @@ impl BrowserNodeClientCore {
         {
             Ok(connection) => connection,
             Err(error) => {
-                if let Some(cache) = &self.dial_failures {
+                if let Some(cache) = self.dial_failures.as_ref().filter(|_| attempted_dial.get()) {
                     cache.borrow_mut().record_failure(
                         self.endpoint.peer_id.clone(),
                         self.endpoint.multiaddr.clone(),
