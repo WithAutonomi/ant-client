@@ -1213,3 +1213,36 @@ pub async fn test_stale_rpc_admission(endpoint: &str) {
     client.find_node(&"22".repeat(32), 20).await.unwrap();
     client.close();
 }
+
+#[wasm_bindgen]
+pub async fn test_draining_pool_capacity(endpoints: JsValue) {
+    let endpoints: Vec<String> = serde_wasm_bindgen::from_value(endpoints).unwrap();
+    let pool = BrowserClientPool::new(1).unwrap();
+    let first = BrowserEndpoint {
+        multiaddr: endpoints[0].clone(),
+    };
+    let second = BrowserEndpoint {
+        multiaddr: endpoints[1].clone(),
+    };
+    {
+        let lease = pool.client(&first).await.unwrap();
+        lease.hello().await.unwrap();
+        assert!(crate::runtime::timeout(
+            Duration::from_millis(10),
+            lease.find_node(&"11".repeat(32), 20)
+        )
+        .await
+        .is_err());
+    }
+    assert!(pool
+        .client_before(&second, TransferDeadline::new(Duration::from_millis(20)))
+        .await
+        .is_err());
+    pool.client_before(&second, TransferDeadline::new(Duration::from_millis(500)))
+        .await
+        .unwrap()
+        .hello()
+        .await
+        .unwrap();
+    pool.close();
+}

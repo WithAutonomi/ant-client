@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { test_multiplex_requests, test_cancelled_read_reservation, test_stale_rpc_admission } from './pkg/ant_core.js';
+import { test_multiplex_requests, test_cancelled_read_reservation, test_stale_rpc_admission, test_draining_pool_capacity } from './pkg/ant_core.js';
 import { mockWebRtc } from './mock-webrtc.mjs';
 const object = v => v instanceof Map ? Object.fromEntries([...v].map(([k,x]) => [k, object(x)])) : Array.isArray(v) ? v.map(object) : v;
 
@@ -52,4 +52,11 @@ test('an old admission cannot send into a replacement authenticated session', as
   await test_stale_rpc_admission(rtc.endpoints[0]);
   assert.equal(rtc.connections.length, 2);
   assert.equal(rtc.requests.filter(r => r.method === 'find_node').length, 1);
+});
+
+test('pool eviction waits for abandoned replies and wakes when draining completes', async () => {
+  const rtc = mockWebRtc([{ multiplex: true, delay: method => method === 'find_node' ? 100 : 0 }, {}]);
+  await test_draining_pool_capacity(rtc.endpoints);
+  assert.equal(rtc.connections.length, 2);
+  assert.ok(rtc.connections.every(c => c.closed));
 });

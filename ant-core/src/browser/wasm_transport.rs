@@ -373,6 +373,8 @@ impl BrowserClientPool {
                             .filter(|(_, entry)| {
                                 Rc::strong_count(&entry.client) == 1
                                     && Rc::strong_count(&entry.data_client) == 1
+                                    && !entry.client.has_pending_requests()
+                                    && !entry.data_client.has_pending_requests()
                             })
                             .min_by_key(|(_, entry)| entry.last_used)
                             .map(|(key, _)| key.clone());
@@ -813,6 +815,16 @@ impl BrowserNodeClientCore {
         self.peer_id.borrow().clone()
     }
 
+    fn has_pending_requests(&self) -> bool {
+        self.connection.borrow().as_ref().is_some_and(|connection| {
+            connection
+                .rpc
+                .borrow()
+                .as_ref()
+                .is_some_and(|rpc| rpc.is_busy())
+        })
+    }
+
     fn is_connected(&self) -> bool {
         self.connection.borrow().as_ref().is_some_and(|connection| {
             connection.data_channel.ready_state() == RtcDataChannelState::Open
@@ -860,6 +872,9 @@ impl BrowserNodeClientCore {
         }
         if let Some(cache) = &self.dial_failures {
             cache.borrow_mut().record_success(&self.endpoint.peer_id);
+        }
+        if let Some(rpc) = connection.rpc.borrow().as_ref() {
+            rpc.set_pool(self.pool_availability.as_ref());
         }
         self.connection.replace(Some(Rc::new(connection)));
         Ok(())

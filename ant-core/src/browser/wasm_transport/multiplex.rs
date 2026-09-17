@@ -21,6 +21,7 @@ pub(super) struct RpcSession {
     changed: watch::Sender<()>,
     multiplex: Cell<bool>,
     closed: Cell<bool>,
+    pool: RefCell<Option<Weak<PoolAvailability>>>,
 }
 
 impl RpcSession {
@@ -40,6 +41,7 @@ impl RpcSession {
             changed,
             multiplex: Cell::new(false),
             closed: Cell::new(false),
+            pool: RefCell::new(None),
         });
         let reader = Rc::clone(&session);
         wasm_bindgen_futures::spawn_local(async move {
@@ -48,6 +50,20 @@ impl RpcSession {
             }
         });
         session
+    }
+
+    pub(super) fn set_pool(&self, pool: Option<&Rc<PoolAvailability>>) {
+        self.pool.replace(pool.map(Rc::downgrade));
+    }
+
+    pub(super) fn is_busy(&self) -> bool {
+        !self.pending.borrow().is_empty()
+    }
+
+    fn notify_pool(&self) {
+        if let Some(pool) = self.pool.borrow().as_ref().and_then(Weak::upgrade) {
+            pool.notify_waiters();
+        }
     }
 
     pub(super) fn enable_multiplex(&self) {
@@ -68,6 +84,7 @@ impl RpcSession {
             let _ = sender.send(Err(error.clone().into()));
         }
         self.changed.send_replace(());
+        self.notify_pool();
     }
 
     pub(super) fn is_closed(&self) -> bool {
@@ -238,6 +255,7 @@ impl RpcSession {
                 .remove(&id)
                 .ok_or_else(|| format!("unsolicited or duplicate response ID {id}"))?;
             let _ = sender.send(Ok((response, started.elapsed())));
+            self.notify_pool();
         }
     }
 }
