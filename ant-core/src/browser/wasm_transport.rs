@@ -2046,7 +2046,9 @@ impl BrowserNetworkClient {
         let mut resolved = self.resolve_public_file(file, progress).await?;
         let content = self
             .shared
-            .data_download_with_concurrency(&resolved.root_data_map, concurrency)
+            .data_download_with_progress(&resolved.root_data_map, concurrency, &|completed, total| {
+                progress.report(&format!("Downloaded chunk {completed}/{total}"));
+            })
             .await
             .map_err(|error| error.to_string())?
             .to_vec();
@@ -2310,6 +2312,7 @@ impl BrowserNetworkClient {
         checkpoint: &UploadCheckpoint,
     ) -> Result<BrowserStoredRecords, String> {
         let count = records.len();
+        progress.report(&format!("Preparing upload of {count} records"));
         let scope = hex::encode(
             blake3::hash(
                 &serde_json::to_vec(&(

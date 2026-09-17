@@ -448,26 +448,34 @@ impl Client {
             adapter.checkpoint(state, Some(&payment)).await?;
             let max_size = wave.iter().map(|r| r.size as usize).max().unwrap_or(1);
             let recovery = &*state;
+            let live_stored = std::sync::atomic::AtomicUsize::new(outcome.addresses.len());
             let stores = crate::client_engine::rolling_unordered(
                 plans
                     .into_iter()
                     .filter_map(|(record, plan)| plan.map(|plan| (record, plan))),
-                |(record, plan)| async move {
-                    let result = async {
-                        let bytes = adapter.load(record).await?;
-                        let prepared = plan.with_content(bytes)?;
-                        let paid: PaidChunk = recovery
-                            .reuse_prepared(&prepared, crate::runtime::system_time())
-                            .ok_or_else(|| {
-                                Error::Payment("paid proof expired before storage".into())
-                            })?;
-                        Ok::<_, Error>(
-                            self.store_paid_chunks_with_events(vec![paid], None, 0, total)
-                                .await,
-                        )
+                |(record, plan)| {
+                    let live_stored = &live_stored;
+                    async move {
+                        let result = async {
+                            let bytes = adapter.load(record).await?;
+                            let prepared = plan.with_content(bytes)?;
+                            let paid: PaidChunk = recovery
+                                .reuse_prepared(&prepared, crate::runtime::system_time())
+                                .ok_or_else(|| {
+                                    Error::Payment("paid proof expired before storage".into())
+                                })?;
+                            Ok::<_, Error>(
+                                self.store_paid_chunks_with_events(vec![paid], None, 0, total)
+                                    .await,
+                            )
+                        }
+                        .await;
+                        if let Ok(stored) = &result {
+                            let completed = live_stored.fetch_add(stored.stored.len(), std::sync::atomic::Ordering::Relaxed) + stored.stored.len();
+                            adapter.stored(completed, total);
+                        }
+                        (record.address, result)
                     }
-                    .await;
-                    (record.address, result)
                 },
                 || {
                     self.controller()
@@ -499,7 +507,6 @@ impl Client {
                 outcome.stats.absorb(&result);
                 outcome.addresses.extend(result.stored);
                 failed.extend(result.failed);
-                adapter.stored(outcome.addresses.len(), total);
             }
             if fatal {
                 break;
@@ -643,8 +650,10 @@ impl Client {
                 .current()
                 .min(crate::client_engine::store_byte_bound(max_size))
         };
+        let live_stored = std::sync::atomic::AtomicUsize::new(outcome.addresses.len());
         let store_one = |address: [u8; 32]| {
             let merkle = &merkle;
+            let live_stored = &live_stored;
             async move {
                 let started = web_time::Instant::now();
                 let record = *merkle
@@ -666,6 +675,8 @@ impl Client {
                     classify_error,
                 )
                 .await?;
+                let completed = live_stored.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                adapter.stored(completed, total);
                 Ok(started)
             }
         };
@@ -794,6 +805,7 @@ impl Client {
             outcome.mode = PaymentMode::Merkle;
             adapter.checkpoint(state, Some(&receipt)).await?;
         }
+        let quote_total = records.len();
         let unpaid = records
             .iter()
             .filter(|r| !state.is_paid(&r.address, crate::runtime::system_time()))
@@ -804,7 +816,11 @@ impl Client {
         }
         let entries = unpaid.iter().map(|r| (r.address, r.size)).collect();
         let plan = match self
-            .plan_merkle_upload(entries, ant_protocol::DATA_TYPE_CHUNK, None)
+            .plan_merkle_upload_observed(entries, ant_protocol::DATA_TYPE_CHUNK, None, &|address, _| {
+                if let Some(record) = records.iter().find(|record| record.address == address) {
+                    adapter.quoted(record.index + 1, quote_total);
+                }
+            })
             .await
         {
             Ok(plan) => plan,

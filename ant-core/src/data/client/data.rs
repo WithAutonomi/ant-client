@@ -360,14 +360,40 @@ impl Client {
         data_map: &DataMap,
         concurrency: usize,
     ) -> Result<Bytes> {
+        self.data_download_with_progress(data_map, concurrency, &|_, _| {}).await
+    }
+
+    /// Internal observer for verified records; reconstruction still uses the shared engine.
+    pub(crate) async fn data_download_with_progress(
+        &self,
+        data_map: &DataMap,
+        concurrency: usize,
+        progress: &impl Fn(usize, usize),
+    ) -> Result<Bytes> {
         if concurrency == 0 {
             return Err(Error::Config(
                 "download concurrency must be positive".into(),
             ));
         }
+        let received = std::sync::Mutex::new(std::collections::HashSet::new());
+        let total = data_map.infos().len();
+        progress(0, total);
         crate::client_engine::files::download(
             data_map,
-            &|address| self.fetch_data_record(address),
+            &|address| {
+                let received = &received;
+                async move {
+                    let bytes = self.fetch_data_record(address).await?;
+                    let mut received = received.lock().unwrap_or_else(|error| error.into_inner());
+                    if received.insert(address) {
+                        let completed = data_map.infos().iter()
+                            .filter(|info| received.contains(&info.dst_hash.0)).count();
+                        drop(received);
+                        progress(completed, total);
+                    }
+                    Ok(bytes)
+                }
+            },
             &|| self.controller().fetch.current().min(concurrency),
             &crate::runtime::sleep,
             retry_data_fetch,

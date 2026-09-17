@@ -790,6 +790,16 @@ impl Client {
         data_type: u32,
         progress: Option<&mpsc::Sender<UploadEvent>>,
     ) -> Result<MerkleUploadPlan> {
+        self.plan_merkle_upload_observed(chunks, data_type, progress, &|_, _| {}).await
+    }
+
+    pub(crate) async fn plan_merkle_upload_observed(
+        &self,
+        chunks: Vec<([u8; 32], u64)>,
+        data_type: u32,
+        progress: Option<&mpsc::Sender<UploadEvent>>,
+        on_quoted: &impl Fn([u8; 32], usize),
+    ) -> Result<MerkleUploadPlan> {
         let total_chunks = chunks.len();
         if total_chunks == 0 {
             return Ok(MerkleUploadPlan::default());
@@ -828,6 +838,7 @@ impl Client {
         while let Some((index, address, data_size, result)) = check_stream.next().await {
             let is_already_stored = result?;
             checked += 1;
+            on_quoted(address, total_chunks);
 
             if let Some(tx) = progress {
                 let _ = tx.try_send(UploadEvent::ChunkQuoted {
