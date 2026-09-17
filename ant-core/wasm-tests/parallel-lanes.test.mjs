@@ -29,8 +29,8 @@ for (const lane of ["control", "data"]) {
     assert.equal(result[lane].result, "cancelled");
     assert.equal(result[lane === "control" ? "data" : "control"].result, "ok");
     assert.equal(rtc.connections.length, 1);
-    assert.equal(rtc.connections[0].channels.length, 3);
-    assert.equal(rtc.requests.filter(r => r.method === "hello").length, 3);
+    assert.equal(rtc.connections[0].channels.length, 2);
+    assert.equal(rtc.requests.filter(r => r.method === "hello").length, 2);
     assert.ok(rtc.connections[0].channels.every(c => c.readyState === "closed"));
   });
 }

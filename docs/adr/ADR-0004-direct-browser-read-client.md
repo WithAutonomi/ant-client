@@ -366,3 +366,38 @@ new writes. Browser new-store counters use only successful PUT callbacks.
 Merkle preflight checks do not imply that candidate payment quotes are ready.
 Record quote completion is emitted only after the actual batch has been prepared.
 These hooks do not authorize payments, change quorum, or relax verification.
+
+## Bounded concurrent RPCs and cancellation (2026-09-17)
+
+Nodes advertise `rpc-multiplex-4` in authenticated HELLO. Supporting clients may
+have at most four uncompleted RPCs on each ordered DataChannel; older nodes keep
+one. This ceiling is a protocol resource limit, not a device-specific throughput
+setting. Global read memory/CPU admission and server source/rate/byte limits still
+apply. Request IDs correlate out-of-order completions. One writer serializes whole
+frames and AEAD sealing; one reader authenticates frames in wire sequence before
+dispatch. Frames are not interleaved, and no cryptographic checks are removed.
+
+Cancelling an admitted caller abandons its result, not its encrypted exchange.
+The transport drains the response under ordinary deadlines, retaining its RPC
+slot and any physical-read reservation. Unsent queued work remains cancellable.
+Cancelled PUTs are not interpreted as failed payments or rolled back storage.
+Explicit client closure and genuine transport/protocol failure close the session.
+For a response already transferring, size-derived frame deadlines still apply;
+first-response timers cannot cut an authenticated bulk frame short.
+
+The server keeps receiving while work executes and while replies are written.
+A channel reset retires channel I/O independently of tracked storage/payment
+workers and their reservations. An excess replacement channel is rejected without
+tearing down a healthy sibling channel. Admission remains bounded per channel,
+connection, source, and listener. Wire request/response formats and native QUIC
+behavior are unchanged; the capability is additive and old clients remain valid.
+
+Draining preserves authentication but does not stop server work or reclaim bytes
+already sent. A full response frame can still delay later responses on its lane.
+Further wire-level cancellation or fragment interleaving would be a separate
+protocol decision, justified by measured benefit and resource accounting.
+
+Validation covers delayed work, out-of-order replies, cancelled active and queued
+callers, authenticated-session reuse, old-node fallback, ingress limits, transfer
+deadlines, and a real WebRTC blocked-storage regression. Live benchmarks compare
+unchanged file bytes and integrity checks, elapsed time and received bytes.

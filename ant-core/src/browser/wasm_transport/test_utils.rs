@@ -282,6 +282,7 @@ pub struct BrowserTestNode {
     records: HashMap<String, Vec<u8>>,
     uploads_enabled: bool,
     address_v2: bool,
+    multiplex: bool,
     invalid_quote: bool,
     committed_key_count: u32,
     last_put_address: String,
@@ -327,6 +328,7 @@ impl BrowserTestNode {
             records: HashMap::new(),
             uploads_enabled: true,
             address_v2: false,
+            multiplex: false,
             invalid_quote: false,
             committed_key_count: 0,
             last_put_address: String::new(),
@@ -340,6 +342,12 @@ impl BrowserTestNode {
     }
     pub fn last_method(&self) -> String {
         self.last_method.clone()
+    }
+    pub fn set_multiplex(&mut self, enabled: bool) {
+        self.multiplex = enabled;
+    }
+    pub fn seal_response(&mut self, plaintext: &[u8]) -> Vec<u8> {
+        encode_pq_frame(&self.session.as_mut().unwrap().seal(plaintext).unwrap()).unwrap()
     }
     pub fn set_address_v2(&mut self, enabled: bool) {
         self.address_v2 = enabled;
@@ -431,6 +439,9 @@ impl BrowserTestNode {
                             "find_node".into(),
                             "get_chunk".into(),
                         ];
+                        if self.multiplex {
+                            capabilities.push(multiplex::CAPABILITY.into());
+                        }
                         if self.uploads_enabled {
                             capabilities.extend(["quote_chunk".into(), "put_chunk".into()]);
                         }
@@ -572,6 +583,9 @@ impl BrowserTestNode {
             body => BrowserResponse::ok(request.request.request_id, body, content.len()),
         };
         let plaintext = encode_response_frame(&response, content).unwrap();
+        if self.multiplex {
+            return plaintext;
+        }
         let encrypted = self.session.as_mut().unwrap().seal(&plaintext).unwrap();
         encode_pq_frame(&encrypted).unwrap()
     }
@@ -1084,4 +1098,118 @@ pub async fn test_close_pool_during_connect(endpoint: &str) {
     assert!(result.unwrap_err().contains("closed"));
     assert!(!lease.is_connected());
     assert!(lease.hello().await.unwrap_err().contains("closed"));
+}
+
+/// Drive more callers than one channel admits, with optional cancellation.
+#[wasm_bindgen]
+pub async fn test_multiplex_requests(endpoint: &str, count: usize, cancel: bool) -> JsValue {
+    let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
+    client.hello().await.unwrap();
+    let started = web_time::Instant::now();
+    let results = futures::future::join_all((0..count).map(|index| {
+        let client = &client;
+        async move {
+            let call = async {
+                client
+                    .authenticated()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .request(
+                        BrowserRequestBody::GetChunk {
+                            address: format!("{index:064x}"),
+                        },
+                        &[],
+                    )
+                    .await
+            };
+            let result = if cancel && index == 0 {
+                crate::runtime::timeout(Duration::from_millis(20), call)
+                    .await
+                    .map_err(|_| "cancelled".to_string())
+                    .and_then(|r| r)
+            } else {
+                call.await
+            };
+            serde_json::json!({"index": index, "ms": started.elapsed().as_millis() as u64,
+                "result": result.map(|_| "ok".to_string()).unwrap_or_else(|e| e)})
+        }
+    }))
+    .await;
+    // Allow the deliberately abandoned reply to drain before testing reuse.
+    crate::runtime::sleep(Duration::from_millis(220)).await;
+    let reuse = client.find_node(&"11".repeat(32), 20).await;
+    client.close();
+    serde_wasm_bindgen::to_value(&serde_json::json!({"results": results, "reuse": reuse.is_ok()}))
+        .unwrap()
+}
+
+#[wasm_bindgen]
+pub async fn test_cancelled_read_reservation(endpoint: &str) {
+    let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
+    client.hello().await.unwrap();
+    let budget = crate::client_engine::read_budget::ReadBudget::new(1, 1);
+    let permit = budget.acquire(|| 1).await.unwrap();
+    let authenticated = client.authenticated().await.unwrap();
+    let request = authenticated.request_reserved(
+        BrowserRequestBody::GetChunk {
+            address: "11".repeat(32),
+        },
+        &[],
+        Duration::from_secs(1),
+        Some(permit),
+    );
+    assert!(crate::runtime::timeout(Duration::from_millis(20), request)
+        .await
+        .is_err());
+    assert!(
+        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1))
+            .await
+            .is_err()
+    );
+    crate::runtime::sleep(Duration::from_millis(120)).await;
+    let permit = crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1))
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, retained) = client
+        .authenticated()
+        .await
+        .unwrap()
+        .request_reserved(
+            BrowserRequestBody::GetChunk {
+                address: "22".repeat(32),
+            },
+            &[],
+            Duration::from_secs(1),
+            Some(permit),
+        )
+        .await
+        .unwrap();
+    assert!(
+        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1))
+            .await
+            .is_err()
+    );
+    drop(retained);
+    assert!(
+        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1))
+            .await
+            .is_ok()
+    );
+    client.close();
+}
+
+#[wasm_bindgen]
+pub async fn test_stale_rpc_admission(endpoint: &str) {
+    let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
+    let old = client.authenticated().await.unwrap();
+    client.close();
+    client.hello().await.unwrap();
+    assert!(old
+        .find_node(&"11".repeat(32), 20)
+        .await
+        .unwrap_err()
+        .contains("session closed"));
+    client.find_node(&"22".repeat(32), 20).await.unwrap();
+    client.close();
 }

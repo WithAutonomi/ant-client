@@ -29,7 +29,7 @@ export function mockWebRtc(nodes = [{}]) {
       // A real DataChannel copies the outgoing bytes. The mock re-enters WASM
       // instead, where allocating the server argument can grow memory and
       // detach an outgoing view into that same memory. Copy before re-entry.
-      const response = this.server.push(new Uint8Array(message));
+      let response = this.server.push(new Uint8Array(message));
       if (!response.length) return;
       const method = this.server.last_method();
       if (method === "put_chunk") {
@@ -43,6 +43,8 @@ export function mockWebRtc(nodes = [{}]) {
       } : {}) });
       if (this.options.respond?.(this, method, response) === false) return;
       setTimeout(() => {
+        if (this.options.multiplex && method !== "handshake") response = this.server.seal_response(response);
+        this.options.delivered?.(this, method);
         for (let offset = 0; offset < response.length; offset += 16_384) {
           this.emit(response.slice(offset, offset + 16_384).buffer);
         }
@@ -98,6 +100,7 @@ export function mockWebRtc(nodes = [{}]) {
       for (const [address, content] of stores[this.remoteSeed - 1]) {
         channel.server.set_record(address, content);
       }
+      channel.server.set_multiplex(channel.options.multiplex ?? false);
       channel.server.set_address_v2(channel.options.addressV2 ?? false);
       channel.server.set_uploads_enabled(channel.options.uploads ?? true);
       channel.server.set_invalid_quote(channel.options.invalidQuote ?? false);

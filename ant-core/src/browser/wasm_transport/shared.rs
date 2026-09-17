@@ -251,9 +251,9 @@ impl BrowserNetwork for SharedNetworkAdapter {
                 }
             }
             let is_read = matches!(&request.body, ChunkMessageBody::GetRequest(_));
-            // Reserve after taking the peer lock, so requests queued behind
-            // the same peer cannot monopolize all physical read reservations.
-            let _read_permit = if is_read {
+            // Reserve after peer RPC admission. The transport owns this permit
+            // across cancellation, then returns it through response decoding.
+            let read_permit = if is_read {
                 Some(
                     crate::runtime::timeout(
                         admission.remaining(),
@@ -272,8 +272,13 @@ impl BrowserNetwork for SharedNetworkAdapter {
             let bytes = request
                 .encode()
                 .map_err(|e| DataError::Protocol(e.to_string()))?;
-            let response = client
-                .request_with_timeout(BrowserRequestBody::ChunkProtocol, &bytes, timeout)
+            let (response, _read_permit) = client
+                .request_reserved(
+                    BrowserRequestBody::ChunkProtocol,
+                    &bytes,
+                    timeout,
+                    read_permit,
+                )
                 .await
                 .map_err(rpc_data_error)?;
             if !matches!(response.header.body, BrowserResponseBody::ChunkProtocol) {

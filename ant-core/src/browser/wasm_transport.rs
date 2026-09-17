@@ -81,6 +81,7 @@ const MAX_UPLOAD_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
 
 mod failed_payment;
 mod inbox;
+mod multiplex;
 mod shared;
 mod upload_adapter;
 use ant_protocol::transport::{client_routing, PeerId};
@@ -233,6 +234,16 @@ impl BrowserClientLease {
                         return Err("lookup waiter cancelled".to_string());
                     }
                     client.hello().await?;
+                    drop(client);
+                    let client = match select(
+                        Box::pin(self.client.authenticated_before(&self.admission)),
+                        Box::pin(sender.cancellation()),
+                    )
+                    .await
+                    {
+                        Either::Left((client, _)) => client.map_err(|error| error.to_string())?,
+                        Either::Right(_) => return Err("lookup waiter cancelled".into()),
+                    };
                     client.find_node(&target, count).await
                 };
                 match select(Box::pin(request), Box::pin(self.availability.wait_closed())).await {
@@ -573,7 +584,8 @@ struct Connection {
     peer_connection: Rc<PeerAssociation>,
     data_channel: RtcDataChannel,
     inbox: Rc<ResponseInbox>,
-    pq_session: RefCell<Option<PqSession>>,
+    pq_session: Rc<RefCell<Option<PqSession>>>,
+    rpc: RefCell<Option<Rc<multiplex::RpcSession>>>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
     _on_error: Closure<dyn FnMut(Event)>,
     _on_close: Closure<dyn FnMut(Event)>,
@@ -677,7 +689,8 @@ impl Connection {
             peer_connection,
             data_channel,
             inbox,
-            pq_session: RefCell::new(None),
+            pq_session: Rc::new(RefCell::new(None)),
+            rpc: RefCell::new(None),
             _on_message: on_message,
             _on_error: on_error,
             _on_close: on_close,
@@ -733,18 +746,28 @@ impl Connection {
 
         let session = establish_pq_session(&connection, endpoint).await?;
         connection.pq_session.replace(Some(session));
+        connection.rpc.replace(Some(multiplex::RpcSession::new(
+            connection.data_channel.clone(),
+            Rc::clone(&connection.inbox),
+            Rc::clone(&connection.pq_session),
+        )));
         *association = Rc::downgrade(&connection.peer_connection);
 
         Ok(connection)
     }
 
-    fn close(self) {
-        drop(self);
+    fn close(&self) {
+        if let Some(rpc) = self.rpc.borrow().as_ref() {
+            rpc.close("WebRTC connection closed".into());
+        }
+        self.inbox.fail("WebRTC connection closed".into());
+        self.data_channel.close();
     }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        self.close();
         self.inbox.fail("WebRTC connection closed".to_string());
         self.data_channel.set_onmessage(None);
         self.data_channel.set_onerror(None);
@@ -760,30 +783,13 @@ pub(super) struct BrowserNodeClientCore {
     pool_availability: Option<Rc<PoolAvailability>>,
     endpoint: WebRtcDirectEndpoint,
     association: SharedAssociation,
-    connection: RefCell<Option<Connection>>,
+    connection: RefCell<Option<Rc<Connection>>>,
     request_lock: Mutex<()>,
     response_processing: Cell<Duration>,
     next_request_id: Cell<u64>,
     generation: Cell<u64>,
     hello: RefCell<Option<BrowserHello>>,
     peer_id: RefCell<Option<String>>,
-}
-
-// The request lock serializes RPCs, but releasing that lock is not enough
-// after cancellation: the next response still belongs to the canceled RPC.
-// Declare this guard after the lock so it closes the association first.
-struct PendingRequest<'a> {
-    client: &'a BrowserNodeClientCore,
-    generation: u64,
-    completed: bool,
-}
-
-impl Drop for PendingRequest<'_> {
-    fn drop(&mut self) {
-        if !self.completed && self.client.generation.get() == self.generation {
-            self.client.close();
-        }
-    }
 }
 
 impl BrowserNodeClientCore {
@@ -855,7 +861,7 @@ impl BrowserNodeClientCore {
         if let Some(cache) = &self.dial_failures {
             cache.borrow_mut().record_success(&self.endpoint.peer_id);
         }
-        self.connection.replace(Some(connection));
+        self.connection.replace(Some(Rc::new(connection)));
         Ok(())
     }
 
@@ -882,7 +888,9 @@ impl BrowserNodeClientCore {
         }
         Ok(LockedBrowserClient {
             client: self,
-            _guard: guard,
+            _guard: Some(guard),
+            slot: RefCell::new(None),
+            authenticated_generation: None,
         })
     }
 
@@ -890,9 +898,36 @@ impl BrowserNodeClientCore {
         &self,
         admission: &TransferDeadline,
     ) -> Result<LockedBrowserClient<'_>, RpcError> {
-        let client = self.lock_before(admission).await?;
-        client.hello().await?;
-        Ok(client)
+        loop {
+            let mut client = self.lock_before(admission).await?;
+            client.hello().await?;
+            client._guard.take();
+            let rpc = self
+                .connection
+                .borrow()
+                .as_ref()
+                .and_then(|c| c.rpc.borrow().clone())
+                .ok_or_else(|| "WebRTC session unavailable".to_string())?;
+            let generation = self.generation.get();
+            match rpc.admit(admission.remaining()).await {
+                Ok(slot) => {
+                    if generation != self.generation.get() {
+                        continue;
+                    }
+                    client.slot.replace(Some(slot));
+                    client.authenticated_generation = Some(generation);
+                    return Ok(client);
+                }
+                Err(_)
+                    if rpc.is_closed()
+                        && !self.pool_is_closed()
+                        && !admission.remaining().is_zero() =>
+                {
+                    continue
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn authenticated(&self) -> Result<LockedBrowserClient<'_>, RpcError> {
@@ -926,11 +961,19 @@ impl BrowserNodeClientCore {
     }
 }
 
-// Only this guard can issue an exchange. Pooled callers retain it from HELLO
-// through capability/payment validation and the complete application response.
+impl Drop for BrowserNodeClientCore {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+// Setup is serialized through HELLO. Authenticated callers release the setup
+// guard and use the session's bounded request admission and response dispatcher.
 struct LockedBrowserClient<'a> {
     client: &'a BrowserNodeClientCore,
-    _guard: MutexGuard<'a, ()>,
+    _guard: Option<MutexGuard<'a, ()>>,
+    slot: RefCell<Option<tokio::sync::OwnedSemaphorePermit>>,
+    authenticated_generation: Option<u64>,
 }
 
 impl Deref for LockedBrowserClient<'_> {
@@ -970,131 +1013,57 @@ impl LockedBrowserClient<'_> {
         content: &[u8],
         response_timeout: Duration,
     ) -> Result<BrowserResponseFrame, RpcError> {
-        if !matches!(&body, BrowserRequestBody::Hello)
-            && (!self.is_connected() || self.hello.borrow().is_none())
+        self.request_reserved(body, content, response_timeout, None)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    async fn request_reserved(
+        &self,
+        body: BrowserRequestBody,
+        content: &[u8],
+        response_timeout: Duration,
+        read_permit: Option<crate::client_engine::read_budget::ReadPermit>,
+    ) -> Result<
+        (
+            BrowserResponseFrame,
+            Option<crate::client_engine::read_budget::ReadPermit>,
+        ),
+        RpcError,
+    > {
+        if self
+            .authenticated_generation
+            .is_some_and(|generation| generation != self.generation.get())
         {
+            return Err("authenticated session closed".to_string().into());
+        }
+        if matches!(&body, BrowserRequestBody::Hello) {
+            self.ensure_connected().await?;
+        } else if !self.is_connected() || self.hello.borrow().is_none() {
             return Err("authenticated session required; call connect() again"
                 .to_string()
                 .into());
         }
-        self.ensure_connected().await?;
-        let mut pending = PendingRequest {
-            client: self,
-            generation: self.generation.get(),
-            completed: false,
-        };
+        let connection = self
+            .connection
+            .borrow()
+            .clone()
+            .ok_or_else(|| "WebRTC DataChannel is not connected".to_string())?;
+        let rpc = connection
+            .rpc
+            .borrow()
+            .clone()
+            .ok_or_else(|| "WebRTC session is unavailable".to_string())?;
         let request_id = self.next_request_id.get();
         self.next_request_id.set(request_id.wrapping_add(1).max(1));
         let request = BrowserRequest::new(request_id, body, content.len());
         let plaintext =
             encode_request_frame(&request, content).map_err(|error| error.to_string())?;
-        let frame = {
-            let connection = self.connection.borrow();
-            let connection = connection
-                .as_ref()
-                .ok_or_else(|| "WebRTC DataChannel is not connected".to_string())?;
-            connection
-                .inbox
-                .expect_response(MAX_BROWSER_RESPONSE_BYTES + PQ_ENCRYPTED_OVERHEAD_BYTES)?;
-            let encrypted = connection
-                .pq_session
-                .borrow_mut()
-                .as_mut()
-                .ok_or_else(|| "WebRTC PQ session is not established".to_string())?
-                .seal(&plaintext)
-                .map_err(|error| error.to_string())?;
-            encode_pq_frame(&encrypted).map_err(|error| error.to_string())?
-        };
-        let transfer_timeout_ms = transfer_timeout_ms(frame.len());
-        let channel = {
-            let connection = self.connection.borrow();
-            connection
-                .as_ref()
-                .map(|connection| connection.data_channel.clone())
-        };
-        let Some(channel) = channel else {
-            self.close();
-            return Err("WebRTC DataChannel is not connected".to_string().into());
-        };
-        let send_result = send_data_channel_frame(&channel, &frame, transfer_timeout_ms).await;
-        if let Err(error) = send_result {
-            // A malformed early response can close the channel during drain.
-            // Preserve that first ingress failure instead of hiding it behind
-            // the resulting channel-closed error.
-            let error = self
-                .connection
-                .borrow()
-                .as_ref()
-                .and_then(|connection| connection.inbox.check_failure().err())
-                .map(RpcError::Transport)
-                .unwrap_or(error);
-            self.close();
-            return Err(error);
-        }
-        let receiver = {
-            let connection = self.connection.borrow();
-            connection
-                .as_ref()
-                .map(|connection| Rc::clone(&connection.inbox))
-        };
-        let Some(receiver) = receiver else {
-            self.close();
-            return Err("WebRTC response inbox is unavailable".to_string().into());
-        };
-        let encrypted_response = match read_pq_payload_typed(
-            receiver,
-            MAX_BROWSER_RESPONSE_BYTES + PQ_ENCRYPTED_OVERHEAD_BYTES,
-            u32::try_from(response_timeout.as_millis())
-                .unwrap_or(i32::MAX as u32)
-                .min(i32::MAX as u32),
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                self.close();
-                return Err(error);
-            }
-        };
-        let processing_started = web_time::Instant::now();
-        let decrypt_result = {
-            let connection = self.connection.borrow();
-            let Some(connection) = connection.as_ref() else {
-                return Err("WebRTC DataChannel is not connected".to_string().into());
-            };
-            let mut pq_session = connection.pq_session.borrow_mut();
-            pq_session
-                .as_mut()
-                .ok_or_else(|| "WebRTC PQ session is not established".to_string())?
-                .open(&encrypted_response)
-                .map_err(|error| error.to_string())
-        };
-        let plaintext_response = match decrypt_result {
-            Ok(response) => response,
-            Err(error) => {
-                self.close();
-                return Err(error.into());
-            }
-        };
-        let response = match parse_response_frame(&plaintext_response) {
-            Ok(response) => response,
-            Err(error) => {
-                self.close();
-                return Err(error.to_string().into());
-            }
-        };
-        if response.header.request_id != request_id {
-            let error = format!(
-                "response ID {} does not match request {request_id}",
-                response.header.request_id
-            );
-            self.close();
-            return Err(error.into());
-        }
-        self.response_processing.set(processing_started.elapsed());
-        // The complete response has been consumed and authenticated. An
-        // ordinary application error can safely retain the session too.
-        pending.completed = true;
+        let slot = self.slot.borrow_mut().take();
+        let (response, processing, read_permit) = rpc
+            .request(request_id, plaintext, response_timeout, read_permit, slot)
+            .await?;
+        self.response_processing.set(processing);
         if response.header.status == BrowserResponseStatus::Error {
             let (code, message) = match &response.header.body {
                 BrowserResponseBody::Error { code, message } => (code.clone(), message.clone()),
@@ -1104,12 +1073,12 @@ impl LockedBrowserClient<'_> {
                 ),
             };
             if code == "authentication_required" {
-                self.close();
+                rpc.close("authenticated session closed".into());
             }
             return Err(RpcError::Remote { code, message });
         }
 
-        Ok(response)
+        Ok((response, read_permit))
     }
 
     pub(super) async fn hello(&self) -> Result<BrowserHello, String> {
@@ -1154,6 +1123,20 @@ impl LockedBrowserClient<'_> {
                 return Err(error.to_string());
             }
         };
+        if hello
+            .capabilities
+            .iter()
+            .any(|cap| cap == multiplex::CAPABILITY)
+        {
+            if let Some(rpc) = self
+                .connection
+                .borrow()
+                .as_ref()
+                .and_then(|c| c.rpc.borrow().clone())
+            {
+                rpc.enable_multiplex();
+            }
+        }
         self.peer_id.replace(Some(peer_id));
         self.hello.replace(Some(hello.clone()));
         Ok(hello)
@@ -2805,7 +2788,7 @@ pub struct BrowserNodeSession {
 
 impl BrowserNodeSession {
     async fn active(&self) -> Result<LockedBrowserClient<'_>, JsValue> {
-        let client = self
+        let mut client = self
             .inner
             .lock_before(&TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
             .await
@@ -2818,6 +2801,23 @@ impl BrowserNodeSession {
                 "session closed; call BrowserNodeClient.connect() again",
             ));
         }
+        client._guard.take();
+        let rpc = self
+            .inner
+            .connection
+            .borrow()
+            .as_ref()
+            .and_then(|c| c.rpc.borrow().clone())
+            .ok_or_else(|| JsValue::from_str("session closed"))?;
+        let slot = rpc
+            .admit(RPC_ADMISSION_TIMEOUT)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        if self.generation != self.inner.generation.get() {
+            return Err(JsValue::from_str("session closed"));
+        }
+        client.slot.replace(Some(slot));
+        client.authenticated_generation = Some(self.generation);
         Ok(client)
     }
 }
@@ -3032,6 +3032,7 @@ async fn read_pq_payload_typed(
                 frame_budget = frame_budget.max(transfer_timeout(expected));
             }
         }
+        receiver.set_transfer(started, frame_budget);
         if received_at.duration_since(started) > frame_budget {
             return Err(RpcError::Timeout(
                 "WebRTC response frame transfer timed out".into(),

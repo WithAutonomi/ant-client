@@ -103,3 +103,9 @@ channel on the same ICE association. Slow transfers, cancellation and malformed
 frames cannot consume the other channel's response or invalidate its PQ session.
 Pool limits count peers with up to two live channels each; eviction checks active
 leases on both lanes. Nodes must allow the standard two channels per connection.
+
+Multiplexing regressions advertise `rpc-multiplex-4` and delay replies before
+AEAD sealing, so out-of-order application completion still preserves encrypted
+wire sequence. They check a four-request maximum, slow/cancelled RPC isolation,
+no repeated authentication, cancellation before admission, legacy-node fallback,
+and read reservations retained through abandoned replies and returned decoding.

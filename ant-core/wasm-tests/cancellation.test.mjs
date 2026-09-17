@@ -4,7 +4,7 @@ import { test_cancel_request, test_cancel_queued_request } from "./pkg/ant_core.
 import { mockWebRtc } from "./mock-webrtc.mjs";
 
 for (const phase of ["response", "partial response", "send buffer"]) {
-  test(`cancellation during ${phase} closes the association before reuse`, async () => {
+  test(`cancellation during ${phase} drains the exchange and reuses authentication`, async () => {
     let partialSent = false;
     const rtc = mockWebRtc([{
       delay: (method) => method === "find_node" ? 50 : 0,
@@ -17,10 +17,15 @@ for (const phase of ["response", "partial response", "send buffer"]) {
       },
     }]);
     await test_cancel_request(rtc.endpoints[0], () => {
-      if (phase === "send buffer") rtc.connections[0].channel.bufferedAmount = 3 * 1024 * 1024;
+      if (phase === "send buffer") {
+        const channel = rtc.connections[0].channel;
+        channel.bufferedAmount = 3 * 1024 * 1024;
+        setTimeout(() => { channel.bufferedAmount = 0; channel.onbufferedamountlow?.({}); }, 60);
+      }
     });
-    assert.equal(rtc.connections.length, 2);
+    assert.equal(rtc.connections.length, 1);
     assert.equal(rtc.connections[0].closed, true);
+    assert.equal(rtc.requests.filter(r => r.method === "hello").length, 1);
     assert.equal(rtc.connections[0].channel.onbufferedamountlow ?? null, null);
   });
 }
