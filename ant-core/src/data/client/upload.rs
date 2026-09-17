@@ -162,8 +162,18 @@ pub trait UploadAdapter: AdapterBounds {
     }
     /// Report a completed store or an already-present record.
     fn stored(&self, _stored: usize, _total: usize) {}
-    /// Report a completed quote.
+    /// Report a successful write in this attempt, identified by stable index + 1.
+    fn record_stored(&self, _index: usize, _total: usize) {}
+    /// Report a completed quote (the first argument is the stable record index + 1).
     fn quoted(&self, _quoted: usize, _total: usize) {}
+    /// Report existing-storage checks, which do not complete payment quotes.
+    fn checked(&self, _checked: usize, _total: usize) {}
+    /// Report a record confirmed already present, identified by stable index + 1.
+    fn already_stored(&self, _index: usize, _total: usize) {}
+    /// Report validated Merkle candidate pools for the current payment batch.
+    fn payment_quotes(&self, _completed: usize, _total: usize) {}
+    /// Describe a preparation boundary that has no meaningful completion fraction.
+    fn preparing(&self, _message: &str) {}
 }
 
 /// Completed upload accounting.
@@ -471,6 +481,9 @@ impl Client {
                         }
                         .await;
                         if let Ok(stored) = &result {
+                            if stored.stored.contains(&record.address) {
+                                adapter.record_stored(record.index + 1, total);
+                            }
                             let completed = live_stored.fetch_add(stored.stored.len(), std::sync::atomic::Ordering::Relaxed) + stored.stored.len();
                             adapter.stored(completed, total);
                         }
@@ -569,6 +582,7 @@ impl Client {
         adapter: &A,
         total: usize,
     ) -> Result<Vec<(UploadRecord, Option<ChunkPaymentPlan>)>> {
+        adapter.preparing("Collecting record payment quotes and checking storage peers");
         let recovery = state;
         let plans = crate::client_engine::rolling_unordered(
             wave.iter().copied(),
@@ -606,7 +620,11 @@ impl Client {
                 if let Some(plan) = plan.as_mut() {
                     adapter.admit(plan).await?;
                 }
-                adapter.quoted(record.index + 1, total);
+                if plan.is_some() {
+                    adapter.quoted(record.index + 1, total);
+                } else {
+                    adapter.already_stored(record.index + 1, total);
+                }
                 Ok::<_, Error>((record, plan))
             },
             || self.controller().quote.current().min(adapter.quote_limit()),
@@ -675,6 +693,7 @@ impl Client {
                     classify_error,
                 )
                 .await?;
+                adapter.record_stored(record.index + 1, total);
                 let completed = live_stored.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 adapter.stored(completed, total);
                 Ok(started)
@@ -815,11 +834,15 @@ impl Client {
             return Ok(());
         }
         let entries = unpaid.iter().map(|r| (r.address, r.size)).collect();
+        adapter.checked(0, unpaid.len());
         let plan = match self
-            .plan_merkle_upload_observed(entries, ant_protocol::DATA_TYPE_CHUNK, None, &|address, _| {
-                if let Some(record) = records.iter().find(|record| record.address == address) {
-                    adapter.quoted(record.index + 1, quote_total);
+            .plan_merkle_upload_observed(entries, ant_protocol::DATA_TYPE_CHUNK, None, &|address, checked, total, present| {
+                if present {
+                    if let Some(record) = records.iter().find(|record| record.address == address) {
+                        adapter.already_stored(record.index + 1, quote_total);
+                    }
                 }
+                adapter.checked(checked, total);
             })
             .await
         {
@@ -839,12 +862,15 @@ impl Client {
         if !should_use_merkle(plan.to_upload.len(), mode) {
             return Ok(());
         }
-        for addresses in merkle_batch_partitions(&plan.to_upload) {
+        let batches = merkle_batch_partitions(&plan.to_upload);
+        for (batch_index, addresses) in batches.iter().enumerate() {
+            adapter.preparing(&format!("Preparing Merkle payment batch {}/{}: collecting candidate quotes", batch_index + 1, batches.len()));
             let batch = match self
-                .prepare_merkle_batch_external(
+                .prepare_merkle_batch_external_observed(
                     addresses,
                     ant_protocol::DATA_TYPE_CHUNK,
                     plan.to_upload_avg_size(),
+                    &|completed, total| adapter.payment_quotes(completed, total),
                 )
                 .await
             {
@@ -852,6 +878,10 @@ impl Client {
                 Err(Error::InsufficientPeers(_)) if mode == PaymentMode::Auto => return Ok(()),
                 Err(error) => return Err(error),
             };
+            for record in records.iter().filter(|record| addresses.contains(&record.address)) {
+                adapter.quoted(record.index + 1, quote_total);
+            }
+            adapter.preparing("Payment quotes ready; saving recovery checkpoint before payment review");
             state.pending_merkle = Some(batch);
             adapter.checkpoint(state, None).await?;
             self.ensure_upload_payment_allowed()?;

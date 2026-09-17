@@ -353,10 +353,24 @@ impl UploadAdapter for BrowserUploadAdapter<'_> {
     }
     fn stored(&self, stored: usize, total: usize) {
         self.progress
-            .report(&format!("Stored record {stored}/{total}"));
+            .report(&format!("Confirmed available record {stored}/{total}"));
     }
     fn quoted(&self, quoted: usize, total: usize) {
-        self.progress
-            .report(&format!("Preparing record {quoted}/{total}"));
+        self.progress.report(&format!("Quoted record {quoted}/{total}"));
+    }
+    fn record_stored(&self, index: usize, total: usize) {
+        self.progress.report(&format!("Stored new record {index}/{total}"));
+    }
+    fn checked(&self, checked: usize, total: usize) {
+        self.progress.report(&format!("Checked existing storage {checked}/{total}"));
+    }
+    fn already_stored(&self, index: usize, total: usize) {
+        self.progress.report(&format!("Already present record {index}/{total}"));
+    }
+    fn payment_quotes(&self, completed: usize, total: usize) {
+        self.progress.report(&format!("Collecting payment quote pools {completed}/{total}"));
+    }
+    fn preparing(&self, message: &str) {
+        self.progress.report(message);
     }
 }

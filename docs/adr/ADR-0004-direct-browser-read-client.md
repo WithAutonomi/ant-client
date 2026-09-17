@@ -353,3 +353,16 @@ wire/typed conversions can reuse the immutable verified object. The cache is
 not an owner-view store: every use still checks the advertised peer identity,
 derives fresh local reliability metadata, and follows the shared monotonic
 replacement and witness policy. Failed verification never evicts a valid entry.
+
+
+### Transfer progress semantics (2026-09-17 correction)
+
+The upload adapter exposes optional observation hooks for existing-storage
+checks, records already present, validated payment quote pools, and successful
+record writes. Existing adapters remain source-compatible through default no-op
+hooks. The aggregate `stored` callback still includes already-present records
+for native accounting; the browser exposes it as confirmed availability, not
+new writes. Browser new-store counters use only successful PUT callbacks.
+Merkle preflight checks do not imply that candidate payment quotes are ready.
+Record quote completion is emitted only after the actual batch has been prepared.
+These hooks do not authorize payments, change quorum, or relax verification.

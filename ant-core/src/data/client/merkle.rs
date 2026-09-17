@@ -790,7 +790,7 @@ impl Client {
         data_type: u32,
         progress: Option<&mpsc::Sender<UploadEvent>>,
     ) -> Result<MerkleUploadPlan> {
-        self.plan_merkle_upload_observed(chunks, data_type, progress, &|_, _| {}).await
+        self.plan_merkle_upload_observed(chunks, data_type, progress, &|_, _, _, _| {}).await
     }
 
     pub(crate) async fn plan_merkle_upload_observed(
@@ -798,7 +798,7 @@ impl Client {
         chunks: Vec<([u8; 32], u64)>,
         data_type: u32,
         progress: Option<&mpsc::Sender<UploadEvent>>,
-        on_quoted: &impl Fn([u8; 32], usize),
+        on_checked: &impl Fn([u8; 32], usize, usize, bool),
     ) -> Result<MerkleUploadPlan> {
         let total_chunks = chunks.len();
         if total_chunks == 0 {
@@ -838,7 +838,7 @@ impl Client {
         while let Some((index, address, data_size, result)) = check_stream.next().await {
             let is_already_stored = result?;
             checked += 1;
-            on_quoted(address, total_chunks);
+            on_checked(address, checked, total_chunks, is_already_stored);
 
             if let Some(tx) = progress {
                 let _ = tx.try_send(UploadEvent::ChunkQuoted {
@@ -988,6 +988,16 @@ impl Client {
         data_type: u32,
         data_size: u64,
     ) -> Result<PreparedMerkleBatch> {
+        self.prepare_merkle_batch_external_observed(addresses, data_type, data_size, &|_, _| {}).await
+    }
+
+    pub(crate) async fn prepare_merkle_batch_external_observed(
+        &self,
+        addresses: &[[u8; 32]],
+        data_type: u32,
+        data_size: u64,
+        on_pool: &impl Fn(usize, usize),
+    ) -> Result<PreparedMerkleBatch> {
         // A refusal established by any earlier upload on this client stops
         // this one before it spends. The verdict is about this build, not
         // about one operation, so an upload that started after another had
@@ -1035,6 +1045,7 @@ impl Client {
                 data_type,
                 data_size,
                 merkle_payment_timestamp,
+                on_pool,
             )
             .await?;
 
@@ -1198,7 +1209,9 @@ impl Client {
         data_type: u32,
         data_size: u64,
         merkle_payment_timestamp: u64,
+        on_pool: &impl Fn(usize, usize),
     ) -> Result<Vec<MerklePaymentCandidatePool>> {
+        on_pool(0, midpoint_proofs.len());
         let mut pool_futures = FuturesUnordered::new();
 
         for midpoint_proof in midpoint_proofs {
@@ -1235,7 +1248,10 @@ impl Client {
         let mut verdict = PoolVerdict::default();
         while let Some(result) = pool_futures.next().await {
             match result {
-                Ok(pool) => pools.push(pool),
+                Ok(pool) => {
+                    pools.push(pool);
+                    on_pool(pools.len(), midpoint_proofs.len());
+                }
                 Err(e) => verdict.note(e),
             }
         }
