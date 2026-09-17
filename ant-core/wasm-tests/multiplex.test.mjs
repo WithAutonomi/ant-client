@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { test_multiplex_requests, test_cancelled_read_reservation, test_stale_rpc_admission, test_draining_pool_capacity } from './pkg/ant_core.js';
+import { test_multiplex_requests, test_cancelled_read_reservation, test_stale_rpc_admission, test_draining_pool_capacity, test_multiplex_puts } from './pkg/ant_core.js';
 import { mockWebRtc } from './mock-webrtc.mjs';
 const object = v => v instanceof Map ? Object.fromEntries([...v].map(([k,x]) => [k, object(x)])) : Array.isArray(v) ? v.map(object) : v;
 
@@ -59,4 +59,18 @@ test('pool eviction waits for abandoned replies and wakes when draining complete
   await test_draining_pool_capacity(rtc.endpoints);
   assert.equal(rtc.connections.length, 2);
   assert.ok(rtc.connections.every(c => c.closed));
+});
+
+test('PUTs retain per-lane serialization on multiplex-capable nodes', async () => {
+  let active = 0, peak = 0;
+  const rtc = mockWebRtc([{
+    multiplex: true,
+    respond(_ch, method) { if (method === 'put_chunk') peak = Math.max(peak, ++active); },
+    delay: method => method === 'put_chunk' ? 35 : 0,
+    delivered(_ch, method) { if (method === 'put_chunk') active--; },
+  }]);
+  assert.deepEqual(await test_multiplex_puts(rtc.endpoints[0]), Array(6).fill(true));
+  assert.equal(peak, 1);
+  assert.equal(rtc.connections.length, 1);
+  assert.equal(rtc.requests.filter(r => r.method === 'hello').length, 1);
 });

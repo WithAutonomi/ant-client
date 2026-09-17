@@ -101,6 +101,7 @@ impl RpcSession {
             .map_err(|_| "WebRTC session closed".to_string().into())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn request(
         self: &Rc<Self>,
         id: u64,
@@ -108,10 +109,31 @@ impl RpcSession {
         timeout: Duration,
         read_permit: Option<ReadPermit>,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        exclusive: bool,
     ) -> Result<(BrowserResponseFrame, Duration, Option<ReadPermit>), RpcError> {
-        let permit = match permit {
-            Some(permit) => permit,
-            None => self.admit(RPC_ADMISSION_TIMEOUT).await?,
+        // Preserve per-lane PUT serialization: several complete incoming PUTs
+        // would consume the node's byte budget before any one can finish. Give
+        // up ordinary admission before acquiring all slots to avoid upgrades
+        // deadlocking when several callers already hold one slot each.
+        let permit = if exclusive {
+            drop(permit);
+            let count = if self.multiplex.get() {
+                MAX_REQUESTS as u32
+            } else {
+                1
+            };
+            crate::runtime::timeout(
+                RPC_ADMISSION_TIMEOUT,
+                self.slots.clone().acquire_many_owned(count),
+            )
+            .await
+            .map_err(|_| RpcError::Timeout("WebRTC write admission timed out".into()))?
+            .map_err(|_| "WebRTC session closed".to_string())?
+        } else {
+            match permit {
+                Some(permit) => permit,
+                None => self.admit(RPC_ADMISSION_TIMEOUT).await?,
+            }
         };
         let (mut sender, receiver) = oneshot::channel();
         let session = Rc::clone(self);

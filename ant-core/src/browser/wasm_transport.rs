@@ -1028,7 +1028,8 @@ impl LockedBrowserClient<'_> {
         content: &[u8],
         response_timeout: Duration,
     ) -> Result<BrowserResponseFrame, RpcError> {
-        self.request_reserved(body, content, response_timeout, None)
+        let exclusive = matches!(&body, BrowserRequestBody::PutChunk { .. });
+        self.request_reserved(body, content, response_timeout, None, exclusive)
             .await
             .map(|(response, _)| response)
     }
@@ -1039,6 +1040,7 @@ impl LockedBrowserClient<'_> {
         content: &[u8],
         response_timeout: Duration,
         read_permit: Option<crate::client_engine::read_budget::ReadPermit>,
+        exclusive: bool,
     ) -> Result<
         (
             BrowserResponseFrame,
@@ -1076,7 +1078,14 @@ impl LockedBrowserClient<'_> {
             encode_request_frame(&request, content).map_err(|error| error.to_string())?;
         let slot = self.slot.borrow_mut().take();
         let (response, processing, read_permit) = rpc
-            .request(request_id, plaintext, response_timeout, read_permit, slot)
+            .request(
+                request_id,
+                plaintext,
+                response_timeout,
+                read_permit,
+                slot,
+                exclusive,
+            )
             .await?;
         self.response_processing.set(processing);
         if response.header.status == BrowserResponseStatus::Error {

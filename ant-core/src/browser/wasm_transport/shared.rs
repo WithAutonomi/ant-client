@@ -269,6 +269,7 @@ impl BrowserNetwork for SharedNetworkAdapter {
             } else {
                 None
             };
+            let exclusive = matches!(&request.body, ChunkMessageBody::PutRequest(_));
             let bytes = request
                 .encode()
                 .map_err(|e| DataError::Protocol(e.to_string()))?;
@@ -278,6 +279,7 @@ impl BrowserNetwork for SharedNetworkAdapter {
                     &bytes,
                     timeout,
                     read_permit,
+                    exclusive,
                 )
                 .await
                 .map_err(rpc_data_error)?;

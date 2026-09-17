@@ -401,3 +401,7 @@ Validation covers delayed work, out-of-order replies, cancelled active and queue
 callers, authenticated-session reuse, old-node fallback, ingress limits, transfer
 deadlines, and a real WebRTC blocked-storage regression. Live benchmarks compare
 unchanged file bytes and integrity checks, elapsed time and received bytes.
+
+PUTs retain exclusive per-lane admission, including through cancellation drain.
+GETs and control RPCs may multiplex; enabling the capability does not multiply
+large incoming uploads against the node's existing source byte limit.

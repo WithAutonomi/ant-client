@@ -1157,6 +1157,7 @@ pub async fn test_cancelled_read_reservation(endpoint: &str) {
         &[],
         Duration::from_secs(1),
         Some(permit),
+        false,
     );
     assert!(crate::runtime::timeout(Duration::from_millis(20), request)
         .await
@@ -1182,6 +1183,7 @@ pub async fn test_cancelled_read_reservation(endpoint: &str) {
             &[],
             Duration::from_secs(1),
             Some(permit),
+            false,
         )
         .await
         .unwrap();
@@ -1245,4 +1247,34 @@ pub async fn test_draining_pool_capacity(endpoints: JsValue) {
         .await
         .unwrap();
     pool.close();
+}
+
+#[wasm_bindgen]
+pub async fn test_multiplex_puts(endpoint: &str) -> JsValue {
+    let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
+    client.hello().await.unwrap();
+    let results = futures::future::join_all((0..6).map(|index| {
+        let client = &client;
+        async move {
+            let bytes = vec![index as u8; 1024];
+            let address = super::super::content_address(&bytes);
+            let (quote, _) = client
+                .authenticated()
+                .await
+                .unwrap()
+                .quote_chunk(&address, bytes.len())
+                .await
+                .unwrap();
+            client
+                .authenticated()
+                .await
+                .unwrap()
+                .put_chunk_typed(&address, &bytes, quote, &"ab".repeat(32))
+                .await
+                .is_ok()
+        }
+    }))
+    .await;
+    client.close();
+    serde_wasm_bindgen::to_value(&results).unwrap()
 }
