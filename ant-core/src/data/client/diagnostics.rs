@@ -174,8 +174,8 @@ pub struct DownloadDiagnosticsRecord {
     pub chunk_index: usize,
     /// Hex-encoded chunk address.
     pub chunk_address: String,
-    /// `cached` (one connected known peer), `initial`, or `retry`
-    /// (internal close-group retry sweep). Cached probes still fetch and verify
+    /// `early` (a candidate while discovery is pending), `initial`, or `retry`
+    /// (internal close-group retry sweep). Early probes still fetch and verify
     /// the content; they are distinct from in-memory `cache_hit` records.
     pub sweep: String,
     /// Peer attempt number within the sweep; `None` for chunk-level records
@@ -186,9 +186,9 @@ pub struct DownloadDiagnosticsRecord {
     pub lookup_duration_ms: Option<u64>,
     /// Process-local identifier shared by attempts from one closest-peer lookup.
     pub lookup_correlation_id: Option<String>,
-    /// One-based ordinal in the selected peer order (one for a cached probe).
+    /// One-based ordinal in the selected peer order (one for an early probe).
     pub selected_peer_ordinal: Option<usize>,
-    /// Peer selected by discovery or the connected-peer cache for this attempt;
+    /// Peer selected by discovery or the early discovery hints for this attempt;
     /// `None` for chunk-level records.
     pub expected_peer: Option<String>,
     /// Dial addresses selected from the DHT record, in priority order.

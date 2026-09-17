@@ -1267,6 +1267,17 @@ impl BrowserNetworkCore {
         progress: &ProgressReporter,
         count: usize,
     ) -> Result<BrowserLookupResult, String> {
+        self.find_closest_with_progress(target, progress, count, None)
+            .await
+    }
+
+    async fn find_closest_with_progress(
+        &self,
+        target: &str,
+        progress: &ProgressReporter,
+        count: usize,
+        read_progress: Option<crate::data::network::ReadProgress>,
+    ) -> Result<BrowserLookupResult, String> {
         // Only authenticated, recently contacted endpoints bootstrap another walk.
         self.routing.borrow_mut().retain(|peer, _| {
             self.contacted
@@ -1277,11 +1288,11 @@ impl BrowserNetworkCore {
         let cached = !self.routing.borrow().is_empty();
         if !cached {
             return self
-                .find_closest_attempt(target, progress, count, true)
+                .find_closest_attempt(target, progress, count, true, read_progress.clone())
                 .await;
         }
         let first = self
-            .find_closest_attempt(target, progress, count, false)
+            .find_closest_attempt(target, progress, count, false, read_progress.clone())
             .await;
         if first
             .as_ref()
@@ -1291,7 +1302,7 @@ impl BrowserNetworkCore {
         }
         progress.report("Retrying lookup through configured seeds");
         let seeded = self
-            .find_closest_attempt(target, progress, count, true)
+            .find_closest_attempt(target, progress, count, true, read_progress.clone())
             .await;
         match (first, seeded) {
             (Ok(first), Ok(second)) if first.nodes.len() > second.nodes.len() => Ok(first),
@@ -1307,6 +1318,7 @@ impl BrowserNetworkCore {
         progress: &ProgressReporter,
         count: usize,
         use_seeds: bool,
+        read_progress: Option<crate::data::network::ReadProgress>,
     ) -> Result<BrowserLookupResult, String> {
         let target_key = parse_lookup_key(target, "lookup target")?;
         let failures = Rc::new(RefCell::new(Vec::new()));
@@ -1315,6 +1327,7 @@ impl BrowserNetworkCore {
             let pool = Rc::clone(&self.pool);
             let failures = Rc::clone(&failures);
             let progress = progress.clone();
+            let read_progress = read_progress.clone();
             async move {
                 let seed_name = endpoint.multiaddr.clone();
                 let result = async {
@@ -1332,7 +1345,14 @@ impl BrowserNetworkCore {
                 }
                 .await;
                 match result {
-                    Ok(candidate) => Some(candidate),
+                    Ok(candidate) => {
+                        if let Some(progress) = &read_progress {
+                            if let Ok(node) = shared::peer_record(&candidate.wire) {
+                                progress.offer(vec![(node.peer_id, node.addresses_by_priority())]);
+                            }
+                        }
+                        Some(candidate)
+                    }
                     Err(error) => {
                         progress.report(&format!("Seed {seed_name} failed: {error}"));
                         failures.borrow_mut().push(BrowserLookupFailure {
@@ -1398,6 +1418,7 @@ impl BrowserNetworkCore {
             contacted: Rc::clone(&self.contacted),
             owner_views: Rc::clone(&self.owner_views),
             reports: HashMap::new(),
+            read_progress,
         };
         run_iterative_lookup(
             &mut lookup,
@@ -1449,6 +1470,7 @@ impl BrowserNetworkCore {
 }
 
 struct BrowserNetworkLookupQuery {
+    read_progress: Option<crate::data::network::ReadProgress>,
     pool: Rc<BrowserClientPool>,
     progress: ProgressReporter,
     failures: Rc<RefCell<Vec<BrowserLookupFailure>>>,
@@ -1496,6 +1518,7 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                 let views = Rc::clone(&self.views);
                 let routing = Rc::clone(&self.routing);
                 let contacted = Rc::clone(&self.contacted);
+                let read_progress = self.read_progress.clone();
                 let target = target.clone();
                 async move {
                     let responder = candidate.peer_id;
@@ -1515,6 +1538,14 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                     .await;
                     match result {
                         Ok(nodes) => {
+                            if let Some(progress) = &read_progress {
+                                let hints = std::iter::once(&candidate.wire)
+                                    .chain(nodes.iter())
+                                    .filter_map(|node| shared::peer_record(node).ok())
+                                    .map(|node| (node.peer_id, node.addresses_by_priority()))
+                                    .collect();
+                                progress.offer(hints);
+                            }
                             pool.preconnect(&nodes);
                             routing.borrow_mut().insert(responder, candidate.clone());
                             contacted

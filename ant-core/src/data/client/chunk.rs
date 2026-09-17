@@ -796,103 +796,119 @@ impl Client {
 
         #[cfg(feature = "native")]
         let observation = diag.map(|_| std::sync::Mutex::new(ReadObservation::default()));
-        let cached_peer = self.network().connected_read_peer(address).await;
-        let cached_read = cached_peer.map(|(peer, addrs)| async move {
-            #[cfg(feature = "native")]
-            if let Some(diag) = diag {
-                // A separate observation keeps speculative GETs independent of
-                // the concurrent discovery sweep's peer ordering and timing.
-                let observation = std::sync::Mutex::new(ReadObservation {
-                    lookup_id: format!(
-                        "{}-{}-cached-{}",
-                        diag.file_attempt,
-                        diag.chunk_index,
-                        NEXT_DIAGNOSTIC_LOOKUP_ID.fetch_add(1, AtomicOrdering::Relaxed)
-                    ),
-                    ..ReadObservation::default()
-                });
-                return self
-                    .chunk_get_diagnostic_attempt(address, &peer, &addrs, diag, &observation)
-                    .await;
-            }
-            self.chunk_get_from_peer(address, &peer, &addrs).await
-        });
-        let discovered = crate::client_engine::read::retrieve(
+        let result = crate::client_engine::read::retrieve_progressive(
             *address,
-            || async {
-                #[cfg(feature = "native")]
-                let lookup_started = Instant::now();
-                #[cfg(feature = "native")]
-                let mut contexts = Vec::new();
-                #[cfg(feature = "native")]
-                let closest_result = if diag.is_some() {
-                    self.network()
-                        .find_closest_peers_with_diagnostics(address, peer_count)
-                        .await
-                        .map(|found| {
-                            let peers = found
-                                .iter()
-                                .map(|c| (c.peer_id, c.addresses.clone()))
-                                .collect();
-                            contexts = found;
-                            peers
-                        })
-                } else {
-                    self.closest_peers(address, peer_count).await
-                };
-                #[cfg(not(feature = "native"))]
-                let closest_result = self.closest_peers(address, peer_count).await;
-                let closest = closest_result.unwrap_or_else(|e| {
-                    #[cfg(feature = "native")]
-                    if let (Some(diag), Some(observation)) = (diag, &observation) {
-                        let round = observation.lock().unwrap_or_else(|e| e.into_inner()).round;
-                        diag.emit_chunk_level(
-                            if round == 0 { "initial" } else { "retry" },
-                            0,
-                            DownloadDiagnosticsOutcome::LookupError,
-                            Some(bounded_error("lookup", &e.to_string())),
-                        );
-                    }
-                    info!(
-                        "Chunk discovery failed for {}: {e}; trying known peers",
-                        hex::encode(address)
-                    );
-                    Vec::new()
-                });
-                let known = self
-                    .network()
-                    .known_peers()
-                    .await
-                    .into_iter()
-                    .filter(|node| node.peer_id != *self.network().peer_id())
-                    .map(|node| {
-                        let addrs = node.addresses_by_priority();
-                        (node.peer_id, addrs)
-                    })
-                    .collect();
-                #[cfg(feature = "native")]
-                if let (Some(diag), Some(observation)) = (diag, &observation) {
-                    let mut state = observation.lock().unwrap_or_else(|e| e.into_inner());
-                    state.round += 1;
-                    state.peer_attempt = 0;
-                    state.lookup_ms =
-                        u64::try_from(lookup_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    state.lookup_id = format!(
-                        "{}-{}-{}-{}",
-                        diag.file_attempt,
-                        diag.chunk_index,
-                        hex::encode(address),
-                        NEXT_DIAGNOSTIC_LOOKUP_ID.fetch_add(1, AtomicOrdering::Relaxed)
-                    );
-                    state.contexts = contexts.into_iter().map(|c| (c.peer_id, c)).collect();
-                }
-                crate::client_engine::read::ReadCandidates { closest, known }
-            },
-            |(peer, _)| *peer.as_bytes(),
-            |(peer, addrs)| {
+            peer_count,
+            |sender| {
                 #[cfg(feature = "native")]
                 let observation = &observation;
                 async move {
+                    let progress = crate::data::network::ReadProgress::new(
+                        *address,
+                        *self.network().peer_id(),
+                        sender,
+                    );
+                    self.network().seed_read_candidates(&progress).await;
+                    #[cfg(feature = "native")]
+                    let lookup_started = Instant::now();
+                    #[cfg(feature = "native")]
+                    let mut contexts = Vec::new();
+                    #[cfg(feature = "native")]
+                    let closest_result = if diag.is_some() {
+                        self.network()
+                            .find_closest_peers_with_diagnostics(address, peer_count)
+                            .await
+                            .map(|found| {
+                                let peers = found
+                                    .iter()
+                                    .map(|c| (c.peer_id, c.addresses.clone()))
+                                    .collect();
+                                contexts = found;
+                                peers
+                            })
+                    } else {
+                        self.closest_peers(address, peer_count).await
+                    };
+                    #[cfg(not(feature = "native"))]
+                    let closest_result = self
+                        .network()
+                        .find_read_peers(address, peer_count, progress)
+                        .await;
+                    let closest = closest_result.unwrap_or_else(|e| {
+                        #[cfg(feature = "native")]
+                        if let (Some(diag), Some(observation)) = (diag, &observation) {
+                            let round = observation.lock().unwrap_or_else(|e| e.into_inner()).round;
+                            diag.emit_chunk_level(
+                                if round == 0 { "initial" } else { "retry" },
+                                0,
+                                DownloadDiagnosticsOutcome::LookupError,
+                                Some(bounded_error("lookup", &e.to_string())),
+                            );
+                        }
+                        info!(
+                            "Chunk discovery failed for {}: {e}; trying known peers",
+                            hex::encode(address)
+                        );
+                        Vec::new()
+                    });
+                    let known = self
+                        .network()
+                        .known_peers()
+                        .await
+                        .into_iter()
+                        .filter(|node| node.peer_id != *self.network().peer_id())
+                        .map(|node| {
+                            let addrs = node.addresses_by_priority();
+                            (node.peer_id, addrs)
+                        })
+                        .collect();
+                    #[cfg(feature = "native")]
+                    if let (Some(diag), Some(observation)) = (diag, &observation) {
+                        let mut state = observation.lock().unwrap_or_else(|e| e.into_inner());
+                        state.round += 1;
+                        state.peer_attempt = 0;
+                        state.lookup_ms =
+                            u64::try_from(lookup_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        state.lookup_id = format!(
+                            "{}-{}-{}-{}",
+                            diag.file_attempt,
+                            diag.chunk_index,
+                            hex::encode(address),
+                            NEXT_DIAGNOSTIC_LOOKUP_ID.fetch_add(1, AtomicOrdering::Relaxed)
+                        );
+                        state.contexts = contexts.into_iter().map(|c| (c.peer_id, c)).collect();
+                    }
+                    crate::client_engine::read::ReadCandidates { closest, known }
+                }
+            },
+            |(peer, _)| *peer.as_bytes(),
+            |(peer, addrs), early| {
+                #[cfg(feature = "native")]
+                let observation = &observation;
+                async move {
+                    if early {
+                        #[cfg(feature = "native")]
+                        if let Some(diag) = diag {
+                            let early_observation = std::sync::Mutex::new(ReadObservation {
+                                lookup_id: format!(
+                                    "{}-{}-early-{}",
+                                    diag.file_attempt,
+                                    diag.chunk_index,
+                                    NEXT_DIAGNOSTIC_LOOKUP_ID.fetch_add(1, AtomicOrdering::Relaxed)
+                                ),
+                                ..ReadObservation::default()
+                            });
+                            return self
+                                .chunk_get_diagnostic_attempt(
+                                    address,
+                                    &peer,
+                                    &addrs,
+                                    diag,
+                                    &early_observation,
+                                )
+                                .await;
+                        }
+                    }
                     #[cfg(feature = "native")]
                     if let (Some(diag), Some(observation)) = (diag, observation) {
                         return self
@@ -909,15 +925,8 @@ impl Client {
                 )
             },
             crate::runtime::sleep,
-        );
-        let result =
-            crate::client_engine::read::race_cached_read(cached_read, discovered, |error| {
-                matches!(
-                    error,
-                    Error::Timeout(_) | Error::Network(_) | Error::Protocol(_)
-                )
-            })
-            .await?;
+        )
+        .await?;
         #[cfg(feature = "native")]
         if result.is_none() {
             if let (Some(diag), Some(observation)) = (diag, &observation) {
@@ -1642,7 +1651,7 @@ impl Client {
                 });
             (
                 match state.round {
-                    0 => "cached",
+                    0 => "early",
                     1 => "initial",
                     _ => "retry",
                 },

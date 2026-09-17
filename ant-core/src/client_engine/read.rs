@@ -68,9 +68,146 @@ pub(crate) fn read_targets<P>(
     primary
 }
 
-/// Errors from GET are classified by the adapter; invalid local input remains
-/// fatal, while transport/remote errors allow another replica to answer.
-pub(crate) async fn retrieve<P, T, E, D, DF, G, GF, S, SF>(
+/// Discover and read concurrently. Early hints are never absence votes or
+/// close-group authority. One early GET runs while discovery is pending; after
+/// discovery one ordinary GET may race it. A peer is queried at most once per
+/// round, and only the completed final candidate set can establish absence.
+pub(crate) async fn retrieve_progressive<P, T, E, D, DF, G, GF, S, SF>(
+    target: [u8; 32],
+    early_limit: usize,
+    discover: D,
+    key: impl Fn(&P) -> [u8; 32],
+    get: G,
+    retryable: impl Fn(&E) -> bool,
+    sleep: S,
+) -> Result<Option<T>, E>
+where
+    P: Clone,
+    D: Fn(tokio::sync::watch::Sender<Vec<P>>) -> DF,
+    DF: Future<Output = ReadCandidates<P>>,
+    G: Fn(P, bool) -> GF,
+    GF: Future<Output = Result<Option<T>, E>>,
+    S: Fn(Duration) -> SF,
+    SF: Future<Output = ()>,
+{
+    for attempt in 0..2 {
+        if attempt > 0 {
+            sleep(CLOSE_GROUP_RETRY_DELAY).await;
+        }
+        let (sender, mut updates) = tokio::sync::watch::channel(Vec::new());
+        let mut discovery = Box::pin(discover(sender));
+        let mut attempted = HashSet::new();
+        let not_found = std::sync::Mutex::new(HashSet::new());
+        let mut active: Option<([u8; 32], std::pin::Pin<Box<GF>>)> = None;
+        let mut updates_open = true;
+        let candidates = loop {
+            if active.is_none() && attempted.len() < early_limit.min(MAX_GET_FALLBACK_PEERS) {
+                let next = updates
+                    .borrow_and_update()
+                    .iter()
+                    .filter(|peer| !attempted.contains(&key(peer)))
+                    .min_by_key(|peer| ant_protocol::transport::xor_distance(&key(peer), &target))
+                    .cloned();
+                if let Some(peer) = next {
+                    let id = key(&peer);
+                    attempted.insert(id);
+                    active = Some((id, Box::pin(get(peer, true))));
+                }
+            }
+            let event = {
+                let changed = async {
+                    if updates_open {
+                        updates.changed().await.is_ok()
+                    } else {
+                        futures::future::pending().await
+                    }
+                };
+                let read = async {
+                    match &mut active {
+                        Some((id, future)) => (*id, future.await),
+                        None => futures::future::pending().await,
+                    }
+                };
+                match select(
+                    discovery.as_mut(),
+                    Box::pin(select(Box::pin(read), Box::pin(changed))),
+                )
+                .await
+                {
+                    Either::Left((candidates, _)) => Either::Left(candidates),
+                    Either::Right((event, _)) => Either::Right(match event {
+                        Either::Left((result, _)) => Either::Left(result),
+                        Either::Right((open, _)) => Either::Right(open),
+                    }),
+                }
+            };
+            match event {
+                Either::Left(candidates) => break candidates,
+                Either::Right(Either::Right(open)) => updates_open = open,
+                Either::Right(Either::Left((id, result))) => {
+                    active = None;
+                    match result {
+                        Ok(Some(value)) => return Ok(Some(value)),
+                        Ok(None) => {
+                            not_found
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(id);
+                        }
+                        Err(error) if !retryable(&error) => return Err(error),
+                        Err(_) => {}
+                    }
+                }
+            }
+        };
+        let peers = read_targets(candidates, &target, &key);
+        let final_ids = peers.iter().map(&key).collect::<HashSet<_>>();
+        let pending_early = active.map(|(id, future)| {
+            let not_found = &not_found;
+            async move {
+                let result = future.await;
+                if matches!(result, Ok(None)) {
+                    not_found
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(id);
+                }
+                result
+            }
+        });
+        let ordinary = async {
+            for peer in peers {
+                let id = key(&peer);
+                if attempted.contains(&id) {
+                    continue;
+                }
+                match get(peer, false).await {
+                    Ok(Some(value)) => return Ok(Some(value)),
+                    Ok(None) => {
+                        not_found
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(id);
+                    }
+                    Err(error) if !retryable(&error) => return Err(error),
+                    Err(_) => {}
+                }
+            }
+            Ok(None)
+        };
+        if let Some(value) = race_cached_read(pending_early, ordinary, &retryable).await? {
+            return Ok(Some(value));
+        }
+        let misses = not_found.lock().unwrap_or_else(|e| e.into_inner());
+        if is_authoritative_not_found(final_ids.intersection(&misses).count(), final_ids.len()) {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+async fn retrieve<P: Clone, T, E, D, DF, G, GF, S, SF>(
     target: [u8; 32],
     discover: D,
     key: impl Fn(&P) -> [u8; 32],
@@ -86,26 +223,16 @@ where
     S: Fn(Duration) -> SF,
     SF: Future<Output = ()>,
 {
-    for attempt in 0..2 {
-        if attempt > 0 {
-            sleep(CLOSE_GROUP_RETRY_DELAY).await;
-        }
-        let peers = read_targets(discover().await, &target, &key);
-        let queried = peers.len();
-        let mut not_found = 0;
-        for peer in peers {
-            match get(peer).await {
-                Ok(Some(value)) => return Ok(Some(value)),
-                Ok(None) => not_found += 1,
-                Err(error) if !retryable(&error) => return Err(error),
-                Err(_) => {}
-            }
-        }
-        if is_authoritative_not_found(not_found, queried) {
-            break;
-        }
-    }
-    Ok(None)
+    retrieve_progressive(
+        target,
+        0,
+        |_| discover(),
+        key,
+        |peer, _| get(peer),
+        retryable,
+        sleep,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -120,6 +247,146 @@ mod tests {
     enum ReadError {
         Transport,
         Integrity,
+    }
+
+    #[test]
+    fn progressive_verified_read_finishes_before_discovery() {
+        let result = futures::executor::block_on(retrieve_progressive(
+            peer(0),
+            7,
+            |updates| async move {
+                updates.send_replace(vec![peer(1)]);
+                futures::future::pending().await
+            },
+            |p| *p,
+            |_, early| async move {
+                assert!(early);
+                Ok::<_, ReadError>(Some(42))
+            },
+            |_| true,
+            |_| async {},
+        ));
+        assert_eq!(result, Ok(Some(42)));
+    }
+
+    #[test]
+    fn early_misses_cannot_end_incomplete_discovery() {
+        use futures::FutureExt;
+        let gets = Cell::new(0);
+        let result = retrieve_progressive(
+            peer(0),
+            7,
+            |updates| async move {
+                updates.send_replace((1..=7).map(peer).collect());
+                futures::future::pending().await
+            },
+            |p| *p,
+            |_, early| {
+                assert!(early);
+                gets.set(gets.get() + 1);
+                async { Ok::<Option<()>, ReadError>(None) }
+            },
+            |_| true,
+            |_| async {},
+        )
+        .now_or_never();
+        assert!(result.is_none());
+        assert_eq!(gets.get(), 7);
+    }
+
+    #[test]
+    fn slow_early_get_is_deduplicated_and_does_not_block_another_holder() {
+        let (send, receive) = futures::channel::oneshot::channel();
+        let send = RefCell::new(Some(send));
+        let receive = RefCell::new(Some(receive));
+        let gets = RefCell::new(Vec::new());
+        let result = futures::executor::block_on(retrieve_progressive(
+            peer(0),
+            7,
+            |updates| {
+                let receive = receive.borrow_mut().take().unwrap();
+                async move {
+                    updates.send_replace(vec![peer(1)]);
+                    receive.await.unwrap();
+                    ReadCandidates {
+                        closest: vec![peer(1), peer(2)],
+                        known: vec![],
+                    }
+                }
+            },
+            |p| *p,
+            |p, early| {
+                gets.borrow_mut().push((p, early));
+                let send = &send;
+                async move {
+                    if p == peer(1) {
+                        send.borrow_mut().take().unwrap().send(()).unwrap();
+                        futures::future::pending().await
+                    } else {
+                        Ok::<_, ReadError>(Some(42))
+                    }
+                }
+            },
+            |_| true,
+            |_| async {},
+        ));
+        assert_eq!(result, Ok(Some(42)));
+        assert_eq!(*gets.borrow(), vec![(peer(1), true), (peer(2), false)]);
+    }
+
+    #[test]
+    fn progressive_early_budget_preserves_ordinary_fallback_and_absence() {
+        let (send, receive) = futures::channel::oneshot::channel();
+        let send = RefCell::new(Some(send));
+        let receive = RefCell::new(Some(receive));
+        let gets = RefCell::new(Vec::new());
+        let result = futures::executor::block_on(retrieve_progressive(
+            peer(0),
+            2,
+            |updates| {
+                let receive = receive.borrow_mut().take().unwrap();
+                async move {
+                    updates.send_replace((1..=7).map(peer).collect());
+                    receive.await.unwrap();
+                    ReadCandidates {
+                        closest: (1..=7).map(peer).collect(),
+                        known: vec![],
+                    }
+                }
+            },
+            |p| *p,
+            |p, early| {
+                gets.borrow_mut().push((p, early));
+                if p == peer(2) {
+                    send.borrow_mut().take().unwrap().send(()).unwrap();
+                }
+                async { Ok::<Option<()>, ReadError>(None) }
+            },
+            |_| true,
+            |_| async {},
+        ));
+        assert_eq!(result, Ok(None));
+        let gets = gets.borrow();
+        assert_eq!(gets.len(), 7);
+        assert_eq!(gets.iter().filter(|(_, early)| *early).count(), 2);
+        assert_eq!(gets.iter().map(|(p, _)| p).collect::<HashSet<_>>().len(), 7);
+    }
+
+    #[test]
+    fn early_integrity_errors_remain_fatal_before_discovery() {
+        let result = futures::executor::block_on(retrieve_progressive(
+            peer(0),
+            7,
+            |updates| async move {
+                updates.send_replace(vec![peer(1)]);
+                futures::future::pending().await
+            },
+            |p| *p,
+            |_, _| async { Err::<Option<()>, _>(ReadError::Integrity) },
+            |error| *error == ReadError::Transport,
+            |_| async {},
+        ));
+        assert_eq!(result, Err(ReadError::Integrity));
     }
 
     #[test]

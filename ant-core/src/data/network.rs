@@ -93,6 +93,54 @@ pub struct Network {
 /// Peer identities and the addresses that can reach them.
 pub type PeerAddresses = Vec<(PeerId, Vec<MultiAddr>)>;
 
+/// Bounded, latest-value hints for an immutable read in progress. Hints only
+/// start authenticated GETs; they never establish closeness, absence or payment
+/// authority. The receiver may cancel discovery after verifying content.
+#[derive(Clone)]
+pub struct ReadProgress {
+    target: [u8; 32],
+    local: PeerId,
+    sender: tokio::sync::watch::Sender<PeerAddresses>,
+}
+
+impl ReadProgress {
+    pub(crate) fn new(
+        target: [u8; 32],
+        local: PeerId,
+        sender: tokio::sync::watch::Sender<PeerAddresses>,
+    ) -> Self {
+        Self {
+            target,
+            local,
+            sender,
+        }
+    }
+
+    /// Offer authenticated discovery hints, retaining only the nearest bounded
+    /// set. Sending never waits for a slow read consumer.
+    pub fn offer(&self, peers: PeerAddresses) {
+        if self.sender.is_closed() {
+            return;
+        }
+        self.sender.send_modify(|current| {
+            for peer in peers {
+                if peer.0 == self.local || peer.1.is_empty() {
+                    continue;
+                }
+                if let Some(existing) = current.iter_mut().find(|entry| entry.0 == peer.0) {
+                    *existing = peer;
+                } else {
+                    current.push(peer);
+                }
+            }
+            current.sort_by_key(|peer| {
+                ant_protocol::transport::xor_distance(peer.0.as_bytes(), &self.target)
+            });
+            current.truncate(crate::client_engine::read::MAX_GET_FALLBACK_PEERS);
+        });
+    }
+}
+
 /// Browser transport boundary for the shared client. Implementations perform
 /// authenticated RPC and discovery; client policy stays in `Client`.
 #[cfg(not(feature = "native"))]
@@ -105,6 +153,16 @@ pub trait BrowserNetwork {
         target: &'a [u8; 32],
         count: usize,
     ) -> futures::future::LocalBoxFuture<'a, Result<PeerAddresses>>;
+    /// Read-only discovery may report verified candidates before completing.
+    /// Existing adapters remain compatible and supply their final result only.
+    fn find_read_peers<'a>(
+        &'a self,
+        target: &'a [u8; 32],
+        count: usize,
+        _progress: ReadProgress,
+    ) -> futures::future::LocalBoxFuture<'a, Result<PeerAddresses>> {
+        self.find_closest_peers(target, count)
+    }
     /// Authenticated responder views for witnessed quote admission.
     fn find_witnessed_close_group<'a>(
         &'a self,
@@ -441,27 +499,28 @@ impl Network {
         }
     }
 
-    /// Closest known peer already connected to this client. This is only a
-    /// speculative read candidate, never a close-group or payment authority.
-    pub(crate) async fn connected_read_peer(
+    /// Seed early reads from the same local phonebook on both platforms.
+    pub(crate) async fn seed_read_candidates(&self, progress: &ReadProgress) {
+        progress.offer(
+            self.known_peers()
+                .await
+                .into_iter()
+                .map(|node| {
+                    let addrs = node.addresses_by_priority();
+                    (node.peer_id, addrs)
+                })
+                .collect(),
+        );
+    }
+
+    #[cfg(not(feature = "native"))]
+    pub(crate) async fn find_read_peers(
         &self,
         target: &[u8; 32],
-    ) -> Option<(PeerId, Vec<MultiAddr>)> {
-        #[cfg(feature = "native")]
-        let connected = self.node.connected_peers().await;
-        #[cfg(not(feature = "native"))]
-        let connected = self.backend.connected_read_peers();
-        if connected.is_empty() {
-            return None;
-        }
-        self.known_peers()
-            .await
-            .into_iter()
-            .filter(|node| node.peer_id != *self.peer_id() && connected.contains(&node.peer_id))
-            .min_by_key(|node| {
-                ant_protocol::transport::xor_distance(node.peer_id.as_bytes(), target)
-            })
-            .map(|node| (node.peer_id, node.addresses_by_priority()))
+        count: usize,
+        progress: ReadProgress,
+    ) -> Result<PeerAddresses> {
+        self.backend.find_read_peers(target, count, progress).await
     }
 }
 

@@ -56,6 +56,31 @@ impl BrowserNetwork for SharedNetworkAdapter {
         })
     }
 
+    fn find_read_peers<'a>(
+        &'a self,
+        target: &'a LookupKey,
+        count: usize,
+        progress: crate::data::network::ReadProgress,
+    ) -> LocalBoxFuture<'a, DataResult<Vec<(PeerId, Vec<MultiAddr>)>>> {
+        Box::pin(async move {
+            let result = self
+                .inner
+                .find_closest_with_progress(
+                    &hex::encode(target),
+                    &ProgressReporter(None),
+                    count,
+                    Some(progress),
+                )
+                .await
+                .map_err(DataError::Network)?;
+            result
+                .nodes
+                .iter()
+                .map(|node| peer_record(node).map(|node| (node.peer_id, node.addresses)))
+                .collect()
+        })
+    }
+
     fn find_witnessed_close_group<'a>(
         &'a self,
         target: &'a LookupKey,

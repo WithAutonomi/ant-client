@@ -90,3 +90,9 @@ ordinary discovery: a miss cannot establish absence, corrupt content remains
 fatal, and a slow cached candidate cannot block a discovered holder. These reads
 use the same policy on native and WASM. The mock copies outbound bytes before
 re-entering WASM, matching the DataChannel ownership boundary across memory growth.
+
+Immutable reads consume bounded candidate updates while discovery is pending.
+Early misses do not establish absence, peers are deduplicated within a round,
+and a slow early GET can race a different final holder. Native seeds this shared
+policy from its routing table; WebRTC also publishes validated lookup replies
+as they arrive. Write discovery and witness admission remain unchanged.

@@ -1,7 +1,7 @@
 import { BrowserNetworkClient } from "./client-fixture.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { encryptPublicFile } from "./pkg/ant_core.js";
+import { encryptPublicFile, parseWebRtcDirectMultiaddr } from "./pkg/ant_core.js";
 import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 
 const content = new TextEncoder().encode("Discoverable storage holder regression.".repeat(100));
@@ -57,6 +57,25 @@ test("a connected known holder can finish a verified read while discovery is sti
   } finally { clearTimeout(deadline); reader?.close(); client.close(); }
 });
 
+
+test("a newly discovered holder is readable before a slow lookup round finishes", async () => {
+  const nodes = [{ view: [1, 2] }, {}, {}];
+  const rtc = mockWebRtc(nodes);
+  const distance = index => BigInt(`0x${parseWebRtcDirectMultiaddr(rtc.endpoints[index]).peerId}`) ^ BigInt(`0x${datamap.address}`);
+  const holder = distance(1) < distance(2) ? 1 : 2;
+  nodes[holder].chunk = datamap.content;
+  nodes[3 - holder].delay = method => method === "find_node" ? 2500 : 0;
+  const client = new BrowserNetworkClient(rtc.endpoints.slice(0, 1));
+  let reader, deadline;
+  try {
+    reader = await Promise.race([
+      client.openPublicFile(datamap.address),
+      new Promise((_, reject) => deadline = setTimeout(() => reject(new Error("read waited for lookup round")), 1500)),
+    ]);
+    assert.equal(reader.size, content.length);
+    assert.ok(rtc.requests.some(r => r.node === holder && r.method === "get_chunk"));
+  } finally { clearTimeout(deadline); reader?.close(); client.close(); }
+});
 
 test("shared Client rejects corrupt content immediately, matching native GET", async () => {
   const rtc = mockWebRtc(Array.from({ length: 24 }, () => ({ chunk: new Uint8Array([1, 2, 3]), respond: failDiscovery })));
