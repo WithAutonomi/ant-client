@@ -114,6 +114,11 @@ pub trait BrowserNetwork {
     ) -> futures::future::LocalBoxFuture<'a, Result<WitnessedCloseGroup>>;
     /// Known records used as fallback candidates after a lookup failure.
     fn known_peers(&self) -> Vec<DHTNode>;
+    /// Authenticated live peers eligible for an opportunistic immutable read.
+    /// Adapters without connection telemetry retain discovery-first behavior.
+    fn connected_read_peers(&self) -> Vec<PeerId> {
+        Vec::new()
+    }
     /// Execute one authenticated request, preserving its request identifier.
     fn request<'a>(
         &'a self,
@@ -434,6 +439,29 @@ impl Network {
         {
             self.backend.known_peers()
         }
+    }
+
+    /// Closest known peer already connected to this client. This is only a
+    /// speculative read candidate, never a close-group or payment authority.
+    pub(crate) async fn connected_read_peer(
+        &self,
+        target: &[u8; 32],
+    ) -> Option<(PeerId, Vec<MultiAddr>)> {
+        #[cfg(feature = "native")]
+        let connected = self.node.connected_peers().await;
+        #[cfg(not(feature = "native"))]
+        let connected = self.backend.connected_read_peers();
+        if connected.is_empty() {
+            return None;
+        }
+        self.known_peers()
+            .await
+            .into_iter()
+            .filter(|node| node.peer_id != *self.peer_id() && connected.contains(&node.peer_id))
+            .min_by_key(|node| {
+                ant_protocol::transport::xor_distance(node.peer_id.as_bytes(), target)
+            })
+            .map(|node| (node.peer_id, node.addresses_by_priority()))
     }
 }
 

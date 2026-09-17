@@ -26,7 +26,10 @@ export function mockWebRtc(nodes = [{}]) {
       this.onmessage?.({ data });
     }
     send(message) {
-      const response = this.server.push(message);
+      // A real DataChannel copies the outgoing bytes. The mock re-enters WASM
+      // instead, where allocating the server argument can grow memory and
+      // detach an outgoing view into that same memory. Copy before re-entry.
+      const response = this.server.push(new Uint8Array(message));
       if (!response.length) return;
       const method = this.server.last_method();
       if (method === "put_chunk") {
@@ -71,6 +74,7 @@ export function mockWebRtc(nodes = [{}]) {
       const seed = Number(remote.sdp.match(/m=application (\d+)/)[1]) - 24_000;
       this.channel.index = seed - 1;
       this.channel.options = nodes[seed - 1];
+      if (this.channel.options.connectErrorDelay) await new Promise(resolve => setTimeout(resolve, this.channel.options.connectErrorDelay));
       if (this.channel.options.connectError) throw new Error(this.channel.options.connectError);
       this.channel.server = new BrowserTestNode(
         seed,

@@ -154,6 +154,17 @@ impl BrowserNetwork for SharedNetworkAdapter {
         known
     }
 
+    fn connected_read_peers(&self) -> Vec<PeerId> {
+        self.inner
+            .pool
+            .clients
+            .borrow()
+            .values()
+            .filter(|entry| entry.client.is_connected() && entry.client.hello.borrow().is_some())
+            .filter_map(|entry| PeerId::from_hex(&entry.client.endpoint.peer_id).ok())
+            .collect()
+    }
+
     fn request<'a>(
         &'a self,
         peer: &'a PeerId,

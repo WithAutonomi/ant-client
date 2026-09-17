@@ -796,7 +796,28 @@ impl Client {
 
         #[cfg(feature = "native")]
         let observation = diag.map(|_| std::sync::Mutex::new(ReadObservation::default()));
-        let result = crate::client_engine::read::retrieve(
+        let cached_peer = self.network().connected_read_peer(address).await;
+        let cached_read = cached_peer.map(|(peer, addrs)| async move {
+            #[cfg(feature = "native")]
+            if let Some(diag) = diag {
+                // A separate observation keeps speculative GETs independent of
+                // the concurrent discovery sweep's peer ordering and timing.
+                let observation = std::sync::Mutex::new(ReadObservation {
+                    lookup_id: format!(
+                        "{}-{}-cached-{}",
+                        diag.file_attempt,
+                        diag.chunk_index,
+                        NEXT_DIAGNOSTIC_LOOKUP_ID.fetch_add(1, AtomicOrdering::Relaxed)
+                    ),
+                    ..ReadObservation::default()
+                });
+                return self
+                    .chunk_get_diagnostic_attempt(address, &peer, &addrs, diag, &observation)
+                    .await;
+            }
+            self.chunk_get_from_peer(address, &peer, &addrs).await
+        });
+        let discovered = crate::client_engine::read::retrieve(
             *address,
             || async {
                 #[cfg(feature = "native")]
@@ -888,8 +909,15 @@ impl Client {
                 )
             },
             crate::runtime::sleep,
-        )
-        .await?;
+        );
+        let result =
+            crate::client_engine::read::race_cached_read(cached_read, discovered, |error| {
+                matches!(
+                    error,
+                    Error::Timeout(_) | Error::Network(_) | Error::Protocol(_)
+                )
+            })
+            .await?;
         #[cfg(feature = "native")]
         if result.is_none() {
             if let (Some(diag), Some(observation)) = (diag, &observation) {
@@ -1613,9 +1641,13 @@ impl Client {
                     publisher_address_set_unix_ns: None,
                 });
             (
-                if state.round == 1 { "initial" } else { "retry" },
+                match state.round {
+                    0 => "cached",
+                    1 => "initial",
+                    _ => "retry",
+                },
                 state.peer_attempt,
-                Some(state.lookup_ms),
+                (state.round != 0).then_some(state.lookup_ms),
                 state.lookup_id.clone(),
                 context,
             )

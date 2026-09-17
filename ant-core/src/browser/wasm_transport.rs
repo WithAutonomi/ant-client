@@ -61,7 +61,10 @@ const REQUEST_TIMEOUT_MS: u32 = 10_000;
 const RPC_ADMISSION_TIMEOUT: Duration = Duration::from_secs(400);
 const CONNECTION_SETUP_TIMEOUT_MS: u32 = 30_000;
 const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
-const DEFAULT_MAX_POOLED_CLIENTS: usize = 32;
+// Retain useful associations across concurrent close-group walks. Active leases
+// remain non-evictable, and the pool still imposes a hard resource bound.
+const DEFAULT_MAX_POOLED_CLIENTS: usize = 64;
+const MAX_LOOKUP_PRECONNECTS: usize = 8;
 const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const MAX_BROWSER_ROUTING_ENTRIES: usize = 256;
 const MAX_BROWSER_ENDPOINT_FAILURES: usize = 256;
@@ -130,6 +133,9 @@ struct BrowserClientPool {
     clients: RefCell<HashMap<String, PoolEntry>>,
     clock: Cell<u64>,
     availability: Rc<PoolAvailability>,
+    preconnecting: RefCell<HashSet<String>>,
+    #[cfg(feature = "test-utils")]
+    preconnect_errors: RefCell<Vec<String>>,
 }
 
 struct BrowserClientLease {
@@ -144,6 +150,15 @@ struct PoolAvailability {
 }
 
 impl PoolAvailability {
+    async fn wait_closed(&self) {
+        let mut changed = self.sender.subscribe();
+        while !self.closed.get() {
+            if changed.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+
     fn notify_waiters(&self) {
         if self.closed.get() {
             return;
@@ -186,6 +201,43 @@ impl BrowserClientLease {
             .find_node(target, count)
             .await
     }
+
+    /// A lookup's grace period limits waiting for a vote, not the lifetime of
+    /// an admitted transport exchange. Drain that exchange under its ordinary
+    /// deadlines so its authenticated association (or actual dial failure) can
+    /// be reused. Queued work is still cancelled, and closing the pool aborts
+    /// even an in-progress connection setup immediately.
+    async fn lookup(self, target: String, count: usize) -> Result<Vec<BrowserNode>, String> {
+        let (mut sender, receiver) = oneshot::channel();
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = {
+                let request = async {
+                    let client = match select(
+                        Box::pin(self.client.lock_before(&self.admission)),
+                        Box::pin(sender.cancellation()),
+                    )
+                    .await
+                    {
+                        Either::Left((client, _)) => client.map_err(|error| error.to_string())?,
+                        Either::Right(_) => return Err("lookup waiter cancelled".to_string()),
+                    };
+                    if sender.is_canceled() {
+                        return Err("lookup waiter cancelled".to_string());
+                    }
+                    client.hello().await?;
+                    client.find_node(&target, count).await
+                };
+                match select(Box::pin(request), Box::pin(self.availability.wait_closed())).await {
+                    Either::Left((result, _)) => result,
+                    Either::Right(_) => Err("WebRTC client pool is closed".to_string()),
+                }
+            };
+            let _ = sender.send(result);
+        });
+        receiver
+            .await
+            .map_err(|_| "WebRTC lookup task closed".to_string())?
+    }
 }
 
 impl Drop for BrowserClientLease {
@@ -214,6 +266,9 @@ impl BrowserClientPool {
                 closed: Cell::new(false),
                 sender: availability_tx,
             }),
+            preconnecting: RefCell::new(HashSet::new()),
+            #[cfg(feature = "test-utils")]
+            preconnect_errors: RefCell::new(Vec::new()),
         })
     }
 
@@ -325,6 +380,78 @@ impl BrowserClientPool {
             .dial_failures
             .borrow_mut()
             .is_suppressed(&peer.to_string(), &endpoint.multiaddr)
+    }
+
+    /// Overlap ICE/PQ/HELLO with the iterative walk, using only owner-signed
+    /// addresses that `find_node` has already verified. These are connection
+    /// hints, not successful lookup votes or storage acknowledgements.
+    fn preconnect(self: &Rc<Self>, nodes: &[BrowserNode]) {
+        for node in nodes {
+            let at_capacity = {
+                let clients = self.clients.borrow();
+                let pending = self.preconnecting.borrow();
+                // A task's reservation stops consuming another slot once its
+                // client has entered the pool.
+                let reserved = pending
+                    .iter()
+                    .filter(|key| !clients.contains_key(*key))
+                    .count();
+                clients.len() + reserved >= self.max_clients
+            };
+            if self.availability.closed.get()
+                || self.preconnecting.borrow().len() >= MAX_LOOKUP_PRECONNECTS
+                || at_capacity
+            {
+                break;
+            }
+            let Some(endpoint) = node
+                .webrtc_direct
+                .as_ref()
+                .filter(|_| node.address_record.is_some())
+            else {
+                continue;
+            };
+            if self.preconnecting.borrow().contains(&endpoint.multiaddr)
+                || !self.is_lookup_eligible(&node.peer_id, endpoint)
+                || self
+                    .clients
+                    .borrow()
+                    .get(&endpoint.multiaddr)
+                    .is_some_and(|entry| {
+                        entry.client.is_connected() || Rc::strong_count(&entry.client) > 1
+                    })
+            {
+                continue;
+            }
+            let pool = Rc::clone(self);
+            let endpoint = endpoint.clone();
+            self.preconnecting
+                .borrow_mut()
+                .insert(endpoint.multiaddr.clone());
+            wasm_bindgen_futures::spawn_local(async move {
+                {
+                    let connect = async {
+                        let lease = pool
+                            .client_before(
+                                &endpoint,
+                                TransferDeadline::new(Duration::from_millis(u64::from(
+                                    REQUEST_TIMEOUT_MS,
+                                ))),
+                            )
+                            .await?;
+                        lease.hello().await.map_err(RpcError::Transport)
+                    };
+                    let outcome =
+                        select(Box::pin(connect), Box::pin(pool.availability.wait_closed())).await;
+                    #[cfg(feature = "test-utils")]
+                    if let Either::Left((Err(error), _)) = &outcome {
+                        pool.preconnect_errors.borrow_mut().push(error.to_string());
+                    }
+                    drop(outcome);
+                }
+                pool.preconnecting.borrow_mut().remove(&endpoint.multiaddr);
+            });
+        }
     }
 
     fn close(&self) {
@@ -1379,8 +1506,8 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                         })?;
                         let client = pool.client(endpoint).await?;
                         client
-                            .find_node(
-                                &target,
+                            .lookup(
+                                target.clone(),
                                 count.max(crate::quote_policy::SINGLE_NODE_WITNESSED_VIEW_COUNT),
                             )
                             .await
@@ -1388,6 +1515,7 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                     .await;
                     match result {
                         Ok(nodes) => {
+                            pool.preconnect(&nodes);
                             routing.borrow_mut().insert(responder, candidate.clone());
                             contacted
                                 .borrow_mut()

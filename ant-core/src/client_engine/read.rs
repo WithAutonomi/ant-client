@@ -1,5 +1,6 @@
 //! Transport-neutral native read policy. Adapters supply discovery, GET and sleep;
 //! the engine owns ordering, fallback bounds, absence decisions and retry timing.
+use futures::future::{select, Either};
 use std::{collections::HashSet, future::Future, time::Duration};
 
 pub(crate) const MAX_GET_FALLBACK_PEERS: usize = 20;
@@ -7,6 +8,36 @@ pub(crate) const CLOSE_GROUP_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub(crate) fn is_authoritative_not_found(not_found: usize, queried: usize) -> bool {
     queried >= ant_protocol::CLOSE_GROUP_MAJORITY && not_found == queried
+}
+
+/// Race one already-connected, known candidate against ordinary discovery and
+/// retrieval. Both paths must verify content before returning `Some`. A cache
+/// miss or transport failure is never evidence of network-wide absence; the
+/// ordinary discovery/retry policy still runs. At most one extra GET is active.
+pub(crate) async fn race_cached_read<T, E>(
+    cached: Option<impl Future<Output = Result<Option<T>, E>>>,
+    discovered: impl Future<Output = Result<Option<T>, E>>,
+    retryable: impl Fn(&E) -> bool,
+) -> Result<Option<T>, E> {
+    let Some(cached) = cached else {
+        return discovered.await;
+    };
+    let remaining = match select(Box::pin(cached), Box::pin(discovered)).await {
+        Either::Left((result, remaining)) => match result {
+            Ok(Some(value)) => return Ok(Some(value)),
+            Err(error) if !retryable(&error) => return Err(error),
+            _ => remaining.await,
+        },
+        Either::Right((result, remaining)) => match result {
+            Ok(Some(value)) => return Ok(Some(value)),
+            Err(error) if !retryable(&error) => return Err(error),
+            _ => remaining.await,
+        },
+    };
+    match remaining {
+        Err(error) if retryable(&error) => Ok(None),
+        result => result,
+    }
 }
 
 /// Discovery results need not include all reachable storage holders.
@@ -83,6 +114,96 @@ mod tests {
     use std::cell::{Cell, RefCell};
     fn peer(id: u8) -> [u8; 32] {
         [id; 32]
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum ReadError {
+        Transport,
+        Integrity,
+    }
+
+    #[test]
+    fn cached_verified_content_does_not_wait_for_discovery() {
+        let result = futures::executor::block_on(race_cached_read(
+            Some(async { Ok::<_, ReadError>(Some(42)) }),
+            futures::future::pending(),
+            |_| false,
+        ));
+        assert_eq!(result, Ok(Some(42)));
+    }
+
+    #[test]
+    fn cached_misses_and_transport_errors_preserve_discovery() {
+        for cached in [Ok(None), Err(ReadError::Transport)] {
+            let result = futures::executor::block_on(race_cached_read(
+                Some(async { cached }),
+                async { Ok(Some(42)) },
+                |error| *error == ReadError::Transport,
+            ));
+            assert_eq!(result, Ok(Some(42)));
+        }
+    }
+
+    #[test]
+    fn cached_integrity_errors_remain_fatal() {
+        let result = futures::executor::block_on(race_cached_read(
+            Some(async { Err::<Option<()>, _>(ReadError::Integrity) }),
+            futures::future::pending(),
+            |error| *error == ReadError::Transport,
+        ));
+        assert_eq!(result, Err(ReadError::Integrity));
+    }
+
+    #[test]
+    fn an_unresponsive_cached_peer_does_not_delay_a_discovered_holder() {
+        let result = futures::executor::block_on(race_cached_read(
+            Some(futures::future::pending()),
+            async { Ok::<_, ReadError>(Some(42)) },
+            |_| false,
+        ));
+        assert_eq!(result, Ok(Some(42)));
+    }
+
+    #[test]
+    fn discovered_absence_does_not_discard_a_late_cached_holder() {
+        let (send, receive) = futures::channel::oneshot::channel();
+        let result = futures::executor::block_on(race_cached_read(
+            Some(async { Ok::<_, ReadError>(Some(receive.await.unwrap())) }),
+            async {
+                send.send(42).unwrap();
+                Ok(None)
+            },
+            |_| false,
+        ));
+        assert_eq!(result, Ok(Some(42)));
+    }
+
+    #[test]
+    fn cached_miss_is_not_an_authoritative_not_found_vote() {
+        let rounds = Cell::new(0);
+        let discovered = retrieve(
+            peer(0),
+            || {
+                rounds.set(rounds.get() + 1);
+                async {
+                    ReadCandidates {
+                        closest: vec![peer(1)],
+                        known: vec![],
+                    }
+                }
+            },
+            |p| *p,
+            |_| async { Ok::<Option<()>, ReadError>(None) },
+            |_| true,
+            |_| async {},
+        );
+        let result = futures::executor::block_on(race_cached_read(
+            Some(async { Ok(None) }),
+            discovered,
+            |_| true,
+        ));
+        assert_eq!(result, Ok(None));
+        assert_eq!(rounds.get(), 2);
     }
 
     #[test]

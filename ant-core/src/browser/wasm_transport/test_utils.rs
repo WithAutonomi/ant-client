@@ -12,6 +12,111 @@ use saorsa_transport::webrtc::{
     accept_pq_session, encode_response_frame, parse_request_frame, BrowserResponse,
 };
 
+/// Abandon an admitted lookup exactly as the iterative lookup grace timer does.
+/// A subsequent lookup must reuse the drained session or the actual dial error.
+#[wasm_bindgen]
+pub async fn test_abandoned_lookup(endpoint: &str, close_pool: bool) -> String {
+    let pool = BrowserClientPool::new(1).unwrap();
+    let endpoint = BrowserEndpoint {
+        multiaddr: endpoint.into(),
+    };
+    let lease = pool.client(&endpoint).await.unwrap();
+    assert!(
+        crate::runtime::timeout(Duration::from_millis(20), lease.lookup("11".repeat(32), 20),)
+            .await
+            .is_err()
+    );
+    if close_pool {
+        pool.close();
+    }
+    crate::runtime::sleep(Duration::from_millis(150)).await;
+    let result = async {
+        pool.client(&endpoint)
+            .await?
+            .lookup("22".repeat(32), 20)
+            .await
+    }
+    .await;
+    pool.close();
+    result
+        .map(|_| "ok".to_string())
+        .unwrap_or_else(|error| error)
+}
+
+/// Abandon a lookup that has not acquired the peer lock. It must send no RPC.
+#[wasm_bindgen]
+pub async fn test_abandoned_queued_lookup(endpoint: &str) {
+    let pool = BrowserClientPool::new(1).unwrap();
+    let endpoint = BrowserEndpoint {
+        multiaddr: endpoint.into(),
+    };
+    let active = pool.client(&endpoint).await.unwrap();
+    active.hello().await.unwrap();
+    let queued = pool.client(&endpoint).await.unwrap();
+    let target = "11".repeat(32);
+    let first = active.find_node(&target, 20);
+    let second = async {
+        crate::runtime::sleep(Duration::from_millis(1)).await;
+        assert!(crate::runtime::timeout(
+            Duration::from_millis(20),
+            queued.lookup("22".repeat(32), 20),
+        )
+        .await
+        .is_err());
+    };
+    let (result, ()) = futures::future::join(first, second).await;
+    result.unwrap();
+    crate::runtime::sleep(Duration::from_millis(20)).await;
+    pool.close();
+}
+
+/// Exercise scheduling with nodes at the already-verified preconnect boundary.
+/// Wire-proof verification is separately exercised through the real FIND_NODE
+/// decoder; this fixture supplies only the trusted marker needed by the pool.
+#[wasm_bindgen]
+pub async fn test_preconnect_pool(
+    endpoints: JsValue,
+    signed: bool,
+    close_early: bool,
+    capacity: usize,
+) {
+    let endpoints: Vec<String> = serde_wasm_bindgen::from_value(endpoints).unwrap();
+    let nodes = endpoints
+        .into_iter()
+        .map(|multiaddr| {
+            let peer_id = parse_webrtc_direct_multiaddr(&multiaddr).unwrap().peer_id;
+            BrowserNode {
+                peer_id,
+                address_record: signed.then(|| "verified upstream".to_string()),
+                peer_record: None,
+                native_addresses: vec![],
+                reliability: 1.0,
+                webrtc_direct: Some(BrowserEndpoint { multiaddr }),
+            }
+        })
+        .collect::<Vec<_>>();
+    let pool = Rc::new(BrowserClientPool::new(capacity).unwrap());
+    pool.preconnect(&nodes);
+    pool.preconnect(&nodes);
+    crate::runtime::sleep(Duration::from_millis(20)).await;
+    if close_early {
+        pool.close();
+    }
+    crate::runtime::timeout(Duration::from_secs(2), async {
+        while !pool.preconnecting.borrow().is_empty() {
+            crate::runtime::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        pool.preconnect_errors.borrow().is_empty(),
+        "{:?}",
+        pool.preconnect_errors.borrow()
+    );
+    pool.close();
+}
+
 #[wasm_bindgen]
 pub struct BrowserTestNode {
     public: Vec<u8>,

@@ -37,6 +37,26 @@ test("GET can recover even when no node answers discovery", async () => {
   } finally { reader?.close(); client.close(); }
 });
 
+test("a connected known holder can finish a verified read while discovery is still pending", async () => {
+  const options = [{ chunk: datamap.content }];
+  const rtc = mockWebRtc(options);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let reader, deadline;
+  try {
+    await client.findClosest(datamap.address);
+    // GET remains responsive while FIND_NODE cannot finish. The same shared
+    // read policy is used by native, and a miss would still await discovery.
+    options[0].respond = (_channel, method) => method === "find_node" ? false : undefined;
+    reader = await Promise.race([
+      client.openPublicFile(datamap.address),
+      new Promise((_, reject) => deadline = setTimeout(() => reject(new Error("read waited for discovery")), 1000)),
+    ]);
+    assert.equal(reader.size, content.length);
+    assert.equal(rtc.connections.length, 1);
+    assert.equal(rtc.requests.filter(request => request.method === "get_chunk").length, 1);
+  } finally { clearTimeout(deadline); reader?.close(); client.close(); }
+});
+
 
 test("shared Client rejects corrupt content immediately, matching native GET", async () => {
   const rtc = mockWebRtc(Array.from({ length: 24 }, () => ({ chunk: new Uint8Array([1, 2, 3]), respond: failDiscovery })));

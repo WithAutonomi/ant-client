@@ -81,3 +81,12 @@ closure during asynchronous prepayment checkpoints for both payment modes.
 buffer drain with early responses, one HELLO for concurrent cold operations,
 reauthentication and capability checks after timeout, bounded admission without
 closing active work, pool closure during setup, and strict queued session handles.
+
+`lookup-reuse.test.mjs` covers draining admitted lookups after grace cancellation,
+retaining actual dial failures, cancelling queued work, closing background work,
+and bounded, deduplicated preconnections from verified owner-address hints. The
+shared read-engine tests also cover racing one connected known holder against
+ordinary discovery: a miss cannot establish absence, corrupt content remains
+fatal, and a slow cached candidate cannot block a discovered holder. These reads
+use the same policy on native and WASM. The mock copies outbound bytes before
+re-entering WASM, matching the DataChannel ownership boundary across memory growth.
