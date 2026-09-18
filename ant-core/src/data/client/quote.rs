@@ -1166,7 +1166,27 @@ impl Client {
         data_size: u64,
         data_type: u32,
     ) -> Result<StoreQuotePlan> {
-        let witnessed_selection = self.select_witnessed_quote_selection(address).await?;
+        self.get_store_quote_plan_split(address, address, data_size, data_type)
+            .await
+    }
+
+    /// As [`Self::get_store_quote_plan`], where the address that decides *who*
+    /// quotes differs from the one they quote *for*.
+    ///
+    /// A chunk passes the same value twice. A pointer does not: it is stored at
+    /// an address that never changes, so the quote must name the state being
+    /// paid for instead, or every update after the first would be free. The
+    /// close group is still the one around the pointer's address, because that
+    /// is what the network routes on and a state identifier names no group.
+    pub(crate) async fn get_store_quote_plan_split(
+        &self,
+        routing: &[u8; 32],
+        content: &[u8; 32],
+        data_size: u64,
+        data_type: u32,
+    ) -> Result<StoreQuotePlan> {
+        let address = content;
+        let witnessed_selection = self.select_witnessed_quote_selection(routing).await?;
         let voters_by_peer: VotersByPeer = witnessed_selection
             .quote_peers
             .iter()

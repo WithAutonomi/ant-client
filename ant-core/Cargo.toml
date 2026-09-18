@@ -39,7 +39,9 @@ tower-http = { version = "0.6.8", features = ["cors"] }
 # deps here or the version can skew between ant-client and ant-node.
 # The settlement-version wire types ride the workspace [patch.crates-io]
 # override (root Cargo.toml) until the release train publishes them.
-ant-protocol = "2.4.0"
+# Pointers (ADR-0015) add the `Pointer` record and its wire messages to
+# ant-protocol. Tracked by branch until that PR lands and a version is cut.
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "feat/pointers-immutable-owner" }
 xor_name = "5"
 self_encryption = "0.36"
 futures = "0.3"

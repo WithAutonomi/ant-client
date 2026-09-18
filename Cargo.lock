@@ -839,7 +839,7 @@ version = "0.9.0"
 dependencies = [
  "alloy",
  "ant-node",
- "ant-protocol",
+ "ant-protocol 2.5.0",
  "anyhow",
  "async-stream",
  "axum",
@@ -896,7 +896,7 @@ version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7076156f259d863278edc52843dfd6ea7f4714f3052630c75cf60b1cb9d3c778"
 dependencies = [
- "ant-protocol",
+ "ant-protocol 2.4.0",
  "bao",
  "blake3",
  "bytes",
@@ -946,6 +946,24 @@ name = "ant-protocol"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "804f04e96808a1689a4393652900752980ae7be467b393ae2d8d161306b91301"
+dependencies = [
+ "blake3",
+ "bytes",
+ "evmlib",
+ "hex",
+ "postcard",
+ "rmp-serde",
+ "saorsa-core",
+ "saorsa-pqc",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ant-protocol"
+version = "2.5.0"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=feat%2Fpointers-immutable-owner#96e61a55c479bf42c3ea0f7147552700775ae516"
 dependencies = [
  "blake3",
  "bytes",
