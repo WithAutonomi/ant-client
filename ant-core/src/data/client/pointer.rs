@@ -37,6 +37,16 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 
+/// The majority of `peers` — the threshold both a store and a read must meet.
+///
+/// Derived from the group actually returned, not from a fixed constant: the
+/// close-group width is configurable, and a fixed four against a width of
+/// twenty would let a write land on four peers and a *disjoint* four answer the
+/// read. Quorums only intersect if both are majorities of the same set.
+fn majority_of(peers: usize) -> usize {
+    (peers / 2) + 1
+}
+
 /// How many pointer hops [`Client::pointer_resolve`] will follow.
 ///
 /// A pointer may target another pointer — that is how handover works — so a
@@ -121,7 +131,7 @@ impl Client {
             .network()
             .find_closest_peers(&address, self.config().close_group_size)
             .await?;
-        let wanted = CLOSE_GROUP_MAJORITY.min(targets.len().max(1));
+        let wanted = majority_of(targets.len());
 
         let request = PointerPutRequest::with_payment(Bytes::from(record.to_bytes()), proof);
         let mut in_flight = FuturesUnordered::new();
@@ -188,6 +198,7 @@ impl Client {
             in_flight.push(self.send_pointer_get(*address, *peer_id, addrs.clone()));
         }
 
+        let wanted = majority_of(peers.len());
         let mut best: Option<Pointer> = None;
         let mut answered = 0usize;
         let mut last_error = None;
@@ -200,6 +211,12 @@ impl Client {
                             Some(held) if held.replaces(&record) => held,
                             _ => record,
                         });
+                    }
+                    // A majority has spoken. Waiting for the rest would let one
+                    // unreachable peer hold the read open for its whole timeout
+                    // after the answer is already known.
+                    if answered >= wanted {
+                        return Ok(best);
                     }
                 }
                 Err(e) => last_error = Some(e),
@@ -214,7 +231,7 @@ impl Client {
         // A single answer is not a network verdict: with no replication, one
         // reachable peer holding a stale record looks exactly like the whole
         // group agreeing. Say so rather than presenting it as the value.
-        if answered < CLOSE_GROUP_MAJORITY.min(peers.len().max(1)) {
+        if answered < wanted {
             return Err(Error::CloseGroupShortfall(format!(
                 "only {answered} of the close group answered for pointer {}",
                 hex::encode(address)
@@ -358,7 +375,7 @@ impl Client {
             &target_peer,
             bytes,
             request_id,
-            std::time::Duration::from_secs(self.config().merkle_store_timeout_secs),
+            std::time::Duration::from_secs(self.config().chunk_get_timeout_secs),
             &peer_addrs,
             move |body| match body {
                 ChunkMessageBody::PointerGetResponse(PointerGetResponse::Success { record }) => {
@@ -523,6 +540,32 @@ mod tests {
         };
         assert_eq!(fold(&[&old, &new]).state_id(), new.state_id());
         assert_eq!(fold(&[&new, &old]).state_id(), new.state_id());
+    }
+
+    /// A write quorum and a read quorum must intersect at every group width.
+    ///
+    /// This is the property a fixed four-of-K silently broke: at K=20 a write
+    /// on four peers and a read of a disjoint four would never meet, so an
+    /// acknowledged pointer could read back as missing.
+    #[test]
+    fn write_and_read_quorums_always_intersect() {
+        for k in 1usize..=64 {
+            let write = majority_of(k);
+            let read = majority_of(k);
+            assert!(
+                write + read > k,
+                "at width {k} a {write}-write and a {read}-read can be disjoint"
+            );
+            assert!(write <= k, "a quorum cannot need more peers than exist");
+        }
+    }
+
+    /// The default close group is seven, where a majority is four.
+    #[test]
+    fn the_default_group_needs_four() {
+        assert_eq!(majority_of(7), 4);
+        assert_eq!(majority_of(20), 11);
+        assert_eq!(majority_of(1), 1);
     }
 
     /// A chain that points at itself must be caught by the seen-set, not by
