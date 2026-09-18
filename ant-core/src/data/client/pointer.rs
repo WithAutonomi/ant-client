@@ -39,14 +39,41 @@ use crate::data::client::chunk::STORE_RESPONSE_TIMEOUT;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 
-/// The majority of `peers` — the threshold both a store and a read must meet.
+/// How many of `peers` must answer a read.
 ///
 /// Derived from the group actually returned, not from a fixed constant: the
 /// close-group width is configurable, and a fixed four against a width of
 /// twenty would let a write land on four peers and a *disjoint* four answer the
-/// read. Quorums only intersect if both are majorities of the same set.
-fn majority_of(peers: usize) -> usize {
+/// read. Quorums only intersect if both are taken from the same set.
+fn read_quorum(peers: usize) -> usize {
     (peers / 2) + 1
+}
+
+/// How many of `peers` a write must reach.
+///
+/// One wider than a bare majority, which is what a chunk needs. A chunk is
+/// self-proving — one copy is *the* chunk for that address — but a pointer read
+/// has to decide which of several signed states is current, and a state that
+/// only one peer reports is a state one peer decided. So a read requires two
+/// peers to report what it returns ([`corroboration`]), and the write is one
+/// wider so that two of them always answer: with `|W| + |R| >= K + 2` the two
+/// sets overlap in at least two peers.
+fn write_quorum(peers: usize) -> usize {
+    (read_quorum(peers) + 1).min(peers)
+}
+
+/// How many peers must report a state before a read will return it.
+///
+/// Two, so that no single peer decides what a pointer says. A peer that is in
+/// the close group and willing to serve what the owner never paid to store
+/// could otherwise answer first with an owner-signed state no honest node
+/// holds, and every reader would take it: the record verifies, it belongs at
+/// the address, and it wins the merge. What it cannot do is make a second peer
+/// agree.
+///
+/// A group of one can only ever be corroborated by itself.
+fn corroboration(peers: usize) -> usize {
+    peers.min(2)
 }
 
 /// The outcome of asking a close group.
@@ -57,17 +84,19 @@ struct Answered {
     last_error: Option<Error>,
 }
 
-/// Ask a whole close group at once and stop as soon as a majority has answered.
+/// Ask a whole close group at once and stop as soon as there is an answer.
 ///
 /// The shape a pointer write and a pointer read share: every peer is asked
-/// concurrently, each answer is handed to `keep`, and the first `wanted`
-/// answers end it. Returning early is what stops one unreachable peer holding
-/// an operation open for its whole timeout after the answer is already decided;
-/// the requests still in flight are dropped, which cancels them.
+/// concurrently and each answer is handed to `keep`, which says whether what it
+/// has is settled. It ends at the first answer that is both settled and the
+/// `wanted`-th, or when the group is exhausted. Stopping early is what keeps one
+/// unreachable peer from holding an operation open for its whole timeout after
+/// the answer is already decided; the requests still in flight are dropped,
+/// which cancels them.
 async fn ask_the_group<T>(
     mut in_flight: FuturesUnordered<impl Future<Output = Result<T>>>,
     wanted: usize,
-    mut keep: impl FnMut(T),
+    mut keep: impl FnMut(T) -> bool,
 ) -> Answered {
     let mut answered = Answered {
         count: 0,
@@ -77,8 +106,8 @@ async fn ask_the_group<T>(
         match result {
             Ok(answer) => {
                 answered.count += 1;
-                keep(answer);
-                if answered.count >= wanted {
+                let settled = keep(answer);
+                if settled && answered.count >= wanted {
                     break;
                 }
             }
@@ -88,15 +117,23 @@ async fn ask_the_group<T>(
     answered
 }
 
-/// Keep whichever of the replies so far the merge rule prefers.
+/// Keep whichever of the replies so far the merge rule prefers, and count how
+/// many peers reported it.
 ///
 /// Any peer may legitimately hold a stale record, so a read takes the best
 /// answer rather than the first — otherwise one slow-to-update peer could pin a
-/// reader to an old target by answering quickest.
-fn keep_the_winner(best: &mut Option<Pointer>, reply: Option<Pointer>) {
-    if let Some(reply) = reply {
-        if !matches!(best, Some(held) if held.replaces(&reply)) {
+/// reader to an old target by answering quickest. The count is what stops the
+/// opposite failure: a state only one peer has ever heard of, which is one peer
+/// deciding rather than the group agreeing. A better state resets it, because
+/// the peers that backed the old one said nothing about the new.
+fn keep_the_winner(best: &mut Option<Pointer>, support: &mut usize, reply: Option<Pointer>) {
+    let Some(reply) = reply else { return };
+    match best {
+        Some(held) if held.state_id() == reply.state_id() => *support += 1,
+        Some(held) if held.replaces(&reply) => (),
+        _ => {
             *best = Some(reply);
+            *support = 1;
         }
     }
 }
@@ -159,7 +196,19 @@ fn read_get_reply(body: ChunkMessageBody, address: XorName) -> Option<Result<Opt
             )),
             Err(e) => Err(Error::InvalidData(format!("invalid pointer: {e}"))),
         },
-        PointerGetResponse::NotFound { .. } => Ok(None),
+        // "I do not have it" still has to be about the address that was asked
+        // for, exactly as an acknowledgement does: an answer naming something
+        // else is not an answer to this request.
+        PointerGetResponse::NotFound { address: absent } => {
+            if absent == address {
+                Ok(None)
+            } else {
+                Err(Error::InvalidData(format!(
+                    "peer reported a different address absent: {}",
+                    hex::encode(absent)
+                )))
+            }
+        }
         PointerGetResponse::Error(e) => Err(Error::Protocol(format!("pointer GET refused: {e}"))),
     })
 }
@@ -238,7 +287,7 @@ impl Client {
             .await?;
 
         let targets = self.pointer_group(&address).await?;
-        let wanted = majority_of(targets.len());
+        let wanted = write_quorum(targets.len());
 
         let request = PointerPutRequest::with_payment(Bytes::from(record.to_bytes()), proof);
         let in_flight = FuturesUnordered::new();
@@ -253,7 +302,7 @@ impl Client {
             ));
         }
 
-        let answered = ask_the_group(in_flight, wanted, |()| ()).await;
+        let answered = ask_the_group(in_flight, wanted, |()| true).await;
         if answered.count >= wanted {
             return Ok(address);
         }
@@ -306,10 +355,17 @@ impl Client {
             in_flight.push(self.send_pointer_get(*address, *peer_id, addrs.clone()));
         }
 
-        let wanted = majority_of(peers.len());
+        let wanted = read_quorum(peers.len());
+        let needed = corroboration(peers.len());
         let mut best: Option<Pointer> = None;
-        let answered =
-            ask_the_group(in_flight, wanted, |found| keep_the_winner(&mut best, found)).await;
+        let mut support = 0usize;
+        let answered = ask_the_group(in_flight, wanted, |found| {
+            keep_the_winner(&mut best, &mut support, found);
+            // Nothing found yet is settled by the count alone; a record is
+            // settled only once enough peers have named it.
+            best.is_none() || support >= needed
+        })
+        .await;
 
         if answered.count == 0 {
             return Err(answered.last_error.unwrap_or_else(|| {
@@ -322,6 +378,16 @@ impl Client {
         if answered.count < wanted {
             return Err(Error::CloseGroupShortfall(format!(
                 "only {} of the close group answered for pointer {}",
+                answered.count,
+                hex::encode(address)
+            )));
+        }
+        // Found, but by too few to call it the network's answer. Either the
+        // write is still settling, or a peer is offering a state no honest node
+        // holds. Neither is a value to hand back as current.
+        if best.is_some() && support < needed {
+            return Err(Error::CloseGroupShortfall(format!(
+                "only {support} of {} peers answering for pointer {} named the state they returned",
                 answered.count,
                 hex::encode(address)
             )));
@@ -547,7 +613,8 @@ mod tests {
         assert!(reply(Bytes::from(tampered)).expect("a reply").is_err());
         assert!(reply(Bytes::new()).expect("a reply").is_err());
 
-        // "I do not have it" is an answer, and counts towards the quorum.
+        // "I do not have it" is an answer, and counts towards the quorum —
+        // but only about the address that was asked for.
         assert!(read_get_reply(
             ChunkMessageBody::PointerGetResponse(PointerGetResponse::NotFound {
                 address: asked_for
@@ -557,6 +624,14 @@ mod tests {
         .expect("a reply")
         .expect("valid")
         .is_none());
+        assert!(read_get_reply(
+            ChunkMessageBody::PointerGetResponse(PointerGetResponse::NotFound {
+                address: [0u8; 32]
+            }),
+            asked_for,
+        )
+        .expect("a reply")
+        .is_err());
 
         // A message that is not a reply to this request is not an answer at all.
         assert!(read_get_reply(
@@ -643,8 +718,9 @@ mod tests {
 
         let fold = |replies: Vec<Option<Pointer>>| {
             let mut best = None;
+            let mut support = 0;
             for reply in replies {
-                keep_the_winner(&mut best, reply);
+                keep_the_winner(&mut best, &mut support, reply);
             }
             best
         };
@@ -686,7 +762,7 @@ mod tests {
         // would never finish.
         let answered = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            ask_the_group(group(4, 3), majority_of(7), |_| ()),
+            ask_the_group(group(4, 3), read_quorum(7), |_| true),
         )
         .await
         .expect("a majority must end the read without waiting for the rest");
@@ -696,7 +772,7 @@ mod tests {
         // how many answered rather than being handed one peer's word.
         let answered = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            ask_the_group(group(3, 0), majority_of(7), |_| ()),
+            ask_the_group(group(3, 0), read_quorum(7), |_| true),
         )
         .await
         .expect("nothing is in flight to wait for");
@@ -715,7 +791,7 @@ mod tests {
         }
         in_flight.push(Box::pin(async { Ok(None) }));
 
-        let answered = ask_the_group(in_flight, majority_of(7), |_| ()).await;
+        let answered = ask_the_group(in_flight, read_quorum(7), |_| true).await;
         assert_eq!(answered.count, 1, "six failures are not six answers");
         assert!(
             answered.last_error.is_some(),
@@ -729,24 +805,96 @@ mod tests {
     /// on four peers and a read of a disjoint four would never meet, so an
     /// acknowledged pointer could read back as missing.
     #[test]
-    fn write_and_read_quorums_always_intersect() {
+    fn write_and_read_quorums_overlap_by_the_corroboration_a_read_demands() {
+        // The whole basis of the read rule: a state a write actually landed
+        // must be reported by at least as many answering peers as a read
+        // insists on, or a legitimate pointer would read back as unconfirmed.
         for k in 1usize..=64 {
-            let write = majority_of(k);
-            let read = majority_of(k);
+            let write = write_quorum(k);
+            let read = read_quorum(k);
+            let needed = corroboration(k);
             assert!(
-                write + read > k,
-                "at width {k} a {write}-write and a {read}-read can be disjoint"
+                write + read >= k + needed,
+                "at width {k} a {write}-write and a {read}-read overlap in fewer \
+                 than the {needed} peers a read requires"
             );
             assert!(write <= k, "a quorum cannot need more peers than exist");
+            assert!(read <= k);
+            assert!(
+                needed <= read,
+                "a read cannot need more backers than answers"
+            );
         }
     }
 
-    /// The default close group is seven, where a majority is four.
+    /// The default close group is seven: four answers decide a read, five
+    /// stores make a write, and two peers must name what a read returns.
     #[test]
-    fn the_default_group_needs_four() {
-        assert_eq!(majority_of(7), 4);
-        assert_eq!(majority_of(20), 11);
-        assert_eq!(majority_of(1), 1);
+    fn the_default_group_reads_on_four_and_writes_on_five() {
+        assert_eq!(read_quorum(7), 4);
+        assert_eq!(write_quorum(7), 5);
+        assert_eq!(corroboration(7), 2);
+
+        assert_eq!(read_quorum(20), 11);
+        assert_eq!(write_quorum(20), 12);
+
+        // A group of one cannot corroborate itself with anyone else.
+        assert_eq!(read_quorum(1), 1);
+        assert_eq!(write_quorum(1), 1);
+        assert_eq!(corroboration(1), 1);
+    }
+
+    /// One peer must not be able to decide what a pointer says.
+    ///
+    /// The attack this closes: an owner signs a state without paying for it and
+    /// one close-group peer serves it. Every honest peer says `NotFound`, the
+    /// record verifies and belongs at the address, and it wins the merge — so a
+    /// read that took the best answer regardless of who backed it would hand
+    /// back a state the network never stored.
+    #[test]
+    fn a_state_only_one_peer_reports_is_not_the_networks_answer() {
+        let (pk, sk) = keypair(11);
+        let unpaid = Pointer::sign(&sk, &pk, 900, chunk_target(9)).expect("sign");
+        let stored = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+
+        // One peer offers the unpaid state; the rest of the close group has
+        // never heard of it.
+        let mut best = None;
+        let mut support = 0;
+        keep_the_winner(&mut best, &mut support, Some(unpaid.clone()));
+        for _ in 0..3 {
+            keep_the_winner(&mut best, &mut support, None);
+        }
+        assert_eq!(
+            support, 1,
+            "a state one peer named has one backer however many others answer"
+        );
+        assert!(
+            support < corroboration(7),
+            "which is not enough to return it"
+        );
+
+        // And a state the group really holds clears the bar.
+        let mut best = None;
+        let mut support = 0;
+        for _ in 0..2 {
+            keep_the_winner(&mut best, &mut support, Some(stored.clone()));
+        }
+        assert_eq!(support, 2);
+        assert!(support >= corroboration(7));
+        assert_eq!(
+            best.as_ref().expect("an answer").state_id(),
+            stored.state_id()
+        );
+
+        // A better state resets the count: the peers that backed the old one
+        // said nothing about the new.
+        keep_the_winner(&mut best, &mut support, Some(unpaid.clone()));
+        assert_eq!(
+            best.as_ref().expect("an answer").state_id(),
+            unpaid.state_id()
+        );
+        assert_eq!(support, 1, "the newcomer starts from one backer");
     }
 
     /// A chain that points at itself must be caught by the seen-set, not by
