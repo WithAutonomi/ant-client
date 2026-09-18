@@ -117,24 +117,51 @@ async fn ask_the_group<T>(
     answered
 }
 
-/// Keep whichever of the replies so far the merge rule prefers, and count how
-/// many peers reported it.
+/// What the peers answering a read have said.
 ///
-/// Any peer may legitimately hold a stale record, so a read takes the best
-/// answer rather than the first — otherwise one slow-to-update peer could pin a
-/// reader to an old target by answering quickest. The count is what stops the
-/// opposite failure: a state only one peer has ever heard of, which is one peer
-/// deciding rather than the group agreeing. A better state resets it, because
-/// the peers that backed the old one said nothing about the new.
-fn keep_the_winner(best: &mut Option<Pointer>, support: &mut usize, reply: Option<Pointer>) {
-    let Some(reply) = reply else { return };
-    match best {
-        Some(held) if held.state_id() == reply.state_id() => *support += 1,
-        Some(held) if held.replaces(&reply) => (),
-        _ => {
-            *best = Some(reply);
-            *support = 1;
+/// A tally of every state offered, not a running winner. Keeping only the best
+/// state and its count would let one peer erase the agreement behind another:
+/// a single peer naming a higher state — which it cannot make anyone else
+/// confirm — would discard the count behind the state the rest of the group
+/// holds, and a healthy pointer would read back as uncorroborated. That is not
+/// only an attack; it is what an ordinary read during an update looks like.
+///
+/// At most one entry per peer, so this is never longer than the close group.
+#[derive(Default)]
+struct Replies {
+    /// Each distinct state offered, and how many peers offered it.
+    seen: Vec<(Pointer, usize)>,
+}
+
+impl Replies {
+    /// Record one peer's answer. `None` is an answer that names no state.
+    fn add(&mut self, reply: Option<Pointer>) {
+        let Some(reply) = reply else { return };
+        for (held, count) in &mut self.seen {
+            if held.state_id() == reply.state_id() {
+                *count += 1;
+                return;
+            }
         }
+        self.seen.push((reply, 1));
+    }
+
+    /// The best state that at least `needed` peers named.
+    ///
+    /// Best by the merge rule, among the corroborated only: a stale state the
+    /// group agrees on beats a newer one only one peer has heard of, because
+    /// the second is one peer's word and the first is the network's.
+    fn corroborated(&self, needed: usize) -> Option<&Pointer> {
+        self.seen
+            .iter()
+            .filter(|(_, count)| *count >= needed)
+            .map(|(record, _)| record)
+            .reduce(|best, next| if next.replaces(best) { next } else { best })
+    }
+
+    /// Whether any peer named a state at all.
+    fn any(&self) -> bool {
+        !self.seen.is_empty()
     }
 }
 
@@ -378,15 +405,17 @@ impl Client {
 
         let wanted = read_quorum(peers.len());
         let needed = corroboration(peers.len());
-        let mut best: Option<Pointer> = None;
-        let mut support = 0usize;
+        let mut replies = Replies::default();
         let answered = ask_the_group(in_flight, wanted, |found| {
-            keep_the_winner(&mut best, &mut support, found);
-            // Nothing found yet is settled by the count alone; a record is
-            // settled only once enough peers have named it.
-            best.is_none() || support >= needed
+            replies.add(found);
+            // Answers alone settle a read that found nothing. A state is
+            // settled only once enough peers have named it — until then the
+            // read keeps asking, because the peers that would confirm it may
+            // simply not have answered yet.
+            !replies.any() || replies.corroborated(needed).is_some()
         })
         .await;
+        let corroborated = replies.corroborated(needed).cloned();
 
         if answered.count == 0 {
             return Err(answered.last_error.unwrap_or_else(|| {
@@ -403,17 +432,18 @@ impl Client {
                 hex::encode(address)
             )));
         }
-        // Found, but by too few to call it the network's answer. Either the
-        // write is still settling, or a peer is offering a state no honest node
-        // holds. Neither is a value to hand back as current.
-        if best.is_some() && support < needed {
+        // States were offered, but none by enough peers to call it the
+        // network's answer. Either the write is still settling, or what was
+        // offered is a state no honest node holds. Neither is a value to hand
+        // back as current.
+        if corroborated.is_none() && replies.any() {
             return Err(Error::CloseGroupShortfall(format!(
-                "only {support} of {} peers answering for pointer {} named the state they returned",
-                answered.count,
-                hex::encode(address)
+                "no state for pointer {} was named by {needed} of the {} peers that answered",
+                hex::encode(address),
+                answered.count
             )));
         }
-        Ok(best)
+        Ok(corroborated)
     }
 
     /// Follow a pointer chain to the chunk it ends at.
@@ -734,6 +764,15 @@ mod tests {
         }
     }
 
+    /// Tally some replies and ask what the group's answer is.
+    fn tally(replies: Vec<Option<Pointer>>) -> Replies {
+        let mut seen = Replies::default();
+        for reply in replies {
+            seen.add(reply);
+        }
+        seen
+    }
+
     /// Reads take the best answer, not the first: any single peer is entitled
     /// to serve a stale record, and must not be able to pin a reader to it.
     #[test]
@@ -741,28 +780,79 @@ mod tests {
         let (pk, sk) = keypair(10);
         let old = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
         let new = old.update(&sk, chunk_target(2)).expect("update");
+        let old = || Some(old.clone());
+        let new = || Some(new.clone());
 
-        let fold = |replies: Vec<Option<Pointer>>| {
-            let mut best = None;
-            let mut support = 0;
-            for reply in replies {
-                keep_the_winner(&mut best, &mut support, reply);
-            }
-            best
-        };
         for order in [
-            vec![Some(old.clone()), Some(new.clone())],
-            vec![Some(new.clone()), Some(old.clone())],
-            vec![None, Some(old.clone()), None, Some(new.clone()), None],
-            vec![Some(new.clone()), None, Some(old.clone())],
+            vec![old(), old(), new(), new()],
+            vec![new(), new(), old(), old()],
+            vec![None, old(), new(), None, new(), old()],
+            vec![new(), None, old(), new(), old()],
         ] {
             assert_eq!(
-                fold(order).expect("an answer").state_id(),
-                new.state_id(),
-                "the newest state wins however the replies interleave"
+                tally(order).corroborated(2).expect("an answer").state_id(),
+                new().expect("new").state_id(),
+                "the newest corroborated state wins however the replies interleave"
             );
         }
-        assert!(fold(vec![None, None]).is_none(), "nobody holds it");
+        assert!(
+            tally(vec![None, None]).corroborated(2).is_none(),
+            "nobody holds it"
+        );
+        assert!(!tally(vec![None, None]).any(), "and nobody named a state");
+    }
+
+    /// One peer naming a higher state must not bury the state the rest of the
+    /// group agrees on.
+    ///
+    /// Two ways to arrive here. A bad peer offers an owner-signed state nobody
+    /// paid to store: it can no longer make the client return it, but if it
+    /// could discard the count behind the real state it would make the pointer
+    /// unreadable instead — a denial of service in place of a forgery. And an
+    /// ordinary read taken while an update is in flight looks exactly the same.
+    #[test]
+    fn a_higher_state_only_one_peer_has_does_not_bury_the_agreed_one() {
+        let (pk, sk) = keypair(12);
+        let agreed = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let singleton = Pointer::sign(&sk, &pk, 900, chunk_target(9)).expect("sign");
+        assert!(singleton.replaces(&agreed), "it does outrank what is held");
+
+        let agreed_reply = || Some(agreed.clone());
+        let singleton_reply = || Some(singleton.clone());
+
+        for order in [
+            vec![singleton_reply(), agreed_reply(), agreed_reply()],
+            vec![agreed_reply(), singleton_reply(), agreed_reply()],
+            vec![agreed_reply(), agreed_reply(), singleton_reply()],
+            vec![
+                singleton_reply(),
+                None,
+                agreed_reply(),
+                agreed_reply(),
+                agreed_reply(),
+            ],
+        ] {
+            let seen = tally(order);
+            assert_eq!(
+                seen.corroborated(2).expect("an answer").state_id(),
+                agreed.state_id(),
+                "the state the group agrees on is the answer, whenever the \
+                 singleton arrives"
+            );
+        }
+
+        // And once a second peer confirms it, it is the answer — that is the
+        // bar, and two colluding peers can clear it. See ADR-0015.
+        let seen = tally(vec![
+            singleton_reply(),
+            singleton_reply(),
+            agreed_reply(),
+            agreed_reply(),
+        ]);
+        assert_eq!(
+            seen.corroborated(2).expect("an answer").state_id(),
+            singleton.state_id()
+        );
     }
 
     /// The fan-out both a write and a read use, driven with synthetic replies.
@@ -885,42 +975,21 @@ mod tests {
 
         // One peer offers the unpaid state; the rest of the close group has
         // never heard of it.
-        let mut best = None;
-        let mut support = 0;
-        keep_the_winner(&mut best, &mut support, Some(unpaid.clone()));
-        for _ in 0..3 {
-            keep_the_winner(&mut best, &mut support, None);
-        }
-        assert_eq!(
-            support, 1,
-            "a state one peer named has one backer however many others answer"
-        );
+        let seen = tally(vec![Some(unpaid.clone()), None, None, None]);
+        assert!(seen.any(), "a state was offered");
         assert!(
-            support < corroboration(7),
-            "which is not enough to return it"
+            seen.corroborated(corroboration(7)).is_none(),
+            "but one peer naming it is one peer deciding, not an answer"
         );
 
-        // And a state the group really holds clears the bar.
-        let mut best = None;
-        let mut support = 0;
-        for _ in 0..2 {
-            keep_the_winner(&mut best, &mut support, Some(stored.clone()));
-        }
-        assert_eq!(support, 2);
-        assert!(support >= corroboration(7));
+        // A state the group really holds clears the bar.
+        let seen = tally(vec![Some(stored.clone()), Some(stored.clone()), None]);
         assert_eq!(
-            best.as_ref().expect("an answer").state_id(),
+            seen.corroborated(corroboration(7))
+                .expect("an answer")
+                .state_id(),
             stored.state_id()
         );
-
-        // A better state resets the count: the peers that backed the old one
-        // said nothing about the new.
-        keep_the_winner(&mut best, &mut support, Some(unpaid.clone()));
-        assert_eq!(
-            best.as_ref().expect("an answer").state_id(),
-            unpaid.state_id()
-        );
-        assert_eq!(support, 1, "the newcomer starts from one backer");
     }
 
     /// A chain that points at itself must be caught by the seen-set, not by
