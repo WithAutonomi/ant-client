@@ -32,6 +32,7 @@ use ant_protocol::send_and_await_chunk_response;
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::XorName;
 use bytes::Bytes;
+use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
@@ -98,9 +99,9 @@ impl Client {
         let address = record.address();
         let state_id = record.state_id();
 
-        // The quote names the state; the peers come from the address's close
-        // group. One payment, one increment.
-        let (proof, peers) = self
+        // The quote names the state; the peers that may issue it are the close
+        // group around the address. One payment, one increment.
+        let (proof, _) = self
             .pay_for_storage_split(
                 &address,
                 &state_id,
@@ -109,21 +110,36 @@ impl Client {
             )
             .await?;
 
-        let request =
-            PointerPutRequest::with_payment(Bytes::from(record.to_bytes()), proof.clone());
+        // Store on exactly the peers a read will ask.
+        //
+        // The payment plan can return far more put-targets than the close
+        // group, and counting those towards success would let a write be
+        // acknowledged entirely outside the set `pointer_get` queries — stored,
+        // paid for, and immediately unreadable. So the write targets the same
+        // strict closest-K set the read does.
+        let targets = self
+            .network()
+            .find_closest_peers(&address, self.config().close_group_size)
+            .await?;
+        let wanted = CLOSE_GROUP_MAJORITY.min(targets.len().max(1));
 
-        // Store on a quorum, not on whichever peer answers first. A single
-        // acknowledgement means one node holds the record, and one node can
-        // lose it — pointers are not replicated by the network yet, so the
-        // client is what puts copies in the close group.
-        let wanted = CLOSE_GROUP_MAJORITY.min(peers.len().max(1));
+        let request = PointerPutRequest::with_payment(Bytes::from(record.to_bytes()), proof);
+        let mut in_flight = FuturesUnordered::new();
+        for (peer_id, addrs) in &targets {
+            let request = request.clone();
+            in_flight.push(self.send_pointer_put(
+                request,
+                *peer_id,
+                addrs.clone(),
+                address,
+                state_id,
+            ));
+        }
+
         let mut stored = 0usize;
         let mut last_error = None;
-        for (peer_id, addrs) in &peers {
-            match self
-                .send_pointer_put(request.clone(), *peer_id, addrs.clone(), address, state_id)
-                .await
-            {
+        while let Some(result) = in_flight.next().await {
+            match result {
                 Ok(()) => {
                     stored += 1;
                     if stored >= wanted {
@@ -135,15 +151,13 @@ impl Client {
         }
 
         if stored > 0 {
-            // Some nodes took it. Say so rather than reporting failure for a
-            // record that is on the network, but do not pretend it is durable.
             return Err(Error::CloseGroupShortfall(format!(
-                "pointer {} stored on {stored} of {wanted} peers",
+                "pointer {} stored on {stored} of {wanted} close-group peers",
                 hex::encode(address)
             )));
         }
         Err(last_error.unwrap_or_else(|| {
-            Error::Protocol("no peers available to store the pointer".to_string())
+            Error::Protocol("no close-group peer accepted the pointer".to_string())
         }))
     }
 
@@ -161,40 +175,52 @@ impl Client {
             .find_closest_peers(address, self.config().close_group_size)
             .await?;
 
-        // Ask the close group and keep the best answer, rather than the first.
+        // Ask the whole close group at once and keep the best answer.
         //
         // Every reply is verified independently, so a dishonest peer can only
-        // offer a record that is genuinely signed and genuinely belongs here —
-        // what it cannot do is stop a *newer* one being found. Taking the first
-        // valid answer would let any single peer pin a reader to a stale value
-        // it is entitled to serve, which is exactly the fork case the merge
-        // rule exists to settle. So the same rule settles it here.
-        let mut best: Option<Pointer> = None;
-        let mut last_error = None;
-        let mut answered = false;
-
+        // offer a record that is genuinely signed and genuinely belongs here.
+        // What it must not be able to do is decide the answer alone: any peer
+        // may legitimately hold a stale record, so taking the first reply would
+        // let one pin a reader to it. Asking concurrently also means one slow
+        // peer cannot stall the read behind the store timeout.
+        let mut in_flight = FuturesUnordered::new();
         for (peer_id, addrs) in &peers {
-            match self
-                .send_pointer_get(*address, *peer_id, addrs.clone())
-                .await
-            {
-                Ok(Some(record)) => {
-                    answered = true;
-                    best = Some(match best {
-                        Some(held) if held.replaces(&record) => held,
-                        _ => record,
-                    });
+            in_flight.push(self.send_pointer_get(*address, *peer_id, addrs.clone()));
+        }
+
+        let mut best: Option<Pointer> = None;
+        let mut answered = 0usize;
+        let mut last_error = None;
+        while let Some(result) = in_flight.next().await {
+            match result {
+                Ok(found) => {
+                    answered += 1;
+                    if let Some(record) = found {
+                        best = Some(match best {
+                            Some(held) if held.replaces(&record) => held,
+                            _ => record,
+                        });
+                    }
                 }
-                Ok(None) => answered = true,
                 Err(e) => last_error = Some(e),
             }
         }
 
-        if best.is_some() || answered {
-            return Ok(best);
+        if answered == 0 {
+            return Err(last_error.unwrap_or_else(|| {
+                Error::Protocol("no close-group peer answered for the pointer".to_string())
+            }));
         }
-        Err(last_error
-            .unwrap_or_else(|| Error::Protocol("no peer answered for the pointer".to_string())))
+        // A single answer is not a network verdict: with no replication, one
+        // reachable peer holding a stale record looks exactly like the whole
+        // group agreeing. Say so rather than presenting it as the value.
+        if answered < CLOSE_GROUP_MAJORITY.min(peers.len().max(1)) {
+            return Err(Error::CloseGroupShortfall(format!(
+                "only {answered} of the close group answered for pointer {}",
+                hex::encode(address)
+            )));
+        }
+        Ok(best)
     }
 
     /// Follow a pointer chain to the chunk it ends at.
@@ -348,9 +374,6 @@ impl Client {
                     })
                 }
                 ChunkMessageBody::PointerGetResponse(PointerGetResponse::NotFound { .. }) => {
-                    Some(Ok(None))
-                }
-                ChunkMessageBody::PointerGetResponse(PointerGetResponse::Unchanged { .. }) => {
                     Some(Ok(None))
                 }
                 ChunkMessageBody::PointerGetResponse(PointerGetResponse::Error(e)) => {
