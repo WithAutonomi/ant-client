@@ -2,3 +2,8 @@
 members = ["ant-core", "ant-cli"]
 resolver = "2"
 
+[patch.crates-io]
+# The published ant-protocol 3.0.0 has no `Pointer` record or wire messages
+# (ADR-0016); 3.1.0 is that release plus them. The only patch needed, and only
+# until 3.1.0 is published. A rev, so the pin is immutable.
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "34b7832a001df8b80b18555ca058734baae43496" }
