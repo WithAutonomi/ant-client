@@ -99,7 +99,7 @@ async fn an_update_is_paid_for_and_replaces_what_the_network_serves() {
         assert_eq!(
             record.counter(),
             expected_counter,
-            "one payment buys exactly one increment"
+            "one payment, one increment"
         );
         assert_eq!(record.target(), chunk_target(expected_counter as u8 + 1));
     }

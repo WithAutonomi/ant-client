@@ -7,13 +7,13 @@
 //!
 //! # What the client owns
 //!
-//! - **The counter.** Creation is counter 0; each update is exactly one past
-//!   the current value, so one payment buys one increment. [`Client::pointer_update`]
-//!   reads the current record and steps it, because guessing the counter is the
-//!   one way to write an update the network refuses. A node will also take a
-//!   state at the counter it already holds if that state wins the merge rule's
-//!   target tie-break, which is how two concurrent updates converge rather than
-//!   splitting the group.
+//! - **The counter.** Creation is counter 0 and an update steps it by one, so
+//!   one payment buys one state and at most one increment.
+//!   [`Client::pointer_update`] reads the current record and steps it, because
+//!   guessing the counter is the one way to write an update the network
+//!   refuses. A node also takes a state at the counter it already holds when
+//!   that state wins the merge rule's target tie-break — separately paid, and
+//!   how two concurrent updates converge instead of splitting the group.
 //! - **Paying at the state, not the address.** The quote names `state_id`, while
 //!   the close group that issues it is the one around the address. Paying at the
 //!   address would buy every future update at once.
@@ -284,8 +284,8 @@ impl Client {
 
     /// Update the pointer owned by `owner` to `target`, at `counter + 1`.
     ///
-    /// Reads the current record first: the counter must be exactly one past
-    /// what the network holds, so it cannot be guessed. A pointer that does not
+    /// Reads the current record first: an update must be one past what the
+    /// network holds, so the counter cannot be guessed. A pointer that does not
     /// exist yet is created at 0.
     ///
     /// # Errors
@@ -325,17 +325,11 @@ impl Client {
         let address = record.address();
         let state_id = record.state_id();
 
-        // Find the storers before paying: an empty group is not somewhere a
-        // write can land, and a quorum of nothing would otherwise be satisfied
-        // by nothing — a paid write reported as stored on zero peers.
-        let targets = self.pointer_group(&address).await?;
-        if targets.is_empty() {
-            return Err(Error::CloseGroupShortfall(format!(
-                "no peer is responsible for pointer {}",
-                hex::encode(address)
-            )));
-        }
-        let wanted = write_quorum(targets.len());
+        // Refuse before paying if nobody is responsible for this address.
+        // There is no sense buying storage with nowhere to put it, and a
+        // quorum of nothing would otherwise be satisfied by nothing — a paid
+        // write reported as stored on zero peers.
+        self.pointer_group(&address).await?;
 
         // The quote names the state; the peers that may issue it are the close
         // group around the address. One payment, one increment.
@@ -347,6 +341,15 @@ impl Client {
                 DATA_TYPE_POINTER,
             )
             .await?;
+
+        // Ask again rather than keep the set from before the payment. Settling
+        // on chain takes time, and the peers responsible for an address can
+        // change while it does; writing to the old set would then be refused by
+        // peers that are no longer responsible while the ones that are were
+        // never asked. The lookup above answered whether there was anywhere to
+        // store this — this one answers where.
+        let targets = self.pointer_group(&address).await?;
+        let wanted = write_quorum(targets.len());
 
         let request = PointerPutRequest::with_payment(Bytes::from(record.to_bytes()), proof);
         let in_flight = FuturesUnordered::new();
@@ -389,9 +392,20 @@ impl Client {
     /// membership that changed in between is not covered. That is churn, and
     /// what covers it is replication, which is not built.
     async fn pointer_group(&self, address: &XorName) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
-        self.network()
+        let peers = self
+            .network()
             .find_closest_peers(address, self.config().close_group_size)
-            .await
+            .await?;
+        if peers.is_empty() {
+            // A lookup that succeeds and returns nobody is not somewhere a
+            // pointer can live. Saying so here keeps every caller from having
+            // to notice that a quorum of an empty group is zero.
+            return Err(Error::CloseGroupShortfall(format!(
+                "no peer is responsible for pointer {}",
+                hex::encode(address)
+            )));
+        }
+        Ok(peers)
     }
 
     /// Read the pointer at `address`, verifying it before returning it.
@@ -408,12 +422,6 @@ impl Client {
     /// answer rather than one peer's.
     pub async fn pointer_get(&self, address: &XorName) -> Result<Option<Pointer>> {
         let peers = self.pointer_group(address).await?;
-        if peers.is_empty() {
-            return Err(Error::CloseGroupShortfall(format!(
-                "no peer is responsible for pointer {}",
-                hex::encode(address)
-            )));
-        }
 
         // Ask the whole close group at once and keep the best answer.
         //
