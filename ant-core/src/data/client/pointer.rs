@@ -19,6 +19,7 @@
 //!   detection are entirely here: see [`Client::pointer_resolve`].
 
 use std::collections::HashSet;
+use std::future::Future;
 
 use ant_protocol::chunk::{
     ChunkMessage, ChunkMessageBody, PointerGetRequest, PointerGetResponse, PointerPutRequest,
@@ -45,6 +46,121 @@ use crate::data::error::{Error, Result};
 /// read. Quorums only intersect if both are majorities of the same set.
 fn majority_of(peers: usize) -> usize {
     (peers / 2) + 1
+}
+
+/// The outcome of asking a close group.
+struct Answered {
+    /// How many peers gave a usable answer.
+    count: usize,
+    /// The last failure, kept only to explain a total failure.
+    last_error: Option<Error>,
+}
+
+/// Ask a whole close group at once and stop as soon as a majority has answered.
+///
+/// The shape a pointer write and a pointer read share: every peer is asked
+/// concurrently, each answer is handed to `keep`, and the first `wanted`
+/// answers end it. Returning early is what stops one unreachable peer holding
+/// an operation open for its whole timeout after the answer is already decided;
+/// the requests still in flight are dropped, which cancels them.
+async fn ask_the_group<T>(
+    mut in_flight: FuturesUnordered<impl Future<Output = Result<T>>>,
+    wanted: usize,
+    mut keep: impl FnMut(T),
+) -> Answered {
+    let mut answered = Answered {
+        count: 0,
+        last_error: None,
+    };
+    while let Some(result) = in_flight.next().await {
+        match result {
+            Ok(answer) => {
+                answered.count += 1;
+                keep(answer);
+                if answered.count >= wanted {
+                    break;
+                }
+            }
+            Err(e) => answered.last_error = Some(e),
+        }
+    }
+    answered
+}
+
+/// Keep whichever of the replies so far the merge rule prefers.
+///
+/// Any peer may legitimately hold a stale record, so a read takes the best
+/// answer rather than the first — otherwise one slow-to-update peer could pin a
+/// reader to an old target by answering quickest.
+fn keep_the_winner(best: &mut Option<Pointer>, reply: Option<Pointer>) {
+    if let Some(reply) = reply {
+        if !matches!(best, Some(held) if held.replaces(&reply)) {
+            *best = Some(reply);
+        }
+    }
+}
+
+/// What one peer's reply means for a write.
+///
+/// `None` means the message was not a reply to this request at all, and the
+/// caller keeps waiting.
+///
+/// A storer that acknowledges some *other* record is claiming to hold something
+/// this client never sent. Taking that at face value would let one peer end the
+/// write — after payment — while storing nothing, so an acknowledgement only
+/// counts when it names the record that was sent.
+fn read_put_reply(
+    body: ChunkMessageBody,
+    expected_address: XorName,
+    expected_state: XorName,
+) -> Option<Result<()>> {
+    let ChunkMessageBody::PointerPutResponse(response) = body else {
+        return None;
+    };
+    Some(match response {
+        // `Unchanged` is success for a retry: the state the client signed is
+        // exactly what the node holds.
+        PointerPutResponse::Success { address, state_id }
+        | PointerPutResponse::Unchanged { address, state_id } => {
+            if address == expected_address && state_id == expected_state {
+                Ok(())
+            } else {
+                Err(Error::InvalidData(format!(
+                    "peer acknowledged a pointer this client did not send: address {} state {}",
+                    hex::encode(address),
+                    hex::encode(state_id)
+                )))
+            }
+        }
+        PointerPutResponse::Stale { state_id, .. } => Err(Error::InvalidData(format!(
+            "the pointer moved while this update was in flight; the network now holds state {}",
+            hex::encode(state_id)
+        ))),
+        PointerPutResponse::PaymentRequired { message } => Err(Error::Payment(message)),
+        PointerPutResponse::Error(e) => Err(Error::Protocol(format!("pointer PUT refused: {e}"))),
+    })
+}
+
+/// What one peer's reply means for a read.
+///
+/// Verify before trusting: the signature must check out and the record must
+/// belong at the address that was asked for, or a storer could answer with
+/// someone else's pointer, or with bytes nobody signed.
+fn read_get_reply(body: ChunkMessageBody, address: XorName) -> Option<Result<Option<Pointer>>> {
+    let ChunkMessageBody::PointerGetResponse(response) = body else {
+        return None;
+    };
+    Some(match response {
+        PointerGetResponse::Success { record } => match Pointer::from_bytes(&record) {
+            Ok(record) if record.address() == address => Ok(Some(record)),
+            Ok(_) => Err(Error::InvalidData(
+                "peer answered with a pointer for a different address".to_string(),
+            )),
+            Err(e) => Err(Error::InvalidData(format!("invalid pointer: {e}"))),
+        },
+        PointerGetResponse::NotFound { .. } => Ok(None),
+        PointerGetResponse::Error(e) => Err(Error::Protocol(format!("pointer GET refused: {e}"))),
+    })
 }
 
 /// How many pointer hops [`Client::pointer_resolve`] will follow.
@@ -120,21 +236,11 @@ impl Client {
             )
             .await?;
 
-        // Store on exactly the peers a read will ask.
-        //
-        // The payment plan can return far more put-targets than the close
-        // group, and counting those towards success would let a write be
-        // acknowledged entirely outside the set `pointer_get` queries — stored,
-        // paid for, and immediately unreadable. So the write targets the same
-        // strict closest-K set the read does.
-        let targets = self
-            .network()
-            .find_closest_peers(&address, self.config().close_group_size)
-            .await?;
+        let targets = self.pointer_group(&address).await?;
         let wanted = majority_of(targets.len());
 
         let request = PointerPutRequest::with_payment(Bytes::from(record.to_bytes()), proof);
-        let mut in_flight = FuturesUnordered::new();
+        let in_flight = FuturesUnordered::new();
         for (peer_id, addrs) in &targets {
             let request = request.clone();
             in_flight.push(self.send_pointer_put(
@@ -146,29 +252,33 @@ impl Client {
             ));
         }
 
-        let mut stored = 0usize;
-        let mut last_error = None;
-        while let Some(result) = in_flight.next().await {
-            match result {
-                Ok(()) => {
-                    stored += 1;
-                    if stored >= wanted {
-                        return Ok(address);
-                    }
-                }
-                Err(e) => last_error = Some(e),
-            }
+        let answered = ask_the_group(in_flight, wanted, |()| ()).await;
+        if answered.count >= wanted {
+            return Ok(address);
         }
-
-        if stored > 0 {
+        if answered.count > 0 {
             return Err(Error::CloseGroupShortfall(format!(
-                "pointer {} stored on {stored} of {wanted} close-group peers",
-                hex::encode(address)
+                "pointer {} stored on {} of {wanted} close-group peers",
+                hex::encode(address),
+                answered.count
             )));
         }
-        Err(last_error.unwrap_or_else(|| {
+        Err(answered.last_error.unwrap_or_else(|| {
             Error::Protocol("no close-group peer accepted the pointer".to_string())
         }))
+    }
+
+    /// The peers a pointer write must land on and a read must ask.
+    ///
+    /// One definition serves both. A write acknowledged outside the set the
+    /// read queries is a write nobody can read — paid for, stored, and
+    /// invisible — so the two sets are not merely the same size, they are
+    /// chosen by the same call. In particular the payment plan's targets, which
+    /// can run far wider than the close group, never count towards a write.
+    async fn pointer_group(&self, address: &XorName) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
+        self.network()
+            .find_closest_peers(address, self.config().close_group_size)
+            .await
     }
 
     /// Read the pointer at `address`, verifying it before returning it.
@@ -180,10 +290,7 @@ impl Client {
     ///
     /// Returns an error if no peer answers.
     pub async fn pointer_get(&self, address: &XorName) -> Result<Option<Pointer>> {
-        let peers = self
-            .network()
-            .find_closest_peers(address, self.config().close_group_size)
-            .await?;
+        let peers = self.pointer_group(address).await?;
 
         // Ask the whole close group at once and keep the best answer.
         //
@@ -193,47 +300,28 @@ impl Client {
         // may legitimately hold a stale record, so taking the first reply would
         // let one pin a reader to it. Asking concurrently also means one slow
         // peer cannot stall the read behind the store timeout.
-        let mut in_flight = FuturesUnordered::new();
+        let in_flight = FuturesUnordered::new();
         for (peer_id, addrs) in &peers {
             in_flight.push(self.send_pointer_get(*address, *peer_id, addrs.clone()));
         }
 
         let wanted = majority_of(peers.len());
         let mut best: Option<Pointer> = None;
-        let mut answered = 0usize;
-        let mut last_error = None;
-        while let Some(result) = in_flight.next().await {
-            match result {
-                Ok(found) => {
-                    answered += 1;
-                    if let Some(record) = found {
-                        best = Some(match best {
-                            Some(held) if held.replaces(&record) => held,
-                            _ => record,
-                        });
-                    }
-                    // A majority has spoken. Waiting for the rest would let one
-                    // unreachable peer hold the read open for its whole timeout
-                    // after the answer is already known.
-                    if answered >= wanted {
-                        return Ok(best);
-                    }
-                }
-                Err(e) => last_error = Some(e),
-            }
-        }
+        let answered =
+            ask_the_group(in_flight, wanted, |found| keep_the_winner(&mut best, found)).await;
 
-        if answered == 0 {
-            return Err(last_error.unwrap_or_else(|| {
+        if answered.count == 0 {
+            return Err(answered.last_error.unwrap_or_else(|| {
                 Error::Protocol("no close-group peer answered for the pointer".to_string())
             }));
         }
         // A single answer is not a network verdict: with no replication, one
         // reachable peer holding a stale record looks exactly like the whole
         // group agreeing. Say so rather than presenting it as the value.
-        if answered < wanted {
+        if answered.count < wanted {
             return Err(Error::CloseGroupShortfall(format!(
-                "only {answered} of the close group answered for pointer {}",
+                "only {} of the close group answered for pointer {}",
+                answered.count,
                 hex::encode(address)
             )));
         }
@@ -314,40 +402,7 @@ impl Client {
             request_id,
             std::time::Duration::from_secs(self.config().merkle_store_timeout_secs),
             &peer_addrs,
-            move |body| match body {
-                // `Unchanged` is success for a retry: the state the client
-                // signed is exactly what the node holds.
-                ChunkMessageBody::PointerPutResponse(
-                    PointerPutResponse::Success { address, state_id }
-                    | PointerPutResponse::Unchanged { address, state_id },
-                ) => Some(
-                    if address == expected_address && state_id == expected_state {
-                        Ok(())
-                    } else {
-                        Err(Error::InvalidData(format!(
-                            "peer acknowledged a pointer this client did not send: \
-                         address {} state {}",
-                            hex::encode(address),
-                            hex::encode(state_id)
-                        )))
-                    },
-                ),
-                ChunkMessageBody::PointerPutResponse(PointerPutResponse::Stale {
-                    state_id,
-                    ..
-                }) => Some(Err(Error::InvalidData(format!(
-                    "the pointer moved while this update was in flight; the network \
-                     now holds state {}",
-                    hex::encode(state_id)
-                )))),
-                ChunkMessageBody::PointerPutResponse(PointerPutResponse::PaymentRequired {
-                    message,
-                }) => Some(Err(Error::Payment(message))),
-                ChunkMessageBody::PointerPutResponse(PointerPutResponse::Error(e)) => {
-                    Some(Err(Error::Protocol(format!("pointer PUT refused: {e}"))))
-                }
-                _ => None,
-            },
+            move |body| read_put_reply(body, expected_address, expected_state),
             |e| Error::Network(format!("pointer PUT send failed: {e}")),
             || Error::Timeout("pointer PUT timed out".to_string()),
         )
@@ -377,27 +432,7 @@ impl Client {
             request_id,
             std::time::Duration::from_secs(self.config().chunk_get_timeout_secs),
             &peer_addrs,
-            move |body| match body {
-                ChunkMessageBody::PointerGetResponse(PointerGetResponse::Success { record }) => {
-                    // Verify before trusting: the signature must check out and
-                    // the record must belong at the address that was asked for,
-                    // or a storer could answer with someone else's pointer.
-                    Some(match Pointer::from_bytes(&record) {
-                        Ok(record) if record.address() == address => Ok(Some(record)),
-                        Ok(_) => Err(Error::InvalidData(
-                            "peer answered with a pointer for a different address".to_string(),
-                        )),
-                        Err(e) => Err(Error::InvalidData(format!("invalid pointer: {e}"))),
-                    })
-                }
-                ChunkMessageBody::PointerGetResponse(PointerGetResponse::NotFound { .. }) => {
-                    Some(Ok(None))
-                }
-                ChunkMessageBody::PointerGetResponse(PointerGetResponse::Error(e)) => {
-                    Some(Err(Error::Protocol(format!("pointer GET refused: {e}"))))
-                }
-                _ => None,
-            },
+            move |body| read_get_reply(body, address),
             |e| Error::Network(format!("pointer GET send failed: {e}")),
             || Error::Timeout("pointer GET timed out".to_string()),
         )
@@ -411,6 +446,7 @@ mod tests {
     use super::*;
     use ant_protocol::pointer::pointer_address;
     use ant_protocol::pqc::api::ml_dsa_65;
+    use futures::future::BoxFuture;
 
     fn keypair(seed: u8) -> (MlDsaPublicKey, MlDsaSecretKey) {
         ml_dsa_65().generate_keypair_from_seed(&[seed; 32])
@@ -469,28 +505,63 @@ mod tests {
         assert_eq!(next.address(), again.address());
     }
 
-    /// A record that does not verify, or verifies but belongs elsewhere, must
-    /// never be accepted as the answer for an address.
+    /// Every reply a peer can give to a read, fed to the code that judges them.
     #[test]
-    fn a_record_for_another_address_is_not_an_answer() {
+    fn a_read_refuses_every_reply_but_this_address_own_signed_record() {
         let (mine, my_sk) = keypair(5);
         let (theirs, their_sk) = keypair(6);
         let asked_for = pointer_address(&mine);
+        let ours = Pointer::create(&my_sk, &mine, chunk_target(1)).expect("create");
+        let theirs = Pointer::create(&their_sk, &theirs, chunk_target(1)).expect("create");
 
-        let mine_record = Pointer::create(&my_sk, &mine, chunk_target(1)).expect("create");
-        let theirs_record = Pointer::create(&their_sk, &theirs, chunk_target(1)).expect("create");
+        let reply = |record: Bytes| {
+            read_get_reply(
+                ChunkMessageBody::PointerGetResponse(PointerGetResponse::Success { record }),
+                asked_for,
+            )
+        };
 
-        assert_eq!(mine_record.address(), asked_for);
-        assert_ne!(
-            theirs_record.address(),
-            asked_for,
-            "a storer answering with this must be refused"
+        let accepted = reply(Bytes::from(ours.to_bytes()));
+        assert_eq!(
+            accepted
+                .expect("a reply")
+                .expect("valid")
+                .expect("present")
+                .state_id(),
+            ours.state_id()
         );
 
-        // Tampering with any byte breaks the signature, so it never parses.
-        let mut tampered = mine_record.to_bytes().to_vec();
+        // Someone else's pointer: signed, genuine, and not what was asked for.
+        assert!(reply(Bytes::from(theirs.to_bytes()))
+            .expect("a reply")
+            .is_err());
+
+        // Tampering with any byte breaks the signature, so nothing parses.
+        let mut tampered = ours.to_bytes();
         tampered[100] ^= 0xff;
-        assert!(Pointer::from_bytes(&tampered).is_err());
+        assert!(reply(Bytes::from(tampered)).expect("a reply").is_err());
+        assert!(reply(Bytes::new()).expect("a reply").is_err());
+
+        // "I do not have it" is an answer, and counts towards the quorum.
+        assert!(read_get_reply(
+            ChunkMessageBody::PointerGetResponse(PointerGetResponse::NotFound {
+                address: asked_for
+            }),
+            asked_for,
+        )
+        .expect("a reply")
+        .expect("valid")
+        .is_none());
+
+        // A message that is not a reply to this request is not an answer at all.
+        assert!(read_get_reply(
+            ChunkMessageBody::PointerPutResponse(PointerPutResponse::Success {
+                address: asked_for,
+                state_id: ours.state_id(),
+            }),
+            asked_for,
+        )
+        .is_none());
     }
 
     /// A peer that answers with a record the client never sent must not end the
@@ -501,45 +572,150 @@ mod tests {
         let (pk, sk) = keypair(9);
         let sent = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
         let other = Pointer::create(&sk, &pk, chunk_target(2)).expect("create");
-
         // Same address — same owner — but a different state.
         assert_eq!(sent.address(), other.address());
         assert_ne!(sent.state_id(), other.state_id());
 
-        // The check the response handler makes.
-        let accepts = |address, state| address == sent.address() && state == sent.state_id();
-        assert!(accepts(sent.address(), sent.state_id()));
-        assert!(
-            !accepts(sent.address(), other.state_id()),
-            "a different state at the right address must be refused"
-        );
-        assert!(
-            !accepts([0u8; 32], sent.state_id()),
-            "a different address must be refused"
-        );
+        let judged = |response| {
+            read_put_reply(
+                ChunkMessageBody::PointerPutResponse(response),
+                sent.address(),
+                sent.state_id(),
+            )
+            .expect("a reply")
+        };
+
+        for honest in [
+            PointerPutResponse::Success {
+                address: sent.address(),
+                state_id: sent.state_id(),
+            },
+            // A re-submission of a state the node already holds: the record is
+            // stored, which is all the write asked for.
+            PointerPutResponse::Unchanged {
+                address: sent.address(),
+                state_id: sent.state_id(),
+            },
+        ] {
+            assert!(judged(honest).is_ok());
+        }
+
+        for lie in [
+            // The right address, some other state of the same pointer.
+            PointerPutResponse::Success {
+                address: sent.address(),
+                state_id: other.state_id(),
+            },
+            // The right state, at an address that was never written.
+            PointerPutResponse::Success {
+                address: [0u8; 32],
+                state_id: sent.state_id(),
+            },
+            PointerPutResponse::Unchanged {
+                address: sent.address(),
+                state_id: other.state_id(),
+            },
+            // Losing a race is not storing.
+            PointerPutResponse::Stale {
+                address: sent.address(),
+                state_id: other.state_id(),
+            },
+            PointerPutResponse::PaymentRequired {
+                message: "pay up".to_string(),
+            },
+        ] {
+            assert!(judged(lie).is_err(), "this must not count as stored");
+        }
     }
 
     /// Reads take the best answer, not the first: any single peer is entitled
     /// to serve a stale record, and must not be able to pin a reader to it.
     #[test]
-    fn a_read_keeps_the_winner_not_the_first_reply() {
+    fn a_read_keeps_the_winner_whatever_order_replies_arrive_in() {
         let (pk, sk) = keypair(10);
         let old = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
         let new = old.update(&sk, chunk_target(2)).expect("update");
 
-        // Whichever order the replies arrive in, the merge rule picks the same.
-        let fold = |replies: &[&Pointer]| {
-            let mut best: Option<Pointer> = None;
-            for r in replies {
-                best = Some(match best {
-                    Some(held) if held.replaces(r) => held,
-                    _ => (*r).clone(),
-                });
+        let fold = |replies: Vec<Option<Pointer>>| {
+            let mut best = None;
+            for reply in replies {
+                keep_the_winner(&mut best, reply);
             }
-            best.expect("non-empty")
+            best
         };
-        assert_eq!(fold(&[&old, &new]).state_id(), new.state_id());
-        assert_eq!(fold(&[&new, &old]).state_id(), new.state_id());
+        for order in [
+            vec![Some(old.clone()), Some(new.clone())],
+            vec![Some(new.clone()), Some(old.clone())],
+            vec![None, Some(old.clone()), None, Some(new.clone()), None],
+            vec![Some(new.clone()), None, Some(old.clone())],
+        ] {
+            assert_eq!(
+                fold(order).expect("an answer").state_id(),
+                new.state_id(),
+                "the newest state wins however the replies interleave"
+            );
+        }
+        assert!(fold(vec![None, None]).is_none(), "nobody holds it");
+    }
+
+    /// The fan-out both a write and a read use, driven with synthetic replies.
+    ///
+    /// A majority ends the operation. The peers that have not answered are
+    /// dropped mid-flight, so one unreachable peer cannot hold the operation
+    /// open for its whole timeout after the answer is already decided.
+    #[tokio::test]
+    async fn a_majority_ends_the_operation_and_a_dead_peer_cannot_stall_it() {
+        let group = |good: usize, dead: usize| {
+            let in_flight: FuturesUnordered<BoxFuture<'static, Result<Option<Pointer>>>> =
+                FuturesUnordered::new();
+            for _ in 0..good {
+                in_flight.push(Box::pin(async { Ok(None) }));
+            }
+            for _ in 0..dead {
+                in_flight.push(Box::pin(futures::future::pending()));
+            }
+            in_flight
+        };
+
+        // Four of seven answer; three never will. Without the early return this
+        // would never finish.
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ask_the_group(group(4, 3), majority_of(7), |_| ()),
+        )
+        .await
+        .expect("a majority must end the read without waiting for the rest");
+        assert_eq!(answered.count, 4);
+
+        // One short of a majority, and the rest are gone: the caller is told
+        // how many answered rather than being handed one peer's word.
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ask_the_group(group(3, 0), majority_of(7), |_| ()),
+        )
+        .await
+        .expect("nothing is in flight to wait for");
+        assert_eq!(answered.count, 3, "three is not a majority of seven");
+    }
+
+    /// A peer that errors has not answered, and cannot make up a quorum.
+    #[tokio::test]
+    async fn an_error_is_not_an_answer() {
+        let in_flight: FuturesUnordered<BoxFuture<'static, Result<Option<Pointer>>>> =
+            FuturesUnordered::new();
+        for _ in 0..6 {
+            in_flight.push(Box::pin(async {
+                Err(Error::Protocol("peer refused".to_string()))
+            }));
+        }
+        in_flight.push(Box::pin(async { Ok(None) }));
+
+        let answered = ask_the_group(in_flight, majority_of(7), |_| ()).await;
+        assert_eq!(answered.count, 1, "six failures are not six answers");
+        assert!(
+            answered.last_error.is_some(),
+            "the failure must be kept to explain the shortfall"
+        );
     }
 
     /// A write quorum and a read quorum must intersect at every group width.
