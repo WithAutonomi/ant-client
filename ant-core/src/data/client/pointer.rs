@@ -491,8 +491,10 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns an error if a hop is missing, the chain cycles, the depth limit
-    /// is reached, or the final target is a kind this build does not know.
+    /// Returns an error if a hop is missing, the chain cycles, or the depth
+    /// limit is reached. A target of a kind this build does not know is *not*
+    /// an error: the record is signed, so the bytes are authentic, and the
+    /// caller is handed the target to decide about.
     pub async fn pointer_resolve(&self, address: &XorName) -> Result<PointerTarget> {
         let mut seen = HashSet::new();
         let mut at = *address;
