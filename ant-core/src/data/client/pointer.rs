@@ -22,7 +22,7 @@ use std::collections::HashSet;
 
 use ant_protocol::chunk::{
     ChunkMessage, ChunkMessageBody, PointerGetRequest, PointerGetResponse, PointerPutRequest,
-    PointerPutResponse,
+    PointerPutResponse, CLOSE_GROUP_MAJORITY,
 };
 use ant_protocol::pointer::{
     Pointer, PointerTarget, PointerTargetKind, DATA_TYPE_POINTER, POINTER_WIRE_LEN,
@@ -112,15 +112,35 @@ impl Client {
         let request =
             PointerPutRequest::with_payment(Bytes::from(record.to_bytes()), proof.clone());
 
+        // Store on a quorum, not on whichever peer answers first. A single
+        // acknowledgement means one node holds the record, and one node can
+        // lose it — pointers are not replicated by the network yet, so the
+        // client is what puts copies in the close group.
+        let wanted = CLOSE_GROUP_MAJORITY.min(peers.len().max(1));
+        let mut stored = 0usize;
         let mut last_error = None;
         for (peer_id, addrs) in &peers {
             match self
-                .send_pointer_put(request.clone(), *peer_id, addrs.clone())
+                .send_pointer_put(request.clone(), *peer_id, addrs.clone(), address, state_id)
                 .await
             {
-                Ok(stored) => return Ok(stored),
+                Ok(()) => {
+                    stored += 1;
+                    if stored >= wanted {
+                        return Ok(address);
+                    }
+                }
                 Err(e) => last_error = Some(e),
             }
+        }
+
+        if stored > 0 {
+            // Some nodes took it. Say so rather than reporting failure for a
+            // record that is on the network, but do not pretend it is durable.
+            return Err(Error::CloseGroupShortfall(format!(
+                "pointer {} stored on {stored} of {wanted} peers",
+                hex::encode(address)
+            )));
         }
         Err(last_error.unwrap_or_else(|| {
             Error::Protocol("no peers available to store the pointer".to_string())
@@ -140,22 +160,38 @@ impl Client {
             .network()
             .find_closest_peers(address, self.config().close_group_size)
             .await?;
+
+        // Ask the close group and keep the best answer, rather than the first.
+        //
+        // Every reply is verified independently, so a dishonest peer can only
+        // offer a record that is genuinely signed and genuinely belongs here —
+        // what it cannot do is stop a *newer* one being found. Taking the first
+        // valid answer would let any single peer pin a reader to a stale value
+        // it is entitled to serve, which is exactly the fork case the merge
+        // rule exists to settle. So the same rule settles it here.
+        let mut best: Option<Pointer> = None;
         let mut last_error = None;
-        let mut any_answered = false;
+        let mut answered = false;
 
         for (peer_id, addrs) in &peers {
             match self
                 .send_pointer_get(*address, *peer_id, addrs.clone())
                 .await
             {
-                Ok(Some(record)) => return Ok(Some(record)),
-                Ok(None) => any_answered = true,
+                Ok(Some(record)) => {
+                    answered = true;
+                    best = Some(match best {
+                        Some(held) if held.replaces(&record) => held,
+                        _ => record,
+                    });
+                }
+                Ok(None) => answered = true,
                 Err(e) => last_error = Some(e),
             }
         }
 
-        if any_answered {
-            return Ok(None);
+        if best.is_some() || answered {
+            return Ok(best);
         }
         Err(last_error
             .unwrap_or_else(|| Error::Protocol("no peer answered for the pointer".to_string())))
@@ -205,13 +241,20 @@ impl Client {
         )))
     }
 
-    /// Send one pointer PUT and interpret the reply.
+    /// Send one pointer PUT and check the acknowledgement against what was sent.
+    ///
+    /// A peer that answers `Success` for a different address or a different
+    /// state is claiming to hold something the client never submitted. Taking
+    /// that at face value would let one peer end the write — after payment —
+    /// while storing nothing, so the reply has to name the record it was given.
     async fn send_pointer_put(
         &self,
         request: PointerPutRequest,
         target_peer: PeerId,
         peer_addrs: Vec<MultiAddr>,
-    ) -> Result<XorName> {
+        expected_address: XorName,
+        expected_state: XorName,
+    ) -> Result<()> {
         let request_id = self.next_request_id();
         let message = ChunkMessage {
             request_id,
@@ -228,13 +271,24 @@ impl Client {
             request_id,
             std::time::Duration::from_secs(self.config().merkle_store_timeout_secs),
             &peer_addrs,
-            |body| match body {
-                // `Unchanged` is success for a client that retried: the state it
-                // signed is what the node holds.
+            move |body| match body {
+                // `Unchanged` is success for a retry: the state the client
+                // signed is exactly what the node holds.
                 ChunkMessageBody::PointerPutResponse(
-                    PointerPutResponse::Success { address, .. }
-                    | PointerPutResponse::Unchanged { address, .. },
-                ) => Some(Ok(address)),
+                    PointerPutResponse::Success { address, state_id }
+                    | PointerPutResponse::Unchanged { address, state_id },
+                ) => Some(
+                    if address == expected_address && state_id == expected_state {
+                        Ok(())
+                    } else {
+                        Err(Error::InvalidData(format!(
+                            "peer acknowledged a pointer this client did not send: \
+                         address {} state {}",
+                            hex::encode(address),
+                            hex::encode(state_id)
+                        )))
+                    },
+                ),
                 ChunkMessageBody::PointerPutResponse(PointerPutResponse::Stale {
                     state_id,
                     ..
@@ -397,6 +451,55 @@ mod tests {
         let mut tampered = mine_record.to_bytes().to_vec();
         tampered[100] ^= 0xff;
         assert!(Pointer::from_bytes(&tampered).is_err());
+    }
+
+    /// A peer that answers with a record the client never sent must not end the
+    /// write. Otherwise one peer takes the payment, stores nothing, and says
+    /// "stored".
+    #[test]
+    fn an_acknowledgement_must_name_the_record_that_was_sent() {
+        let (pk, sk) = keypair(9);
+        let sent = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let other = Pointer::create(&sk, &pk, chunk_target(2)).expect("create");
+
+        // Same address — same owner — but a different state.
+        assert_eq!(sent.address(), other.address());
+        assert_ne!(sent.state_id(), other.state_id());
+
+        // The check the response handler makes.
+        let accepts = |address, state| address == sent.address() && state == sent.state_id();
+        assert!(accepts(sent.address(), sent.state_id()));
+        assert!(
+            !accepts(sent.address(), other.state_id()),
+            "a different state at the right address must be refused"
+        );
+        assert!(
+            !accepts([0u8; 32], sent.state_id()),
+            "a different address must be refused"
+        );
+    }
+
+    /// Reads take the best answer, not the first: any single peer is entitled
+    /// to serve a stale record, and must not be able to pin a reader to it.
+    #[test]
+    fn a_read_keeps_the_winner_not_the_first_reply() {
+        let (pk, sk) = keypair(10);
+        let old = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let new = old.update(&sk, chunk_target(2)).expect("update");
+
+        // Whichever order the replies arrive in, the merge rule picks the same.
+        let fold = |replies: &[&Pointer]| {
+            let mut best: Option<Pointer> = None;
+            for r in replies {
+                best = Some(match best {
+                    Some(held) if held.replaces(r) => held,
+                    _ => (*r).clone(),
+                });
+            }
+            best.expect("non-empty")
+        };
+        assert_eq!(fold(&[&old, &new]).state_id(), new.state_id());
+        assert_eq!(fold(&[&new, &old]).state_id(), new.state_id());
     }
 
     /// A chain that points at itself must be caught by the seen-set, not by
