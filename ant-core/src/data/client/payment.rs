@@ -46,6 +46,28 @@ impl Client {
         data_size: u64,
         data_type: u32,
     ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>)> {
+        self.pay_for_storage_split(address, address, data_size, data_type)
+            .await
+    }
+
+    /// As [`Self::pay_for_storage`], quoting at `content` while collecting from
+    /// the close group around `routing`.
+    ///
+    /// The two are one address for a chunk and two for a pointer, whose address
+    /// is stable for its life: paying against it would buy every future update
+    /// at once.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::pay_for_storage`].
+    pub async fn pay_for_storage_split(
+        &self,
+        routing: &[u8; 32],
+        content: &[u8; 32],
+        data_size: u64,
+        data_type: u32,
+    ) -> Result<(Vec<u8>, Vec<(PeerId, Vec<MultiAddr>)>)> {
+        let address = content;
         // A refusal established by any earlier upload on this client stops
         // this one before it spends. The verdict is about this build, not
         // about one operation.
@@ -61,7 +83,7 @@ impl Client {
 
         // 1. Collect at least one witnessed quote from the network
         let quote_plan = self
-            .get_store_quote_plan(address, data_size, data_type)
+            .get_store_quote_plan_split(routing, content, data_size, data_type)
             .await?;
         let quotes_with_peers = quote_plan.quotes;
         let median_quote_issuer =

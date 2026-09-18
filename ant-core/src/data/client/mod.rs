@@ -14,6 +14,7 @@ pub mod diagnostics;
 pub mod file;
 pub mod merkle;
 pub mod payment;
+pub mod pointer;
 pub mod quote;
 
 use crate::data::client::adaptive::{AdaptiveConfig, AdaptiveController, ChannelStart, Outcome};

@@ -24,6 +24,7 @@ use ant_node::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig, QuoteGenerator,
     QuotingMetricsTracker,
 };
+use ant_node::pointer::{service::PointerService, store::PointerStore};
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::storage::{AntProtocol, ChunkStore, ChunkStoreConfig, MigrationConfig};
 // Wire / transport / EVM types: route through ant-protocol so the test
@@ -369,12 +370,22 @@ impl MiniTestnet {
                 .map_or_else(|_| vec![], |sig| sig.as_bytes().to_vec())
         });
 
+        // Pointers live beside the chunks under the same root, exactly as a
+        // real node wires them: without a pointer service the node refuses
+        // every pointer message, which would make a pointer E2E test prove
+        // nothing about the code a node actually runs.
+        let pointer_store = PointerStore::new(data_dir)
+            .await
+            .expect("create pointer store");
+        let pointers = PointerService::new(pointer_store)
+            .with_chunk_store(Arc::clone(&storage))
+            .with_payments(Arc::clone(&payment_verifier));
+
         // Create protocol handler
-        let protocol = Arc::new(AntProtocol::new(
-            storage,
-            payment_verifier,
-            Arc::new(quote_generator),
-        ));
+        let protocol = Arc::new(
+            AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator))
+                .with_pointer_service(pointers),
+        );
         // Wire the P2P node into the protocol so direct PUT storage-admission
         // and payment closeness checks use the node's live DHT view.
         protocol.attach_p2p_node(Arc::clone(&node));
