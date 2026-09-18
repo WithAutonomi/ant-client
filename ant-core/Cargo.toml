@@ -169,6 +169,7 @@ test-utils = ["dep:fips204"]
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
 ant-node = { version = "0.20.0", git = "https://github.com/WithAutonomi/ant-node.git", rev = "9de2bf29da95fc2f6e4ba81bea562707e8b234a0", features = ["test-utils"] }
+>>>>>>> 6dd2ba2 (refactor(pointer): follow the protocol record, and pin the chain by branch)
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
