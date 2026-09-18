@@ -109,7 +109,12 @@ async fn an_update_is_paid_for_and_replaces_what_the_network_serves() {
 }
 
 /// Re-submitting a state the network already holds is answered as stored
-/// without writing anything, so a retry is safe and buys nothing.
+/// without writing anything, so a retry after a timeout cannot lose the update
+/// or fork it.
+///
+/// "Buys nothing" is literal: the write is still paid for, because the node
+/// cannot tell a retry from a fresh submission until it has been paid to look.
+/// What the retry cannot do is move the pointer.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn resubmitting_a_stored_state_is_accepted_and_changes_nothing() {
