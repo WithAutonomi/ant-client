@@ -35,6 +35,7 @@ use ant_protocol::XorName;
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 
+use crate::data::client::chunk::STORE_RESPONSE_TIMEOUT;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 
@@ -400,7 +401,11 @@ impl Client {
             &target_peer,
             bytes,
             request_id,
-            std::time::Duration::from_secs(self.config().merkle_store_timeout_secs),
+            // A pointer PUT carries a single-node proof — merkle proofs are
+            // refused for pointers — so it does not make the storer do the
+            // network closeness lookup the merkle timeout exists to cover.
+            // Same budget as a non-merkle chunk PUT.
+            STORE_RESPONSE_TIMEOUT,
             &peer_addrs,
             move |body| read_put_reply(body, expected_address, expected_state),
             |e| Error::Network(format!("pointer PUT send failed: {e}")),
