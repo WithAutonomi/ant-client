@@ -208,8 +208,12 @@ fn is_authoritative_not_found(not_found: usize, queried: usize) -> bool {
     queried >= CLOSE_GROUP_MAJORITY && not_found == queried
 }
 
-/// Store-response timeout for non-merkle chunk PUTs.
-const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Store-response timeout for a PUT carrying a single-node payment proof.
+///
+/// The merkle timeout is far longer only because a merkle pool makes the
+/// storer do an authoritative network closeness lookup first. A PUT that
+/// carries a single-node proof does no such lookup, so it is held to this.
+pub(crate) const STORE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Extra waves allowed after the computed diagnostic peer-sweep deadline.
 const DIAGNOSTIC_TIMEOUT_PADDING_WAVES: usize = 1;
