@@ -1,16 +1,19 @@
 //! Client operations for pointers (ADR-0015 in `ant-node`).
 //!
 //! A pointer is a mutable, owner-signed reference stored at
-//! `BLAKE3("autonomi.pointer.address.v1" || owner_key)`. Public-key addressed
-//! and self-verifying: the key is inside the record, so anything that parses is
-//! checkable on the spot, with no fetch.
+//! `BLAKE3::derive_key("autonomi.pointer.address.v1", owner_key)`. Public-key
+//! addressed and self-verifying: the key is inside the record, so anything that
+//! parses is checkable on the spot, with no fetch.
 //!
 //! # What the client owns
 //!
 //! - **The counter.** Creation is counter 0; each update is exactly one past
 //!   the current value, so one payment buys one increment. [`Client::pointer_update`]
 //!   reads the current record and steps it, because guessing the counter is the
-//!   one way to write an update the network refuses.
+//!   one way to write an update the network refuses. A node will also take a
+//!   state at the counter it already holds if that state wins the merge rule's
+//!   target tie-break, which is how two concurrent updates converge rather than
+//!   splitting the group.
 //! - **Paying at the state, not the address.** The quote names `state_id`, while
 //!   the close group that issues it is the one around the address. Paying at the
 //!   address would buy every future update at once.
@@ -308,12 +311,31 @@ impl Client {
 
     /// Pay for and store an already-signed pointer.
     ///
+    /// Each call settles a payment for the state it is given. A state the
+    /// network already holds is answered as stored, but the payment for it has
+    /// been made either way — so a retry after a timeout costs a second quote.
+    /// Read first if that matters; the node cannot tell a retry from a fresh
+    /// submission before it has been paid to look.
+    ///
     /// # Errors
     ///
-    /// Returns an error if payment fails or no storer accepts the record.
+    /// Returns an error if no peer is responsible for the address, if payment
+    /// fails, or if no storer accepts the record.
     pub async fn pointer_put(&self, record: &Pointer) -> Result<XorName> {
         let address = record.address();
         let state_id = record.state_id();
+
+        // Find the storers before paying: an empty group is not somewhere a
+        // write can land, and a quorum of nothing would otherwise be satisfied
+        // by nothing — a paid write reported as stored on zero peers.
+        let targets = self.pointer_group(&address).await?;
+        if targets.is_empty() {
+            return Err(Error::CloseGroupShortfall(format!(
+                "no peer is responsible for pointer {}",
+                hex::encode(address)
+            )));
+        }
+        let wanted = write_quorum(targets.len());
 
         // The quote names the state; the peers that may issue it are the close
         // group around the address. One payment, one increment.
@@ -325,9 +347,6 @@ impl Client {
                 DATA_TYPE_POINTER,
             )
             .await?;
-
-        let targets = self.pointer_group(&address).await?;
-        let wanted = write_quorum(targets.len());
 
         let request = PointerPutRequest::with_payment(Bytes::from(record.to_bytes()), proof);
         let in_flight = FuturesUnordered::new();
@@ -389,6 +408,12 @@ impl Client {
     /// answer rather than one peer's.
     pub async fn pointer_get(&self, address: &XorName) -> Result<Option<Pointer>> {
         let peers = self.pointer_group(address).await?;
+        if peers.is_empty() {
+            return Err(Error::CloseGroupShortfall(format!(
+                "no peer is responsible for pointer {}",
+                hex::encode(address)
+            )));
+        }
 
         // Ask the whole close group at once and keep the best answer.
         //
@@ -958,6 +983,29 @@ mod tests {
         assert_eq!(read_quorum(1), 1);
         assert_eq!(write_quorum(1), 1);
         assert_eq!(corroboration(1), 1);
+    }
+
+    /// A quorum of nothing is satisfied by nothing.
+    ///
+    /// `write_quorum(0)` is zero, so a write to an empty group would count zero
+    /// acknowledgements as enough and report a paid record as stored on no
+    /// peers at all. Both paths refuse an empty group before that arithmetic
+    /// is ever reached.
+    #[test]
+    fn an_empty_group_is_not_a_quorum() {
+        assert_eq!(
+            write_quorum(0),
+            0,
+            "which is exactly why an empty group must be refused earlier"
+        );
+        assert_eq!(corroboration(0), 0, "and nothing can corroborate nothing");
+        for k in 1usize..=64 {
+            assert!(write_quorum(k) >= 1, "a real group always needs a storer");
+            assert!(
+                corroboration(k) >= 1,
+                "and a real answer always needs a peer"
+            );
+        }
     }
 
     /// One peer must not be able to decide what a pointer says.
