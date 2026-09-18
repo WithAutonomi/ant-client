@@ -109,10 +109,8 @@ impl Client {
             )
             .await?;
 
-        let request = PointerPutRequest::with_payment(
-            Bytes::copy_from_slice(record.as_bytes()),
-            proof.clone(),
-        );
+        let request =
+            PointerPutRequest::with_payment(Bytes::from(record.to_bytes()), proof.clone());
 
         let mut last_error = None;
         for (peer_id, addrs) in &peers {
@@ -396,7 +394,7 @@ mod tests {
         );
 
         // Tampering with any byte breaks the signature, so it never parses.
-        let mut tampered = mine_record.as_bytes().to_vec();
+        let mut tampered = mine_record.to_bytes().to_vec();
         tampered[100] ^= 0xff;
         assert!(Pointer::from_bytes(&tampered).is_err());
     }
@@ -433,7 +431,7 @@ mod tests {
         let (pk, sk) = keypair(7);
         let exotic = PointerTarget::from_raw_tag(200, [9; 32]);
         let record = Pointer::sign(&sk, &pk, 0, exotic).expect("sign");
-        let parsed = Pointer::from_bytes(record.as_bytes()).expect("parse");
+        let parsed = Pointer::from_bytes(&record.to_bytes()).expect("parse");
         assert_eq!(parsed.target().kind_tag(), 200);
         assert_eq!(parsed.target().kind(), None);
     }
