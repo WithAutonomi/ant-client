@@ -24,8 +24,8 @@ use ant_node::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig, QuoteGenerator,
     QuotingMetricsTracker,
 };
-use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::pointer::{service::PointerService, store::PointerStore};
+use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::storage::{AntProtocol, ChunkStore, ChunkStoreConfig, MigrationConfig};
 // Wire / transport / EVM types: route through ant-protocol so the test
 // harness exercises the same surface the client does.

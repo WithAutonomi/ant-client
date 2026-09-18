@@ -29,7 +29,9 @@ async fn setup() -> (Client, MiniTestnet) {
 /// A fresh owner. Every test needs its own: the address *is* the key, so two
 /// tests sharing one would be writing to one pointer.
 fn owner() -> (MlDsaPublicKey, MlDsaSecretKey) {
-    ml_dsa_65().generate_keypair().expect("generate ML-DSA-65 keypair")
+    ml_dsa_65()
+        .generate_keypair()
+        .expect("generate ML-DSA-65 keypair")
 }
 
 fn chunk_target(byte: u8) -> PointerTarget {
