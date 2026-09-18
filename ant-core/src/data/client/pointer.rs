@@ -170,10 +170,23 @@ fn read_put_reply(
                 )))
             }
         }
-        PointerPutResponse::Stale { state_id, .. } => Err(Error::InvalidData(format!(
-            "the pointer moved while this update was in flight; the network now holds state {}",
-            hex::encode(state_id)
-        ))),
+        // Every reply names the address it is about, and every one of them is
+        // checked against the address that was sent. A refusal is not exempt:
+        // one about some other pointer says nothing about this write.
+        PointerPutResponse::Stale { address, state_id } => {
+            Err(Error::InvalidData(if address == expected_address {
+                format!(
+                    "the pointer moved while this update was in flight; the network \
+                     now holds state {}",
+                    hex::encode(state_id)
+                )
+            } else {
+                format!(
+                    "peer refused a pointer this client did not send: address {}",
+                    hex::encode(address)
+                )
+            }))
+        }
         PointerPutResponse::PaymentRequired { message } => Err(Error::Payment(message)),
         PointerPutResponse::Error(e) => Err(Error::Protocol(format!("pointer PUT refused: {e}"))),
     })
@@ -698,6 +711,11 @@ mod tests {
             // Losing a race is not storing.
             PointerPutResponse::Stale {
                 address: sent.address(),
+                state_id: other.state_id(),
+            },
+            // Nor is a refusal about somebody else's pointer.
+            PointerPutResponse::Stale {
+                address: [0u8; 32],
                 state_id: other.state_id(),
             },
             PointerPutResponse::PaymentRequired {
