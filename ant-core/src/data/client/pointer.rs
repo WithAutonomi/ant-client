@@ -335,9 +335,13 @@ impl Client {
     ///
     /// One definition serves both. A write acknowledged outside the set the
     /// read queries is a write nobody can read — paid for, stored, and
-    /// invisible — so the two sets are not merely the same size, they are
-    /// chosen by the same call. In particular the payment plan's targets, which
-    /// can run far wider than the close group, never count towards a write.
+    /// invisible — so both go through here rather than each deciding for
+    /// itself. In particular the payment plan's targets, which can run far
+    /// wider than the close group, never count towards a write.
+    ///
+    /// Same definition, not the same answer: a read does its own lookup, so
+    /// membership that changed in between is not covered. That is churn, and
+    /// what covers it is replication, which is not built.
     async fn pointer_group(&self, address: &XorName) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
         self.network()
             .find_closest_peers(address, self.config().close_group_size)
@@ -347,11 +351,15 @@ impl Client {
     /// Read the pointer at `address`, verifying it before returning it.
     ///
     /// The record is checked against the address it was asked for, so a storer
-    /// cannot answer with a different owner's pointer.
+    /// cannot answer with a different owner's pointer, and the state returned
+    /// must be named by more than one of them, so no single peer decides what
+    /// the pointer says.
     ///
     /// # Errors
     ///
-    /// Returns an error if no peer answers.
+    /// Returns an error if no peer answers, if too few of the group do, or if
+    /// the best state found has too few peers behind it to be the network's
+    /// answer rather than one peer's.
     pub async fn pointer_get(&self, address: &XorName) -> Result<Option<Pointer>> {
         let peers = self.pointer_group(address).await?;
 
