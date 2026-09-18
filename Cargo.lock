@@ -894,7 +894,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.19.0"
-source = "git+https://github.com/WithAutonomi/ant-node?branch=feat%2Fpointers-immutable-owner#cc37918bcda2c1835584c62a9ef3f3c4379499f6"
+source = "git+https://github.com/WithAutonomi/ant-node?branch=feat%2Fpointers-immutable-owner#42c1ed5c1867ae3240ed5d87dbc64678de8f9825"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -944,7 +944,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.5.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=feat%2Fpointers-immutable-owner#82cec9386f21512f3c6101b3df68ab15236142e4"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=feat%2Fpointers-immutable-owner#868954ae89ed9f6dd725ac5c14edc2e6f74ab1ba"
 dependencies = [
  "blake3",
  "bytes",
