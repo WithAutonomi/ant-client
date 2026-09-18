@@ -22,7 +22,7 @@ use std::collections::HashSet;
 
 use ant_protocol::chunk::{
     ChunkMessage, ChunkMessageBody, PointerGetRequest, PointerGetResponse, PointerPutRequest,
-    PointerPutResponse, CLOSE_GROUP_MAJORITY,
+    PointerPutResponse,
 };
 use ant_protocol::pointer::{
     Pointer, PointerTarget, PointerTargetKind, DATA_TYPE_POINTER, POINTER_WIRE_LEN,
