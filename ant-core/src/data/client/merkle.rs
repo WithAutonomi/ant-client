@@ -784,13 +784,18 @@ impl Client {
     /// through the merkle batch.
     ///
     /// `chunks` contains `(address, data_size)` pairs.
+    ///
+    /// Native-only: the sole caller is the filesystem upload path in
+    /// `data::client::file::native`, so a browser build would see it as dead code.
+    #[cfg(feature = "native")]
     pub(crate) async fn plan_merkle_upload(
         &self,
         chunks: Vec<([u8; 32], u64)>,
         data_type: u32,
         progress: Option<&mpsc::Sender<UploadEvent>>,
     ) -> Result<MerkleUploadPlan> {
-        self.plan_merkle_upload_observed(chunks, data_type, progress, &|_, _, _, _| {}).await
+        self.plan_merkle_upload_observed(chunks, data_type, progress, &|_, _, _, _| {})
+            .await
     }
 
     pub(crate) async fn plan_merkle_upload_observed(
@@ -988,7 +993,8 @@ impl Client {
         data_type: u32,
         data_size: u64,
     ) -> Result<PreparedMerkleBatch> {
-        self.prepare_merkle_batch_external_observed(addresses, data_type, data_size, &|_, _| {}).await
+        self.prepare_merkle_batch_external_observed(addresses, data_type, data_size, &|_, _| {})
+            .await
     }
 
     pub(crate) async fn prepare_merkle_batch_external_observed(

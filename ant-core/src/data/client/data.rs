@@ -360,7 +360,8 @@ impl Client {
         data_map: &DataMap,
         concurrency: usize,
     ) -> Result<Bytes> {
-        self.data_download_with_progress(data_map, concurrency, &|_, _| {}).await
+        self.data_download_with_progress(data_map, concurrency, &|_, _| {})
+            .await
     }
 
     /// Internal observer for verified records; reconstruction still uses the shared engine.
@@ -386,8 +387,11 @@ impl Client {
                     let bytes = self.fetch_data_record(address).await?;
                     let mut received = received.lock().unwrap_or_else(|error| error.into_inner());
                     if received.insert(address) {
-                        let completed = data_map.infos().iter()
-                            .filter(|info| received.contains(&info.dst_hash.0)).count();
+                        let completed = data_map
+                            .infos()
+                            .iter()
+                            .filter(|info| received.contains(&info.dst_hash.0))
+                            .count();
                         drop(received);
                         progress(completed, total);
                     }

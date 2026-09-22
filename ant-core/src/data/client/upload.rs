@@ -484,7 +484,10 @@ impl Client {
                             if stored.stored.contains(&record.address) {
                                 adapter.record_stored(record.index + 1, total);
                             }
-                            let completed = live_stored.fetch_add(stored.stored.len(), std::sync::atomic::Ordering::Relaxed) + stored.stored.len();
+                            let completed = live_stored.fetch_add(
+                                stored.stored.len(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            ) + stored.stored.len();
                             adapter.stored(completed, total);
                         }
                         (record.address, result)
@@ -836,14 +839,21 @@ impl Client {
         let entries = unpaid.iter().map(|r| (r.address, r.size)).collect();
         adapter.checked(0, unpaid.len());
         let plan = match self
-            .plan_merkle_upload_observed(entries, ant_protocol::DATA_TYPE_CHUNK, None, &|address, checked, total, present| {
-                if present {
-                    if let Some(record) = records.iter().find(|record| record.address == address) {
-                        adapter.already_stored(record.index + 1, quote_total);
+            .plan_merkle_upload_observed(
+                entries,
+                ant_protocol::DATA_TYPE_CHUNK,
+                None,
+                &|address, checked, total, present| {
+                    if present {
+                        if let Some(record) =
+                            records.iter().find(|record| record.address == address)
+                        {
+                            adapter.already_stored(record.index + 1, quote_total);
+                        }
                     }
-                }
-                adapter.checked(checked, total);
-            })
+                    adapter.checked(checked, total);
+                },
+            )
             .await
         {
             Ok(plan) => plan,
@@ -864,7 +874,11 @@ impl Client {
         }
         let batches = merkle_batch_partitions(&plan.to_upload);
         for (batch_index, addresses) in batches.iter().enumerate() {
-            adapter.preparing(&format!("Preparing Merkle payment batch {}/{}: collecting candidate quotes", batch_index + 1, batches.len()));
+            adapter.preparing(&format!(
+                "Preparing Merkle payment batch {}/{}: collecting candidate quotes",
+                batch_index + 1,
+                batches.len()
+            ));
             let batch = match self
                 .prepare_merkle_batch_external_observed(
                     addresses,
@@ -878,10 +892,15 @@ impl Client {
                 Err(Error::InsufficientPeers(_)) if mode == PaymentMode::Auto => return Ok(()),
                 Err(error) => return Err(error),
             };
-            for record in records.iter().filter(|record| addresses.contains(&record.address)) {
+            for record in records
+                .iter()
+                .filter(|record| addresses.contains(&record.address))
+            {
                 adapter.quoted(record.index + 1, quote_total);
             }
-            adapter.preparing("Payment quotes ready; saving recovery checkpoint before payment review");
+            adapter.preparing(
+                "Payment quotes ready; saving recovery checkpoint before payment review",
+            );
             state.pending_merkle = Some(batch);
             adapter.checkpoint(state, None).await?;
             self.ensure_upload_payment_allowed()?;
