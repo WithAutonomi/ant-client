@@ -79,6 +79,8 @@ pub fn load_bootstrap_multiaddrs() -> Result<Option<Vec<MultiAddr>>> {
 
 /// Resolve native QUIC bootstrap addresses without losing peer identity suffixes.
 /// Explicit input and selected manifests are authoritative; neither falls back.
+/// With neither, the config file wins, and the seeds bundled into the binary
+/// stand in when there is no config file.
 pub fn resolve_bootstrap_multiaddrs(
     explicit: &[MultiAddr],
     manifest: Option<&DevnetManifest>,
@@ -96,8 +98,22 @@ pub fn resolve_bootstrap_multiaddrs(
             .filter(|addr| addr.is_quic())
             .cloned()
             .collect()
+    } else if let Some(peers) = load_bootstrap_multiaddrs()? {
+        peers
     } else {
-        load_bootstrap_multiaddrs()?.ok_or(Error::NoBootstrapPeers)?
+        // No config file. Fall back to the seeds compiled into the binary, so an install that
+        // never wrote one still reaches the network: npm has blocked package install scripts by
+        // default since npm 12, so the postinstall that copies `bootstrap_peers.toml` into the
+        // config directory frequently does not run. Reached only where the alternative is
+        // `NoBootstrapPeers`, so it cannot override a user's choice, and the branches above mean
+        // an explicitly selected devnet manifest still errors rather than reaching for mainnet.
+        let seeds = crate::network_defaults::bundled_bootstrap_seeds()
+            .map_err(|e| Error::BootstrapConfigParse(e.to_string()))?;
+        tracing::info!(
+            "No bootstrap config file; using {} bundled bootstrap seed(s)",
+            seeds.quic.len()
+        );
+        seeds.quic
     };
     if peers.is_empty() {
         return Err(Error::NoBootstrapPeers);
@@ -109,10 +125,11 @@ pub fn resolve_bootstrap_multiaddrs(
 ///
 /// Priority: explicitly supplied peers (e.g. a frontend's `--bootstrap`
 /// flag) > devnet manifest peers > the platform `bootstrap_peers.toml`
-/// config file. Manifest peers without a resolvable socket address are
-/// filtered out. A selected manifest is authoritative: if it yields no
-/// usable peers, resolution fails rather than falling back to the
-/// config file.
+/// config file > the seeds bundled into the binary. Manifest peers
+/// without a resolvable socket address are filtered out. A selected
+/// manifest is authoritative: if it yields no usable peers, resolution
+/// fails rather than falling back to the config file or the bundled
+/// seeds — a devnet run must never silently reach for mainnet peers.
 ///
 /// # Errors
 ///
