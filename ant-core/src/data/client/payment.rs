@@ -13,8 +13,7 @@ use ant_protocol::transport::{MultiAddr, PeerId};
 use std::sync::Arc;
 use tracing::{debug, info};
 
-/// Single-node payment pays the selected median quote at 3x its quoted price.
-pub(crate) const SINGLE_NODE_PAYMENT_MULTIPLIER: u64 = 3;
+pub(crate) use crate::payment_policy::SINGLE_NODE_PAYMENT_MULTIPLIER;
 
 impl Client {
     /// Get the wallet, returning an error if not configured.

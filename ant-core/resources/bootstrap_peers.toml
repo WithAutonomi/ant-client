@@ -1,0 +1,16 @@
+# Autonomi mainnet bootstrap seeds. Shared by native releases and WASM.
+# Preserve optional /p2p/<peer-id> suffixes on QUIC addresses.
+quic = [
+    "/ip4/207.148.94.42/udp/10000/quic",
+    "/ip4/45.77.50.10/udp/10000/quic",
+    "/ip4/66.135.23.83/udp/10000/quic",
+    "/ip4/149.248.9.2/udp/10000/quic",
+    "/ip4/49.12.119.240/udp/10000/quic",
+    "/ip4/5.161.25.133/udp/10000/quic",
+    "/ip4/18.228.202.183/udp/10000/quic",
+]
+
+# Add verified full WebRTC Direct multiaddresses here when deployed.
+# Format: /ip4|ip6/<ip>/udp/<port>/webrtc-direct/certhash/<hash>/p2p/<peer-id>
+# Empty deliberately: the SDK reports unavailable defaults until seeds exist.
+webrtc = []

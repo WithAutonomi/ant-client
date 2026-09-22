@@ -47,18 +47,24 @@
 //!   removed from saorsa-core; this controller only tunes client
 //!   concurrency.
 
-use futures::stream::{self, FuturesUnordered, StreamExt};
+use futures_util::stream::{self, FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+#[cfg(feature = "native")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "native")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use std::time::Duration;
+use tracing::debug;
+#[cfg(feature = "native")]
+use tracing::warn;
+use web_time::Instant;
 
 /// Process-monotonic counter for unique snapshot temp filenames.
 /// Combined with PID + nanosecond timestamp, makes collision
 /// effectively impossible across concurrent save_snapshot calls.
+#[cfg(feature = "native")]
 static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Fetch starts at the residential-saturation floor validated in
@@ -92,6 +98,10 @@ const HILL_STRESS_DECREASE_DIVISOR: usize = 2;
 /// fixed sample window can unfairly compare a full lower-cap wave with
 /// a partial higher-cap wave.
 const HILL_EPOCH_FULL_WAVES: usize = 2;
+
+// Slow links must not wait for 32 completed chunks before learning. A timed
+// epoch still needs the minimum evidence and two full waves at its current cap.
+const HILL_EPOCH_MAX_DURATION: Duration = Duration::from_secs(2);
 
 /// Lock helper matching the project pattern (see `cache::ChunkCache`):
 /// poisoned mutexes still yield the inner state rather than panicking.
@@ -460,6 +470,7 @@ pub struct Limiter {
 
 #[derive(Debug)]
 struct LimiterInner {
+    observation_epoch: u64,
     /// Current concurrency cap returned by `current()`.
     current: usize,
     /// Sliding window of recent outcomes.
@@ -506,6 +517,7 @@ impl Limiter {
         let window_cap = config.window_ops;
         Self {
             inner: Arc::new(Mutex::new(LimiterInner {
+                observation_epoch: 0,
                 current: clamped,
                 window: VecDeque::with_capacity(window_cap),
                 samples_since_increase: 0,
@@ -541,6 +553,27 @@ impl Limiter {
         self.observe_with_timing(outcome, latency, bytes, operation_started);
     }
 
+    pub(crate) fn observation_epoch(&self) -> u64 {
+        lock(&self.inner).observation_epoch
+    }
+
+    pub(crate) fn observe_fetch_in_epoch(
+        &self,
+        outcome: Outcome,
+        latency: Duration,
+        bytes: u64,
+        epoch: u64,
+    ) {
+        let now = Instant::now();
+        self.observe_with_timing_in_epoch(
+            outcome,
+            latency,
+            bytes,
+            now.checked_sub(latency).unwrap_or(now),
+            Some(epoch),
+        );
+    }
+
     fn observe_with_timing(
         &self,
         outcome: Outcome,
@@ -548,15 +581,34 @@ impl Limiter {
         bytes: u64,
         operation_started: Instant,
     ) {
+        self.observe_with_timing_in_epoch(outcome, latency, bytes, operation_started, None);
+    }
+
+    fn observe_with_timing_in_epoch(
+        &self,
+        outcome: Outcome,
+        latency: Duration,
+        bytes: u64,
+        operation_started: Instant,
+        expected_epoch: Option<u64>,
+    ) {
         if !self.config.enabled {
             return;
         }
         let mut g = lock(&self.inner);
+        // Work launched at a different concurrency cannot train this probe.
+        // Cancellation remains unobserved, and epochs change only with the cap.
+        if self.algorithm == LimiterAlgorithm::ThroughputHillClimb
+            && expected_epoch.is_some_and(|epoch| epoch != g.observation_epoch)
+        {
+            return;
+        }
         if g.window.len() == self.config.window_ops {
             g.window.pop_front();
         }
         g.window.push_back(Sample { outcome, latency });
         if self.algorithm == LimiterAlgorithm::ThroughputHillClimb {
+            let previous_cap = g.current;
             observe_hill_climb(
                 &mut g,
                 outcome,
@@ -565,6 +617,9 @@ impl Limiter {
                 operation_started,
                 &self.config,
             );
+            if g.current != previous_cap {
+                g.observation_epoch = g.observation_epoch.wrapping_add(1);
+            }
             return;
         }
         g.samples_since_increase = g.samples_since_increase.saturating_add(1);
@@ -605,6 +660,7 @@ impl Limiter {
         );
         let mut g = lock(&self.inner);
         g.current = clamped;
+        g.observation_epoch = g.observation_epoch.wrapping_add(1);
         g.left_slow_start = clamped >= self.config.slow_start_ramp_threshold;
         g.hill = HillClimbState::new(clamped, self.config.window_ops);
     }
@@ -826,7 +882,15 @@ fn observe_hill_climb(
         return;
     }
 
-    if inner.hill.epoch_samples < hill_epoch_target_samples(inner.current, cfg) {
+    let minimum = cfg
+        .min_window_ops
+        .max(inner.current.saturating_mul(HILL_EPOCH_FULL_WAVES));
+    let timed_epoch = inner.hill.epoch_samples >= minimum
+        && inner
+            .hill
+            .epoch_started
+            .is_some_and(|started| started.elapsed() >= HILL_EPOCH_MAX_DURATION);
+    if !timed_epoch && inner.hill.epoch_samples < hill_epoch_target_samples(inner.current, cfg) {
         return;
     }
 
@@ -1251,6 +1315,7 @@ impl Default for AdaptiveController {
 /// cancel, observe on completion" — callers that need to keep
 /// fail-fast batches drained for full signal use `rebucketed`.
 struct ObserveGuard<'a> {
+    epoch: u64,
     limiter: &'a Limiter,
     started: Instant,
     outcome: Option<(Outcome, Duration, u64)>,
@@ -1259,6 +1324,7 @@ struct ObserveGuard<'a> {
 impl<'a> ObserveGuard<'a> {
     fn new(limiter: &'a Limiter) -> Self {
         Self {
+            epoch: limiter.observation_epoch(),
             limiter,
             started: Instant::now(),
             outcome: None,
@@ -1276,8 +1342,13 @@ impl<'a> ObserveGuard<'a> {
 impl Drop for ObserveGuard<'_> {
     fn drop(&mut self) {
         if let Some((outcome, latency, bytes)) = self.outcome.take() {
-            self.limiter
-                .observe_with_timing(outcome, latency, bytes, self.started);
+            self.limiter.observe_with_timing_in_epoch(
+                outcome,
+                latency,
+                bytes,
+                self.started,
+                Some(self.epoch),
+            );
         }
     }
 }
@@ -1480,20 +1551,25 @@ where
 /// can evolve the controller without crashing on stale files — an
 /// unknown future schema version simply causes a silent fallback to
 /// cold defaults.
+#[cfg(feature = "native")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
     schema: u32,
     channels: ChannelStart,
 }
 
+#[cfg(feature = "native")]
 const PERSIST_SCHEMA: u32 = 2;
+#[cfg(feature = "native")]
 const PERSIST_SCHEMA_AIMD_FETCH: u32 = 1;
+#[cfg(feature = "native")]
 const PERSIST_FILENAME: &str = "client_adaptive.json";
 
 /// Default persistence path: `<data_dir>/client_adaptive.json`. Falls
 /// back to `None` if the platform data dir is not resolvable; in that
 /// case the controller still works, it just won't persist.
 #[must_use]
+#[cfg(feature = "native")]
 pub fn default_persist_path() -> Option<PathBuf> {
     crate::config::data_dir()
         .ok()
@@ -1506,6 +1582,7 @@ pub fn default_persist_path() -> Option<PathBuf> {
 /// effort — never propagate errors that would block the user's
 /// operation.
 #[must_use]
+#[cfg(feature = "native")]
 pub fn load_snapshot(path: &Path) -> Option<ChannelStart> {
     let bytes = std::fs::read(path).ok()?;
     let state: PersistedState = match serde_json::from_slice(&bytes) {
@@ -1541,6 +1618,7 @@ pub fn load_snapshot(path: &Path) -> Option<ChannelStart> {
 
 /// Save a snapshot to disk atomically (write to `<path>.tmp`, then
 /// rename). Best effort — failures are logged at warn and discarded.
+#[cfg(feature = "native")]
 pub fn save_snapshot(path: &Path, channels: ChannelStart) {
     let state = PersistedState {
         schema: PERSIST_SCHEMA,
@@ -1602,6 +1680,7 @@ pub fn save_snapshot(path: &Path, channels: ChannelStart) {
 ///
 /// Used by `Client::drop` so a stalled filesystem cannot block
 /// process shutdown indefinitely.
+#[cfg(feature = "native")]
 pub fn save_snapshot_with_timeout(path: PathBuf, channels: ChannelStart, timeout: Duration) {
     let handle = std::thread::spawn(move || {
         save_snapshot(&path, channels);
@@ -1717,6 +1796,51 @@ mod tests {
             latency_inflation_factor: l.latency_inflation_factor,
             latency_ewma_alpha: l.latency_ewma_alpha,
         }
+    }
+
+    #[test]
+    fn timed_fetch_epochs_require_evidence_and_ignore_previous_caps() {
+        let limiter = AdaptiveController::default().fetch;
+        let initial = limiter.observation_epoch();
+        for _ in 0..7 {
+            limiter.observe_fetch_in_epoch(
+                Outcome::Success,
+                Duration::from_secs(3),
+                1024 * 1024,
+                initial,
+            );
+        }
+        assert_eq!(limiter.current(), 4);
+        limiter.observe_fetch_in_epoch(
+            Outcome::Success,
+            Duration::from_secs(3),
+            1024 * 1024,
+            initial,
+        );
+        assert_eq!(
+            limiter.current(),
+            5,
+            "a slow epoch must learn before 32 completions"
+        );
+        let next = limiter.observation_epoch();
+        assert_ne!(next, initial);
+        limiter.observe_fetch_in_epoch(Outcome::Timeout, Duration::from_secs(10), 0, initial);
+        assert_eq!(
+            lock(&limiter.inner).hill.epoch_samples,
+            0,
+            "old work cannot train the new probe"
+        );
+        limiter.observe_fetch_in_epoch(Outcome::Success, Duration::from_secs(3), 1024 * 1024, next);
+        assert_eq!(lock(&limiter.inner).hill.epoch_samples, 1);
+    }
+
+    #[test]
+    fn fast_fetch_epochs_keep_the_full_sample_window() {
+        let limiter = AdaptiveController::default().fetch;
+        for _ in 0..8 {
+            limiter.observe_with_bytes(Outcome::Success, Duration::from_millis(1), 1024);
+        }
+        assert_eq!(limiter.current(), 4);
     }
 
     #[test]
@@ -3156,8 +3280,10 @@ mod tests {
                     observe_op_with_success_bytes(
                         &limiter,
                         || async {
-                            tokio::time::sleep(Duration::from_millis(HILL_TEST_ASYNC_LATENCY_MS))
-                                .await;
+                            crate::runtime::sleep(Duration::from_millis(
+                                HILL_TEST_ASYNC_LATENCY_MS,
+                            ))
+                            .await;
                             Ok::<(), ()>(())
                         },
                         |_| Outcome::NetworkError,
@@ -3366,7 +3492,7 @@ mod tests {
         // started to "warm up".
         let bump_handle = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_millis(2)).await;
+                crate::runtime::sleep(Duration::from_millis(2)).await;
                 if processed_for_bump.load(AtomicOrdering::Relaxed) >= 16 {
                     l_for_bump.warm_start(16);
                     return;
@@ -3380,7 +3506,7 @@ mod tests {
             async move {
                 let cur = in_flight.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                 max_seen.fetch_max(cur, AtomicOrdering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                crate::runtime::sleep(Duration::from_millis(1)).await;
                 in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
                 processed.fetch_add(1, AtomicOrdering::Relaxed);
                 Ok::<(), &'static str>(())
@@ -3600,9 +3726,9 @@ mod tests {
                 // scheduler, items 1..N can start as soon as their
                 // slot frees from a fast completion.
                 if i == 0 {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    crate::runtime::sleep(Duration::from_millis(50)).await;
                 } else {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    crate::runtime::sleep(Duration::from_millis(1)).await;
                 }
                 in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
                 Ok::<(), &'static str>(())
@@ -3636,7 +3762,7 @@ mod tests {
             |(idx, v)| async move {
                 // Reverse-bias delay so out-of-order completion is likely.
                 let delay = (50 - v) as u64;
-                tokio::time::sleep(Duration::from_micros(delay)).await;
+                crate::runtime::sleep(Duration::from_micros(delay)).await;
                 Ok::<_, &'static str>((idx, v * 10))
             },
         )
@@ -3667,7 +3793,7 @@ mod tests {
         let items: Vec<(usize, u64)> = (0..40).map(|i| (i, 1000u64 + i as u64)).collect();
         let result: Vec<u64> = rebucketed_ordered(&l, items, |(idx, hash)| async move {
             let delay = (40 - idx) as u64; // reverse delay
-            tokio::time::sleep(Duration::from_micros(delay)).await;
+            crate::runtime::sleep(Duration::from_micros(delay)).await;
             // "content_for_hash" derived from the hash.
             Ok::<_, &'static str>((idx, hash * 7))
         })
@@ -3787,13 +3913,13 @@ mod tests {
                 if i == 5 {
                     // Slight delay so item 6, 7 also start before
                     // this error propagates.
-                    tokio::time::sleep(Duration::from_micros(100)).await;
+                    crate::runtime::sleep(Duration::from_micros(100)).await;
                     return Err("first error");
                 }
                 if i == 10 {
                     return Err("second error - should be ignored");
                 }
-                tokio::time::sleep(Duration::from_micros(50)).await;
+                crate::runtime::sleep(Duration::from_micros(50)).await;
                 Ok(())
             }
         })
@@ -4053,7 +4179,7 @@ mod tests {
         let shrink_handle = tokio::spawn(async move {
             // Bump down the cap once 50 items have completed.
             loop {
-                tokio::time::sleep(Duration::from_millis(2)).await;
+                crate::runtime::sleep(Duration::from_millis(2)).await;
                 if p_for_shrink.load(AtomicOrdering::Relaxed) >= 50 {
                     l_for_shrink.warm_start(2);
                     shrunk_for_shrink.store(true, AtomicOrdering::Relaxed);
@@ -4071,7 +4197,7 @@ mod tests {
                 if shrunk.load(AtomicOrdering::Relaxed) {
                     max_after_shrink.fetch_max(cur, AtomicOrdering::Relaxed);
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                crate::runtime::sleep(Duration::from_millis(1)).await;
                 in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
                 processed.fetch_add(1, AtomicOrdering::Relaxed);
                 Ok::<(), &'static str>(())

@@ -62,7 +62,7 @@ use tracing::{debug, info, warn};
 /// Set to match `MERKLE_PAYMENT_EXPIRATION` in `evmlib` (7 days). After
 /// the payment ages out on-chain there is no point keeping the cache —
 /// the proofs can no longer be verified by storers.
-const PAYMENT_EXPIRATION_SECS: u64 = 7 * 24 * 60 * 60;
+const PAYMENT_EXPIRATION_SECS: u64 = ant_protocol::evm::MERKLE_PAYMENT_EXPIRATION;
 
 /// Subdirectory under the platform-appropriate data dir.
 const PAYMENTS_SUBDIR: &str = "payments";
@@ -94,6 +94,7 @@ fn file_hash_key(file_path: &str) -> String {
 /// Idempotent: re-saving for the same `(timestamp, file_path)` overwrites
 /// the previous file. Different timestamps for the same file produce
 /// different filenames, which is fine — `cleanup_outdated` reaps them.
+#[cfg(test)]
 pub fn save(file_path: &str, result: &MerkleBatchPaymentResult) -> Result<PathBuf> {
     let dir = payments_dir()?;
     let ts = if result.merkle_payment_timestamp > 0 {
@@ -119,19 +120,6 @@ pub fn save(file_path: &str, result: &MerkleBatchPaymentResult) -> Result<PathBu
         path.display()
     );
     Ok(path)
-}
-
-/// Best-effort save. Logs on failure but never returns an error.
-///
-/// Intended for the upload path: if we can't cache the receipt we still
-/// want to attempt the chunk PUTs.
-pub fn try_save(file_path: &str, result: &MerkleBatchPaymentResult) {
-    if let Err(e) = save(file_path, result) {
-        warn!(
-            "Failed to cache merkle payment receipt for {file_path:?}: {e}. \
-             Upload will proceed without resume support."
-        );
-    }
 }
 
 /// Load the cached merkle batch receipt for a given source file path.

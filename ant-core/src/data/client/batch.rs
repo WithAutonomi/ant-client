@@ -7,34 +7,32 @@
 use crate::data::client::adaptive::observe_op;
 use crate::data::client::classify_error;
 use crate::data::client::file::UploadEvent;
-use crate::data::client::payment::{peer_id_to_encoded, SINGLE_NODE_PAYMENT_MULTIPLIER};
+use crate::data::client::payment::peer_id_to_encoded;
+#[cfg(test)]
+use crate::data::client::payment::SINGLE_NODE_PAYMENT_MULTIPLIER;
 use crate::data::client::Client;
-use crate::data::error::{Error, PartialUploadSpend, Result};
+use crate::data::error::{Error, Result};
 use ant_protocol::evm::{
     Amount, EncodedPeerId, PayForQuotesError, PaymentQuote, ProofOfPayment, QuoteHash,
     RewardsAddress, TxHash, Wallet,
 };
-use ant_protocol::payment::{
-    deserialize_proof, serialize_single_node_proof, PaymentProof, QuotePaymentInfo,
-};
+#[cfg(any(feature = "native", test))]
+use ant_protocol::payment::deserialize_proof;
+use ant_protocol::payment::{serialize_single_node_proof, PaymentProof, QuotePaymentInfo};
 use ant_protocol::transport::{MultiAddr, PeerId};
-use ant_protocol::{compute_address, XorName, CLOSE_GROUP_SIZE, DATA_TYPE_CHUNK};
+#[cfg(test)]
+use ant_protocol::CLOSE_GROUP_SIZE;
+use ant_protocol::{compute_address, XorName, DATA_TYPE_CHUNK};
 use bytes::Bytes;
-use futures::stream::{self, FuturesUnordered, StreamExt};
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use futures::stream::StreamExt;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+use web_time::Duration;
+use web_time::Instant;
 
 /// Number of chunks per payment wave.
-const PAYMENT_WAVE_SIZE: usize = 64;
-
-/// Soft ceiling on the combined body size of chunks stored concurrently in a
-/// single wave. Caps store concurrency for large chunks so the send path's
-/// per-peer body buffers can't pin multiple GB at once (see V2-461). At ~4 MB
-/// chunks this permits ~16 concurrent stores; small chunks hit the chunk-count
-/// / adaptive limits instead and are unaffected.
-const STORE_INFLIGHT_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+pub(super) const PAYMENT_WAVE_SIZE: usize = 64;
 
 /// Variable-size single-node payment plan for a chunk.
 ///
@@ -43,7 +41,7 @@ const STORE_INFLIGHT_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 /// accepts any non-empty quote bundle up to `CLOSE_GROUP_SIZE`, so the client
 /// keeps the same 3x-median payment rule while allowing the single-node path to
 /// proceed with as few as one valid quote.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SingleNodeQuotePayment {
     /// Quotes sorted by price; the median-priced quote receives 3x payment and
     /// the rest receive zero.
@@ -56,36 +54,20 @@ impl SingleNodeQuotePayment {
     /// The quotes are sorted by price, the median quote receives 3x its quoted
     /// price, and every other quote is included with a zero amount so proof and
     /// payment intent construction stay aligned.
-    pub fn from_quotes(mut quotes: Vec<PaymentQuote>) -> Result<Self> {
-        let quote_count = quotes.len();
-        if !(1..=CLOSE_GROUP_SIZE).contains(&quote_count) {
-            return Err(Error::Payment(format!(
-                "Single-node payment requires 1..={CLOSE_GROUP_SIZE} quotes, got {quote_count}"
-            )));
-        }
-
-        quotes.sort_by_key(|quote| quote.price);
-        let median_index = quote_count / 2;
-        let median_price = quotes[median_index].price;
-        let enhanced_price = median_price
-            .checked_mul(Amount::from(SINGLE_NODE_PAYMENT_MULTIPLIER))
-            .ok_or_else(|| {
-                Error::Payment("Price overflow when calculating 3x median".to_string())
-            })?;
-
-        let quotes = quotes
+    pub fn from_quotes(quotes: Vec<PaymentQuote>) -> Result<Self> {
+        let prices = quotes.iter().map(|quote| quote.price).collect::<Vec<_>>();
+        let plan = crate::payment_policy::SingleNodePaymentPlan::from_prices(&prices)
+            .map_err(|error| Error::Payment(error.to_string()))?;
+        let quotes = plan
+            .quotes
             .into_iter()
-            .enumerate()
-            .map(|(idx, quote)| {
+            .map(|planned| {
+                let quote = &quotes[planned.quote_index];
                 let quote_hash = quote.hash();
                 QuotePaymentInfo {
                     quote_hash,
                     rewards_address: quote.rewards_address,
-                    amount: if idx == median_index {
-                        enhanced_price
-                    } else {
-                        Amount::ZERO
-                    },
+                    amount: planned.amount,
                     price: quote.price,
                 }
             })
@@ -155,6 +137,42 @@ pub struct PreparedChunk {
     /// sidecars in the PUT bundle so storers cross-check synchronously. Empty
     /// when every quote was baseline (no commitment to pin).
     pub commitment_sidecars: Vec<Vec<u8>>,
+}
+
+/// Verified payment plan for a record staged outside the Rust heap.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChunkPaymentPlan {
+    /// Expected BLAKE3 content address.
+    pub address: XorName,
+    /// Expected record length.
+    pub data_size: u64,
+    /// Ordered peers eligible to store the proof.
+    pub quoted_peers: Vec<(PeerId, Vec<MultiAddr>)>,
+    /// Median payment selected by the shared quote policy.
+    pub payment: SingleNodeQuotePayment,
+    /// Verified quotes included in the proof.
+    pub peer_quotes: Vec<(EncodedPeerId, PaymentQuote)>,
+    /// Verified commitment evidence carried to storers.
+    pub commitment_sidecars: Vec<Vec<u8>>,
+}
+
+impl ChunkPaymentPlan {
+    /// Bind externally staged bytes to the address and size that were quoted.
+    pub fn with_content(self, content: Bytes) -> Result<PreparedChunk> {
+        if content.len() as u64 != self.data_size || compute_address(&content) != self.address {
+            return Err(Error::InvalidData(
+                "staged chunk differs from its payment plan".into(),
+            ));
+        }
+        Ok(PreparedChunk {
+            content,
+            address: self.address,
+            quoted_peers: self.quoted_peers,
+            payment: self.payment,
+            peer_quotes: self.peer_quotes,
+            commitment_sidecars: self.commitment_sidecars,
+        })
+    }
 }
 
 /// Chunk paid but not yet stored. Produced by [`Client::batch_pay`].
@@ -292,42 +310,43 @@ fn build_paid_chunks(
     prepared: Vec<PreparedChunk>,
     tx_hash_map: &HashMap<QuoteHash, TxHash>,
 ) -> Result<Vec<PaidChunk>> {
-    let mut paid_chunks = Vec::with_capacity(prepared.len());
-    for chunk in prepared {
-        let mut tx_hashes = Vec::new();
-        for info in &chunk.payment.quotes {
-            if !info.amount.is_zero() {
-                let tx_hash = tx_hash_map.get(&info.quote_hash).copied().ok_or_else(|| {
+    prepared
+        .into_iter()
+        .map(|chunk| super::upload_state::UploadState::pay_prepared(chunk, tx_hash_map))
+        .collect()
+}
+
+pub(super) fn build_plan_proof(
+    plan: &ChunkPaymentPlan,
+    tx_hash_map: &HashMap<QuoteHash, TxHash>,
+) -> Result<Vec<u8>> {
+    let mut tx_hashes = Vec::new();
+    for info in &plan.payment.quotes {
+        if !info.amount.is_zero() {
+            let tx_hash = tx_hash_map.get(&info.quote_hash).copied().ok_or_else(|| {
                     Error::Payment(format!(
                         "Missing tx hash for quote {} — external signer did not return a receipt for this payment",
                         hex::encode(info.quote_hash)
                     ))
                 })?;
-                tx_hashes.push(tx_hash);
-            }
+            tx_hashes.push(tx_hash);
         }
-
-        let proof = PaymentProof {
-            proof_of_payment: ProofOfPayment {
-                peer_quotes: chunk.peer_quotes,
-            },
-            tx_hashes,
-            // ADR-0004: forward the bound quotes' commitments so storers
-            // cross-check synchronously; stripped before persistence node-side.
-            commitment_sidecars: chunk.commitment_sidecars,
-        };
-
-        let proof_bytes = serialize_single_node_proof(&proof)
-            .map_err(|e| Error::Serialization(format!("Failed to serialize payment proof: {e}")))?;
-
-        paid_chunks.push(PaidChunk {
-            content: chunk.content,
-            address: chunk.address,
-            quoted_peers: chunk.quoted_peers,
-            proof_bytes,
-        });
     }
-    Ok(paid_chunks)
+
+    let proof = PaymentProof {
+        proof_of_payment: ProofOfPayment {
+            peer_quotes: plan.peer_quotes.clone(),
+        },
+        tx_hashes,
+        // ADR-0004: forward the bound quotes' commitments so storers
+        // cross-check synchronously; stripped before persistence node-side.
+        commitment_sidecars: plan.commitment_sidecars.clone(),
+    };
+
+    let proof_bytes = serialize_single_node_proof(&proof)
+        .map_err(|e| Error::Serialization(format!("Failed to serialize payment proof: {e}")))?;
+
+    Ok(proof_bytes)
 }
 
 /// Finalize a batch payment using externally-provided transaction hashes.
@@ -365,7 +384,24 @@ impl Client {
         let address = compute_address(&content);
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::InvalidData(format!("content size too large: {e}")))?;
+        self.prepare_chunk_payment_plan(address, data_size)
+            .await?
+            .map(|plan| plan.with_content(content))
+            .transpose()
+    }
 
+    /// Quote a content-addressed record without retaining its bytes. The
+    /// returned plan must be bound to verified content before proof construction.
+    pub async fn prepare_chunk_payment_plan(
+        &self,
+        address: XorName,
+        data_size: u64,
+    ) -> Result<Option<ChunkPaymentPlan>> {
+        if data_size > ant_protocol::MAX_CHUNK_SIZE as u64 {
+            return Err(Error::InvalidData(
+                "chunk exceeds the protocol size limit".into(),
+            ));
+        }
         let quote_plan = match self
             .get_store_quote_plan(&address, data_size, DATA_TYPE_CHUNK)
             .await
@@ -403,8 +439,8 @@ impl Client {
         let payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment)
             .map_err(|e| Error::Payment(format!("Failed to create payment: {e}")))?;
 
-        Ok(Some(PreparedChunk {
-            content,
+        Ok(Some(ChunkPaymentPlan {
+            data_size,
             address,
             quoted_peers,
             payment,
@@ -521,330 +557,49 @@ impl Client {
         progress: Option<&mpsc::Sender<UploadEvent>>,
         stored_offset: usize,
         file_total: usize,
-        resume_key: Option<&str>,
+        _resume_key: Option<&str>,
     ) -> Result<(Vec<XorName>, String, u128, WaveAggregateStats)> {
-        if chunks.is_empty() {
-            return Ok((
-                Vec::new(),
-                "0".to_string(),
-                0,
-                WaveAggregateStats::default(),
-            ));
-        }
-
-        let total_chunks = chunks.len();
-        let quote_cap = self.controller().quote.current();
-        let store_cap = self.controller().store.current();
-        debug!(
-            "Batch uploading {total_chunks} chunks in waves of {PAYMENT_WAVE_SIZE} \
-             (current adaptive caps — quote: {quote_cap}, store: {store_cap})"
-        );
-
-        // Load any previously-cached single-node receipt for this
-        // upload. Each chunk whose address is in the cache will skip
-        // the quote + pay phases and have its `PaidChunk` constructed
-        // directly from the cached proof + fresh quoted peers. The
-        // caller is responsible for deleting the cache on full
-        // success; we only read here, never write the load result back.
-        //
-        // Before trusting any cached proof, decode it locally and drop
-        // any whose quote.timestamp is past the storer's per-quote age
-        // budget (`QUOTE_MAX_AGE_SECS`, mirrored here as
-        // `CACHED_PROOF_EXPIRY_SECS`). The previous design trusted a
-        // substring match on remote error text, which a Byzantine
-        // storer could spoof to force double-payment. Local pre-flight
-        // is decision-pure: we never hand a doomed proof to a storer,
-        // and the cache is updated under our own lock with no remote
-        // text involved.
-        // Load only the cached PROOFS (for reuse). The cost this function
-        // returns is a per-call DELTA — what was freshly paid in THIS call —
-        // not the cache's cumulative. The single-node wave driver
-        // (`upload_spill_addresses_single`) calls this once per wave and SUMS
-        // the per-call costs, so seeding the return with the cumulative cache
-        // (which grows as each wave appends to it) double-counts:
-        // A + (A+B) + (A+B+C) instead of A+B+C.
-        let cached_proofs: HashMap<XorName, Vec<u8>> = match resume_key {
-            Some(key) => match crate::data::client::cached_single::try_load_for_file(key) {
-                Some((_, receipt)) => prune_locally_expired_proofs(key, receipt.proofs),
-                None => HashMap::new(),
-            },
-            None => HashMap::new(),
+        #[cfg(feature = "native")]
+        let proofs = _resume_key
+            .and_then(crate::data::client::cached_single::try_load_for_file)
+            .map(|(_, receipt)| {
+                prune_locally_expired_proofs(_resume_key.unwrap_or_default(), receipt.proofs)
+            })
+            .unwrap_or_default();
+        #[cfg(not(feature = "native"))]
+        let proofs = HashMap::new();
+        let mut state = super::upload_state::UploadState::from_proofs(proofs);
+        let records = chunks
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| super::upload::UploadRecord {
+                address: compute_address(bytes),
+                size: bytes.len() as u64,
+                index,
+            })
+            .collect();
+        let adapter = super::upload::MemoryUploadAdapter {
+            client: self,
+            chunks: &chunks,
+            progress,
+            stored_offset,
+            file_total,
+            resume_key: _resume_key,
         };
-
-        let mut all_addresses = Vec::with_capacity(total_chunks);
-        let mut seen_addresses: HashSet<XorName> = HashSet::new();
-
-        // Accumulate only THIS call's freshly-paid cost (per-call delta; see
-        // the proof-load comment above for why this must not include the cache).
-        let mut total_storage = Amount::ZERO;
-        let mut total_gas: u128 = 0;
-        let mut agg_stats = WaveAggregateStats::default();
-
-        // Deduplicate chunks by content address.
-        let mut unique_chunks = Vec::with_capacity(total_chunks);
-        for chunk in chunks {
-            let address = compute_address(&chunk);
-            if seen_addresses.insert(address) {
-                unique_chunks.push(chunk);
-            } else {
-                debug!("Skipping duplicate chunk {}", hex::encode(address));
-                all_addresses.push(address);
-                if let Some(tx) = progress {
-                    let _ = tx.try_send(UploadEvent::ChunkStored {
-                        stored: stored_offset + all_addresses.len(),
-                        total: file_total,
-                    });
-                }
-            }
-        }
-
-        // Split into waves.
-        let waves: Vec<Vec<Bytes>> = unique_chunks
-            .chunks(PAYMENT_WAVE_SIZE)
-            .map(<[Bytes]>::to_vec)
-            .collect();
-        let wave_count = waves.len();
-
-        debug!(
-            "{total_chunks} chunks -> {} unique -> {wave_count} waves",
-            seen_addresses.len()
-        );
-
-        let mut pending_store: Option<Vec<PaidChunk>> = None;
-        let mut total_quoted: usize = 0;
-
-        for (wave_idx, wave_chunks) in waves.into_iter().enumerate() {
-            let wave_num = wave_idx + 1;
-            let wave_size = wave_chunks.len();
-
-            // Pipeline: store previous wave while preparing this one.
-            let (prepare_result, store_result) = match pending_store.take() {
-                Some(paid_chunks) => {
-                    let store_offset = stored_offset + all_addresses.len();
-                    let quoted_offset = stored_offset + total_quoted;
-                    let (prep, stored) = tokio::join!(
-                        self.prepare_wave(wave_chunks, progress, quoted_offset, file_total),
-                        self.store_paid_chunks_with_events(
-                            paid_chunks,
-                            progress,
-                            store_offset,
-                            file_total
-                        )
-                    );
-                    (prep, Some(stored))
-                }
-                None => {
-                    let quoted_offset = stored_offset + total_quoted;
-                    let result = self
-                        .prepare_wave(wave_chunks, progress, quoted_offset, file_total)
-                        .await;
-                    (result, None)
-                }
-            };
-            total_quoted += wave_size;
-
-            // Track partial progress from previous wave.
-            if let Some(wave_result) = store_result {
-                all_addresses.extend(&wave_result.stored);
-                agg_stats.absorb(&wave_result);
-                if !wave_result.failed.is_empty() {
-                    let failed_count = wave_result.failed.len();
-                    warn!("{failed_count} chunks failed to store after retries");
-                    return Err(Error::PartialUpload {
-                        stored: all_addresses.clone(),
-                        stored_count: stored_offset + all_addresses.len(),
-                        failed: wave_result.failed,
-                        failed_count,
-                        total_chunks: file_total,
-                        spend: Box::new(PartialUploadSpend {
-                            storage_cost_atto: total_storage.to_string(),
-                            gas_cost_wei: total_gas,
-                        }),
-                        reason: "wave store failed after retries".into(),
-                    });
-                }
-            }
-
-            let (prepared_chunks, already_stored) = prepare_result?;
-            all_addresses.extend(&already_stored);
-            if let Some(tx) = progress {
-                for _ in &already_stored {
-                    let _ = tx.try_send(UploadEvent::ChunkStored {
-                        stored: stored_offset + all_addresses.len(),
-                        total: file_total,
-                    });
-                }
-            }
-
-            if prepared_chunks.is_empty() {
-                info!("Wave {wave_num}/{wave_count}: all chunks already stored");
-                continue;
-            }
-
-            // Split prepared chunks into "already paid in a previous
-            // attempt" (cached) and "needs payment" (fresh). Cached
-            // chunks build a `PaidChunk` from the cached proof + the
-            // freshly-quoted peers, bypassing the EVM transaction.
-            let mut needs_pay: Vec<PreparedChunk> = Vec::with_capacity(prepared_chunks.len());
-            let mut cached_paid: Vec<PaidChunk> = Vec::new();
-            for prep in prepared_chunks {
-                if let Some(proof_bytes) = cached_proofs.get(&prep.address).cloned() {
-                    cached_paid.push(PaidChunk {
-                        content: prep.content,
-                        address: prep.address,
-                        quoted_peers: prep.quoted_peers,
-                        proof_bytes,
-                    });
-                } else {
-                    needs_pay.push(prep);
-                }
-            }
-            if !cached_paid.is_empty() {
-                info!(
-                    "Wave {wave_num}/{wave_count}: reusing {} cached payment proofs",
-                    cached_paid.len()
-                );
-            }
-
-            let (mut paid_chunks, wave_storage, wave_gas) = if needs_pay.is_empty() {
-                (Vec::new(), "0".to_string(), 0u128)
-            } else {
-                info!(
-                    "Wave {wave_num}/{wave_count}: paying for {} chunks",
-                    needs_pay.len()
-                );
-                self.batch_pay(needs_pay).await?
-            };
-            if let Ok(cost) = wave_storage.parse::<Amount>() {
-                total_storage += cost;
-            }
-            total_gas = total_gas.saturating_add(wave_gas);
-
-            // Persist the freshly-paid wave's proofs so a later
-            // failure can resume without re-paying.
-            if let Some(key) = resume_key {
-                if !paid_chunks.is_empty() {
-                    let new_proofs: HashMap<[u8; 32], Vec<u8>> = paid_chunks
-                        .iter()
-                        .map(|pc| (pc.address, pc.proof_bytes.clone()))
-                        .collect();
-                    crate::data::client::cached_single::try_append_wave(
-                        key,
-                        new_proofs,
-                        &wave_storage,
-                        wave_gas,
-                    );
-                }
-            }
-
-            paid_chunks.extend(cached_paid);
-            pending_store = Some(paid_chunks);
-        }
-
-        // Store the last wave.
-        if let Some(paid_chunks) = pending_store {
-            let store_offset = stored_offset + all_addresses.len();
-            let wave_result = self
-                .store_paid_chunks_with_events(paid_chunks, progress, store_offset, file_total)
-                .await;
-            all_addresses.extend(&wave_result.stored);
-            agg_stats.absorb(&wave_result);
-            if !wave_result.failed.is_empty() {
-                let failed_count = wave_result.failed.len();
-                warn!("{failed_count} chunks failed to store after retries (final wave)");
-                return Err(Error::PartialUpload {
-                    stored: all_addresses.clone(),
-                    stored_count: stored_offset + all_addresses.len(),
-                    failed: wave_result.failed,
-                    failed_count,
-                    total_chunks: file_total,
-                    spend: Box::new(PartialUploadSpend {
-                        storage_cost_atto: total_storage.to_string(),
-                        gas_cost_wei: total_gas,
-                    }),
-                    reason: "final wave store failed after retries".into(),
-                });
-            }
-        }
-
-        debug!("Batch upload complete: {} addresses", all_addresses.len());
+        let result = self
+            .upload_records(
+                records,
+                &mut state,
+                &adapter,
+                super::merkle::PaymentMode::Single,
+            )
+            .await?;
         Ok((
-            all_addresses,
-            total_storage.to_string(),
-            total_gas,
-            agg_stats,
+            result.addresses,
+            result.amount.to_string(),
+            result.gas,
+            result.stats,
         ))
-    }
-
-    /// Prepare a wave of chunks by collecting quotes concurrently.
-    ///
-    /// Fires [`UploadEvent::ChunkQuoted`] as each chunk's quote completes.
-    /// Returns `(prepared_chunks, already_stored_addresses)`.
-    async fn prepare_wave(
-        &self,
-        chunks: Vec<Bytes>,
-        progress: Option<&mpsc::Sender<UploadEvent>>,
-        quoted_offset: usize,
-        file_total: usize,
-    ) -> Result<(Vec<PreparedChunk>, Vec<XorName>)> {
-        let chunk_count = chunks.len();
-        let chunks_with_addr: Vec<(Bytes, XorName)> = chunks
-            .into_iter()
-            .map(|c| {
-                let addr = compute_address(&c);
-                (c, addr)
-            })
-            .collect();
-
-        let quote_limiter = self.controller().quote.clone();
-        // Batch-aware fan-out: clamp to chunk_count so we never
-        // pay for fan-out slots we cannot fill on a partial wave.
-        // See PERF-RESULTS.md — measured ~30% slowdown when
-        // cap > batch size on quoting workloads (live mainnet).
-        let quote_concurrency = quote_limiter.current().min(chunk_count.max(1));
-        let mut quote_stream = stream::iter(chunks_with_addr)
-            .map(|(content, address)| {
-                let limiter = quote_limiter.clone();
-                async move {
-                    let result = observe_op(
-                        &limiter,
-                        || async move { self.prepare_chunk_payment(content).await },
-                        classify_error,
-                    )
-                    .await;
-                    (address, result)
-                }
-            })
-            .buffer_unordered(quote_concurrency);
-
-        let mut prepared = Vec::with_capacity(chunk_count);
-        let mut already_stored = Vec::new();
-        let mut quoted_count = 0usize;
-
-        while let Some((address, result)) = quote_stream.next().await {
-            let chunk_already_stored = result.as_ref().is_ok_and(|r| r.is_none());
-            match result? {
-                Some(chunk) => prepared.push(chunk),
-                None => already_stored.push(address),
-            }
-            quoted_count += 1;
-            let progress_num = quoted_offset + quoted_count;
-            if file_total > 0 {
-                if chunk_already_stored {
-                    info!("Verified {progress_num}/{file_total} (already stored)");
-                } else {
-                    info!("Quoted {progress_num}/{file_total}");
-                }
-            }
-            if let Some(tx) = progress {
-                let _ = tx.try_send(UploadEvent::ChunkQuoted {
-                    quoted: progress_num,
-                    total: file_total,
-                });
-            }
-        }
-
-        Ok((prepared, already_stored))
     }
 
     /// Store a batch of paid chunks concurrently to their close groups.
@@ -865,9 +620,6 @@ impl Client {
         stored_before: usize,
         total_chunks: usize,
     ) -> WaveResult {
-        const MAX_RETRIES: u32 = 3;
-        const BASE_DELAY_MS: u64 = 500;
-
         let mut stored = Vec::new();
         let mut to_retry = paid_chunks;
 
@@ -891,20 +643,18 @@ impl Client {
         let max_chunk_bytes = to_retry.iter().map(|c| c.content.len()).max().unwrap_or(0);
         // `checked_div` yields `None` only when `max_chunk_bytes == 0` (an
         // empty/zero-length wave), in which case there is no byte limit.
-        let byte_bound = STORE_INFLIGHT_BYTE_BUDGET
-            .checked_div(max_chunk_bytes)
-            .map_or(usize::MAX, |n| n.max(1));
+        let byte_bound = crate::client_engine::store_byte_bound(max_chunk_bytes);
 
         let mut chunk_attempts_total: usize = 0;
         let mut store_durations_ms: Vec<u64> = Vec::new();
         let mut retries_per_chunk: Vec<u32> = Vec::new();
 
-        for attempt in 0..=MAX_RETRIES {
+        for attempt in 0..=crate::client_engine::STORE_MAX_RETRIES {
             if attempt > 0 {
-                let delay = Duration::from_millis(BASE_DELAY_MS * 2u64.pow(attempt - 1));
-                tokio::time::sleep(delay).await;
+                crate::runtime::sleep(crate::client_engine::store_retry_delay(attempt)).await;
                 info!(
-                    "Retry attempt {attempt}/{MAX_RETRIES} for {} chunks",
+                    "Retry attempt {attempt}/{} for {} chunks",
+                    crate::client_engine::STORE_MAX_RETRIES,
                     to_retry.len()
                 );
             }
@@ -940,21 +690,12 @@ impl Client {
                     (chunk_clone, result)
                 }
             };
-            let mut chunk_iter = to_retry.into_iter();
-            let mut in_flight = FuturesUnordered::new();
-
             let mut failed_this_round = Vec::new();
-            loop {
-                let slots = store_limiter.current().min(byte_bound).max(1);
-                while in_flight.len() < slots {
-                    match chunk_iter.next() {
-                        Some(chunk) => in_flight.push(make_store(chunk)),
-                        None => break,
-                    }
-                }
-                let Some((chunk, result)) = in_flight.next().await else {
-                    break;
-                };
+            let results = crate::client_engine::rolling_unordered(to_retry, make_store, || {
+                store_limiter.current().min(byte_bound)
+            });
+            futures::pin_mut!(results);
+            while let Some((chunk, result)) = results.next().await {
                 match result {
                     Ok(name) => {
                         let duration_ms = first_seen
@@ -991,7 +732,7 @@ impl Client {
                 return result;
             }
 
-            if attempt == MAX_RETRIES {
+            if attempt == crate::client_engine::STORE_MAX_RETRIES {
                 let failed = failed_this_round
                     .into_iter()
                     .map(|(c, e)| (c.address, e))
@@ -1063,7 +804,7 @@ fn log_wave_summary(result: &WaveResult) {
 /// the chunk body. 5 minutes is generous for all three combined and
 /// cheap: a wrongly-kept proof costs an extra retry round trip, a
 /// wrongly-dropped proof costs one re-pay (cheap chunk).
-const CACHED_PROOF_SAFETY_MARGIN_SECS: u64 = 300;
+pub(super) const CACHED_PROOF_SAFETY_MARGIN_SECS: u64 = 300;
 
 /// Storer-side budget for a quote's age. Mirrors `QUOTE_MAX_AGE_SECS`
 /// in `ant-node/src/payment/verifier.rs`. If this value drifts on the
@@ -1071,19 +812,7 @@ const CACHED_PROOF_SAFETY_MARGIN_SECS: u64 = 300;
 /// past the storer limit (forced re-pay on next retry, no money lost)
 /// or drops them slightly early (one extra re-pay, no money lost).
 /// Either way, no payment is double-spent or stranded.
-const CACHED_PROOF_MAX_AGE_SECS: u64 = 24 * 60 * 60;
-
-/// How far a cached quote's `timestamp` may be in the future before we
-/// classify it as too-skewed-to-trust and prune.
-///
-/// Mirrors `QUOTE_FUTURE_SKEW_TOLERANCE_SECS = 300` in
-/// `ant-node/src/payment/verifier.rs`. If the client's clock runs
-/// slow relative to the storer that issued the quote, a perfectly
-/// valid proof can appear future-dated to the client — rejecting any
-/// forward drift would re-pay those chunks on every retry. Allow the
-/// same 5-minute window the storer does so the client and node agree
-/// on which proofs are fresh.
-const CACHED_PROOF_FUTURE_SKEW_TOLERANCE_SECS: u64 = 300;
+pub(super) const CACHED_PROOF_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
 /// Drop cached `proof_bytes` whose quote timestamps are too close to
 /// the storer's expiry window to safely reuse.
@@ -1108,6 +837,7 @@ const CACHED_PROOF_FUTURE_SKEW_TOLERANCE_SECS: u64 = 300;
 ///
 /// Side-effect: dropped entries are removed from the on-disk cache so
 /// they don't reappear on the next load.
+#[cfg(feature = "native")]
 fn prune_locally_expired_proofs(
     resume_key: &str,
     proofs: HashMap<[u8; 32], Vec<u8>>,
@@ -1116,7 +846,6 @@ fn prune_locally_expired_proofs(
     let max_safe_age = Duration::from_secs(
         CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS),
     );
-    let max_future_skew = Duration::from_secs(CACHED_PROOF_FUTURE_SKEW_TOLERANCE_SECS);
     let mut kept: HashMap<XorName, Vec<u8>> = HashMap::with_capacity(proofs.len());
     // Pair each expired address with the EXACT bytes we observed at
     // load time. The cache-side drop only removes the entry if those
@@ -1127,7 +856,7 @@ fn prune_locally_expired_proofs(
     for (addr, bytes) in proofs {
         match deserialize_proof(&bytes) {
             Ok((proof, _tx_hashes)) => {
-                if proof_is_safely_fresh(&proof, now, max_safe_age, max_future_skew) {
+                if proof_is_safely_fresh(&proof, now, max_safe_age) {
                     kept.insert(addr, bytes);
                 } else {
                     expired.push((addr, bytes));
@@ -1152,32 +881,28 @@ fn prune_locally_expired_proofs(
 }
 
 /// True iff every quote in the proof has a timestamp not older than
-/// `now - max_safe_age` AND not further in the future than
-/// `max_future_skew`. The forward-skew check mirrors the storer's
-/// `QUOTE_FUTURE_SKEW_TOLERANCE_SECS` (300s) so a slow-running client
-/// clock doesn't cause us to wrongly prune perfectly fresh proofs
-/// that the storer would still accept.
-fn proof_is_safely_fresh(
+/// `now - max_safe_age`.
+///
+/// A quote timestamp is stamped by the *issuing node's* clock, and the
+/// storer never rejects a quote for being future-dated (see
+/// `test_future_quote_uses_storage_delta_not_timestamp` in
+/// `ant-node/src/payment/verifier.rs`), so a quote from a peer whose clock
+/// runs ahead of ours is simply "not yet old" here. This function used to
+/// carry a 300s forward-skew bound as well, which made every proof
+/// containing a quote from such a peer unusable: on a staging network with
+/// one node VM deliberately skewed +3h, ~10% of chunks (a 7-peer close group
+/// drawn from 15 skewed nodes in 990) failed on every single-payment upload
+/// path — before payment natively ("unsubmitted payment quotes expired"),
+/// after payment in the browser ("paid proof expired before storage").
+pub(super) fn proof_is_safely_fresh(
     proof: &ProofOfPayment,
     now: std::time::SystemTime,
     max_safe_age: Duration,
-    max_future_skew: Duration,
 ) -> bool {
-    for (_peer, quote) in &proof.peer_quotes {
-        match now.duration_since(quote.timestamp) {
-            Ok(age) => {
-                if age > max_safe_age {
-                    return false;
-                }
-            }
-            Err(future) => {
-                if future.duration() > max_future_skew {
-                    return false;
-                }
-            }
-        }
-    }
-    true
+    proof.peer_quotes.iter().all(|(_peer, quote)| {
+        now.duration_since(quote.timestamp)
+            .map_or(true, |age| age <= max_safe_age)
+    })
 }
 
 /// Compile-time assertions that batch method futures are Send.
@@ -1446,22 +1171,19 @@ mod tests {
         ProofOfPayment { peer_quotes }
     }
 
-    fn default_max_future_skew() -> Duration {
-        Duration::from_secs(CACHED_PROOF_FUTURE_SKEW_TOLERANCE_SECS)
-    }
-
     #[test]
+    #[cfg(any(feature = "native", test))]
     fn proof_is_safely_fresh_accepts_recent_quote() {
         let proof = make_proof_with_timestamps(&[std::time::SystemTime::now()]);
         assert!(proof_is_safely_fresh(
             &proof,
             std::time::SystemTime::now(),
             Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS),
-            default_max_future_skew(),
         ));
     }
 
     #[test]
+    #[cfg(any(feature = "native", test))]
     fn proof_is_safely_fresh_rejects_quote_past_safe_window() {
         // 23h57m old: past the 24h - 5min safe-reuse threshold but
         // still within the storer's hard 24h limit. The whole point
@@ -1473,17 +1195,13 @@ mod tests {
             CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS),
         );
         assert!(
-            !proof_is_safely_fresh(
-                &proof,
-                std::time::SystemTime::now(),
-                max_safe,
-                default_max_future_skew(),
-            ),
+            !proof_is_safely_fresh(&proof, std::time::SystemTime::now(), max_safe),
             "23h57m-old quote must fail safe-reuse check (limit is 24h - 5min margin)"
         );
     }
 
     #[test]
+    #[cfg(any(feature = "native", test))]
     fn proof_is_safely_fresh_rejects_if_any_quote_is_stale() {
         // The storer rejects on a per-quote basis: a proof with even
         // one stale quote will fail on every retry. We must drop it.
@@ -1494,48 +1212,49 @@ mod tests {
         let max_safe = Duration::from_secs(
             CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS),
         );
-        assert!(!proof_is_safely_fresh(
-            &proof,
-            now,
-            max_safe,
-            default_max_future_skew(),
-        ));
+        assert!(!proof_is_safely_fresh(&proof, now, max_safe));
     }
 
     #[test]
-    fn proof_is_safely_fresh_accepts_slight_future_skew_within_node_tolerance() {
+    #[cfg(any(feature = "native", test))]
+    fn proof_is_safely_fresh_accepts_slight_future_skew() {
         // Client clock 60s slow. Quote claims 60s in the future of
-        // our local view. Node tolerates 300s forward skew, so the
-        // storer would accept this quote — we must too, or we'd
-        // wrongly prune fresh proofs and force re-payment.
+        // our local view. The storer accepts it, so we must too, or
+        // we'd wrongly prune fresh proofs and force re-payment.
         let now = std::time::SystemTime::now();
         let slight_future = now + Duration::from_secs(60);
         let proof = make_proof_with_timestamps(&[slight_future]);
         let max_safe = Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS);
         assert!(
-            proof_is_safely_fresh(&proof, now, max_safe, default_max_future_skew()),
-            "60s-future quote must be accepted (within node's 300s skew tolerance)"
+            proof_is_safely_fresh(&proof, now, max_safe),
+            "60s-future quote must be accepted"
         );
     }
 
     #[test]
-    fn proof_is_safely_fresh_rejects_far_future_dated_quote() {
-        // 1 hour in the future of our local clock. Exceeds the
-        // node's 300s forward-skew tolerance and the storer would
-        // reject it — we drop it locally to avoid a round trip.
+    #[cfg(any(feature = "native", test))]
+    fn proof_is_safely_fresh_accepts_quote_from_peer_clock_hours_ahead() {
+        // A quote is stamped by the issuing node's clock, not ours. A node
+        // running 3h ahead (the staging profile skews one VM by exactly
+        // that) produces quotes 3h in our future for every chunk whose
+        // close group includes it, and the storer accepts them. Rejecting
+        // them here failed ~10% of chunks on every single-payment upload
+        // against that network (DEV-03 run 588, 2026-09-16), so a fresh
+        // quote from a fast peer must not read as "expired".
         let now = std::time::SystemTime::now();
-        let far_future = now + Duration::from_secs(3600);
-        let proof = make_proof_with_timestamps(&[far_future]);
-        let max_safe = Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS);
-        assert!(!proof_is_safely_fresh(
-            &proof,
-            now,
-            max_safe,
-            default_max_future_skew(),
-        ));
+        let peer_ahead = now + Duration::from_secs(3 * 60 * 60);
+        let proof = make_proof_with_timestamps(&[now, peer_ahead, now]);
+        let max_safe = Duration::from_secs(
+            CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS),
+        );
+        assert!(
+            proof_is_safely_fresh(&proof, now, max_safe),
+            "a quote from a peer whose clock is ahead is fresh, not expired"
+        );
     }
 
     #[test]
+    #[cfg(any(feature = "native", test))]
     fn proof_is_safely_fresh_empty_quotes_is_vacuously_safe() {
         // No quotes = no storer-side timestamp check to fail. The
         // proof is structurally invalid for other reasons, but
@@ -1546,7 +1265,6 @@ mod tests {
             &proof,
             std::time::SystemTime::now(),
             Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS),
-            default_max_future_skew(),
         ));
     }
 }

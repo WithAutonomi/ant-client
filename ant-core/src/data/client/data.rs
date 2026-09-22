@@ -6,21 +6,24 @@
 //! For file-based streaming uploads that avoid loading the entire
 //! file into memory, see the `file` module.
 
-use crate::data::client::adaptive::{observe_op, rebucketed_ordered};
+#[cfg(feature = "native")]
+use crate::data::client::adaptive::observe_op;
+#[cfg(feature = "native")]
 use crate::data::client::batch::{PaymentIntent, PreparedChunk};
+#[cfg(feature = "native")]
 use crate::data::client::classify_error;
+#[cfg(feature = "native")]
 use crate::data::client::file::{ExternalPaymentInfo, PreparedUpload, Visibility};
-use crate::data::client::merkle::{chunk_contents_for_upload_addresses, PaymentMode};
+use crate::data::client::merkle::PaymentMode;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use ant_protocol::{compute_address, DATA_TYPE_CHUNK};
+use ant_protocol::compute_address;
 use bytes::Bytes;
+#[cfg(feature = "native")]
 use futures::stream::StreamExt;
-use self_encryption::{decrypt, encrypt, get_root_data_map, DataMap, EncryptedChunk};
+use self_encryption::{encrypt, DataMap};
 use std::num::NonZeroUsize;
-use tokio::runtime::{Handle, RuntimeFlavor};
 use tracing::{debug, info};
-use xor_name::XorName;
 
 /// Result of an in-memory data upload: the `DataMap` needed to retrieve the data.
 #[derive(Debug, Clone)]
@@ -84,148 +87,44 @@ impl Client {
         content: Bytes,
         mode: PaymentMode,
     ) -> Result<DataUploadResult> {
-        let content_len = content.len();
-        debug!("Encrypting data ({content_len} bytes) with mode {mode:?}");
-
-        let (data_map, encrypted_chunks) = encrypt(content)
-            .map_err(|e| Error::Encryption(format!("Failed to encrypt data: {e}")))?;
-
-        let chunk_count = encrypted_chunks.len();
-        info!("Data encrypted into {chunk_count} chunks");
-
-        let chunk_contents: Vec<Bytes> = encrypted_chunks
+        let (data_map, encrypted) =
+            encrypt(content).map_err(|e| Error::Encryption(e.to_string()))?;
+        let chunks = encrypted
             .into_iter()
             .map(|chunk| chunk.content)
+            .collect::<Vec<_>>();
+        let records = chunks
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| super::upload::UploadRecord {
+                address: compute_address(bytes),
+                size: bytes.len() as u64,
+                index,
+            })
             .collect();
-
-        if self.should_use_merkle(chunk_count, mode) {
-            // Merkle batch payment path
-            info!("Using merkle batch payment for {chunk_count} chunks");
-
-            let chunk_entries: Vec<([u8; 32], u64)> = chunk_contents
-                .iter()
-                .map(|chunk| {
-                    let size = u64::try_from(chunk.len())
-                        .map_err(|e| Error::InvalidData(format!("chunk size too large: {e}")))?;
-                    Ok((compute_address(chunk), size))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let merkle_plan = match self
-                .plan_merkle_upload(chunk_entries, DATA_TYPE_CHUNK, None)
-                .await
-            {
-                Ok(plan) => plan,
-                Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
-                    info!("Merkle preflight needs more peers ({msg}), falling back to wave-batch");
-                    let (addresses, _sc, _gc) = self.batch_upload_chunks(chunk_contents).await?;
-                    return Ok(DataUploadResult {
-                        data_map,
-                        chunks_stored: addresses.len(),
-                        payment_mode_used: PaymentMode::Single,
-                    });
-                }
-                Err(e) => return Err(e),
-            };
-
-            if merkle_plan.to_upload.is_empty() {
-                info!("All {chunk_count} chunks already stored; skipping merkle payment");
-                return Ok(DataUploadResult {
-                    data_map,
-                    chunks_stored: chunk_count,
-                    payment_mode_used: PaymentMode::Merkle,
-                });
-            }
-
-            let chunk_contents =
-                chunk_contents_for_upload_addresses(chunk_contents, &merkle_plan.to_upload)?;
-
-            let remaining_chunks = merkle_plan.to_upload.len();
-            if !self.should_use_merkle(remaining_chunks, mode) {
-                info!(
-                    "{remaining_chunks} chunks need upload after merkle preflight; \
-                     using single-node payment"
-                );
-                let (addresses, _sc, _gc) = self.batch_upload_chunks(chunk_contents).await?;
-                return Ok(DataUploadResult {
-                    data_map,
-                    chunks_stored: merkle_plan.already_stored.len() + addresses.len(),
-                    payment_mode_used: PaymentMode::Single,
-                });
-            }
-
-            // Try merkle batch; in Auto mode, fall back to per-chunk on network issues
-            let batch_result = match self
-                .pay_for_merkle_batch(
-                    &merkle_plan.to_upload,
-                    DATA_TYPE_CHUNK,
-                    merkle_plan.to_upload_avg_size(),
-                )
-                .await
-            {
-                Ok(result) => result,
-                Err(Error::InsufficientPeers(ref msg)) if mode == PaymentMode::Auto => {
-                    info!("Merkle needs more peers ({msg}), falling back to wave-batch");
-                    let (addresses, _sc, _gc) = self.batch_upload_chunks(chunk_contents).await?;
-                    return Ok(DataUploadResult {
-                        data_map,
-                        chunks_stored: merkle_plan.already_stored.len() + addresses.len(),
-                        payment_mode_used: PaymentMode::Single,
-                    });
-                }
-                Err(e) => return Err(e),
-            };
-
-            let outcome = self
-                .merkle_upload_chunks(
-                    chunk_contents,
-                    merkle_plan.to_upload,
-                    &batch_result,
-                    None,
-                    merkle_plan.already_stored.len(),
-                    chunk_count,
-                )
-                .await?;
-            // Unlike `FileUploadResult`, `DataUploadResult` cannot express a
-            // partial store, and the returned `data_map` is unusable unless
-            // every chunk landed (download fails on any missing chunk). So a
-            // residual shortfall after retries is a hard failure here, not a
-            // success with a quietly broken data map.
-            if outcome.failed > 0 {
-                return Err(Error::InsufficientPeers(format!(
-                    "Data merkle upload incomplete: {} of {} chunk(s) short of quorum after retries",
-                    outcome.failed, chunk_count
-                )));
-            }
-
-            info!(
-                "Data uploaded via merkle: {} chunks stored ({content_len} bytes)",
-                outcome.stored
-            );
-            Ok(DataUploadResult {
-                data_map,
-                chunks_stored: outcome.stored,
-                payment_mode_used: PaymentMode::Merkle,
-            })
-        } else {
-            // Wave-based batch payment path (single EVM tx per wave).
-            let (addresses, _sc, _gc) = self.batch_upload_chunks(chunk_contents).await?;
-
-            info!(
-                "Data uploaded: {} chunks stored ({content_len} bytes original)",
-                addresses.len()
-            );
-            Ok(DataUploadResult {
-                data_map,
-                chunks_stored: addresses.len(),
-                payment_mode_used: PaymentMode::Single,
-            })
-        }
+        let adapter = super::upload::MemoryUploadAdapter {
+            client: self,
+            chunks: &chunks,
+            progress: None,
+            stored_offset: 0,
+            file_total: chunks.len(),
+            resume_key: None,
+        };
+        let outcome = self
+            .upload_records(records, &mut Default::default(), &adapter, mode)
+            .await?;
+        Ok(DataUploadResult {
+            data_map,
+            chunks_stored: outcome.addresses.len(),
+            payment_mode_used: outcome.mode,
+        })
     }
 
     /// Phase 1 of external-signer data upload: encrypt and collect quotes.
     ///
     /// Equivalent to [`Client::data_prepare_upload_with_visibility`] with
     /// [`Visibility::Private`] — see that method for details.
+    #[cfg(feature = "native")]
     pub async fn data_prepare_upload(&self, content: Bytes) -> Result<PreparedUpload> {
         self.data_prepare_upload_with_visibility(content, Visibility::Private)
             .await
@@ -257,6 +156,7 @@ impl Client {
     ///
     /// Returns an error if encryption fails, DataMap serialization fails
     /// (public only), or quote collection fails.
+    #[cfg(feature = "native")]
     pub async fn data_prepare_upload_with_visibility(
         &self,
         content: Bytes,
@@ -283,11 +183,8 @@ impl Client {
         let data_map_address = match visibility {
             Visibility::Private => None,
             Visibility::Public => {
-                let serialized = rmp_serde::to_vec(&data_map).map_err(|e| {
-                    Error::Serialization(format!("Failed to serialize DataMap: {e}"))
-                })?;
-                let bytes = Bytes::from(serialized);
-                let address = compute_address(&bytes);
+                let (address, bytes) = crate::client_engine::files::public_map_record(&data_map)
+                    .map_err(Error::Serialization)?;
                 info!(
                     "Public upload: bundling DataMap chunk ({} bytes) at address {}",
                     bytes.len(),
@@ -310,8 +207,8 @@ impl Client {
         let quote_limiter = self.controller().quote.clone();
         let quote_concurrency = quote_limiter.current().min(chunk_count.max(1));
         let results: Vec<([u8; 32], Result<Option<PreparedChunk>>)> =
-            futures::stream::iter(chunks_with_addr)
-                .map(|(content, address)| {
+            crate::client_engine::bounded_unordered(
+                chunks_with_addr.into_iter().map(|(content, address)| {
                     let limiter = quote_limiter.clone();
                     async move {
                         let result = observe_op(
@@ -322,10 +219,11 @@ impl Client {
                         .await;
                         (address, result)
                     }
-                })
-                .buffer_unordered(quote_concurrency)
-                .collect()
-                .await;
+                }),
+                quote_concurrency,
+            )
+            .collect()
+            .await;
 
         let mut prepared_chunks = Vec::with_capacity(results.len());
         let mut already_stored_addresses = Vec::new();
@@ -378,15 +276,15 @@ impl Client {
     ///
     /// Returns an error if serialization or the chunk store fails.
     pub async fn data_map_store(&self, data_map: &DataMap) -> Result<[u8; 32]> {
-        let serialized = rmp_serde::to_vec(data_map)
-            .map_err(|e| Error::Serialization(format!("Failed to serialize DataMap: {e}")))?;
+        let (_, serialized) = crate::client_engine::files::public_map_record(data_map)
+            .map_err(Error::Serialization)?;
 
         info!(
             "Storing DataMap as public chunk ({} bytes serialized)",
             serialized.len()
         );
 
-        self.chunk_put(Bytes::from(serialized)).await
+        self.chunk_put(serialized).await
     }
 
     /// Fetch a `DataMap` from the network by its chunk address.
@@ -445,184 +343,134 @@ impl Client {
     /// map is resolved back to its root form before download, keeping this
     /// primitive symmetric with `data_upload`.
     ///
-    /// Resolving a shrunk map bridges self-encryption's synchronous fetcher
-    /// onto the async network via `block_in_place`, so it requires a
-    /// multi-threaded Tokio runtime; on a current-thread runtime it returns
-    /// [`Error::Config`] instead of panicking. Flat maps (the common case)
-    /// take neither path, so this requirement never applies to them.
+    /// Map resolution and network fetching are fully async and also work on a
+    /// current-thread runtime. The same workflow drives browser downloads.
     ///
     /// # Errors
-    ///
-    /// Returns an error if any chunk cannot be retrieved (a chunk absent from
-    /// every queried peer surfaces as [`Error::NotFound`]), if decryption
-    /// fails, or if a shrunk map must be resolved on a current-thread runtime.
+    /// Returns the underlying fetch error, or an encryption error for invalid
+    /// datamaps and content that fails verification/decryption.
     pub async fn data_download(&self, data_map: &DataMap) -> Result<Bytes> {
-        let root_data_map = self.resolve_root_data_map(data_map).await?;
+        self.data_download_with_concurrency(data_map, usize::MAX)
+            .await
+    }
 
-        let chunk_infos = root_data_map.infos();
-        debug!("Downloading data ({} chunks)", chunk_infos.len());
+    /// Download data with an upper bound on concurrent record fetches.
+    pub async fn data_download_with_concurrency(
+        &self,
+        data_map: &DataMap,
+        concurrency: usize,
+    ) -> Result<Bytes> {
+        self.data_download_with_progress(data_map, concurrency, &|_, _| {})
+            .await
+    }
 
-        // Extract owned addresses to avoid HRTB lifetime issue with
-        // stream::iter over references combined with async closures.
-        let addresses: Vec<[u8; 32]> = chunk_infos.iter().map(|info| info.dst_hash.0).collect();
-
-        // Rolling rebucketing: re-reads the controller's fetch cap as
-        // each slot frees, so a long download (e.g. 10 GB = ~2500
-        // chunks) sees adaptive growth/decay mid-flight without batch
-        // fences. Output is index-sorted so self_encryption decrypt
-        // sees DataMap-ordered chunks.
-        let fetch_limiter = self.controller().fetch.clone();
-        let encrypted_chunks: Vec<EncryptedChunk> = rebucketed_ordered(
-            &fetch_limiter,
-            addresses.into_iter().enumerate(),
-            |(idx, address)| {
+    /// Internal observer for verified records; reconstruction still uses the shared engine.
+    pub(crate) async fn data_download_with_progress(
+        &self,
+        data_map: &DataMap,
+        concurrency: usize,
+        progress: &impl Fn(usize, usize),
+    ) -> Result<Bytes> {
+        if concurrency == 0 {
+            return Err(Error::Config(
+                "download concurrency must be positive".into(),
+            ));
+        }
+        let received = std::sync::Mutex::new(std::collections::HashSet::new());
+        let total = data_map.infos().len();
+        progress(0, total);
+        crate::client_engine::files::download(
+            data_map,
+            &|address| {
+                let received = &received;
                 async move {
-                    // chunk_get_observed feeds the adaptive fetch
-                    // limiter once per call via chunk_get_outcome
-                    // (Ok(None) -> Timeout is the load-shedding
-                    // signal for sustained close-group exhaustion).
-                    let chunk = self.chunk_get_observed(&address).await?.ok_or_else(|| {
-                        Error::NotFound(format!(
-                            "Missing chunk {} required for data reconstruction",
-                            hex::encode(address)
-                        ))
-                    })?;
-                    Ok::<_, Error>((
-                        idx,
-                        EncryptedChunk {
-                            content: chunk.content,
-                        },
-                    ))
+                    let bytes = self.fetch_data_record(address).await?;
+                    let mut received = received.lock().unwrap_or_else(|error| error.into_inner());
+                    if received.insert(address) {
+                        let completed = data_map
+                            .infos()
+                            .iter()
+                            .filter(|info| received.contains(&info.dst_hash.0))
+                            .count();
+                        drop(received);
+                        progress(completed, total);
+                    }
+                    Ok(bytes)
                 }
             },
+            &|| self.controller().fetch.current().min(concurrency),
+            &crate::runtime::sleep,
+            retry_data_fetch,
         )
-        .await?;
-
-        debug!(
-            "All {} chunks retrieved, decrypting",
-            encrypted_chunks.len()
-        );
-
-        let content = decrypt(&root_data_map, &encrypted_chunks)
-            .map_err(|e| Error::Encryption(format!("Failed to decrypt data: {e}")))?;
-
-        info!("Data downloaded and decrypted ({} bytes)", content.len());
-
-        Ok(content)
+        .await
+        .map_err(map_read_error)
     }
 
-    /// Resolve a possibly-shrunk `DataMap` to its root (flat) form.
-    ///
-    /// `data_upload` shrinks large maps via self-encryption's
-    /// `shrink_data_map`: the serialized map is recursively encrypted into
-    /// wrapper chunks (which are uploaded alongside the content chunks) and
-    /// the returned map has `is_child() == true`. Its `infos()` reference the
-    /// outermost wrapper chunks, *not* the root content chunks, so handing it
-    /// straight to `decrypt` fails with a missing-chunk error for a root-level
-    /// chunk that was never fetched.
-    ///
-    /// This fetches the wrapper chunks and unshrinks recursively (via
-    /// `self_encryption::get_root_data_map`) until it obtains the root map,
-    /// whose `infos()` reference the actual content chunks. A map that is not
-    /// a child is returned unchanged without any network access.
-    ///
-    /// Resolution bridges self-encryption's synchronous fetcher onto the async
-    /// network via `block_in_place`, which requires a multi-threaded Tokio
-    /// runtime. On a current-thread runtime this returns [`Error::Config`]
-    /// rather than letting `block_in_place` panic.
+    /// Download a plaintext byte range using the shared streaming reader.
+    /// Resolves child maps first and fetches only records overlapping the range.
+    /// Length is clamped at EOF; a start at or beyond EOF returns empty bytes.
     ///
     /// # Errors
-    ///
-    /// Returns an error if called on a current-thread runtime, if a wrapper
-    /// chunk cannot be retrieved, or if the map cannot be unshrunk.
-    async fn resolve_root_data_map(&self, data_map: &DataMap) -> Result<DataMap> {
-        if !data_map.is_child() {
-            return Ok(data_map.clone());
-        }
+    /// Returns fetch, datamap validation or decryption errors.
+    pub async fn data_download_range(
+        &self,
+        data_map: &DataMap,
+        start: usize,
+        length: usize,
+    ) -> Result<Bytes> {
+        let fetch = |address| self.fetch_data_record(address);
+        let cap = || self.controller().fetch.current();
+        let root = crate::client_engine::files::resolve(data_map, &fetch, &cap)
+            .await
+            .map_err(map_read_error)?;
+        crate::client_engine::files::read_range(
+            &root,
+            start,
+            length,
+            &fetch,
+            &cap,
+            &crate::runtime::sleep,
+            retry_data_fetch,
+        )
+        .await
+        .map_err(map_read_error)
+    }
 
-        debug!("DataMap is shrunk (child); resolving root data map");
-
-        // `get_root_data_map` drives a synchronous `FnMut` fetcher, so bridge
-        // to the async `chunk_get_observed` via `block_in_place` + `block_on`
-        // (the same pattern `file_download` uses). The observed variant feeds
-        // the adaptive fetch limiter, keeping the wrapper-chunk fetches
-        // consistent with the content-chunk fetches in `data_download`.
-        // `block_in_place` panics on a current-thread runtime, so reject that
-        // precondition with a clear error instead of letting it panic inside
-        // the fetcher.
-        let handle = Handle::current();
-        ensure_shrunk_resolution_runtime(handle.runtime_flavor())?;
-
-        // The self-encryption fetcher may only yield `self_encryption::Error`.
-        // Capture the underlying `ant-core` error out-of-band so a missing
-        // wrapper chunk surfaces as `Error::NotFound` (matching the
-        // content-chunk path) and a network failure keeps its `Timeout` /
-        // `Network` classification, instead of every resolution failure
-        // flattening to `Error::Encryption`.
-        let mut fetch_error: Option<Error> = None;
-        let resolve_result = tokio::task::block_in_place(|| {
-            let mut get_chunk =
-                |name: XorName| -> std::result::Result<Bytes, self_encryption::Error> {
-                    let address = name.0;
-                    handle.block_on(async {
-                        match self.chunk_get_observed(&address).await {
-                            Ok(Some(chunk)) => Ok(chunk.content),
-                            Ok(None) => Err(record_wrapper_fetch_error(
-                                &mut fetch_error,
-                                Error::NotFound(format!(
-                                    "Missing wrapper chunk {} required to resolve root DataMap",
-                                    hex::encode(address)
-                                )),
-                            )),
-                            Err(e) => Err(record_wrapper_fetch_error(&mut fetch_error, e)),
-                        }
-                    })
-                };
-            get_root_data_map(data_map.clone(), &mut get_chunk)
-        });
-
-        resolve_result.map_err(|e| {
-            fetch_error.take().unwrap_or_else(|| {
-                Error::Encryption(format!("Failed to resolve root data map: {e}"))
+    async fn fetch_data_record(&self, address: [u8; 32]) -> Result<Bytes> {
+        self.chunk_get_observed(&address)
+            .await?
+            .map(|chunk| chunk.content)
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "Missing chunk {} required for data reconstruction",
+                    hex::encode(address)
+                ))
             })
-        })
     }
 }
 
-/// Stash the real `ant-core` error behind a self-encryption fetch failure and
-/// return the `self_encryption::Error` the fetcher is required to yield.
-///
-/// `get_root_data_map`'s fetcher may only return `self_encryption::Error`, which
-/// would otherwise flatten a missing chunk or a classified network error into a
-/// generic `Error::Encryption`. Recording the descriptive error in `slot` lets
-/// [`Client::resolve_root_data_map`] recover it and preserve the error taxonomy.
-fn record_wrapper_fetch_error(slot: &mut Option<Error>, error: Error) -> self_encryption::Error {
-    let message = error.to_string();
-    *slot = Some(error);
-    self_encryption::Error::Generic(message)
+fn retry_data_fetch(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::NotFound(_)
+            | Error::Timeout(_)
+            | Error::Network(_)
+            | Error::Protocol(_)
+            | Error::Storage(_)
+            | Error::Io(_)
+            | Error::InsufficientPeers(_)
+    )
 }
 
-/// Reject resolving a shrunk `DataMap` on a current-thread Tokio runtime.
-///
-/// Resolution uses `block_in_place` to bridge self-encryption's synchronous
-/// chunk fetcher onto the async network, and `block_in_place` panics on a
-/// current-thread runtime. Mapping that precondition to [`Error::Config`]
-/// turns a hard panic into a recoverable error for library consumers that
-/// drive `data_download` from a current-thread runtime.
-fn ensure_shrunk_resolution_runtime(flavor: RuntimeFlavor) -> Result<()> {
-    if flavor == RuntimeFlavor::CurrentThread {
-        return Err(Error::Config(
-            "resolving a shrunk DataMap requires a multi-threaded Tokio runtime, \
-             but data_download was called on a current-thread runtime"
-                .to_string(),
-        ));
+pub(super) fn map_read_error(error: crate::client_engine::files::ReadError<Error>) -> Error {
+    match error {
+        crate::client_engine::files::ReadError::Fetch(error) => error,
+        crate::client_engine::files::ReadError::Invalid(error) => Error::Encryption(error),
     }
-    Ok(())
 }
 
 fn decode_data_map_chunk(content: &[u8]) -> Result<DataMap> {
-    rmp_serde::from_slice(content)
-        .map_err(|e| Error::Serialization(format!("Failed to deserialize DataMap: {e}")))
+    crate::client_engine::files::decode_map(content).map_err(Error::Serialization)
 }
 
 /// Compile-time assertions that Client method futures are Send.
@@ -650,6 +498,17 @@ mod send_assertions {
         _assert_send(&fut);
     }
 
+    #[allow(
+        dead_code,
+        unreachable_code,
+        unused_variables,
+        clippy::diverging_sub_expression
+    )]
+    async fn _data_download_range_is_send(client: &Client) {
+        let dm: DataMap = todo!();
+        _assert_send(&client.data_download_range(&dm, 0, 1024));
+    }
+
     #[allow(dead_code, unreachable_code, clippy::diverging_sub_expression)]
     async fn _data_upload_is_send(client: &Client) {
         let fut = client.data_upload(Bytes::new());
@@ -672,25 +531,5 @@ mod send_assertions {
     async fn _data_prepare_upload_with_visibility_is_send(client: &Client) {
         let fut = client.data_prepare_upload_with_visibility(Bytes::new(), Visibility::Public);
         _assert_send(&fut);
-    }
-}
-
-#[cfg(test)]
-mod runtime_guard_tests {
-    use super::*;
-
-    #[test]
-    fn shrunk_resolution_rejects_current_thread_runtime() {
-        // A current-thread runtime cannot drive `block_in_place`, so the guard
-        // must surface a descriptive `Error::Config` rather than panicking.
-        assert!(matches!(
-            ensure_shrunk_resolution_runtime(RuntimeFlavor::CurrentThread),
-            Err(Error::Config(_))
-        ));
-    }
-
-    #[test]
-    fn shrunk_resolution_accepts_multi_thread_runtime() {
-        assert!(ensure_shrunk_resolution_runtime(RuntimeFlavor::MultiThread).is_ok());
     }
 }
