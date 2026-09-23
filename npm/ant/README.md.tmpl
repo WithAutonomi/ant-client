@@ -1,0 +1,98 @@
+# ant
+
+The unified CLI for the [Autonomi](https://autonomi.com) network: store and retrieve data, and
+manage local nodes.
+
+This package distributes the same signed binary published on the
+[ant-client releases page](https://github.com/WithAutonomi/ant-client/releases). It exists so
+that `ant` can be installed anywhere npm reaches — including agent sandboxes and CI runners that
+allow package-manager traffic but block direct binary downloads.
+
+## Install
+
+```sh
+npm install -g @withautonomi/ant
+ant --help
+```
+
+The beta channel tracks pre-release builds:
+
+```sh
+npm install -g @withautonomi/ant@beta
+```
+
+## Supported platforms
+
+| Platform | Architecture |
+|---|---|
+| Linux | x86_64, ARM64 |
+| macOS | x86_64, Apple silicon |
+| Windows | x86_64 (also used on ARM64, under emulation) |
+
+Linux builds are statically linked against musl, so they run on any distribution.
+
+The binary lives in a per-platform companion package (`@withautonomi/ant-linux-x64` and friends)
+declared as an optional dependency, so `npm install` downloads only the one your machine needs.
+Installing with `--no-optional` or `--omit=optional` skips it and leaves `ant` unable to run.
+
+## Configuration
+
+`ant` joins the network through a list of bootstrap peers. It works out of the box: the same
+peer list published in the release archives is compiled into the binary, and is used whenever no
+config file is present.
+
+To customise the list, put your own `bootstrap_peers.toml` here — it takes precedence over the
+built-in one:
+
+| Platform | Path |
+|---|---|
+| Linux | `$XDG_CONFIG_HOME/ant/bootstrap_peers.toml`, or `~/.config/ant/bootstrap_peers.toml` |
+| macOS | `~/Library/Application Support/ant/bootstrap_peers.toml` |
+| Windows | `%APPDATA%\ant\bootstrap_peers.toml` |
+
+Installing normally writes that file for you, but npm 12 blocks package install scripts by
+default, so it often will not appear. Nothing breaks when it doesn't. If you want the file so you
+can edit it, either install with
+
+```sh
+npm install -g --allow-scripts=@withautonomi/ant @withautonomi/ant
+```
+
+or copy it out of the installed platform package. Individual runs can always override everything
+with `ant -b <multiaddr> …`.
+
+## Updating
+
+```sh
+npm update -g @withautonomi/ant
+```
+
+`ant update`, which self-replaces the binary for installs made from the release page, detects an
+npm-managed install and tells you to use npm instead — otherwise npm's view of the installed
+version would silently diverge from what is on disk, and the next `npm update` would roll you
+back.
+
+## Uninstall
+
+```sh
+npm uninstall -g @withautonomi/ant
+```
+
+Your config directory is left alone. Delete it by hand if you want it gone.
+
+## Verifying what you installed
+
+Packages are published from the ant-client release workflow with
+[npm provenance](https://docs.npmjs.com/generating-provenance-statements), so npm records which
+workflow run and commit produced each tarball. The binaries are copied verbatim from the release
+archives, whose checksums and ML-DSA-65 signatures are verified during packaging, so they are
+byte-identical to the corresponding GitHub release assets.
+
+## Other install methods
+
+The release page, `install.sh` and `install.ps1` all still work and are unaffected by this
+package. See the [project README](https://github.com/WithAutonomi/ant-client#readme).
+
+## Licence
+
+MIT OR Apache-2.0

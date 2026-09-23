@@ -20,6 +20,8 @@ pub mod datamap_file;
 #[cfg(feature = "native")]
 pub mod error;
 #[cfg(feature = "native")]
+pub mod install;
+#[cfg(feature = "native")]
 pub mod node;
 mod runtime;
 #[cfg(feature = "native")]
