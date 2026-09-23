@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.3.7"
+version = "0.3.8-rc.1"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.9.0"
+version = "0.10.0-rc.1"
 dependencies = [
  "alloy",
  "ant-node",
@@ -908,8 +908,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.19.0"
-source = "git+https://github.com/WithAutonomi/ant-node.git?rev=50167d39b8acc03ae771e790ef54b060a8d8ea72#50167d39b8acc03ae771e790ef54b060a8d8ea72"
+version = "0.20.0-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.9.3#be85f0dee3eaa902d9b23a679e74d22739940220"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -960,8 +960,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.4.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=17949f860740fed494f2d0c98f710f5749e8b85b#17949f860740fed494f2d0c98f710f5749e8b85b"
+version = "3.0.0-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.9.3#686151834391c766fd8ba7a394953e82de79cc27"
 dependencies = [
  "blake3",
  "bytes",
@@ -2726,8 +2726,8 @@ dependencies = [
 
 [[package]]
 name = "evmlib"
-version = "0.9.1"
-source = "git+https://github.com/WithAutonomi/evmlib?rev=8ad5ec02dfc2673c9ffb7e5ea5d315f059c76954#8ad5ec02dfc2673c9ffb7e5ea5d315f059c76954"
+version = "0.10.0-rc.1"
+source = "git+https://github.com/WithAutonomi/evmlib?branch=rc-2026.9.3#94ac34b4a4860be031dbd9e51c7746ae7c1bc266"
 dependencies = [
  "alloy",
  "ant-merkle",
@@ -3307,27 +3307,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest 0.10.7",
-]
-
-[[package]]
-name = "hpke"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f65d16b699dd1a1fa2d851c970b0c971b388eeeb40f744252b8de48860980c8f"
-dependencies = [
- "aead",
- "aes-gcm",
- "chacha20poly1305",
- "digest 0.10.7",
- "generic-array",
- "hkdf",
- "hmac",
- "p256",
- "rand_core 0.9.5",
- "sha2",
- "subtle",
- "x25519-dalek",
- "zeroize",
 ]
 
 [[package]]
@@ -5545,8 +5524,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.27.4"
-source = "git+https://github.com/WithAutonomi/saorsa-core?rev=3dec586c41eb3a9febe9fd4ed01db07d73e017c5#3dec586c41eb3a9febe9fd4ed01db07d73e017c5"
+version = "0.28.0-rc.1"
+source = "git+https://github.com/WithAutonomi/saorsa-core?branch=rc-2026.9.3#1412309b13159bf205adfc4807a6b5ba98c56d8e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5577,8 +5556,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-pqc"
-version = "0.5.1"
-source = "git+https://github.com/saorsa-labs/saorsa-pqc?rev=29a2b272c4ee8b72c17102da00033dbfe1ddcd37#29a2b272c4ee8b72c17102da00033dbfe1ddcd37"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "211578bef9588f0f57162139f1c214bcc6207fb632e9368040d52e4e36471938"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -5592,7 +5572,6 @@ dependencies = [
  "getrandom 0.2.17",
  "hkdf",
  "hmac",
- "hpke",
  "log",
  "pbkdf2",
  "postcard",
@@ -5613,8 +5592,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.36.4"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=1995901c69d34af43c9d22144a253a92670240d9#1995901c69d34af43c9d22144a253a92670240d9"
+version = "0.37.0-rc.1"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?branch=rc-2026.9.3#c7c14f3bc96428093faa6330a7aef463e77d55aa"
 dependencies = [
  "anyhow",
  "async-trait",
