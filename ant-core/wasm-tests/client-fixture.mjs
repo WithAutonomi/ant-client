@@ -9,4 +9,8 @@ export class BrowserNetworkClient extends RawBrowserNetworkClient {
     args[6] ??= value => { this.lastCheckpoint = value; };
     return super.uploadStagedPublicFile(...args);
   }
+  uploadRecords(...args) {
+    args[6] ??= value => { this.lastCheckpoint = value; };
+    return super.uploadRecords(...args);
+  }
 }

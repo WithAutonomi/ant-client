@@ -25,6 +25,10 @@ cover inconsistent views, partial existing-holder votes, one payable quote,
 even quote counts, wider PUT fallback, and reuse of the paid proof. Structured
 remote errors are tested separately from an actual PUT-response deadline.
 
+Record-batch tests upload one file as consecutive caller-staged batches with
+separate payments, check that progress keeps file-level record positions, and
+confirm each result reports the payment mode the shared coordinator used.
+
 Download regressions cover known holders omitted by failed discovery, complete
 discovery failure, bounded fallback, and unchanged BLAKE3 verification. The mock
 retains successful PUT payloads across connection replacements so a full upload,
