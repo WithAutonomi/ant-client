@@ -909,7 +909,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.19.0"
-source = "git+https://github.com/WithAutonomi/ant-node.git?rev=07a11e091fc1c4d0ef4883d077a4e0dc7836f43d#07a11e091fc1c4d0ef4883d077a4e0dc7836f43d"
+source = "git+https://github.com/WithAutonomi/ant-node.git?rev=b0263b324c418a5732d1727d7a66df4c15946559#b0263b324c418a5732d1727d7a66df4c15946559"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -943,6 +943,7 @@ dependencies = [
  "self_encryption",
  "semver 1.0.28",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2",
  "tar",
@@ -961,7 +962,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.4.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=ac25b717d99e70468d934b66c32d6e6219a37350#ac25b717d99e70468d934b66c32d6e6219a37350"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=a66ddcfb60d50a9ec07b9aee0d063a730a96b330#a66ddcfb60d50a9ec07b9aee0d063a730a96b330"
 dependencies = [
  "blake3",
  "bytes",
@@ -1998,7 +1999,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -5546,7 +5547,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.27.4"
-source = "git+https://github.com/WithAutonomi/saorsa-core?rev=e1f1ef92aacb0dab60e6c3dded5da8bae3b63d07#e1f1ef92aacb0dab60e6c3dded5da8bae3b63d07"
+source = "git+https://github.com/WithAutonomi/saorsa-core?rev=53f1fc6fca13109f583dd951ee3eab42d7a37121#53f1fc6fca13109f583dd951ee3eab42d7a37121"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5614,7 +5615,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.36.4"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=3bd451d2d2c86b01df1dd355a88e81bcb854d815#3bd451d2d2c86b01df1dd355a88e81bcb854d815"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=1766037ef159d80495515de65f96b3fd8fc94319#1766037ef159d80495515de65f96b3fd8fc94319"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7496,7 +7497,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
