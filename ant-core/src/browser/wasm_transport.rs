@@ -1853,8 +1853,9 @@ struct BrowserDownloadResult {
     content: Vec<u8>,
     hash: String,
     file: PublicFileDescriptor,
-    #[serde(rename = "dataMapNode")]
-    data_map_node: BrowserNode,
+    /// Node that served a public DataMap; absent for a caller-held private DataMap.
+    #[serde(rename = "dataMapNode", skip_serializing_if = "Option::is_none")]
+    data_map_node: Option<BrowserNode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1901,10 +1902,32 @@ impl BrowserPublicFileInput {
     }
 }
 
-struct ResolvedBrowserPublicFile {
+/// A private file identified only by the DataMap its uploader kept.
+///
+/// `data_map` holds the canonical MessagePack DataMap, the same bytes a native
+/// `.datamap` file contains. Nested DataMap records are fetched from the network.
+#[derive(Debug, Deserialize)]
+struct BrowserPrivateFileInput {
+    #[serde(with = "serde_bytes")]
+    data_map: Vec<u8>,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    content_type: String,
+}
+
+/// Where a readable file's published DataMap comes from.
+enum BrowserFileSource {
+    /// Fetch the public DataMap record by address.
+    Public(BrowserPublicFileInput),
+    /// Use a DataMap supplied by its holder.
+    Private(BrowserPrivateFileInput),
+}
+
+struct ResolvedBrowserFile {
     file: PublicFileDescriptor,
     expected_hash: Option<String>,
-    data_map_node: BrowserNode,
+    data_map_node: Option<BrowserNode>,
     root_data_map: self_encryption::DataMap,
 }
 
@@ -2238,12 +2261,22 @@ impl BrowserNetworkClient {
     ) -> Result<JsValue, JsValue> {
         let file: BrowserPublicFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let progress = ProgressReporter::from_js(on_progress);
-        let result = self
-            .download_public_file_inner(file, concurrency.unwrap_or(usize::MAX), &progress)
+        self.download_file(BrowserFileSource::Public(file), concurrency, on_progress)
             .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Download and reconstruct a private file from the DataMap its uploader kept.
+    #[wasm_bindgen(js_name = downloadPrivateFile)]
+    pub async fn download_private_file(
+        &self,
+        file: JsValue,
+        concurrency: Option<usize>,
+        on_progress: Option<js_sys::Function>,
+    ) -> Result<JsValue, JsValue> {
+        let file: BrowserPrivateFileInput = serde_wasm_bindgen::from_value(file)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        self.download_file(BrowserFileSource::Private(file), concurrency, on_progress)
+            .await
     }
 
     /// Resolve and validate a public file for random-access range reads.
@@ -2256,7 +2289,22 @@ impl BrowserNetworkClient {
         let file: BrowserPublicFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let progress = ProgressReporter::from_js(on_progress);
-        self.open_public_file_inner(file, progress)
+        self.open_file_inner(BrowserFileSource::Public(file), progress)
+            .await
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
+    /// Resolve a private file from its DataMap for random-access range reads.
+    #[wasm_bindgen(js_name = openPrivateFile)]
+    pub async fn open_private_file(
+        &self,
+        file: JsValue,
+        on_progress: Option<js_sys::Function>,
+    ) -> Result<BrowserFileReader, JsValue> {
+        let file: BrowserPrivateFileInput = serde_wasm_bindgen::from_value(file)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let progress = ProgressReporter::from_js(on_progress);
+        self.open_file_inner(BrowserFileSource::Private(file), progress)
             .await
             .map_err(|error| JsValue::from_str(&error))
     }
@@ -2437,12 +2485,26 @@ impl BrowserNetworkClient {
         Ok((chunk.content.to_vec(), node))
     }
 
-    async fn open_public_file_inner(
+    async fn download_file(
         &self,
-        file: BrowserPublicFileInput,
+        source: BrowserFileSource,
+        concurrency: Option<usize>,
+        on_progress: Option<js_sys::Function>,
+    ) -> Result<JsValue, JsValue> {
+        let progress = ProgressReporter::from_js(on_progress);
+        let result = self
+            .download_file_inner(source, concurrency.unwrap_or(usize::MAX), &progress)
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
+        serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    async fn open_file_inner(
+        &self,
+        source: BrowserFileSource,
         progress: ProgressReporter,
     ) -> Result<BrowserFileReader, String> {
-        let resolved = self.resolve_public_file(file, &progress).await?;
+        let resolved = self.resolve_file(source, &progress).await?;
         let file = resolved.file;
         progress.report(&format!(
             "Ready to stream {} ({} bytes, {} chunks)",
@@ -2458,16 +2520,16 @@ impl BrowserNetworkClient {
         })
     }
 
-    async fn download_public_file_inner(
+    async fn download_file_inner(
         &self,
-        file: BrowserPublicFileInput,
+        source: BrowserFileSource,
         concurrency: usize,
         progress: &ProgressReporter,
     ) -> Result<BrowserDownloadResult, String> {
         if concurrency == 0 {
             return Err("download concurrency must be a positive integer".to_string());
         }
-        let mut resolved = self.resolve_public_file(file, progress).await?;
+        let mut resolved = self.resolve_file(source, progress).await?;
         let content = self
             .shared
             .data_download_with_progress(
@@ -2504,11 +2566,22 @@ impl BrowserNetworkClient {
         })
     }
 
+    async fn resolve_file(
+        &self,
+        source: BrowserFileSource,
+        progress: &ProgressReporter,
+    ) -> Result<ResolvedBrowserFile, String> {
+        match source {
+            BrowserFileSource::Public(file) => self.resolve_public_file(file, progress).await,
+            BrowserFileSource::Private(file) => self.resolve_private_file(file, progress).await,
+        }
+    }
+
     async fn resolve_public_file(
         &self,
         file: BrowserPublicFileInput,
         progress: &ProgressReporter,
-    ) -> Result<ResolvedBrowserPublicFile, String> {
+    ) -> Result<ResolvedBrowserFile, String> {
         let (address, descriptor) = file.into_address_and_descriptor();
         let address = super::protocol::normalize_hex(&address, 32)?;
         progress.report(&format!("Fetching public DataMap {address}"));
@@ -2517,7 +2590,64 @@ impl BrowserNetworkClient {
             "Verified public DataMap ({} bytes)",
             encoded_data_map.len()
         ));
-        let published_data_map = crate::client_engine::files::decode_map(&encoded_data_map)?;
+        let descriptor = descriptor.unwrap_or_else(|| PublicFileDescriptor {
+            name: fallback_public_file_name(&address),
+            address: address.clone(),
+            size: 0,
+            content_type: "application/octet-stream".into(),
+            blake3: String::new(),
+            data_map_size: 0,
+            chunks: Vec::new(),
+            replicas: 0,
+        });
+        let mut resolved = self
+            .resolve_data_map(&encoded_data_map, descriptor, progress)
+            .await?;
+        resolved.file.address = address;
+        resolved.data_map_node = Some(data_map_node);
+        Ok(resolved)
+    }
+
+    async fn resolve_private_file(
+        &self,
+        file: BrowserPrivateFileInput,
+        progress: &ProgressReporter,
+    ) -> Result<ResolvedBrowserFile, String> {
+        if file.data_map.len() > MAX_BROWSER_RECORD_BYTES {
+            return Err("private DataMap is larger than any DataMap record".to_string());
+        }
+        // Content address the DataMap would have if published; it is never fetched.
+        let address = super::content_address(&file.data_map);
+        progress.report(&format!(
+            "Using private DataMap ({} bytes)",
+            file.data_map.len()
+        ));
+        let descriptor = PublicFileDescriptor {
+            name: if file.name.is_empty() {
+                fallback_private_file_name(&address)
+            } else {
+                file.name
+            },
+            address,
+            size: 0,
+            content_type: file.content_type,
+            blake3: String::new(),
+            data_map_size: 0,
+            chunks: Vec::new(),
+            replicas: 0,
+        };
+        self.resolve_data_map(&file.data_map, descriptor, progress)
+            .await
+    }
+
+    /// Resolve nested DataMap records and describe the file the root map covers.
+    async fn resolve_data_map(
+        &self,
+        encoded_data_map: &[u8],
+        mut file: PublicFileDescriptor,
+        progress: &ProgressReporter,
+    ) -> Result<ResolvedBrowserFile, String> {
+        let published_data_map = crate::client_engine::files::decode_map(encoded_data_map)?;
         let root_data_map = crate::client_engine::files::resolve(
             &published_data_map,
             &|address| async move {
@@ -2550,27 +2680,15 @@ impl BrowserNetworkClient {
             return Err(format!("invalid public file size {resolved_size}"));
         }
 
-        let mut file = descriptor.unwrap_or_else(|| PublicFileDescriptor {
-            name: fallback_public_file_name(&address),
-            address: address.clone(),
-            size: 0,
-            content_type: "application/octet-stream".into(),
-            blake3: String::new(),
-            data_map_size: 0,
-            chunks: Vec::new(),
-            replicas: 0,
-        });
-        file.address = address;
         file.size = resolved_size;
         file.chunks = actual_chunks;
         file.data_map_size = encoded_data_map.len();
         file.blake3.clear(); // Computed when plaintext is read; not a second content identity.
         file.content_type = normalized_content_type(&file.content_type);
-        let expected_hash = None;
-        Ok(ResolvedBrowserPublicFile {
+        Ok(ResolvedBrowserFile {
             file,
-            expected_hash,
-            data_map_node,
+            expected_hash: None,
+            data_map_node: None,
             root_data_map,
         })
     }
@@ -2816,6 +2934,10 @@ fn normalized_content_type(content_type: &str) -> String {
 
 fn fallback_public_file_name(address: &str) -> String {
     format!("public-file-{}.bin", &address[..16])
+}
+
+fn fallback_private_file_name(address: &str) -> String {
+    format!("private-file-{}.bin", &address[..16])
 }
 
 fn validate_staged_file(staged: &mut BrowserStagedFile) -> Result<(), String> {

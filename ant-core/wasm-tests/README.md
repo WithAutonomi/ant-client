@@ -28,6 +28,8 @@ remote errors are tested separately from an actual PUT-response deadline.
 Record-batch tests upload one file as consecutive caller-staged batches with
 separate payments, check that progress keeps file-level record positions, and
 confirm each result reports the payment mode the shared coordinator used.
+Private-file tests keep the DataMap record local, then download and range-read
+through the caller-held DataMap, including one with nested DataMap records.
 
 Download regressions cover known holders omitted by failed discovery, complete
 discovery failure, bounded fallback, and unchanged BLAKE3 verification. The mock
