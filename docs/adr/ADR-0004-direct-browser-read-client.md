@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-09-16
+- **Last amended:** 2026-09-23
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -405,3 +405,29 @@ unchanged file bytes and integrity checks, elapsed time and received bytes.
 PUTs retain exclusive per-lane admission, including through cancellation drain.
 GETs and control RPCs may multiplex; enabling the capability does not multiply
 large incoming uploads against the node's existing source byte limit.
+
+## Record batches and private DataMaps (2026-09-23)
+
+`BrowserNetworkClient.uploadRecords(batch, ...)` uploads one batch of
+caller-staged, content-addressed records through the shared coordinator. It lets
+the SDK upload a file whose ciphertext does not fit the browser's storage quota
+as consecutive batches. Each batch is a separate `upload_records` invocation: it
+preflights, quotes, pays for, and stores only its own records, and its checkpoint
+scope derives from the payment network and that batch's record list. The
+coordinator selects single-node or Merkle payment for each batch under the
+caller's `PaymentMode`, with the native threshold and fallback rules. A batch's
+first-record position and optional file record count affect progress text only.
+Records are still loaded lazily and verified against their addresses on every
+load. Rust does not check that a sequence of batches covers a DataMap; the caller
+that produced the records owns that composition, as it already owns their storage.
+
+Every upload entry point now reports the effective `paymentMode` (`single` or
+`merkle`), like native `payment_mode_used`.
+
+Private files mirror native `Visibility::Private`. The uploader does not store
+the DataMap record and keeps its canonical MessagePack bytes, the native
+`.datamap` format. `downloadPrivateFile` and `openPrivateFile` resolve that
+caller-held DataMap, fetch nested DataMap records and chunks from the network,
+and apply the same verification as public reads. A private DataMap is bounded by
+the maximum record size before it is decoded. Wire messages, stored formats, and
+native APIs are unchanged.

@@ -17,6 +17,7 @@ pub(super) struct BrowserUploadAdapter<'a> {
     pub merkle_wallet: Option<&'a js_sys::Function>,
     pub wallet: &'a js_sys::Function,
     pub progress: &'a ProgressReporter,
+    pub placement: RecordPlacement,
     pub checkpoint: &'a UploadCheckpoint,
     pub scope: &'a str,
     pub last_transaction: RefCell<Option<String>>,
@@ -134,6 +135,13 @@ impl BrowserUploadAdapter<'_> {
             .await
             .map_err(Error::Payment)?;
         Ok(value)
+    }
+
+    /// Report a record position within the whole file rather than this batch.
+    fn report_record(&self, label: &str, position: usize, total: usize) {
+        let position = self.placement.position(position);
+        let total = self.placement.total(total);
+        self.progress.report(&format!("{label} {position}/{total}"));
     }
 
     fn update_journal(&self, state: &mut UploadState) {
@@ -352,24 +360,20 @@ impl UploadAdapter for BrowserUploadAdapter<'_> {
         DEFAULT_BROWSER_QUOTE_CONCURRENCY
     }
     fn stored(&self, stored: usize, total: usize) {
-        self.progress
-            .report(&format!("Confirmed available record {stored}/{total}"));
+        self.report_record("Confirmed available record", stored, total);
     }
     fn quoted(&self, quoted: usize, total: usize) {
-        self.progress
-            .report(&format!("Quoted record {quoted}/{total}"));
+        self.report_record("Quoted record", quoted, total);
     }
     fn record_stored(&self, index: usize, total: usize) {
-        self.progress
-            .report(&format!("Stored new record {index}/{total}"));
+        self.report_record("Stored new record", index, total);
     }
     fn checked(&self, checked: usize, total: usize) {
         self.progress
             .report(&format!("Checked existing storage {checked}/{total}"));
     }
     fn already_stored(&self, index: usize, total: usize) {
-        self.progress
-            .report(&format!("Already present record {index}/{total}"));
+        self.report_record("Already present record", index, total);
     }
     fn payment_quotes(&self, completed: usize, total: usize) {
         self.progress.report(&format!(

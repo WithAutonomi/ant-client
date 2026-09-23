@@ -17,6 +17,7 @@ use super::protocol::{
     MAX_BROWSER_RESPONSE_BYTES, WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
 use super::{BrowserRecord, BrowserRecordInfo, BrowserStagedFile};
+use crate::data::client::merkle::PaymentMode;
 #[cfg(feature = "test-utils")]
 use crate::transfer_policy::PutRejection;
 use crate::transfer_policy::RpcError;
@@ -78,6 +79,9 @@ const READ_RESPONSE_RESERVATION: usize =
 const MAX_BROWSER_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_UPLOAD_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
+// A 1 GB self-encrypted file needs only a few hundred records. Keep malformed
+// JavaScript metadata from creating unbounded quote work.
+const MAX_UPLOAD_RECORDS: usize = 4096;
 
 mod failed_payment;
 mod inbox;
@@ -1849,8 +1853,9 @@ struct BrowserDownloadResult {
     content: Vec<u8>,
     hash: String,
     file: PublicFileDescriptor,
-    #[serde(rename = "dataMapNode")]
-    data_map_node: BrowserNode,
+    /// Node that served a public DataMap; absent for a caller-held private DataMap.
+    #[serde(rename = "dataMapNode", skip_serializing_if = "Option::is_none")]
+    data_map_node: Option<BrowserNode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1897,10 +1902,32 @@ impl BrowserPublicFileInput {
     }
 }
 
-struct ResolvedBrowserPublicFile {
+/// A private file identified only by the DataMap its uploader kept.
+///
+/// `data_map` holds the canonical MessagePack DataMap, the same bytes a native
+/// `.datamap` file contains. Nested DataMap records are fetched from the network.
+#[derive(Debug, Deserialize)]
+struct BrowserPrivateFileInput {
+    #[serde(with = "serde_bytes")]
+    data_map: Vec<u8>,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    content_type: String,
+}
+
+/// Where a readable file's published DataMap comes from.
+enum BrowserFileSource {
+    /// Fetch the public DataMap record by address.
+    Public(BrowserPublicFileInput),
+    /// Use a DataMap supplied by its holder.
+    Private(BrowserPrivateFileInput),
+}
+
+struct ResolvedBrowserFile {
     file: PublicFileDescriptor,
     expected_hash: Option<String>,
-    data_map_node: BrowserNode,
+    data_map_node: Option<BrowserNode>,
     root_data_map: self_encryption::DataMap,
 }
 
@@ -1949,12 +1976,72 @@ struct BrowserUploadResult {
     #[serde(rename = "storageCostAtto")]
     storage_cost_atto: String,
     records: usize,
+    /// Effective payment mode reported by the shared coordinator.
+    #[serde(rename = "paymentMode")]
+    payment_mode: PaymentMode,
+}
+
+/// Content-addressed records staged by the caller and paid as one batch.
+#[derive(Debug, Deserialize)]
+struct BrowserRecordBatch {
+    records: Vec<BrowserRecordInfo>,
+    /// Position of the first record in its file, keeping progress stable across batches.
+    #[serde(default)]
+    first_index: usize,
+    /// Record count of the whole file, when the caller already knows it.
+    #[serde(default)]
+    total_records: Option<usize>,
+}
+
+/// Accounting for one caller-staged record batch.
+#[derive(Debug, Serialize)]
+struct BrowserRecordBatchResult {
+    #[serde(rename = "transactionHash", skip_serializing_if = "Option::is_none")]
+    transaction_hash: Option<String>,
+    #[serde(rename = "storageCostAtto")]
+    storage_cost_atto: String,
+    records: usize,
+    replicas: usize,
+    #[serde(rename = "paymentMode")]
+    payment_mode: PaymentMode,
 }
 
 struct BrowserStoredRecords {
     payment: BrowserPaymentSubmission,
     replicas: usize,
     records: usize,
+    mode: PaymentMode,
+}
+
+impl From<BrowserStoredRecords> for BrowserRecordBatchResult {
+    fn from(stored: BrowserStoredRecords) -> Self {
+        Self {
+            transaction_hash: stored.payment.transaction_hash,
+            storage_cost_atto: stored.payment.total_amount,
+            records: stored.records,
+            replicas: stored.replicas,
+            payment_mode: stored.mode,
+        }
+    }
+}
+
+/// Maps batch-local record positions onto stable positions within a file.
+#[derive(Debug, Clone, Copy, Default)]
+struct RecordPlacement {
+    offset: usize,
+    file_total: Option<usize>,
+}
+
+impl RecordPlacement {
+    fn position(self, batch_position: usize) -> usize {
+        self.offset + batch_position
+    }
+
+    fn total(self, batch_total: usize) -> usize {
+        self.file_total
+            .unwrap_or_default()
+            .max(self.offset + batch_total)
+    }
 }
 
 /// Random-access public-file reader for media playback and bounded downloads.
@@ -2023,7 +2110,7 @@ impl BrowserFileReader {
 
 #[derive(Default, Clone)]
 struct UploadCheckpoint {
-    mode: crate::data::client::merkle::PaymentMode,
+    mode: PaymentMode,
     merkle_wallet: Option<js_sys::Function>,
     snapshot: Option<String>,
     callback: Option<js_sys::Function>,
@@ -2036,6 +2123,20 @@ struct UploadCheckpointEnvelope {
 }
 
 impl UploadCheckpoint {
+    fn from_js(
+        payment_mode: Option<String>,
+        merkle_wallet: Option<js_sys::Function>,
+        snapshot: Option<String>,
+        callback: Option<js_sys::Function>,
+    ) -> Result<Self, JsValue> {
+        Ok(Self {
+            mode: parse_payment_mode(payment_mode.as_deref())?,
+            merkle_wallet,
+            snapshot,
+            callback,
+        })
+    }
+
     fn envelope(snapshot: &str) -> Result<UploadCheckpointEnvelope, String> {
         if snapshot.len() > MAX_UPLOAD_CHECKPOINT_BYTES {
             return Err("upload checkpoint too large".into());
@@ -2160,12 +2261,22 @@ impl BrowserNetworkClient {
     ) -> Result<JsValue, JsValue> {
         let file: BrowserPublicFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let progress = ProgressReporter::from_js(on_progress);
-        let result = self
-            .download_public_file_inner(file, concurrency.unwrap_or(usize::MAX), &progress)
+        self.download_file(BrowserFileSource::Public(file), concurrency, on_progress)
             .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Download and reconstruct a private file from the DataMap its uploader kept.
+    #[wasm_bindgen(js_name = downloadPrivateFile)]
+    pub async fn download_private_file(
+        &self,
+        file: JsValue,
+        concurrency: Option<usize>,
+        on_progress: Option<js_sys::Function>,
+    ) -> Result<JsValue, JsValue> {
+        let file: BrowserPrivateFileInput = serde_wasm_bindgen::from_value(file)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        self.download_file(BrowserFileSource::Private(file), concurrency, on_progress)
+            .await
     }
 
     /// Resolve and validate a public file for random-access range reads.
@@ -2178,7 +2289,22 @@ impl BrowserNetworkClient {
         let file: BrowserPublicFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let progress = ProgressReporter::from_js(on_progress);
-        self.open_public_file_inner(file, progress)
+        self.open_file_inner(BrowserFileSource::Public(file), progress)
+            .await
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
+    /// Resolve a private file from its DataMap for random-access range reads.
+    #[wasm_bindgen(js_name = openPrivateFile)]
+    pub async fn open_private_file(
+        &self,
+        file: JsValue,
+        on_progress: Option<js_sys::Function>,
+    ) -> Result<BrowserFileReader, JsValue> {
+        let file: BrowserPrivateFileInput = serde_wasm_bindgen::from_value(file)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let progress = ProgressReporter::from_js(on_progress);
+        self.open_file_inner(BrowserFileSource::Private(file), progress)
             .await
             .map_err(|error| JsValue::from_str(&error))
     }
@@ -2199,23 +2325,10 @@ impl BrowserNetworkClient {
         payment_mode: Option<String>,
         pay_for_merkle: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
-        let payment_network: BrowserPaymentNetwork =
-            serde_wasm_bindgen::from_value(payment_network)
-                .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let payment_network = validate_browser_payment_network(payment_network)
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let payment_network = parse_payment_network(payment_network)?;
         let progress = ProgressReporter::from_js(on_progress);
-        let checkpoint = UploadCheckpoint {
-            mode: match payment_mode.as_deref().unwrap_or("auto") {
-                "auto" => crate::data::client::merkle::PaymentMode::Auto,
-                "single" => crate::data::client::merkle::PaymentMode::Single,
-                "merkle" => crate::data::client::merkle::PaymentMode::Merkle,
-                _ => return Err(JsValue::from_str("unknown payment mode")),
-            },
-            merkle_wallet: pay_for_merkle,
-            snapshot: checkpoint,
-            callback: on_checkpoint,
-        };
+        let checkpoint =
+            UploadCheckpoint::from_js(payment_mode, pay_for_merkle, checkpoint, on_checkpoint)?;
         let result = self
             .upload_public_file_inner(
                 content,
@@ -2251,23 +2364,10 @@ impl BrowserNetworkClient {
     ) -> Result<JsValue, JsValue> {
         let staged: BrowserStagedFile = serde_wasm_bindgen::from_value(staged)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let payment_network: BrowserPaymentNetwork =
-            serde_wasm_bindgen::from_value(payment_network)
-                .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let payment_network = validate_browser_payment_network(payment_network)
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let payment_network = parse_payment_network(payment_network)?;
         let progress = ProgressReporter::from_js(on_progress);
-        let checkpoint = UploadCheckpoint {
-            mode: match payment_mode.as_deref().unwrap_or("auto") {
-                "auto" => crate::data::client::merkle::PaymentMode::Auto,
-                "single" => crate::data::client::merkle::PaymentMode::Single,
-                "merkle" => crate::data::client::merkle::PaymentMode::Merkle,
-                _ => return Err(JsValue::from_str("unknown payment mode")),
-            },
-            merkle_wallet: pay_for_merkle,
-            snapshot: checkpoint,
-            callback: on_checkpoint,
-        };
+        let checkpoint =
+            UploadCheckpoint::from_js(payment_mode, pay_for_merkle, checkpoint, on_checkpoint)?;
         let result = self
             .upload_staged_public_file_inner(
                 staged,
@@ -2282,9 +2382,77 @@ impl BrowserNetworkClient {
         serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
+    /// Quote, pay for, and store one batch of caller-staged records.
+    ///
+    /// Callers that cannot hold a whole file's encrypted records at once stage
+    /// and upload consecutive batches. Each batch is its own payment and
+    /// checkpoint scope; the shared coordinator selects single-node or Merkle
+    /// payment for it exactly as for a complete file. Records are loaded
+    /// lazily and verified against their addresses on every load.
+    #[wasm_bindgen(js_name = uploadRecords)]
+    #[allow(clippy::too_many_arguments)] // Mirrors the staged upload argument order.
+    pub async fn upload_records(
+        &self,
+        batch: JsValue,
+        payment_network: JsValue,
+        load_record: js_sys::Function,
+        pay_for_quotes: js_sys::Function,
+        on_progress: Option<js_sys::Function>,
+        checkpoint: Option<String>,
+        on_checkpoint: Option<js_sys::Function>,
+        payment_mode: Option<String>,
+        pay_for_merkle: Option<js_sys::Function>,
+    ) -> Result<JsValue, JsValue> {
+        let mut batch: BrowserRecordBatch = serde_wasm_bindgen::from_value(batch)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        validate_record_batch(&mut batch).map_err(|error| JsValue::from_str(&error))?;
+        let payment_network = parse_payment_network(payment_network)?;
+        let progress = ProgressReporter::from_js(on_progress);
+        let checkpoint =
+            UploadCheckpoint::from_js(payment_mode, pay_for_merkle, checkpoint, on_checkpoint)?;
+        let placement = RecordPlacement {
+            offset: batch.first_index,
+            file_total: batch.total_records,
+        };
+        let records = batch
+            .records
+            .into_iter()
+            .map(UploadRecord::from)
+            .collect::<Vec<_>>();
+        let stored = self
+            .prepare_pay_and_store_records(
+                records,
+                &payment_network,
+                Some(&load_record),
+                &pay_for_quotes,
+                &progress,
+                &checkpoint,
+                placement,
+            )
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
+        serde_wasm_bindgen::to_value(&BrowserRecordBatchResult::from(stored))
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
     /// Close all pooled WebRTC associations.
     pub fn close(&self) {
         self.inner.pool.close();
+    }
+}
+
+fn parse_payment_network(value: JsValue) -> Result<BrowserPaymentNetwork, JsValue> {
+    let network: BrowserPaymentNetwork = serde_wasm_bindgen::from_value(value)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    validate_browser_payment_network(network).map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+fn parse_payment_mode(value: Option<&str>) -> Result<PaymentMode, JsValue> {
+    match value {
+        None | Some("auto") => Ok(PaymentMode::Auto),
+        Some("single") => Ok(PaymentMode::Single),
+        Some("merkle") => Ok(PaymentMode::Merkle),
+        Some(_) => Err(JsValue::from_str("unknown payment mode")),
     }
 }
 
@@ -2317,12 +2485,26 @@ impl BrowserNetworkClient {
         Ok((chunk.content.to_vec(), node))
     }
 
-    async fn open_public_file_inner(
+    async fn download_file(
         &self,
-        file: BrowserPublicFileInput,
+        source: BrowserFileSource,
+        concurrency: Option<usize>,
+        on_progress: Option<js_sys::Function>,
+    ) -> Result<JsValue, JsValue> {
+        let progress = ProgressReporter::from_js(on_progress);
+        let result = self
+            .download_file_inner(source, concurrency.unwrap_or(usize::MAX), &progress)
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
+        serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    async fn open_file_inner(
+        &self,
+        source: BrowserFileSource,
         progress: ProgressReporter,
     ) -> Result<BrowserFileReader, String> {
-        let resolved = self.resolve_public_file(file, &progress).await?;
+        let resolved = self.resolve_file(source, &progress).await?;
         let file = resolved.file;
         progress.report(&format!(
             "Ready to stream {} ({} bytes, {} chunks)",
@@ -2338,16 +2520,16 @@ impl BrowserNetworkClient {
         })
     }
 
-    async fn download_public_file_inner(
+    async fn download_file_inner(
         &self,
-        file: BrowserPublicFileInput,
+        source: BrowserFileSource,
         concurrency: usize,
         progress: &ProgressReporter,
     ) -> Result<BrowserDownloadResult, String> {
         if concurrency == 0 {
             return Err("download concurrency must be a positive integer".to_string());
         }
-        let mut resolved = self.resolve_public_file(file, progress).await?;
+        let mut resolved = self.resolve_file(source, progress).await?;
         let content = self
             .shared
             .data_download_with_progress(
@@ -2384,11 +2566,22 @@ impl BrowserNetworkClient {
         })
     }
 
+    async fn resolve_file(
+        &self,
+        source: BrowserFileSource,
+        progress: &ProgressReporter,
+    ) -> Result<ResolvedBrowserFile, String> {
+        match source {
+            BrowserFileSource::Public(file) => self.resolve_public_file(file, progress).await,
+            BrowserFileSource::Private(file) => self.resolve_private_file(file, progress).await,
+        }
+    }
+
     async fn resolve_public_file(
         &self,
         file: BrowserPublicFileInput,
         progress: &ProgressReporter,
-    ) -> Result<ResolvedBrowserPublicFile, String> {
+    ) -> Result<ResolvedBrowserFile, String> {
         let (address, descriptor) = file.into_address_and_descriptor();
         let address = super::protocol::normalize_hex(&address, 32)?;
         progress.report(&format!("Fetching public DataMap {address}"));
@@ -2397,7 +2590,64 @@ impl BrowserNetworkClient {
             "Verified public DataMap ({} bytes)",
             encoded_data_map.len()
         ));
-        let published_data_map = crate::client_engine::files::decode_map(&encoded_data_map)?;
+        let descriptor = descriptor.unwrap_or_else(|| PublicFileDescriptor {
+            name: fallback_public_file_name(&address),
+            address: address.clone(),
+            size: 0,
+            content_type: "application/octet-stream".into(),
+            blake3: String::new(),
+            data_map_size: 0,
+            chunks: Vec::new(),
+            replicas: 0,
+        });
+        let mut resolved = self
+            .resolve_data_map(&encoded_data_map, descriptor, progress)
+            .await?;
+        resolved.file.address = address;
+        resolved.data_map_node = Some(data_map_node);
+        Ok(resolved)
+    }
+
+    async fn resolve_private_file(
+        &self,
+        file: BrowserPrivateFileInput,
+        progress: &ProgressReporter,
+    ) -> Result<ResolvedBrowserFile, String> {
+        if file.data_map.len() > MAX_BROWSER_RECORD_BYTES {
+            return Err("private DataMap is larger than any DataMap record".to_string());
+        }
+        // Content address the DataMap would have if published; it is never fetched.
+        let address = super::content_address(&file.data_map);
+        progress.report(&format!(
+            "Using private DataMap ({} bytes)",
+            file.data_map.len()
+        ));
+        let descriptor = PublicFileDescriptor {
+            name: if file.name.is_empty() {
+                fallback_private_file_name(&address)
+            } else {
+                file.name
+            },
+            address,
+            size: 0,
+            content_type: file.content_type,
+            blake3: String::new(),
+            data_map_size: 0,
+            chunks: Vec::new(),
+            replicas: 0,
+        };
+        self.resolve_data_map(&file.data_map, descriptor, progress)
+            .await
+    }
+
+    /// Resolve nested DataMap records and describe the file the root map covers.
+    async fn resolve_data_map(
+        &self,
+        encoded_data_map: &[u8],
+        mut file: PublicFileDescriptor,
+        progress: &ProgressReporter,
+    ) -> Result<ResolvedBrowserFile, String> {
+        let published_data_map = crate::client_engine::files::decode_map(encoded_data_map)?;
         let root_data_map = crate::client_engine::files::resolve(
             &published_data_map,
             &|address| async move {
@@ -2430,27 +2680,15 @@ impl BrowserNetworkClient {
             return Err(format!("invalid public file size {resolved_size}"));
         }
 
-        let mut file = descriptor.unwrap_or_else(|| PublicFileDescriptor {
-            name: fallback_public_file_name(&address),
-            address: address.clone(),
-            size: 0,
-            content_type: "application/octet-stream".into(),
-            blake3: String::new(),
-            data_map_size: 0,
-            chunks: Vec::new(),
-            replicas: 0,
-        });
-        file.address = address;
         file.size = resolved_size;
         file.chunks = actual_chunks;
         file.data_map_size = encoded_data_map.len();
         file.blake3.clear(); // Computed when plaintext is read; not a second content identity.
         file.content_type = normalized_content_type(&file.content_type);
-        let expected_hash = None;
-        Ok(ResolvedBrowserPublicFile {
+        Ok(ResolvedBrowserFile {
             file,
-            expected_hash,
-            data_map_node,
+            expected_hash: None,
+            data_map_node: None,
             root_data_map,
         })
     }
@@ -2487,6 +2725,7 @@ impl BrowserNetworkClient {
                 pay_for_quotes,
                 progress,
                 checkpoint,
+                RecordPlacement::default(),
             )
             .await?;
         let descriptor = PublicFileDescriptor {
@@ -2504,6 +2743,7 @@ impl BrowserNetworkClient {
             transaction_hash: stored.payment.transaction_hash,
             storage_cost_atto: stored.payment.total_amount,
             records: stored.records,
+            payment_mode: stored.mode,
         })
     }
 
@@ -2584,6 +2824,7 @@ impl BrowserNetworkClient {
                 pay_for_quotes,
                 progress,
                 checkpoint,
+                RecordPlacement::default(),
             )
             .await?;
         let descriptor = PublicFileDescriptor {
@@ -2601,9 +2842,11 @@ impl BrowserNetworkClient {
             transaction_hash: stored.payment.transaction_hash,
             storage_cost_atto: stored.payment.total_amount,
             records: stored.records,
+            payment_mode: stored.mode,
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // Browser callbacks stay explicit, as at the JS boundary.
     async fn prepare_pay_and_store_records(
         &self,
         records: Vec<UploadRecord>,
@@ -2612,6 +2855,7 @@ impl BrowserNetworkClient {
         pay_for_quotes: &js_sys::Function,
         progress: &ProgressReporter,
         checkpoint: &UploadCheckpoint,
+        placement: RecordPlacement,
     ) -> Result<BrowserStoredRecords, String> {
         let count = records.len();
         progress.report(&format!("Preparing upload of {count} records"));
@@ -2655,6 +2899,7 @@ impl BrowserNetworkClient {
             wallet: pay_for_quotes,
             merkle_wallet: checkpoint.merkle_wallet.as_ref(),
             progress,
+            placement,
             checkpoint,
             scope: &scope,
             last_transaction: RefCell::new(None),
@@ -2674,6 +2919,7 @@ impl BrowserNetworkClient {
             },
             replicas: CLOSE_GROUP_MAJORITY,
             records: count,
+            mode: result.mode,
         })
     }
 }
@@ -2690,6 +2936,10 @@ fn fallback_public_file_name(address: &str) -> String {
     format!("public-file-{}.bin", &address[..16])
 }
 
+fn fallback_private_file_name(address: &str) -> String {
+    format!("private-file-{}.bin", &address[..16])
+}
+
 fn validate_staged_file(staged: &mut BrowserStagedFile) -> Result<(), String> {
     if staged.name.is_empty() {
         return Err("upload file has no name".to_string());
@@ -2698,14 +2948,38 @@ fn validate_staged_file(staged: &mut BrowserStagedFile) -> Result<(), String> {
     if staged.records.is_empty() {
         return Err("staged upload contains no records".to_string());
     }
-    // A 1 GB self-encrypted file currently needs only a few hundred records.
-    // Keep malformed JavaScript metadata from creating unbounded quote work.
-    if staged.records.len() > 4096 {
+    validate_record_infos(&mut staged.records)?;
+    staged.address = super::protocol::normalize_hex(&staged.address, 32)?;
+    let public_data_map = staged
+        .records
+        .last()
+        .ok_or_else(|| "staged upload contains no public DataMap".to_string())?;
+    if public_data_map.address != staged.address {
+        return Err("staged public DataMap metadata does not match its record".to_string());
+    }
+    Ok(())
+}
+
+fn validate_record_batch(batch: &mut BrowserRecordBatch) -> Result<(), String> {
+    if batch.records.is_empty() {
+        return Err("record batch contains no records".to_string());
+    }
+    validate_record_infos(&mut batch.records)?;
+    let end = batch
+        .first_index
+        .checked_add(batch.records.len())
+        .ok_or("record batch position overflow")?;
+    if batch.total_records.is_some_and(|total| total < end) {
+        return Err("record batch extends past its file's record count".to_string());
+    }
+    Ok(())
+}
+
+fn validate_record_infos(records: &mut [BrowserRecordInfo]) -> Result<(), String> {
+    if records.len() > MAX_UPLOAD_RECORDS {
         return Err("staged upload contains too many records".to_string());
     }
-
-    staged.address = super::protocol::normalize_hex(&staged.address, 32)?;
-    for record in &mut staged.records {
+    for record in records {
         record.address = super::protocol::normalize_hex(&record.address, 32)?;
         if record.size == 0 || record.size > MAX_BROWSER_RECORD_BYTES {
             return Err(format!(
@@ -2713,13 +2987,6 @@ fn validate_staged_file(staged: &mut BrowserStagedFile) -> Result<(), String> {
                 record.address, record.size
             ));
         }
-    }
-    let public_data_map = staged
-        .records
-        .last()
-        .ok_or_else(|| "staged upload contains no public DataMap".to_string())?;
-    if public_data_map.address != staged.address {
-        return Err("staged public DataMap metadata does not match its record".to_string());
     }
     Ok(())
 }
