@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { BrowserNodeClient, contentAddress } from "./pkg/ant_core.js";
-import { mockWebRtc } from "./mock-webrtc.mjs";
+import { closesSettled, mockWebRtc } from "./mock-webrtc.mjs";
 
 test("idle pooled connections reject unsolicited messages immediately", async () => {
   const rtc = mockWebRtc();
@@ -12,6 +12,7 @@ test("idle pooled connections reject unsolicited messages immediately", async ()
     for (let i = 0; i < 256; i++) {
       connection.channel.emit(new Uint8Array(16_384).buffer);
     }
+    await closesSettled();
     assert.equal(connection.closed, true);
     // The failed association must not poison subsequent requests.
     await assert.rejects(client.hello(), /session closed/);
@@ -45,6 +46,7 @@ for (const scenario of ["oversized", "byte budget", "tiny messages", "empty"]) {
         client.getChunk("11".repeat(32)),
         /message size|byte budget|too many messages/,
       );
+      await closesSettled();
       assert.equal(rtc.connections[0].closed, true);
     } finally {
       client.close();

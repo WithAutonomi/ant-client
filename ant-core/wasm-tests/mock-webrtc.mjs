@@ -6,6 +6,13 @@ export const paymentNetwork = {
   payment_vault_address: `0x${"22".repeat(20)}`,
 };
 
+// A DataChannel close completes two setImmediate turns after close() (see
+// Channel.close below). Await this before asserting that a channel, or the
+// peer connection its last close releases, has closed.
+export async function closesSettled() {
+  for (let turn = 0; turn < 2; turn++) await new Promise(resolve => setImmediate(resolve));
+}
+
 // Reset for each test. Only browser-owned RTC objects are mocked; all node
 // responses use the shared Rust wire contract and real session encryption.
 export function mockWebRtc(nodes = [{}]) {
@@ -50,8 +57,18 @@ export function mockWebRtc(nodes = [{}]) {
         }
       }, this.options.delay?.(method) ?? 0);
     }
+    // Matches node-datachannel's polyfill, which the Node.js WASM client
+    // runs on: close() only records the request and defers the native close
+    // through setImmediate, and readyState stays "open" until the native
+    // callback and a second setImmediate have run. Browsers report "closing"
+    // at once, so a caller that trusts readyState after close() works there
+    // and spins here (V2-1305).
     close() {
-      if (this.readyState === "closed") return;
+      if (this.readyState === "closed" || this.closeRequested) return;
+      this.closeRequested = true;
+      setImmediate(() => setImmediate(() => this.finishClose()));
+    }
+    finishClose() {
       this.readyState = "closed";
       this.dispatchEvent(new Event("close"));
       this.onclose?.({});

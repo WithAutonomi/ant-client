@@ -39,6 +39,10 @@ test("an expired send budget is a transfer timeout and retires the sealed associ
   assert.equal(rtc.requests.filter(r => r.method === "get_chunk").length, 2);
 });
 
+// V2-1305: the timeout closes the session while the mock, like
+// node-datachannel, still reports the channel open. The queued RPCs must redial
+// rather than retry admission on the dead session, which never yields and so
+// blocks the event loop until the 400 s admission deadline.
 test("a queued pooled RPC authenticates a replacement after response timeout", async () => {
   let first = true;
   const rtc = mockWebRtc([{ respond(channel, method, response) {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { test_parallel_lanes, test_active_data_lane_capacity } from "./pkg/ant_core.js";
-import { mockWebRtc } from "./mock-webrtc.mjs";
+import { closesSettled, mockWebRtc } from "./mock-webrtc.mjs";
 const object = value => value instanceof Map ? Object.fromEntries([...value].map(([k,v]) => [k, object(v)])) : value;
 
 for (const slow of ["find_node", "get_chunk"]) {
@@ -31,6 +31,7 @@ for (const lane of ["control", "data"]) {
     assert.equal(rtc.connections.length, 1);
     assert.equal(rtc.connections[0].channels.length, 2);
     assert.equal(rtc.requests.filter(r => r.method === "hello").length, 2);
+    await closesSettled();
     assert.ok(rtc.connections[0].channels.every(c => c.readyState === "closed"));
   });
 }
@@ -54,6 +55,7 @@ test("closing a pool wakes both active lanes and releases the association", asyn
   assert.match(result.data.result, /closed/);
   assert.ok(result.control.ms < 150 && result.data.ms < 150);
   assert.equal(rtc.connections.length, 1);
+  await closesSettled();
   assert.ok(rtc.connections[0].channels.every(c => c.readyState === "closed"));
 });
 

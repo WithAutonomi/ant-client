@@ -829,9 +829,19 @@ impl BrowserNodeClientCore {
         })
     }
 
+    /// A locally closed session is disconnected whatever `readyState` says.
+    /// node-datachannel reports a closed channel as open until its event loop
+    /// dispatches the close, so trusting `readyState` alone let the admission
+    /// retry reuse a dead session without ever yielding for that close to land
+    /// (V2-1305).
     fn is_connected(&self) -> bool {
         self.connection.borrow().as_ref().is_some_and(|connection| {
             connection.data_channel.ready_state() == RtcDataChannelState::Open
+                && connection
+                    .rpc
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|rpc| !rpc.is_closed())
         })
     }
 
@@ -937,6 +947,9 @@ impl BrowserNodeClientCore {
                     client.authenticated_generation = Some(generation);
                     return Ok(client);
                 }
+                // Retry through `hello()`, which redials because a closed
+                // session is not `is_connected()`. That redial is what makes
+                // this loop yield; without it the retry never awaits anything.
                 Err(_)
                     if rpc.is_closed()
                         && !self.pool_is_closed()
@@ -1111,9 +1124,7 @@ impl LockedBrowserClient<'_> {
 
     pub(super) async fn hello(&self) -> Result<BrowserHello, String> {
         if let Some(hello) = self.hello.borrow().clone() {
-            if self.connection.borrow().as_ref().is_some_and(|connection| {
-                connection.data_channel.ready_state() == RtcDataChannelState::Open
-            }) {
+            if self.is_connected() {
                 return Ok(hello);
             }
         }
