@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { test_parallel_lanes, test_active_data_lane_capacity } from "./pkg/ant_core.js";
+import { test_parallel_lanes, test_active_data_lane_capacity, test_redial_after_local_close } from "./pkg/ant_core.js";
 import { closesSettled, mockWebRtc } from "./mock-webrtc.mjs";
 const object = value => value instanceof Map ? Object.fromEntries([...value].map(([k,v]) => [k, object(v)])) : value;
 
@@ -57,6 +57,14 @@ test("closing a pool wakes both active lanes and releases the association", asyn
   assert.equal(rtc.connections.length, 1);
   await closesSettled();
   assert.ok(rtc.connections[0].channels.every(c => c.readyState === "closed"));
+});
+
+test("a lane closed locally redials a fresh association rather than reusing its own", async () => {
+  const rtc = mockWebRtc([{}]);
+  await test_redial_after_local_close(rtc.endpoints[0]);
+  // The retired channel still read "open" when the redial began.
+  assert.equal(rtc.connections.length, 2);
+  assert.equal(rtc.connections[0].channels.length, 1);
 });
 
 test("an active data lease cannot be evicted by another peer", async () => {

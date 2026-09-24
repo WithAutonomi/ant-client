@@ -559,7 +559,27 @@ struct BrowserPutResponse {
 /// cancelled exchange retires only its channel; the other lane remains usable.
 struct PeerAssociation {
     connection: RtcPeerConnection,
-    channels: RefCell<Vec<RtcDataChannel>>,
+    channels: RefCell<Vec<AssociationChannel>>,
+}
+
+/// One lane's channel, with the inbox that records when this client stopped
+/// using it.
+struct AssociationChannel {
+    channel: RtcDataChannel,
+    inbox: Rc<ResponseInbox>,
+}
+
+impl AssociationChannel {
+    /// Open and still in use. A lane closed locally fails its inbox at once,
+    /// while node-datachannel keeps reporting the channel open until the
+    /// deferred close lands.
+    fn is_live(&self) -> bool {
+        self.channel.ready_state() == RtcDataChannelState::Open && !self.inbox.is_failed()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.channel.ready_state() == RtcDataChannelState::Closed
+    }
 }
 
 impl Deref for PeerAssociation {
@@ -570,11 +590,15 @@ impl Deref for PeerAssociation {
 }
 
 impl PeerAssociation {
-    fn has_open_channel(&self) -> bool {
+    /// Reuse the association only while another lane still uses it. A
+    /// channel this client has retired may still read "open", and reusing its
+    /// association could put a new channel on a dead SCTP association without
+    /// counting the failure as a dial.
+    fn has_live_channel(&self) -> bool {
         self.channels
             .borrow()
             .iter()
-            .any(|channel| channel.ready_state() == RtcDataChannelState::Open)
+            .any(AssociationChannel::is_live)
     }
 }
 
@@ -609,7 +633,7 @@ impl Connection {
         let mut association = source.lock().await;
         let existing = association
             .upgrade()
-            .filter(|connection| connection.has_open_channel());
+            .filter(|connection| connection.has_live_channel());
         let fresh = existing.is_none();
         attempted_dial.set(fresh);
         let peer_connection = if let Some(existing) = existing {
@@ -629,7 +653,7 @@ impl Connection {
             .channels
             .borrow()
             .iter()
-            .filter(|channel| channel.ready_state() != RtcDataChannelState::Closed)
+            .filter(|channel| !channel.is_closed())
             .count()
             >= 2
         {
@@ -642,13 +666,16 @@ impl Connection {
             &channel_configuration,
         );
         data_channel.set_binary_type(RtcDataChannelType::Arraybuffer);
+        let inbox = ResponseInbox::new();
         {
             let mut channels = peer_connection.channels.borrow_mut();
-            channels.retain(|channel| channel.ready_state() != RtcDataChannelState::Closed);
-            channels.push(data_channel.clone());
+            channels.retain(|channel| !channel.is_closed());
+            channels.push(AssociationChannel {
+                channel: data_channel.clone(),
+                inbox: Rc::clone(&inbox),
+            });
         }
 
-        let inbox = ResponseInbox::new();
         let (open_tx, open_rx) = oneshot::channel::<Result<(), String>>();
         let open_tx = Rc::new(RefCell::new(Some(open_tx)));
         let message_inbox = Rc::clone(&inbox);

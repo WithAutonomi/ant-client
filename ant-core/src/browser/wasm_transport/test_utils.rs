@@ -1216,6 +1216,22 @@ pub async fn test_stale_rpc_admission(endpoint: &str) {
     client.close();
 }
 
+/// Redial a lane whose session this client closed while an in-flight exchange
+/// still keeps its association alive.
+#[wasm_bindgen]
+pub async fn test_redial_after_local_close(endpoint: &str) {
+    let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
+    client.hello().await.unwrap();
+    let in_flight = client.connection.borrow().clone();
+    client
+        .current_rpc()
+        .unwrap()
+        .close("test closed the session".into());
+    client.hello().await.unwrap();
+    drop(in_flight);
+    client.close();
+}
+
 /// A client admitted on a session that then closes must fail, not redial.
 #[wasm_bindgen]
 pub async fn test_admitted_hello_never_redials(endpoint: &str) {
