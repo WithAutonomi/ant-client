@@ -1129,6 +1129,13 @@ impl LockedBrowserClient<'_> {
         if self.is_connected() && self.hello.borrow().is_some() {
             return Ok(());
         }
+        // An admitted client is bound to the session it was admitted on. A
+        // redial here would build a connection that the stale generation then
+        // refuses to use, left attached to a `BrowserNodeSession` that is
+        // documented never to reconnect.
+        if self.authenticated_generation.is_some() {
+            return Err("authenticated session closed".to_string());
+        }
         self.ensure_connected().await?;
         let response = timeout(
             self.request(BrowserRequestBody::Hello, &[]),
