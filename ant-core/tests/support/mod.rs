@@ -29,6 +29,7 @@ use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitme
 use ant_node::storage::{AntProtocol, ChunkStore, ChunkStoreConfig, MigrationConfig};
 // Wire / transport / EVM types: route through ant-protocol so the test
 // harness exercises the same surface the client does.
+use ant_protocol::chunk::{ChunkMessage, ChunkMessageBody};
 use ant_protocol::evm::{testnet::Testnet, Network as EvmNetwork, RewardsAddress, Wallet};
 use ant_protocol::pqc::ops::{MlDsaOperations, MlDsaSecretKey};
 use ant_protocol::transport::{
@@ -37,6 +38,7 @@ use ant_protocol::transport::{
 use ant_protocol::{CLOSE_GROUP_SIZE, MAX_WIRE_MESSAGE_SIZE};
 use rand::Rng;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -95,7 +97,50 @@ pub fn test_client_config() -> ClientConfig {
 pub struct TestNode {
     pub p2p_node: Option<Arc<P2PNode>>,
     pub protocol: Option<Arc<AntProtocol>>,
+    /// Which pointer requests the node takes off the wire and ignores.
+    pub pointer_silence: Arc<PointerSilence>,
     _handler_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Switches that make a node ignore pointer requests while staying in the
+/// network, as a peer that is up but unreachable for them would.
+///
+/// A silenced request is read off the wire and dropped: nothing is stored and
+/// nothing is answered, so the sender waits out its own timeout. Everything
+/// else the node handles as usual. Lets a test choose how many of a close group
+/// a read or a write actually reaches, over the real transport.
+///
+/// The decision is taken as each message arrives, before any work is spawned
+/// for it, so a request that arrived while its kind was silenced is dropped
+/// even if the switch is lifted a moment later.
+#[derive(Default)]
+pub struct PointerSilence {
+    /// Ignore pointer GETs.
+    pub gets: AtomicBool,
+    /// Ignore pointer PUTs.
+    pub puts: AtomicBool,
+}
+
+impl PointerSilence {
+    /// Whether `data` is a pointer request this node is ignoring.
+    fn drops(&self, data: &[u8]) -> bool {
+        let gets = self.gets.load(Ordering::Relaxed);
+        let puts = self.puts.load(Ordering::Relaxed);
+        if !gets && !puts {
+            return false;
+        }
+        match ChunkMessage::decode(data) {
+            Ok(ChunkMessage {
+                body: ChunkMessageBody::PointerGetRequest(_),
+                ..
+            }) => gets,
+            Ok(ChunkMessage {
+                body: ChunkMessageBody::PointerPutRequest(_),
+                ..
+            }) => puts,
+            _ => false,
+        }
+    }
 }
 
 pub struct MiniTestnet {
@@ -150,7 +195,7 @@ impl MiniTestnet {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
             let temp_dir = tempfile::TempDir::new().expect("create temp dir");
-            let (node, protocol, handler) = Self::spawn_node(
+            let (node, protocol, pointer_silence, handler) = Self::spawn_node(
                 addr,
                 &bootstrap_addrs,
                 temp_dir.path(),
@@ -164,6 +209,7 @@ impl MiniTestnet {
             nodes.push(TestNode {
                 p2p_node: Some(Arc::clone(&node)),
                 protocol: Some(protocol),
+                pointer_silence,
                 _handler_task: Some(handler),
             });
             temp_dirs.push(temp_dir);
@@ -176,7 +222,7 @@ impl MiniTestnet {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
             let temp_dir = tempfile::TempDir::new().expect("create temp dir");
-            let (node, protocol, handler) = Self::spawn_node(
+            let (node, protocol, pointer_silence, handler) = Self::spawn_node(
                 addr,
                 &bootstrap_addrs,
                 temp_dir.path(),
@@ -189,6 +235,7 @@ impl MiniTestnet {
             nodes.push(TestNode {
                 p2p_node: Some(Arc::clone(&node)),
                 protocol: Some(protocol),
+                pointer_silence,
                 _handler_task: Some(handler),
             });
             temp_dirs.push(temp_dir);
@@ -290,7 +337,12 @@ impl MiniTestnet {
         evm_network: &EvmNetwork,
         node_index: usize,
         commitment_key_count: Option<u32>,
-    ) -> (Arc<P2PNode>, Arc<AntProtocol>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        Arc<P2PNode>,
+        Arc<AntProtocol>,
+        Arc<PointerSilence>,
+        tokio::task::JoinHandle<()>,
+    ) {
         // Generate ML-DSA-65 identity for this node
         let identity = Arc::new(NodeIdentity::generate().expect("generate node identity"));
 
@@ -401,6 +453,8 @@ impl MiniTestnet {
         }
 
         // Start message handler loop
+        let pointer_silence = Arc::new(PointerSilence::default());
+        let handler_silence = Arc::clone(&pointer_silence);
         let handler_node = Arc::clone(&node);
         let handler_protocol = Arc::clone(&protocol);
         let handler = tokio::spawn(async move {
@@ -413,6 +467,10 @@ impl MiniTestnet {
                         data,
                         ..
                     }) => {
+                        if topic == ant_protocol::CHUNK_PROTOCOL_ID && handler_silence.drops(&data)
+                        {
+                            continue;
+                        }
                         let protocol = Arc::clone(&handler_protocol);
                         let node = Arc::clone(&handler_node);
                         let topic_clone = topic.clone();
@@ -457,7 +515,7 @@ impl MiniTestnet {
             }
         });
 
-        (node, protocol, handler)
+        (node, protocol, pointer_silence, handler)
     }
 
     /// Shut down a node by index, simulating a failure.
