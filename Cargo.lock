@@ -840,7 +840,7 @@ version = "0.10.0"
 dependencies = [
  "alloy",
  "ant-node",
- "ant-protocol 2.5.0",
+ "ant-protocol",
  "anyhow",
  "async-stream",
  "async-trait",
@@ -909,10 +909,9 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19a35999e85e8c5e854fbc36a0da1089812406407c19212532cd19b86991add3"
+source = "git+https://github.com/WithAutonomi/ant-node.git?rev=9de2bf29da95fc2f6e4ba81bea562707e8b234a0#9de2bf29da95fc2f6e4ba81bea562707e8b234a0"
 dependencies = [
- "ant-protocol 2.4.0",
+ "ant-protocol",
  "bao",
  "blake3",
  "bytes",
@@ -961,27 +960,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c7b4fbfd0a8b397d0dc1a0dc7308308242911147224c4e1a56130168e7ad48f"
-dependencies = [
- "blake3",
- "bytes",
- "evmlib",
- "hex",
- "postcard",
- "rmp-serde",
- "saorsa-core",
- "saorsa-pqc",
- "serde",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ant-protocol"
-version = "2.5.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=feat%2Fpointers-immutable-owner#96e61a55c479bf42c3ea0f7147552700775ae516"
+version = "3.1.0"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=34b7832a001df8b80b18555ca058734baae43496#34b7832a001df8b80b18555ca058734baae43496"
 dependencies = [
  "blake3",
  "bytes",
