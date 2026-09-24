@@ -762,8 +762,17 @@ impl Connection {
         Ok(connection)
     }
 
+    fn rpc(&self) -> Option<Rc<multiplex::RpcSession>> {
+        self.rpc.borrow().clone()
+    }
+
+    fn is_live(&self) -> bool {
+        self.data_channel.ready_state() == RtcDataChannelState::Open
+            && self.rpc().is_some_and(|rpc| !rpc.is_closed())
+    }
+
     fn close(&self) {
-        if let Some(rpc) = self.rpc.borrow().as_ref() {
+        if let Some(rpc) = self.rpc() {
             rpc.close("WebRTC connection closed".into());
         }
         self.inbox.fail("WebRTC connection closed".into());
@@ -819,14 +828,12 @@ impl BrowserNodeClientCore {
         self.peer_id.borrow().clone()
     }
 
+    fn current_rpc(&self) -> Option<Rc<multiplex::RpcSession>> {
+        self.connection.borrow().as_ref().and_then(|c| c.rpc())
+    }
+
     fn has_pending_requests(&self) -> bool {
-        self.connection.borrow().as_ref().is_some_and(|connection| {
-            connection
-                .rpc
-                .borrow()
-                .as_ref()
-                .is_some_and(|rpc| rpc.is_busy())
-        })
+        self.current_rpc().is_some_and(|rpc| rpc.is_busy())
     }
 
     /// A locally closed session is disconnected whatever `readyState` says.
@@ -835,14 +842,10 @@ impl BrowserNodeClientCore {
     /// retry reuse a dead session without ever yielding for that close to land
     /// (V2-1305).
     fn is_connected(&self) -> bool {
-        self.connection.borrow().as_ref().is_some_and(|connection| {
-            connection.data_channel.ready_state() == RtcDataChannelState::Open
-                && connection
-                    .rpc
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|rpc| !rpc.is_closed())
-        })
+        self.connection
+            .borrow()
+            .as_ref()
+            .is_some_and(|connection| connection.is_live())
     }
 
     async fn ensure_connected(&self) -> Result<(), String> {
@@ -887,7 +890,7 @@ impl BrowserNodeClientCore {
         if let Some(cache) = &self.dial_failures {
             cache.borrow_mut().record_success(&self.endpoint.peer_id);
         }
-        if let Some(rpc) = connection.rpc.borrow().as_ref() {
+        if let Some(rpc) = connection.rpc() {
             rpc.set_pool(self.pool_availability.as_ref());
         }
         self.connection.replace(Some(Rc::new(connection)));
@@ -932,10 +935,7 @@ impl BrowserNodeClientCore {
             client.hello().await?;
             client._guard.take();
             let rpc = self
-                .connection
-                .borrow()
-                .as_ref()
-                .and_then(|c| c.rpc.borrow().clone())
+                .current_rpc()
                 .ok_or_else(|| "WebRTC session unavailable".to_string())?;
             let generation = self.generation.get();
             match rpc.admit(admission.remaining()).await {
@@ -1084,9 +1084,7 @@ impl LockedBrowserClient<'_> {
             .clone()
             .ok_or_else(|| "WebRTC DataChannel is not connected".to_string())?;
         let rpc = connection
-            .rpc
-            .borrow()
-            .clone()
+            .rpc()
             .ok_or_else(|| "WebRTC session is unavailable".to_string())?;
         let request_id = self.next_request_id.get();
         self.next_request_id.set(request_id.wrapping_add(1).max(1));
@@ -1167,12 +1165,7 @@ impl LockedBrowserClient<'_> {
             .iter()
             .any(|cap| cap == multiplex::CAPABILITY)
         {
-            if let Some(rpc) = self
-                .connection
-                .borrow()
-                .as_ref()
-                .and_then(|c| c.rpc.borrow().clone())
-            {
+            if let Some(rpc) = self.current_rpc() {
                 rpc.enable_multiplex();
             }
         }
@@ -3106,10 +3099,7 @@ impl BrowserNodeSession {
         client._guard.take();
         let rpc = self
             .inner
-            .connection
-            .borrow()
-            .as_ref()
-            .and_then(|c| c.rpc.borrow().clone())
+            .current_rpc()
             .ok_or_else(|| JsValue::from_str("session closed"))?;
         let slot = rpc
             .admit(RPC_ADMISSION_TIMEOUT)
