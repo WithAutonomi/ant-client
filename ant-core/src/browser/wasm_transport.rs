@@ -237,7 +237,7 @@ impl BrowserClientLease {
                     if sender.is_canceled() {
                         return Err("lookup waiter cancelled".to_string());
                     }
-                    client.hello().await?;
+                    client.authenticate().await?;
                     drop(client);
                     let client = match select(
                         Box::pin(self.client.authenticated_before(&self.admission)),
@@ -934,7 +934,7 @@ impl BrowserNodeClientCore {
     ) -> Result<LockedBrowserClient<'_>, RpcError> {
         loop {
             let mut client = self.lock_before(admission).await?;
-            client.hello().await?;
+            client.authenticate().await?;
             client._guard.take();
             let rpc = self
                 .current_rpc()
@@ -1122,11 +1122,12 @@ impl LockedBrowserClient<'_> {
         Ok((response, read_permit))
     }
 
-    pub(super) async fn hello(&self) -> Result<BrowserHello, String> {
-        if let Some(hello) = self.hello.borrow().clone() {
-            if self.is_connected() {
-                return Ok(hello);
-            }
+    /// Authenticate this lane, reusing the cached HELLO while the session is
+    /// live. Callers that only need the session use this rather than `hello()`
+    /// and skip cloning the HELLO on every RPC.
+    async fn authenticate(&self) -> Result<(), String> {
+        if self.is_connected() && self.hello.borrow().is_some() {
+            return Ok(());
         }
         self.ensure_connected().await?;
         let response = timeout(
@@ -1172,8 +1173,16 @@ impl LockedBrowserClient<'_> {
             }
         }
         self.peer_id.replace(Some(peer_id));
-        self.hello.replace(Some(hello.clone()));
-        Ok(hello)
+        self.hello.replace(Some(hello));
+        Ok(())
+    }
+
+    pub(super) async fn hello(&self) -> Result<BrowserHello, String> {
+        self.authenticate().await?;
+        self.hello
+            .borrow()
+            .clone()
+            .ok_or_else(|| "authenticated session closed".to_string())
     }
 
     pub(super) async fn find_node(
