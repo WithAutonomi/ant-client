@@ -1232,6 +1232,21 @@ pub async fn test_redial_after_local_close(endpoint: &str) {
     client.close();
 }
 
+/// Report the error a pooled RPC sees when its session closes after admission.
+#[wasm_bindgen]
+pub async fn test_closed_session_error(endpoint: &str) -> String {
+    let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
+    let admitted = client.authenticated().await.unwrap();
+    client
+        .current_rpc()
+        .unwrap()
+        .close("test closed the session".into());
+    let error = admitted.find_node(&"11".repeat(32), 20).await.unwrap_err();
+    drop(admitted);
+    client.close();
+    error
+}
+
 /// A client admitted on a session that then closes must fail, not redial.
 #[wasm_bindgen]
 pub async fn test_admitted_hello_never_redials(endpoint: &str) {

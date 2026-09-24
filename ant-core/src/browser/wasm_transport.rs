@@ -1115,9 +1115,10 @@ impl LockedBrowserClient<'_> {
         if matches!(&body, BrowserRequestBody::Hello) {
             self.ensure_connected().await?;
         } else if !self.is_connected() || self.hello.borrow().is_none() {
-            return Err("authenticated session required; call connect() again"
-                .to_string()
-                .into());
+            // Pooled callers redial on their next admission, so name the
+            // closed session rather than ask them to reconnect. An explicit
+            // `BrowserNodeSession` gets its reconnect hint from `active()`.
+            return Err("WebRTC session closed".to_string().into());
         }
         let connection = self
             .connection
