@@ -899,6 +899,17 @@ impl BrowserNodeClientCore {
         Ok(())
     }
 
+    /// Drop the connection if it still carries `rpc`, so the next HELLO must
+    /// redial. A session another caller has already replaced is left alone.
+    fn retire(&self, rpc: &Rc<multiplex::RpcSession>) {
+        if self
+            .current_rpc()
+            .is_some_and(|current| Rc::ptr_eq(&current, rpc))
+        {
+            self.close();
+        }
+    }
+
     fn pool_is_closed(&self) -> bool {
         self.pool_availability
             .as_ref()
@@ -941,24 +952,25 @@ impl BrowserNodeClientCore {
                 .ok_or_else(|| "WebRTC session unavailable".to_string())?;
             let generation = self.generation.get();
             match rpc.admit(admission.remaining()).await {
-                Ok(slot) => {
-                    if generation != self.generation.get() {
-                        continue;
-                    }
+                Ok(_) if generation != self.generation.get() => continue,
+                Ok(slot) if !rpc.is_closed() => {
                     client.slot.replace(Some(slot));
                     client.authenticated_generation = Some(generation);
                     return Ok(client);
                 }
-                // Retry through `hello()`, which redials because a closed
-                // session is not `is_connected()`. That redial is what makes
-                // this loop yield; without it the retry never awaits anything.
-                Err(_)
-                    if rpc.is_closed()
-                        && !self.pool_is_closed()
-                        && !admission.remaining().is_zero() =>
+                // The session closed before or during admission (tokio refuses
+                // a closed semaphore, so a closed `Ok` is only defensive).
+                // Retire it so the next pass must redial: that redial is the
+                // await that lets this loop yield, whatever `readyState` or
+                // the liveness checks report (V2-1305).
+                _ if rpc.is_closed()
+                    && !self.pool_is_closed()
+                    && !admission.remaining().is_zero() =>
                 {
-                    continue
+                    self.retire(&rpc);
+                    continue;
                 }
+                Ok(_) => return Err("WebRTC session closed".to_string().into()),
                 Err(error) => return Err(error),
             }
         }
