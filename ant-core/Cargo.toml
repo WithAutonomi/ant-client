@@ -1,6 +1,6 @@
 [package]
 name = "ant-core"
-version = "0.10.0-rc.1"
+version = "0.10.0"
 edition = "2021"
 description = "Headless Rust library for the Autonomi network: data storage and retrieval with self-encryption and EVM payments, plus node lifecycle management."
 license = "MIT OR Apache-2.0"
@@ -26,7 +26,7 @@ serde_bytes = "0.11"
 serde_json = "1"
 self_encryption = "0.36"
 # Portable WebRTC Direct profile shared with ant-node.
-saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", branch = "rc-2026.9.3", default-features = false, features = ["webrtc"] }
+saorsa-transport = { version = "0.37.0", default-features = false, features = ["webrtc"] }
 thiserror = "2"
 url = "2"
 web-time = "1.1"
@@ -57,7 +57,7 @@ tower-http = { version = "0.6.8", features = ["cors"], optional = true }
 # under `ant_protocol::{evm, transport, pqc}`. This is the ONE pin for
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "rc-2026.9.3", default-features = false, features = ["rpc"] }
+ant-protocol = { version = "3.0.0", default-features = false, features = ["rpc"] }
 xor_name = { version = "5" }
 futures = { version = "0.3" }
 tracing = { version = "0.1" }
@@ -79,7 +79,7 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"], o
 # `MultiAddr` mutually incompatible in `node/devnet.rs`. The draft node
 # revision below carries the same reviewed core/transport pins as this
 # workspace and uses the same released ant-protocol lineage.
-ant-node = { git = "https://github.com/WithAutonomi/ant-node", branch = "rc-2026.9.3", optional = true }
+ant-node = { version = "0.20.0", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # Browser bindings are optional so ordinary native consumers do not pull the
@@ -168,7 +168,7 @@ test-utils = ["dep:fips204"]
 # always compile even without the `devnet` feature. Pinned to the same
 # version as the runtime dep so there is a single ant-node /
 # saorsa-core version across the whole graph.
-ant-node = { git = "https://github.com/WithAutonomi/ant-node", branch = "rc-2026.9.3", features = ["test-utils"] }
+ant-node = { version = "0.20.0", features = ["test-utils"] }
 serial_test = "3"
 anyhow = "1"
 alloy = { version = "1.6", features = ["node-bindings"] }
