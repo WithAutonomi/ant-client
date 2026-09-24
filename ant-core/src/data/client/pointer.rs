@@ -7,13 +7,12 @@
 //!
 //! # What the client owns
 //!
-//! - **The counter.** Creation is counter 0 and an update steps it by one, so
-//!   one payment buys one state and at most one increment.
-//!   [`Client::pointer_update`] reads the current record and steps it, because
-//!   guessing the counter is the one way to write an update the network
-//!   refuses. A node also takes a state at the counter it already holds when
-//!   that state wins the merge rule's target tie-break — separately paid, and
-//!   how two concurrent updates converge instead of splitting the group.
+//! - **The counter.** Creation is counter 0 and [`Client::pointer_update`]
+//!   signs one past the counter the network serves, because the update has to
+//!   beat it. A node takes any paid state that beats what it holds, so a
+//!   counter may skip, a peer that missed updates takes the next one, and two
+//!   states at one counter converge on the smaller target until a later
+//!   counter replaces both.
 //! - **Paying at the state, not the address.** The quote names `state_id`, while
 //!   the close group that issues it is the one around the address. Paying at the
 //!   address would buy every future update at once.
@@ -284,9 +283,9 @@ impl Client {
 
     /// Update the pointer owned by `owner` to `target`, at `counter + 1`.
     ///
-    /// Reads the current record first: an update must be one past what the
-    /// network holds, so the counter cannot be guessed. A pointer that does not
-    /// exist yet is created at 0.
+    /// Reads the current record first, because the update has to beat what the
+    /// network serves: it is signed one past that counter. A pointer that does
+    /// not exist yet is created at 0.
     ///
     /// # Errors
     ///
@@ -332,7 +331,7 @@ impl Client {
         self.pointer_group(&address).await?;
 
         // The quote names the state; the peers that may issue it are the close
-        // group around the address. One payment, one increment.
+        // group around the address. One payment, one state.
         let (proof, _) = self
             .pay_for_storage_split(
                 &address,
@@ -613,9 +612,8 @@ mod tests {
         PointerTarget::new(PointerTargetKind::Chunk, [byte; 32])
     }
 
-    /// The client's half of "pay to create, pay to update": a create is counter
-    /// 0 and every update is exactly one more, so one payment buys one
-    /// increment and the node never has to refuse a guessed counter.
+    /// A create is counter 0 and each update the client builds is one more,
+    /// the smallest counter that beats the record it read.
     #[test]
     fn the_client_creates_at_zero_and_steps_by_one() {
         let (pk, sk) = keypair(1);
