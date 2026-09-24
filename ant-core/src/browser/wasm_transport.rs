@@ -766,8 +766,15 @@ impl Connection {
         self.rpc.borrow().clone()
     }
 
+    /// Usable for a new RPC. Every local close (a failed exchange, malformed
+    /// ingress, a channel error) fails the inbox or closes the RPC session at
+    /// once, but `readyState` can lag: node-datachannel reports a closed
+    /// channel as open until its event loop dispatches the close. A retry that
+    /// trusted `readyState` alone reused the dead session without ever
+    /// yielding for that close to land (V2-1305).
     fn is_live(&self) -> bool {
         self.data_channel.ready_state() == RtcDataChannelState::Open
+            && !self.inbox.is_failed()
             && self.rpc().is_some_and(|rpc| !rpc.is_closed())
     }
 
@@ -836,11 +843,6 @@ impl BrowserNodeClientCore {
         self.current_rpc().is_some_and(|rpc| rpc.is_busy())
     }
 
-    /// A locally closed session is disconnected whatever `readyState` says.
-    /// node-datachannel reports a closed channel as open until its event loop
-    /// dispatches the close, so trusting `readyState` alone let the admission
-    /// retry reuse a dead session without ever yielding for that close to land
-    /// (V2-1305).
     fn is_connected(&self) -> bool {
         self.connection
             .borrow()

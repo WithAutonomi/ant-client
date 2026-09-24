@@ -12,10 +12,13 @@ test("idle pooled connections reject unsolicited messages immediately", async ()
     for (let i = 0; i < 256; i++) {
       connection.channel.emit(new Uint8Array(16_384).buffer);
     }
+    // The failed inbox retires the session at once, before the deferred
+    // DataChannel close has landed and while readyState still reads "open".
+    assert.equal(connection.channel.readyState, "open");
+    await assert.rejects(client.hello(), /session closed/);
     await closesSettled();
     assert.equal(connection.closed, true);
     // The failed association must not poison subsequent requests.
-    await assert.rejects(client.hello(), /session closed/);
     client = await new BrowserNodeClient(rtc.endpoints[0]).connect();
     assert.equal(rtc.connections.length, 2);
   } finally {
