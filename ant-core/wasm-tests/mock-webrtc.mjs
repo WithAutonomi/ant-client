@@ -6,11 +6,17 @@ export const paymentNetwork = {
   payment_vault_address: `0x${"22".repeat(20)}`,
 };
 
-// A DataChannel close completes two setImmediate turns after close() (see
-// Channel.close below). Await this before asserting that a channel, or the
-// peer connection its last close releases, has closed.
+// DataChannel closes still in flight (see Channel.close below).
+const pendingCloses = new Set();
+
+// Await this before asserting that a channel, or the peer connection its last
+// close releases, has closed. It also waits for closes requested while it
+// waits, such as sibling channels closed in reaction to a close event.
 export async function closesSettled() {
-  for (let turn = 0; turn < 2; turn++) await new Promise(resolve => setImmediate(resolve));
+  do {
+    await Promise.all(pendingCloses);
+    await new Promise(resolve => setImmediate(resolve));
+  } while (pendingCloses.size);
 }
 
 // Reset for each test. Only browser-owned RTC objects are mocked; all node
@@ -66,7 +72,15 @@ export function mockWebRtc(nodes = [{}]) {
     close() {
       if (this.readyState === "closed" || this.closeRequested) return;
       this.closeRequested = true;
-      setImmediate(() => setImmediate(() => this.finishClose()));
+      const closed = new Promise(resolve => setImmediate(() => setImmediate(() => {
+        try {
+          this.finishClose();
+        } finally {
+          resolve();
+        }
+      })));
+      pendingCloses.add(closed);
+      closed.then(() => pendingCloses.delete(closed));
     }
     finishClose() {
       this.readyState = "closed";
