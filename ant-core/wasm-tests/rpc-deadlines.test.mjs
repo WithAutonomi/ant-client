@@ -53,6 +53,9 @@ test("a queued pooled RPC authenticates a replacement after response timeout", a
     return false;
   } }]);
   const results = await requests(rtc);
+  // A redial takes milliseconds after the 300 ms response timeout; a spin
+  // holds the queued RPCs until the admission deadline.
+  assert.ok(results.every(r => r.finishedMs < 5_000), JSON.stringify(results));
   assert.match(results[0].result, /response.*timed out/);
   assert.deepEqual(results.slice(1).map(r => r.result), ["ok", "ok"]);
   assert.equal(rtc.connections.length, 2);
