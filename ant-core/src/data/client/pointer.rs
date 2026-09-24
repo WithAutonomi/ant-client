@@ -1,4 +1,4 @@
-//! Client operations for pointers (ADR-0015 in `ant-node`).
+//! Client operations for pointers (ADR-0016 in `ant-node`).
 //!
 //! A pointer is a mutable, owner-signed reference stored at
 //! `BLAKE3::derive_key("autonomi.pointer.address.v1", owner_key)`. Public-key
@@ -877,7 +877,7 @@ mod tests {
         }
 
         // And once a second peer confirms it, it is the answer — that is the
-        // bar, and two colluding peers can clear it. See ADR-0015.
+        // bar, and two colluding peers can clear it. See ADR-0016.
         let seen = tally(vec![
             singleton_reply(),
             singleton_reply(),
