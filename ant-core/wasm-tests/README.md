@@ -102,6 +102,14 @@ Early misses do not establish absence, peers are deduplicated within a round,
 and a slow early GET can race a different final holder. Native seeds this shared
 policy from its routing table; WebRTC also publishes validated lookup replies
 as they arrive. Write discovery and witness admission remain unchanged.
+Both targets now permit one additional early candidate after a one-second stall,
+while preserving the two-GET maximum even when discovery completes. Shared tests
+cover the delay, slot handoff, deduplication, and fatal integrity errors. The lane
+tests check that a failed cold dial is not repeated by the other queued lane.
+Early candidates use authenticated connections, with WebRTC preconnections
+publishing hints once ready. Download regressions cover cold closer addresses
+blocking neither slot ahead of a ready holder, and retaining the twenty-peer
+fallback allowance after more than seven early misses.
 
 `parallel-lanes.test.mjs` checks the two-channel transport profile: discovery and
 quotes use the control channel; GET/PUT use an independent authenticated data

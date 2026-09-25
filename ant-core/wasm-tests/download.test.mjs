@@ -77,6 +77,56 @@ test("a newly discovered holder is readable before a slow lookup round finishes"
   } finally { clearTimeout(deadline); reader?.close(); client.close(); }
 });
 
+test("early misses do not exhaust the fallback allowance before a later holder", async () => {
+  const nodes = Array.from({ length: 12 }, () => ({
+    respond: (_channel, method) => method === "find_node" ? false : undefined,
+  }));
+  const rtc = mockWebRtc(nodes);
+  const target = BigInt(`0x${datamap.address}`);
+  const ordered = rtc.endpoints.map((endpoint, index) => ({index,
+    distance: BigInt(`0x${parseWebRtcDirectMultiaddr(endpoint).peerId}`) ^ target,
+  })).sort((a,b) => a.distance < b.distance ? -1 : 1);
+  // Seven misses must not prevent trying a holder already in the bounded
+  // candidate set while the ordinary discovery walk is still outstanding.
+  const holder = ordered[8].index;
+  nodes[holder].chunk = datamap.content;
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let reader, deadline;
+  try {
+    reader = await Promise.race([
+      client.openPublicFile(datamap.address),
+      new Promise((_, reject) => deadline = setTimeout(() => reject(new Error("speculation exhausted before holder")), 1500)),
+    ]);
+    assert.equal(reader.size, content.length);
+    const gets = rtc.requests.filter(r => r.method === "get_chunk");
+    assert.ok(gets.some(r => r.node === holder));
+    assert.equal(new Set(gets.map(r => r.node)).size, gets.length);
+  } finally { clearTimeout(deadline); reader?.close(); client.close(); }
+});
+
+test("cold closer hints cannot occupy the read slots before a connected holder", async () => {
+  const nodes = [{ view: [1, 2, 3] }, {}, {}, {}];
+  const rtc = mockWebRtc(nodes);
+  const target = BigInt(`0x${datamap.address}`);
+  const ordered = [1, 2, 3].sort((a, b) => {
+    const distance = i => BigInt(`0x${parseWebRtcDirectMultiaddr(rtc.endpoints[i]).peerId}`) ^ target;
+    return distance(a) < distance(b) ? -1 : 1;
+  });
+  for (const i of ordered.slice(0, 2)) nodes[i].connectDelay = 2500;
+  const holder = ordered[2]; nodes[holder].chunk = datamap.content;
+  const client = new BrowserNetworkClient(rtc.endpoints.slice(0, 1));
+  let reader, deadline;
+  try {
+    reader = await Promise.race([
+      client.openPublicFile(datamap.address),
+      new Promise((_, reject) => deadline = setTimeout(() => reject(new Error("cold hints occupied read slots")), 1500)),
+    ]);
+    assert.equal(reader.size, content.length);
+    assert.ok(rtc.requests.some(r => r.node === holder && r.method === "get_chunk"));
+    assert.ok(!rtc.requests.some(r => ordered.slice(0, 2).includes(r.node) && r.method === "get_chunk"));
+  } finally { clearTimeout(deadline); reader?.close(); client.close(); }
+});
+
 test("shared Client rejects corrupt content immediately, matching native GET", async () => {
   const rtc = mockWebRtc(Array.from({ length: 24 }, () => ({ chunk: new Uint8Array([1, 2, 3]), respond: failDiscovery })));
   const client = new BrowserNetworkClient(rtc.endpoints);

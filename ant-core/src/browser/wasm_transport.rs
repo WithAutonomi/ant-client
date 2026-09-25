@@ -91,6 +91,8 @@ mod upload_adapter;
 use ant_protocol::transport::{client_routing, PeerId};
 use shared::{native_quote_artifact, SharedNetworkAdapter};
 #[cfg(feature = "test-utils")]
+mod diagnostics;
+#[cfg(feature = "test-utils")]
 mod test_utils;
 use inbox::ResponseInbox;
 
@@ -444,10 +446,26 @@ impl BrowserClientPool {
             .is_suppressed(&peer.to_string(), &endpoint.multiaddr)
     }
 
+    /// Read speculation must not wait for a cold association to open.
+    fn has_authenticated_connection(&self, endpoint: &BrowserEndpoint) -> bool {
+        self.clients
+            .borrow()
+            .get(&endpoint.multiaddr)
+            .is_some_and(|entry| {
+                [&entry.client, &entry.data_client]
+                    .iter()
+                    .any(|client| client.is_connected() && client.hello.borrow().is_some())
+            })
+    }
+
     /// Overlap ICE/PQ/HELLO with the iterative walk, using only owner-signed
-    /// addresses that `find_node` has already verified. These are connection
-    /// hints, not successful lookup votes or storage acknowledgements.
-    fn preconnect(self: &Rc<Self>, nodes: &[BrowserNode]) {
+    /// addresses that `find_node` has already verified. Publish a read hint
+    /// after authentication; these are not lookup votes or storage receipts.
+    fn preconnect(
+        self: &Rc<Self>,
+        nodes: &[BrowserNode],
+        read_progress: Option<crate::data::network::ReadProgress>,
+    ) {
         for node in nodes {
             let at_capacity = {
                 let clients = self.clients.borrow();
@@ -487,6 +505,8 @@ impl BrowserClientPool {
             }
             let pool = Rc::clone(self);
             let endpoint = endpoint.clone();
+            let read_progress = read_progress.clone();
+            let node = node.clone();
             self.preconnecting
                 .borrow_mut()
                 .insert(endpoint.multiaddr.clone());
@@ -501,7 +521,13 @@ impl BrowserClientPool {
                                 ))),
                             )
                             .await?;
-                        lease.hello().await.map_err(RpcError::Transport)
+                        let hello = lease.hello().await.map_err(RpcError::Transport)?;
+                        if let Some(progress) = &read_progress {
+                            if let Ok(node) = shared::peer_record(&node) {
+                                progress.offer(vec![(node.peer_id, node.addresses_by_priority())]);
+                            }
+                        }
+                        Ok::<_, RpcError>(hello)
                     };
                     let outcome =
                         select(Box::pin(connect), Box::pin(pool.availability.wait_closed())).await;
@@ -627,14 +653,35 @@ impl Connection {
         endpoint: &WebRtcDirectEndpoint,
         source: &SharedAssociation,
         attempted_dial: &Cell<bool>,
+        dial_failures: Option<&DialFailures>,
     ) -> Result<Self, String> {
         // Serialize only setup. Each lane has its own RPC lock, inbox, request
         // IDs and PQ session; no stream cipher/response state is shared.
         let mut association = source.lock().await;
+        #[cfg(feature = "test-utils")]
+        let mut trace = diagnostics::Trace::new(
+            "association",
+            endpoint.multiaddr.clone(),
+            endpoint.peer_id.clone(),
+        );
         let existing = association
             .upgrade()
             .filter(|connection| connection.has_live_channel());
         let fresh = existing.is_none();
+        // The other lane may have failed while we waited for the association
+        // lock. Do not spend a second setup timeout redialing the same endpoint.
+        // A live association can still be reused without a new dial.
+        if fresh
+            && dial_failures.is_some_and(|cache| {
+                cache
+                    .borrow_mut()
+                    .is_suppressed(&endpoint.peer_id, &endpoint.multiaddr)
+            })
+        {
+            return Err("WebRTC endpoint is in the failed-connection cache".into());
+        }
+        #[cfg(feature = "test-utils")]
+        trace.event("dial", if fresh { "fresh" } else { "reused" });
         attempted_dial.set(fresh);
         let peer_connection = if let Some(existing) = existing {
             existing
@@ -776,6 +823,8 @@ impl Connection {
         )
         .await?;
         connection.data_channel.set_onopen(None);
+        #[cfg(feature = "test-utils")]
+        trace.event("channel-open", "");
 
         let session = establish_pq_session(&connection, endpoint).await?;
         connection.pq_session.replace(Some(session));
@@ -785,6 +834,9 @@ impl Connection {
             Rc::clone(&connection.pq_session),
         )));
         *association = Rc::downgrade(&connection.peer_connection);
+
+        #[cfg(feature = "test-utils")]
+        trace.finish("authenticated");
 
         Ok(connection)
     }
@@ -882,6 +934,12 @@ impl BrowserNodeClientCore {
             return Ok(());
         }
         self.close();
+        #[cfg(feature = "test-utils")]
+        let mut trace = diagnostics::Trace::new(
+            "connect",
+            self.endpoint.multiaddr.clone(),
+            self.endpoint.peer_id.clone(),
+        );
         if let Some(cache) = &self.dial_failures {
             if cache
                 .borrow_mut()
@@ -893,7 +951,12 @@ impl BrowserNodeClientCore {
         let generation = self.generation.get();
         let attempted_dial = Cell::new(false);
         let connection = match timeout_with_ms(
-            Connection::open(&self.endpoint, &self.association, &attempted_dial),
+            Connection::open(
+                &self.endpoint,
+                &self.association,
+                &attempted_dial,
+                self.dial_failures.as_ref(),
+            ),
             "WebRTC connection/authentication setup timed out",
             CONNECTION_SETUP_TIMEOUT_MS,
         )
@@ -901,6 +964,8 @@ impl BrowserNodeClientCore {
         {
             Ok(connection) => connection,
             Err(error) => {
+                #[cfg(feature = "test-utils")]
+                trace.finish(&error);
                 if let Some(cache) = self.dial_failures.as_ref().filter(|_| attempted_dial.get()) {
                     cache.borrow_mut().record_failure(
                         self.endpoint.peer_id.clone(),
@@ -923,6 +988,8 @@ impl BrowserNodeClientCore {
             rpc.set_pool(self.pool_availability.as_ref());
         }
         self.connection.replace(Some(Rc::new(connection)));
+        #[cfg(feature = "test-utils")]
+        trace.finish("connected");
         Ok(())
     }
 
@@ -1752,12 +1819,17 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                             if let Some(progress) = &read_progress {
                                 let hints = std::iter::once(&candidate.wire)
                                     .chain(nodes.iter())
+                                    .filter(|node| {
+                                        node.webrtc_direct.as_ref().is_some_and(|endpoint| {
+                                            pool.has_authenticated_connection(endpoint)
+                                        })
+                                    })
                                     .filter_map(|node| shared::peer_record(node).ok())
                                     .map(|node| (node.peer_id, node.addresses_by_priority()))
                                     .collect();
                                 progress.offer(hints);
                             }
-                            pool.preconnect(&nodes);
+                            pool.preconnect(&nodes, read_progress.clone());
                             routing.borrow_mut().insert(responder, candidate.clone());
                             contacted
                                 .borrow_mut()
@@ -1892,6 +1964,8 @@ impl ProgressReporter {
     }
 
     fn report(&self, message: &str) {
+        #[cfg(feature = "test-utils")]
+        diagnostics::Trace::new("lookup-progress", String::new(), String::new()).finish(message);
         if let Some(callback) = &self.0 {
             let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(message));
         }

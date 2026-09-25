@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-09-23
+- **Last amended:** 2026-09-25
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -116,6 +116,45 @@ and its ability to store another issuer's proof are separate checks.
 discard externally staged encrypted records, report progress, and submit an
 already verified payment plan. Those callbacks expose browser capabilities;
 they do not reimplement Autonomi protocol behavior.
+
+### Bounded progressive reads on both targets
+
+Native and WASM use the same `client_engine::read::retrieve_progressive` policy.
+Speculation starts from already-connected peers on both targets. Browser lookup
+replies publish authenticated responders and already-connected hints; bounded
+owner-signed preconnections publish additional hints after HELLO completes. Cold
+addresses remain available to ordinary discovery and final fallback, rather than
+occupying speculative GET slots for an entire ICE timeout.
+
+An immutable read begins with one speculative GET while ordinary XOR discovery
+continues. If it is still pending after one second, a second candidate may race
+it. The existing limit of two simultaneous GETs per record is retained: when
+discovery completes with both speculative slots occupied, the ordinary path
+waits for a slot. Immediate successes and misses do not trigger extra fan-out.
+
+The one-second delay prevents a slow connection setup from blocking every newer
+hint, without replacing the ordinary lookup or shortening a serving peer's
+response allowance. Speculation may use the existing twenty-peer fallback
+allowance while discovery is pending; it previously stopped after seven attempts
+and could exhaust that allowance on stale hints before a holder appeared. Peer
+deduplication, final fallback bounds, two-round retry policy, content verification and authoritative
+absence rules are unchanged. Early misses cannot establish absence. This is a
+shared scheduling change, not a separate browser read protocol or metadata format.
+It can perform more early attempts and one extra overlapping read during a slow
+lookup, within the peak concurrency already allowed after lookup. Browser response-memory reservations
+continue to apply to every physical GET, including abandoned replies.
+
+WebRTC's control and data lanes recheck endpoint suppression while holding their
+shared association setup lock. A lane queued behind a failed dial must reuse the
+failure, rather than repeating the same ten-second connection attempt. Existing
+live associations remain reusable. Cancellation alone does not populate the
+failure cache.
+
+`test-utils` builds expose opt-in, per-record/per-peer timing through
+`setBrowserTrace`; production bindings contain no trace callback or address logs.
+The read-only Chromium startup probe records cold-client results against explicit
+caller-supplied seeds. Live-network timing is supporting evidence alongside
+deterministic tests for hedging, concurrency, failure sharing and integrity.
 
 ### Browser RPC ownership and deadlines
 

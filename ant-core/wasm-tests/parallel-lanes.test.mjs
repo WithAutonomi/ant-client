@@ -1,8 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { test_parallel_lanes, test_active_data_lane_capacity, test_redial_after_local_close } from "./pkg/ant_core.js";
+import { test_parallel_lanes, test_active_data_lane_capacity, test_redial_after_local_close, test_concurrent_failed_lanes } from "./pkg/ant_core.js";
 import { closesSettled, mockWebRtc } from "./mock-webrtc.mjs";
 const object = value => value instanceof Map ? Object.fromEntries([...value].map(([k,v]) => [k, object(v)])) : value;
+
+test("a failed cold dial is shared by control and data waiters", async () => {
+  const rtc = mockWebRtc([{ connectErrorDelay: 70, connectError: "unreachable endpoint" }]);
+  const results = await test_concurrent_failed_lanes(rtc.endpoints[0]);
+  assert.match(results[0], /unreachable endpoint/);
+  assert.match(results[1], /failed-connection cache/);
+  assert.equal(rtc.connections.length, 1, "the queued lane must not redial after the first lane failed");
+  assert.ok(rtc.connections.every(c => c.closed));
+});
 
 for (const slow of ["find_node", "get_chunk"]) {
   test(`a slow ${slow} does not block the other authenticated lane`, async () => {

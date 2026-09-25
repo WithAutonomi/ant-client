@@ -1,0 +1,8 @@
+{
+  "ant-core/src/browser/wasm_transport.rs": "36a91aa508b8c84d1a5483f01d480ca62e41fb897e4f68884a0223c937b2af05",
+  "ant-core/src/browser/wasm_transport/shared.rs": "0c61603bf699f820a4098a78e7770ea2ae6b0d573138abcd9d68c652f135c959",
+  "ant-core/src/browser/wasm_transport/diagnostics.rs": "03482d16ade1a2e82d66245a2f878e7ed7757dedfa10114a6a830976ff051a84",
+  "ant-core/src/client_engine/read.rs": "3a7fe44c4a65fa735940962e8def512e0679b80410c98a2e960cbc5b26c7b195",
+  "ant-core/src/data/network.rs": "70c693f4934b344d5fa0147e63962b52f02556a0d426253ab3c1613f3ac26b12",
+  "ant-core/src/data/client/chunk.rs": "b354d896e167cdc689777aefc209ef32cc88f63d81fcfe2f9df0822a923d89eb"
+}

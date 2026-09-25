@@ -61,6 +61,23 @@ pub async fn test_budgeted_reads(endpoints: JsValue, close_early: bool) -> JsVal
     serde_wasm_bindgen::to_value(&results).unwrap()
 }
 
+/// Both cold lanes must observe the same failed association setup.
+#[wasm_bindgen]
+pub async fn test_concurrent_failed_lanes(endpoint: &str) -> JsValue {
+    let pool = BrowserClientPool::new(1).unwrap();
+    let endpoint = BrowserEndpoint {
+        multiaddr: endpoint.into(),
+    };
+    let control = pool.client(&endpoint).await.unwrap();
+    let data = pool
+        .data_client_before(&endpoint, TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
+        .await
+        .unwrap();
+    let (control, data) = futures::future::join(control.hello(), data.hello()).await;
+    pool.close();
+    serde_wasm_bindgen::to_value(&vec![control.err(), data.err()]).unwrap()
+}
+
 /// Exercise independent RPC lanes, channel-local cancellation and reuse of the
 /// shared association. Each lane authenticates its own PQ session and HELLO.
 #[wasm_bindgen]
@@ -246,8 +263,8 @@ pub async fn test_preconnect_pool(
         })
         .collect::<Vec<_>>();
     let pool = Rc::new(BrowserClientPool::new(capacity).unwrap());
-    pool.preconnect(&nodes);
-    pool.preconnect(&nodes);
+    pool.preconnect(&nodes, None);
+    pool.preconnect(&nodes, None);
     crate::runtime::sleep(Duration::from_millis(20)).await;
     if close_early {
         pool.close();
