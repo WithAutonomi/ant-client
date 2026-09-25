@@ -21,12 +21,6 @@ pub mod merkle;
 #[cfg(feature = "native")]
 mod native_payment;
 pub mod payment;
-// Native only. A browser client cannot reach a pointer yet: the node's WebRTC
-// boundary admits, sanitizes and classifies message kinds explicitly, and
-// pointer requests are in none of those lists. Compiling the API for a
-// transport that rejects it would offer browser callers something that always
-// fails — see ADR-0016 for what opening that path needs.
-#[cfg(feature = "native")]
 pub mod pointer;
 pub mod quote;
 pub mod upload;

@@ -25,6 +25,64 @@ pub(super) struct BrowserUploadAdapter<'a> {
     pub recovering: Cell<bool>,
 }
 
+/// The quotes a wallet is asked to pay: each plan's one paid quote, verified
+/// and in the envelope the JavaScript wallet adapter takes.
+pub(super) fn wallet_quotes(plans: &[ChunkPaymentPlan]) -> DataResult<Vec<VerifiedStorageQuote>> {
+    plans
+        .iter()
+        .map(|plan| {
+            let payable = plan
+                .payment
+                .quotes
+                .iter()
+                .find(|q| !q.amount.is_zero())
+                .ok_or_else(|| Error::Payment("payment plan has no paid quote".into()))?;
+            let (_, quote) = plan
+                .peer_quotes
+                .iter()
+                .find(|(_, q)| q.hash() == payable.quote_hash)
+                .ok_or_else(|| Error::Payment("paid quote missing from plan".into()))?;
+            Ok(VerifiedStorageQuote {
+                quote: native_quote_artifact(quote, &plan.commitment_sidecars)
+                    .map_err(Error::Payment)?,
+                quote_hash: hex::encode(payable.quote_hash),
+                rewards_address: format!("0x{}", hex::encode(payable.rewards_address)),
+                amount: payable.amount.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Match a wallet's receipt to the quotes it was asked to pay.
+pub(super) fn paid_transactions(
+    verified: &[VerifiedStorageQuote],
+    payment: &BrowserPaymentSubmission,
+) -> DataResult<HashMap<QuoteHash, TxHash>> {
+    let mut transactions = HashMap::new();
+    for quote in verified {
+        let hash = if payment.transaction_hashes.is_empty() {
+            payment.transaction_hash.as_ref()
+        } else {
+            payment
+                .transaction_hashes
+                .get(&quote.quote_hash)
+                .or_else(|| {
+                    payment
+                        .transaction_hashes
+                        .get(&format!("0x{}", quote.quote_hash))
+                })
+        }
+        .ok_or_else(|| Error::Payment("wallet returned no transaction for a paid quote".into()))?;
+        transactions.insert(
+            QuoteHash::from(
+                parse_lookup_key(&quote.quote_hash, "quote hash").map_err(Error::Payment)?,
+            ),
+            TxHash::from(parse_lookup_key(hash, "transaction hash").map_err(Error::Payment)?),
+        );
+    }
+    Ok(transactions)
+}
+
 impl BrowserUploadAdapter<'_> {
     async fn invoke(&self, callback: &js_sys::Function, input: JsValue) -> DataResult<JsValue> {
         let state = self
@@ -196,58 +254,13 @@ impl UploadAdapter for BrowserUploadAdapter<'_> {
         Ok(())
     }
     async fn pay(&self, plans: &[ChunkPaymentPlan]) -> DataResult<UploadPayment> {
-        let verified = plans
-            .iter()
-            .map(|plan| {
-                let payable = plan
-                    .payment
-                    .quotes
-                    .iter()
-                    .find(|q| !q.amount.is_zero())
-                    .ok_or_else(|| Error::Payment("payment plan has no paid quote".into()))?;
-                let (_, quote) = plan
-                    .peer_quotes
-                    .iter()
-                    .find(|(_, q)| q.hash() == payable.quote_hash)
-                    .ok_or_else(|| Error::Payment("paid quote missing from plan".into()))?;
-                Ok(VerifiedStorageQuote {
-                    quote: native_quote_artifact(quote, &plan.commitment_sidecars)
-                        .map_err(Error::Payment)?,
-                    quote_hash: hex::encode(payable.quote_hash),
-                    rewards_address: format!("0x{}", hex::encode(payable.rewards_address)),
-                    amount: payable.amount.to_string(),
-                })
-            })
-            .collect::<DataResult<Vec<_>>>()?;
+        let verified = wallet_quotes(plans)?;
         let input =
             serde_wasm_bindgen::to_value(&verified).map_err(|e| Error::Payment(e.to_string()))?;
         let value = self.invoke(self.wallet, input).await?;
         let payment: BrowserPaymentSubmission =
             serde_wasm_bindgen::from_value(value).map_err(|e| Error::Payment(e.to_string()))?;
-        let mut transactions = HashMap::new();
-        for quote in &verified {
-            let hash = if payment.transaction_hashes.is_empty() {
-                payment.transaction_hash.as_ref()
-            } else {
-                payment
-                    .transaction_hashes
-                    .get(&quote.quote_hash)
-                    .or_else(|| {
-                        payment
-                            .transaction_hashes
-                            .get(&format!("0x{}", quote.quote_hash))
-                    })
-            }
-            .ok_or_else(|| {
-                Error::Payment("wallet returned no transaction for a paid quote".into())
-            })?;
-            transactions.insert(
-                QuoteHash::from(
-                    parse_lookup_key(&quote.quote_hash, "quote hash").map_err(Error::Payment)?,
-                ),
-                TxHash::from(parse_lookup_key(hash, "transaction hash").map_err(Error::Payment)?),
-            );
-        }
+        let transactions = paid_transactions(&verified, &payment)?;
         *self.last_transaction.borrow_mut() = payment.transaction_hash;
         Ok(UploadPayment {
             transactions,

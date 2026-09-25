@@ -888,6 +888,30 @@ async fn a_read_needs_four_answers_and_two_that_agree() {
     testnet.teardown().await;
 }
 
+/// Creating a pointer that already exists is refused before anything is
+/// paid: the payment would buy nothing, whatever state the network holds.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn creating_a_pointer_that_exists_is_refused_before_paying() {
+    let (client, testnet) = setup().await;
+    let (pk, sk) = owner();
+    client
+        .pointer_create(&sk, &pk, chunk_target(1))
+        .await
+        .expect("create");
+
+    let before = balance(&client).await;
+    let err = client
+        .pointer_create(&sk, &pk, chunk_target(2))
+        .await
+        .expect_err("a second create must be refused");
+    assert!(err.to_string().contains("already exists"), "got: {err}");
+    assert_eq!(balance(&client).await, before, "the refused create paid");
+
+    drop(client);
+    testnet.teardown().await;
+}
+
 /// Re-submitting a state the network already holds is answered as stored
 /// without writing anything, so a retry after a timeout cannot lose the update
 /// or fork it.

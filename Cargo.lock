@@ -825,9 +825,11 @@ dependencies = [
  "colored",
  "hex",
  "indicatif",
+ "rand 0.8.6",
  "rmp-serde",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",
@@ -909,7 +911,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.20.0"
-source = "git+https://github.com/WithAutonomi/ant-node.git?rev=0d3a3bf6f7a51393fe5447aeed7a22bfc912612c#0d3a3bf6f7a51393fe5447aeed7a22bfc912612c"
+source = "git+https://github.com/WithAutonomi/ant-node.git?rev=3c70728b1bc70e37219bd99b53e7243e72c18550#3c70728b1bc70e37219bd99b53e7243e72c18550"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -3454,7 +3456,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]

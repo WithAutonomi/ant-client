@@ -73,6 +73,7 @@ ant-core/src/
 │       ├── payment.rs        # pay_for_storage, approve_token_spend
 │       ├── quote.rs          # get_store_quotes from network peers
 │       ├── merkle.rs         # Merkle batch payment (PaymentMode enum)
+│       ├── pointer.rs        # pointer_create/update/get/resolve (ADR-0016)
 │       └── cache.rs          # In-memory LRU chunk cache
 └── node/                     # Node management
     ├── mod.rs                # add_nodes, remove_node, reset
@@ -108,6 +109,7 @@ ant-cli/src/
     ├── data/
     │   ├── file.rs           # ant file upload/download
     │   ├── chunk.rs          # ant chunk put/get
+    │   ├── pointer.rs        # ant pointer keygen/address/create/update/get/resolve
     │   └── wallet.rs         # ant wallet address/balance
     └── node/
         ├── mod.rs

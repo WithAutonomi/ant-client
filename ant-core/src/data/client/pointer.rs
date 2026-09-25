@@ -28,18 +28,23 @@ use ant_protocol::chunk::{
     PointerPutResponse,
 };
 use ant_protocol::pointer::{
-    Pointer, PointerTarget, PointerTargetKind, DATA_TYPE_POINTER, POINTER_WIRE_LEN,
+    pointer_address, Pointer, PointerTarget, PointerTargetKind, DATA_TYPE_POINTER, POINTER_WIRE_LEN,
 };
 use ant_protocol::pqc::api::{MlDsaPublicKey, MlDsaSecretKey};
-use ant_protocol::send_and_await_chunk_response;
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::XorName;
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
+use tracing::warn;
+use web_time::Duration;
 
+use crate::client_engine::{store_retry_delay, STORE_MAX_RETRIES};
+use crate::data::client::batch::ChunkPaymentPlan;
 use crate::data::client::chunk::STORE_RESPONSE_TIMEOUT;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
+use crate::data::network::send_and_await_chunk_response;
+use crate::runtime::sleep;
 
 /// How many of `peers` must answer a read.
 ///
@@ -82,8 +87,20 @@ fn corroboration(peers: usize) -> usize {
 struct Answered {
     /// How many peers gave a usable answer.
     count: usize,
-    /// The last failure, kept only to explain a total failure.
+    /// The last failure that was not a refusal, kept to explain a total
+    /// failure.
     last_error: Option<Error>,
+    /// The first failure that was a refusal rather than a missing answer: a
+    /// peer that answered and said no. Asking again would get the same.
+    refusal: Option<Error>,
+}
+
+impl Answered {
+    /// What to report when too few answered: a refusal if any peer gave one,
+    /// since it says why, else the last failure.
+    fn failure(self) -> Option<Error> {
+        self.refusal.or(self.last_error)
+    }
 }
 
 /// Ask a whole close group at once and stop as soon as there is an answer.
@@ -103,6 +120,7 @@ async fn ask_the_group<T>(
     let mut answered = Answered {
         count: 0,
         last_error: None,
+        refusal: None,
     };
     while let Some(result) = in_flight.next().await {
         match result {
@@ -112,6 +130,9 @@ async fn ask_the_group<T>(
                 if settled && answered.count >= wanted {
                     break;
                 }
+            }
+            Err(e) if answered.refusal.is_none() && !worth_retrying(&e) => {
+                answered.refusal = Some(e);
             }
             Err(e) => answered.last_error = Some(e),
         }
@@ -165,6 +186,18 @@ impl Replies {
     fn any(&self) -> bool {
         !self.seen.is_empty()
     }
+}
+
+/// Whether a pointer write that failed this way may succeed if tried again
+/// with the same proof: a shortfall or an unreachable group, not a refusal.
+fn worth_retrying(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::CloseGroupShortfall(_)
+            | Error::Network(_)
+            | Error::Timeout(_)
+            | Error::InsufficientPeers(_)
+    )
 }
 
 /// What one peer's reply means for a write.
@@ -276,9 +309,38 @@ impl Client {
         owner: &MlDsaPublicKey,
         target: PointerTarget,
     ) -> Result<XorName> {
-        let record = Pointer::create(secret_key, owner, target)
-            .map_err(|e| Error::InvalidData(format!("cannot sign pointer: {e}")))?;
+        let record = self.pointer_sign_create(secret_key, owner, target).await?;
         self.pointer_put(&record).await
+    }
+
+    /// Sign the record that creates `owner`'s pointer, after checking the
+    /// network holds none.
+    ///
+    /// Checked before anything is paid: a second creation would pay again for
+    /// a state the network either already holds, and answers as unchanged, or
+    /// has moved past, and refuses as stale. Either way the payment buys
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pointer already exists, if the network cannot
+    /// say whether it does, or if signing fails.
+    pub async fn pointer_sign_create(
+        &self,
+        secret_key: &MlDsaSecretKey,
+        owner: &MlDsaPublicKey,
+        target: PointerTarget,
+    ) -> Result<Pointer> {
+        let address = pointer_address(owner);
+        if let Some(existing) = self.pointer_get(&address).await? {
+            return Err(Error::InvalidData(format!(
+                "pointer {} already exists at counter {}; update it instead",
+                hex::encode(address),
+                existing.counter()
+            )));
+        }
+        Pointer::create(secret_key, owner, target)
+            .map_err(|e| Error::InvalidData(format!("cannot sign pointer: {e}")))
     }
 
     /// Update the pointer owned by `owner` to `target`, at `counter + 1`.
@@ -297,15 +359,32 @@ impl Client {
         owner: &MlDsaPublicKey,
         target: PointerTarget,
     ) -> Result<XorName> {
-        let address = ant_protocol::pointer::pointer_address(owner);
-        let record = match self.pointer_get(&address).await? {
+        let record = self.pointer_sign_update(secret_key, owner, target).await?;
+        self.pointer_put(&record).await
+    }
+
+    /// Sign the record that updates `owner`'s pointer to `target`, without
+    /// storing it: one past the counter the network serves, or a creation at 0
+    /// if it serves none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the current record cannot be read, the counter is
+    /// exhausted, or signing fails.
+    pub async fn pointer_sign_update(
+        &self,
+        secret_key: &MlDsaSecretKey,
+        owner: &MlDsaPublicKey,
+        target: PointerTarget,
+    ) -> Result<Pointer> {
+        let address = pointer_address(owner);
+        match self.pointer_get(&address).await? {
             Some(current) => current
                 .update(secret_key, target)
-                .map_err(|e| Error::InvalidData(format!("cannot sign pointer update: {e}")))?,
+                .map_err(|e| Error::InvalidData(format!("cannot sign pointer update: {e}"))),
             None => Pointer::create(secret_key, owner, target)
-                .map_err(|e| Error::InvalidData(format!("cannot sign pointer: {e}")))?,
-        };
-        self.pointer_put(&record).await
+                .map_err(|e| Error::InvalidData(format!("cannot sign pointer: {e}"))),
+        }
     }
 
     /// Pay for and store an already-signed pointer.
@@ -340,6 +419,70 @@ impl Client {
                 DATA_TYPE_POINTER,
             )
             .await?;
+        self.pointer_put_paid(record, proof).await
+    }
+
+    /// Quote a signed pointer's state for a payer outside this client, such as
+    /// a browser wallet or another external signer, without paying.
+    ///
+    /// Pay the plan's median quote, build the proof with
+    /// [`ChunkPaymentPlan::proof`], then store with [`Self::pointer_put_paid`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no peer is responsible for the address, or if too
+    /// few acceptable quotes come back.
+    pub async fn prepare_pointer_payment(&self, record: &Pointer) -> Result<ChunkPaymentPlan> {
+        let address = record.address();
+        // As for a wallet payment: nothing is quoted with nowhere to store it.
+        self.pointer_group(&address).await?;
+        self.prepare_payment_plan_split(
+            &address,
+            &record.state_id(),
+            POINTER_WIRE_LEN as u64,
+            DATA_TYPE_POINTER,
+        )
+        .await
+    }
+
+    /// Store a signed pointer with a proof already paid for its state.
+    ///
+    /// The second half of [`Self::pointer_put`], for a proof paid outside this
+    /// client. It is also how to retry a write that fell short without paying
+    /// again: the proof stays valid for its state, and a node that already
+    /// holds that state answers as stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no peer is responsible for the address or if too few
+    /// of the close group accept the record.
+    pub async fn pointer_put_paid(&self, record: &Pointer, proof: Vec<u8>) -> Result<XorName> {
+        // A write that fell short is retried with the same proof, as a chunk
+        // store is: peers that took it the first time answer `Unchanged`, which
+        // counts, so each round only has to reach the ones that did not. A
+        // refusal that says something definite — a newer state won, the
+        // payment was refused, a peer acknowledged something else — is final.
+        let mut attempt = 0;
+        loop {
+            match self.pointer_put_once(record, &proof).await {
+                Ok(address) => return Ok(address),
+                Err(e) if attempt < STORE_MAX_RETRIES && worth_retrying(&e) => {
+                    attempt += 1;
+                    warn!(
+                        "pointer {} write fell short ({e}); retry {attempt}/{STORE_MAX_RETRIES}",
+                        hex::encode(record.address())
+                    );
+                    sleep(store_retry_delay(attempt)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// One round of [`Self::pointer_put_paid`].
+    async fn pointer_put_once(&self, record: &Pointer, proof: &[u8]) -> Result<XorName> {
+        let address = record.address();
+        let state_id = record.state_id();
 
         // Ask again rather than keep the set from before the payment. Settling
         // on chain takes time, and the peers responsible for an address can
@@ -350,7 +493,8 @@ impl Client {
         let targets = self.pointer_group(&address).await?;
         let wanted = write_quorum(targets.len());
 
-        let request = PointerPutRequest::with_payment(Bytes::from(record.to_bytes()), proof);
+        let request =
+            PointerPutRequest::with_payment(Bytes::from(record.to_bytes()), proof.to_vec());
         let in_flight = FuturesUnordered::new();
         for (peer_id, addrs) in &targets {
             let request = request.clone();
@@ -367,6 +511,12 @@ impl Client {
         if answered.count >= wanted {
             return Ok(address);
         }
+        // A peer that refused — a newer state won, the payment was refused, an
+        // acknowledgement named another record — is the answer, and is not
+        // retried. Only a group that did not answer is a shortfall.
+        if let Some(refusal) = answered.refusal {
+            return Err(refusal);
+        }
         if answered.count > 0 {
             return Err(Error::CloseGroupShortfall(format!(
                 "pointer {} stored on {} of {wanted} close-group peers",
@@ -374,7 +524,7 @@ impl Client {
                 answered.count
             )));
         }
-        Err(answered.last_error.unwrap_or_else(|| {
+        Err(answered.failure().unwrap_or_else(|| {
             Error::Protocol("no close-group peer accepted the pointer".to_string())
         }))
     }
@@ -388,8 +538,9 @@ impl Client {
     /// wider than the close group, never count towards a write.
     ///
     /// Same definition, not the same answer: a read does its own lookup, so
-    /// membership that changed in between is not covered. That is churn, and
-    /// what covers it is replication, which is not built.
+    /// membership that changed in between is not covered here. That is churn,
+    /// and what covers it is the nodes' replication, which hands a paid state to
+    /// every member of the group that should hold it.
     async fn pointer_group(&self, address: &XorName) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
         let peers = self
             .network()
@@ -450,13 +601,14 @@ impl Client {
         let corroborated = replies.corroborated(needed).cloned();
 
         if answered.count == 0 {
-            return Err(answered.last_error.unwrap_or_else(|| {
+            return Err(answered.failure().unwrap_or_else(|| {
                 Error::Protocol("no close-group peer answered for the pointer".to_string())
             }));
         }
-        // A single answer is not a network verdict: with no replication, one
-        // reachable peer holding a stale record looks exactly like the whole
-        // group agreeing. Say so rather than presenting it as the value.
+        // A single answer is not a network verdict: one reachable peer holding
+        // a stale record, before replication has reached it, looks exactly like
+        // the whole group agreeing. Say so rather than presenting it as the
+        // value.
         if answered.count < wanted {
             return Err(Error::CloseGroupShortfall(format!(
                 "only {} of the close group answered for pointer {}",
@@ -548,7 +700,7 @@ impl Client {
             .map_err(|e| Error::Protocol(format!("cannot encode pointer PUT: {e}")))?;
 
         send_and_await_chunk_response(
-            self.network().node(),
+            self.network(),
             &target_peer,
             bytes,
             request_id,
@@ -582,11 +734,11 @@ impl Client {
             .map_err(|e| Error::Protocol(format!("cannot encode pointer GET: {e}")))?;
 
         send_and_await_chunk_response(
-            self.network().node(),
+            self.network(),
             &target_peer,
             bytes,
             request_id,
-            std::time::Duration::from_secs(self.config().chunk_get_timeout_secs),
+            Duration::from_secs(self.config().chunk_get_timeout_secs),
             &peer_addrs,
             move |body| read_get_reply(body, address),
             |e| Error::Network(format!("pointer GET send failed: {e}")),
@@ -600,12 +752,32 @@ impl Client {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use ant_protocol::pointer::pointer_address;
     use ant_protocol::pqc::api::ml_dsa_65;
     use futures::future::BoxFuture;
 
     fn keypair(seed: u8) -> (MlDsaPublicKey, MlDsaSecretKey) {
         ml_dsa_65().generate_keypair_from_seed(&[seed; 32])
+    }
+
+    /// A write that fell short is retried with the proof already paid; one
+    /// that was refused for a reason is not, since retrying cannot change it.
+    #[test]
+    fn only_a_shortfall_is_retried_with_the_same_proof() {
+        for retried in [
+            Error::CloseGroupShortfall("3 of 5".into()),
+            Error::Network("unreachable".into()),
+            Error::Timeout("slow".into()),
+            Error::InsufficientPeers("none".into()),
+        ] {
+            assert!(worth_retrying(&retried), "{retried} must be retried");
+        }
+        for refused in [
+            Error::InvalidData("the pointer moved while this update was in flight".into()),
+            Error::Payment("valid payment is required".into()),
+            Error::Protocol("pointer PUT refused".into()),
+        ] {
+            assert!(!worth_retrying(&refused), "{refused} must not be retried");
+        }
     }
 
     fn chunk_target(byte: u8) -> PointerTarget {
@@ -943,9 +1115,32 @@ mod tests {
         let answered = ask_the_group(in_flight, read_quorum(7), |_| true).await;
         assert_eq!(answered.count, 1, "six failures are not six answers");
         assert!(
-            answered.last_error.is_some(),
+            answered.failure().is_some(),
             "the failure must be kept to explain the shortfall"
         );
+    }
+
+    /// A refusal is kept apart from a missing answer, so a write that fell
+    /// short because a peer said no reports that, and is not retried.
+    #[tokio::test]
+    async fn a_refusal_is_kept_apart_from_a_missing_answer() {
+        let in_flight: FuturesUnordered<BoxFuture<'static, Result<()>>> = FuturesUnordered::new();
+        in_flight.push(Box::pin(async { Err(Error::Timeout("slow".to_string())) }));
+        in_flight.push(Box::pin(async {
+            Err(Error::InvalidData(
+                "the pointer moved while this update was in flight".to_string(),
+            ))
+        }));
+        in_flight.push(Box::pin(async { Err(Error::Timeout("slow".to_string())) }));
+        in_flight.push(Box::pin(async { Ok(()) }));
+
+        let answered = ask_the_group(in_flight, write_quorum(7), |()| true).await;
+        assert_eq!(answered.count, 1);
+        assert!(
+            matches!(&answered.refusal, Some(Error::InvalidData(message)) if message.contains("moved")),
+            "the refusal is what the write reports"
+        );
+        assert!(matches!(answered.last_error, Some(Error::Timeout(_))));
     }
 
     /// A write quorum and a read quorum must intersect at every group width.
