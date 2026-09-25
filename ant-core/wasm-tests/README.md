@@ -19,6 +19,11 @@ regressions use a mock `RTCPeerConnection` while running the real PQ handshake,
 record encryption, lookup, quote verification, and upload implementation.
 Production packages should enable only `browser-wasm`.
 
+Bootstrap regressions cover first-ready authentication in the retained network
+pool, discovery before a slow seed completes, late-seed fallback, the four-dial
+bootstrap bound, cancellation and payment-policy rejection. A fast seed from the
+wrong network cannot win or re-enter through discovery or ordinary GET fallback.
+
 Upload fixtures follow native policy: seven initial peers, authenticated
 witness views, a supported paid median, and four successful stores. Tests
 cover inconsistent views, partial existing-holder votes, one payable quote,

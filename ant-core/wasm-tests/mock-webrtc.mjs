@@ -134,6 +134,7 @@ export function mockWebRtc(nodes = [{}]) {
       channel.server.set_multiplex(channel.options.multiplex ?? false);
       channel.server.set_address_v2(channel.options.addressV2 ?? false);
       channel.server.set_uploads_enabled(channel.options.uploads ?? true);
+      if (channel.options.payment) channel.server.set_hello_payment(channel.options.payment);
       channel.server.set_invalid_quote(channel.options.invalidQuote ?? false);
       channel.server.set_committed_key_count(channel.options.keyCount ?? 0);
       const view = channel.options.view ?? nodes.map((_, i) => i);

@@ -292,6 +292,7 @@ pub struct BrowserTestNode {
     endpoint: String,
     session: Option<PqSession>,
     hello_received: bool,
+    hello_payment: BrowserPaymentNetwork,
     received: Vec<u8>,
     already_stored: bool,
     last_method: String,
@@ -338,6 +339,7 @@ impl BrowserTestNode {
             endpoint,
             session: None,
             hello_received: false,
+            hello_payment: network(),
             received: Vec::new(),
             already_stored,
             last_method: String::new(),
@@ -362,6 +364,10 @@ impl BrowserTestNode {
     }
     pub fn set_multiplex(&mut self, enabled: bool) {
         self.multiplex = enabled;
+    }
+
+    pub fn set_hello_payment(&mut self, payment: JsValue) {
+        self.hello_payment = serde_wasm_bindgen::from_value(payment).unwrap();
     }
     pub fn seal_response(&mut self, plaintext: &[u8]) -> Vec<u8> {
         encode_pq_frame(&self.session.as_mut().unwrap().seal(plaintext).unwrap()).unwrap()
@@ -449,7 +455,7 @@ impl BrowserTestNode {
                     endpoint: BrowserEndpoint {
                         multiaddr: self.endpoint.clone(),
                     },
-                    payment: network(),
+                    payment: self.hello_payment.clone(),
                     capabilities: {
                         let mut capabilities = vec![
                             "chunk_protocol".into(),

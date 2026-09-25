@@ -37,15 +37,13 @@ try {
       const record = event => globalThis.recordTrace({ms: performance.now() - start,
         download_ms: downloadStart === undefined ? undefined : performance.now() - downloadStart, ...event});
       core.setBrowserTrace(value => record({kind: 'trace', ...JSON.parse(value)}));
-      // Core mode begins in the same cold download state without repeating the
-      // SDK's earlier, discarded authentication probe. SDK mode includes it.
+      const client = new core.BrowserNetworkClient(seeds);
+      // SDK mode authenticates through the retained network pool before the
+      // download; core mode starts with a completely cold network client.
       if (lifecycle === 'sdk') {
-        const probe = new core.BrowserNodeClient(seeds[0]);
-        try { const session = await probe.connect(); await session.hello(); session.close(); session.free(); }
-        finally { probe.free(); }
+        await client.connect();
       }
       record({kind: 'connected'});
-      const client = new core.BrowserNetworkClient(seeds);
       try {
         downloadStart = performance.now();
         await client.downloadPublicFile('134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889', undefined,

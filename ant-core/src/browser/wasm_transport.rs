@@ -66,6 +66,7 @@ const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 // remain non-evictable, and the pool still imposes a hard resource bound.
 const DEFAULT_MAX_POOLED_CLIENTS: usize = 64;
 const MAX_LOOKUP_PRECONNECTS: usize = 8;
+const MAX_BOOTSTRAP_CONNECTIONS: usize = 4;
 const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const MAX_BROWSER_ROUTING_ENTRIES: usize = 256;
 const MAX_BROWSER_ENDPOINT_FAILURES: usize = 256;
@@ -83,6 +84,7 @@ const MAX_UPLOAD_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
 // JavaScript metadata from creating unbounded quote work.
 const MAX_UPLOAD_RECORDS: usize = 4096;
 
+mod bootstrap;
 mod failed_payment;
 mod inbox;
 mod multiplex;
@@ -149,6 +151,7 @@ struct BrowserClientPool {
     clock: Cell<u64>,
     availability: Rc<PoolAvailability>,
     preconnecting: RefCell<HashSet<String>>,
+    rejected_bootstrap: RefCell<HashMap<String, String>>,
     #[cfg(feature = "test-utils")]
     preconnect_errors: RefCell<Vec<String>>,
 }
@@ -297,6 +300,7 @@ impl BrowserClientPool {
                 sender: availability_tx,
             }),
             preconnecting: RefCell::new(HashSet::new()),
+            rejected_bootstrap: RefCell::new(HashMap::new()),
             #[cfg(feature = "test-utils")]
             preconnect_errors: RefCell::new(Vec::new()),
         })
@@ -355,6 +359,9 @@ impl BrowserClientPool {
         let endpoint = parse_webrtc_direct_multiaddr(&endpoint.multiaddr)
             .map_err(|error| error.to_string())?;
         let key = endpoint.multiaddr.clone();
+        if let Some(error) = self.rejected_bootstrap.borrow().get(&key) {
+            return Err(error.clone());
+        }
         // Subscribe before checking the predicate so a release cannot be missed.
         let mut availability = self.availability.sender.subscribe();
         loop {
@@ -430,6 +437,13 @@ impl BrowserClientPool {
     }
 
     fn is_lookup_eligible(&self, peer: &str, endpoint: &BrowserEndpoint) -> bool {
+        if self
+            .rejected_bootstrap
+            .borrow()
+            .contains_key(&endpoint.multiaddr)
+        {
+            return false;
+        }
         // Native allows an existing connection even when its advertised
         // address is in the dial-failure cache.
         if self
@@ -1501,6 +1515,7 @@ struct BrowserNetworkCore {
     routing: Rc<RefCell<HashMap<LookupKey, BrowserLookupCandidate>>>,
     contacted: Rc<RefCell<HashMap<LookupKey, web_time::Instant>>>,
     owner_views: Rc<RefCell<lru::LruCache<LookupKey, BrowserLookupCandidate>>>,
+    bootstrap: bootstrap::Bootstrap,
 }
 
 impl BrowserNetworkCore {
@@ -1519,6 +1534,7 @@ impl BrowserNetworkCore {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
+            bootstrap: bootstrap::Bootstrap::new(),
             seeds,
             pool: Rc::new(BrowserClientPool::new(DEFAULT_MAX_POOLED_CLIENTS)?),
             routing: Rc::new(RefCell::new(HashMap::new())),
@@ -1598,73 +1614,125 @@ impl BrowserNetworkCore {
         use_seeds: bool,
         read_progress: Option<crate::data::network::ReadProgress>,
     ) -> Result<BrowserLookupResult, String> {
+        let deadline = TransferDeadline::new(Duration::from_secs(
+            u64::from(ant_protocol::transport::LOOKUP_TIMEOUT_SECS) / if use_seeds { 1 } else { 2 },
+        ));
+        if !use_seeds {
+            let candidates = self.routing.borrow().values().cloned().collect();
+            return self
+                .find_closest_from(target, progress, count, candidates, read_progress, deadline)
+                .await;
+        }
+        let mut updates = self.bootstrap.subscribe(self, None)?;
+        let mut best: Option<BrowserLookupResult> = None;
+        let mut used = 0;
+        loop {
+            let state = updates.borrow_and_update().clone();
+            if state.ready.len() > used {
+                used = state.ready.len();
+                // A first walk may already have authenticated and queried the
+                // other seeds through discovery. Their bootstrap completion
+                // must not trigger a duplicate walk or extra quote witnesses.
+                if best.as_ref().is_some_and(|result| {
+                    state.ready.iter().all(|hello| {
+                        result
+                            .nodes
+                            .iter()
+                            .any(|node| node.peer_id == hello.peer_id)
+                    })
+                }) {
+                    continue;
+                }
+                let candidates = state
+                    .ready
+                    .iter()
+                    .map(bootstrap::candidate)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let lookup = self.find_closest_from(
+                    target,
+                    progress,
+                    count,
+                    candidates,
+                    read_progress.clone(),
+                    deadline,
+                );
+                // Publish newly authenticated seeds to early reads while the
+                // unchanged shared DHT walker progresses through the first ones.
+                let publish = async {
+                    loop {
+                        let state = updates.borrow_and_update().clone();
+                        if let Some(read) = &read_progress {
+                            let hints = state
+                                .ready
+                                .iter()
+                                .filter_map(|hello| bootstrap::candidate(hello).ok())
+                                .filter_map(|candidate| shared::peer_record(&candidate.wire).ok())
+                                .map(|node| (node.peer_id, node.addresses_by_priority()))
+                                .collect();
+                            read.offer(hints);
+                        }
+                        match self.bootstrap_changed(&mut updates).await {
+                            Ok(()) => {}
+                            Err(error) => break Err::<(), _>(error),
+                        }
+                    }
+                };
+                let result = match select(Box::pin(lookup), Box::pin(publish)).await {
+                    Either::Left((result, _)) => result,
+                    Either::Right((Err(error), _)) => return Err(error),
+                    Either::Right((Ok(()), _)) => unreachable!(),
+                };
+                match result {
+                    Ok(mut result) => {
+                        result.failures.extend(updates.borrow().failures.clone());
+                        if result.nodes.len() >= count {
+                            return Ok(result);
+                        }
+                        if best
+                            .as_ref()
+                            .is_none_or(|best| result.nodes.len() > best.nodes.len())
+                        {
+                            best = Some(result);
+                        }
+                    }
+                    Err(error) if deadline.remaining().is_zero() => return best.ok_or(error),
+                    Err(error)
+                        if updates.borrow().pending == 0
+                            && updates.borrow().ready.len() <= used =>
+                    {
+                        return best.ok_or(error)
+                    }
+                    Err(_) => {}
+                }
+                continue;
+            }
+            if state.pending == 0 || deadline.remaining().is_zero() {
+                return best.ok_or_else(|| bootstrap::failure(&state));
+            }
+            match crate::runtime::timeout(
+                deadline.remaining(),
+                self.bootstrap_changed(&mut updates),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => return best.ok_or_else(|| "bootstrap lookup timed out".into()),
+            }
+        }
+    }
+
+    async fn find_closest_from(
+        &self,
+        target: &str,
+        progress: &ProgressReporter,
+        count: usize,
+        initial_candidates: Vec<BrowserLookupCandidate>,
+        read_progress: Option<crate::data::network::ReadProgress>,
+        deadline: TransferDeadline,
+    ) -> Result<BrowserLookupResult, String> {
         let target_key = parse_lookup_key(target, "lookup target")?;
         let failures = Rc::new(RefCell::new(Vec::new()));
         let views = Rc::new(RefCell::new(HashMap::new()));
-        let seed_futures = self.seeds.iter().cloned().map(|endpoint| {
-            let pool = Rc::clone(&self.pool);
-            let failures = Rc::clone(&failures);
-            let progress = progress.clone();
-            let read_progress = read_progress.clone();
-            async move {
-                let seed_name = endpoint.multiaddr.clone();
-                let result = async {
-                    let client = pool.client(&endpoint).await?;
-                    let hello = client.hello().await?;
-                    progress.report(&format!("Connected seed {}", hello.peer_id));
-                    BrowserLookupCandidate::parse(BrowserNode {
-                        address_record: None,
-                        peer_record: None,
-                        peer_id: hello.peer_id,
-                        native_addresses: Vec::new(),
-                        reliability: 1.0,
-                        webrtc_direct: Some(hello.endpoint),
-                    })
-                }
-                .await;
-                match result {
-                    Ok(candidate) => {
-                        if let Some(progress) = &read_progress {
-                            if let Ok(node) = shared::peer_record(&candidate.wire) {
-                                progress.offer(vec![(node.peer_id, node.addresses_by_priority())]);
-                            }
-                        }
-                        Some(candidate)
-                    }
-                    Err(error) => {
-                        progress.report(&format!("Seed {seed_name} failed: {error}"));
-                        failures.borrow_mut().push(BrowserLookupFailure {
-                            peer_id: seed_name,
-                            message: error,
-                        });
-                        None
-                    }
-                }
-            }
-        });
-        let mut initial_candidates = self
-            .routing
-            .borrow()
-            .values()
-            .filter(|candidate| candidate.wire.webrtc_direct.is_some())
-            .cloned()
-            .collect::<Vec<_>>();
-        if use_seeds {
-            initial_candidates.clear();
-            initial_candidates.extend(join_all(seed_futures).await.into_iter().flatten());
-        }
-        if initial_candidates.is_empty() {
-            let detail = failures
-                .borrow()
-                .iter()
-                .map(|failure| failure.message.as_str())
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(format!(
-                "could not connect to any WebRtcDirect seed: {detail}"
-            ));
-        }
-
         let config = LookupConfig::saorsa(count);
         let mut lookup =
             IterativeLookup::new(target_key, config).map_err(|error| error.to_string())?;
@@ -1701,9 +1769,7 @@ impl BrowserNetworkCore {
         run_iterative_lookup(
             &mut lookup,
             &mut query,
-            TimeoutFuture::new(
-                ant_protocol::transport::LOOKUP_TIMEOUT_SECS * if use_seeds { 1_000 } else { 500 },
-            ),
+            crate::runtime::sleep(deadline.remaining()),
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -2369,6 +2435,20 @@ impl BrowserNetworkClient {
             shared,
             adapter,
         })
+    }
+
+    /// Authenticate the first usable configured seed in this client's own pool.
+    /// Remaining seeds connect in the background within the bootstrap bound.
+    pub async fn connect(&self, expected_payment: Option<JsValue>) -> Result<JsValue, JsValue> {
+        let expected = expected_payment.map(parse_payment_network).transpose()?;
+        let hello = self
+            .inner
+            .connect(expected)
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
+        hello
+            .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
+            .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Run Saorsa's iterative closest-node lookup over Rust-owned DataChannels.

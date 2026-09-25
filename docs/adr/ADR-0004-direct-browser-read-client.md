@@ -332,6 +332,25 @@ and pays against a local Anvil chain.
 
 ### Browser API and recovery boundaries
 
+The high-level SDK authenticates through `BrowserNetworkClient.connect()` and
+retains the winning session in that network client's pool. The standalone
+`BrowserNodeClient` remains a low-level per-peer API; it is not a disposable
+probe on the SDK connection path. A network client starts at most four seed
+authentication attempts concurrently, validates capabilities and any supplied
+payment identity, and returns the first usable authenticated seed. The remaining
+attempts continue within the same bound and are cancelled when the pool closes.
+The expected bootstrap identity is fixed before startup and cannot be changed
+on a running pool. Seeds rejected for capability or network identity mismatches
+cannot re-enter through discovery or ordinary read fallback in that pool.
+
+Discovery begins with authenticated seeds already available, using the unchanged
+shared iterative lookup engine. Later seeds are offered to progressive reads;
+an insufficient lookup retries through newly authenticated seeds within one
+overall lookup budget. This preserves slow-seed fallback without placing an
+all-seed authentication barrier before the first discovery request. Closing the
+SDK during authentication closes the pool immediately and frees its WASM handle
+after the pending async call settles.
+
 `BrowserNodeClient.connect()` completes the PQ handshake and HELLO and returns
 `BrowserNodeSession`. Application RPC methods belong to that session. Closing
 it invalidates the handle; reconnect explicitly to obtain another session.
