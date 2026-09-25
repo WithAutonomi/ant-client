@@ -51,8 +51,12 @@ wasm-pack build --target web --out-dir wasm-tests/pkg --release . --no-default-f
 
 The test starts seven real ant-nodes and an isolated Anvil chain, then uses
 Chromium's real WebRTC implementation. `ANT_NODE_DIR` overrides the default
-sibling `ant-node-web-support` checkout. CI checks out the node revision pinned
-by `ant-core/Cargo.toml`. Anvil must be installed and available on PATH.
+sibling `ant-node-web-support` checkout. CI checks out the exact browser-enabled
+node revision in [`node-revision`](node-revision); use that revision locally to
+reproduce CI. This integration pin is separate from the native `ant-node`
+registry dependency, which has no git `rev`. Update the pin only with a passing
+paid browser integration run against the replacement. Anvil must be installed
+and available on PATH.
 
 The harness authenticates through `BrowserNetworkClient.connect()` and retains
 that pool for the upload, makes one batched storage payment,
