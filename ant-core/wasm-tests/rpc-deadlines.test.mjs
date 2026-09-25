@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BrowserNodeClient, test_pooled_requests, test_admission_deadlines, test_close_pool_during_connect } from "./pkg/ant_core.js";
+import { test_connect_node, test_pooled_requests, test_admission_deadlines, test_close_pool_during_connect } from "./pkg/ant_core.js";
 import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 
 async function requests(rtc, { warm = true, payment = undefined, before = () => {} } = {}) {
@@ -119,14 +119,13 @@ test("pool closure during setup cannot publish a replacement association", async
   assert.equal(rtc.requests.filter(r => r.method === "hello").length, 0);
 });
 
-test("queued explicit session calls stay closed after their active RPC fails", async () => {
+test("queued transport generation handles stay closed after their active RPC fails", async () => {
   const rtc = mockWebRtc([{ respond(channel, method) {
     if (method !== "find_node") return;
     setTimeout(() => channel.close(), 20);
     return false;
   } }]);
-  const connector = new BrowserNodeClient(rtc.endpoints[0]);
-  const session = await connector.connect();
+  const session = await test_connect_node(rtc.endpoints[0]);
   try {
     const results = await Promise.allSettled([
       session.findNode("11".repeat(32), 20),
@@ -138,7 +137,7 @@ test("queued explicit session calls stay closed after their active RPC fails", a
     assert.match(String(results[2].reason), /session closed/);
     assert.equal(rtc.connections.length, 1);
     assert.equal(rtc.requests.filter(r => r.method === "find_node").length, 1);
-  } finally { session.close(); session.free(); connector.free(); }
+  } finally { session.close(); session.free(); }
 });
 
 

@@ -3,6 +3,8 @@
 //! all traverse the same ant-core implementation used by browser callers.
 
 use super::*;
+
+mod node_session;
 use base64::Engine;
 use fips204::{
     ml_dsa_65,

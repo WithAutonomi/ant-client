@@ -19,6 +19,13 @@ regressions use a mock `RTCPeerConnection` while running the real PQ handshake,
 record encryption, lookup, quote verification, and upload implementation.
 Production packages should enable only `browser-wasm`.
 
+Per-node framing, owner-proof and deadline tests use `test_connect_node()` and
+its `TestNodeSession` handle, available only with `test-utils`. They drive the
+same internal connection code without discovery hiding a single-node failure.
+Production bindings expose `BrowserNetworkClient` for authentication and network
+operations; the standalone `BrowserNodeClient` and `BrowserNodeSession` exports
+have been removed. Real-browser integration exercises the production client.
+
 Bootstrap regressions cover first-ready authentication in the retained network
 pool, discovery before a slow seed completes, late-seed fallback, the four-dial
 bootstrap bound, cancellation and payment-policy rejection. A fast seed from the

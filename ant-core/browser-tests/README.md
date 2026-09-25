@@ -54,9 +54,11 @@ Chromium's real WebRTC implementation. `ANT_NODE_DIR` overrides the default
 sibling `ant-node-web-support` checkout. CI checks out the node revision pinned
 by `ant-core/Cargo.toml`. Anvil must be installed and available on PATH.
 
-The harness authenticates through HELLO, makes one batched storage payment,
+The harness authenticates through `BrowserNetworkClient.connect()` and retains
+that pool for the upload, makes one batched storage payment,
 injects a post-payment byte-loader failure, resumes on a new client without
 another payment, and downloads using only the public DataMap address. No RTC
-or node RPC mocks are installed. Temporary node data is removed on shutdown.
+or node RPC mocks are installed. It also checks that a closed network client
+rejects reconnection. Temporary node data is removed on shutdown.
 The suite uses local funds only and verifies that the RPC belongs to the local
 Anvil devnet before invoking the wallet.

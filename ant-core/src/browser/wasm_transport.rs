@@ -574,27 +574,6 @@ impl BrowserClientPool {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct BrowserChunk {
-    #[serde(with = "serde_bytes")]
-    content: Vec<u8>,
-    hash: String,
-}
-
-#[derive(Debug, Serialize)]
-struct BrowserQuoteResponse {
-    quote: BrowserQuoteArtifact,
-    #[serde(rename = "alreadyStored")]
-    already_stored: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct BrowserPutResponse {
-    address: String,
-    #[serde(rename = "alreadyStored")]
-    already_stored: bool,
-}
-
 /// Two independent authenticated channels share ICE/DTLS/SCTP. Dropping a
 /// cancelled exchange retires only its channel; the other lane remains usable.
 struct PeerAssociation {
@@ -904,7 +883,6 @@ pub(super) struct BrowserNodeClientCore {
     next_request_id: Cell<u64>,
     generation: Cell<u64>,
     hello: RefCell<Option<BrowserHello>>,
-    peer_id: RefCell<Option<String>>,
 }
 
 impl BrowserNodeClientCore {
@@ -920,12 +898,7 @@ impl BrowserNodeClientCore {
             next_request_id: Cell::new(1),
             generation: Cell::new(0),
             hello: RefCell::new(None),
-            peer_id: RefCell::new(None),
         }
-    }
-
-    pub(super) fn peer_id(&self) -> Option<String> {
-        self.peer_id.borrow().clone()
     }
 
     fn current_rpc(&self) -> Option<Rc<multiplex::RpcSession>> {
@@ -1084,11 +1057,13 @@ impl BrowserNodeClientCore {
         }
     }
 
+    #[cfg(feature = "test-utils")]
     async fn authenticated(&self) -> Result<LockedBrowserClient<'_>, RpcError> {
         self.authenticated_before(&TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
             .await
     }
 
+    #[cfg(feature = "test-utils")]
     pub(super) async fn hello(&self) -> Result<BrowserHello, String> {
         self.authenticated()
             .await
@@ -1111,7 +1086,6 @@ impl BrowserNodeClientCore {
             connection.close();
         }
         self.hello.borrow_mut().take();
-        self.peer_id.borrow_mut().take();
     }
 }
 
@@ -1196,9 +1170,8 @@ impl LockedBrowserClient<'_> {
         if matches!(&body, BrowserRequestBody::Hello) {
             self.ensure_connected().await?;
         } else if !self.is_connected() || self.hello.borrow().is_none() {
-            // Pooled callers redial on their next admission, so name the
-            // closed session rather than ask them to reconnect. An explicit
-            // `BrowserNodeSession` gets its reconnect hint from `active()`.
+            // Pooled callers redial on their next admission. An admitted
+            // request cannot move to a replacement session.
             return Err("WebRTC session closed".to_string().into());
         }
         let connection = self
@@ -1251,9 +1224,8 @@ impl LockedBrowserClient<'_> {
             return Ok(());
         }
         // An admitted client is bound to the session it was admitted on. A
-        // redial here would build a connection that the stale generation then
-        // refuses to use, left attached to a `BrowserNodeSession` that is
-        // documented never to reconnect.
+        // redial here would attach a new connection to an operation admitted
+        // on the previous generation, which must remain invalid.
         if self.authenticated_generation.is_some() {
             return Err("authenticated session closed".to_string());
         }
@@ -1284,13 +1256,10 @@ impl LockedBrowserClient<'_> {
             capabilities,
             payment,
         };
-        let peer_id = match validate_hello_metadata(&hello, &self.endpoint) {
-            Ok(peer_id) => peer_id,
-            Err(error) => {
-                self.close();
-                return Err(error.to_string());
-            }
-        };
+        if let Err(error) = validate_hello_metadata(&hello, &self.endpoint) {
+            self.close();
+            return Err(error.to_string());
+        }
         if hello
             .capabilities
             .iter()
@@ -1300,11 +1269,11 @@ impl LockedBrowserClient<'_> {
                 rpc.enable_multiplex();
             }
         }
-        self.peer_id.replace(Some(peer_id));
         self.hello.replace(Some(hello));
         Ok(())
     }
 
+    #[cfg(feature = "test-utils")]
     pub(super) async fn hello(&self) -> Result<BrowserHello, String> {
         self.authenticate().await?;
         self.hello
@@ -1393,119 +1362,6 @@ impl LockedBrowserClient<'_> {
             }
         }
         Ok(nodes)
-    }
-
-    pub(super) async fn get_chunk(&self, address: &str) -> Result<(Vec<u8>, String), String> {
-        self.try_get_chunk(address)
-            .await?
-            .ok_or_else(|| format!("chunk {address} was not found on this node"))
-    }
-
-    async fn try_get_chunk(&self, address: &str) -> Result<Option<(Vec<u8>, String)>, String> {
-        let address = super::protocol::normalize_hex(address, 32)?;
-        let response = self
-            .request(
-                BrowserRequestBody::GetChunk {
-                    address: address.clone(),
-                },
-                &[],
-            )
-            .await?;
-        if response.header.status == BrowserResponseStatus::NotFound {
-            return Ok(None);
-        }
-        let BrowserResponseBody::Chunk {
-            address: response_address,
-            size,
-        } = response.header.body
-        else {
-            return Err("expected a CHUNK response".to_string());
-        };
-        if response_address.to_ascii_lowercase() != address {
-            return Err("node returned a different chunk address".to_string());
-        }
-        if size != response.content.len() {
-            return Err("chunk metadata size does not match its content".to_string());
-        }
-        super::verify_record(&address, &response.content).map_err(|error| error.to_string())?;
-        Ok(Some((response.content, address)))
-    }
-
-    pub(super) async fn quote_chunk(
-        &self,
-        address: &str,
-        size: usize,
-    ) -> Result<(BrowserQuoteArtifact, bool), String> {
-        let address = super::protocol::normalize_hex(address, 32)?;
-        if size > super::protocol::MAX_BROWSER_RECORD_BYTES {
-            return Err(format!("invalid chunk size {size}"));
-        }
-        let response = self
-            .request(
-                BrowserRequestBody::QuoteChunk {
-                    address: address.clone(),
-                    size: u64::try_from(size).map_err(|_| format!("invalid chunk size {size}"))?,
-                },
-                &[],
-            )
-            .await?;
-        let BrowserResponseBody::StorageQuote {
-            address: response_address,
-            already_stored,
-            quote,
-        } = response.header.body
-        else {
-            return Err("expected a STORAGE_QUOTE response".to_string());
-        };
-        if response_address.to_ascii_lowercase() != address {
-            return Err("node returned a quote for a different chunk address".to_string());
-        }
-        Ok((quote, already_stored))
-    }
-
-    pub(super) async fn put_chunk(
-        &self,
-        address: &str,
-        content: &[u8],
-        quote: BrowserQuoteArtifact,
-        transaction_hash: &str,
-    ) -> Result<(String, bool), String> {
-        self.put_chunk_typed(address, content, quote, transaction_hash)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    pub(super) async fn put_chunk_typed(
-        &self,
-        address: &str,
-        content: &[u8],
-        quote: BrowserQuoteArtifact,
-        transaction_hash: &str,
-    ) -> Result<(String, bool), RpcError> {
-        let address = super::protocol::normalize_hex(address, 32)?;
-        let transaction_hash = super::protocol::normalize_hex(transaction_hash, 32)?;
-        super::verify_record(&address, content).map_err(|error| error.to_string())?;
-        let response = self
-            .request_typed(
-                BrowserRequestBody::PutChunk {
-                    address: address.clone(),
-                    quote: Box::new(quote),
-                    transaction_hash,
-                },
-                content,
-            )
-            .await?;
-        let BrowserResponseBody::ChunkStored {
-            address: response_address,
-            already_stored,
-        } = response.header.body
-        else {
-            return Err("expected a CHUNK_STORED response".to_string().into());
-        };
-        if response_address.to_ascii_lowercase() != address {
-            return Err("node stored a different chunk address".to_string().into());
-        }
-        Ok((address, already_stored))
     }
 }
 
@@ -3248,174 +3104,6 @@ async fn load_upload_record(
     };
     super::verify_record(&record.address, content.as_slice()).map_err(|error| error.to_string())?;
     Ok(content)
-}
-
-/// One authenticated browser-to-node WebRTC Direct client implemented in Rust.
-#[wasm_bindgen(js_name = BrowserNodeClient)]
-pub struct BrowserNodeClient {
-    inner: Rc<BrowserNodeClientCore>,
-}
-
-#[wasm_bindgen(js_class = BrowserNodeClient)]
-impl BrowserNodeClient {
-    /// Construct a client from a raw or structured WebRTC Direct endpoint.
-    #[wasm_bindgen(constructor)]
-    pub fn new(endpoint: JsValue) -> Result<Self, JsValue> {
-        let endpoint: BrowserEndpointInput = serde_wasm_bindgen::from_value(endpoint)
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let endpoint = parse_webrtc_direct_multiaddr(endpoint.multiaddr())
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        Ok(Self {
-            inner: Rc::new(BrowserNodeClientCore::new(endpoint)),
-        })
-    }
-
-    /// Complete PQ authentication and HELLO, returning a session for application RPCs.
-    pub async fn connect(&self) -> Result<BrowserNodeSession, JsValue> {
-        // Each returned capability owns a distinct association. Old handles cannot
-        // close or issue requests on a later connection created by this connector.
-        let inner = Rc::new(BrowserNodeClientCore::new(self.inner.endpoint.clone()));
-        inner
-            .hello()
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        Ok(BrowserNodeSession {
-            generation: inner.generation.get(),
-            inner,
-        })
-    }
-}
-
-/// Authenticated application session. Reconnect through `BrowserNodeClient` after closure.
-#[wasm_bindgen(js_name = BrowserNodeSession)]
-pub struct BrowserNodeSession {
-    inner: Rc<BrowserNodeClientCore>,
-    generation: u64,
-}
-
-impl BrowserNodeSession {
-    async fn active(&self) -> Result<LockedBrowserClient<'_>, JsValue> {
-        let mut client = self
-            .inner
-            .lock_before(&TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
-            .await
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        if self.generation != self.inner.generation.get()
-            || !self.inner.is_connected()
-            || self.inner.hello.borrow().is_none()
-        {
-            return Err(JsValue::from_str(
-                "session closed; call BrowserNodeClient.connect() again",
-            ));
-        }
-        client._guard.take();
-        let rpc = self
-            .inner
-            .current_rpc()
-            .ok_or_else(|| JsValue::from_str("session closed"))?;
-        let slot = rpc
-            .admit(RPC_ADMISSION_TIMEOUT)
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        if self.generation != self.inner.generation.get() {
-            return Err(JsValue::from_str("session closed"));
-        }
-        client.slot.replace(Some(slot));
-        client.authenticated_generation = Some(self.generation);
-        Ok(client)
-    }
-}
-
-#[wasm_bindgen(js_class = BrowserNodeSession)]
-impl BrowserNodeSession {
-    /// Authenticated remote peer identity.
-    #[wasm_bindgen(getter, js_name = peerId)]
-    pub fn peer_id(&self) -> Option<String> {
-        self.inner.peer_id()
-    }
-
-    /// Authenticate the connected node.
-    pub async fn hello(&self) -> Result<JsValue, JsValue> {
-        let hello = self
-            .active()
-            .await?
-            .hello()
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        hello
-            .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
-            .map_err(|error| JsValue::from_str(&error.to_string()))
-    }
-
-    /// Request nodes closest to a 32-byte target.
-    #[wasm_bindgen(js_name = findNode)]
-    pub async fn find_node(&self, target: &str, count: usize) -> Result<JsValue, JsValue> {
-        let nodes = self
-            .active()
-            .await?
-            .find_node(target, count)
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        serde_wasm_bindgen::to_value(&nodes).map_err(|error| JsValue::from_str(&error.to_string()))
-    }
-
-    /// Retrieve and BLAKE3-verify one content-addressed record.
-    #[wasm_bindgen(js_name = getChunk)]
-    pub async fn get_chunk(&self, address: &str) -> Result<JsValue, JsValue> {
-        let (content, hash) = self
-            .active()
-            .await?
-            .get_chunk(address)
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        serde_wasm_bindgen::to_value(&BrowserChunk { content, hash })
-            .map_err(|error| JsValue::from_str(&error.to_string()))
-    }
-
-    /// Request a signed storage quote.
-    #[wasm_bindgen(js_name = quoteChunk)]
-    pub async fn quote_chunk(&self, address: &str, size: usize) -> Result<JsValue, JsValue> {
-        let (quote, already_stored) = self
-            .active()
-            .await?
-            .quote_chunk(address, size)
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        serde_wasm_bindgen::to_value(&BrowserQuoteResponse {
-            quote,
-            already_stored,
-        })
-        .map_err(|error| JsValue::from_str(&error.to_string()))
-    }
-
-    /// Store a paid content-addressed record.
-    #[wasm_bindgen(js_name = putChunk)]
-    pub async fn put_chunk(
-        &self,
-        address: &str,
-        content: &[u8],
-        quote: JsValue,
-        transaction_hash: &str,
-    ) -> Result<JsValue, JsValue> {
-        let quote: BrowserQuoteArtifact = serde_wasm_bindgen::from_value(quote)
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let (address, already_stored) = self
-            .active()
-            .await?
-            .put_chunk(address, content, quote, transaction_hash)
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        serde_wasm_bindgen::to_value(&BrowserPutResponse {
-            address,
-            already_stored,
-        })
-        .map_err(|error| JsValue::from_str(&error.to_string()))
-    }
-
-    /// Close the DataChannel and peer connection.
-    pub fn close(&self) {
-        self.inner.close();
-    }
 }
 
 async fn establish_pq_session(

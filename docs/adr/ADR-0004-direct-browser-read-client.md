@@ -162,8 +162,8 @@ A pooled operation owns the peer mutex from connection/PQ/HELLO authentication
 through capability and payment-network validation and the complete application
 exchange. The private locked client is the only entry point to wire requests.
 Queued operations recheck authentication under that lock and may reconnect after
-a failed predecessor. An explicit `BrowserNodeSession` instead checks its captured
-generation under the lock and remains invalid after closure.
+a failed predecessor. An admitted operation is bound to its captured generation;
+closure invalidates it even if another operation establishes a new connection.
 
 Pool and peer admission share one monotonic 400-second ceiling. This allows one
 maximum request/response transfer (180 seconds each) plus bounded setup; it is a
@@ -333,9 +333,8 @@ and pays against a local Anvil chain.
 ### Browser API and recovery boundaries
 
 The high-level SDK authenticates through `BrowserNetworkClient.connect()` and
-retains the winning session in that network client's pool. The standalone
-`BrowserNodeClient` remains a low-level per-peer API; it is not a disposable
-probe on the SDK connection path. A network client starts at most four seed
+retains the winning session in that network client's pool. `BrowserNetworkClient`
+is the single production WASM networking client. A network client starts at most four seed
 authentication attempts concurrently, validates capabilities and any supplied
 payment identity, and returns the first usable authenticated seed. The remaining
 attempts continue within the same bound and are cancelled when the pool closes.
@@ -351,9 +350,21 @@ all-seed authentication barrier before the first discovery request. Closing the
 SDK during authentication closes the pool immediately and frees its WASM handle
 after the pending async call settles.
 
-`BrowserNodeClient.connect()` completes the PQ handshake and HELLO and returns
-`BrowserNodeSession`. Application RPC methods belong to that session. Closing
-it invalidates the handle; reconnect explicitly to obtain another session.
+Remove the standalone `BrowserNodeClient` and `BrowserNodeSession` exports.
+The SDK and applications have no separate per-node RPC requirement; internal
+per-peer connections remain owned by the network pool. Single-node health or
+identity checks can use `BrowserNetworkClient([endpoint]).connect()`. Exact
+replica diagnostics or protocol debugging could justify a separate API later,
+but retaining a second public connection owner for hypothetical users increases
+lifecycle and compatibility obligations. Normal transfers must retain shared
+discovery, payment and retry policy.
+
+This is a breaking change for direct consumers of the former WASM exports;
+the high-level SDK and native Rust APIs remain unchanged. Production browser
+integration uses the network client. Transport regressions retain only their
+needed per-node operations through `test_connect_node()` and `TestNodeSession`
+under `test-utils`; neither helper is shipped in production bindings. Tests
+assert this boundary for both generated JavaScript and WASM binary exports.
 
 Public file identity is its canonical DataMap address. Browser descriptor fields
 are display hints or derived metadata, not another source of content identity.
