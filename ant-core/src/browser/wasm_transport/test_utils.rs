@@ -3,6 +3,8 @@
 //! all traverse the same ant-core implementation used by browser callers.
 
 use super::*;
+use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
+use ant_protocol::pointer::Pointer;
 use base64::Engine;
 use fips204::{
     ml_dsa_65,
@@ -289,6 +291,12 @@ pub struct BrowserTestNode {
     last_put_quote_hash: String,
     closest_peers: Vec<BrowserNode>,
     put_error: Option<(String, String)>,
+    pointers_enabled: bool,
+}
+
+/// Where the mock keeps a pointer, beside chunks in the same record map.
+fn pointer_key(address: &[u8; 32]) -> String {
+    format!("pointer:{}", hex::encode(address))
 }
 
 fn network() -> BrowserPaymentNetwork {
@@ -335,6 +343,7 @@ impl BrowserTestNode {
             last_put_quote_hash: String::new(),
             closest_peers: Vec::new(),
             put_error: None,
+            pointers_enabled: true,
         }
     }
     pub fn endpoint(&self) -> String {
@@ -372,6 +381,9 @@ impl BrowserTestNode {
     }
     pub fn set_closest_peers(&mut self, peers: JsValue) {
         self.closest_peers = serde_wasm_bindgen::from_value(peers).unwrap();
+    }
+    pub fn set_pointers_enabled(&mut self, enabled: bool) {
+        self.pointers_enabled = enabled;
     }
     pub fn set_put_error(&mut self, code: String, message: String) {
         self.put_error = (!code.is_empty()).then_some((code, message));
@@ -448,6 +460,9 @@ impl BrowserTestNode {
                         if self.address_v2 {
                             capabilities
                                 .push(ant_protocol::transport::ADDRESS_V2_CAPABILITY.into());
+                        }
+                        if self.pointers_enabled {
+                            capabilities.push(POINTER_PROTOCOL_CAPABILITY.into());
                         }
                         capabilities
                     },
@@ -866,6 +881,66 @@ impl BrowserTestNode {
                             address: request.address,
                         }
                     }
+                })
+            }
+            Body::PointerPutRequest(request) => {
+                assert!(
+                    self.pointers_enabled,
+                    "pointer PUT sent to a node without them"
+                );
+                self.last_method = "put_pointer".into();
+                let record = Pointer::from_bytes(&request.record).unwrap();
+                let address = record.address();
+                let state_id = record.state_id();
+                self.last_put_address = hex::encode(address);
+                let (proof, _) = ant_protocol::payment::deserialize_proof(
+                    request.payment_proof.as_deref().unwrap(),
+                )
+                .unwrap();
+                // Paid at the state, never the address.
+                assert!(proof
+                    .peer_quotes
+                    .iter()
+                    .all(|(_, quote)| quote.content.0 == state_id));
+                let mut quotes = proof
+                    .peer_quotes
+                    .iter()
+                    .map(|(_, quote)| quote)
+                    .collect::<Vec<_>>();
+                quotes.sort_by_key(|quote| quote.price);
+                self.last_put_quote_hash = hex::encode(quotes[quotes.len() / 2].hash());
+                let key = pointer_key(&address);
+                let held = self
+                    .records
+                    .get(&key)
+                    .and_then(|bytes| Pointer::from_bytes(bytes).ok());
+                Body::PointerPutResponse(match held {
+                    Some(held) if held.state_id() == state_id => {
+                        PointerPutResponse::Unchanged { address, state_id }
+                    }
+                    Some(held) if !record.replaces(&held) => PointerPutResponse::Stale {
+                        address,
+                        state_id: held.state_id(),
+                    },
+                    _ => {
+                        self.records.insert(key, request.record.to_vec());
+                        PointerPutResponse::Success { address, state_id }
+                    }
+                })
+            }
+            Body::PointerGetRequest(request) => {
+                assert!(
+                    self.pointers_enabled,
+                    "pointer GET sent to a node without them"
+                );
+                self.last_method = "get_pointer".into();
+                Body::PointerGetResponse(match self.records.get(&pointer_key(&request.address)) {
+                    Some(record) => PointerGetResponse::Success {
+                        record: record.clone().into(),
+                    },
+                    None => PointerGetResponse::NotFound {
+                        address: request.address,
+                    },
                 })
             }
             other => panic!("unsupported mock request: {other:?}"),

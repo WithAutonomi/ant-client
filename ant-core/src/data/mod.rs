@@ -22,6 +22,11 @@ pub use crate::node::devnet::LocalDevnet;
 // Re-export commonly used types from the wire protocol crate.
 pub use ant_protocol::{compute_address, DataChunk, XorName};
 
+// The pointer record (ADR-0016) and the owner key that signs it, so a caller of
+// the pointer API needs no direct protocol dependency.
+pub use ant_protocol::pointer::{pointer_address, Pointer, PointerTarget, PointerTargetKind};
+pub use ant_protocol::pqc::api::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
+
 // Re-export client data types
 pub use client::batch::{
     finalize_batch_payment, PaidChunk, PaymentIntent, PreparedChunk, SingleNodeQuotePayment,

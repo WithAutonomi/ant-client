@@ -31,6 +31,13 @@ confirm each result reports the payment mode the shared coordinator used.
 Private-file tests keep the DataMap record local, then download and range-read
 through the caller-held DataMap, including one with nested DataMap records.
 
+Pointer tests create, update, read and resolve pointers through the real
+client, quorum and payment code against mock nodes that keep pointers with the
+node's merge rule, and check that a node which does not advertise
+`pointer_protocol` is never asked. The mock serves every channel of one node
+from one store, as a real node does, since pointer reads and writes take
+different channels.
+
 Download regressions cover known holders omitted by failed discovery, complete
 discovery failure, bounded fallback, and unchanged BLAKE3 verification. The mock
 retains successful PUT payloads across connection replacements so a full upload,

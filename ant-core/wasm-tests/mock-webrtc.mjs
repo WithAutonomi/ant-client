@@ -29,6 +29,8 @@ export function mockWebRtc(nodes = [{}]) {
       // A real DataChannel copies the outgoing bytes. The mock re-enters WASM
       // instead, where allocating the server argument can grow memory and
       // detach an outgoing view into that same memory. Copy before re-entry.
+      // One node has one store, whichever of its channels wrote to it.
+      for (const [key, content] of stores[this.index]) this.server.set_record(key, content);
       let response = this.server.push(new Uint8Array(message));
       if (!response.length) return;
       const method = this.server.last_method();
@@ -37,7 +39,13 @@ export function mockWebRtc(nodes = [{}]) {
         const content = this.server.stored_record(address);
         if (content.length) stores[this.index].set(address, content);
       }
-      requests.push({ node: this.index, method, ...(method === "put_chunk" ? {
+      if (method === "put_pointer") {
+        const key = `pointer:${this.server.last_put_address()}`;
+        const record = this.server.stored_record(key);
+        if (record.length) stores[this.index].set(key, record);
+      }
+      const put = method === "put_chunk" || method === "put_pointer";
+      requests.push({ node: this.index, method, ...(put ? {
         address: this.server.last_put_address(),
         quoteHash: this.server.last_put_quote_hash(),
       } : {}) });
@@ -103,6 +111,7 @@ export function mockWebRtc(nodes = [{}]) {
       channel.server.set_multiplex(channel.options.multiplex ?? false);
       channel.server.set_address_v2(channel.options.addressV2 ?? false);
       channel.server.set_uploads_enabled(channel.options.uploads ?? true);
+      channel.server.set_pointers_enabled(channel.options.pointers ?? true);
       channel.server.set_invalid_quote(channel.options.invalidQuote ?? false);
       channel.server.set_committed_key_count(channel.options.keyCount ?? 0);
       const view = channel.options.view ?? nodes.map((_, i) => i);

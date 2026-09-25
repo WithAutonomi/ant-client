@@ -10,6 +10,7 @@ use crate::data::client::file::UploadEvent;
 use crate::data::client::payment::peer_id_to_encoded;
 #[cfg(test)]
 use crate::data::client::payment::SINGLE_NODE_PAYMENT_MULTIPLIER;
+use crate::data::client::quote::StoreQuotePlan;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::evm::{
@@ -142,7 +143,8 @@ pub struct PreparedChunk {
 /// Verified payment plan for a record staged outside the Rust heap.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChunkPaymentPlan {
-    /// Expected BLAKE3 content address.
+    /// The address the quotes name: a chunk's BLAKE3 content address, or a
+    /// pointer's `state_id`.
     pub address: XorName,
     /// Expected record length.
     pub data_size: u64,
@@ -157,6 +159,16 @@ pub struct ChunkPaymentPlan {
 }
 
 impl ChunkPaymentPlan {
+    /// The payment proof for this plan, from the transactions that paid it:
+    /// what a storer is sent alongside the record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a paid quote has no transaction in `transactions`.
+    pub fn proof(&self, transactions: &HashMap<QuoteHash, TxHash>) -> Result<Vec<u8>> {
+        build_plan_proof(self, transactions)
+    }
+
     /// Bind externally staged bytes to the address and size that were quoted.
     pub fn with_content(self, content: Bytes) -> Result<PreparedChunk> {
         if content.len() as u64 != self.data_size || compute_address(&content) != self.address {
@@ -316,7 +328,7 @@ fn build_paid_chunks(
         .collect()
 }
 
-pub(super) fn build_plan_proof(
+pub(crate) fn build_plan_proof(
     plan: &ChunkPaymentPlan,
     tx_hash_map: &HashMap<QuoteHash, TxHash>,
 ) -> Result<Vec<u8>> {
@@ -347,6 +359,49 @@ pub(super) fn build_plan_proof(
         .map_err(|e| Error::Serialization(format!("Failed to serialize payment proof: {e}")))?;
 
     Ok(proof_bytes)
+}
+
+/// Turn a verified quote plan into a payment plan: the median payment and the
+/// quotes and commitments its proof carries.
+fn payment_plan_from_quotes(
+    address: XorName,
+    data_size: u64,
+    quote_plan: StoreQuotePlan,
+) -> Result<ChunkPaymentPlan> {
+    let quotes_with_peers = quote_plan.quotes;
+
+    // Capture the ordered PUT target set for replication. This can be
+    // wider than the peers that supplied the paid quotes.
+    let quoted_peers = quote_plan.put_peers;
+
+    // Build peer_quotes for ProofOfPayment + quotes for single-node payment.
+    // Use node-reported prices directly — no contract price fetch needed.
+    let mut peer_quotes = Vec::with_capacity(quotes_with_peers.len());
+    let mut quotes_for_payment = Vec::with_capacity(quotes_with_peers.len());
+    // ADR-0004: forward each bound quote's commitment sidecar (baseline
+    // quotes ship none); `get_store_quotes` already verified the binding.
+    let mut commitment_sidecars = Vec::new();
+
+    for (peer_id, _addrs, quote, _price, commitment) in quotes_with_peers {
+        let encoded = peer_id_to_encoded(&peer_id)?;
+        peer_quotes.push((encoded, quote.clone()));
+        quotes_for_payment.push(quote);
+        if let Some(sidecar) = commitment {
+            commitment_sidecars.push(sidecar);
+        }
+    }
+
+    let payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment)
+        .map_err(|e| Error::Payment(format!("Failed to create payment: {e}")))?;
+
+    Ok(ChunkPaymentPlan {
+        data_size,
+        address,
+        quoted_peers,
+        payment,
+        peer_quotes,
+        commitment_sidecars,
+    })
 }
 
 /// Finalize a batch payment using externally-provided transaction hashes.
@@ -413,40 +468,28 @@ impl Client {
             }
             Err(e) => return Err(e),
         };
-        let quotes_with_peers = quote_plan.quotes;
+        payment_plan_from_quotes(address, data_size, quote_plan).map(Some)
+    }
 
-        // Capture the ordered PUT target set for replication. This can be
-        // wider than the peers that supplied the paid quotes.
-        let quoted_peers = quote_plan.put_peers;
-
-        // Build peer_quotes for ProofOfPayment + quotes for single-node payment.
-        // Use node-reported prices directly — no contract price fetch needed.
-        let mut peer_quotes = Vec::with_capacity(quotes_with_peers.len());
-        let mut quotes_for_payment = Vec::with_capacity(quotes_with_peers.len());
-        // ADR-0004: forward each bound quote's commitment sidecar (baseline
-        // quotes ship none); `get_store_quotes` already verified the binding.
-        let mut commitment_sidecars = Vec::new();
-
-        for (peer_id, _addrs, quote, _price, commitment) in quotes_with_peers {
-            let encoded = peer_id_to_encoded(&peer_id)?;
-            peer_quotes.push((encoded, quote.clone()));
-            quotes_for_payment.push(quote);
-            if let Some(sidecar) = commitment {
-                commitment_sidecars.push(sidecar);
-            }
+    /// Quote `content` from the close group around `routing` and plan its
+    /// payment, without paying.
+    ///
+    /// The two are one address for a chunk and two for a pointer, which is
+    /// quoted at its state and collected from the group around its address.
+    pub(crate) async fn prepare_payment_plan_split(
+        &self,
+        routing: &XorName,
+        content: &XorName,
+        data_size: u64,
+        data_type: u32,
+    ) -> Result<ChunkPaymentPlan> {
+        if let Some(refusal) = self.corroborated_settlement_refusal() {
+            return Err(Error::ClientUpdateRequired(refusal));
         }
-
-        let payment = SingleNodeQuotePayment::from_quotes(quotes_for_payment)
-            .map_err(|e| Error::Payment(format!("Failed to create payment: {e}")))?;
-
-        Ok(Some(ChunkPaymentPlan {
-            data_size,
-            address,
-            quoted_peers,
-            payment,
-            peer_quotes,
-            commitment_sidecars,
-        }))
+        let quote_plan = self
+            .get_store_quote_plan_split(routing, content, data_size, data_type)
+            .await?;
+        payment_plan_from_quotes(*content, data_size, quote_plan)
     }
 
     /// Pay for multiple chunks in a single EVM transaction.

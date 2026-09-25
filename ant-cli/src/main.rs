@@ -165,6 +165,17 @@ async fn run() -> anyhow::Result<()> {
             client.save_adaptive_snapshot();
             result?;
         }
+        Commands::Pointer { action } => {
+            if !action.needs_network() {
+                return action.execute_offline(json);
+            }
+            let client =
+                build_data_client(&data_ctx, action.needs_wallet(), json, None, None).await?;
+            let result = action.execute(&client, json).await;
+            client.save_peer_cache().await;
+            client.save_adaptive_snapshot();
+            result?;
+        }
         Commands::Update(args) => {
             args.execute(json).await?;
         }
