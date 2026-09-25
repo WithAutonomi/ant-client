@@ -342,6 +342,20 @@ The expected bootstrap identity is fixed before startup and cannot be changed
 on a running pool. Seeds rejected for capability or network identity mismatches
 cannot re-enter through discovery or ordinary read fallback in that pool.
 
+Bootstrap readiness is revalidated against live pooled sessions on later calls.
+A closed or evicted seed must reconnect and authenticate before `connect()` can
+report success. After an exhausted batch, a later caller may retry transient
+failures in one new batch, still limited to four concurrent attempts and with
+at least one second between batch starts. Concurrent callers share that batch;
+there is no autonomous retry loop. Closing the pool cancels a pending backoff.
+The existing failed-dial cache continues to apply. Retries preserve the original
+payment policy and never retry a permanent capability or identity rejection.
+
+Both control and data HELLOs validate the configured seed policy before becoming
+usable. A rejection invalidates both lanes and wakes waiting callers. Pool,
+peer and request admission recheck rejection, so a lease issued before rejection
+cannot send subsequent application requests or reconnect the rejected endpoint.
+
 Discovery begins with authenticated seeds already available, using the unchanged
 shared iterative lookup engine. Later seeds are offered to progressive reads;
 an insufficient lookup retries through newly authenticated seeds within one

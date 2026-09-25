@@ -151,7 +151,7 @@ struct BrowserClientPool {
     clock: Cell<u64>,
     availability: Rc<PoolAvailability>,
     preconnecting: RefCell<HashSet<String>>,
-    rejected_bootstrap: RefCell<HashMap<String, String>>,
+    bootstrap_policy: Rc<bootstrap::Policies>,
     #[cfg(feature = "test-utils")]
     preconnect_errors: RefCell<Vec<String>>,
 }
@@ -300,7 +300,7 @@ impl BrowserClientPool {
                 sender: availability_tx,
             }),
             preconnecting: RefCell::new(HashSet::new()),
-            rejected_bootstrap: RefCell::new(HashMap::new()),
+            bootstrap_policy: Rc::new(bootstrap::Policies::default()),
             #[cfg(feature = "test-utils")]
             preconnect_errors: RefCell::new(Vec::new()),
         })
@@ -359,12 +359,10 @@ impl BrowserClientPool {
         let endpoint = parse_webrtc_direct_multiaddr(&endpoint.multiaddr)
             .map_err(|error| error.to_string())?;
         let key = endpoint.multiaddr.clone();
-        if let Some(error) = self.rejected_bootstrap.borrow().get(&key) {
-            return Err(error.clone());
-        }
         // Subscribe before checking the predicate so a release cannot be missed.
         let mut availability = self.availability.sender.subscribe();
         loop {
+            self.bootstrap_policy.check(&key)?;
             if self.availability.closed.get() {
                 return Err("WebRTC client pool is closed".to_string());
             }
@@ -402,10 +400,12 @@ impl BrowserClientPool {
                         let mut client = BrowserNodeClientCore::new(endpoint.clone());
                         client.dial_failures = Some(Rc::clone(&self.dial_failures));
                         client.pool_availability = Some(Rc::clone(&self.availability));
+                        client.bootstrap_policy = Some(Rc::clone(&self.bootstrap_policy));
                         let mut data_client = BrowserNodeClientCore::new(endpoint.clone());
                         data_client.association = Rc::clone(&client.association);
                         data_client.dial_failures = Some(Rc::clone(&self.dial_failures));
                         data_client.pool_availability = Some(Rc::clone(&self.availability));
+                        data_client.bootstrap_policy = Some(Rc::clone(&self.bootstrap_policy));
                         let data_client = Rc::new(data_client);
                         let client = Rc::new(client);
                         clients.insert(
@@ -416,6 +416,7 @@ impl BrowserClientPool {
                                 last_used: now,
                             },
                         );
+                        self.bootstrap_policy.register(&key, &clients[&key]);
                         Some(if data_lane { data_client } else { client })
                     } else {
                         None
@@ -437,11 +438,7 @@ impl BrowserClientPool {
     }
 
     fn is_lookup_eligible(&self, peer: &str, endpoint: &BrowserEndpoint) -> bool {
-        if self
-            .rejected_bootstrap
-            .borrow()
-            .contains_key(&endpoint.multiaddr)
-        {
+        if self.bootstrap_policy.check(&endpoint.multiaddr).is_err() {
             return false;
         }
         // Native allows an existing connection even when its advertised
@@ -462,13 +459,29 @@ impl BrowserClientPool {
 
     /// Read speculation must not wait for a cold association to open.
     fn has_authenticated_connection(&self, endpoint: &BrowserEndpoint) -> bool {
-        self.clients
-            .borrow()
-            .get(&endpoint.multiaddr)
-            .is_some_and(|entry| {
-                [&entry.client, &entry.data_client]
-                    .iter()
-                    .any(|client| client.is_connected() && client.hello.borrow().is_some())
+        self.bootstrap_policy.check(&endpoint.multiaddr).is_ok()
+            && self
+                .clients
+                .borrow()
+                .get(&endpoint.multiaddr)
+                .is_some_and(|entry| {
+                    [&entry.client, &entry.data_client]
+                        .iter()
+                        .any(|client| client.is_connected() && client.hello.borrow().is_some())
+                })
+    }
+
+    fn authenticated_hello(&self, endpoint: &BrowserEndpoint) -> Option<BrowserHello> {
+        self.bootstrap_policy.check(&endpoint.multiaddr).ok()?;
+        let clients = self.clients.borrow();
+        let entry = clients.get(&endpoint.multiaddr)?;
+        [&entry.client, &entry.data_client]
+            .iter()
+            .find_map(|client| {
+                client
+                    .is_connected()
+                    .then(|| client.hello.borrow().clone())
+                    .flatten()
             })
     }
 
@@ -875,6 +888,7 @@ impl Drop for Connection {
 pub(super) struct BrowserNodeClientCore {
     dial_failures: Option<DialFailures>,
     pool_availability: Option<Rc<PoolAvailability>>,
+    bootstrap_policy: Option<Rc<bootstrap::Policies>>,
     endpoint: WebRtcDirectEndpoint,
     association: SharedAssociation,
     connection: RefCell<Option<Rc<Connection>>>,
@@ -890,6 +904,7 @@ impl BrowserNodeClientCore {
         Self {
             dial_failures: None,
             pool_availability: None,
+            bootstrap_policy: None,
             endpoint,
             association: Rc::new(Mutex::new(Weak::new())),
             connection: RefCell::new(None),
@@ -916,7 +931,15 @@ impl BrowserNodeClientCore {
             .is_some_and(|connection| connection.is_live())
     }
 
+    fn check_bootstrap_policy(&self) -> Result<(), String> {
+        if let Some(policy) = &self.bootstrap_policy {
+            policy.check(&self.endpoint.multiaddr)?;
+        }
+        Ok(())
+    }
+
     async fn ensure_connected(&self) -> Result<(), String> {
+        self.check_bootstrap_policy()?;
         if self.is_connected() {
             return Ok(());
         }
@@ -964,7 +987,10 @@ impl BrowserNodeClientCore {
         };
         // close() can run while SDP, ICE or PQ authentication is awaiting JS.
         // Never publish a connection belonging to an invalidated generation.
-        if generation != self.generation.get() || self.pool_is_closed() {
+        if generation != self.generation.get()
+            || self.pool_is_closed()
+            || self.check_bootstrap_policy().is_err()
+        {
             connection.close();
             return Err("WebRTC client closed during connection setup".into());
         }
@@ -1012,6 +1038,7 @@ impl BrowserNodeClientCore {
         if self.pool_is_closed() {
             return Err("WebRTC client pool is closed".to_string().into());
         }
+        self.check_bootstrap_policy()?;
         Ok(LockedBrowserClient {
             client: self,
             _guard: Some(guard),
@@ -1161,6 +1188,7 @@ impl LockedBrowserClient<'_> {
         ),
         RpcError,
     > {
+        self.check_bootstrap_policy()?;
         if self
             .authenticated_generation
             .is_some_and(|generation| generation != self.generation.get())
@@ -1220,6 +1248,7 @@ impl LockedBrowserClient<'_> {
     /// live. Callers that only need the session use this rather than `hello()`
     /// and skip cloning the HELLO on every RPC.
     async fn authenticate(&self) -> Result<(), String> {
+        self.check_bootstrap_policy()?;
         if self.is_connected() && self.hello.borrow().is_some() {
             return Ok(());
         }
@@ -1259,6 +1288,9 @@ impl LockedBrowserClient<'_> {
         if let Err(error) = validate_hello_metadata(&hello, &self.endpoint) {
             self.close();
             return Err(error.to_string());
+        }
+        if let Some(policy) = &self.bootstrap_policy {
+            policy.validate(&self.endpoint.multiaddr, &hello)?;
         }
         if hello
             .capabilities
@@ -1484,8 +1516,8 @@ impl BrowserNetworkCore {
         let mut used = 0;
         loop {
             let state = updates.borrow_and_update().clone();
-            if state.ready.len() > used {
-                used = state.ready.len();
+            if state.revision != used && !state.ready.is_empty() {
+                used = state.revision;
                 // A first walk may already have authenticated and queried the
                 // other seeds through discovery. Their bootstrap completion
                 // must not trigger a duplicate walk or extra quote witnesses.
@@ -1553,8 +1585,7 @@ impl BrowserNetworkCore {
                     }
                     Err(error) if deadline.remaining().is_zero() => return best.ok_or(error),
                     Err(error)
-                        if updates.borrow().pending == 0
-                            && updates.borrow().ready.len() <= used =>
+                        if updates.borrow().pending == 0 && updates.borrow().revision == used =>
                     {
                         return best.ok_or(error)
                     }

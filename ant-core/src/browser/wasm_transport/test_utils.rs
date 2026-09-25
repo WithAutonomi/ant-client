@@ -14,6 +14,29 @@ use saorsa_transport::webrtc::{
     accept_pq_session, encode_response_frame, parse_request_frame, BrowserResponse,
 };
 
+/// Exercise bootstrap readiness after actual LRU pool eviction.
+#[wasm_bindgen]
+pub async fn test_bootstrap_eviction(endpoints: JsValue) -> Result<(), JsValue> {
+    let endpoints: Vec<BrowserEndpointInput> = serde_wasm_bindgen::from_value(endpoints).unwrap();
+    let endpoints: Vec<_> = endpoints
+        .iter()
+        .map(|endpoint| BrowserEndpoint {
+            multiaddr: endpoint.multiaddr().into(),
+        })
+        .collect();
+    let mut core = BrowserNetworkCore::new(vec![endpoints[0].clone()]).unwrap();
+    core.pool = Rc::new(BrowserClientPool::new(1).unwrap());
+    let result = async {
+        core.connect(None).await?;
+        core.pool.client(&endpoints[1]).await?.hello().await?;
+        core.connect(None).await?;
+        Ok::<_, String>(())
+    }
+    .await;
+    core.pool.close();
+    result.map_err(|error| JsValue::from_str(&error))
+}
+
 /// Run independent peer reads through the real adapter's physical GET gate.
 #[wasm_bindgen]
 pub async fn test_budgeted_reads(endpoints: JsValue, close_early: bool) -> JsValue {
