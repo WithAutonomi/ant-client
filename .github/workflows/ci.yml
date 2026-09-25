@@ -116,10 +116,10 @@ jobs:
           sudo tar -xzf /tmp/foundry.tar.gz -C /usr/local/bin anvil forge cast chisel
           anvil --version
           forge --version
-      - name: Check out the node revision pinned by ant-core
+      - name: Check out the pinned browser integration node
         shell: bash
         run: |
-          node_revision=$(python3 -c 'import tomllib; print(tomllib.load(open("ant-core/Cargo.toml", "rb"))["dependencies"]["ant-node"]["rev"])')
+          node_revision=$(cat ant-core/browser-tests/node-revision)
           git clone https://github.com/WithAutonomi/ant-node.git ../ant-node-web-support
           git -C ../ant-node-web-support checkout "$node_revision"
       - run: cargo install wasm-pack --version 0.15.0 --locked

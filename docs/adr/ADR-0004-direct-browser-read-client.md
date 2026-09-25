@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-09-23
+- **Last amended:** 2026-09-25
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -117,14 +117,53 @@ discard externally staged encrypted records, report progress, and submit an
 already verified payment plan. Those callbacks expose browser capabilities;
 they do not reimplement Autonomi protocol behavior.
 
+### Bounded progressive reads on both targets
+
+Native and WASM use the same `client_engine::read::retrieve_progressive` policy.
+Speculation starts from already-connected peers on both targets. Browser lookup
+replies publish authenticated responders and already-connected hints; bounded
+owner-signed preconnections publish additional hints after HELLO completes. Cold
+addresses remain available to ordinary discovery and final fallback, rather than
+occupying speculative GET slots for an entire ICE timeout.
+
+An immutable read begins with one speculative GET while ordinary XOR discovery
+continues. If it is still pending after one second, a second candidate may race
+it. The existing limit of two simultaneous GETs per record is retained: when
+discovery completes with both speculative slots occupied, the ordinary path
+waits for a slot. Immediate successes and misses do not trigger extra fan-out.
+
+The one-second delay prevents a slow connection setup from blocking every newer
+hint, without replacing the ordinary lookup or shortening a serving peer's
+response allowance. Speculation may use the existing twenty-peer fallback
+allowance while discovery is pending; it previously stopped after seven attempts
+and could exhaust that allowance on stale hints before a holder appeared. Peer
+deduplication, final fallback bounds, two-round retry policy, content verification and authoritative
+absence rules are unchanged. Early misses cannot establish absence. This is a
+shared scheduling change, not a separate browser read protocol or metadata format.
+It can perform more early attempts and one extra overlapping read during a slow
+lookup, within the peak concurrency already allowed after lookup. Browser response-memory reservations
+continue to apply to every physical GET, including abandoned replies.
+
+WebRTC's control and data lanes recheck endpoint suppression while holding their
+shared association setup lock. A lane queued behind a failed dial must reuse the
+failure, rather than repeating the same ten-second connection attempt. Existing
+live associations remain reusable. Cancellation alone does not populate the
+failure cache.
+
+`test-utils` builds expose opt-in, per-record/per-peer timing through
+`setBrowserTrace`; production bindings contain no trace callback or address logs.
+The read-only Chromium startup probe records cold-client results against explicit
+caller-supplied seeds. Live-network timing is supporting evidence alongside
+deterministic tests for hedging, concurrency, failure sharing and integrity.
+
 ### Browser RPC ownership and deadlines
 
 A pooled operation owns the peer mutex from connection/PQ/HELLO authentication
 through capability and payment-network validation and the complete application
 exchange. The private locked client is the only entry point to wire requests.
 Queued operations recheck authentication under that lock and may reconnect after
-a failed predecessor. An explicit `BrowserNodeSession` instead checks its captured
-generation under the lock and remains invalid after closure.
+a failed predecessor. An admitted operation is bound to its captured generation;
+closure invalidates it even if another operation establishes a new connection.
 
 Pool and peer admission share one monotonic 400-second ceiling. This allows one
 maximum request/response transfer (180 seconds each) plus bounded setup; it is a
@@ -293,9 +332,53 @@ and pays against a local Anvil chain.
 
 ### Browser API and recovery boundaries
 
-`BrowserNodeClient.connect()` completes the PQ handshake and HELLO and returns
-`BrowserNodeSession`. Application RPC methods belong to that session. Closing
-it invalidates the handle; reconnect explicitly to obtain another session.
+The high-level SDK authenticates through `BrowserNetworkClient.connect()` and
+retains the winning session in that network client's pool. `BrowserNetworkClient`
+is the single production WASM networking client. A network client starts at most four seed
+authentication attempts concurrently, validates capabilities and any supplied
+payment identity, and returns the first usable authenticated seed. The remaining
+attempts continue within the same bound and are cancelled when the pool closes.
+The expected bootstrap identity is fixed before startup and cannot be changed
+on a running pool. Seeds rejected for capability or network identity mismatches
+cannot re-enter through discovery or ordinary read fallback in that pool.
+
+Bootstrap readiness is revalidated against live pooled sessions on later calls.
+A closed or evicted seed must reconnect and authenticate before `connect()` can
+report success. After an exhausted batch, a later caller may retry transient
+failures in one new batch, still limited to four concurrent attempts and with
+at least one second between batch starts. Concurrent callers share that batch;
+there is no autonomous retry loop. Closing the pool cancels a pending backoff.
+The existing failed-dial cache continues to apply. Retries preserve the original
+payment policy and never retry a permanent capability or identity rejection.
+
+Both control and data HELLOs validate the configured seed policy before becoming
+usable. A rejection invalidates both lanes and wakes waiting callers. Pool,
+peer and request admission recheck rejection, so a lease issued before rejection
+cannot send subsequent application requests or reconnect the rejected endpoint.
+
+Discovery begins with authenticated seeds already available, using the unchanged
+shared iterative lookup engine. Later seeds are offered to progressive reads;
+an insufficient lookup retries through newly authenticated seeds within one
+overall lookup budget. This preserves slow-seed fallback without placing an
+all-seed authentication barrier before the first discovery request. Closing the
+SDK during authentication closes the pool immediately and frees its WASM handle
+after the pending async call settles.
+
+Remove the standalone `BrowserNodeClient` and `BrowserNodeSession` exports.
+The SDK and applications have no separate per-node RPC requirement; internal
+per-peer connections remain owned by the network pool. Single-node health or
+identity checks can use `BrowserNetworkClient([endpoint]).connect()`. Exact
+replica diagnostics or protocol debugging could justify a separate API later,
+but retaining a second public connection owner for hypothetical users increases
+lifecycle and compatibility obligations. Normal transfers must retain shared
+discovery, payment and retry policy.
+
+This is a breaking change for direct consumers of the former WASM exports;
+the high-level SDK and native Rust APIs remain unchanged. Production browser
+integration uses the network client. Transport regressions retain only their
+needed per-node operations through `test_connect_node()` and `TestNodeSession`
+under `test-utils`; neither helper is shipped in production bindings. Tests
+assert this boundary for both generated JavaScript and WASM binary exports.
 
 Public file identity is its canonical DataMap address. Browser descriptor fields
 are display hints or derived metadata, not another source of content identity.

@@ -1,0 +1,6 @@
+{
+  "ant-core/src/browser/wasm_transport.rs": "3adff7fad53f4a6de45942f522d8cbb7efe619a885b97d7ef2456e3dfd110a78",
+  "ant-core/src/browser/wasm_transport/bootstrap.rs": "db565ce2a4e12ca528f408f8e7bcd74671a8949d8c5c4c792916a67189643b6e",
+  "../ant-client-browser-sdk/src/client.ts": "c5e8ee9cc4fc727c34db40cfb7acc9acd55175babc0c3a00c6b28bbac6d63186",
+  "../ant-client-browser-sdk/src/internal/runtime.ts": "ac05ee950dee50802a9bbe34cfa1228902a287fdfde5c8dac9ded120843c9f68"
+}

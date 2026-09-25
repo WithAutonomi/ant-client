@@ -3,6 +3,8 @@
 //! all traverse the same ant-core implementation used by browser callers.
 
 use super::*;
+
+mod node_session;
 use base64::Engine;
 use fips204::{
     ml_dsa_65,
@@ -11,6 +13,29 @@ use fips204::{
 use saorsa_transport::webrtc::{
     accept_pq_session, encode_response_frame, parse_request_frame, BrowserResponse,
 };
+
+/// Exercise bootstrap readiness after actual LRU pool eviction.
+#[wasm_bindgen]
+pub async fn test_bootstrap_eviction(endpoints: JsValue) -> Result<(), JsValue> {
+    let endpoints: Vec<BrowserEndpointInput> = serde_wasm_bindgen::from_value(endpoints).unwrap();
+    let endpoints: Vec<_> = endpoints
+        .iter()
+        .map(|endpoint| BrowserEndpoint {
+            multiaddr: endpoint.multiaddr().into(),
+        })
+        .collect();
+    let mut core = BrowserNetworkCore::new(vec![endpoints[0].clone()]).unwrap();
+    core.pool = Rc::new(BrowserClientPool::new(1).unwrap());
+    let result = async {
+        core.connect(None).await?;
+        core.pool.client(&endpoints[1]).await?.hello().await?;
+        core.connect(None).await?;
+        Ok::<_, String>(())
+    }
+    .await;
+    core.pool.close();
+    result.map_err(|error| JsValue::from_str(&error))
+}
 
 /// Run independent peer reads through the real adapter's physical GET gate.
 #[wasm_bindgen]
@@ -59,6 +84,23 @@ pub async fn test_budgeted_reads(endpoints: JsValue, close_early: bool) -> JsVal
     let (results, ()) = futures::future::join(futures::future::join_all(requests), close).await;
     core.pool.close();
     serde_wasm_bindgen::to_value(&results).unwrap()
+}
+
+/// Both cold lanes must observe the same failed association setup.
+#[wasm_bindgen]
+pub async fn test_concurrent_failed_lanes(endpoint: &str) -> JsValue {
+    let pool = BrowserClientPool::new(1).unwrap();
+    let endpoint = BrowserEndpoint {
+        multiaddr: endpoint.into(),
+    };
+    let control = pool.client(&endpoint).await.unwrap();
+    let data = pool
+        .data_client_before(&endpoint, TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
+        .await
+        .unwrap();
+    let (control, data) = futures::future::join(control.hello(), data.hello()).await;
+    pool.close();
+    serde_wasm_bindgen::to_value(&vec![control.err(), data.err()]).unwrap()
 }
 
 /// Exercise independent RPC lanes, channel-local cancellation and reuse of the
@@ -246,8 +288,8 @@ pub async fn test_preconnect_pool(
         })
         .collect::<Vec<_>>();
     let pool = Rc::new(BrowserClientPool::new(capacity).unwrap());
-    pool.preconnect(&nodes);
-    pool.preconnect(&nodes);
+    pool.preconnect(&nodes, None);
+    pool.preconnect(&nodes, None);
     crate::runtime::sleep(Duration::from_millis(20)).await;
     if close_early {
         pool.close();
@@ -275,6 +317,7 @@ pub struct BrowserTestNode {
     endpoint: String,
     session: Option<PqSession>,
     hello_received: bool,
+    hello_payment: BrowserPaymentNetwork,
     received: Vec<u8>,
     already_stored: bool,
     last_method: String,
@@ -321,6 +364,7 @@ impl BrowserTestNode {
             endpoint,
             session: None,
             hello_received: false,
+            hello_payment: network(),
             received: Vec::new(),
             already_stored,
             last_method: String::new(),
@@ -345,6 +389,10 @@ impl BrowserTestNode {
     }
     pub fn set_multiplex(&mut self, enabled: bool) {
         self.multiplex = enabled;
+    }
+
+    pub fn set_hello_payment(&mut self, payment: JsValue) {
+        self.hello_payment = serde_wasm_bindgen::from_value(payment).unwrap();
     }
     pub fn seal_response(&mut self, plaintext: &[u8]) -> Vec<u8> {
         encode_pq_frame(&self.session.as_mut().unwrap().seal(plaintext).unwrap()).unwrap()
@@ -432,7 +480,7 @@ impl BrowserTestNode {
                     endpoint: BrowserEndpoint {
                         multiaddr: self.endpoint.clone(),
                     },
-                    payment: network(),
+                    payment: self.hello_payment.clone(),
                     capabilities: {
                         let mut capabilities = vec![
                             "chunk_protocol".into(),
@@ -1213,6 +1261,55 @@ pub async fn test_stale_rpc_admission(endpoint: &str) {
         .unwrap_err()
         .contains("session closed"));
     client.find_node(&"22".repeat(32), 20).await.unwrap();
+    client.close();
+}
+
+/// Redial a lane whose session this client closed while an in-flight exchange
+/// still keeps its association alive.
+#[wasm_bindgen]
+pub async fn test_redial_after_local_close(endpoint: &str) {
+    let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
+    client.hello().await.unwrap();
+    let in_flight = client.connection.borrow().clone();
+    client
+        .current_rpc()
+        .unwrap()
+        .close("test closed the session".into());
+    client.hello().await.unwrap();
+    drop(in_flight);
+    client.close();
+}
+
+/// Report the error a pooled RPC sees when its session closes after admission.
+#[wasm_bindgen]
+pub async fn test_closed_session_error(endpoint: &str) -> String {
+    let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
+    let admitted = client.authenticated().await.unwrap();
+    client
+        .current_rpc()
+        .unwrap()
+        .close("test closed the session".into());
+    let error = admitted.find_node(&"11".repeat(32), 20).await.unwrap_err();
+    drop(admitted);
+    client.close();
+    error
+}
+
+/// A client admitted on a session that then closes must fail, not redial.
+#[wasm_bindgen]
+pub async fn test_admitted_hello_never_redials(endpoint: &str) {
+    let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
+    let admitted = client.authenticated().await.unwrap();
+    client
+        .current_rpc()
+        .unwrap()
+        .close("test closed the session".into());
+    assert!(admitted
+        .hello()
+        .await
+        .unwrap_err()
+        .contains("session closed"));
+    drop(admitted);
     client.close();
 }
 

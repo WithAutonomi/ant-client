@@ -6,6 +6,19 @@ export const paymentNetwork = {
   payment_vault_address: `0x${"22".repeat(20)}`,
 };
 
+// DataChannel closes still in flight (see Channel.close below).
+const pendingCloses = new Set();
+
+// Await this before asserting that a channel, or the peer connection its last
+// close releases, has closed. It also waits for closes requested while it
+// waits, such as sibling channels closed in reaction to a close event.
+export async function closesSettled() {
+  do {
+    await Promise.all(pendingCloses);
+    await new Promise(resolve => setImmediate(resolve));
+  } while (pendingCloses.size);
+}
+
 // Reset for each test. Only browser-owned RTC objects are mocked; all node
 // responses use the shared Rust wire contract and real session encryption.
 export function mockWebRtc(nodes = [{}]) {
@@ -50,8 +63,26 @@ export function mockWebRtc(nodes = [{}]) {
         }
       }, this.options.delay?.(method) ?? 0);
     }
+    // Matches node-datachannel's polyfill, which the Node.js WASM client
+    // runs on: close() only records the request and defers the native close
+    // through setImmediate, and readyState stays "open" until the native
+    // callback and a second setImmediate have run. Browsers report "closing"
+    // at once, so a caller that trusts readyState after close() works there
+    // and spins here (V2-1305).
     close() {
-      if (this.readyState === "closed") return;
+      if (this.readyState === "closed" || this.closeRequested) return;
+      this.closeRequested = true;
+      const closed = new Promise(resolve => setImmediate(() => setImmediate(() => {
+        try {
+          this.finishClose();
+        } finally {
+          resolve();
+        }
+      })));
+      pendingCloses.add(closed);
+      closed.then(() => pendingCloses.delete(closed));
+    }
+    finishClose() {
       this.readyState = "closed";
       this.dispatchEvent(new Event("close"));
       this.onclose?.({});
@@ -103,6 +134,7 @@ export function mockWebRtc(nodes = [{}]) {
       channel.server.set_multiplex(channel.options.multiplex ?? false);
       channel.server.set_address_v2(channel.options.addressV2 ?? false);
       channel.server.set_uploads_enabled(channel.options.uploads ?? true);
+      if (channel.options.payment) channel.server.set_hello_payment(channel.options.payment);
       channel.server.set_invalid_quote(channel.options.invalidQuote ?? false);
       channel.server.set_committed_key_count(channel.options.keyCount ?? 0);
       const view = channel.options.view ?? nodes.map((_, i) => i);
