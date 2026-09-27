@@ -911,7 +911,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.20.0"
-source = "git+https://github.com/WithAutonomi/ant-node.git?rev=3c70728b1bc70e37219bd99b53e7243e72c18550#3c70728b1bc70e37219bd99b53e7243e72c18550"
+source = "git+https://github.com/WithAutonomi/ant-node.git?rev=7353c9ea2740de33495e78a3c36ff75b75116d4b#7353c9ea2740de33495e78a3c36ff75b75116d4b"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -962,8 +962,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "3.1.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=4412b6af4fab2ceb0a4e1efea1efca08e68c6e4e#4412b6af4fab2ceb0a4e1efea1efca08e68c6e4e"
+version = "3.0.0"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=d11d1010d93958fee6e63e4aace8770f39a0678b#d11d1010d93958fee6e63e4aace8770f39a0678b"
 dependencies = [
  "blake3",
  "bytes",

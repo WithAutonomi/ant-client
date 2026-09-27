@@ -4,6 +4,6 @@ resolver = "2"
 
 [patch.crates-io]
 # The published ant-protocol 3.0.0 has no `Pointer` record or wire messages
-# (ADR-0016); 3.1.0 is that release plus them. The only patch needed, and only
-# until 3.1.0 is published. A rev, so the pin is immutable.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "4412b6af4fab2ceb0a4e1efea1efca08e68c6e4e" }
+# (ADR-0016). Pin the pointer revision until a release includes it.
+# Versions are bumped at release; this immutable revision remains 3.0.0.
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "d11d1010d93958fee6e63e4aace8770f39a0678b" }
