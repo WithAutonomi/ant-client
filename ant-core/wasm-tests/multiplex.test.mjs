@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { test_multiplex_requests, test_cancelled_read_reservation, test_stale_rpc_admission, test_draining_pool_capacity, test_multiplex_puts } from './pkg/ant_core.js';
+import { test_multiplex_requests, test_cancelled_read_reservation, test_stale_rpc_admission, test_admitted_hello_never_redials, test_closed_session_error, test_draining_pool_capacity, test_multiplex_puts } from './pkg/ant_core.js';
 import { mockWebRtc } from './mock-webrtc.mjs';
 const object = v => v instanceof Map ? Object.fromEntries([...v].map(([k,x]) => [k, object(x)])) : Array.isArray(v) ? v.map(object) : v;
 
@@ -52,6 +52,19 @@ test('an old admission cannot send into a replacement authenticated session', as
   await test_stale_rpc_admission(rtc.endpoints[0]);
   assert.equal(rtc.connections.length, 2);
   assert.equal(rtc.requests.filter(r => r.method === 'find_node').length, 1);
+});
+
+test('an admitted session that closes underneath fails without redialling', async () => {
+  const rtc = mockWebRtc([{ multiplex: true }]);
+  await test_admitted_hello_never_redials(rtc.endpoints[0]);
+  assert.equal(rtc.connections.length, 1);
+  assert.equal(rtc.requests.filter(r => r.method === 'hello').length, 1);
+});
+
+test('a pooled RPC whose session closed reports it without a reconnect instruction', async () => {
+  const rtc = mockWebRtc([{ multiplex: true }]);
+  assert.equal(await test_closed_session_error(rtc.endpoints[0]), 'WebRTC session closed');
+  assert.equal(rtc.requests.filter(r => r.method === 'find_node').length, 0);
 });
 
 test('pool eviction waits for abandoned replies and wakes when draining completes', async () => {

@@ -1019,7 +1019,8 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 `ant-core/resources/bootstrap_peers.toml` is the shared release resource. Its
 `quic` list contains native multiaddresses; its `webrtc` list contains complete
 WebRTC Direct multiaddresses with certificate and peer identity pins. The
-WebRTC list is intentionally empty until production seeds are deployed.
+WebRTC list includes seven mainnet bootstrap nodes and is exposed through WASM
+for the browser SDK's default mainnet connection.
 
 The CLI accepts `--bootstrap /ip4/127.0.0.1/udp/10000/quic` (including optional
 `/p2p/<peer-id>`). Legacy `ip:port` arguments and installed `peers = [...]`

@@ -19,6 +19,18 @@ regressions use a mock `RTCPeerConnection` while running the real PQ handshake,
 record encryption, lookup, quote verification, and upload implementation.
 Production packages should enable only `browser-wasm`.
 
+Per-node framing, owner-proof and deadline tests use `test_connect_node()` and
+its `TestNodeSession` handle, available only with `test-utils`. They drive the
+same internal connection code without discovery hiding a single-node failure.
+Production bindings expose `BrowserNetworkClient` for authentication and network
+operations; the standalone `BrowserNodeClient` and `BrowserNodeSession` exports
+have been removed. Real-browser integration exercises the production client.
+
+Bootstrap regressions cover first-ready authentication in the retained network
+pool, discovery before a slow seed completes, late-seed fallback, the four-dial
+bootstrap bound, cancellation and payment-policy rejection. A fast seed from the
+wrong network cannot win or re-enter through discovery or ordinary GET fallback.
+
 Upload fixtures follow native policy: seven initial peers, authenticated
 witness views, a supported paid median, and four successful stores. Tests
 cover inconsistent views, partial existing-holder votes, one payable quote,
@@ -102,6 +114,14 @@ Early misses do not establish absence, peers are deduplicated within a round,
 and a slow early GET can race a different final holder. Native seeds this shared
 policy from its routing table; WebRTC also publishes validated lookup replies
 as they arrive. Write discovery and witness admission remain unchanged.
+Both targets now permit one additional early candidate after a one-second stall,
+while preserving the two-GET maximum even when discovery completes. Shared tests
+cover the delay, slot handoff, deduplication, and fatal integrity errors. The lane
+tests check that a failed cold dial is not repeated by the other queued lane.
+Early candidates use authenticated connections, with WebRTC preconnections
+publishing hints once ready. Download regressions cover cold closer addresses
+blocking neither slot ahead of a ready holder, and retaining the twenty-peer
+fallback allowance after more than seven early misses.
 
 `parallel-lanes.test.mjs` checks the two-channel transport profile: discovery and
 quotes use the control channel; GET/PUT use an independent authenticated data

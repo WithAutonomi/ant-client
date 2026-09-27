@@ -1,15 +1,9 @@
-import init, { BrowserNodeClient, BrowserNetworkClient, encryptPublicFile } from "../wasm-tests/pkg/ant_core.js";
+import init, { BrowserNetworkClient, encryptPublicFile } from "../wasm-tests/pkg/ant_core.js";
 import { Contract, JsonRpcProvider } from "ethers";
 await init();
 globalThis.runIntegration = async ({ endpoint, payment, rpcUrl }) => {
-  const connector = new BrowserNodeClient(endpoint);
-  if (connector.getChunk !== undefined) throw new Error("Unauthenticated connector exposes RPC methods");
-  const session = await connector.connect();
-  const hello = await session.hello();
-  session.close();
-  try { await session.getChunk("00".repeat(32)); throw new Error("Closed session accepted a request"); }
-  catch (error) { if (!String(error).includes("session closed")) throw error; }
-  session.free(); connector.free();
+  let client = new BrowserNetworkClient([endpoint]);
+  const hello = await client.connect(payment);
   const content = new TextEncoder().encode("Real browser paid recovery and canonical DataMap. ".repeat(256));
   const encrypted = encryptPublicFile(content);
   const staged = { name: "integration.txt", content_type: "text/plain", address: encrypted.address,
@@ -34,14 +28,16 @@ globalThis.runIntegration = async ({ endpoint, payment, rpcUrl }) => {
     paid = true;
     return receipt;
   };
-  let client = new BrowserNetworkClient([endpoint]);
   try {
     await client.uploadStagedPublicFile(staged, payment,
       index => { if (paid) throw new Error("injected post-payment storage interruption"); return encrypted.records[index].content; },
       pay, undefined, undefined, save, "single");
     throw new Error("Expected paid upload interruption");
   } catch (error) { if (!String(error).includes("injected post-payment")) throw error; }
-  client.close(); client.free();
+  client.close();
+  try { await client.connect(payment); throw new Error("Closed network client accepted a connection"); }
+  catch (error) { if (!String(error).includes("pool is closed")) throw error; }
+  client.free();
   client = new BrowserNetworkClient([endpoint]);
   const result = await client.uploadStagedPublicFile(staged, payment, index => encrypted.records[index].content,
     () => { throw new Error("Recovery tried to pay again"); }, undefined, checkpoint, save, "single");

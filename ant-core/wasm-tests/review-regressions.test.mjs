@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { BrowserNetworkClient } from "./client-fixture.mjs";
-import { BrowserNetworkClient as RawNetwork, BrowserNodeClient, contentAddress, encryptPublicFile, test_pool_waiters, test_operation_timeout } from "./pkg/ant_core.js";
+import { BrowserNetworkClient as RawNetwork, test_connect_node, contentAddress, encryptPublicFile, test_pool_waiters, test_operation_timeout } from "./pkg/ant_core.js";
 import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 const content = new TextEncoder().encode("Recovery regression ".repeat(100));
 const receipt = quotes => ({ transactionHash: `0x${"ab".repeat(32)}`, totalAmount: quotes.reduce((sum, quote) => sum + BigInt(quote.amount), 0n).toString() });
@@ -85,7 +85,7 @@ test("wall clock jumps cannot interrupt a progressing response", async () => {
     }, 0);
     return false;
   } }]);
-  const client = await new BrowserNodeClient(rtc.endpoints[0]).connect();
+  const client = await test_connect_node(rtc.endpoints[0]);
   try { assert.deepEqual((await client.getChunk(contentAddress(bytes))).content, bytes); }
   finally { Date.now = clock; client.close(); }
 });

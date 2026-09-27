@@ -802,7 +802,11 @@ impl Client {
         let observation = diag.map(|_| std::sync::Mutex::new(ReadObservation::default()));
         let result = crate::client_engine::read::retrieve_progressive(
             *address,
-            peer_count,
+            // Use the same bounded fallback allowance while discovery is in
+            // flight. Stopping after just the close-group count can exhaust
+            // speculation on stale hints before a live holder is discovered.
+            // The final close-group size and absence rules still use peer_count.
+            crate::client_engine::read::MAX_GET_FALLBACK_PEERS,
             |sender| {
                 #[cfg(feature = "native")]
                 let observation = &observation;

@@ -66,6 +66,7 @@ const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 // remain non-evictable, and the pool still imposes a hard resource bound.
 const DEFAULT_MAX_POOLED_CLIENTS: usize = 64;
 const MAX_LOOKUP_PRECONNECTS: usize = 8;
+const MAX_BOOTSTRAP_CONNECTIONS: usize = 4;
 const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const MAX_BROWSER_ROUTING_ENTRIES: usize = 256;
 const MAX_BROWSER_ENDPOINT_FAILURES: usize = 256;
@@ -83,6 +84,7 @@ const MAX_UPLOAD_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
 // JavaScript metadata from creating unbounded quote work.
 const MAX_UPLOAD_RECORDS: usize = 4096;
 
+mod bootstrap;
 mod failed_payment;
 mod inbox;
 mod multiplex;
@@ -90,6 +92,8 @@ mod shared;
 mod upload_adapter;
 use ant_protocol::transport::{client_routing, PeerId};
 use shared::{native_quote_artifact, SharedNetworkAdapter};
+#[cfg(feature = "test-utils")]
+mod diagnostics;
 #[cfg(feature = "test-utils")]
 mod test_utils;
 use inbox::ResponseInbox;
@@ -147,6 +151,7 @@ struct BrowserClientPool {
     clock: Cell<u64>,
     availability: Rc<PoolAvailability>,
     preconnecting: RefCell<HashSet<String>>,
+    bootstrap_policy: Rc<bootstrap::Policies>,
     #[cfg(feature = "test-utils")]
     preconnect_errors: RefCell<Vec<String>>,
 }
@@ -237,7 +242,7 @@ impl BrowserClientLease {
                     if sender.is_canceled() {
                         return Err("lookup waiter cancelled".to_string());
                     }
-                    client.hello().await?;
+                    client.authenticate().await?;
                     drop(client);
                     let client = match select(
                         Box::pin(self.client.authenticated_before(&self.admission)),
@@ -295,6 +300,7 @@ impl BrowserClientPool {
                 sender: availability_tx,
             }),
             preconnecting: RefCell::new(HashSet::new()),
+            bootstrap_policy: Rc::new(bootstrap::Policies::default()),
             #[cfg(feature = "test-utils")]
             preconnect_errors: RefCell::new(Vec::new()),
         })
@@ -356,6 +362,7 @@ impl BrowserClientPool {
         // Subscribe before checking the predicate so a release cannot be missed.
         let mut availability = self.availability.sender.subscribe();
         loop {
+            self.bootstrap_policy.check(&key)?;
             if self.availability.closed.get() {
                 return Err("WebRTC client pool is closed".to_string());
             }
@@ -393,10 +400,12 @@ impl BrowserClientPool {
                         let mut client = BrowserNodeClientCore::new(endpoint.clone());
                         client.dial_failures = Some(Rc::clone(&self.dial_failures));
                         client.pool_availability = Some(Rc::clone(&self.availability));
+                        client.bootstrap_policy = Some(Rc::clone(&self.bootstrap_policy));
                         let mut data_client = BrowserNodeClientCore::new(endpoint.clone());
                         data_client.association = Rc::clone(&client.association);
                         data_client.dial_failures = Some(Rc::clone(&self.dial_failures));
                         data_client.pool_availability = Some(Rc::clone(&self.availability));
+                        data_client.bootstrap_policy = Some(Rc::clone(&self.bootstrap_policy));
                         let data_client = Rc::new(data_client);
                         let client = Rc::new(client);
                         clients.insert(
@@ -407,6 +416,7 @@ impl BrowserClientPool {
                                 last_used: now,
                             },
                         );
+                        self.bootstrap_policy.register(&key, &clients[&key]);
                         Some(if data_lane { data_client } else { client })
                     } else {
                         None
@@ -428,6 +438,9 @@ impl BrowserClientPool {
     }
 
     fn is_lookup_eligible(&self, peer: &str, endpoint: &BrowserEndpoint) -> bool {
+        if self.bootstrap_policy.check(&endpoint.multiaddr).is_err() {
+            return false;
+        }
         // Native allows an existing connection even when its advertised
         // address is in the dial-failure cache.
         if self
@@ -444,10 +457,42 @@ impl BrowserClientPool {
             .is_suppressed(&peer.to_string(), &endpoint.multiaddr)
     }
 
+    /// Read speculation must not wait for a cold association to open.
+    fn has_authenticated_connection(&self, endpoint: &BrowserEndpoint) -> bool {
+        self.bootstrap_policy.check(&endpoint.multiaddr).is_ok()
+            && self
+                .clients
+                .borrow()
+                .get(&endpoint.multiaddr)
+                .is_some_and(|entry| {
+                    [&entry.client, &entry.data_client]
+                        .iter()
+                        .any(|client| client.is_connected() && client.hello.borrow().is_some())
+                })
+    }
+
+    fn authenticated_hello(&self, endpoint: &BrowserEndpoint) -> Option<BrowserHello> {
+        self.bootstrap_policy.check(&endpoint.multiaddr).ok()?;
+        let clients = self.clients.borrow();
+        let entry = clients.get(&endpoint.multiaddr)?;
+        [&entry.client, &entry.data_client]
+            .iter()
+            .find_map(|client| {
+                client
+                    .is_connected()
+                    .then(|| client.hello.borrow().clone())
+                    .flatten()
+            })
+    }
+
     /// Overlap ICE/PQ/HELLO with the iterative walk, using only owner-signed
-    /// addresses that `find_node` has already verified. These are connection
-    /// hints, not successful lookup votes or storage acknowledgements.
-    fn preconnect(self: &Rc<Self>, nodes: &[BrowserNode]) {
+    /// addresses that `find_node` has already verified. Publish a read hint
+    /// after authentication; these are not lookup votes or storage receipts.
+    fn preconnect(
+        self: &Rc<Self>,
+        nodes: &[BrowserNode],
+        read_progress: Option<crate::data::network::ReadProgress>,
+    ) {
         for node in nodes {
             let at_capacity = {
                 let clients = self.clients.borrow();
@@ -487,6 +532,8 @@ impl BrowserClientPool {
             }
             let pool = Rc::clone(self);
             let endpoint = endpoint.clone();
+            let read_progress = read_progress.clone();
+            let node = node.clone();
             self.preconnecting
                 .borrow_mut()
                 .insert(endpoint.multiaddr.clone());
@@ -501,7 +548,13 @@ impl BrowserClientPool {
                                 ))),
                             )
                             .await?;
-                        lease.hello().await.map_err(RpcError::Transport)
+                        let hello = lease.hello().await.map_err(RpcError::Transport)?;
+                        if let Some(progress) = &read_progress {
+                            if let Ok(node) = shared::peer_record(&node) {
+                                progress.offer(vec![(node.peer_id, node.addresses_by_priority())]);
+                            }
+                        }
+                        Ok::<_, RpcError>(hello)
                     };
                     let outcome =
                         select(Box::pin(connect), Box::pin(pool.availability.wait_closed())).await;
@@ -534,32 +587,31 @@ impl BrowserClientPool {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct BrowserChunk {
-    #[serde(with = "serde_bytes")]
-    content: Vec<u8>,
-    hash: String,
-}
-
-#[derive(Debug, Serialize)]
-struct BrowserQuoteResponse {
-    quote: BrowserQuoteArtifact,
-    #[serde(rename = "alreadyStored")]
-    already_stored: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct BrowserPutResponse {
-    address: String,
-    #[serde(rename = "alreadyStored")]
-    already_stored: bool,
-}
-
 /// Two independent authenticated channels share ICE/DTLS/SCTP. Dropping a
 /// cancelled exchange retires only its channel; the other lane remains usable.
 struct PeerAssociation {
     connection: RtcPeerConnection,
-    channels: RefCell<Vec<RtcDataChannel>>,
+    channels: RefCell<Vec<AssociationChannel>>,
+}
+
+/// One lane's channel, with the inbox that records when this client stopped
+/// using it.
+struct AssociationChannel {
+    channel: RtcDataChannel,
+    inbox: Rc<ResponseInbox>,
+}
+
+impl AssociationChannel {
+    /// Open and still in use. A lane closed locally fails its inbox at once,
+    /// while node-datachannel keeps reporting the channel open until the
+    /// deferred close lands.
+    fn is_live(&self) -> bool {
+        self.channel.ready_state() == RtcDataChannelState::Open && !self.inbox.is_failed()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.channel.ready_state() == RtcDataChannelState::Closed
+    }
 }
 
 impl Deref for PeerAssociation {
@@ -570,11 +622,15 @@ impl Deref for PeerAssociation {
 }
 
 impl PeerAssociation {
-    fn has_open_channel(&self) -> bool {
+    /// Reuse the association only while another lane still uses it. A
+    /// channel this client has retired may still read "open", and reusing its
+    /// association could put a new channel on a dead SCTP association without
+    /// counting the failure as a dial.
+    fn has_live_channel(&self) -> bool {
         self.channels
             .borrow()
             .iter()
-            .any(|channel| channel.ready_state() == RtcDataChannelState::Open)
+            .any(AssociationChannel::is_live)
     }
 }
 
@@ -603,14 +659,35 @@ impl Connection {
         endpoint: &WebRtcDirectEndpoint,
         source: &SharedAssociation,
         attempted_dial: &Cell<bool>,
+        dial_failures: Option<&DialFailures>,
     ) -> Result<Self, String> {
         // Serialize only setup. Each lane has its own RPC lock, inbox, request
         // IDs and PQ session; no stream cipher/response state is shared.
         let mut association = source.lock().await;
+        #[cfg(feature = "test-utils")]
+        let mut trace = diagnostics::Trace::new(
+            "association",
+            endpoint.multiaddr.clone(),
+            endpoint.peer_id.clone(),
+        );
         let existing = association
             .upgrade()
-            .filter(|connection| connection.has_open_channel());
+            .filter(|connection| connection.has_live_channel());
         let fresh = existing.is_none();
+        // The other lane may have failed while we waited for the association
+        // lock. Do not spend a second setup timeout redialing the same endpoint.
+        // A live association can still be reused without a new dial.
+        if fresh
+            && dial_failures.is_some_and(|cache| {
+                cache
+                    .borrow_mut()
+                    .is_suppressed(&endpoint.peer_id, &endpoint.multiaddr)
+            })
+        {
+            return Err("WebRTC endpoint is in the failed-connection cache".into());
+        }
+        #[cfg(feature = "test-utils")]
+        trace.event("dial", if fresh { "fresh" } else { "reused" });
         attempted_dial.set(fresh);
         let peer_connection = if let Some(existing) = existing {
             existing
@@ -629,7 +706,7 @@ impl Connection {
             .channels
             .borrow()
             .iter()
-            .filter(|channel| channel.ready_state() != RtcDataChannelState::Closed)
+            .filter(|channel| !channel.is_closed())
             .count()
             >= 2
         {
@@ -642,13 +719,16 @@ impl Connection {
             &channel_configuration,
         );
         data_channel.set_binary_type(RtcDataChannelType::Arraybuffer);
+        let inbox = ResponseInbox::new();
         {
             let mut channels = peer_connection.channels.borrow_mut();
-            channels.retain(|channel| channel.ready_state() != RtcDataChannelState::Closed);
-            channels.push(data_channel.clone());
+            channels.retain(|channel| !channel.is_closed());
+            channels.push(AssociationChannel {
+                channel: data_channel.clone(),
+                inbox: Rc::clone(&inbox),
+            });
         }
 
-        let inbox = ResponseInbox::new();
         let (open_tx, open_rx) = oneshot::channel::<Result<(), String>>();
         let open_tx = Rc::new(RefCell::new(Some(open_tx)));
         let message_inbox = Rc::clone(&inbox);
@@ -749,6 +829,8 @@ impl Connection {
         )
         .await?;
         connection.data_channel.set_onopen(None);
+        #[cfg(feature = "test-utils")]
+        trace.event("channel-open", "");
 
         let session = establish_pq_session(&connection, endpoint).await?;
         connection.pq_session.replace(Some(session));
@@ -759,11 +841,30 @@ impl Connection {
         )));
         *association = Rc::downgrade(&connection.peer_connection);
 
+        #[cfg(feature = "test-utils")]
+        trace.finish("authenticated");
+
         Ok(connection)
     }
 
+    fn rpc(&self) -> Option<Rc<multiplex::RpcSession>> {
+        self.rpc.borrow().clone()
+    }
+
+    /// Usable for a new RPC. Every local close (a failed exchange, malformed
+    /// ingress, a channel error) fails the inbox or closes the RPC session at
+    /// once, but `readyState` can lag: node-datachannel reports a closed
+    /// channel as open until its event loop dispatches the close. A retry that
+    /// trusted `readyState` alone reused the dead session without ever
+    /// yielding for that close to land (V2-1305).
+    fn is_live(&self) -> bool {
+        self.data_channel.ready_state() == RtcDataChannelState::Open
+            && !self.inbox.is_failed()
+            && self.rpc().is_some_and(|rpc| !rpc.is_closed())
+    }
+
     fn close(&self) {
-        if let Some(rpc) = self.rpc.borrow().as_ref() {
+        if let Some(rpc) = self.rpc() {
             rpc.close("WebRTC connection closed".into());
         }
         self.inbox.fail("WebRTC connection closed".into());
@@ -787,6 +888,7 @@ impl Drop for Connection {
 pub(super) struct BrowserNodeClientCore {
     dial_failures: Option<DialFailures>,
     pool_availability: Option<Rc<PoolAvailability>>,
+    bootstrap_policy: Option<Rc<bootstrap::Policies>>,
     endpoint: WebRtcDirectEndpoint,
     association: SharedAssociation,
     connection: RefCell<Option<Rc<Connection>>>,
@@ -795,7 +897,6 @@ pub(super) struct BrowserNodeClientCore {
     next_request_id: Cell<u64>,
     generation: Cell<u64>,
     hello: RefCell<Option<BrowserHello>>,
-    peer_id: RefCell<Option<String>>,
 }
 
 impl BrowserNodeClientCore {
@@ -803,6 +904,7 @@ impl BrowserNodeClientCore {
         Self {
             dial_failures: None,
             pool_availability: None,
+            bootstrap_policy: None,
             endpoint,
             association: Rc::new(Mutex::new(Weak::new())),
             connection: RefCell::new(None),
@@ -811,35 +913,43 @@ impl BrowserNodeClientCore {
             next_request_id: Cell::new(1),
             generation: Cell::new(0),
             hello: RefCell::new(None),
-            peer_id: RefCell::new(None),
         }
     }
 
-    pub(super) fn peer_id(&self) -> Option<String> {
-        self.peer_id.borrow().clone()
+    fn current_rpc(&self) -> Option<Rc<multiplex::RpcSession>> {
+        self.connection.borrow().as_ref().and_then(|c| c.rpc())
     }
 
     fn has_pending_requests(&self) -> bool {
-        self.connection.borrow().as_ref().is_some_and(|connection| {
-            connection
-                .rpc
-                .borrow()
-                .as_ref()
-                .is_some_and(|rpc| rpc.is_busy())
-        })
+        self.current_rpc().is_some_and(|rpc| rpc.is_busy())
     }
 
     fn is_connected(&self) -> bool {
-        self.connection.borrow().as_ref().is_some_and(|connection| {
-            connection.data_channel.ready_state() == RtcDataChannelState::Open
-        })
+        self.connection
+            .borrow()
+            .as_ref()
+            .is_some_and(|connection| connection.is_live())
+    }
+
+    fn check_bootstrap_policy(&self) -> Result<(), String> {
+        if let Some(policy) = &self.bootstrap_policy {
+            policy.check(&self.endpoint.multiaddr)?;
+        }
+        Ok(())
     }
 
     async fn ensure_connected(&self) -> Result<(), String> {
+        self.check_bootstrap_policy()?;
         if self.is_connected() {
             return Ok(());
         }
         self.close();
+        #[cfg(feature = "test-utils")]
+        let mut trace = diagnostics::Trace::new(
+            "connect",
+            self.endpoint.multiaddr.clone(),
+            self.endpoint.peer_id.clone(),
+        );
         if let Some(cache) = &self.dial_failures {
             if cache
                 .borrow_mut()
@@ -851,7 +961,12 @@ impl BrowserNodeClientCore {
         let generation = self.generation.get();
         let attempted_dial = Cell::new(false);
         let connection = match timeout_with_ms(
-            Connection::open(&self.endpoint, &self.association, &attempted_dial),
+            Connection::open(
+                &self.endpoint,
+                &self.association,
+                &attempted_dial,
+                self.dial_failures.as_ref(),
+            ),
             "WebRTC connection/authentication setup timed out",
             CONNECTION_SETUP_TIMEOUT_MS,
         )
@@ -859,6 +974,8 @@ impl BrowserNodeClientCore {
         {
             Ok(connection) => connection,
             Err(error) => {
+                #[cfg(feature = "test-utils")]
+                trace.finish(&error);
                 if let Some(cache) = self.dial_failures.as_ref().filter(|_| attempted_dial.get()) {
                     cache.borrow_mut().record_failure(
                         self.endpoint.peer_id.clone(),
@@ -870,18 +987,34 @@ impl BrowserNodeClientCore {
         };
         // close() can run while SDP, ICE or PQ authentication is awaiting JS.
         // Never publish a connection belonging to an invalidated generation.
-        if generation != self.generation.get() || self.pool_is_closed() {
+        if generation != self.generation.get()
+            || self.pool_is_closed()
+            || self.check_bootstrap_policy().is_err()
+        {
             connection.close();
             return Err("WebRTC client closed during connection setup".into());
         }
         if let Some(cache) = &self.dial_failures {
             cache.borrow_mut().record_success(&self.endpoint.peer_id);
         }
-        if let Some(rpc) = connection.rpc.borrow().as_ref() {
+        if let Some(rpc) = connection.rpc() {
             rpc.set_pool(self.pool_availability.as_ref());
         }
         self.connection.replace(Some(Rc::new(connection)));
+        #[cfg(feature = "test-utils")]
+        trace.finish("connected");
         Ok(())
+    }
+
+    /// Drop the connection if it still carries `rpc`, so the next HELLO must
+    /// redial. A session another caller has already replaced is left alone.
+    fn retire(&self, rpc: &Rc<multiplex::RpcSession>) {
+        if self
+            .current_rpc()
+            .is_some_and(|current| Rc::ptr_eq(&current, rpc))
+        {
+            self.close();
+        }
     }
 
     fn pool_is_closed(&self) -> bool {
@@ -905,6 +1038,7 @@ impl BrowserNodeClientCore {
         if self.pool_is_closed() {
             return Err("WebRTC client pool is closed".to_string().into());
         }
+        self.check_bootstrap_policy()?;
         Ok(LockedBrowserClient {
             client: self,
             _guard: Some(guard),
@@ -919,41 +1053,44 @@ impl BrowserNodeClientCore {
     ) -> Result<LockedBrowserClient<'_>, RpcError> {
         loop {
             let mut client = self.lock_before(admission).await?;
-            client.hello().await?;
+            client.authenticate().await?;
             client._guard.take();
             let rpc = self
-                .connection
-                .borrow()
-                .as_ref()
-                .and_then(|c| c.rpc.borrow().clone())
+                .current_rpc()
                 .ok_or_else(|| "WebRTC session unavailable".to_string())?;
             let generation = self.generation.get();
             match rpc.admit(admission.remaining()).await {
-                Ok(slot) => {
-                    if generation != self.generation.get() {
-                        continue;
-                    }
+                Ok(_) if generation != self.generation.get() => continue,
+                Ok(slot) if !rpc.is_closed() => {
                     client.slot.replace(Some(slot));
                     client.authenticated_generation = Some(generation);
                     return Ok(client);
                 }
-                Err(_)
-                    if rpc.is_closed()
-                        && !self.pool_is_closed()
-                        && !admission.remaining().is_zero() =>
+                // The session closed before or during admission (tokio refuses
+                // a closed semaphore, so a closed `Ok` is only defensive).
+                // Retire it so the next pass must redial: that redial is the
+                // await that lets this loop yield, whatever `readyState` or
+                // the liveness checks report (V2-1305).
+                _ if rpc.is_closed()
+                    && !self.pool_is_closed()
+                    && !admission.remaining().is_zero() =>
                 {
-                    continue
+                    self.retire(&rpc);
+                    continue;
                 }
+                Ok(_) => return Err("WebRTC session closed".to_string().into()),
                 Err(error) => return Err(error),
             }
         }
     }
 
+    #[cfg(feature = "test-utils")]
     async fn authenticated(&self) -> Result<LockedBrowserClient<'_>, RpcError> {
         self.authenticated_before(&TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
             .await
     }
 
+    #[cfg(feature = "test-utils")]
     pub(super) async fn hello(&self) -> Result<BrowserHello, String> {
         self.authenticated()
             .await
@@ -976,7 +1113,6 @@ impl BrowserNodeClientCore {
             connection.close();
         }
         self.hello.borrow_mut().take();
-        self.peer_id.borrow_mut().take();
     }
 }
 
@@ -1052,6 +1188,7 @@ impl LockedBrowserClient<'_> {
         ),
         RpcError,
     > {
+        self.check_bootstrap_policy()?;
         if self
             .authenticated_generation
             .is_some_and(|generation| generation != self.generation.get())
@@ -1061,9 +1198,9 @@ impl LockedBrowserClient<'_> {
         if matches!(&body, BrowserRequestBody::Hello) {
             self.ensure_connected().await?;
         } else if !self.is_connected() || self.hello.borrow().is_none() {
-            return Err("authenticated session required; call connect() again"
-                .to_string()
-                .into());
+            // Pooled callers redial on their next admission. An admitted
+            // request cannot move to a replacement session.
+            return Err("WebRTC session closed".to_string().into());
         }
         let connection = self
             .connection
@@ -1071,9 +1208,7 @@ impl LockedBrowserClient<'_> {
             .clone()
             .ok_or_else(|| "WebRTC DataChannel is not connected".to_string())?;
         let rpc = connection
-            .rpc
-            .borrow()
-            .clone()
+            .rpc()
             .ok_or_else(|| "WebRTC session is unavailable".to_string())?;
         let request_id = self.next_request_id.get();
         self.next_request_id.set(request_id.wrapping_add(1).max(1));
@@ -1109,13 +1244,19 @@ impl LockedBrowserClient<'_> {
         Ok((response, read_permit))
     }
 
-    pub(super) async fn hello(&self) -> Result<BrowserHello, String> {
-        if let Some(hello) = self.hello.borrow().clone() {
-            if self.connection.borrow().as_ref().is_some_and(|connection| {
-                connection.data_channel.ready_state() == RtcDataChannelState::Open
-            }) {
-                return Ok(hello);
-            }
+    /// Authenticate this lane, reusing the cached HELLO while the session is
+    /// live. Callers that only need the session use this rather than `hello()`
+    /// and skip cloning the HELLO on every RPC.
+    async fn authenticate(&self) -> Result<(), String> {
+        self.check_bootstrap_policy()?;
+        if self.is_connected() && self.hello.borrow().is_some() {
+            return Ok(());
+        }
+        // An admitted client is bound to the session it was admitted on. A
+        // redial here would attach a new connection to an operation admitted
+        // on the previous generation, which must remain invalid.
+        if self.authenticated_generation.is_some() {
+            return Err("authenticated session closed".to_string());
         }
         self.ensure_connected().await?;
         let response = timeout(
@@ -1144,30 +1285,33 @@ impl LockedBrowserClient<'_> {
             capabilities,
             payment,
         };
-        let peer_id = match validate_hello_metadata(&hello, &self.endpoint) {
-            Ok(peer_id) => peer_id,
-            Err(error) => {
-                self.close();
-                return Err(error.to_string());
-            }
-        };
+        if let Err(error) = validate_hello_metadata(&hello, &self.endpoint) {
+            self.close();
+            return Err(error.to_string());
+        }
+        if let Some(policy) = &self.bootstrap_policy {
+            policy.validate(&self.endpoint.multiaddr, &hello)?;
+        }
         if hello
             .capabilities
             .iter()
             .any(|cap| cap == multiplex::CAPABILITY)
         {
-            if let Some(rpc) = self
-                .connection
-                .borrow()
-                .as_ref()
-                .and_then(|c| c.rpc.borrow().clone())
-            {
+            if let Some(rpc) = self.current_rpc() {
                 rpc.enable_multiplex();
             }
         }
-        self.peer_id.replace(Some(peer_id));
-        self.hello.replace(Some(hello.clone()));
-        Ok(hello)
+        self.hello.replace(Some(hello));
+        Ok(())
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub(super) async fn hello(&self) -> Result<BrowserHello, String> {
+        self.authenticate().await?;
+        self.hello
+            .borrow()
+            .clone()
+            .ok_or_else(|| "authenticated session closed".to_string())
     }
 
     pub(super) async fn find_node(
@@ -1251,119 +1395,6 @@ impl LockedBrowserClient<'_> {
         }
         Ok(nodes)
     }
-
-    pub(super) async fn get_chunk(&self, address: &str) -> Result<(Vec<u8>, String), String> {
-        self.try_get_chunk(address)
-            .await?
-            .ok_or_else(|| format!("chunk {address} was not found on this node"))
-    }
-
-    async fn try_get_chunk(&self, address: &str) -> Result<Option<(Vec<u8>, String)>, String> {
-        let address = super::protocol::normalize_hex(address, 32)?;
-        let response = self
-            .request(
-                BrowserRequestBody::GetChunk {
-                    address: address.clone(),
-                },
-                &[],
-            )
-            .await?;
-        if response.header.status == BrowserResponseStatus::NotFound {
-            return Ok(None);
-        }
-        let BrowserResponseBody::Chunk {
-            address: response_address,
-            size,
-        } = response.header.body
-        else {
-            return Err("expected a CHUNK response".to_string());
-        };
-        if response_address.to_ascii_lowercase() != address {
-            return Err("node returned a different chunk address".to_string());
-        }
-        if size != response.content.len() {
-            return Err("chunk metadata size does not match its content".to_string());
-        }
-        super::verify_record(&address, &response.content).map_err(|error| error.to_string())?;
-        Ok(Some((response.content, address)))
-    }
-
-    pub(super) async fn quote_chunk(
-        &self,
-        address: &str,
-        size: usize,
-    ) -> Result<(BrowserQuoteArtifact, bool), String> {
-        let address = super::protocol::normalize_hex(address, 32)?;
-        if size > super::protocol::MAX_BROWSER_RECORD_BYTES {
-            return Err(format!("invalid chunk size {size}"));
-        }
-        let response = self
-            .request(
-                BrowserRequestBody::QuoteChunk {
-                    address: address.clone(),
-                    size: u64::try_from(size).map_err(|_| format!("invalid chunk size {size}"))?,
-                },
-                &[],
-            )
-            .await?;
-        let BrowserResponseBody::StorageQuote {
-            address: response_address,
-            already_stored,
-            quote,
-        } = response.header.body
-        else {
-            return Err("expected a STORAGE_QUOTE response".to_string());
-        };
-        if response_address.to_ascii_lowercase() != address {
-            return Err("node returned a quote for a different chunk address".to_string());
-        }
-        Ok((quote, already_stored))
-    }
-
-    pub(super) async fn put_chunk(
-        &self,
-        address: &str,
-        content: &[u8],
-        quote: BrowserQuoteArtifact,
-        transaction_hash: &str,
-    ) -> Result<(String, bool), String> {
-        self.put_chunk_typed(address, content, quote, transaction_hash)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    pub(super) async fn put_chunk_typed(
-        &self,
-        address: &str,
-        content: &[u8],
-        quote: BrowserQuoteArtifact,
-        transaction_hash: &str,
-    ) -> Result<(String, bool), RpcError> {
-        let address = super::protocol::normalize_hex(address, 32)?;
-        let transaction_hash = super::protocol::normalize_hex(transaction_hash, 32)?;
-        super::verify_record(&address, content).map_err(|error| error.to_string())?;
-        let response = self
-            .request_typed(
-                BrowserRequestBody::PutChunk {
-                    address: address.clone(),
-                    quote: Box::new(quote),
-                    transaction_hash,
-                },
-                content,
-            )
-            .await?;
-        let BrowserResponseBody::ChunkStored {
-            address: response_address,
-            already_stored,
-        } = response.header.body
-        else {
-            return Err("expected a CHUNK_STORED response".to_string().into());
-        };
-        if response_address.to_ascii_lowercase() != address {
-            return Err("node stored a different chunk address".to_string().into());
-        }
-        Ok((address, already_stored))
-    }
 }
 
 struct BrowserNetworkCore {
@@ -1372,6 +1403,7 @@ struct BrowserNetworkCore {
     routing: Rc<RefCell<HashMap<LookupKey, BrowserLookupCandidate>>>,
     contacted: Rc<RefCell<HashMap<LookupKey, web_time::Instant>>>,
     owner_views: Rc<RefCell<lru::LruCache<LookupKey, BrowserLookupCandidate>>>,
+    bootstrap: bootstrap::Bootstrap,
 }
 
 impl BrowserNetworkCore {
@@ -1390,6 +1422,7 @@ impl BrowserNetworkCore {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
+            bootstrap: bootstrap::Bootstrap::new(),
             seeds,
             pool: Rc::new(BrowserClientPool::new(DEFAULT_MAX_POOLED_CLIENTS)?),
             routing: Rc::new(RefCell::new(HashMap::new())),
@@ -1469,73 +1502,124 @@ impl BrowserNetworkCore {
         use_seeds: bool,
         read_progress: Option<crate::data::network::ReadProgress>,
     ) -> Result<BrowserLookupResult, String> {
+        let deadline = TransferDeadline::new(Duration::from_secs(
+            u64::from(ant_protocol::transport::LOOKUP_TIMEOUT_SECS) / if use_seeds { 1 } else { 2 },
+        ));
+        if !use_seeds {
+            let candidates = self.routing.borrow().values().cloned().collect();
+            return self
+                .find_closest_from(target, progress, count, candidates, read_progress, deadline)
+                .await;
+        }
+        let mut updates = self.bootstrap.subscribe(self, None)?;
+        let mut best: Option<BrowserLookupResult> = None;
+        let mut used = 0;
+        loop {
+            let state = updates.borrow_and_update().clone();
+            if state.revision != used && !state.ready.is_empty() {
+                used = state.revision;
+                // A first walk may already have authenticated and queried the
+                // other seeds through discovery. Their bootstrap completion
+                // must not trigger a duplicate walk or extra quote witnesses.
+                if best.as_ref().is_some_and(|result| {
+                    state.ready.iter().all(|hello| {
+                        result
+                            .nodes
+                            .iter()
+                            .any(|node| node.peer_id == hello.peer_id)
+                    })
+                }) {
+                    continue;
+                }
+                let candidates = state
+                    .ready
+                    .iter()
+                    .map(bootstrap::candidate)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let lookup = self.find_closest_from(
+                    target,
+                    progress,
+                    count,
+                    candidates,
+                    read_progress.clone(),
+                    deadline,
+                );
+                // Publish newly authenticated seeds to early reads while the
+                // unchanged shared DHT walker progresses through the first ones.
+                let publish = async {
+                    loop {
+                        let state = updates.borrow_and_update().clone();
+                        if let Some(read) = &read_progress {
+                            let hints = state
+                                .ready
+                                .iter()
+                                .filter_map(|hello| bootstrap::candidate(hello).ok())
+                                .filter_map(|candidate| shared::peer_record(&candidate.wire).ok())
+                                .map(|node| (node.peer_id, node.addresses_by_priority()))
+                                .collect();
+                            read.offer(hints);
+                        }
+                        match self.bootstrap_changed(&mut updates).await {
+                            Ok(()) => {}
+                            Err(error) => break Err::<(), _>(error),
+                        }
+                    }
+                };
+                let result = match select(Box::pin(lookup), Box::pin(publish)).await {
+                    Either::Left((result, _)) => result,
+                    Either::Right((Err(error), _)) => return Err(error),
+                    Either::Right((Ok(()), _)) => unreachable!(),
+                };
+                match result {
+                    Ok(mut result) => {
+                        result.failures.extend(updates.borrow().failures.clone());
+                        if result.nodes.len() >= count {
+                            return Ok(result);
+                        }
+                        if best
+                            .as_ref()
+                            .is_none_or(|best| result.nodes.len() > best.nodes.len())
+                        {
+                            best = Some(result);
+                        }
+                    }
+                    Err(error) if deadline.remaining().is_zero() => return best.ok_or(error),
+                    Err(error)
+                        if updates.borrow().pending == 0 && updates.borrow().revision == used =>
+                    {
+                        return best.ok_or(error)
+                    }
+                    Err(_) => {}
+                }
+                continue;
+            }
+            if state.pending == 0 || deadline.remaining().is_zero() {
+                return best.ok_or_else(|| bootstrap::failure(&state));
+            }
+            match crate::runtime::timeout(
+                deadline.remaining(),
+                self.bootstrap_changed(&mut updates),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => return best.ok_or_else(|| "bootstrap lookup timed out".into()),
+            }
+        }
+    }
+
+    async fn find_closest_from(
+        &self,
+        target: &str,
+        progress: &ProgressReporter,
+        count: usize,
+        initial_candidates: Vec<BrowserLookupCandidate>,
+        read_progress: Option<crate::data::network::ReadProgress>,
+        deadline: TransferDeadline,
+    ) -> Result<BrowserLookupResult, String> {
         let target_key = parse_lookup_key(target, "lookup target")?;
         let failures = Rc::new(RefCell::new(Vec::new()));
         let views = Rc::new(RefCell::new(HashMap::new()));
-        let seed_futures = self.seeds.iter().cloned().map(|endpoint| {
-            let pool = Rc::clone(&self.pool);
-            let failures = Rc::clone(&failures);
-            let progress = progress.clone();
-            let read_progress = read_progress.clone();
-            async move {
-                let seed_name = endpoint.multiaddr.clone();
-                let result = async {
-                    let client = pool.client(&endpoint).await?;
-                    let hello = client.hello().await?;
-                    progress.report(&format!("Connected seed {}", hello.peer_id));
-                    BrowserLookupCandidate::parse(BrowserNode {
-                        address_record: None,
-                        peer_record: None,
-                        peer_id: hello.peer_id,
-                        native_addresses: Vec::new(),
-                        reliability: 1.0,
-                        webrtc_direct: Some(hello.endpoint),
-                    })
-                }
-                .await;
-                match result {
-                    Ok(candidate) => {
-                        if let Some(progress) = &read_progress {
-                            if let Ok(node) = shared::peer_record(&candidate.wire) {
-                                progress.offer(vec![(node.peer_id, node.addresses_by_priority())]);
-                            }
-                        }
-                        Some(candidate)
-                    }
-                    Err(error) => {
-                        progress.report(&format!("Seed {seed_name} failed: {error}"));
-                        failures.borrow_mut().push(BrowserLookupFailure {
-                            peer_id: seed_name,
-                            message: error,
-                        });
-                        None
-                    }
-                }
-            }
-        });
-        let mut initial_candidates = self
-            .routing
-            .borrow()
-            .values()
-            .filter(|candidate| candidate.wire.webrtc_direct.is_some())
-            .cloned()
-            .collect::<Vec<_>>();
-        if use_seeds {
-            initial_candidates.clear();
-            initial_candidates.extend(join_all(seed_futures).await.into_iter().flatten());
-        }
-        if initial_candidates.is_empty() {
-            let detail = failures
-                .borrow()
-                .iter()
-                .map(|failure| failure.message.as_str())
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(format!(
-                "could not connect to any WebRtcDirect seed: {detail}"
-            ));
-        }
-
         let config = LookupConfig::saorsa(count);
         let mut lookup =
             IterativeLookup::new(target_key, config).map_err(|error| error.to_string())?;
@@ -1572,9 +1656,7 @@ impl BrowserNetworkCore {
         run_iterative_lookup(
             &mut lookup,
             &mut query,
-            TimeoutFuture::new(
-                ant_protocol::transport::LOOKUP_TIMEOUT_SECS * if use_seeds { 1_000 } else { 500 },
-            ),
+            crate::runtime::sleep(deadline.remaining()),
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -1690,12 +1772,17 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                             if let Some(progress) = &read_progress {
                                 let hints = std::iter::once(&candidate.wire)
                                     .chain(nodes.iter())
+                                    .filter(|node| {
+                                        node.webrtc_direct.as_ref().is_some_and(|endpoint| {
+                                            pool.has_authenticated_connection(endpoint)
+                                        })
+                                    })
                                     .filter_map(|node| shared::peer_record(node).ok())
                                     .map(|node| (node.peer_id, node.addresses_by_priority()))
                                     .collect();
                                 progress.offer(hints);
                             }
-                            pool.preconnect(&nodes);
+                            pool.preconnect(&nodes, read_progress.clone());
                             routing.borrow_mut().insert(responder, candidate.clone());
                             contacted
                                 .borrow_mut()
@@ -1830,6 +1917,8 @@ impl ProgressReporter {
     }
 
     fn report(&self, message: &str) {
+        #[cfg(feature = "test-utils")]
+        diagnostics::Trace::new("lookup-progress", String::new(), String::new()).finish(message);
         if let Some(callback) = &self.0 {
             let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(message));
         }
@@ -2233,6 +2322,20 @@ impl BrowserNetworkClient {
             shared,
             adapter,
         })
+    }
+
+    /// Authenticate the first usable configured seed in this client's own pool.
+    /// Remaining seeds connect in the background within the bootstrap bound.
+    pub async fn connect(&self, expected_payment: Option<JsValue>) -> Result<JsValue, JsValue> {
+        let expected = expected_payment.map(parse_payment_network).transpose()?;
+        let hello = self
+            .inner
+            .connect(expected)
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
+        hello
+            .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
+            .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Run Saorsa's iterative closest-node lookup over Rust-owned DataChannels.
@@ -3032,177 +3135,6 @@ async fn load_upload_record(
     };
     super::verify_record(&record.address, content.as_slice()).map_err(|error| error.to_string())?;
     Ok(content)
-}
-
-/// One authenticated browser-to-node WebRTC Direct client implemented in Rust.
-#[wasm_bindgen(js_name = BrowserNodeClient)]
-pub struct BrowserNodeClient {
-    inner: Rc<BrowserNodeClientCore>,
-}
-
-#[wasm_bindgen(js_class = BrowserNodeClient)]
-impl BrowserNodeClient {
-    /// Construct a client from a raw or structured WebRTC Direct endpoint.
-    #[wasm_bindgen(constructor)]
-    pub fn new(endpoint: JsValue) -> Result<Self, JsValue> {
-        let endpoint: BrowserEndpointInput = serde_wasm_bindgen::from_value(endpoint)
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let endpoint = parse_webrtc_direct_multiaddr(endpoint.multiaddr())
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        Ok(Self {
-            inner: Rc::new(BrowserNodeClientCore::new(endpoint)),
-        })
-    }
-
-    /// Complete PQ authentication and HELLO, returning a session for application RPCs.
-    pub async fn connect(&self) -> Result<BrowserNodeSession, JsValue> {
-        // Each returned capability owns a distinct association. Old handles cannot
-        // close or issue requests on a later connection created by this connector.
-        let inner = Rc::new(BrowserNodeClientCore::new(self.inner.endpoint.clone()));
-        inner
-            .hello()
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        Ok(BrowserNodeSession {
-            generation: inner.generation.get(),
-            inner,
-        })
-    }
-}
-
-/// Authenticated application session. Reconnect through `BrowserNodeClient` after closure.
-#[wasm_bindgen(js_name = BrowserNodeSession)]
-pub struct BrowserNodeSession {
-    inner: Rc<BrowserNodeClientCore>,
-    generation: u64,
-}
-
-impl BrowserNodeSession {
-    async fn active(&self) -> Result<LockedBrowserClient<'_>, JsValue> {
-        let mut client = self
-            .inner
-            .lock_before(&TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
-            .await
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        if self.generation != self.inner.generation.get()
-            || !self.inner.is_connected()
-            || self.inner.hello.borrow().is_none()
-        {
-            return Err(JsValue::from_str(
-                "session closed; call BrowserNodeClient.connect() again",
-            ));
-        }
-        client._guard.take();
-        let rpc = self
-            .inner
-            .connection
-            .borrow()
-            .as_ref()
-            .and_then(|c| c.rpc.borrow().clone())
-            .ok_or_else(|| JsValue::from_str("session closed"))?;
-        let slot = rpc
-            .admit(RPC_ADMISSION_TIMEOUT)
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        if self.generation != self.inner.generation.get() {
-            return Err(JsValue::from_str("session closed"));
-        }
-        client.slot.replace(Some(slot));
-        client.authenticated_generation = Some(self.generation);
-        Ok(client)
-    }
-}
-
-#[wasm_bindgen(js_class = BrowserNodeSession)]
-impl BrowserNodeSession {
-    /// Authenticated remote peer identity.
-    #[wasm_bindgen(getter, js_name = peerId)]
-    pub fn peer_id(&self) -> Option<String> {
-        self.inner.peer_id()
-    }
-
-    /// Authenticate the connected node.
-    pub async fn hello(&self) -> Result<JsValue, JsValue> {
-        let hello = self
-            .active()
-            .await?
-            .hello()
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        hello
-            .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
-            .map_err(|error| JsValue::from_str(&error.to_string()))
-    }
-
-    /// Request nodes closest to a 32-byte target.
-    #[wasm_bindgen(js_name = findNode)]
-    pub async fn find_node(&self, target: &str, count: usize) -> Result<JsValue, JsValue> {
-        let nodes = self
-            .active()
-            .await?
-            .find_node(target, count)
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        serde_wasm_bindgen::to_value(&nodes).map_err(|error| JsValue::from_str(&error.to_string()))
-    }
-
-    /// Retrieve and BLAKE3-verify one content-addressed record.
-    #[wasm_bindgen(js_name = getChunk)]
-    pub async fn get_chunk(&self, address: &str) -> Result<JsValue, JsValue> {
-        let (content, hash) = self
-            .active()
-            .await?
-            .get_chunk(address)
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        serde_wasm_bindgen::to_value(&BrowserChunk { content, hash })
-            .map_err(|error| JsValue::from_str(&error.to_string()))
-    }
-
-    /// Request a signed storage quote.
-    #[wasm_bindgen(js_name = quoteChunk)]
-    pub async fn quote_chunk(&self, address: &str, size: usize) -> Result<JsValue, JsValue> {
-        let (quote, already_stored) = self
-            .active()
-            .await?
-            .quote_chunk(address, size)
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        serde_wasm_bindgen::to_value(&BrowserQuoteResponse {
-            quote,
-            already_stored,
-        })
-        .map_err(|error| JsValue::from_str(&error.to_string()))
-    }
-
-    /// Store a paid content-addressed record.
-    #[wasm_bindgen(js_name = putChunk)]
-    pub async fn put_chunk(
-        &self,
-        address: &str,
-        content: &[u8],
-        quote: JsValue,
-        transaction_hash: &str,
-    ) -> Result<JsValue, JsValue> {
-        let quote: BrowserQuoteArtifact = serde_wasm_bindgen::from_value(quote)
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let (address, already_stored) = self
-            .active()
-            .await?
-            .put_chunk(address, content, quote, transaction_hash)
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        serde_wasm_bindgen::to_value(&BrowserPutResponse {
-            address,
-            already_stored,
-        })
-        .map_err(|error| JsValue::from_str(&error.to_string()))
-    }
-
-    /// Close the DataChannel and peer connection.
-    pub fn close(&self) {
-        self.inner.close();
-    }
 }
 
 async fn establish_pq_session(
