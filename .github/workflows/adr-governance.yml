@@ -7,15 +7,6 @@ on:
       - '.adr-kit.yaml'
       - 'scripts/adr-governance.py'
       - '.github/workflows/adr-governance.yml'
-  push:
-    branches:
-      - main
-      - master
-    paths:
-      - 'docs/adr/**'
-      - '.adr-kit.yaml'
-      - 'scripts/adr-governance.py'
-      - '.github/workflows/adr-governance.yml'
 
 jobs:
   adr-governance:
