@@ -196,6 +196,11 @@ impl ResponseInbox {
         }
     }
 
+    /// Whether the inbox has failed, without draining it as `check_failure` does.
+    pub(super) fn is_failed(&self) -> bool {
+        self.failure.borrow().is_some()
+    }
+
     pub(super) fn check_failure(&self) -> Result<(), String> {
         let failure = self.failure.borrow().clone();
         match failure {

@@ -1,10 +1,12 @@
 //! Transport-neutral native read policy. Adapters supply discovery, GET and sleep;
 //! the engine owns ordering, fallback bounds, absence decisions and retry timing.
 use futures::future::{select, Either};
+use futures::{stream::FuturesUnordered, StreamExt};
 use std::{collections::HashSet, future::Future, time::Duration};
 
 pub(crate) const MAX_GET_FALLBACK_PEERS: usize = 20;
 pub(crate) const CLOSE_GROUP_RETRY_DELAY: Duration = Duration::from_secs(1);
+const EARLY_READ_HEDGE_DELAY: Duration = Duration::from_secs(1);
 
 pub(crate) fn is_authoritative_not_found(not_found: usize, queried: usize) -> bool {
     queried >= ant_protocol::CLOSE_GROUP_MAJORITY && not_found == queried
@@ -69,9 +71,10 @@ pub(crate) fn read_targets<P>(
 }
 
 /// Discover and read concurrently. Early hints are never absence votes or
-/// close-group authority. One early GET runs while discovery is pending; after
-/// discovery one ordinary GET may race it. A peer is queried at most once per
-/// round, and only the completed final candidate set can establish absence.
+/// close-group authority. A stalled early GET may race one other candidate after
+/// a delay, on both native and WASM. At most two GETs run, including after discovery.
+/// A peer is queried at most once per round, and only the completed final candidate
+/// set can establish absence.
 pub(crate) async fn retrieve_progressive<P, T, E, D, DF, G, GF, S, SF>(
     target: [u8; 32],
     early_limit: usize,
@@ -98,10 +101,14 @@ where
         let mut discovery = Box::pin(discover(sender));
         let mut attempted = HashSet::new();
         let not_found = std::sync::Mutex::new(HashSet::new());
-        let mut active: Option<([u8; 32], std::pin::Pin<Box<GF>>)> = None;
+        let mut active = FuturesUnordered::new();
+        let mut hedge_timer = None;
+        let mut hedge_ready = false;
         let mut updates_open = true;
         let candidates = loop {
-            if active.is_none() && attempted.len() < early_limit.min(MAX_GET_FALLBACK_PEERS) {
+            if (active.is_empty() || (active.len() == 1 && hedge_ready))
+                && attempted.len() < early_limit.min(MAX_GET_FALLBACK_PEERS)
+            {
                 let next = updates
                     .borrow_and_update()
                     .iter()
@@ -111,7 +118,12 @@ where
                 if let Some(peer) = next {
                     let id = key(&peer);
                     attempted.insert(id);
-                    active = Some((id, Box::pin(get(peer, true))));
+                    if active.is_empty() {
+                        hedge_ready = false;
+                        hedge_timer = Some(Box::pin(sleep(EARLY_READ_HEDGE_DELAY)));
+                    }
+                    let future = get(peer, true);
+                    active.push(async move { (id, future.await) });
                 }
             }
             let event = {
@@ -123,29 +135,72 @@ where
                     }
                 };
                 let read = async {
-                    match &mut active {
-                        Some((id, future)) => (*id, future.await),
+                    if active.is_empty() {
+                        futures::future::pending().await
+                    } else {
+                        active.next().await.expect("nonempty early reads")
+                    }
+                };
+                let hedge = async {
+                    match &mut hedge_timer {
+                        Some(timer) => timer.await,
                         None => futures::future::pending().await,
                     }
                 };
                 match select(
                     discovery.as_mut(),
-                    Box::pin(select(Box::pin(read), Box::pin(changed))),
+                    Box::pin(select(
+                        Box::pin(read),
+                        Box::pin(select(Box::pin(changed), Box::pin(hedge))),
+                    )),
                 )
                 .await
                 {
                     Either::Left((candidates, _)) => Either::Left(candidates),
                     Either::Right((event, _)) => Either::Right(match event {
                         Either::Left((result, _)) => Either::Left(result),
-                        Either::Right((open, _)) => Either::Right(open),
+                        Either::Right((event, _)) => Either::Right(match event {
+                            Either::Left((open, _)) => Some(open),
+                            Either::Right(_) => None,
+                        }),
                     }),
                 }
             };
             match event {
                 Either::Left(candidates) => break candidates,
-                Either::Right(Either::Right(open)) => updates_open = open,
-                Either::Right(Either::Left((id, result))) => {
-                    active = None;
+                Either::Right(Either::Right(Some(open))) => updates_open = open,
+                Either::Right(Either::Right(None)) => {
+                    hedge_ready = true;
+                    hedge_timer = None;
+                }
+                Either::Right(Either::Left((id, result))) => match result {
+                    Ok(Some(value)) => return Ok(Some(value)),
+                    Ok(None) => {
+                        not_found
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(id);
+                    }
+                    Err(error) if !retryable(&error) => return Err(error),
+                    Err(_) => {}
+                },
+            }
+        };
+        let peers = read_targets(candidates, &target, &key);
+        let final_ids = peers.iter().map(&key).collect::<HashSet<_>>();
+        // Discovery may finish with two early reads still active. Start the
+        // ordinary path only once one retires; never create a third wire GET.
+        let (slot, slot_available) = futures::channel::oneshot::channel();
+        let wait_for_slot = active.len() == 2;
+        let pending_early = (!active.is_empty()).then(|| {
+            let not_found = &not_found;
+            let retryable = &retryable;
+            async move {
+                let mut slot = Some(slot);
+                while let Some((id, result)) = active.next().await {
+                    if let Some(slot) = slot.take() {
+                        let _ = slot.send(());
+                    }
                     match result {
                         Ok(Some(value)) => return Ok(Some(value)),
                         Ok(None) => {
@@ -158,24 +213,13 @@ where
                         Err(_) => {}
                     }
                 }
-            }
-        };
-        let peers = read_targets(candidates, &target, &key);
-        let final_ids = peers.iter().map(&key).collect::<HashSet<_>>();
-        let pending_early = active.map(|(id, future)| {
-            let not_found = &not_found;
-            async move {
-                let result = future.await;
-                if matches!(result, Ok(None)) {
-                    not_found
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(id);
-                }
-                result
+                Ok(None)
             }
         });
         let ordinary = async {
+            if wait_for_slot {
+                let _ = slot_available.await;
+            }
             for peer in peers {
                 let id = key(&peer);
                 if attempted.contains(&id) {
@@ -247,6 +291,132 @@ mod tests {
     enum ReadError {
         Transport,
         Integrity,
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_early_read_can_race_a_new_hint_before_discovery_finishes() {
+        let gets = RefCell::new(Vec::new());
+        let start = tokio::time::Instant::now();
+        let read = retrieve_progressive(
+            peer(0),
+            7,
+            |updates| async move {
+                updates.send_replace(vec![peer(1)]);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                updates.send_replace(vec![peer(1), peer(2)]);
+                futures::future::pending().await
+            },
+            |p| *p,
+            |p, early| {
+                gets.borrow_mut().push((p, early));
+                async move {
+                    if p == peer(1) {
+                        futures::future::pending().await
+                    } else {
+                        Ok::<_, ReadError>(Some(42))
+                    }
+                }
+            },
+            |_| true,
+            tokio::time::sleep,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(2), read)
+            .await
+            .expect("hedged read stalled");
+        assert_eq!(result, Ok(Some(42)));
+        assert_eq!(start.elapsed(), EARLY_READ_HEDGE_DELAY);
+        assert_eq!(*gets.borrow(), vec![(peer(1), true), (peer(2), true)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_completion_does_not_add_a_third_get_to_two_early_reads() {
+        use futures::FutureExt;
+        let (found, found_rx) = futures::channel::oneshot::channel();
+        let found = RefCell::new(Some(found));
+        let found_rx = RefCell::new(Some(found_rx));
+        let (release, release_rx) = futures::channel::oneshot::channel();
+        let release_rx = RefCell::new(Some(release_rx));
+        let gets = RefCell::new(Vec::new());
+        let future = retrieve_progressive(
+            peer(0),
+            7,
+            |updates| {
+                let found_rx = found_rx.borrow_mut().take().unwrap();
+                async move {
+                    updates.send_replace(vec![peer(1), peer(2)]);
+                    found_rx.await.unwrap();
+                    ReadCandidates {
+                        closest: vec![peer(1), peer(2), peer(3)],
+                        known: vec![],
+                    }
+                }
+            },
+            |p| *p,
+            |p, early| {
+                gets.borrow_mut().push((p, early));
+                let release_rx = if p == peer(1) {
+                    release_rx.borrow_mut().take()
+                } else {
+                    None
+                };
+                let found = &found;
+                async move {
+                    if let Some(release_rx) = release_rx {
+                        release_rx.await.unwrap();
+                        Ok::<_, ReadError>(None)
+                    } else if p == peer(2) {
+                        found.borrow_mut().take().unwrap().send(()).unwrap();
+                        futures::future::pending().await
+                    } else {
+                        Ok(Some(42))
+                    }
+                }
+            },
+            |_| true,
+            tokio::time::sleep,
+        );
+        futures::pin_mut!(future);
+        assert!(future.as_mut().now_or_never().is_none());
+        tokio::time::advance(EARLY_READ_HEDGE_DELAY).await;
+        assert!(future.as_mut().now_or_never().is_none());
+        assert_eq!(*gets.borrow(), vec![(peer(1), true), (peer(2), true)]);
+        release.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), future)
+                .await
+                .expect("ordinary read stalled"),
+            Ok(Some(42))
+        );
+        assert_eq!(
+            *gets.borrow(),
+            vec![(peer(1), true), (peer(2), true), (peer(3), false)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn integrity_failure_from_a_hedged_read_remains_fatal() {
+        let read = retrieve_progressive(
+            peer(0),
+            7,
+            |updates| async move {
+                updates.send_replace(vec![peer(1), peer(2)]);
+                futures::future::pending().await
+            },
+            |p| *p,
+            |p, _| async move {
+                if p == peer(1) {
+                    futures::future::pending().await
+                } else {
+                    Err::<Option<()>, _>(ReadError::Integrity)
+                }
+            },
+            |error| *error == ReadError::Transport,
+            tokio::time::sleep,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(2), read)
+            .await
+            .expect("integrity failure was not returned");
+        assert_eq!(result, Err(ReadError::Integrity));
     }
 
     #[test]

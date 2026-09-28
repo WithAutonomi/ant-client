@@ -1,0 +1,178 @@
+{
+  "baseline": {
+    "samples": [
+      {
+        "connect": {
+          "seconds": 5.350099999904632
+        },
+        "public_map": {
+          "seconds": 20.4955,
+          "downloadSeconds": 15.145400000095368
+        },
+        "metadata": {
+          "seconds": 26.7425,
+          "downloadSeconds": 21.392400000095368
+        },
+        "first": {
+          "seconds": 29.872799999952317,
+          "downloadSeconds": 24.522700000047685
+        },
+        "third": {
+          "seconds": 31.720799999952316,
+          "downloadSeconds": 26.370700000047684
+        }
+      },
+      {
+        "connect": {
+          "seconds": 5.271900000095368
+        },
+        "public_map": {
+          "seconds": 15.048300000190736,
+          "downloadSeconds": 9.776400000095368
+        },
+        "metadata": {
+          "seconds": 18.855800000190733,
+          "downloadSeconds": 13.583900000095367
+        },
+        "first": {
+          "seconds": 22.577700000047685,
+          "downloadSeconds": 17.305799999952317
+        },
+        "third": {
+          "seconds": 27.9195,
+          "downloadSeconds": 22.64759999990463
+        }
+      },
+      {
+        "connect": {
+          "seconds": 5.266700000047684
+        },
+        "public_map": {
+          "seconds": 15.012700000047683,
+          "downloadSeconds": 9.746
+        },
+        "metadata": {
+          "seconds": 24.432200000047683,
+          "downloadSeconds": 19.1655
+        },
+        "first": {
+          "seconds": 28.505,
+          "downloadSeconds": 23.238299999952318
+        },
+        "third": {
+          "seconds": 34.28110000014305,
+          "downloadSeconds": 29.014400000095367
+        }
+      }
+    ],
+    "medians": {
+      "connect": {
+        "seconds": 5.271900000095368
+      },
+      "public_map": {
+        "seconds": 15.048300000190736,
+        "downloadSeconds": 9.776400000095368
+      },
+      "metadata": {
+        "seconds": 24.432200000047683,
+        "downloadSeconds": 19.1655
+      },
+      "first": {
+        "seconds": 28.505,
+        "downloadSeconds": 23.238299999952318
+      },
+      "third": {
+        "seconds": 31.720799999952316,
+        "downloadSeconds": 26.370700000047684
+      }
+    }
+  },
+  "candidate": {
+    "samples": [
+      {
+        "connect": {
+          "seconds": 2.1385
+        },
+        "public_map": {
+          "seconds": 6.565900000095367,
+          "downloadSeconds": 4.427400000095368
+        },
+        "metadata": {
+          "seconds": 13.445400000095367,
+          "downloadSeconds": 11.306900000095368
+        },
+        "first": {
+          "seconds": 16.541600000143053,
+          "downloadSeconds": 14.403100000143052
+        },
+        "third": {
+          "seconds": 25.182,
+          "downloadSeconds": 23.0435
+        }
+      },
+      {
+        "connect": {
+          "seconds": 2.108899999856949
+        },
+        "public_map": {
+          "seconds": 6.5292999999523165,
+          "downloadSeconds": 4.4202999999523165
+        },
+        "metadata": {
+          "seconds": 14.470099999904633,
+          "downloadSeconds": 12.361099999904633
+        },
+        "first": {
+          "seconds": 18.635099999904632,
+          "downloadSeconds": 16.526099999904634
+        },
+        "third": {
+          "seconds": 24.7435,
+          "downloadSeconds": 22.6345
+        }
+      },
+      {
+        "connect": {
+          "seconds": 2.0917999999523165
+        },
+        "public_map": {
+          "seconds": 6.559399999856949,
+          "downloadSeconds": 4.4675
+        },
+        "metadata": {
+          "seconds": 13.496099999904633,
+          "downloadSeconds": 11.404200000047684
+        },
+        "first": {
+          "seconds": 18.591,
+          "downloadSeconds": 16.499100000143052
+        },
+        "third": {
+          "seconds": 22.819399999856948,
+          "downloadSeconds": 20.7275
+        }
+      }
+    ],
+    "medians": {
+      "connect": {
+        "seconds": 2.108899999856949
+      },
+      "public_map": {
+        "seconds": 6.559399999856949,
+        "downloadSeconds": 4.427400000095368
+      },
+      "metadata": {
+        "seconds": 13.496099999904633,
+        "downloadSeconds": 11.404200000047684
+      },
+      "first": {
+        "seconds": 18.591,
+        "downloadSeconds": 16.499100000143052
+      },
+      "third": {
+        "seconds": 24.7435,
+        "downloadSeconds": 22.6345
+      }
+    }
+  }
+}

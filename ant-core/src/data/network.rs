@@ -303,10 +303,12 @@ impl Network {
         let local_peer_id = self.node.peer_id();
 
         // Request one extra to account for filtering out our own peer ID
-        let closest_nodes = self
-            .node
-            .dht()
-            .find_closest_nodes(target, count + 1)
+        // Keep the large transport future behind the adapter boundary. This
+        // preserves Send without expanding the entire dial/lookup type through
+        // the shared discovery/read race and recursive DataMap resolver.
+        let lookup: futures::future::BoxFuture<'_, _> =
+            Box::pin(self.node.dht().find_closest_nodes(target, count + 1));
+        let closest_nodes = lookup
             .await
             .map_err(|e| Error::Network(format!("DHT closest-nodes lookup failed: {e}")))?;
 
@@ -330,10 +332,9 @@ impl Network {
         count: usize,
     ) -> Result<Vec<ClosestPeerDiagnostics>> {
         let local_peer_id = self.node.peer_id();
-        let closest_nodes = self
-            .node
-            .dht()
-            .find_closest_nodes(target, count + 1)
+        let lookup: futures::future::BoxFuture<'_, _> =
+            Box::pin(self.node.dht().find_closest_nodes(target, count + 1));
+        let closest_nodes = lookup
             .await
             .map_err(|e| Error::Network(format!("DHT closest-nodes lookup failed: {e}")))?;
         let now_ns = std::time::SystemTime::now()
@@ -499,12 +500,20 @@ impl Network {
         }
     }
 
-    /// Seed early reads from the same local phonebook on both platforms.
+    /// Speculate on already-connected peers on both platforms. Discovery owns
+    /// cold dialing; a dead address must not occupy an early GET slot while a
+    /// reachable holder is being discovered. Ordinary fallback still sees all
+    /// known peers, including those requiring a new connection.
     pub(crate) async fn seed_read_candidates(&self, progress: &ReadProgress) {
+        #[cfg(feature = "native")]
+        let connected = self.node.connected_peers().await;
+        #[cfg(not(feature = "native"))]
+        let connected = self.backend.connected_read_peers();
         progress.offer(
             self.known_peers()
                 .await
                 .into_iter()
+                .filter(|node| connected.contains(&node.peer_id))
                 .map(|node| {
                     let addrs = node.addresses_by_priority();
                     (node.peer_id, addrs)

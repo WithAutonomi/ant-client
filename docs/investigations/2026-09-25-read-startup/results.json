@@ -1,0 +1,434 @@
+{
+  "baseline-single-1": [
+    {
+      "download_ms": 2,
+      "message": "Fetching public DataMap 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 2.1000001430511475,
+      "message": "Fetching 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 27744.400000095367,
+      "message": "Verified public DataMap (320 bytes)"
+    },
+    {
+      "download_ms": 27745.900000095367,
+      "message": "Resolving nested DataMap record 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 27746,
+      "message": "Fetching 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 27746.700000047684,
+      "message": "Resolving nested DataMap record 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 27746.700000047684,
+      "message": "Fetching 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 27748.10000014305,
+      "message": "Resolving nested DataMap record 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 27748.200000047684,
+      "message": "Fetching 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 51040.5,
+      "message": "Downloaded chunk 0/147"
+    },
+    {
+      "download_ms": 54657.799999952316,
+      "message": "Downloaded chunk 1/147"
+    },
+    {
+      "download_ms": 73099.79999995232,
+      "message": "Downloaded chunk 2/147"
+    },
+    {
+      "download_ms": 73978.79999995232,
+      "message": "Downloaded chunk 3/147"
+    }
+  ],
+  "baseline-single-2": [
+    {
+      "download_ms": 2.0999999046325684,
+      "message": "Fetching public DataMap 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 2.1999998092651367,
+      "message": "Fetching 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 21911.5,
+      "message": "Verified public DataMap (320 bytes)"
+    },
+    {
+      "download_ms": 21913,
+      "message": "Resolving nested DataMap record 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 21913,
+      "message": "Fetching 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 21913.699999809265,
+      "message": "Resolving nested DataMap record 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 21913.699999809265,
+      "message": "Fetching 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 21915.099999904633,
+      "message": "Resolving nested DataMap record 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 21915.199999809265,
+      "message": "Fetching 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 42284.299999952316,
+      "message": "Downloaded chunk 0/147"
+    },
+    {
+      "download_ms": 48341.59999990463,
+      "message": "Downloaded chunk 1/147"
+    },
+    {
+      "download_ms": 60151.59999990463,
+      "message": "Downloaded chunk 2/147"
+    },
+    {
+      "download_ms": 64771.299999952316,
+      "message": "Downloaded chunk 3/147"
+    }
+  ],
+  "baseline-single-3": [
+    {
+      "download_ms": 2.200000047683716,
+      "message": "Fetching public DataMap 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 2.4000000953674316,
+      "message": "Fetching 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 27407.400000095367,
+      "message": "Verified public DataMap (320 bytes)"
+    },
+    {
+      "download_ms": 27408.799999952316,
+      "message": "Resolving nested DataMap record 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 27408.799999952316,
+      "message": "Fetching 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 27410.60000014305,
+      "message": "Resolving nested DataMap record 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 27410.60000014305,
+      "message": "Fetching 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 27411.10000014305,
+      "message": "Resolving nested DataMap record 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 27411.10000014305,
+      "message": "Fetching 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 61883.799999952316,
+      "message": "Downloaded chunk 0/147"
+    },
+    {
+      "download_ms": 72265.10000014305,
+      "message": "Downloaded chunk 1/147"
+    },
+    {
+      "download_ms": 78131.5,
+      "message": "Downloaded chunk 2/147"
+    },
+    {
+      "download_ms": 84497.5,
+      "message": "Downloaded chunk 3/147"
+    }
+  ],
+  "baseline-single-4": [
+    {
+      "download_ms": 2.200000047683716,
+      "message": "Fetching public DataMap 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 2.4000000953674316,
+      "message": "Fetching 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 27477.900000095367,
+      "message": "Verified public DataMap (320 bytes)"
+    },
+    {
+      "download_ms": 27481.400000095367,
+      "message": "Resolving nested DataMap record 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 27481.60000014305,
+      "message": "Fetching 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 27483.10000014305,
+      "message": "Resolving nested DataMap record 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 27483.10000014305,
+      "message": "Fetching 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 27486.400000095367,
+      "message": "Resolving nested DataMap record 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 27486.5,
+      "message": "Fetching 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 30151.200000047684,
+      "message": "Downloaded chunk 0/147"
+    },
+    {
+      "download_ms": 38799.60000014305,
+      "message": "Downloaded chunk 1/147"
+    },
+    {
+      "download_ms": 51158.90000009537,
+      "message": "Downloaded chunk 2/147"
+    },
+    {
+      "download_ms": 67251.5,
+      "message": "Downloaded chunk 3/147"
+    }
+  ],
+  "changed-single-1": [
+    {
+      "download_ms": 2.0999999046325684,
+      "message": "Fetching public DataMap 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 2.299999952316284,
+      "message": "Fetching 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 12320.400000095367,
+      "message": "Verified public DataMap (320 bytes)"
+    },
+    {
+      "download_ms": 12321.900000095367,
+      "message": "Resolving nested DataMap record 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 12321.900000095367,
+      "message": "Fetching 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 12322.599999904633,
+      "message": "Resolving nested DataMap record 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 12322.700000047684,
+      "message": "Fetching 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 12323.099999904633,
+      "message": "Resolving nested DataMap record 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 12323.200000047684,
+      "message": "Fetching 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 16053.299999952316,
+      "message": "Downloaded chunk 0/147"
+    },
+    {
+      "download_ms": 20229.299999952316,
+      "message": "Downloaded chunk 1/147"
+    },
+    {
+      "download_ms": 25421.299999952316,
+      "message": "Downloaded chunk 2/147"
+    },
+    {
+      "download_ms": 27192,
+      "message": "Downloaded chunk 3/147"
+    }
+  ],
+  "changed-single-2": [
+    {
+      "download_ms": 2.5,
+      "message": "Fetching public DataMap 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 2.5999999046325684,
+      "message": "Fetching 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 21911.400000095367,
+      "message": "Verified public DataMap (320 bytes)"
+    },
+    {
+      "download_ms": 21913.099999904633,
+      "message": "Resolving nested DataMap record 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 21913.200000047684,
+      "message": "Fetching 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 21914,
+      "message": "Resolving nested DataMap record 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 21914,
+      "message": "Fetching 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 21914.400000095367,
+      "message": "Resolving nested DataMap record 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 21914.400000095367,
+      "message": "Fetching 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 35633.200000047684,
+      "message": "Downloaded chunk 0/147"
+    },
+    {
+      "download_ms": 43309.90000009537,
+      "message": "Downloaded chunk 1/147"
+    },
+    {
+      "download_ms": 48927.09999990463,
+      "message": "Downloaded chunk 2/147"
+    },
+    {
+      "download_ms": 49521.200000047684,
+      "message": "Downloaded chunk 3/147"
+    }
+  ],
+  "changed-single-3": [
+    {
+      "download_ms": 2.1000001430511475,
+      "message": "Fetching public DataMap 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 2.200000047683716,
+      "message": "Fetching 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 26686.400000095367,
+      "message": "Verified public DataMap (320 bytes)"
+    },
+    {
+      "download_ms": 26687.900000095367,
+      "message": "Resolving nested DataMap record 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 26688,
+      "message": "Fetching 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 26688.60000014305,
+      "message": "Resolving nested DataMap record 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 26688.60000014305,
+      "message": "Fetching 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 26688.799999952316,
+      "message": "Resolving nested DataMap record 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 26688.900000095367,
+      "message": "Fetching 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 42818.90000009537,
+      "message": "Downloaded chunk 0/147"
+    },
+    {
+      "download_ms": 49466.799999952316,
+      "message": "Downloaded chunk 1/147"
+    },
+    {
+      "download_ms": 50533.200000047684,
+      "message": "Downloaded chunk 2/147"
+    },
+    {
+      "download_ms": 52989.299999952316,
+      "message": "Downloaded chunk 3/147"
+    }
+  ],
+  "changed-all-1": [
+    {
+      "download_ms": 2.200000047683716,
+      "message": "Fetching public DataMap 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 2.299999952316284,
+      "message": "Fetching 134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889"
+    },
+    {
+      "download_ms": 11425.5,
+      "message": "Verified public DataMap (320 bytes)"
+    },
+    {
+      "download_ms": 11427,
+      "message": "Resolving nested DataMap record 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 11427,
+      "message": "Fetching 69443b7fecbc2d04895a5155d84965a6b6f131c059dac3e108f014f4d24d8e78"
+    },
+    {
+      "download_ms": 11427.700000047684,
+      "message": "Resolving nested DataMap record 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 11427.700000047684,
+      "message": "Fetching 187af5fe3f69c12b417e8ca51b6dea4963964e53042089b5536d9e7e8c1e7d84"
+    },
+    {
+      "download_ms": 11428.100000143051,
+      "message": "Resolving nested DataMap record 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 11428.100000143051,
+      "message": "Fetching 7f4b3e83ed0b434668dedbcd98023474e968bcf0b589436b2fbb9c1515e2bf33"
+    },
+    {
+      "download_ms": 15058.900000095367,
+      "message": "Downloaded chunk 0/147"
+    },
+    {
+      "download_ms": 17387,
+      "message": "Downloaded chunk 1/147"
+    },
+    {
+      "download_ms": 18613.700000047684,
+      "message": "Downloaded chunk 2/147"
+    },
+    {
+      "download_ms": 18758.60000014305,
+      "message": "Downloaded chunk 3/147"
+    }
+  ]
+}

@@ -2,7 +2,6 @@ import { BrowserNetworkClient } from "./client-fixture.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  BrowserNodeClient,
   parseResponseFrame,
   parseWebRtcDirectMultiaddr,
   paymentQuoteHash,
@@ -28,9 +27,6 @@ test("Rust/WASM parses stable certificate-pinned WebRTC Direct addresses", () =>
     /literal IP/,
   );
 
-  const node = new BrowserNodeClient(multiaddr);
-  assert.equal(node.getChunk, undefined);
-  node.free();
   const network = new BrowserNetworkClient([{ multiaddr }]);
   network.close();
 });

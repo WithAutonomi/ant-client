@@ -63,6 +63,9 @@ impl BrowserNetwork for SharedNetworkAdapter {
         progress: crate::data::network::ReadProgress,
     ) -> LocalBoxFuture<'a, DataResult<Vec<(PeerId, Vec<MultiAddr>)>>> {
         Box::pin(async move {
+            #[cfg(feature = "test-utils")]
+            let mut trace =
+                diagnostics::Trace::new("discovery", hex::encode(target), String::new());
             let result = self
                 .inner
                 .find_closest_with_progress(
@@ -73,6 +76,8 @@ impl BrowserNetwork for SharedNetworkAdapter {
                 )
                 .await
                 .map_err(DataError::Network)?;
+            #[cfg(feature = "test-utils")]
+            trace.finish(&format!("{} peers", result.nodes.len()));
             result
                 .nodes
                 .iter()
@@ -185,7 +190,11 @@ impl BrowserNetwork for SharedNetworkAdapter {
             .clients
             .borrow()
             .values()
-            .filter(|entry| entry.client.is_connected() && entry.client.hello.borrow().is_some())
+            .filter(|entry| {
+                [&entry.client, &entry.data_client]
+                    .iter()
+                    .any(|client| client.is_connected() && client.hello.borrow().is_some())
+            })
             .filter_map(|entry| PeerId::from_hex(&entry.client.endpoint.peer_id).ok())
             .collect()
     }
@@ -198,6 +207,15 @@ impl BrowserNetwork for SharedNetworkAdapter {
         timeout: Duration,
     ) -> LocalBoxFuture<'a, DataResult<ChunkMessage>> {
         Box::pin(async move {
+            #[cfg(feature = "test-utils")]
+            let mut trace = diagnostics::Trace::new(
+                "rpc",
+                match &request.body {
+                    ChunkMessageBody::GetRequest(get) => hex::encode(get.address),
+                    _ => String::new(),
+                },
+                peer.to_hex(),
+            );
             let endpoint = addrs
                 .iter()
                 .find(|addr| addr.is_webrtc_direct())
@@ -214,10 +232,6 @@ impl BrowserNetwork for SharedNetworkAdapter {
             // The node already accepts two independently authenticated channels
             // on one association; application request/witness semantics stay intact.
             let admission = TransferDeadline::new(RPC_ADMISSION_TIMEOUT);
-            // A pointer write is a paid write, and waits on its payment being
-            // verified, so it takes the data lane as a chunk PUT does. A pointer
-            // read returns one small record, like a quote, and stays on the RPC
-            // lane.
             let client = if matches!(
                 &request.body,
                 ChunkMessageBody::GetRequest(_)
@@ -233,6 +247,8 @@ impl BrowserNetwork for SharedNetworkAdapter {
             }
             .map_err(rpc_data_error)?;
             let client = client.authenticated().await.map_err(rpc_data_error)?;
+            #[cfg(feature = "test-utils")]
+            trace.event("authenticated", "");
             let hello = client
                 .hello
                 .borrow()
@@ -294,6 +310,8 @@ impl BrowserNetwork for SharedNetworkAdapter {
                 &request.body,
                 ChunkMessageBody::PutRequest(_) | ChunkMessageBody::PointerPutRequest(_)
             );
+            #[cfg(feature = "test-utils")]
+            trace.event("admitted", "");
             let bytes = request
                 .encode()
                 .map_err(|e| DataError::Protocol(e.to_string()))?;
@@ -316,6 +334,15 @@ impl BrowserNetwork for SharedNetworkAdapter {
             let decode_started = web_time::Instant::now();
             let response = ChunkMessage::decode(&response.content)
                 .map_err(|e| DataError::Protocol(e.to_string()))?;
+            #[cfg(feature = "test-utils")]
+            trace.finish(&match &response.body {
+                ChunkMessageBody::GetResponse(ant_protocol::ChunkGetResponse::Success {
+                    content,
+                    ..
+                }) => format!("found {} bytes", content.len()),
+                ChunkMessageBody::GetResponse(other) => format!("{other:?}"),
+                _ => "response".into(),
+            });
             if response.request_id != request.request_id {
                 return Err(DataError::Protocol("chunk request ID mismatch".into()));
             }
