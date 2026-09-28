@@ -21,6 +21,7 @@ pub mod merkle;
 #[cfg(feature = "native")]
 mod native_payment;
 pub mod payment;
+pub mod pointer;
 pub mod quote;
 pub mod upload;
 pub mod upload_state;

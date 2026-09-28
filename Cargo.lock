@@ -825,9 +825,11 @@ dependencies = [
  "colored",
  "hex",
  "indicatif",
+ "rand 0.8.6",
  "rmp-serde",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",
@@ -909,8 +911,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19a35999e85e8c5e854fbc36a0da1089812406407c19212532cd19b86991add3"
+source = "git+https://github.com/WithAutonomi/ant-node.git?rev=7353c9ea2740de33495e78a3c36ff75b75116d4b#7353c9ea2740de33495e78a3c36ff75b75116d4b"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -962,8 +963,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c7b4fbfd0a8b397d0dc1a0dc7308308242911147224c4e1a56130168e7ad48f"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=d11d1010d93958fee6e63e4aace8770f39a0678b#d11d1010d93958fee6e63e4aace8770f39a0678b"
 dependencies = [
  "blake3",
  "bytes",
@@ -3456,7 +3456,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]

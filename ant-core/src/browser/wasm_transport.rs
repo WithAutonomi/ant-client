@@ -56,6 +56,9 @@ use web_sys::{
 };
 
 const REQUEST_TIMEOUT_MS: u32 = 10_000;
+/// Advertised by a node whose `chunk_protocol` admits pointer reads and paid
+/// pointer writes (ADR-0016).
+const POINTER_PROTOCOL_CAPABILITY: &str = "pointer_protocol";
 // A queued operation may wait behind a maximum-sized request and response
 // (180 seconds each), plus connection/authentication setup. Admission has its
 // own ceiling and never spends the caller's response allowance.
@@ -88,6 +91,7 @@ mod bootstrap;
 mod failed_payment;
 mod inbox;
 mod multiplex;
+mod pointer;
 mod shared;
 mod upload_adapter;
 use ant_protocol::transport::{client_routing, PeerId};

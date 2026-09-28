@@ -234,7 +234,9 @@ impl BrowserNetwork for SharedNetworkAdapter {
             let admission = TransferDeadline::new(RPC_ADMISSION_TIMEOUT);
             let client = if matches!(
                 &request.body,
-                ChunkMessageBody::GetRequest(_) | ChunkMessageBody::PutRequest(_)
+                ChunkMessageBody::GetRequest(_)
+                    | ChunkMessageBody::PutRequest(_)
+                    | ChunkMessageBody::PointerPutRequest(_)
             ) {
                 self.inner
                     .pool
@@ -257,6 +259,20 @@ impl BrowserNetwork for SharedNetworkAdapter {
                     "node does not support shared ant-protocol RPC".into(),
                 ));
             }
+            // A node that predates browser pointers refuses them, so it is
+            // not asked: its refusal would read as a failed peer.
+            if matches!(
+                request.body,
+                ChunkMessageBody::PointerGetRequest(_) | ChunkMessageBody::PointerPutRequest(_)
+            ) && !hello
+                .capabilities
+                .iter()
+                .any(|cap| cap == POINTER_PROTOCOL_CAPABILITY)
+            {
+                return Err(DataError::Network(
+                    "node does not support browser pointers".into(),
+                ));
+            }
             let payment_network = self.payment_network.clone();
             if matches!(
                 request.body,
@@ -265,6 +281,7 @@ impl BrowserNetwork for SharedNetworkAdapter {
                     | ChunkMessageBody::MerkleCandidateQuoteRequest(_)
                     | ChunkMessageBody::MerkleCandidateQuoteRequestV2(_)
                     | ChunkMessageBody::PutRequest(_)
+                    | ChunkMessageBody::PointerPutRequest(_)
             ) {
                 if let Some(network) = payment_network {
                     assert_upload_node(&hello, &network).map_err(DataError::Network)?;
@@ -289,7 +306,10 @@ impl BrowserNetwork for SharedNetworkAdapter {
             } else {
                 None
             };
-            let exclusive = matches!(&request.body, ChunkMessageBody::PutRequest(_));
+            let exclusive = matches!(
+                &request.body,
+                ChunkMessageBody::PutRequest(_) | ChunkMessageBody::PointerPutRequest(_)
+            );
             #[cfg(feature = "test-utils")]
             trace.event("admitted", "");
             let bytes = request

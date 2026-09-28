@@ -2,7 +2,7 @@ use ant_core::data::MultiAddr;
 use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::commands::data::{ChunkAction, FileAction, WalletAction};
+use crate::commands::data::{ChunkAction, FileAction, PointerAction, WalletAction};
 use crate::commands::node::NodeCommand;
 use crate::commands::update::UpdateArgs;
 
@@ -109,6 +109,11 @@ pub enum Commands {
     Chunk {
         #[command(subcommand)]
         action: ChunkAction,
+    },
+    /// Pointer operations (owner-signed mutable references, paid per update)
+    Pointer {
+        #[command(subcommand)]
+        action: PointerAction,
     },
     /// Update the ant binary to the latest version
     Update(UpdateArgs),

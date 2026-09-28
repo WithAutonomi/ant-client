@@ -71,6 +71,15 @@ There is no browser-specific recovery probe or relaxed payment threshold.
 The requested responder count must be satisfied before quote witnessing and
 storage-majority checks proceed.
 
+Pointers work from the browser too: `getPointer`, `resolvePointer`,
+`createPointer` and `updatePointer` on `BrowserNetworkClient`, and
+`pointerAddress(seed)` offline. They run the native client's own read quorum,
+corroboration and write quorum, and pay each state through the same wallet
+callback file uploads take. The owner key is passed as its 32-byte seed. Only
+nodes that advertise `pointer_protocol` are asked. A write can hand the paid
+record and proof to an `onPaid` callback; `storePaidPointer` stores them later
+without paying again.
+
 Browser protocol v5 and browser manifest v6 advertise only the payment chain ID
 and token/vault addresses. RPC providers belong to the application or wallet;
 the node's verification RPC URL is never sent to the browser. Paid uploads
@@ -291,6 +300,56 @@ $ ant chunk get a1b2c3d4... -o output.bin
 | Flag | Description |
 |------|-------------|
 | `-o, --output <PATH>` | Write to file instead of stdout. |
+
+### `ant pointer` — Pointer Operations
+
+A pointer is a mutable reference to a chunk or to another pointer, signed by an
+owner key that can never change. Every state is paid for; reads are free. The
+owner key is kept as a 32-byte seed in a file only its owner can read (`0600`
+on Unix; on Windows it takes its directory's permissions, so keep it in your
+user profile). Losing it means the pointer can never be updated again.
+
+#### `ant pointer keygen --output <FILE>`
+
+Create a new owner key and print the address of the pointer it controls. Never
+overwrites an existing file.
+
+```
+$ ant pointer keygen --output owner.key
+Owner key written to owner.key
+9f3c...
+```
+
+#### `ant pointer address --key <FILE>`
+
+Print the address of the pointer a key controls. Needs no network.
+
+#### `ant pointer create --key <FILE> <TARGET> [--kind chunk|pointer]`
+
+Create the pointer, pointing at `TARGET` (hex). Requires `SECRET_KEY` to pay.
+Refused before paying if the pointer already exists.
+
+#### `ant pointer update --key <FILE> <TARGET> [--kind chunk|pointer]`
+
+Point it at `TARGET`, one past the counter the network serves (or create it).
+Requires `SECRET_KEY` to pay for the new state.
+
+#### `ant pointer get <ADDRESS>`
+
+Print a pointer's counter, target and state.
+
+```
+$ ant pointer get 9f3c...
+address:  9f3c...
+counter:  1
+kind:     chunk
+target:   a1b2...
+state_id: 5e7d...
+```
+
+#### `ant pointer resolve <ADDRESS>`
+
+Follow a chain of pointers to the target at its end.
 
 ### `ant wallet` — Wallet Operations
 
