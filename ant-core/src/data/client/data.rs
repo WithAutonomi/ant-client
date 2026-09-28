@@ -418,7 +418,28 @@ impl Client {
         start: usize,
         length: usize,
     ) -> Result<Bytes> {
-        let fetch = |address| self.fetch_data_record(address);
+        self.data_download_range_with(data_map, start, length, |_| None)
+            .await
+    }
+
+    /// As [`Client::data_download_range`], taking records the caller already
+    /// holds from `held` and fetching the rest. Held records are verified too.
+    pub(crate) async fn data_download_range_with(
+        &self,
+        data_map: &DataMap,
+        start: usize,
+        length: usize,
+        held: impl Fn(&[u8; 32]) -> Option<Bytes>,
+    ) -> Result<Bytes> {
+        let fetch = |address| {
+            let held = held(&address);
+            async move {
+                match held {
+                    Some(content) => Ok(content),
+                    None => self.fetch_data_record(address).await,
+                }
+            }
+        };
         let cap = || self.controller().fetch.current();
         let root = crate::client_engine::files::resolve(data_map, &fetch, &cap)
             .await

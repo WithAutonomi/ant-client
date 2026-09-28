@@ -514,3 +514,69 @@ caller-held DataMap, fetch nested DataMap records and chunks from the network,
 and apply the same verification as public reads. A private DataMap is bounded by
 the maximum record size before it is decoded. Wire messages, stored formats, and
 native APIs are unchanged.
+
+## Streaming reads (2026-09-28)
+
+Media playback of a 612 MB mainnet video froze after eight seconds. The service
+worker requested the next block, and that range read did not return for 45 to 60
+seconds. Browser discovery of a record's close group routinely takes 40 to 55
+seconds on mainnet. Meanwhile, speculation spent its twenty-peer allowance on
+connected peers far from the target within two seconds. Discovery offered the
+record's holders about ten seconds in, but the exhausted allowance left them
+unread until discovery completed.
+
+Speculation now continues past the allowance for a hint that may hold the
+record: one with fewer than `CLOSE_GROUP_SIZE` attempted peers nearer the target.
+Hints converging on the target therefore remain readable, while stale hints do
+not. Speculative GETs are bounded at twice the allowance per round. The limit of
+two simultaneous GETs, the hedge delay, deduplication, verification and
+absence rules are unchanged. Native and WASM share this policy.
+
+`BrowserFileReader` reads ahead. A sequential read, which continues one of the
+last four reads or comes from a streaming reader, moves a 32 MiB window to its
+start. Up to four records in that window are fetched in parallel, alongside the
+read. A read's own records are fetched the same way, so a read that needs a
+record being fetched waits for that fetch rather than issuing a second one.
+Another read fetches only the record after it. A streaming read from the start
+of the file also fetches the last record, where MP4 and WebM usually keep their
+index.
+
+The reader holds the records it fetches ahead. The client's shared chunk cache
+keeps eight records, fewer than a window spans, so read-ahead through it would
+evict records before their read and fetch them again without end. A window
+position fetches each record once. A failed fetch is not retried in the
+background: a read that needs the record fetches it itself, and each later read
+retries it once. Once the reader holds more than 24 records, about 100 MB, it
+releases those behind it, farthest first, then those farthest ahead. The window
+and the current read's records are kept.
+
+Fetches left behind by a seek continue until five are in flight: the window's
+four and one more, such as the start of a file that a player returns to after
+reading the index at its end. Each new fetch then cancels the most recently
+started stale fetch, which has made the least progress. The client's read budget
+admits at most eight GETs at once, which leaves each fetch in flight room for
+one. Closing or dropping the reader cancels its fetches and releases its
+records.
+
+`openPublicFile` and `openPrivateFile` take an optional `streaming` flag. A
+streaming reader treats every read as sequential, so a seek fetches the window
+alongside its first read. The SDK sets the flag only for media sources. Other
+readers read ahead only once a read continues another, because scattered reads
+and a single header read would waste bandwidth. Wire messages and stored
+formats are unchanged.
+
+Validation: `a_hint_near_the_target_is_read_after_stale_hints_use_the_allowance`
+fails without the rule and passes with it.
+`a_far_hint_is_not_read_after_the_allowance_is_used` keeps stale hints bounded,
+and `speculative_reads_stop_at_twice_the_allowance` bounds the rest. WASM tests
+check that a streaming reader serves a later record from read-ahead while an
+ordinary reader fetches it. They also check that read-ahead of a file larger
+than its window fetches each record once and then stops, that an ordinary
+reader's header read fetches two records, and that a failed record is retried
+only after another read. On mainnet, the video that froze permanently at 8.5
+seconds played two minutes without a stall in the vault, with about 30 seconds
+buffered. After seeks, playback resumed in 2 to 21 seconds, and the first frame
+appeared 16 to 26 seconds after connecting. Both waits are bound by discovery
+latency, which this change does not alter. These mainnet runs used an earlier
+revision that read ahead through the shared chunk cache; repeat them before
+acceptance.

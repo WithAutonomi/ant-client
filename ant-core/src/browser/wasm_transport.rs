@@ -92,6 +92,7 @@ mod failed_payment;
 mod inbox;
 mod multiplex;
 mod pointer;
+mod read_ahead;
 mod shared;
 mod upload_adapter;
 use ant_protocol::transport::{client_routing, PeerId};
@@ -2143,6 +2144,7 @@ pub struct BrowserFileReader {
     shared: Rc<crate::data::Client>,
     file: PublicFileDescriptor,
     root_data_map: self_encryption::DataMap,
+    read_ahead: Rc<read_ahead::ReadAhead>,
     closed: Cell<bool>,
 }
 
@@ -2179,7 +2181,14 @@ impl BrowserFileReader {
     /// Release cached encrypted records held for playback read-ahead and seeks.
     pub fn close(&self) {
         self.closed.set(true);
+        self.read_ahead.close();
         self.shared.chunk_cache().clear();
+    }
+}
+
+impl Drop for BrowserFileReader {
+    fn drop(&mut self) {
+        self.read_ahead.close();
     }
 }
 
@@ -2193,9 +2202,15 @@ impl BrowserFileReader {
                 "browser range reads are limited to {MAX_BROWSER_RANGE_BYTES} bytes"
             ));
         }
-        self.shared
-            .data_download_range(&self.root_data_map, start, length)
-            .await
+        let held = self.read_ahead.before_read(start, length).await;
+        let bytes = self
+            .shared
+            .data_download_range_with(&self.root_data_map, start, length, |address| {
+                held.get(address).cloned()
+            })
+            .await;
+        self.read_ahead.after_read(start);
+        bytes
             .map(|bytes| bytes.to_vec())
             .map_err(|error| error.to_string())
     }
@@ -2387,33 +2402,46 @@ impl BrowserNetworkClient {
     }
 
     /// Resolve and validate a public file for random-access range reads.
+    /// A `streaming` reader, such as one serving media playback, treats every
+    /// read as the start of a sequential stream and fetches ahead of it.
     #[wasm_bindgen(js_name = openPublicFile)]
     pub async fn open_public_file(
         &self,
         file: JsValue,
         on_progress: Option<js_sys::Function>,
+        streaming: Option<bool>,
     ) -> Result<BrowserFileReader, JsValue> {
         let file: BrowserPublicFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let progress = ProgressReporter::from_js(on_progress);
-        self.open_file_inner(BrowserFileSource::Public(file), progress)
-            .await
-            .map_err(|error| JsValue::from_str(&error))
+        self.open_file_inner(
+            BrowserFileSource::Public(file),
+            progress,
+            streaming.unwrap_or(false),
+        )
+        .await
+        .map_err(|error| JsValue::from_str(&error))
     }
 
     /// Resolve a private file from its DataMap for random-access range reads.
+    /// `streaming` is as for `openPublicFile`.
     #[wasm_bindgen(js_name = openPrivateFile)]
     pub async fn open_private_file(
         &self,
         file: JsValue,
         on_progress: Option<js_sys::Function>,
+        streaming: Option<bool>,
     ) -> Result<BrowserFileReader, JsValue> {
         let file: BrowserPrivateFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let progress = ProgressReporter::from_js(on_progress);
-        self.open_file_inner(BrowserFileSource::Private(file), progress)
-            .await
-            .map_err(|error| JsValue::from_str(&error))
+        self.open_file_inner(
+            BrowserFileSource::Private(file),
+            progress,
+            streaming.unwrap_or(false),
+        )
+        .await
+        .map_err(|error| JsValue::from_str(&error))
     }
 
     /// Self-encrypt, quote, pay through a wallet callback, and store a public file.
@@ -2610,6 +2638,7 @@ impl BrowserNetworkClient {
         &self,
         source: BrowserFileSource,
         progress: ProgressReporter,
+        streaming: bool,
     ) -> Result<BrowserFileReader, String> {
         let resolved = self.resolve_file(source, &progress).await?;
         let file = resolved.file;
@@ -2619,10 +2648,16 @@ impl BrowserNetworkClient {
             file.size,
             file.chunks.len()
         ));
+        let read_ahead = read_ahead::ReadAhead::new(
+            Rc::clone(&self.shared),
+            &resolved.root_data_map,
+            streaming,
+        )?;
         Ok(BrowserFileReader {
             shared: Rc::clone(&self.shared),
             file,
             root_data_map: resolved.root_data_map,
+            read_ahead,
             closed: Cell::new(false),
         })
     }

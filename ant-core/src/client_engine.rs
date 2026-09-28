@@ -2,6 +2,8 @@
 
 pub(crate) mod files;
 pub(crate) mod read;
+#[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]
+pub(crate) mod read_ahead;
 #[cfg(any(test, not(feature = "native")))]
 pub(crate) mod read_budget;
 
