@@ -1,0 +1,12 @@
+stream-a3-1.log: first frame 17.1s (first range 4.8s), seek resume 12.3s, after-seek waits 2 totalling 1.8s
+stream-a3-2.log: first frame 62.3s (first range 11.2s), seek resume 23.4s, after-seek waits 0 totalling 0.0s
+stream-a3-3.log: first frame 39.2s (first range 14.0s), seek resume 8.1s, after-seek waits 0 totalling 0.0s
+stream-a6-1.log: first frame 16.9s (first range 7.9s), seek resume 3.7s, after-seek waits 0 totalling 0.0s
+stream-a6-2.log: first frame 14.2s (first range 7.2s), seek resume 17.6s, after-seek waits 1 totalling 1.9s
+stream-a6-3.log: first frame 19.0s (first range 10.0s), seek resume 24.0s, after-seek waits 1 totalling 0.1s
+stream-a10-1.log: first frame 20.1s (first range 2.0s), seek resume 11.3s, after-seek waits 1 totalling 12.6s
+stream-a10-2.log: first frame 24.5s (first range 8.3s), seek resume 35.8s, after-seek waits 0 totalling 0.0s
+stream-a10-3.log: first frame 20.5s (first range 7.8s), seek resume 11.2s, after-seek waits 1 totalling 18.9s
+alpha-seek-1.log: first frame 18.3s (first range 9.3s), seek resume 6.4s, after-seek waits 0 totalling 0.0s
+alpha-seek-2.log: first frame 19.3s (first range 10.4s), seek resume 4.0s, after-seek waits 2 totalling 17.6s
+alpha-seek-3.log: first frame 22.4s (first range 14.7s), seek resume 11.0s, after-seek waits 1 totalling 21.2s

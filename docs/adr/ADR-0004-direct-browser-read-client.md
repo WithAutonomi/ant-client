@@ -615,3 +615,22 @@ appeared 16 to 26 seconds after connecting. Both waits are bound by discovery
 latency, which this change does not alter. These mainnet runs used an earlier
 revision that read ahead through the shared chunk cache; repeat them before
 acceptance.
+
+## Browser lookup parallelism (2026-09-29)
+
+Browser lookups query six peers per round instead of the Kademlia default of
+three. Between a third and half of the WebRTC Direct endpoints that mainnet
+lookups dial time out after ten seconds. A round takes its first answer and then
+waits up to the protocol's five-second grace for the rest, so a round of three
+usually paid most of that grace. Read lookups need several rounds, which is why
+cold records took tens of seconds.
+
+On mainnet, cold record reads of the test video took a mean of 11.5 s, with a
+p90 of 29.2 s, at three peers per round. At six they took a mean of 6.1 s, with
+a p90 of 17.2 s. Ten was faster for isolated reads, but during playback, whose
+read-ahead runs several lookups at once, it opened dozens of connections against
+the 64-connection pool and stalled after four of six seeks. A two-second grace
+did not help, because it dropped slow but live responders. The grace period, the
+dial timeout, the lookup termination rules and native lookups are unchanged.
+The method, raw results and scripts are in
+`docs/investigations/2026-09-29-browser-lookup-alpha`.
