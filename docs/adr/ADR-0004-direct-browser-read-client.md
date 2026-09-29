@@ -634,7 +634,9 @@ did not help, because it dropped slow but live responders. The same setting
 applies to upload quoting, whose lookups find and cross-check each record's
 close group. On mainnet, uploads of four records reached the payment request in
 a mean of 120 s instead of 155 s. They opened about 40% more authenticated
-connections. The grace period, the dial timeout, the lookup termination rules
+connections. The same builds on a 2-vCPU cloud machine showed the same result:
+cold reads averaged 6.2 s instead of 8.0 s, and upload quoting 105 s instead of
+161 s. The grace period, the dial timeout, the lookup termination rules
 and native lookups are unchanged.
 The method, raw results and scripts are in
 `docs/investigations/2026-09-29-browser-lookup-alpha`.

@@ -77,6 +77,26 @@ Every upload reached the payment request with quotes for all four records.
 Alpha 6 was about 23% faster, at the cost of about 40% more authenticated
 connections. Quoting remains slow at either alpha, and needs its own investigation.
 
+## Second machine
+
+The runs above used a 32-core Apple M3 Ultra on a home connection. The same
+alpha 3 and 6 builds (identical `.wasm` SHA-256), pages and runners were run on
+a DigitalOcean `s-2vcpu-4gb-amd` droplet in `ams3`, with Ubuntu 24.04 and
+Playwright 1.63.0 Chromium. Raw data is in `results/droplet-*`.
+
+| Machine | alpha | Cold read p50 | p90 | Mean | Reads over 10 s | Upload mean (range) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| M3 Ultra, 32 cores | 3 | 4.1 s | 29.2 s | 11.5 s | 12 of 36 | 155 s (131–184) |
+| M3 Ultra, 32 cores | 6 | 3.5 s | 17.2 s | 6.1 s | 6 of 36 | 120 s (91–137) |
+| Droplet, 2 vCPU | 3 | 4.7 s | 13.9 s | 8.0 s | 9 of 36 | 161 s (132–203) |
+| Droplet, 2 vCPU | 6 | 3.9 s | 14.6 s | 6.2 s | 6 of 36 | 105 s (87–125) |
+
+Alpha 6 also helped on the 2-vCPU machine. The extra concurrency cost no CPU
+headroom there: upload quoting improved by 35%, against 23% on the M3 Ultra.
+Cold reads gained less on the droplet because its alpha 3 tail was already
+shorter, which fits its data-centre network rather than its CPU. No read or
+upload failed on either machine.
+
 ## Decision
 
 Browser lookups use an `alpha` of 6. For cold reads, that roughly halves the
