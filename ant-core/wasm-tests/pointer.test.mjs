@@ -352,3 +352,71 @@ test("a paid state handed to onPaid is stored again without paying", async () =>
     client.close();
   }
 });
+
+test("a transfer hands the address over for good, and reads follow it", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  const recipientSeed = new Uint8Array(32).fill(8);
+  try {
+    const recipient = await client.createPointer(recipientSeed, target(9), "chunk", paymentNetwork, signer.pay);
+    const handed = await client.createPointer(seed, target(1), "chunk", paymentNetwork, signer.pay);
+    const address = handed.pointer.address;
+
+    const written = await client.transferPointer(seed, recipient.pointer.address, paymentNetwork, signer.pay);
+    assert.equal(written.pointer.address, address, "the address readers use does not change");
+    assert.equal(written.pointer.counter, "18446744073709551615", "signed at the final counter");
+    assert.equal(written.pointer.kind, "pointer");
+    assert.equal(written.pointer.target, recipient.pointer.address);
+    assert.equal(signer.calls.length, 3, "the transfer is one paid state");
+
+    const finality = await client.pointerFinality(address);
+    assert.equal(finality.status, "final");
+    assert.equal(finality.states.length, 1);
+    assert.equal(finality.majority.transferredTo, recipient.pointer.address);
+    assert.ok(finality.majority.holders >= 5, "the write reached a majority plus one");
+
+    assert.deepEqual(await client.resolvePointer(address), { kind: "chunk", kindTag: 0, target: target(9) });
+
+    // The recipient moves it; the former owner can move nothing.
+    await client.updatePointer(recipientSeed, target(4), "chunk", paymentNetwork, signer.pay);
+    assert.deepEqual(await client.resolvePointer(address), { kind: "chunk", kindTag: 0, target: target(4) });
+    const paid = signer.calls.length;
+    await assert.rejects(
+      client.updatePointer(seed, target(5), "chunk", paymentNetwork, signer.pay),
+      /pointer is final/,
+    );
+    await assert.rejects(
+      client.transferPointer(seed, target(6), paymentNetwork, signer.pay),
+      /pointer is final/,
+    );
+    assert.equal(signer.calls.length, paid, "nothing is paid for a move a final pointer cannot make");
+  } finally {
+    client.close();
+  }
+});
+
+test("an open pointer reports its counter, and a transfer nowhere is refused before paying", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    const written = await client.createPointer(seed, target(1), "chunk", paymentNetwork, signer.pay);
+    const finality = await client.pointerFinality(written.pointer.address);
+    assert.equal(finality.status, "open");
+    assert.equal(finality.counter, "0");
+    assert.deepEqual(finality.states, []);
+
+    await assert.rejects(
+      client.transferPointer(seed, target(0x42), paymentNetwork, signer.pay),
+      /does not exist/,
+    );
+    await assert.rejects(
+      client.transferPointer(seed, written.pointer.address, paymentNetwork, signer.pay),
+      /to itself/,
+    );
+    assert.equal(signer.calls.length, 1, "only the create was paid for");
+  } finally {
+    client.close();
+  }
+});

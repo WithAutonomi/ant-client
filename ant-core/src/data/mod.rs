@@ -24,7 +24,9 @@ pub use ant_protocol::{compute_address, DataChunk, XorName};
 
 // The pointer record (ADR-0016) and the owner key that signs it, so a caller of
 // the pointer API needs no direct protocol dependency.
-pub use ant_protocol::pointer::{pointer_address, Pointer, PointerTarget, PointerTargetKind};
+pub use ant_protocol::pointer::{
+    pointer_address, Pointer, PointerTarget, PointerTargetKind, FINAL_COUNTER,
+};
 pub use ant_protocol::pqc::api::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
 
 // Re-export client data types
@@ -51,6 +53,7 @@ pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
     DEFAULT_MERKLE_THRESHOLD,
 };
+pub use client::pointer::{FinalState, FinalityStatus, PointerController, PointerFinality};
 
 // Re-export self-encryption types
 pub use self_encryption::DataMap;

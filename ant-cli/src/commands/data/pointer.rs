@@ -3,14 +3,19 @@
 //! A pointer is owned by an ML-DSA-65 key for life, so the key is the one thing
 //! these commands ask the user to keep. It is kept as the 32-byte FIPS 204 seed
 //! the key pair derives from, hex-encoded in a file only its owner can read.
+//!
+//! The key never changes, but what the pointer's address resolves to can be
+//! handed over for good (ADR-0018 in `ant-node`): `transfer` signs the
+//! pointer's final state, pointing at the recipient's pointer, and `finality`
+//! is how the recipient checks it landed before relying on it.
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use ant_core::data::{
-    ml_dsa_65, pointer_address, Client, MlDsaPublicKey, MlDsaSecretKey, Pointer, PointerTarget,
-    PointerTargetKind, XorName,
+    ml_dsa_65, pointer_address, Client, FinalState, FinalityStatus, MlDsaPublicKey, MlDsaSecretKey,
+    Pointer, PointerFinality, PointerTarget, PointerTargetKind, XorName,
 };
 use clap::{Subcommand, ValueEnum};
 use rand::rngs::OsRng;
@@ -28,7 +33,8 @@ const SEED_LEN: usize = 32;
 pub enum TargetKind {
     /// A chunk, such as a file's data map.
     Chunk,
-    /// Another pointer, which is how a pointer is handed over.
+    /// Another pointer. A forwarding its owner can still change; use
+    /// `transfer` to hand a pointer over for good.
     Pointer,
 }
 
@@ -44,7 +50,8 @@ impl From<TargetKind> for PointerTargetKind {
 /// Pointer subcommands.
 #[derive(Subcommand, Debug)]
 pub enum PointerAction {
-    /// Create a new owner key. A pointer's owner can never change, so keep it.
+    /// Create a new owner key. A pointer's owner key can never change, so keep
+    /// it. Use a fresh key for each pointer you receive by transfer.
     Keygen {
         /// File to write the key to. Refuses to overwrite an existing file.
         #[arg(long, short)]
@@ -80,6 +87,36 @@ pub enum PointerAction {
         #[arg(long, value_enum, default_value = "chunk")]
         kind: TargetKind,
     },
+    /// Hand the pointer a key owns over to the pointer at RECIPIENT, for good.
+    /// Pays for the final state.
+    ///
+    /// Readers of the pointer's address are redirected to RECIPIENT, which
+    /// only its owner can move, and this key can change nothing any more. The
+    /// address stays the same. Irreversible once stored.
+    ///
+    /// Refused, before paying, if the pointer is already final, if RECIPIENT
+    /// does not exist, or if RECIPIENT leads back to this pointer.
+    Transfer {
+        /// Owner key file.
+        #[arg(long, short)]
+        key: PathBuf,
+        /// Hex-encoded address of the recipient's pointer (64 hex chars).
+        recipient: String,
+    },
+    /// Ask the whole close group whether a pointer is final, and on what.
+    ///
+    /// Check this before relying on a transfer: only `final` means one final
+    /// state, held by a majority of the group, with no rival.
+    Finality {
+        /// Hex-encoded pointer address (64 hex chars).
+        address: String,
+    },
+    /// Follow a pointer's transfers to the pointer whose owner now decides
+    /// what it resolves to.
+    Controller {
+        /// Hex-encoded pointer address (64 hex chars).
+        address: String,
+    },
     /// Read a pointer.
     Get {
         /// Hex-encoded pointer address (64 hex chars).
@@ -95,7 +132,10 @@ pub enum PointerAction {
 impl PointerAction {
     /// Whether this action pays, and so needs a wallet.
     pub fn needs_wallet(&self) -> bool {
-        matches!(self, Self::Create { .. } | Self::Update { .. })
+        matches!(
+            self,
+            Self::Create { .. } | Self::Update { .. } | Self::Transfer { .. }
+        )
     }
 
     /// Whether this action talks to the network at all.
@@ -160,6 +200,52 @@ impl PointerAction {
                     .map_err(|e| anyhow::anyhow!("Pointer update failed: {e}"))?;
                 print_address(&address, json);
             }
+            Self::Transfer { key, recipient } => {
+                let (owner, secret) = read_key(&key)?;
+                let recipient = parse_address(&recipient)?;
+                info!("Transferring pointer");
+                let finality = client
+                    .pointer_transfer(&secret, &owner, recipient)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Pointer transfer failed: {e}"))?;
+                print_finality(&finality, json);
+            }
+            Self::Finality { address } => {
+                let at = parse_address(&address)?;
+                let finality = client
+                    .pointer_finality(&at)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Pointer finality check failed: {e}"))?;
+                print_finality(&finality, json);
+            }
+            Self::Controller { address } => {
+                let at = parse_address(&address)?;
+                let controller = client
+                    .pointer_controller(&at)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Pointer controller lookup failed: {e}"))?;
+                let pointer = hex::encode(controller.pointer);
+                let transfers: Vec<String> = controller.transfers.iter().map(hex::encode).collect();
+                if json {
+                    println!(
+                        "{}",
+                        json!({
+                            "pointer": pointer,
+                            "transfers": transfers,
+                            "frozen": controller.frozen,
+                        })
+                    );
+                } else {
+                    for hop in &transfers {
+                        println!("transferred to: {hop}");
+                    }
+                    if controller.frozen {
+                        println!("frozen:         {pointer} (final; nobody can move it)");
+                    } else {
+                        println!("controller:     {pointer}");
+                    }
+                }
+            }
             Self::Get { address } => {
                 let at = parse_address(&address)?;
                 let record = client
@@ -222,6 +308,86 @@ fn print_record(record: &Pointer, json: bool) {
         println!("kind:     {kind}");
         println!("target:   {target}");
         println!("state_id: {state}");
+    }
+}
+
+/// One final state as JSON.
+fn final_state_json(state: &FinalState) -> serde_json::Value {
+    let (kind, target) =
+        describe_target(&PointerTarget::from_raw_tag(state.kind_tag, state.target));
+    json!({
+        "state_id": hex::encode(state.state_id),
+        "kind": kind,
+        "target": target,
+        "holders": state.holders,
+        "transferred_to": state.transferred_to().map(hex::encode),
+    })
+}
+
+/// One final state as a line of text.
+fn final_state_line(state: &FinalState, group: usize) -> String {
+    let (kind, target) =
+        describe_target(&PointerTarget::from_raw_tag(state.kind_tag, state.target));
+    let holders = state.holders;
+    let id = hex::encode(state.state_id);
+    format!("{kind} {target} (state {id}, held by {holders} of {group})")
+}
+
+fn print_finality(finality: &PointerFinality, json: bool) {
+    let address = hex::encode(finality.address);
+    let group = finality.group;
+    let answered = finality.answered;
+    if json {
+        let status = match &finality.status {
+            FinalityStatus::Open { counter } => json!({ "status": "open", "counter": counter }),
+            FinalityStatus::Settling(state) => {
+                json!({ "status": "settling", "state": final_state_json(state) })
+            }
+            FinalityStatus::Final(state) => {
+                json!({ "status": "final", "state": final_state_json(state) })
+            }
+            FinalityStatus::Forked { states, majority } => json!({
+                "status": "forked",
+                "states": states.iter().map(final_state_json).collect::<Vec<_>>(),
+                "majority": majority.as_ref().map(final_state_json),
+            }),
+        };
+        println!(
+            "{}",
+            json!({
+                "address": address,
+                "group": group,
+                "answered": answered,
+                "finality": status,
+            })
+        );
+        return;
+    }
+    println!("address:  {address}");
+    println!("answered: {answered} of {group}");
+    match &finality.status {
+        FinalityStatus::Open { counter } => match counter {
+            Some(counter) => println!("status:   open (counter {counter}; its owner can move it)"),
+            None => println!("status:   open (no state held)"),
+        },
+        FinalityStatus::Settling(state) => {
+            println!("status:   settling (final, but not yet on a majority of the group)");
+            println!("state:    {}", final_state_line(state, group));
+        }
+        FinalityStatus::Final(state) => {
+            println!("status:   final");
+            println!("state:    {}", final_state_line(state, group));
+        }
+        FinalityStatus::Forked { states, majority } => {
+            println!("status:   forked (its owner signed more than one final state)");
+            for state in states {
+                println!("state:    {}", final_state_line(state, group));
+            }
+            match majority {
+                Some(state) => println!("reads:    {}", final_state_line(state, group)),
+                None => println!("reads:    fail (no state is held by a majority)"),
+            }
+        }
     }
 }
 
@@ -355,6 +521,12 @@ mod tests {
         assert!(!get.needs_wallet() && get.needs_network());
         let resolve = parse(&["t", "resolve", &target]);
         assert!(!resolve.needs_wallet() && resolve.needs_network());
+        let transfer = parse(&["t", "transfer", "--key", key, &target]);
+        assert!(transfer.needs_wallet() && transfer.needs_network());
+        let finality = parse(&["t", "finality", &target]);
+        assert!(!finality.needs_wallet() && finality.needs_network());
+        let controller = parse(&["t", "controller", &target]);
+        assert!(!controller.needs_wallet() && controller.needs_network());
         let keygen = parse(&["t", "keygen", "--output", key]);
         assert!(!keygen.needs_wallet() && !keygen.needs_network());
         let address = parse(&["t", "address", "--key", key]);

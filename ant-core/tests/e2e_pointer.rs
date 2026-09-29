@@ -35,7 +35,7 @@
 mod support;
 
 use ant_core::data::client::pointer::MAX_POINTER_RESOLVE_DEPTH;
-use ant_core::data::{Client, ClientConfig, Error, XorName};
+use ant_core::data::{Client, ClientConfig, Error, FinalityStatus, XorName};
 use ant_node::storage::AntProtocol;
 use ant_protocol::chunk::{
     ChunkMessage, ChunkMessageBody, PointerGetRequest, PointerGetResponse, PointerPutRequest,
@@ -43,7 +43,7 @@ use ant_protocol::chunk::{
 };
 use ant_protocol::evm::U256;
 use ant_protocol::pointer::{
-    pointer_address, Pointer, PointerTarget, PointerTargetKind, DATA_TYPE_POINTER,
+    pointer_address, Pointer, PointerTarget, PointerTargetKind, DATA_TYPE_POINTER, FINAL_COUNTER,
     POINTER_BODY_LEN, POINTER_WIRE_LEN,
 };
 use ant_protocol::pqc::api::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
@@ -1104,6 +1104,268 @@ async fn an_address_nobody_wrote_reads_as_absent() {
             .is_none(),
         "nothing was ever written here"
     );
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// A transfer hands the address over for good (ADR-0018 in `ant-node`).
+///
+/// Refused before anything is paid when it could not land well: to the
+/// pointer itself, to a pointer nobody created, or to one that leads back.
+/// Once stored, readers of the address are redirected to the recipient's
+/// pointer, which the recipient moves, and the former owner can move nothing:
+/// the client refuses before paying, and a paid final state sent straight to
+/// every node that holds the transfer is refused by each, whichever way its
+/// target sorts.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_transfer_hands_the_address_over_for_good() {
+    let (client, testnet) = setup().await;
+    let (pk, sk) = owner();
+    let (recipient_pk, recipient_sk) = owner();
+
+    let address = client
+        .pointer_create(&sk, &pk, chunk_target(1))
+        .await
+        .expect("create the pointer to hand over");
+    let recipient = client
+        .pointer_create(&recipient_sk, &recipient_pk, chunk_target(2))
+        .await
+        .expect("the recipient creates its own pointer");
+
+    // Refusals that cost nothing.
+    let before = balance(&client).await;
+    let to_itself = client.pointer_transfer(&sk, &pk, address).await;
+    assert!(matches!(to_itself, Err(Error::InvalidData(ref m)) if m.contains("itself")));
+    let nowhere = client.pointer_transfer(&sk, &pk, [0x42; 32]).await;
+    assert!(matches!(nowhere, Err(Error::InvalidData(ref m)) if m.contains("does not exist")));
+    let (loop_pk, loop_sk) = owner();
+    let loops_back = client
+        .pointer_create(
+            &loop_sk,
+            &loop_pk,
+            PointerTarget::new(PointerTargetKind::Pointer, address),
+        )
+        .await
+        .expect("a pointer that forwards back to the one being handed over");
+    let paid_for_loop = balance(&client).await;
+    let cycle = client.pointer_transfer(&sk, &pk, loops_back).await;
+    assert!(matches!(cycle, Err(Error::InvalidData(ref m)) if m.contains("cycle")));
+    assert!(
+        before > paid_for_loop,
+        "only the forwarding pointer was paid for"
+    );
+    assert_eq!(
+        balance(&client).await,
+        paid_for_loop,
+        "no refused transfer settles a payment"
+    );
+
+    // The transfer itself.
+    let finality = client
+        .pointer_transfer(&sk, &pk, recipient)
+        .await
+        .expect("the transfer lands");
+    assert!(
+        balance(&client).await < paid_for_loop,
+        "a transfer is paid for"
+    );
+    assert_eq!(finality.address, address);
+    assert!(finality.is_final(), "got {:?}", finality.status);
+    assert_eq!(finality.transferred_to(), Some(recipient));
+
+    let held = client
+        .pointer_get(&address)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(held.counter(), FINAL_COUNTER);
+    assert_eq!(held.transferred_to(), Some(recipient));
+
+    // Readers follow it; the recipient moves it.
+    assert_eq!(
+        client.pointer_resolve(&address).await.expect("resolve"),
+        chunk_target(2)
+    );
+    client
+        .pointer_update(&recipient_sk, &recipient_pk, chunk_target(3))
+        .await
+        .expect("the recipient updates its own pointer");
+    assert_eq!(
+        client.pointer_resolve(&address).await.expect("resolve"),
+        chunk_target(3),
+        "the recipient now decides what the address resolves to"
+    );
+    let controller = client
+        .pointer_controller(&address)
+        .await
+        .expect("controller");
+    assert_eq!(controller.pointer, recipient);
+    assert_eq!(controller.transfers, vec![recipient]);
+    assert!(!controller.frozen);
+
+    // The former owner, through the client: refused before paying.
+    let before = balance(&client).await;
+    let update = client.pointer_update(&sk, &pk, chunk_target(4)).await;
+    assert!(
+        matches!(update, Err(Error::PointerFinal(_))),
+        "got {update:?}"
+    );
+    let again = client.pointer_transfer(&sk, &pk, loops_back).await;
+    assert!(
+        matches!(again, Err(Error::PointerFinal(_))),
+        "got {again:?}"
+    );
+    assert_eq!(balance(&client).await, before, "nothing was paid");
+
+    // The former owner, around the client: a paid final state whose target
+    // sorts first, sent to every node that holds the transfer.
+    let group = close_group(&client, &testnet, &address).await;
+    let take_back = Pointer::sign(
+        &sk,
+        &pk,
+        FINAL_COUNTER,
+        PointerTarget::new(PointerTargetKind::Chunk, [0; 32]),
+    )
+    .expect("sign");
+    assert!(take_back.target().to_bytes() < held.target().to_bytes());
+    let request = paid(&client, &take_back).await;
+    let mut refused = 0;
+    for member in &group {
+        let holds_transfer = held_by(&member.protocol, &address)
+            .await
+            .is_some_and(|record| record.state_id() == held.state_id());
+        if !holds_transfer {
+            continue;
+        }
+        match put_over_quic(&client, member, request.clone()).await {
+            PointerPutResponse::Stale { state_id, .. } => {
+                assert_eq!(state_id, held.state_id(), "the refusal names the transfer");
+                refused += 1;
+            }
+            other => panic!("a node holding the transfer took another final state: {other:?}"),
+        }
+    }
+    assert!(
+        refused >= 5,
+        "the transfer reached a write quorum ({refused})"
+    );
+    assert_group_unchanged(&client, &address, &group).await;
+    assert_eq!(
+        client
+            .pointer_get(&address)
+            .await
+            .expect("get")
+            .expect("present")
+            .state_id(),
+        held.state_id()
+    );
+    assert!(client
+        .pointer_finality(&address)
+        .await
+        .expect("finality")
+        .is_final());
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// The one fork a final state allows: the owner signs two and races them to
+/// different nodes, each of which keeps what it took first. With a majority
+/// on one side, reads return it and the finality check reports the fork; with
+/// no majority, reads fail as forked rather than pick a side, and the client
+/// will not build on either.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_raced_final_state_is_read_by_its_majority_or_reported_as_forked() {
+    let (client, testnet) = setup().await;
+
+    // Four against three: the four win every read.
+    let (pk, sk) = owner();
+    let address = pointer_address(&pk);
+    let group = close_group(&client, &testnet, &address).await;
+    let created = Pointer::create(&sk, &pk, chunk_target(1)).expect("sign");
+    client.pointer_put(&created).await.expect("create");
+    let majority = Pointer::sign(&sk, &pk, FINAL_COUNTER, chunk_target(9)).expect("sign");
+    let minority = Pointer::sign(&sk, &pk, FINAL_COUNTER, chunk_target(2)).expect("sign");
+    let (four, three) = group.split_at(4);
+    store_on(&client, four, &majority).await;
+    store_on(&client, three, &minority).await;
+    assert_held(four, &majority).await;
+    assert_held(three, &minority).await;
+    assert_group_unchanged(&client, &address, &group).await;
+
+    for _ in 0..3 {
+        let read = client
+            .pointer_get(&address)
+            .await
+            .expect("a majority answers")
+            .expect("present");
+        assert_eq!(
+            read.state_id(),
+            majority.state_id(),
+            "the majority wins even though the minority's target sorts first"
+        );
+    }
+    match client
+        .pointer_finality(&address)
+        .await
+        .expect("finality")
+        .status
+    {
+        FinalityStatus::Forked {
+            states,
+            majority: held,
+        } => {
+            assert_eq!(states.len(), 2);
+            assert_eq!(held.map(|s| s.state_id), Some(majority.state_id()));
+        }
+        other => panic!("expected the fork to be reported, got {other:?}"),
+    }
+
+    // Three against three, one left behind: no answer.
+    let (pk, sk) = owner();
+    let address = pointer_address(&pk);
+    let group = close_group(&client, &testnet, &address).await;
+    let created = Pointer::create(&sk, &pk, chunk_target(1)).expect("sign");
+    client.pointer_put(&created).await.expect("create");
+    let one = Pointer::sign(&sk, &pk, FINAL_COUNTER, chunk_target(7)).expect("sign");
+    let other = Pointer::sign(&sk, &pk, FINAL_COUNTER, chunk_target(8)).expect("sign");
+    let (first, rest) = group.split_at(3);
+    let (second, _behind) = rest.split_at(3);
+    store_on(&client, first, &one).await;
+    store_on(&client, second, &other).await;
+    assert_group_unchanged(&client, &address, &group).await;
+
+    let read = client.pointer_get(&address).await;
+    assert!(matches!(read, Err(Error::PointerForked(_))), "got {read:?}");
+    match client
+        .pointer_finality(&address)
+        .await
+        .expect("finality")
+        .status
+    {
+        FinalityStatus::Forked { states, majority } => {
+            assert_eq!(states.len(), 2);
+            assert!(majority.is_none());
+        }
+        other => panic!("expected a fork with no majority, got {other:?}"),
+    }
+    let before = balance(&client).await;
+    let (recipient_pk, recipient_sk) = owner();
+    let recipient = client
+        .pointer_create(&recipient_sk, &recipient_pk, chunk_target(3))
+        .await
+        .expect("recipient");
+    let paid_recipient = balance(&client).await;
+    assert!(paid_recipient < before);
+    let transfer = client.pointer_transfer(&sk, &pk, recipient).await;
+    assert!(
+        matches!(transfer, Err(Error::PointerForked(_))),
+        "got {transfer:?}"
+    );
+    assert_eq!(balance(&client).await, paid_recipient, "nothing was paid");
 
     drop(client);
     testnet.teardown().await;

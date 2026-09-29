@@ -78,7 +78,9 @@ corroboration and write quorum, and pay each state through the same wallet
 callback file uploads take. The owner key is passed as its 32-byte seed. Only
 nodes that advertise `pointer_protocol` are asked. A write can hand the paid
 record and proof to an `onPaid` callback; `storePaidPointer` stores them later
-without paying again.
+without paying again. `transferPointer` hands a pointer over for good and
+`pointerFinality` asks the whole close group whether it is final (see
+`ant pointer transfer` below).
 
 Browser protocol v5 and browser manifest v6 advertise only the payment chain ID
 and token/vault addresses. RPC providers belong to the application or wallet;
@@ -309,6 +311,11 @@ owner key is kept as a 32-byte seed in a file only its owner can read (`0600`
 on Unix; on Windows it takes its directory's permissions, so keep it in your
 user profile). Losing it means the pointer can never be updated again.
 
+The key cannot change hands, but the pointer can: `ant pointer transfer` signs
+its final state, pointing at a pointer the new owner holds the key to. Readers
+of the address are redirected there, the address stays the same, and the
+former owner's key can change nothing any more (ADR-0018 in `ant-node`).
+
 #### `ant pointer keygen --output <FILE>`
 
 Create a new owner key and print the address of the pointer it controls. Never
@@ -350,6 +357,38 @@ state_id: 5e7d...
 #### `ant pointer resolve <ADDRESS>`
 
 Follow a chain of pointers to the target at its end.
+
+#### `ant pointer transfer --key <FILE> <RECIPIENT>`
+
+Hand the pointer over for good to the pointer at `RECIPIENT` (hex), which the
+new owner creates first, with a fresh key for each pointer they receive.
+Requires `SECRET_KEY` to pay for the final state. Refused before paying if the
+pointer is already final, or if `RECIPIENT` does not exist or leads back to
+this pointer. Irreversible once stored. Prints the result of `finality`.
+
+#### `ant pointer finality <ADDRESS>`
+
+Ask every peer of the close group whether a pointer is final, and on what:
+
+- `open` — not final; its owner can still move it.
+- `settling` — one final state, not yet on a majority of the group.
+- `final` — one final state, held by a majority, with no rival. The only
+  status to rely on before treating a transfer as done.
+- `forked` — its owner signed more than one final state. Reads return the one a
+  majority holds, or fail if none does.
+
+```
+$ ant pointer finality 9f3c...
+address:  9f3c...
+answered: 7 of 7
+status:   final
+state:    pointer 4b1e... (state 77a0..., held by 7 of 7)
+```
+
+#### `ant pointer controller <ADDRESS>`
+
+Follow a pointer's transfers to the pointer whose owner now decides what it
+resolves to.
 
 ### `ant wallet` — Wallet Operations
 
