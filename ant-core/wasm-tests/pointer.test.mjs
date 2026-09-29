@@ -189,6 +189,59 @@ test("creating a pointer that exists is refused before anything is paid", async 
   }
 });
 
+test("one peer claiming the pointer moved on does not end a paid write", async () => {
+  // A newer state for the same owner, signed and paid for elsewhere.
+  const elsewhere = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const other = new BrowserNetworkClient(elsewhere.endpoints);
+  let newer;
+  try {
+    await other.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay);
+    await other.updatePointer(seed, target(2), "chunk", paymentNetwork, wallet().pay,
+      value => { newer = value.record; });
+  } finally {
+    other.close();
+  }
+
+  const nodes = Array.from({ length: 7 }, () => ({}));
+  const rtc = mockWebRtc(nodes);
+  let paid;
+  const first = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    await first.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
+      value => { paid = value; });
+  } finally {
+    first.close();
+  }
+
+  // One node now claims the newer state and two cannot be reached, so four
+  // hold the paid state: one short of a write quorum.
+  rtc.stores[0].set(`pointer:${pointerAddress(seed)}`, newer);
+  nodes[5].connectError = "unreachable";
+  nodes[6].connectError = "unreachable";
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    await assert.rejects(
+      client.storePaidPointer(paid.record, paid.proof, paymentNetwork),
+      error => /stored on 4 of 5/.test(String(error)) && !/moved/.test(String(error)),
+      "one peer's word is a shortfall to retry, not a final answer",
+    );
+  } finally {
+    client.close();
+  }
+
+  // Once the group really holds the newer state, the write ends at once.
+  for (let i = 0; i < 5; i += 1) rtc.stores[i].set(`pointer:${pointerAddress(seed)}`, newer);
+  const again = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    await assert.rejects(
+      again.storePaidPointer(paid.record, paid.proof, paymentNetwork),
+      /moved while this update was in flight/,
+    );
+  } finally {
+    again.close();
+  }
+});
+
 test("a paid state handed to onPaid is stored again without paying", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
   const client = new BrowserNetworkClient(rtc.endpoints);

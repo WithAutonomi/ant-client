@@ -83,6 +83,18 @@ fn corroboration(peers: usize) -> usize {
     peers.min(2)
 }
 
+/// How many members the quorums of an operation on `found` peers are counted
+/// over: the configured close group, however few a lookup returned.
+///
+/// A lookup can come back short, while a node's view is thin or the network
+/// churns. Counting quorums over what it returned would shrink them with it:
+/// one returned peer would make a write of one copy complete, and a read that
+/// one peer answers would need no second peer to agree. Counted over the whole
+/// group, a short lookup is a shortfall instead.
+fn quorum_width(found: usize, close_group_size: usize) -> usize {
+    found.max(close_group_size)
+}
+
 /// The outcome of asking a close group.
 struct Answered {
     /// How many peers gave a usable answer.
@@ -231,6 +243,59 @@ async fn collect_read(
     (answered, replies)
 }
 
+/// What one peer's acknowledgement of a pointer PUT says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PutAck {
+    /// It holds the state that was sent.
+    Stored,
+    /// It holds a state it says beats the one sent. That is one peer's word,
+    /// not a verified record, so a write stops for it only once a read
+    /// confirms the pointer has moved on.
+    Stale,
+}
+
+/// Whether one round of a pointer write stored it, from what came back.
+///
+/// `stored` peers hold the record, `wanted` is the write quorum, and `moved`
+/// says a read confirmed the network holds a state that replaces it.
+///
+/// A refusal ends the write only when no peer stored the record. Once any
+/// peer has taken the same proof, one peer refusing it is that peer's
+/// problem, and the round is a shortfall to retry with the proof already
+/// paid for, rather than a final answer that throws the payment away.
+fn judge_write(
+    address: &XorName,
+    stored: usize,
+    wanted: usize,
+    moved: bool,
+    answered: Answered,
+) -> Result<()> {
+    if stored >= wanted {
+        return Ok(());
+    }
+    if moved {
+        return Err(Error::InvalidData(format!(
+            "the pointer {} moved while this update was in flight; the network now \
+             holds a newer state",
+            hex::encode(address)
+        )));
+    }
+    if stored == 0 {
+        if let Some(refusal) = answered.refusal {
+            return Err(refusal);
+        }
+    }
+    if answered.count > 0 {
+        return Err(Error::CloseGroupShortfall(format!(
+            "pointer {} stored on {stored} of {wanted} close-group peers",
+            hex::encode(address)
+        )));
+    }
+    Err(answered
+        .failure()
+        .unwrap_or_else(|| Error::Protocol("no close-group peer accepted the pointer".to_string())))
+}
+
 /// Whether a pointer write that failed this way may succeed if tried again
 /// with the same proof: a shortfall or an unreachable group, not a refusal.
 fn worth_retrying(error: &Error) -> bool {
@@ -256,7 +321,7 @@ fn read_put_reply(
     body: ChunkMessageBody,
     expected_address: XorName,
     expected_state: XorName,
-) -> Option<Result<()>> {
+) -> Option<Result<PutAck>> {
     let ChunkMessageBody::PointerPutResponse(response) = body else {
         return None;
     };
@@ -266,7 +331,7 @@ fn read_put_reply(
         PointerPutResponse::Success { address, state_id }
         | PointerPutResponse::Unchanged { address, state_id } => {
             if address == expected_address && state_id == expected_state {
-                Ok(())
+                Ok(PutAck::Stored)
             } else {
                 Err(Error::InvalidData(format!(
                     "peer acknowledged a pointer this client did not send: address {} state {}",
@@ -278,20 +343,15 @@ fn read_put_reply(
         // Every reply names the address it is about, and every one of them is
         // checked against the address that was sent. A refusal is not exempt:
         // one about some other pointer says nothing about this write.
-        PointerPutResponse::Stale { address, state_id } => {
-            Err(Error::InvalidData(if address == expected_address {
-                format!(
-                    "the pointer moved while this update was in flight; the network \
-                     now holds state {}",
-                    hex::encode(state_id)
-                )
-            } else {
-                format!(
-                    "peer refused a pointer this client did not send: address {}",
-                    hex::encode(address)
-                )
-            }))
+        // A claim, about this pointer, that it has moved on. Whether it has
+        // is for a read to confirm (see [`judge_write`]).
+        PointerPutResponse::Stale { address, .. } if address == expected_address => {
+            Ok(PutAck::Stale)
         }
+        PointerPutResponse::Stale { address, .. } => Err(Error::InvalidData(format!(
+            "peer refused a pointer this client did not send: address {}",
+            hex::encode(address)
+        ))),
         PointerPutResponse::PaymentRequired { message } => Err(Error::Payment(message)),
         PointerPutResponse::Error(e) => Err(Error::Protocol(format!("pointer PUT refused: {e}"))),
     })
@@ -535,7 +595,14 @@ impl Client {
         // never asked. The lookup above answered whether there was anywhere to
         // store this — this one answers where.
         let targets = self.pointer_group(&address).await?;
-        let wanted = write_quorum(targets.len());
+        let wanted = write_quorum(quorum_width(targets.len(), self.config().close_group_size));
+        if targets.len() < wanted {
+            return Err(Error::CloseGroupShortfall(format!(
+                "found {} close-group peers for pointer {}, and a write needs {wanted}",
+                targets.len(),
+                hex::encode(address)
+            )));
+        }
 
         let request =
             PointerPutRequest::with_payment(Bytes::from(record.to_bytes()), proof.to_vec());
@@ -551,26 +618,28 @@ impl Client {
             ));
         }
 
-        let answered = ask_the_group(in_flight, wanted, |()| true).await;
-        if answered.count >= wanted {
-            return Ok(address);
-        }
-        // A peer that refused — a newer state won, the payment was refused, an
-        // acknowledgement named another record — is the answer, and is not
-        // retried. Only a group that did not answer is a shortfall.
-        if let Some(refusal) = answered.refusal {
-            return Err(refusal);
-        }
-        if answered.count > 0 {
-            return Err(Error::CloseGroupShortfall(format!(
-                "pointer {} stored on {} of {wanted} close-group peers",
-                hex::encode(address),
-                answered.count
-            )));
-        }
-        Err(answered.failure().unwrap_or_else(|| {
-            Error::Protocol("no close-group peer accepted the pointer".to_string())
-        }))
+        let (mut stored, mut stale) = (0usize, 0usize);
+        let answered = ask_the_group(in_flight, wanted, |ack| {
+            match ack {
+                PutAck::Stored => stored += 1,
+                PutAck::Stale => stale += 1,
+            }
+            stored >= wanted
+        })
+        .await;
+        // Only a peer's word says the pointer moved on, so a read decides it
+        // before the write is abandoned.
+        let moved = stored < wanted && stale > 0 && self.moved_past(record).await;
+        judge_write(&address, stored, wanted, moved, answered).map(|()| address)
+    }
+
+    /// Whether the network has moved past `record`: a read returns a state
+    /// that replaces it. A read that fails says nothing, and counts as no.
+    async fn moved_past(&self, record: &Pointer) -> bool {
+        matches!(
+            self.pointer_get(&record.address()).await,
+            Ok(Some(current)) if current.replaces(record)
+        )
     }
 
     /// The peers a pointer write must land on and a read must ask.
@@ -617,7 +686,17 @@ impl Client {
         address: &XorName,
     ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
         let group = self.pointer_group(address).await?;
-        let wanted = write_quorum(group.len());
+        let wanted = write_quorum(quorum_width(group.len(), self.config().close_group_size));
+        // Too few found to reach a write quorum is a shortfall, whatever they
+        // would say: no need to ask them.
+        if group.len() < wanted {
+            return Err(Error::CloseGroupShortfall(format!(
+                "found {} close-group peers for pointer {}, and a write needs {wanted}; \
+                 nothing was paid",
+                group.len(),
+                hex::encode(address)
+            )));
+        }
         let mut asked: FuturesUnordered<_> = group
             .iter()
             .map(|(peer, addrs)| self.network().accepts_pointer_writes(peer, addrs))
@@ -680,9 +759,10 @@ impl Client {
             in_flight.push(self.send_pointer_get(*address, *peer_id, addrs.clone()));
         }
 
-        let wanted = read_quorum(peers.len());
-        let needed = corroboration(peers.len());
-        let (answered, replies) = collect_read(in_flight, peers.len()).await;
+        let width = quorum_width(peers.len(), self.config().close_group_size);
+        let wanted = read_quorum(width);
+        let needed = corroboration(width);
+        let (answered, replies) = collect_read(in_flight, width).await;
         let corroborated = replies.corroborated(needed).cloned();
 
         if answered.count == 0 {
@@ -774,7 +854,7 @@ impl Client {
         peer_addrs: Vec<MultiAddr>,
         expected_address: XorName,
         expected_state: XorName,
-    ) -> Result<()> {
+    ) -> Result<PutAck> {
         let request_id = self.next_request_id();
         let message = ChunkMessage {
             request_id,
@@ -1018,7 +1098,7 @@ mod tests {
                 state_id: sent.state_id(),
             },
         ] {
-            assert!(judged(honest).is_ok());
+            assert!(matches!(judged(honest), Ok(PutAck::Stored)));
         }
 
         for lie in [
@@ -1050,8 +1130,65 @@ mod tests {
                 message: "pay up".to_string(),
             },
         ] {
-            assert!(judged(lie).is_err(), "this must not count as stored");
+            assert!(
+                !matches!(judged(lie), Ok(PutAck::Stored)),
+                "this must not count as stored"
+            );
         }
+    }
+
+    /// A lookup that comes back short does not shrink the quorums: they are
+    /// counted over the configured group, so one returned peer can neither
+    /// complete a write nor decide a read.
+    #[test]
+    fn a_short_lookup_is_a_shortfall_not_a_smaller_quorum() {
+        let width = quorum_width(1, 7);
+        assert_eq!(write_quorum(width), 5, "a write still needs five copies");
+        assert_eq!(read_quorum(width), 4, "a read still needs four answers");
+        assert_eq!(corroboration(width), 2, "and two peers naming its state");
+        assert_eq!(quorum_width(9, 7), 9, "a wider lookup is counted as it is");
+    }
+
+    fn answered(count: usize, refusal: Option<Error>) -> Answered {
+        Answered {
+            count,
+            last_error: None,
+            refusal,
+        }
+    }
+
+    /// One peer's word cannot throw a paid write away. Four peers stored it and
+    /// one claims the pointer moved on: unless a read confirms that, the round
+    /// is a shortfall, retried with the proof already paid for.
+    #[test]
+    fn one_peer_cannot_end_a_paid_write_that_others_stored() {
+        let address = [7u8; 32];
+        let refused = || Some(Error::Payment("pay up".to_string()));
+
+        let unconfirmed = judge_write(&address, 4, 5, false, answered(5, None));
+        assert!(
+            matches!(&unconfirmed, Err(e) if worth_retrying(e)),
+            "a claim nobody confirmed is a shortfall, got {unconfirmed:?}"
+        );
+        let refused_after_stores = judge_write(&address, 2, 5, false, answered(3, refused()));
+        assert!(
+            matches!(&refused_after_stores, Err(e) if worth_retrying(e)),
+            "a refusal after others took the proof is retried, got {refused_after_stores:?}"
+        );
+
+        let confirmed = judge_write(&address, 4, 5, true, answered(5, None));
+        assert!(
+            matches!(&confirmed, Err(e) if !worth_retrying(e)),
+            "a move a read confirmed is final, got {confirmed:?}"
+        );
+        assert!(
+            matches!(
+                judge_write(&address, 0, 5, false, answered(1, refused())),
+                Err(Error::Payment(_))
+            ),
+            "a refusal nobody contradicted is the answer"
+        );
+        assert!(judge_write(&address, 5, 5, false, answered(5, None)).is_ok());
     }
 
     /// Tally some replies and ask what the group's answer is.
