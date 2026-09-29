@@ -60,10 +60,28 @@ Playback read-ahead runs several lookups at once, so alpha 10 opens dozens of
 WebRTC connections together against a 64-connection pool. It waited 12 to 21
 seconds after four of six seeks. Alpha 6 never waited more than two seconds.
 
+## Upload quoting
+
+`run-uploads.mjs` uploads 8 MB of random content, which is four records, in
+single-node payment mode. It stops at the payment request and declines to pay,
+so nothing is stored or paid for. This covers the upload's lookups and quote
+collection. Two uploads ran per fresh page, with the variants interleaved over
+three rounds.
+
+| alpha | Uploads | Time to payment request | Median | Mean | Dials ok / failed |
+| ---: | ---: | --- | ---: | ---: | --- |
+| 3 | 6 | 131, 142, 146, 156, 173, 184 s | 156 s | 155 s | 1215 / 1067 |
+| 6 | 6 | 91, 108, 119, 131, 136, 137 s | 131 s | 120 s | 1712 / 1242 |
+
+Every upload reached the payment request with quotes for all four records.
+Alpha 6 was about 23% faster, at the cost of about 40% more authenticated
+connections. Quoting remains slow at either alpha, and needs its own investigation.
+
 ## Decision
 
 Browser lookups use an `alpha` of 6. For cold reads, that roughly halves the
-mean read time and the p90 relative to 3. It gave the steadiest first frame
+mean read time and the p90 relative to 3. It also shortened upload quoting by
+about a quarter. It gave the steadiest first frame
 during playback without the contention seen at 10. The grace period stays at the
 protocol's 5 seconds. Seek resume time remains variable at every alpha and is
 bound by how quickly a new region's holders are found.
