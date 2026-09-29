@@ -186,6 +186,49 @@ impl Replies {
     fn any(&self) -> bool {
         !self.seen.is_empty()
     }
+
+    /// Whether what has been heard settles the read.
+    ///
+    /// Answers alone settle a read that found nothing. A state is settled only
+    /// once enough peers have named it: until then the read keeps asking,
+    /// because the peers that would confirm it may simply not have answered yet.
+    ///
+    /// Nor is it settled while a state that would replace it has been named
+    /// by too few. The write and read quorums overlap in two peers, not two
+    /// honest ones: after a write that reached a bare write quorum, the peers
+    /// it missed hold the older state, and one more peer replaying that state
+    /// corroborates it before a second holder of the newer state has
+    /// answered. So the read waits for the rest of the group before letting
+    /// the older state stand. The newer state still has to be corroborated to
+    /// be returned, so no single peer decides the answer; one that names a
+    /// state nobody else holds only makes the read ask everyone.
+    fn settled(&self, needed: usize) -> bool {
+        match self.corroborated(needed) {
+            None => !self.any(),
+            Some(best) => !self
+                .seen
+                .iter()
+                .any(|(record, count)| *count < needed && record.replaces(best)),
+        }
+    }
+}
+
+/// Ask a close group of `peers` for a pointer, tallying the states they name.
+///
+/// Ends once a read quorum has answered and the tally is settled (see
+/// [`Replies::settled`]), or when the group is exhausted.
+async fn collect_read(
+    in_flight: FuturesUnordered<impl Future<Output = Result<Option<Pointer>>>>,
+    peers: usize,
+) -> (Answered, Replies) {
+    let needed = corroboration(peers);
+    let mut replies = Replies::default();
+    let answered = ask_the_group(in_flight, read_quorum(peers), |found| {
+        replies.add(found);
+        replies.settled(needed)
+    })
+    .await;
+    (answered, replies)
 }
 
 /// Whether a pointer write that failed this way may succeed if tried again
@@ -403,11 +446,12 @@ impl Client {
         let address = record.address();
         let state_id = record.state_id();
 
-        // Refuse before paying if nobody is responsible for this address.
-        // There is no sense buying storage with nowhere to put it, and a
-        // quorum of nothing would otherwise be satisfied by nothing — a paid
-        // write reported as stored on zero peers.
-        self.pointer_group(&address).await?;
+        // Refuse before paying if nobody is responsible for this address, or
+        // too few of those who are can take the write. There is no sense
+        // buying storage with nowhere to put it, and a quorum of nothing would
+        // otherwise be satisfied by nothing — a paid write reported as stored
+        // on zero peers.
+        self.pointer_write_group(&address).await?;
 
         // The quote names the state; the peers that may issue it are the close
         // group around the address. One payment, one state.
@@ -435,7 +479,7 @@ impl Client {
     pub async fn prepare_pointer_payment(&self, record: &Pointer) -> Result<ChunkPaymentPlan> {
         let address = record.address();
         // As for a wallet payment: nothing is quoted with nowhere to store it.
-        self.pointer_group(&address).await?;
+        self.pointer_write_group(&address).await?;
         self.prepare_payment_plan_split(
             &address,
             &record.state_id(),
@@ -558,6 +602,52 @@ impl Client {
         Ok(peers)
     }
 
+    /// The close group a write of `address` goes to, refused before anything
+    /// is quoted or paid if too few of it would take the write.
+    ///
+    /// While nodes are being upgraded some of a close group may not store
+    /// pointers yet. A browser can tell which from what each node advertises,
+    /// and a write that fewer than a write quorum would take is otherwise paid
+    /// for and then falls short. Only a node that says it would refuse counts
+    /// against the write: one that cannot be asked in time might still take
+    /// it, and the write finds out, as it did before. A native client cannot
+    /// tell at all, and its write finds out as before.
+    async fn pointer_write_group(
+        &self,
+        address: &XorName,
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
+        let group = self.pointer_group(address).await?;
+        let wanted = write_quorum(group.len());
+        let mut asked: FuturesUnordered<_> = group
+            .iter()
+            .map(|(peer, addrs)| self.network().accepts_pointer_writes(peer, addrs))
+            .collect();
+        let (mut taking, mut refusing) = (0usize, 0usize);
+        while let Some(answer) = asked.next().await {
+            match answer {
+                Some(true) => taking += 1,
+                Some(false) => refusing += 1,
+                None => {}
+            }
+            if taking >= wanted {
+                break;
+            }
+            if group.len().saturating_sub(refusing) < wanted {
+                return Err(Error::InsufficientPeers(format!(
+                    "{refusing} of the {} close-group peers for pointer {} do not accept \
+                     pointer writes, so a write cannot reach the {wanted} it needs; nothing \
+                     was paid",
+                    group.len(),
+                    hex::encode(address)
+                )));
+            }
+        }
+        // Enough would take it, or too few could be asked to be sure it
+        // cannot land. Probes still out are dropped, which cancels them.
+        drop(asked);
+        Ok(group)
+    }
+
     /// Read the pointer at `address`, verifying it before returning it.
     ///
     /// The record is checked against the address it was asked for, so a storer
@@ -580,7 +670,11 @@ impl Client {
         // What it must not be able to do is decide the answer alone: any peer
         // may legitimately hold a stale record, so taking the first reply would
         // let one pin a reader to it. Asking concurrently also means one slow
-        // peer cannot stall the read behind the store timeout.
+        // peer cannot stall a read whose answer is settled. One that is not,
+        // because a newer state has been named but not yet confirmed, waits
+        // for the rest of the group, each request within its own deadline:
+        // that is what an update in flight costs a reader, and all a peer
+        // naming a state nobody else holds can cost it.
         let in_flight = FuturesUnordered::new();
         for (peer_id, addrs) in &peers {
             in_flight.push(self.send_pointer_get(*address, *peer_id, addrs.clone()));
@@ -588,16 +682,7 @@ impl Client {
 
         let wanted = read_quorum(peers.len());
         let needed = corroboration(peers.len());
-        let mut replies = Replies::default();
-        let answered = ask_the_group(in_flight, wanted, |found| {
-            replies.add(found);
-            // Answers alone settle a read that found nothing. A state is
-            // settled only once enough peers have named it — until then the
-            // read keeps asking, because the peers that would confirm it may
-            // simply not have answered yet.
-            !replies.any() || replies.corroborated(needed).is_some()
-        })
-        .await;
+        let (answered, replies) = collect_read(in_flight, peers.len()).await;
         let corroborated = replies.corroborated(needed).cloned();
 
         if answered.count == 0 {
@@ -1057,6 +1142,88 @@ mod tests {
         assert_eq!(
             seen.corroborated(2).expect("an answer").state_id(),
             singleton.state_id()
+        );
+    }
+
+    /// Replies that arrive in the order given, one every ten milliseconds.
+    fn arriving(
+        replies: Vec<Result<Option<Pointer>>>,
+    ) -> FuturesUnordered<BoxFuture<'static, Result<Option<Pointer>>>> {
+        let in_flight: FuturesUnordered<BoxFuture<'static, Result<Option<Pointer>>>> =
+            FuturesUnordered::new();
+        for (at, reply) in (1u64..).zip(replies) {
+            in_flight.push(Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10 * at)).await;
+                reply
+            }));
+        }
+        in_flight
+    }
+
+    /// A write that reached five of seven peers must read back, even when one
+    /// peer replays the older record it replaced.
+    ///
+    /// The two peers the write missed still hold the older state, honestly,
+    /// and the replaying peer makes three. If those three answer first, the
+    /// older state is corroborated after four answers while the newer one has
+    /// been named once. Stopping there hands back the state the write replaced
+    /// while four peers hold the new one, so the read keeps asking until the
+    /// newer state is corroborated or the group is exhausted. A newer state
+    /// nobody corroborates still never wins.
+    #[tokio::test(start_paused = true)]
+    async fn a_replayed_older_state_cannot_end_a_read_before_the_newer_one_is_heard() {
+        let (pk, sk) = keypair(13);
+        let old = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let new = old.update(&sk, chunk_target(2)).expect("update");
+        let old_reply = || Ok(Some(old.clone()));
+        let new_reply = || Ok(Some(new.clone()));
+
+        let (answered, replies) = collect_read(
+            arriving(vec![
+                old_reply(),
+                old_reply(),
+                old_reply(),
+                new_reply(),
+                new_reply(),
+                new_reply(),
+                new_reply(),
+            ]),
+            7,
+        )
+        .await;
+        assert_eq!(
+            replies
+                .corroborated(corroboration(7))
+                .expect("an answer")
+                .state_id(),
+            new.state_id(),
+            "the state the write stored is the answer ({} answered)",
+            answered.count
+        );
+
+        // When nobody else confirms the newer state, it is still one peer's
+        // word, and the group's answer stands, only later.
+        let (answered, replies) = collect_read(
+            arriving(vec![
+                old_reply(),
+                old_reply(),
+                old_reply(),
+                new_reply(),
+                Err(Error::Timeout("gone".to_string())),
+                Err(Error::Timeout("gone".to_string())),
+                Err(Error::Timeout("gone".to_string())),
+            ]),
+            7,
+        )
+        .await;
+        assert_eq!(answered.count, 4);
+        assert_eq!(
+            replies
+                .corroborated(corroboration(7))
+                .expect("an answer")
+                .state_id(),
+            old.state_id(),
+            "a newer state one peer names never wins"
         );
     }
 

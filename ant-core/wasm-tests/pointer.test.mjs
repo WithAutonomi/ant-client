@@ -119,6 +119,40 @@ test("a node that does not advertise pointers is never sent one", async () => {
   }
 });
 
+test("a write too few peers can accept is refused before anything is paid", async () => {
+  // Mid-rollout: four of the seven advertise pointers, and a write needs five.
+  const rtc = mockWebRtc(Array.from({ length: 7 }, (_, i) => ({ pointers: i >= 3 })));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    await assert.rejects(
+      client.createPointer(seed, target(1), "chunk", paymentNetwork, signer.pay),
+      /accept pointer writes/,
+    );
+    await assert.rejects(
+      client.updatePointer(seed, target(2), "chunk", paymentNetwork, signer.pay),
+      /accept pointer writes/,
+    );
+    assert.equal(signer.calls.length, 0, "nothing is paid for a write that cannot land");
+    assert.equal(puts(rtc).length, 0, "and nothing is sent");
+  } finally {
+    client.close();
+  }
+});
+
+test("a write five of seven can accept still goes ahead", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, (_, i) => ({ pointers: i >= 2 })));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    const written = await client.createPointer(seed, target(1), "chunk", paymentNetwork, signer.pay);
+    assert.equal(signer.calls.length, 1);
+    assert.deepEqual(await client.getPointer(written.pointer.address), written.pointer);
+  } finally {
+    client.close();
+  }
+});
+
 test("an owner seed of the wrong length is refused before anything is paid", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
   const client = new BrowserNetworkClient(rtc.endpoints);

@@ -240,6 +240,44 @@ impl BrowserNetwork for SharedNetworkAdapter {
             .collect()
     }
 
+    fn accepts_pointer_writes<'a>(
+        &'a self,
+        peer: &'a PeerId,
+        addrs: &'a [MultiAddr],
+    ) -> LocalBoxFuture<'a, Option<bool>> {
+        Box::pin(async move {
+            // The lane a pointer PUT goes out on, so the session asked is the
+            // one the write would use.
+            let hello = crate::runtime::timeout(POINTER_WRITE_PROBE_TIMEOUT, async {
+                let endpoint = webrtc_endpoint(peer, addrs).ok()?;
+                let admission = TransferDeadline::new(POINTER_WRITE_PROBE_TIMEOUT);
+                let client = self
+                    .inner
+                    .pool
+                    .data_client_before(&endpoint, admission)
+                    .await
+                    .ok()?;
+                let client = client.authenticated().await.ok()?;
+                let hello = client.hello.borrow().clone();
+                hello
+            })
+            .await
+            .ok()
+            .flatten()?;
+            Some(
+                admits(
+                    &hello,
+                    Admission {
+                        pointer: true,
+                        paid: true,
+                    },
+                    self.payment_network.as_ref(),
+                )
+                .is_ok(),
+            )
+        })
+    }
+
     fn request<'a>(
         &'a self,
         peer: &'a PeerId,
@@ -257,18 +295,7 @@ impl BrowserNetwork for SharedNetworkAdapter {
                 },
                 peer.to_hex(),
             );
-            let endpoint = addrs
-                .iter()
-                .find(|addr| addr.is_webrtc_direct())
-                .ok_or_else(|| DataError::Network("peer has no WebRTC endpoint".into()))?;
-            let endpoint = BrowserEndpoint {
-                multiaddr: endpoint.to_string(),
-            };
-            let parsed = parse_webrtc_direct_multiaddr(&endpoint.multiaddr)
-                .map_err(|e| DataError::Network(e.to_string()))?;
-            if parsed.peer_id != peer.to_hex() {
-                return Err(DataError::Network("endpoint peer mismatch".into()));
-            }
+            let endpoint = webrtc_endpoint(peer, addrs)?;
             let admission = TransferDeadline::new(RPC_ADMISSION_TIMEOUT);
             let is_read = matches!(&request.body, ChunkMessageBody::GetRequest(_));
             // Read-ahead reserves before peer admission, so a GET queued as
@@ -305,39 +332,11 @@ impl BrowserNetwork for SharedNetworkAdapter {
                 .borrow()
                 .clone()
                 .ok_or_else(|| DataError::Network("authenticated session required".into()))?;
-            if !hello.capabilities.iter().any(|cap| cap == "chunk_protocol") {
-                return Err(DataError::Network(
-                    "node does not support shared ant-protocol RPC".into(),
-                ));
-            }
-            // A node that predates browser pointers refuses them, so it is
-            // not asked: its refusal would read as a failed peer.
-            if matches!(
-                request.body,
-                ChunkMessageBody::PointerGetRequest(_) | ChunkMessageBody::PointerPutRequest(_)
-            ) && !hello
-                .capabilities
-                .iter()
-                .any(|cap| cap == POINTER_PROTOCOL_CAPABILITY)
-            {
-                return Err(DataError::Network(
-                    "node does not support browser pointers".into(),
-                ));
-            }
-            let payment_network = self.payment_network.clone();
-            if matches!(
-                request.body,
-                ChunkMessageBody::QuoteRequest(_)
-                    | ChunkMessageBody::QuoteRequestV2(_)
-                    | ChunkMessageBody::MerkleCandidateQuoteRequest(_)
-                    | ChunkMessageBody::MerkleCandidateQuoteRequestV2(_)
-                    | ChunkMessageBody::PutRequest(_)
-                    | ChunkMessageBody::PointerPutRequest(_)
-            ) {
-                if let Some(network) = payment_network {
-                    assert_upload_node(&hello, &network).map_err(DataError::Network)?;
-                }
-            }
+            admits(
+                &hello,
+                Admission::of(&request.body),
+                self.payment_network.as_ref(),
+            )?;
             // The transport owns the read permit across cancellation, then
             // returns it through response decoding.
             if is_read && read_permit.is_none() {
@@ -416,6 +415,84 @@ impl BrowserNetwork for SharedNetworkAdapter {
             Ok(response)
         })
     }
+}
+
+/// The authenticated endpoint `addrs` offers for `peer`, if it has one that is
+/// really `peer`'s.
+fn webrtc_endpoint(peer: &PeerId, addrs: &[MultiAddr]) -> DataResult<BrowserEndpoint> {
+    let endpoint = addrs
+        .iter()
+        .find(|addr| addr.is_webrtc_direct())
+        .ok_or_else(|| DataError::Network("peer has no WebRTC endpoint".into()))?;
+    let endpoint = BrowserEndpoint {
+        multiaddr: endpoint.to_string(),
+    };
+    let parsed = parse_webrtc_direct_multiaddr(&endpoint.multiaddr)
+        .map_err(|e| DataError::Network(e.to_string()))?;
+    if parsed.peer_id != peer.to_hex() {
+        return Err(DataError::Network("endpoint peer mismatch".into()));
+    }
+    Ok(endpoint)
+}
+
+/// What a request needs a node to have advertised before it is sent.
+#[derive(Clone, Copy)]
+struct Admission {
+    /// A pointer request: the node must advertise pointers.
+    pointer: bool,
+    /// A paid request: the node must take paid uploads on the client's
+    /// payment network, when the client has one.
+    paid: bool,
+}
+
+impl Admission {
+    fn of(body: &ChunkMessageBody) -> Self {
+        Self {
+            pointer: matches!(
+                body,
+                ChunkMessageBody::PointerGetRequest(_) | ChunkMessageBody::PointerPutRequest(_)
+            ),
+            paid: matches!(
+                body,
+                ChunkMessageBody::QuoteRequest(_)
+                    | ChunkMessageBody::QuoteRequestV2(_)
+                    | ChunkMessageBody::MerkleCandidateQuoteRequest(_)
+                    | ChunkMessageBody::MerkleCandidateQuoteRequestV2(_)
+                    | ChunkMessageBody::PutRequest(_)
+                    | ChunkMessageBody::PointerPutRequest(_)
+            ),
+        }
+    }
+}
+
+/// Whether a node that said `hello` may be sent a request needing `needs`.
+///
+/// One definition for sending a request and for asking, before paying,
+/// whether a pointer write could be sent at all.
+fn admits(
+    hello: &BrowserHello,
+    needs: Admission,
+    payment_network: Option<&BrowserPaymentNetwork>,
+) -> DataResult<()> {
+    let advertises = |capability: &str| hello.capabilities.iter().any(|cap| cap == capability);
+    if !advertises("chunk_protocol") {
+        return Err(DataError::Network(
+            "node does not support shared ant-protocol RPC".into(),
+        ));
+    }
+    // A node that predates browser pointers refuses them, so it is not asked:
+    // its refusal would read as a failed peer.
+    if needs.pointer && !advertises(POINTER_PROTOCOL_CAPABILITY) {
+        return Err(DataError::Network(
+            "node does not support browser pointers".into(),
+        ));
+    }
+    if needs.paid {
+        if let Some(network) = payment_network {
+            assert_upload_node(hello, network).map_err(DataError::Network)?;
+        }
+    }
+    Ok(())
 }
 
 /// Convert a verified native quote to the existing JavaScript wallet envelope.
