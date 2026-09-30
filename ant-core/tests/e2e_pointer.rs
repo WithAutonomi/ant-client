@@ -1321,6 +1321,19 @@ async fn a_final_state_left_on_one_node_refuses_a_second_transfer_before_paying(
         "got {second:?}"
     );
     assert_eq!(balance(&client).await, before, "nothing was paid");
+
+    // Nor will the owner update past it: the node holding it would never
+    // follow, so the group would split for good.
+    let update = client.pointer_update(&sk, &pk, chunk_target(3)).await;
+    assert!(
+        matches!(&update, Err(Error::PointerFinal(m)) if m.contains(&hex::encode(first.state_id()))),
+        "got {update:?}"
+    );
+    assert_eq!(
+        balance(&client).await,
+        before,
+        "nothing was paid for the update"
+    );
     assert_eq!(
         holders_anywhere(&testnet, &first).await,
         1,

@@ -339,26 +339,56 @@ fn final_state_line(state: &FinalState, group: usize) -> String {
 fn print_transfer(transfer: &PointerTransfer, json: bool) {
     let address = hex::encode(transfer.address);
     let state = hex::encode(transfer.state_id);
-    match &transfer.finality {
-        Ok(finality) => {
-            if !json {
-                println!("transferred: pointer {address}, final state {state}");
-            }
-            print_finality(finality, json);
-        }
-        Err(e) if json => println!(
+    if json {
+        let (finality, finality_error) = match &transfer.finality {
+            Ok(finality) => (Some(finality_json(finality)), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
+        println!(
             "{}",
             json!({
                 "address": address,
                 "state": state,
-                "finality_error": e.to_string(),
+                "finality": finality,
+                "finality_error": finality_error,
             })
-        ),
+        );
+        return;
+    }
+    println!("transferred: pointer {address}, final state {state}");
+    match &transfer.finality {
+        Ok(finality) => print_finality(finality, false),
         Err(e) => {
-            println!("transferred: pointer {address}, final state {state}");
             println!("finality:    unavailable ({e}); run `pointer finality {address}` again");
         }
     }
+}
+
+/// A finality check as JSON: the group, how many answered, and the status.
+fn finality_json(finality: &PointerFinality) -> serde_json::Value {
+    let status = match &finality.status {
+        FinalityStatus::Open { counter } => json!({ "status": "open", "counter": counter }),
+        FinalityStatus::Settling(state) => {
+            json!({ "status": "settling", "state": final_state_json(state) })
+        }
+        FinalityStatus::Final(state) => {
+            json!({ "status": "final", "state": final_state_json(state) })
+        }
+        FinalityStatus::Unconfirmed(state) => {
+            json!({ "status": "unconfirmed", "state": final_state_json(state) })
+        }
+        FinalityStatus::Forked { states, majority } => json!({
+            "status": "forked",
+            "states": states.iter().map(final_state_json).collect::<Vec<_>>(),
+            "majority": majority.as_ref().map(final_state_json),
+        }),
+    };
+    json!({
+        "address": hex::encode(finality.address),
+        "group": finality.group,
+        "answered": finality.answered,
+        "finality": status,
+    })
 }
 
 fn print_finality(finality: &PointerFinality, json: bool) {
@@ -366,32 +396,7 @@ fn print_finality(finality: &PointerFinality, json: bool) {
     let group = finality.group;
     let answered = finality.answered;
     if json {
-        let status = match &finality.status {
-            FinalityStatus::Open { counter } => json!({ "status": "open", "counter": counter }),
-            FinalityStatus::Settling(state) => {
-                json!({ "status": "settling", "state": final_state_json(state) })
-            }
-            FinalityStatus::Final(state) => {
-                json!({ "status": "final", "state": final_state_json(state) })
-            }
-            FinalityStatus::Unconfirmed(state) => {
-                json!({ "status": "unconfirmed", "state": final_state_json(state) })
-            }
-            FinalityStatus::Forked { states, majority } => json!({
-                "status": "forked",
-                "states": states.iter().map(final_state_json).collect::<Vec<_>>(),
-                "majority": majority.as_ref().map(final_state_json),
-            }),
-        };
-        println!(
-            "{}",
-            json!({
-                "address": address,
-                "group": group,
-                "answered": answered,
-                "finality": status,
-            })
-        );
+        println!("{}", finality_json(finality));
         return;
     }
     println!("address:  {address}");

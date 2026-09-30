@@ -362,18 +362,25 @@ Follow a chain of pointers to the target at its end.
 
 Hand the pointer over for good to the pointer at `RECIPIENT` (hex), which the
 new owner creates first, with a fresh key for each pointer they receive.
-Requires `SECRET_KEY` to pay for the final state. Refused before paying if the
-pointer is already final, or if `RECIPIENT` does not exist or leads back to
-this pointer. Irreversible once stored. Prints the result of `finality`.
+Requires `SECRET_KEY` to pay for the final state. Refused before paying if any
+peer of the close group holds a final state for the pointer, if not every peer
+of the group answers, or if `RECIPIENT` does not exist or leads back to this
+pointer. Irreversible once stored. Prints the stored state and the result of
+`finality`; a failed `finality` check after the write does not mean the
+transfer failed.
 
 #### `ant pointer finality <ADDRESS>`
 
 Ask every peer of the close group whether a pointer is final, and on what:
 
-- `open` — not final; its owner can still move it.
+- `open` — no peer that answered holds a final state; its owner can still
+  move it. Check `answered`: a peer that did not answer could hold one.
 - `settling` — one final state, not yet on a majority of the group.
-- `final` — one final state, held by a majority, with no rival. The only
-  status to rely on before treating a transfer as done.
+- `unconfirmed` — one final state on a majority, but not every peer answered,
+  so a rival could be unseen. Ask again.
+- `final` — one final state, held by a majority, every peer answered and none
+  holds a rival. The only status to rely on before treating a transfer as
+  done.
 - `forked` — its owner signed more than one final state. Reads return the one a
   majority holds, or fail if none does.
 
