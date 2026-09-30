@@ -107,6 +107,8 @@ struct Answered {
     /// The first failure that was a refusal rather than a missing answer: a
     /// peer that answered and said no. Asking again would get the same.
     refusal: Option<Error>,
+    /// How many peers refused.
+    refusals: usize,
 }
 
 impl Answered {
@@ -135,6 +137,7 @@ async fn ask_the_group<T>(
         count: 0,
         last_error: None,
         refusal: None,
+        refusals: 0,
     };
     while let Some(result) = in_flight.next().await {
         match result {
@@ -145,8 +148,13 @@ async fn ask_the_group<T>(
                     break;
                 }
             }
-            Err(e) if answered.refusal.is_none() && !worth_retrying(&e) => {
-                answered.refusal = Some(e);
+            Err(e) if !worth_retrying(&e) => {
+                answered.refusals += 1;
+                if answered.refusal.is_none() {
+                    answered.refusal = Some(e);
+                } else {
+                    answered.last_error = Some(e);
+                }
             }
             Err(e) => answered.last_error = Some(e),
         }
@@ -261,10 +269,12 @@ enum PutAck {
 /// `stored` peers hold the record, `wanted` is the write quorum, and `moved`
 /// says a read confirmed the network holds a state that replaces it.
 ///
-/// A refusal ends the write only when no peer stored the record. Once any
-/// peer has taken the same proof, one peer refusing it is that peer's
-/// problem, and the round is a shortfall to retry with the proof already
-/// paid for, rather than a final answer that throws the payment away.
+/// A refusal ends the write only when no peer stored the record and a second
+/// peer refused as well. Once any peer has taken the same proof, one peer
+/// refusing it is that peer's problem; and while the rest of the group is
+/// silent, one refusal is that peer's word alone. Either way the round is a
+/// shortfall to retry with the proof already paid for, rather than a final
+/// answer one peer gave that throws the payment away.
 fn judge_write(
     address: &XorName,
     stored: usize,
@@ -282,19 +292,19 @@ fn judge_write(
             hex::encode(address)
         )));
     }
-    if stored == 0 {
+    if stored == 0 && answered.refusals >= corroboration(wanted) {
         if let Some(refusal) = answered.refusal {
             return Err(refusal);
         }
     }
-    if answered.count > 0 {
+    if answered.count > 0 || answered.refusals > 0 {
         return Err(Error::CloseGroupShortfall(format!(
             "pointer {} stored on {stored} of {wanted} close-group peers",
             hex::encode(address)
         )));
     }
     Err(answered
-        .failure()
+        .last_error
         .unwrap_or_else(|| Error::Protocol("no close-group peer accepted the pointer".to_string())))
 }
 
@@ -1152,10 +1162,12 @@ mod tests {
     }
 
     fn answered(count: usize, refusal: Option<Error>) -> Answered {
+        let refusals = usize::from(refusal.is_some());
         Answered {
             count,
             last_error: None,
             refusal,
+            refusals,
         }
     }
 
@@ -1185,12 +1197,43 @@ mod tests {
         );
         assert!(
             matches!(
-                judge_write(&address, 0, 5, false, answered(1, refused())),
+                judge_write(
+                    &address,
+                    0,
+                    5,
+                    false,
+                    Answered {
+                        refusals: 2,
+                        ..answered(0, refused())
+                    }
+                ),
                 Err(Error::Payment(_))
             ),
-            "a refusal nobody contradicted is the answer"
+            "a refusal a second peer repeats, with nobody storing, is the answer"
         );
         assert!(judge_write(&address, 5, 5, false, answered(5, None)).is_ok());
+    }
+
+    /// Nor can one peer end it while the rest of the group is silent. Six
+    /// peers time out and one refuses: that refusal is one peer's word, so
+    /// the round is retried with the proof already paid for.
+    #[test]
+    fn one_refusal_among_silent_peers_is_retried() {
+        let address = [7u8; 32];
+        let alone = judge_write(
+            &address,
+            0,
+            5,
+            false,
+            Answered {
+                last_error: Some(Error::Timeout("no answer".to_string())),
+                ..answered(0, Some(Error::Payment("pay up".to_string())))
+            },
+        );
+        assert!(
+            matches!(&alone, Err(e) if worth_retrying(e)),
+            "one refusal among silent peers is a shortfall, got {alone:?}"
+        );
     }
 
     /// Tally some replies and ask what the group's answer is.
