@@ -53,7 +53,9 @@ pub use client::merkle::{
     finalize_merkle_batch, MerkleBatchPaymentResult, PaymentMode, PreparedMerkleBatch,
     DEFAULT_MERKLE_THRESHOLD,
 };
-pub use client::pointer::{FinalState, FinalityStatus, PointerController, PointerFinality};
+pub use client::pointer::{
+    FinalState, FinalityStatus, PointerController, PointerFinality, PointerTransfer,
+};
 
 // Re-export self-encryption types
 pub use self_encryption::DataMap;

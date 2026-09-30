@@ -367,9 +367,15 @@ pub enum FinalityStatus {
     /// One final state, and no other, but a majority of the group does not
     /// hold it yet: a transfer still spreading, or a write that fell short.
     Settling(FinalState),
-    /// One final state, held by a majority of the group, and no other seen.
-    /// Nothing can move the pointer off it.
+    /// One final state, held by a majority of the group, and no other: every
+    /// peer of the group answered and none holds a rival. Nothing can move
+    /// the pointer off it.
     Final(FinalState),
+    /// One final state, held by a majority of the group, and no other among
+    /// the peers that answered, but not every peer of the group answered. A
+    /// rival held by one that did not would not show, so this is not yet
+    /// [`Self::Final`]; ask again once the whole group can answer.
+    Unconfirmed(FinalState),
     /// The owner signed two or more different final states. `majority` is
     /// the one a majority holds, which reads return; with none, reads fail.
     Forked {
@@ -385,7 +391,8 @@ pub enum FinalityStatus {
 pub struct PointerFinality {
     /// The pointer asked about.
     pub address: XorName,
-    /// How many peers were asked: the whole close group.
+    /// How many peers the group has: the configured close group, or more if
+    /// a lookup returned more.
     pub group: usize,
     /// How many of them answered.
     pub answered: usize,
@@ -409,6 +416,30 @@ impl PointerFinality {
             _ => None,
         }
     }
+}
+
+/// A pointer read (see [`Client::pointer_get`]), with what it heard but
+/// does not return.
+struct PointerRead {
+    /// What the read returns.
+    current: Option<Pointer>,
+    /// A final state some answering peer named that the read does not return:
+    /// too few peers to decide a read, but signed by the owner all the same.
+    unreturned_final: Option<Pointer>,
+}
+
+/// What [`Client::pointer_transfer`] stored, and what the close group said
+/// about it afterwards.
+#[derive(Debug)]
+pub struct PointerTransfer {
+    /// The pointer handed over.
+    pub address: XorName,
+    /// The final state stored.
+    pub state_id: XorName,
+    /// The whole close group's view once the write landed. An error here does
+    /// not undo the transfer, which is stored and final; only the check
+    /// failed. Ask again with [`Client::pointer_finality`].
+    pub finality: Result<PointerFinality>,
 }
 
 /// Whose pointer decides what an address resolves to, after following every
@@ -447,15 +478,16 @@ fn rival_final(finality: &PointerFinality, ours: &Pointer) -> Option<Error> {
     let address = hex::encode(finality.address);
     match &finality.status {
         FinalityStatus::Open { .. } => None,
-        FinalityStatus::Settling(state) | FinalityStatus::Final(state) => (state.state_id != ours)
-            .then(|| {
-                Error::PointerFinal(format!(
-                    "pointer {address} is already final on state {} held by {} of {} peers",
-                    hex::encode(state.state_id),
-                    state.holders,
-                    finality.group
-                ))
-            }),
+        FinalityStatus::Settling(state)
+        | FinalityStatus::Final(state)
+        | FinalityStatus::Unconfirmed(state) => (state.state_id != ours).then(|| {
+            Error::PointerFinal(format!(
+                "pointer {address} is already final on state {} held by {} of {} peers",
+                hex::encode(state.state_id),
+                state.holders,
+                finality.group
+            ))
+        }),
         FinalityStatus::Forked { states, .. } => Some(Error::PointerForked(format!(
             "pointer {address} holds {} different final states",
             states.len()
@@ -463,8 +495,9 @@ fn rival_final(finality: &PointerFinality, ours: &Pointer) -> Option<Error> {
     }
 }
 
-/// What a finality check makes of a tally over the whole group.
-fn finality_status(replies: &Replies, group: usize) -> FinalityStatus {
+/// What a finality check makes of a tally over a group of `group` peers, of
+/// which `answered` answered.
+fn finality_status(replies: &Replies, group: usize, answered: usize) -> FinalityStatus {
     let majority = read_quorum(group);
     let mut finals: Vec<FinalState> = replies
         .finals()
@@ -481,7 +514,10 @@ fn finality_status(replies: &Replies, group: usize) -> FinalityStatus {
                 .corroborated(corroboration(group))
                 .map(Pointer::counter),
         },
-        [only] if only.holders >= majority => FinalityStatus::Final(only.clone()),
+        [only] if only.holders >= majority && answered >= group => {
+            FinalityStatus::Final(only.clone())
+        }
+        [only] if only.holders >= majority => FinalityStatus::Unconfirmed(only.clone()),
         [only] => FinalityStatus::Settling(only.clone()),
         _ => FinalityStatus::Forked {
             states: finals,
@@ -659,6 +695,75 @@ fn read_get_reply(body: ChunkMessageBody, address: XorName) -> Option<Result<Opt
 /// client bounds it.
 pub const MAX_POINTER_RESOLVE_DEPTH: usize = 16;
 
+/// Refuse a recipient that does not exist or whose chain leads back to
+/// `address`.
+///
+/// A transfer to a pointer nobody created redirects every reader into a
+/// broken chain, and one that leads back here is a cycle; either is final
+/// the moment it is stored. The chain is followed as it stands now: the
+/// recipient can still move its own pointer later, and a read that meets
+/// a cycle then refuses it as it would any other.
+///
+/// A reader of `address` reads it first and then every pointer from the
+/// recipient on, so the recipient's chain gets one hop fewer than
+/// [`MAX_POINTER_RESOLVE_DEPTH`]. A chain still going after that is
+/// refused: readers could not resolve it, and whether it leads back here
+/// is past what can be checked.
+async fn check_recipient_chain<Get, Fut>(
+    address: &XorName,
+    recipient: &XorName,
+    get: Get,
+) -> Result<()>
+where
+    Get: Fn(XorName) -> Fut,
+    Fut: Future<Output = Result<Option<Pointer>>>,
+{
+    let mut at = *recipient;
+    let mut seen = HashSet::new();
+    for hop in 0..MAX_POINTER_RESOLVE_DEPTH.saturating_sub(1) {
+        if at == *address {
+            return Err(Error::InvalidData(format!(
+                "recipient pointer {} leads back to pointer {}; the transfer would be a \
+                 cycle",
+                hex::encode(recipient),
+                hex::encode(address)
+            )));
+        }
+        if !seen.insert(at) {
+            return Ok(());
+        }
+        let Some(record) = get(at).await? else {
+            if hop == 0 {
+                return Err(Error::InvalidData(format!(
+                    "recipient pointer {} does not exist; its owner must create it before \
+                     it can receive a transfer",
+                    hex::encode(recipient)
+                )));
+            }
+            return Ok(());
+        };
+        let target = record.target();
+        match target.kind() {
+            Some(PointerTargetKind::Pointer) => at = target.address,
+            _ => return Ok(()),
+        }
+    }
+    if at == *address {
+        return Err(Error::InvalidData(format!(
+            "recipient pointer {} leads back to pointer {}; the transfer would be a cycle",
+            hex::encode(recipient),
+            hex::encode(address)
+        )));
+    }
+    Err(Error::InvalidData(format!(
+        "recipient pointer {} starts a chain longer than {} hops; readers of pointer {} \
+         could not follow the transfer",
+        hex::encode(recipient),
+        MAX_POINTER_RESOLVE_DEPTH.saturating_sub(1),
+        hex::encode(address)
+    )))
+}
+
 impl Client {
     /// Create a pointer at counter 0, owned by `owner`.
     ///
@@ -733,8 +838,10 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns an error if the current record cannot be read, the counter is
-    /// exhausted, or signing fails.
+    /// Returns [`Error::PointerFinal`] if the pointer is final, or if any
+    /// peer the read heard from holds a final state for it, even one too few
+    /// peers hold for the read to return; otherwise an error if the current
+    /// record cannot be read or signing fails.
     pub async fn pointer_sign_update(
         &self,
         secret_key: &MlDsaSecretKey,
@@ -742,7 +849,19 @@ impl Client {
         target: PointerTarget,
     ) -> Result<Pointer> {
         let address = pointer_address(owner);
-        match self.pointer_get(&address).await? {
+        let read = self.pointer_read(&address).await?;
+        // A final state even one answering peer holds was signed by the owner,
+        // and no node holding it will take this update. That is a transfer or
+        // freeze that fell short: finish it rather than move the rest of the
+        // group somewhere those nodes never follow.
+        if let Some(lone) = read.unreturned_final.as_ref() {
+            return Err(Error::PointerFinal(format!(
+                "pointer {} has {} on some of its close group; an update cannot replace it",
+                hex::encode(address),
+                describe_final(lone)
+            )));
+        }
+        match read.current {
             Some(current) => current.update(secret_key, target).map_err(|e| match e {
                 PointerError::CounterExhausted => Error::PointerFinal(format!(
                     "pointer {} holds {}; nothing can update it",
@@ -769,9 +888,11 @@ impl Client {
     /// it receives: a pointer's address derives from its key, so every address
     /// handed to one recipient pointer resolves to the same place.
     ///
-    /// The returned finality is the whole close group's view once the write
-    /// has landed. A recipient should check it with
-    /// [`Self::pointer_finality`] itself before relying on the transfer.
+    /// Once the write has landed the whole close group is asked where the
+    /// transfer stands. That check is reported beside the transfer, not as its
+    /// outcome: a check that fails after the write says nothing about a
+    /// transfer that is already stored and final. A recipient should check it
+    /// with [`Self::pointer_finality`] itself before relying on the transfer.
     ///
     /// # Errors
     ///
@@ -784,7 +905,7 @@ impl Client {
         secret_key: &MlDsaSecretKey,
         owner: &MlDsaPublicKey,
         recipient: XorName,
-    ) -> Result<PointerFinality> {
+    ) -> Result<PointerTransfer> {
         let record = self
             .pointer_sign_transfer(secret_key, owner, recipient)
             .await?;
@@ -799,24 +920,40 @@ impl Client {
             }
             return Err(e);
         }
-        self.pointer_finality(&address).await
+        Ok(PointerTransfer {
+            address,
+            state_id: record.state_id(),
+            finality: self.pointer_finality(&address).await,
+        })
     }
 
     /// Sign the final state that hands `owner`'s pointer over to the pointer
     /// at `recipient`, without storing it.
     ///
-    /// Everything that can be checked is checked before signing, because once
-    /// a final state is stored it cannot be taken back: the pointer must not
-    /// be final already, the recipient must not be the pointer itself, the
+    /// Everything that can be checked is checked before it is stored, because
+    /// once a final state is stored it cannot be taken back: the pointer must
+    /// not be final already, the recipient must not be the pointer itself, the
     /// recipient pointer must exist, and following it must not lead back
     /// here.
     ///
+    /// "Final already" is asked of the whole close group
+    /// ([`Self::pointer_finality`]), not of an ordinary read. A read returns a
+    /// state only once two peers name it, so a final state an earlier
+    /// transfer left on one peer is not what it returns, and signing a second
+    /// final state past that one would fork the pointer for good. Any final
+    /// state other than the one signed here refuses the transfer; the same
+    /// state, left by an earlier attempt at this very transfer, does not. A
+    /// peer that does not answer cannot be asked, so this sees every final
+    /// state the answering peers hold, and the nodes' own look before a final
+    /// state covers the rest.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::PointerFinal`] if the pointer is already final,
+    /// Returns [`Error::PointerFinal`] if the pointer is already final, or
+    /// [`Error::PointerForked`] if its owner already forked it,
     /// [`Error::InvalidData`] for a recipient that is this pointer, does not
     /// exist or leads back to it, or an error if either pointer cannot be
-    /// read or signing fails.
+    /// read, the group cannot be asked, or signing fails.
     pub async fn pointer_sign_transfer(
         &self,
         secret_key: &MlDsaSecretKey,
@@ -841,53 +978,26 @@ impl Client {
         self.check_recipient(&address, &recipient).await?;
 
         let target = PointerTarget::new(PointerTargetKind::Pointer, recipient);
-        match current {
+        let record = match current {
             Some(current) => current.transfer_to(secret_key, recipient),
             None => Pointer::sign(secret_key, owner, FINAL_COUNTER, target),
         }
-        .map_err(|e| Error::InvalidData(format!("cannot sign pointer transfer: {e}")))
+        .map_err(|e| Error::InvalidData(format!("cannot sign pointer transfer: {e}")))?;
+
+        let finality = self.pointer_finality(&address).await?;
+        if let Some(refusal) = rival_final(&finality, &record) {
+            return Err(refusal);
+        }
+        Ok(record)
     }
 
     /// Refuse a recipient that does not exist or whose chain leads back to
-    /// `address`.
-    ///
-    /// A transfer to a pointer nobody created redirects every reader into a
-    /// broken chain, and one that leads back here is a cycle; either is final
-    /// the moment it is stored. The chain is followed as it stands now: the
-    /// recipient can still move its own pointer later, and a read that meets
-    /// a cycle then refuses it as it would any other.
+    /// `address` (see [`check_recipient_chain`]).
     async fn check_recipient(&self, address: &XorName, recipient: &XorName) -> Result<()> {
-        let mut at = *recipient;
-        let mut seen = HashSet::new();
-        for hop in 0..MAX_POINTER_RESOLVE_DEPTH {
-            if at == *address {
-                return Err(Error::InvalidData(format!(
-                    "recipient pointer {} leads back to pointer {}; the transfer would be a \
-                     cycle",
-                    hex::encode(recipient),
-                    hex::encode(address)
-                )));
-            }
-            if !seen.insert(at) {
-                return Ok(());
-            }
-            let Some(record) = self.pointer_get(&at).await? else {
-                if hop == 0 {
-                    return Err(Error::InvalidData(format!(
-                        "recipient pointer {} does not exist; its owner must create it before \
-                         it can receive a transfer",
-                        hex::encode(recipient)
-                    )));
-                }
-                return Ok(());
-            };
-            let target = record.target();
-            match target.kind() {
-                Some(PointerTargetKind::Pointer) => at = target.address,
-                _ => return Ok(()),
-            }
-        }
-        Ok(())
+        check_recipient_chain(address, recipient, |at| async move {
+            self.pointer_get(&at).await
+        })
+        .await
     }
 
     /// Ask the whole close group where `address` stands with respect to
@@ -897,7 +1007,9 @@ impl Client {
     /// every peer is asked, within its own deadline, so a second final state
     /// held by even one of them is seen. That is what a recipient needs before
     /// relying on a transfer — [`FinalityStatus::Final`] means one final state,
-    /// held by a majority, and no rival anywhere the group could show.
+    /// held by a majority, with every peer of the configured close group
+    /// answering and none holding a rival. A group that did not all answer
+    /// can show at most [`FinalityStatus::Unconfirmed`].
     ///
     /// # Errors
     ///
@@ -916,7 +1028,11 @@ impl Client {
         })
         .await;
 
-        let wanted = read_quorum(peers.len());
+        // Counted over the configured group, as every pointer quorum is: a
+        // lookup that came back short is peers that did not answer, not a
+        // smaller group.
+        let width = quorum_width(peers.len(), self.config().close_group_size);
+        let wanted = read_quorum(width);
         if answered.count < wanted {
             let count = answered.count;
             return Err(answered
@@ -931,9 +1047,9 @@ impl Client {
         }
         Ok(PointerFinality {
             address: *address,
-            group: peers.len(),
+            group: width,
             answered: answered.count,
-            status: finality_status(&replies, peers.len()),
+            status: finality_status(&replies, width, answered.count),
         })
     }
 
@@ -1131,11 +1247,16 @@ impl Client {
     }
 
     /// Whether the network has moved past `record`: a read returns a state
-    /// that replaces it. A read that fails says nothing, and counts as no.
+    /// that replaces it, or, for a final state, a different final state,
+    /// which nothing replaces either and which the group settled on instead.
+    /// A read that fails says nothing, and counts as no.
     async fn moved_past(&self, record: &Pointer) -> bool {
         matches!(
             self.pointer_get(&record.address()).await,
             Ok(Some(current)) if current.replaces(record)
+                || (record.is_terminal()
+                    && current.is_terminal()
+                    && current.state_id() != record.state_id())
         )
     }
 
@@ -1237,6 +1358,12 @@ impl Client {
     /// the best state found has too few peers behind it to be the network's
     /// answer rather than one peer's.
     pub async fn pointer_get(&self, address: &XorName) -> Result<Option<Pointer>> {
+        self.pointer_read(address).await.map(|read| read.current)
+    }
+
+    /// [`Self::pointer_get`], also naming a final state a peer reported that
+    /// the read does not return.
+    async fn pointer_read(&self, address: &XorName) -> Result<PointerRead> {
         let peers = self.pointer_group(address).await?;
 
         // Ask the whole close group at once and keep the best answer.
@@ -1302,7 +1429,19 @@ impl Client {
                 answered.count
             )));
         }
-        Ok(corroborated)
+        let unreturned_final = replies
+            .finals()
+            .map(|(record, _)| record)
+            .find(|record| {
+                corroborated
+                    .as_ref()
+                    .is_none_or(|current| current.state_id() != record.state_id())
+            })
+            .cloned();
+        Ok(PointerRead {
+            current: corroborated,
+            unreturned_final,
+        })
     }
 
     /// Follow a pointer chain to the chunk it ends at.
@@ -1429,6 +1568,7 @@ mod tests {
     use super::*;
     use ant_protocol::pqc::api::ml_dsa_65;
     use futures::future::BoxFuture;
+    use std::collections::HashMap;
 
     fn keypair(seed: u8) -> (MlDsaPublicKey, MlDsaSecretKey) {
         ml_dsa_65().generate_keypair_from_seed(&[seed; 32])
@@ -2323,7 +2463,7 @@ mod tests {
         let frozen = Pointer::sign(&sk, &pk, FINAL_COUNTER, chunk_target(5)).expect("sign");
         let group = 7;
 
-        let open = finality_status(&tally(vec![Some(before.clone()); 7]), group);
+        let open = finality_status(&tally(vec![Some(before.clone()); 7]), group, group);
         assert_eq!(open, FinalityStatus::Open { counter: Some(0) });
 
         let status = finality_status(
@@ -2334,7 +2474,9 @@ mod tests {
                 Some(transfer.clone()),
                 Some(before.clone()),
                 None,
+                None,
             ]),
+            group,
             group,
         );
         match &status {
@@ -2353,6 +2495,7 @@ mod tests {
                 Some(before.clone()),
             ]),
             group,
+            3,
         );
         assert!(matches!(status, FinalityStatus::Settling(ref s) if s.holders == 2));
 
@@ -2365,6 +2508,7 @@ mod tests {
                 Some(transfer.clone()),
             ]),
             group,
+            5,
         );
         match status {
             FinalityStatus::Forked { states, majority } => {
@@ -2379,11 +2523,115 @@ mod tests {
             other => panic!("expected Forked, got {other:?}"),
         }
 
-        let status = finality_status(&tally(vec![Some(frozen.clone()); 5]), group);
+        let status = finality_status(&tally(vec![Some(frozen.clone()); 7]), group, group);
         match status {
             FinalityStatus::Final(state) => assert_eq!(state.transferred_to(), None),
             other => panic!("expected a frozen Final, got {other:?}"),
         }
+    }
+
+    /// Four of seven report the transfer and three do not answer. One of the
+    /// three could hold a rival, so this is not yet final; a recipient that
+    /// relied on it could be relying on the minority side of a fork.
+    #[test]
+    fn a_majority_is_not_final_while_part_of_the_group_is_silent() {
+        let (pk, sk) = keypair(47);
+        let transfer = handed_to(&pk, &sk, 0x77);
+        let status = finality_status(&tally(vec![Some(transfer.clone()); 4]), 7, 4);
+        assert!(
+            matches!(&status, FinalityStatus::Unconfirmed(state) if state.holders == 4),
+            "got {status:?}"
+        );
+        let finality = PointerFinality {
+            address: transfer.address(),
+            group: 7,
+            answered: 4,
+            status,
+        };
+        assert!(!finality.is_final());
+        assert_eq!(finality.transferred_to(), None);
+
+        // And a rival already seen still refuses a transfer it would fork.
+        let other = handed_to(&pk, &sk, 0x01);
+        assert!(matches!(
+            rival_final(&finality, &other),
+            Some(Error::PointerFinal(_))
+        ));
+        assert!(rival_final(&finality, &transfer).is_none());
+    }
+
+    /// The recipient walk, over pointers held in a map.
+    async fn walk(
+        chain: &HashMap<XorName, Pointer>,
+        address: XorName,
+        recipient: XorName,
+    ) -> Result<()> {
+        check_recipient_chain(&address, &recipient, |at| {
+            let found = chain.get(&at).cloned();
+            async move { Ok(found) }
+        })
+        .await
+    }
+
+    /// A chain of `hops` pointers from `[1; 32]`, each targeting the next,
+    /// the last targeting `end`.
+    fn chain_to(hops: u8, end: PointerTarget) -> HashMap<XorName, Pointer> {
+        (1..=hops)
+            .map(|hop| {
+                let (pk, sk) = keypair(hop);
+                let target = if hop == hops {
+                    end
+                } else {
+                    PointerTarget::new(
+                        PointerTargetKind::Pointer,
+                        pointer_address(&keypair(hop + 1).0),
+                    )
+                };
+                let record = Pointer::create(&sk, &pk, target).expect("create");
+                (record.address(), record)
+            })
+            .collect()
+    }
+
+    /// Readers of the source read it and then every recipient hop, so the
+    /// recipient's chain gets one hop fewer than a resolve allows. A chain
+    /// that returns to the source at the very last hop is a cycle, and one
+    /// too long to follow is refused rather than let through unchecked.
+    #[tokio::test]
+    async fn a_recipient_chain_is_checked_to_the_last_hop_a_reader_takes() {
+        let (source_pk, _) = keypair(200);
+        let source = pointer_address(&source_pk);
+        let back = PointerTarget::new(PointerTargetKind::Pointer, source);
+        let first = pointer_address(&keypair(1).0);
+        let allowed = u8::try_from(MAX_POINTER_RESOLVE_DEPTH - 1).expect("small");
+
+        let ends = chain_to(allowed, chunk_target(9));
+        assert!(
+            walk(&ends, source, first).await.is_ok(),
+            "the longest chain a reader can follow"
+        );
+
+        let cycles_at_the_end = chain_to(allowed, back);
+        assert!(
+            matches!(walk(&cycles_at_the_end, source, first).await, Err(Error::InvalidData(m)) if m.contains("cycle")),
+            "a chain back to the source at its last hop is a cycle"
+        );
+
+        let too_long = chain_to(allowed + 1, chunk_target(9));
+        assert!(
+            matches!(walk(&too_long, source, first).await, Err(Error::InvalidData(m)) if m.contains("longer")),
+            "a chain no reader could follow is refused"
+        );
+
+        // One hop longer and back to the source: the walk runs out exactly
+        // as it reaches the source, which must not pass as no cycle.
+        let cycles_past_the_end = chain_to(allowed + 1, back);
+        assert!(walk(&cycles_past_the_end, source, first).await.is_err());
+
+        let nowhere = HashMap::new();
+        assert!(
+            matches!(walk(&nowhere, source, first).await, Err(Error::InvalidData(m)) if m.contains("does not exist")),
+        );
     }
 
     /// A transfer refused because the pointer was already final on another

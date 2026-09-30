@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use ant_core::data::{
     ml_dsa_65, pointer_address, Client, FinalState, FinalityStatus, MlDsaPublicKey, MlDsaSecretKey,
-    Pointer, PointerFinality, PointerTarget, PointerTargetKind, XorName,
+    Pointer, PointerFinality, PointerTarget, PointerTargetKind, PointerTransfer, XorName,
 };
 use clap::{Subcommand, ValueEnum};
 use rand::rngs::OsRng;
@@ -204,11 +204,11 @@ impl PointerAction {
                 let (owner, secret) = read_key(&key)?;
                 let recipient = parse_address(&recipient)?;
                 info!("Transferring pointer");
-                let finality = client
+                let transfer = client
                     .pointer_transfer(&secret, &owner, recipient)
                     .await
                     .map_err(|e| anyhow::anyhow!("Pointer transfer failed: {e}"))?;
-                print_finality(&finality, json);
+                print_transfer(&transfer, json);
             }
             Self::Finality { address } => {
                 let at = parse_address(&address)?;
@@ -333,6 +333,34 @@ fn final_state_line(state: &FinalState, group: usize) -> String {
     format!("{kind} {target} (state {id}, held by {holders} of {group})")
 }
 
+/// A stored transfer, and the finality check after it. A failed check is
+/// printed as that, not as a failed transfer: the transfer is stored and final
+/// either way.
+fn print_transfer(transfer: &PointerTransfer, json: bool) {
+    let address = hex::encode(transfer.address);
+    let state = hex::encode(transfer.state_id);
+    match &transfer.finality {
+        Ok(finality) => {
+            if !json {
+                println!("transferred: pointer {address}, final state {state}");
+            }
+            print_finality(finality, json);
+        }
+        Err(e) if json => println!(
+            "{}",
+            json!({
+                "address": address,
+                "state": state,
+                "finality_error": e.to_string(),
+            })
+        ),
+        Err(e) => {
+            println!("transferred: pointer {address}, final state {state}");
+            println!("finality:    unavailable ({e}); run `pointer finality {address}` again");
+        }
+    }
+}
+
 fn print_finality(finality: &PointerFinality, json: bool) {
     let address = hex::encode(finality.address);
     let group = finality.group;
@@ -345,6 +373,9 @@ fn print_finality(finality: &PointerFinality, json: bool) {
             }
             FinalityStatus::Final(state) => {
                 json!({ "status": "final", "state": final_state_json(state) })
+            }
+            FinalityStatus::Unconfirmed(state) => {
+                json!({ "status": "unconfirmed", "state": final_state_json(state) })
             }
             FinalityStatus::Forked { states, majority } => json!({
                 "status": "forked",
@@ -376,6 +407,13 @@ fn print_finality(finality: &PointerFinality, json: bool) {
         }
         FinalityStatus::Final(state) => {
             println!("status:   final");
+            println!("state:    {}", final_state_line(state, group));
+        }
+        FinalityStatus::Unconfirmed(state) => {
+            println!(
+                "status:   unconfirmed (final on a majority, but not every peer answered, so a \
+                 rival could be unseen; ask again)"
+            );
             println!("state:    {}", final_state_line(state, group));
         }
         FinalityStatus::Forked { states, majority } => {

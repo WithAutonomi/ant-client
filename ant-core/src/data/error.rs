@@ -190,24 +190,27 @@ pub enum Error {
         max_leaves: usize,
     },
 
-    /// Cost estimation could not reach a representative quote.
-    ///
     /// The pointer is final: its state is at the final counter, so nothing
     /// can update it or hand it over again (ADR-0018 in `ant-node`).
     ///
-    /// Raised before anything is paid.
+    /// Raised before anything is paid when a read or the finality check shows
+    /// it. A transfer that was paid for and then refused because the group
+    /// already holds a different final state is reported as this too.
     #[error("pointer is final: {0}")]
     PointerFinal(String),
 
-    /// The pointer's owner signed two or more different final states and no
-    /// one of them is held by a majority of the close group, so there is no
-    /// answer to give (ADR-0018 in `ant-node`).
+    /// The pointer's owner signed two or more different final states
+    /// (ADR-0018 in `ant-node`). A read raises it when no one of them is held
+    /// by a majority of the close group, so there is no answer to give; a
+    /// transfer raises it whenever it sees more than one.
     ///
     /// Not a transient failure: nodes keep the final state they took first,
     /// so a retry sees the same split.
     #[error("pointer is forked: {0}")]
     PointerForked(String),
 
+    /// Cost estimation could not reach a representative quote.
+    ///
     /// Returned by [`crate::data::Client::estimate_upload_cost`] when every
     /// sampled chunk address reported `AlreadyStored`, so the network price
     /// for the remainder of the file cannot be inferred from a sample.

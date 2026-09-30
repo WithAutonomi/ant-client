@@ -7,4 +7,4 @@ resolver = "2"
 # state that ownership transfer relies on (ADR-0018 in ant-node). Pin the
 # companion revision until a release includes it. Versions are bumped at
 # release; this immutable revision remains 3.1.0.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "7aab0772aed9931ce7912eeda23b1f8482d6d116" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "9ad7fce38aa2b79ea6c532985930a3f347ab529b" }

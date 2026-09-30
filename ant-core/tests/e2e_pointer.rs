@@ -1163,7 +1163,7 @@ async fn a_transfer_hands_the_address_over_for_good() {
     );
 
     // The transfer itself.
-    let finality = client
+    let transfer = client
         .pointer_transfer(&sk, &pk, recipient)
         .await
         .expect("the transfer lands");
@@ -1171,6 +1171,8 @@ async fn a_transfer_hands_the_address_over_for_good() {
         balance(&client).await < paid_for_loop,
         "a transfer is paid for"
     );
+    assert_eq!(transfer.address, address);
+    let finality = transfer.finality.expect("the group can be asked");
     assert_eq!(finality.address, address);
     assert!(finality.is_final(), "got {:?}", finality.status);
     assert_eq!(finality.transferred_to(), Some(recipient));
@@ -1266,6 +1268,64 @@ async fn a_transfer_hands_the_address_over_for_good() {
         .await
         .expect("finality")
         .is_final());
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// A transfer that fell short left its final state on one node. A read does
+/// not return a state only one peer holds, so a second transfer built on a
+/// read would sign past it, pay, and fork the pointer for good on the nodes
+/// that never heard of the first. The whole group is asked first, and the
+/// second transfer is refused before anything is paid.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_final_state_left_on_one_node_refuses_a_second_transfer_before_paying() {
+    let (client, testnet) = setup().await;
+    let (pk, sk) = owner();
+    let (recipient_pk, recipient_sk) = owner();
+    let address = client
+        .pointer_create(&sk, &pk, chunk_target(1))
+        .await
+        .expect("create the pointer");
+    let recipient = client
+        .pointer_create(&recipient_sk, &recipient_pk, chunk_target(2))
+        .await
+        .expect("the recipient creates its own pointer");
+
+    let group = close_group(&client, &testnet, &address).await;
+    let first = Pointer::sign(
+        &sk,
+        &pk,
+        FINAL_COUNTER,
+        PointerTarget::new(PointerTargetKind::Pointer, [0x42; 32]),
+    )
+    .expect("sign");
+    let (one, _) = group.split_at(1);
+    store_on(&client, one, &first).await;
+    assert_eq!(
+        client
+            .pointer_get(&address)
+            .await
+            .expect("get")
+            .expect("present")
+            .counter(),
+        0,
+        "a read does not return a state one node holds"
+    );
+
+    let before = balance(&client).await;
+    let second = client.pointer_transfer(&sk, &pk, recipient).await;
+    assert!(
+        matches!(&second, Err(Error::PointerFinal(m)) if m.contains(&hex::encode(first.state_id()))),
+        "got {second:?}"
+    );
+    assert_eq!(balance(&client).await, before, "nothing was paid");
+    assert_eq!(
+        holders_anywhere(&testnet, &first).await,
+        1,
+        "and nothing else changed"
+    );
 
     drop(client);
     testnet.teardown().await;

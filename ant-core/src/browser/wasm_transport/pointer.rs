@@ -108,8 +108,9 @@ impl From<&FinalState> for BrowserFinalState {
 
 /// Where a pointer stands with respect to finality, as JavaScript sees it.
 ///
-/// `status` is `"open"`, `"settling"`, `"final"` or `"forked"`. `states` holds
-/// every final state seen, most-held first; `majority` the one reads return.
+/// `status` is `"open"`, `"settling"`, `"final"`, `"unconfirmed"` (final on a
+/// majority, but not every peer answered) or `"forked"`. `states` holds every
+/// final state seen, most-held first; `majority` the one reads return.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BrowserPointerFinality {
@@ -134,6 +135,9 @@ impl From<&PointerFinality> for BrowserPointerFinality {
             }
             FinalityStatus::Settling(state) => ("settling", None, vec![state.into()], None),
             FinalityStatus::Final(state) => ("final", None, vec![state.into()], Some(state.into())),
+            FinalityStatus::Unconfirmed(state) => {
+                ("unconfirmed", None, vec![state.into()], Some(state.into()))
+            }
             FinalityStatus::Forked { states, majority } => (
                 "forked",
                 None,
