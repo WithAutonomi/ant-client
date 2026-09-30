@@ -361,10 +361,18 @@ impl BrowserNetworkClient {
         let payment_network = parse_payment_network(payment_network)?;
         let record = Pointer::from_bytes(record)
             .map_err(|error| JsValue::from_str(&format!("invalid pointer record: {error}")))?;
-        self.paying_client(&payment_network)
-            .pointer_put_paid(&record, proof.to_vec())
-            .await
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let client = self.paying_client(&payment_network);
+        if let Err(error) = client.pointer_put_paid(&record, proof.to_vec()).await {
+            // As for a transfer written the first time: a final state whose
+            // acknowledgements were all lost may have landed anyway.
+            if !record.is_terminal() {
+                return Err(JsValue::from_str(&error.to_string()));
+            }
+            client
+                .recover_final_write(&record, error)
+                .await
+                .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        }
         to_js(&BrowserPointer::from(&record))
     }
 }

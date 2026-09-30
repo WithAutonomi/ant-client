@@ -359,6 +359,38 @@ test("a transfer whose acknowledgements are all lost is reported as done", async
   }
 });
 
+test("a transfer stored again from onPaid is done even if every acknowledgement is lost", async () => {
+  // The page journals a paid transfer through onPaid.
+  const elsewhere = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const first = new BrowserNetworkClient(elsewhere.endpoints);
+  const recipientSeed = new Uint8Array(32).fill(0x56);
+  let paid;
+  try {
+    await first.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay);
+    const recipient = await first.createPointer(recipientSeed, target(2), "chunk",
+      paymentNetwork, wallet().pay);
+    await first.transferPointer(seed, recipient.pointer.address, paymentNetwork, wallet().pay,
+      value => { paid = value; });
+  } finally {
+    first.close();
+  }
+  assert.ok(paid, "the paid transfer was handed over");
+
+  // Stored again from the journal on a group that stores it and loses every
+  // acknowledgement.
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({
+    respond: (_channel, method) => method !== "put_pointer",
+  })));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const stored = await client.storePaidPointer(paid.record, paid.proof, paymentNetwork);
+    assert.equal(stored.address, pointerAddress(seed));
+    assert.equal((await client.pointerFinality(pointerAddress(seed))).status, "final");
+  } finally {
+    client.close();
+  }
+});
+
 test("a paid state handed to onPaid is stored again without paying", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
   const client = new BrowserNetworkClient(rtc.endpoints);
