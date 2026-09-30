@@ -448,10 +448,18 @@ impl BrowserNetworkClient {
                 crate::runtime::timeout(ON_PAID_TIMEOUT, hand_over_paid(on_paid, record, &proof))
                     .await;
         }
-        client
-            .pointer_put_paid(record, proof)
-            .await
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = client.pointer_put_paid(record, proof).await {
+            // A final state cannot be taken back, and a write whose
+            // acknowledgements were all lost may have landed anyway; the
+            // group says, as it does for a native transfer.
+            if !record.is_terminal() {
+                return Err(error.to_string());
+            }
+            client
+                .recover_final_write(record, error)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         Ok(BrowserPointerWrite {
             pointer: BrowserPointer::from(record),
             transaction_hash: submission.transaction_hash,

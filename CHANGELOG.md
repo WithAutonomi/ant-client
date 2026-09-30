@@ -10,12 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Pointer ownership transfer (ADR-0018 in `ant-node`). `ant pointer transfer --key <FILE>
   <RECIPIENT>` signs the pointer's final state, at counter `u64::MAX`, pointing at the new
-  owner's pointer: readers of the address are redirected there, the address stays the same, and
-  the former owner's key can change nothing, because a final state is replaced by nothing. It is
-  refused before paying if the pointer is already final, or if the recipient does not exist or
-  leads back. `ant pointer finality <ADDRESS>` asks the whole close group whether a pointer is
-  `open`, `settling`, `final` or `forked`, which is what a recipient checks before relying on a
-  transfer, and `ant pointer controller <ADDRESS>` follows transfers to the pointer that now
+  owner's pointer: readers of the address are redirected there by every node that holds it, the
+  address stays the same, and no node that holds it gives it up, because a final state is
+  replaced by nothing. It is refused before paying if any peer of the close group holds a final
+  state for the pointer, if not every peer answers, or if the recipient does not exist or leads
+  back. `ant pointer finality <ADDRESS>` asks the whole close group whether a pointer is `open`,
+  `settling`, `unconfirmed` (final on a majority, but not every peer answered), `final` or
+  `forked`, which is what a recipient checks before relying on a transfer, and `ant pointer controller <ADDRESS>` follows transfers to the pointer that now
   decides. In `ant-core`: `Client::pointer_transfer`, `pointer_sign_transfer`,
   `pointer_finality` and `pointer_controller`, and the new `Error::PointerFinal` and
   `Error::PointerForked`. In the browser: `transferPointer` and `pointerFinality`.

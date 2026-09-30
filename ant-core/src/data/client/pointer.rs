@@ -525,7 +525,7 @@ fn after_failed_transfer(
     put: Error,
     finality: Result<PointerFinality>,
     record: &Pointer,
-) -> Result<PointerTransfer> {
+) -> Result<PointerFinality> {
     let Ok(finality) = finality else {
         return Err(put);
     };
@@ -537,11 +537,7 @@ fn after_failed_transfer(
         FinalityStatus::Final(state) | FinalityStatus::Unconfirmed(state)
             if state.state_id == ours =>
         {
-            Ok(PointerTransfer {
-                address: record.address(),
-                state_id: ours,
-                finality: Ok(finality),
-            })
+            Ok(finality)
         }
         _ => Err(put),
     }
@@ -965,14 +961,35 @@ impl Client {
             // Nodes refuse a final state when they hold, or their group
             // proves, a different one; and a write whose acknowledgements
             // were lost may have landed all the same. The group says which.
-            let finality = self.pointer_finality(&address).await;
-            return after_failed_transfer(e, finality, &record);
+            let finality = self.recover_final_write(&record, e).await?;
+            return Ok(PointerTransfer {
+                address,
+                state_id: record.state_id(),
+                finality: Ok(finality),
+            });
         }
         Ok(PointerTransfer {
             address,
             state_id: record.state_id(),
             finality: self.pointer_finality(&address).await,
         })
+    }
+
+    /// Whether the final state `record`, whose write reported `error`, landed
+    /// anyway: the group holding it on a majority means its acknowledgements
+    /// were lost, not the write. See [`after_failed_transfer`].
+    ///
+    /// # Errors
+    ///
+    /// The rival final state that refused it, or `error` itself when the
+    /// group does not show the record held by a majority.
+    pub(crate) async fn recover_final_write(
+        &self,
+        record: &Pointer,
+        error: Error,
+    ) -> Result<PointerFinality> {
+        let finality = self.pointer_finality(&record.address()).await;
+        after_failed_transfer(error, finality, record)
     }
 
     /// Sign the final state that hands `owner`'s pointer over to the pointer
@@ -2699,7 +2716,9 @@ mod tests {
             &ours,
         );
         assert!(
-            matches!(&landed, Ok(done) if done.state_id == ours.state_id()),
+            matches!(&landed, Ok(finality)
+                if matches!(&finality.status, FinalityStatus::Final(state)
+                    if state.state_id == ours.state_id())),
             "got {landed:?}"
         );
         assert!(after_failed_transfer(

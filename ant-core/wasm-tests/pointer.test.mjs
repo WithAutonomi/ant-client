@@ -333,6 +333,32 @@ test("nodes that cannot store just then do not end a paid write", async () => {
   }
 });
 
+test("a transfer whose acknowledgements are all lost is reported as done", async () => {
+  // Every node stores the transfer and drops its answer, every round.
+  let dropPuts = false;
+  const nodes = Array.from({ length: 7 }, () => ({
+    respond: (_channel, method) => !(dropPuts && method === "put_pointer"),
+  }));
+  const rtc = mockWebRtc(nodes);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const recipientSeed = new Uint8Array(32).fill(0x55);
+  try {
+    await client.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay);
+    const recipient = await client.createPointer(recipientSeed, target(2), "chunk",
+      paymentNetwork, wallet().pay);
+    dropPuts = true;
+    const signer = wallet();
+    const done = await client.transferPointer(seed, recipient.pointer.address, paymentNetwork,
+      signer.pay);
+    assert.equal(done.pointer.address, pointerAddress(seed));
+    assert.equal(signer.calls.length, 1, "paid once");
+    const finality = await client.pointerFinality(pointerAddress(seed));
+    assert.equal(finality.status, "final");
+  } finally {
+    client.close();
+  }
+});
+
 test("a paid state handed to onPaid is stored again without paying", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
   const client = new BrowserNetworkClient(rtc.endpoints);
