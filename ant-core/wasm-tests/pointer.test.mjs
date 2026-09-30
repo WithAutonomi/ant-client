@@ -300,6 +300,39 @@ test("one node refusing while the rest miss a round does not end a paid write", 
   }
 });
 
+test("nodes that cannot store just then do not end a paid write", async () => {
+  const elsewhere = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const first = new BrowserNetworkClient(elsewhere.endpoints);
+  let paid;
+  try {
+    await first.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
+      value => { paid = value; });
+  } finally {
+    first.close();
+  }
+
+  // Two nodes have no room; the other five miss the first round.
+  const missed = new Set();
+  const nodes = Array.from({ length: 7 }, (_, index) => index < 2
+    ? { putError: { code: "storage_full", message: "disk full" } }
+    : {
+      respond: (_channel, method) => {
+        if (method !== "put_pointer" || missed.has(index)) return true;
+        missed.add(index);
+        return false;
+      },
+    });
+  const rtc = mockWebRtc(nodes);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const stored = await client.storePaidPointer(paid.record, paid.proof, paymentNetwork);
+    assert.equal(stored.address, pointerAddress(seed));
+    assert.equal(missed.size, 5);
+  } finally {
+    client.close();
+  }
+});
+
 test("a paid state handed to onPaid is stored again without paying", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
   const client = new BrowserNetworkClient(rtc.endpoints);

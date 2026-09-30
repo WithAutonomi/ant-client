@@ -309,7 +309,12 @@ fn judge_write(
 }
 
 /// Whether a pointer write that failed this way may succeed if tried again
-/// with the same proof: a shortfall or an unreachable group, not a refusal.
+/// with the same proof: a shortfall, an unreachable group, or a node that
+/// could not store it just then, not a refusal of the record itself.
+///
+/// A node answering with an error reports its own condition, such as a full
+/// disk or too many checks running, not a verdict on a record this client
+/// signed and paid for, so other peers may still take the same proof.
 fn worth_retrying(error: &Error) -> bool {
     matches!(
         error,
@@ -317,6 +322,7 @@ fn worth_retrying(error: &Error) -> bool {
             | Error::Network(_)
             | Error::Timeout(_)
             | Error::InsufficientPeers(_)
+            | Error::RemotePut { .. }
     )
 }
 
@@ -365,7 +371,12 @@ fn read_put_reply(
             hex::encode(address)
         ))),
         PointerPutResponse::PaymentRequired { message } => Err(Error::Payment(message)),
-        PointerPutResponse::Error(e) => Err(Error::Protocol(format!("pointer PUT refused: {e}"))),
+        // The node's own reason, kept as it gave it: a node that could not
+        // store the record is a shortfall to retry, not a refusal of it.
+        PointerPutResponse::Error(e) => Err(Error::RemotePut {
+            address: hex::encode(expected_address),
+            source: e,
+        }),
     })
 }
 
@@ -416,8 +427,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns an error if signing fails, payment fails, or no storer accepts
-    /// the record.
+    /// Returns an error if signing fails, payment fails, or fewer peers than
+    /// the write quorum store the record.
     pub async fn pointer_create(
         &self,
         secret_key: &MlDsaSecretKey,
@@ -467,7 +478,8 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if the current record cannot be read, the counter is
-    /// exhausted, signing fails, payment fails, or no storer accepts it.
+    /// exhausted, signing fails, payment fails, or fewer peers than the write
+    /// quorum store it.
     pub async fn pointer_update(
         &self,
         secret_key: &MlDsaSecretKey,
@@ -513,7 +525,7 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if no peer is responsible for the address, if payment
-    /// fails, or if no storer accepts the record.
+    /// fails, or if fewer peers than the write quorum store the record.
     pub async fn pointer_put(&self, record: &Pointer) -> Result<XorName> {
         let address = record.address();
         let state_id = record.state_id();
@@ -1532,6 +1544,35 @@ mod tests {
         assert!(
             matches!(&judged, Err(Error::Payment(_))),
             "two refusals with nobody storing are the answer, got {judged:?}"
+        );
+    }
+
+    /// A node that cannot store a record just then, such as one whose disk is
+    /// full, says nothing about the record. Two of them among five silent
+    /// peers leave a round to retry with the same proof.
+    #[tokio::test]
+    async fn a_node_that_cannot_store_is_a_shortfall_not_a_refusal() {
+        let in_flight: FuturesUnordered<BoxFuture<'static, Result<PutAck>>> =
+            FuturesUnordered::new();
+        for peer in 0..7 {
+            in_flight.push(Box::pin(async move {
+                if peer < 2 {
+                    Err(Error::RemotePut {
+                        address: String::new(),
+                        source: ant_protocol::ProtocolError::StorageFailed("disk full".to_string()),
+                    })
+                } else {
+                    Err(Error::Timeout("slow".to_string()))
+                }
+            }));
+        }
+        let wanted = write_quorum(7);
+        let answered = ask_the_group(in_flight, wanted, |_| true).await;
+        assert_eq!(answered.refusals, 0, "a full disk is not a refusal");
+        let judged = judge_write(&[7u8; 32], 0, wanted, false, answered);
+        assert!(
+            matches!(&judged, Err(e) if worth_retrying(e)),
+            "got {judged:?}"
         );
     }
 
