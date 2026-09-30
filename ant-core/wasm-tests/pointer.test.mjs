@@ -242,6 +242,29 @@ test("one peer claiming the pointer moved on does not end a paid write", async (
   }
 });
 
+test("an onPaid callback that never settles does not keep a paid state from being stored", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  let paid;
+  let deadline;
+  try {
+    const written = await Promise.race([
+      client.createPointer(seed, target(1), "chunk", paymentNetwork, signer.pay,
+        value => { paid = value; return new Promise(() => {}); }),
+      new Promise((_, reject) => deadline = setTimeout(
+        () => reject(new Error("the write waited on onPaid")), 10000)),
+    ]);
+    assert.ok(paid.record instanceof Uint8Array, "the paid state was handed over first");
+    assert.equal(signer.calls.length, 1, "and paid for once");
+    assert.ok(puts(rtc).length > 0, "then stored");
+    assert.deepEqual(await client.getPointer(written.pointer.address), written.pointer);
+  } finally {
+    clearTimeout(deadline);
+    client.close();
+  }
+});
+
 test("a paid state handed to onPaid is stored again without paying", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
   const client = new BrowserNetworkClient(rtc.endpoints);

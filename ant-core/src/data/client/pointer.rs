@@ -48,10 +48,12 @@ use crate::runtime::sleep;
 
 /// How many of `peers` must answer a read.
 ///
-/// Derived from the group actually returned, not from a fixed constant: the
-/// close-group width is configurable, and a fixed four against a width of
-/// twenty would let a write land on four peers and a *disjoint* four answer the
-/// read. Quorums only intersect if both are taken from the same set.
+/// `peers` is the width from [`quorum_width`]: the configured close group, or
+/// more peers than that if a lookup returned more, never fewer. It is not a
+/// fixed constant, because the close-group width is configurable, and a fixed
+/// four against a width of twenty would let a write land on four peers and a
+/// *disjoint* four answer the read. Quorums only intersect if both are taken
+/// from the same set.
 fn read_quorum(peers: usize) -> usize {
     (peers / 2) + 1
 }
