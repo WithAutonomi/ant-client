@@ -265,6 +265,41 @@ test("an onPaid callback that never settles does not keep a paid state from bein
   }
 });
 
+test("one node refusing while the rest miss a round does not end a paid write", async () => {
+  // A paid state, from a network that stored it.
+  const elsewhere = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const first = new BrowserNetworkClient(elsewhere.endpoints);
+  let paid;
+  try {
+    await first.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
+      value => { paid = value; });
+  } finally {
+    first.close();
+  }
+
+  // One node refuses every write; the other six drop the answer to their
+  // first write, so the first round hears nothing but that refusal.
+  const missed = new Set();
+  const nodes = Array.from({ length: 7 }, (_, index) => index === 0
+    ? { putError: { code: "payment_required", message: "pay up" } }
+    : {
+      respond: (_channel, method) => {
+        if (method !== "put_pointer" || missed.has(index)) return true;
+        missed.add(index);
+        return false;
+      },
+    });
+  const rtc = mockWebRtc(nodes);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const stored = await client.storePaidPointer(paid.record, paid.proof, paymentNetwork);
+    assert.equal(stored.address, pointerAddress(seed));
+    assert.equal(missed.size, 6, "every other node missed the first round");
+  } finally {
+    client.close();
+  }
+});
+
 test("a paid state handed to onPaid is stored again without paying", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
   const client = new BrowserNetworkClient(rtc.endpoints);

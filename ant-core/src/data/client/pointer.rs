@@ -576,8 +576,11 @@ impl Client {
         // A write that fell short is retried with the same proof, as a chunk
         // store is: peers that took it the first time answer `Unchanged`, which
         // counts, so each round only has to reach the ones that did not. A
-        // refusal that says something definite — a newer state won, the
-        // payment was refused, a peer acknowledged something else — is final.
+        // refusal that says something definite, such as the payment was
+        // refused or a peer acknowledged something else, is final only once a
+        // second peer repeats it and nobody stored the record; a newer state
+        // winning is final once a read confirms it (see [`judge_write`]). One
+        // peer's refusal alone is retried like any shortfall.
         let mut attempt = 0;
         loop {
             match self.pointer_put_once(record, &proof).await {
@@ -1470,7 +1473,7 @@ mod tests {
     }
 
     /// A refusal is kept apart from a missing answer, so a write that fell
-    /// short because a peer said no reports that, and is not retried.
+    /// short because peers said no can report that rather than a timeout.
     #[tokio::test]
     async fn a_refusal_is_kept_apart_from_a_missing_answer() {
         let in_flight: FuturesUnordered<BoxFuture<'static, Result<()>>> = FuturesUnordered::new();
@@ -1485,11 +1488,51 @@ mod tests {
 
         let answered = ask_the_group(in_flight, write_quorum(7), |()| true).await;
         assert_eq!(answered.count, 1);
+        assert_eq!(answered.refusals, 1);
         assert!(
             matches!(&answered.refusal, Some(Error::InvalidData(message)) if message.contains("moved")),
             "the refusal is what the write reports"
         );
         assert!(matches!(answered.last_error, Some(Error::Timeout(_))));
+    }
+
+    /// Refusals are counted as they arrive through the group, not only the
+    /// first kept. One refusal among six silent peers is retried with the
+    /// proof already paid for; a second makes it the answer.
+    #[tokio::test]
+    async fn refusals_are_counted_through_the_group_and_judged_by_how_many() {
+        let group = |refusals: usize| {
+            let in_flight: FuturesUnordered<BoxFuture<'static, Result<PutAck>>> =
+                FuturesUnordered::new();
+            for peer in 0..7 {
+                in_flight.push(Box::pin(async move {
+                    if peer < refusals {
+                        Err(Error::Payment("pay up".to_string()))
+                    } else {
+                        Err(Error::Timeout("slow".to_string()))
+                    }
+                }));
+            }
+            in_flight
+        };
+        let address = [7u8; 32];
+        let wanted = write_quorum(7);
+
+        let one = ask_the_group(group(1), wanted, |_| true).await;
+        assert_eq!(one.refusals, 1);
+        let judged = judge_write(&address, 0, wanted, false, one);
+        assert!(
+            matches!(&judged, Err(e) if worth_retrying(e)),
+            "one refusal among silent peers is retried, got {judged:?}"
+        );
+
+        let two = ask_the_group(group(2), wanted, |_| true).await;
+        assert_eq!(two.refusals, 2);
+        let judged = judge_write(&address, 0, wanted, false, two);
+        assert!(
+            matches!(&judged, Err(Error::Payment(_))),
+            "two refusals with nobody storing are the answer, got {judged:?}"
+        );
     }
 
     /// A write quorum and a read quorum must intersect at every group width.
