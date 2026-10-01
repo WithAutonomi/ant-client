@@ -58,10 +58,11 @@ export function mockWebRtc(nodes = [{}]) {
         if (record.length) stores[this.index].set(key, record);
       }
       const put = method === "put_chunk" || method === "put_pointer";
+      const address = method === "get_chunk" ? this.server.last_get_address() : undefined;
       requests.push({ node: this.index, method, ...(put ? {
         address: this.server.last_put_address(),
         quoteHash: this.server.last_put_quote_hash(),
-      } : {}) });
+      } : {}), ...(address ? { address } : {}) });
       if (this.options.respond?.(this, method, response) === false) return;
       setTimeout(() => {
         if (this.options.multiplex && method !== "handshake") response = this.server.seal_response(response);
@@ -69,7 +70,7 @@ export function mockWebRtc(nodes = [{}]) {
         for (let offset = 0; offset < response.length; offset += 16_384) {
           this.emit(response.slice(offset, offset + 16_384).buffer);
         }
-      }, this.options.delay?.(method) ?? 0);
+      }, this.options.delay?.(method, address) ?? 0);
     }
     // Matches node-datachannel's polyfill, which the Node.js WASM client
     // runs on: close() only records the request and defers the native close

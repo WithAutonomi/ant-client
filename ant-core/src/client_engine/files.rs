@@ -144,6 +144,7 @@ where
 
 /// Plaintext layout of a resolved root DataMap, in record order. Chunk sizes are
 /// read from the native DataMap; checked sums avoid overflow on untrusted maps.
+#[derive(Default)]
 pub(crate) struct RecordLayout {
     /// Plaintext end offset and content address of each record.
     records: Vec<(usize, [u8; 32])>,

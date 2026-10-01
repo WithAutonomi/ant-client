@@ -334,6 +334,7 @@ pub struct BrowserTestNode {
     committed_key_count: u32,
     last_put_address: String,
     last_put_quote_hash: String,
+    last_get_address: String,
     closest_peers: Vec<BrowserNode>,
     put_error: Option<(String, String)>,
     pointers_enabled: bool,
@@ -387,6 +388,7 @@ impl BrowserTestNode {
             committed_key_count: 0,
             last_put_address: String::new(),
             last_put_quote_hash: String::new(),
+            last_get_address: String::new(),
             closest_peers: Vec::new(),
             put_error: None,
             pointers_enabled: true,
@@ -443,6 +445,9 @@ impl BrowserTestNode {
     }
     pub fn last_put_quote_hash(&self) -> String {
         self.last_put_quote_hash.clone()
+    }
+    pub fn last_get_address(&self) -> String {
+        self.last_get_address.clone()
     }
     pub fn push(&mut self, message: &[u8]) -> Vec<u8> {
         self.received.extend_from_slice(message);
@@ -618,6 +623,7 @@ impl BrowserTestNode {
             }
             BrowserRequestBody::GetChunk { address } => {
                 self.last_method = "get_chunk".into();
+                self.last_get_address.clone_from(&address);
                 if let Some(content) = self.records.get(&address) {
                     self.chunk = content.clone();
                 }
@@ -872,6 +878,7 @@ impl BrowserTestNode {
             }
             Body::GetRequest(request) => {
                 self.last_method = "get_chunk".into();
+                self.last_get_address = hex::encode(request.address);
                 let content = self
                     .records
                     .get(&hex::encode(request.address))
@@ -1273,7 +1280,7 @@ pub async fn test_cancelled_read_reservation(endpoint: &str) {
     let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
     client.hello().await.unwrap();
     let budget = crate::client_engine::read_budget::ReadBudget::new(1, 1);
-    let permit = budget.acquire(|| 1).await.unwrap();
+    let permit = budget.acquire(|| 1, || false).await.unwrap();
     let authenticated = client.authenticated().await.unwrap();
     let request = authenticated.request_reserved(
         BrowserRequestBody::GetChunk {
@@ -1288,12 +1295,12 @@ pub async fn test_cancelled_read_reservation(endpoint: &str) {
         .await
         .is_err());
     assert!(
-        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1))
+        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1, || false))
             .await
             .is_err()
     );
     crate::runtime::sleep(Duration::from_millis(120)).await;
-    let permit = crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1))
+    let permit = crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1, || false))
         .await
         .unwrap()
         .unwrap();
@@ -1313,13 +1320,13 @@ pub async fn test_cancelled_read_reservation(endpoint: &str) {
         .await
         .unwrap();
     assert!(
-        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1))
+        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1, || false))
             .await
             .is_err()
     );
     drop(retained);
     assert!(
-        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1))
+        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1, || false))
             .await
             .is_ok()
     );

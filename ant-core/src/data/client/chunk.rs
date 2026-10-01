@@ -426,19 +426,30 @@ impl Client {
                 diag,
             )
             .await;
-        let latency = started.elapsed();
+        self.observe_chunk_get(&result, started.elapsed(), epoch);
+        result
+    }
+
+    /// Feed one `chunk_get` outcome to the adaptive fetch limiter, including
+    /// one another client fetched on this client's behalf. `epoch` is the
+    /// limiter's observation epoch when the fetch started.
+    pub(crate) fn observe_chunk_get(
+        &self,
+        result: &Result<Option<DataChunk>>,
+        latency: Duration,
+        epoch: u64,
+    ) {
         let bytes = result
             .as_ref()
             .ok()
             .and_then(Option::as_ref)
             .map_or(0, |chunk| chunk.content.len() as u64);
         self.controller().fetch.observe_fetch_in_epoch(
-            chunk_get_outcome(&result),
+            chunk_get_outcome(result),
             latency,
             bytes,
             epoch,
         );
-        result
     }
 }
 
