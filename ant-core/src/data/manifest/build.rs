@@ -1,0 +1,386 @@
+//! Building a manifest from local files and public addresses.
+//!
+//! Local files are uploaded through the ordinary file upload with the
+//! visibility the caller chose. Already-public files are added by address
+//! and nothing is uploaded. The builder never stores a DataMap chunk on its
+//! own: a file becomes public only through the caller's upload choice.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use self_encryption::MIN_ENCRYPTABLE_BYTES;
+use tokio::sync::mpsc;
+
+use crate::data::client::file::{UploadEvent, Visibility};
+use crate::data::client::merkle::PaymentMode;
+use crate::data::Client;
+
+use super::path::PATH_SEPARATOR;
+use super::{ContentRef, Manifest, ManifestEntry, ManifestError, ADDRESS_LEN};
+
+/// Capacity of the per-file upload progress channel.
+const UPLOAD_PROGRESS_CAPACITY: usize = 64;
+
+/// How a locally uploaded file is referenced from the manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReferenceMode {
+    /// Embed the DataMap. The recipient skips one fetch per file.
+    #[default]
+    Embedded,
+    /// Prefer a public address wherever the DataMap chunk is already on
+    /// the network; embed otherwise. Never stores a DataMap chunk itself.
+    Compact,
+}
+
+/// Options for [`ManifestBuilder`].
+#[derive(Debug, Clone, Default)]
+pub struct BuildOptions {
+    /// Suggested root directory name.
+    pub name: Option<String>,
+    /// How uploaded files are referenced.
+    pub reference_mode: ReferenceMode,
+    /// Visibility of the file uploads themselves. `Public` stores each
+    /// file's DataMap chunk and makes the file public.
+    pub visibility: Visibility,
+    /// Payment mode for the uploads.
+    pub payment_mode: PaymentMode,
+    /// Follow symlinks to regular files instead of skipping them.
+    pub follow_symlinks: bool,
+}
+
+/// Progress during [`ManifestBuilder::finish`].
+#[derive(Debug, Clone)]
+pub enum BuildEvent {
+    /// An upload is starting.
+    FileStarted {
+        /// Manifest path of the file.
+        path: String,
+        /// Zero-based index among the files to upload.
+        index: usize,
+        /// Number of files to upload.
+        total: usize,
+    },
+    /// Progress from the underlying file upload.
+    Upload {
+        /// Manifest path of the file.
+        path: String,
+        /// The upload event.
+        event: UploadEvent,
+    },
+    /// An upload finished.
+    FileFinished {
+        /// Manifest path of the file.
+        path: String,
+        /// Chunks newly stored by this upload.
+        chunks_stored: usize,
+        /// `embedded` or `public`.
+        reference: &'static str,
+    },
+}
+
+/// What [`ManifestBuilder::finish`] produced.
+#[derive(Debug, Clone)]
+pub struct BuildResult {
+    /// The finished, canonical manifest.
+    pub manifest: Manifest,
+    /// Symlinks skipped during directory walks.
+    pub skipped_symlinks: Vec<PathBuf>,
+    /// Files uploaded.
+    pub files_uploaded: usize,
+    /// Chunks newly stored across all uploads.
+    pub chunks_stored: usize,
+    /// Storage paid across all uploads, in atto tokens.
+    pub storage_cost_atto: u128,
+    /// Gas paid across all uploads, in wei.
+    pub gas_cost_wei: u128,
+}
+
+struct PendingFile {
+    local: PathBuf,
+    path: String,
+}
+
+/// Collects files and addresses, then uploads and assembles a manifest.
+pub struct ManifestBuilder<'a> {
+    client: &'a Client,
+    options: BuildOptions,
+    pending: Vec<PendingFile>,
+    entries: Vec<ManifestEntry>,
+    skipped_symlinks: Vec<PathBuf>,
+}
+
+impl<'a> ManifestBuilder<'a> {
+    /// A builder that uploads through `client`.
+    pub fn new(client: &'a Client, options: BuildOptions) -> Self {
+        Self {
+            client,
+            options,
+            pending: Vec::new(),
+            entries: Vec::new(),
+            skipped_symlinks: Vec::new(),
+        }
+    }
+
+    /// Number of local files queued for upload.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Add a local file or directory. A directory's entries are prefixed
+    /// with its own name; a file is added under its file name.
+    pub fn add_path(&mut self, local: &Path) -> Result<(), ManifestError> {
+        let meta = fs::symlink_metadata(local)?;
+        let name = file_name_utf8(local)?;
+        if meta.is_dir() {
+            self.add_directory(local, Some(&name))
+        } else if meta.file_type().is_symlink() {
+            if self.options.follow_symlinks && fs::metadata(local)?.is_file() {
+                self.add_file(local, name)
+            } else {
+                self.skipped_symlinks.push(local.to_path_buf());
+                Ok(())
+            }
+        } else {
+            self.add_file(local, name)
+        }
+    }
+
+    /// Queue one local file under `path`.
+    pub fn add_file(&mut self, local: &Path, path: String) -> Result<(), ManifestError> {
+        super::path::validate_path(&path).map_err(|reason| ManifestError::InvalidPath {
+            path: path.clone(),
+            reason,
+        })?;
+        self.pending.push(PendingFile {
+            local: local.to_path_buf(),
+            path,
+        });
+        Ok(())
+    }
+
+    /// Queue every regular file under `root`, with paths relative to it,
+    /// optionally under `prefix`. Entries are sorted by path. Symlinks are
+    /// skipped and reported unless `follow_symlinks` is set, in which case
+    /// symlinks to regular files are included.
+    pub fn add_directory(
+        &mut self,
+        root: &Path,
+        prefix: Option<&str>,
+    ) -> Result<(), ManifestError> {
+        let mut files = Vec::new();
+        self.walk(root, prefix.unwrap_or(""), &mut files)?;
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        for file in files {
+            self.add_file(&file.local, file.path)?;
+        }
+        Ok(())
+    }
+
+    /// Add an already-public file by address. Nothing is uploaded.
+    pub fn add_public(
+        &mut self,
+        address: [u8; ADDRESS_LEN],
+        path: Option<String>,
+        size: Option<u64>,
+    ) -> Result<(), ManifestError> {
+        if let Some(p) = &path {
+            super::path::validate_path(p).map_err(|reason| ManifestError::InvalidPath {
+                path: p.clone(),
+                reason,
+            })?;
+        }
+        self.entries.push(ManifestEntry {
+            path,
+            size,
+            source: ContentRef::Public { address },
+        });
+        Ok(())
+    }
+
+    /// Upload every queued file and assemble the manifest.
+    pub async fn finish(
+        mut self,
+        progress: Option<mpsc::Sender<BuildEvent>>,
+    ) -> Result<BuildResult, ManifestError> {
+        let total = self.pending.len();
+        let mut files_uploaded = 0;
+        let mut chunks_stored = 0;
+        let mut storage_cost_atto: u128 = 0;
+        let mut gas_cost_wei: u128 = 0;
+
+        let pending = std::mem::take(&mut self.pending);
+        for (index, file) in pending.into_iter().enumerate() {
+            let size = fs::metadata(&file.local)?.len();
+            if size < MIN_ENCRYPTABLE_BYTES as u64 {
+                return Err(ManifestError::Build(format!(
+                    "{} is {size} bytes; files need at least {MIN_ENCRYPTABLE_BYTES} bytes to upload",
+                    file.local.display()
+                )));
+            }
+            if let Some(tx) = &progress {
+                let _ = tx
+                    .send(BuildEvent::FileStarted {
+                        path: file.path.clone(),
+                        index,
+                        total,
+                    })
+                    .await;
+            }
+
+            let upload_progress = progress.as_ref().map(|tx| {
+                let (upload_tx, mut upload_rx) = mpsc::channel(UPLOAD_PROGRESS_CAPACITY);
+                let tx = tx.clone();
+                let path = file.path.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = upload_rx.recv().await {
+                        let _ = tx
+                            .send(BuildEvent::Upload {
+                                path: path.clone(),
+                                event,
+                            })
+                            .await;
+                    }
+                });
+                upload_tx
+            });
+
+            let result = self
+                .client
+                .file_upload_with_visibility_and_progress(
+                    &file.local,
+                    self.options.payment_mode,
+                    self.options.visibility,
+                    upload_progress,
+                )
+                .await?;
+
+            files_uploaded += 1;
+            chunks_stored += result.chunks_stored;
+            storage_cost_atto =
+                storage_cost_atto.saturating_add(parse_atto(&result.storage_cost_atto)?);
+            gas_cost_wei = gas_cost_wei.saturating_add(result.gas_cost_wei);
+
+            let source = self
+                .reference_for(&result.data_map, result.data_map_address)
+                .await?;
+            let reference = source.kind();
+            self.entries.push(ManifestEntry {
+                path: Some(file.path.clone()),
+                size: Some(size),
+                source,
+            });
+
+            if let Some(tx) = &progress {
+                let _ = tx
+                    .send(BuildEvent::FileFinished {
+                        path: file.path,
+                        chunks_stored: result.chunks_stored,
+                        reference,
+                    })
+                    .await;
+            }
+        }
+
+        let mut manifest = Manifest {
+            name: self.options.name.clone(),
+            entries: std::mem::take(&mut self.entries),
+        };
+        manifest.canonicalize()?;
+
+        Ok(BuildResult {
+            manifest,
+            skipped_symlinks: self.skipped_symlinks,
+            files_uploaded,
+            chunks_stored,
+            storage_cost_atto,
+            gas_cost_wei,
+        })
+    }
+
+    async fn reference_for(
+        &self,
+        data_map: &self_encryption::DataMap,
+        public_address: Option<[u8; ADDRESS_LEN]>,
+    ) -> Result<ContentRef, ManifestError> {
+        if let Some(address) = public_address {
+            return Ok(ContentRef::Public { address });
+        }
+        let embedded = ContentRef::Embedded {
+            data_map: data_map.clone(),
+        };
+        if self.options.reference_mode == ReferenceMode::Compact {
+            let address = embedded.content_address()?;
+            if self.client.chunk_exists(&address).await? {
+                return Ok(ContentRef::Public { address });
+            }
+        }
+        Ok(embedded)
+    }
+
+    fn walk(
+        &mut self,
+        dir: &Path,
+        prefix: &str,
+        out: &mut Vec<PendingFile>,
+    ) -> Result<(), ManifestError> {
+        let mut children: Vec<_> = fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            let local = child.path();
+            let name = file_name_utf8(&local)?;
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}{PATH_SEPARATOR}{name}")
+            };
+            let meta = fs::symlink_metadata(&local)?;
+            if meta.file_type().is_symlink() {
+                if self.options.follow_symlinks && fs::metadata(&local)?.is_file() {
+                    out.push(PendingFile { local, path });
+                } else {
+                    self.skipped_symlinks.push(local);
+                }
+            } else if meta.is_dir() {
+                self.walk(&local, &path, out)?;
+            } else if meta.is_file() {
+                out.push(PendingFile { local, path });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn file_name_utf8(path: &Path) -> Result<String, ManifestError> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| ManifestError::Build(format!("{} has no UTF-8 file name", path.display())))
+}
+
+fn parse_atto(value: &str) -> Result<u128, ManifestError> {
+    value
+        .parse::<u128>()
+        .map_err(|e| ManifestError::Build(format!("storage cost {value:?} is not a number: {e}")))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_name_requires_utf8_and_a_name() {
+        assert_eq!(file_name_utf8(Path::new("a/b.txt")).unwrap(), "b.txt");
+        assert!(file_name_utf8(Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn atto_parsing() {
+        assert_eq!(parse_atto("0").unwrap(), 0);
+        assert_eq!(
+            parse_atto("123456789012345678901").unwrap(),
+            123456789012345678901
+        );
+        assert!(parse_atto("x").is_err());
+    }
+}

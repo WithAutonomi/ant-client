@@ -2,7 +2,7 @@ use ant_core::data::MultiAddr;
 use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::commands::data::{ChunkAction, FileAction, PointerAction, WalletAction};
+use crate::commands::data::{ChunkAction, FileAction, ManifestAction, PointerAction, WalletAction};
 use crate::commands::node::NodeCommand;
 use crate::commands::update::UpdateArgs;
 
@@ -114,6 +114,11 @@ pub enum Commands {
     Pointer {
         #[command(subcommand)]
         action: PointerAction,
+    },
+    /// Manifest operations (torrent-like file sets shared as .ant files or ant:// links)
+    Manifest {
+        #[command(subcommand)]
+        action: ManifestAction,
     },
     /// Update the ant binary to the latest version
     Update(UpdateArgs),

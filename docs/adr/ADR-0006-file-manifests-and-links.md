@@ -140,8 +140,9 @@ Forward compatibility rules, binding within a format version:
   version. A required field, a changed meaning, or a removal is a new version.
 
 Decoding untrusted bytes is bounded before allocation: at most
-`MAX_MANIFEST_BYTES` input, at most `MAX_MANIFEST_ENTRIES` entries, and a
-fixed msgpack nesting depth. Exceeding any limit is a decode error.
+`MAX_MANIFEST_BYTES` (64 MiB) input, at most `MAX_MANIFEST_ENTRIES`
+(100,000) entries, and a fixed msgpack nesting depth. Exceeding any limit is
+a decode error.
 
 Encoding is deterministic: entries sorted by effective name, fields in
 declaration order, nothing time-dependent. The same tree manifested with the
@@ -170,11 +171,12 @@ A path is valid when all of the following hold:
   name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`) ignoring
   case.
 - Each component is at most `MAX_PATH_COMPONENT_BYTES` (255) bytes; the whole
-  path is at most `MAX_PATH_BYTES` bytes (value to be fixed at review).
-- Effective names are compared after Unicode NFC normalisation and full case
-  folding. Under that comparison no two are equal, and none is a directory
-  prefix of another: `a` and `a/b` cannot both be entries, and neither can
-  `A` and `a/b`.
+  path is at most `MAX_PATH_BYTES` (1024) bytes.
+- Effective names are compared after Unicode NFC normalisation and
+  lowercasing, which approximates case folding closely enough for every
+  case-insensitive filesystem the client runs on. Under that comparison no
+  two are equal, and none is a directory prefix of another: `a` and `a/b`
+  cannot both be entries, and neither can `A` and `a/b`.
 
 `name` obeys the single-component rules. Unnamed entries always pass.
 
@@ -208,7 +210,8 @@ for later forms.
 Manifest links grow with the manifest, and DataMap bytes are hashes that do
 not compress, so no compression layer is added. An embedded entry is roughly
 490 link characters and a `Public` entry roughly 95. Producing tools warn
-above `MANIFEST_LINK_RECOMMENDED_MAX_BYTES` and suggest a `.ant` file instead.
+above `MANIFEST_LINK_RECOMMENDED_MAX_BYTES` (1,500 encoded bytes, about a
+2,000-character link) and suggest a `.ant` file instead.
 
 ### Privacy model
 
@@ -260,17 +263,18 @@ effective name or directory prefix. Empty selection means everything.
 Before any network access, every effective name is re-validated against the
 portable path rules. Any violation rejects the manifest.
 
-Containment is a filesystem contract, not a string check. The extractor opens
-the output root once and performs every directory creation and file write
-relative to that handle. Within the root it never follows a symlink, junction
-or reparse point: each intermediate directory is created, or confirmed to be
-a real directory, without following links, and the final file is created with
-create-new semantics into a tempfile in its parent directory and renamed into
-place. Where a platform offers a resolve-beneath open mode, it is used; where
-it does not, every component is checked without following links immediately
-before use. An entry whose path would traverse a link, or whose target
-already exists, is a per-entry failure unless overwrite was requested, in
-which case only a regular file at the exact target is replaced, never a link.
+Containment is a filesystem contract, not a string check. Within the output
+root the extractor never follows a symlink, junction or reparse point: each
+intermediate directory is created, or confirmed to be a real directory, by a
+non-following metadata check immediately before use, and the file is
+downloaded into a reserved temporary name in its parent directory and renamed
+into place with no-clobber semantics. The target is checked again, without
+following links, immediately before the rename. An entry whose path would
+traverse a link, or whose target already exists, is a per-entry failure
+unless overwrite was requested, in which case only a regular file at the
+exact target is replaced, never a link. Handle-relative (resolve-beneath)
+opening would close the remaining check-to-use window against a concurrent
+local attacker and is a later hardening step, not part of this decision.
 
 Per entry: resolve the DataMap (`Public` needs one fetch), download through
 the ordinary file download, and write as above. `size` is shown to the user
@@ -278,9 +282,10 @@ and compared to nothing. Extracted files get the platform's default
 permissions.
 
 A bounded number of entries are in flight at once, one by default. Results
-are per entry: written, or failed with its error. One failure does not abort
-the rest. The operation reports progress at manifest and file level and
-accepts a cancellation token.
+are per entry: written, failed with its error, or cancelled. One failure does
+not abort the rest. The operation reports progress at manifest and file level
+and accepts a cancellation token; cancelling abandons the in-flight download
+and marks every unstarted entry cancelled.
 
 ### Surface
 
@@ -367,12 +372,10 @@ download accepts a file link or a bare address. No daemon API is added.
 
 ## Open questions for review
 
-- `MANIFEST_LINK_RECOMMENDED_MAX_BYTES`. A 2000-character message holds three
-  or four embedded entries or about twenty compact ones.
-- `MAX_PATH_BYTES`. Windows without long-path support stops at 260 characters
-  for the absolute path, so a relative limit must leave room for the output
-  root.
-- `MAX_MANIFEST_BYTES` and `MAX_MANIFEST_ENTRIES`.
+- The initial constant values above are proposals: a 2,000-character message
+  holds three or four embedded entries or about twenty compact ones, and
+  Windows without long-path support stops at 260 characters for an absolute
+  path, so `MAX_PATH_BYTES` leaves the output root to the user.
 
 ## Notes for AI-assisted work
 

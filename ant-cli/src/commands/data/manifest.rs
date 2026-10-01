@@ -1,0 +1,683 @@
+//! Manifest commands (ADR-0006).
+//!
+//! A manifest is a torrent-like description of a set of files. It is shared
+//! off the network as a `.ant` file or an `ant://manifest/...` link, never
+//! stored on the network.
+
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use ant_core::data::{
+    extract_manifest, is_link, manifest_filename_for, manifest_link, parse_link,
+    read_manifest_file, write_manifest_file, BuildEvent, BuildOptions, Client, ContentRef,
+    DownloadEvent, EntryStatus, ExtractEvent, ExtractOptions, Link, Manifest, ManifestBuilder,
+    PaymentMode, ReferenceMode, UploadEvent, Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+};
+use clap::Subcommand;
+use serde_json::json;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tracing::info;
+
+use crate::progress;
+
+/// Entries downloaded at once unless `--concurrency` says otherwise.
+const DEFAULT_CONCURRENCY: usize = 1;
+/// Capacity of the progress channels between core and the terminal UI.
+const PROGRESS_CHANNEL_CAPACITY: usize = 64;
+/// Separator between address and path in `--public-file ADDRESS=PATH`.
+const PUBLIC_FILE_SEPARATOR: char = '=';
+
+/// Manifest subcommands.
+#[derive(Subcommand, Debug)]
+pub enum ManifestAction {
+    /// Upload files and write a manifest describing them.
+    ///
+    /// One directory: its contents become the entries and its name the
+    /// manifest name. Otherwise each path is added under its own name.
+    Create {
+        /// Files or directories to upload.
+        paths: Vec<PathBuf>,
+        /// Where to write the manifest. Defaults to `<name>.ant` here.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Manifest name, used as the default extraction directory.
+        #[arg(long)]
+        name: Option<String>,
+        /// Reference files by public address where their DataMap chunk is
+        /// already on the network, to keep the manifest small. Never
+        /// publishes anything itself.
+        #[arg(long)]
+        compact: bool,
+        /// Upload the files as public (stores each DataMap chunk). Anyone
+        /// with a file's address can then download it.
+        #[arg(long)]
+        public: bool,
+        /// Follow symlinks to regular files instead of skipping them.
+        #[arg(long)]
+        follow_symlinks: bool,
+        /// Add an already-public file by address, optionally under PATH.
+        #[arg(long = "public-file", value_name = "ADDRESS[=PATH]")]
+        public_files: Vec<String>,
+        /// Force merkle batch payment regardless of chunk count.
+        #[arg(long, conflicts_with = "no_merkle")]
+        merkle: bool,
+        /// Disable merkle batch payment, always use per-chunk payments.
+        #[arg(long, conflicts_with = "merkle")]
+        no_merkle: bool,
+        /// Replace an existing manifest file at the output path.
+        #[arg(long)]
+        overwrite: bool,
+        /// Also print the manifest as an `ant://manifest/...` link.
+        #[arg(long)]
+        link: bool,
+    },
+    /// List the entries of a manifest file or link.
+    Show {
+        /// A `.ant` file or an `ant://manifest/...` link.
+        source: String,
+    },
+    /// Print a manifest file as an `ant://manifest/...` link.
+    Link {
+        /// The `.ant` file.
+        file: PathBuf,
+    },
+    /// Download the files a manifest describes.
+    Download {
+        /// A `.ant` file or an `ant://manifest/...` link.
+        source: String,
+        /// Directory to extract into. Defaults to the manifest name, or
+        /// the current directory when it has none.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Only extract these entries or directories. Repeatable.
+        #[arg(long = "select", value_name = "PATH")]
+        selection: Vec<String>,
+        /// Replace existing regular files at target paths.
+        #[arg(long)]
+        overwrite: bool,
+        /// Entries to download at once.
+        #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
+        concurrency: usize,
+    },
+}
+
+impl ManifestAction {
+    /// Whether the command talks to the network.
+    pub fn needs_network(&self) -> bool {
+        match self {
+            Self::Create { paths, .. } => !paths.is_empty(),
+            Self::Download { .. } => true,
+            Self::Show { .. } | Self::Link { .. } => false,
+        }
+    }
+
+    /// Whether the command pays for anything.
+    pub fn needs_wallet(&self) -> bool {
+        matches!(self, Self::Create { paths, .. } if !paths.is_empty())
+    }
+
+    /// Run a command that needs no network.
+    pub fn execute_offline(self, json: bool) -> anyhow::Result<()> {
+        match self {
+            Self::Show { source } => show(&load_manifest(&source)?, json),
+            Self::Link { file } => link(&read_manifest_file(&file)?, json),
+            Self::Create {
+                paths,
+                output,
+                name,
+                public_files,
+                overwrite,
+                link,
+                ..
+            } if paths.is_empty() => {
+                // Nothing to upload: a manifest over already-public files.
+                let mut manifest = Manifest::new(name);
+                for spec in &public_files {
+                    let (address, path) = parse_public_file(spec)?;
+                    manifest.entries.push(ant_core::data::ManifestEntry {
+                        path,
+                        size: None,
+                        source: ContentRef::Public { address },
+                    });
+                }
+                if manifest.entries.is_empty() {
+                    anyhow::bail!("nothing to add: pass files, directories or --public-file");
+                }
+                manifest.canonicalize()?;
+                let out = write_manifest(&manifest, output, overwrite)?;
+                report_created(&manifest, &out, None, link, json)
+            }
+            Self::Create { .. } | Self::Download { .. } => {
+                anyhow::bail!("this command needs a network connection")
+            }
+        }
+    }
+
+    /// Run a command against the network.
+    pub async fn execute(self, client: &Client, json: bool) -> anyhow::Result<()> {
+        match self {
+            Self::Create {
+                paths,
+                output,
+                name,
+                compact,
+                public,
+                follow_symlinks,
+                public_files,
+                merkle,
+                no_merkle,
+                overwrite,
+                link,
+            } => {
+                let payment_mode = if merkle {
+                    PaymentMode::Merkle
+                } else if no_merkle {
+                    PaymentMode::Single
+                } else {
+                    PaymentMode::Auto
+                };
+                create(
+                    client,
+                    CreateArgs {
+                        paths,
+                        output,
+                        name,
+                        compact,
+                        public,
+                        follow_symlinks,
+                        public_files,
+                        payment_mode,
+                        overwrite,
+                        link,
+                    },
+                    json,
+                )
+                .await
+            }
+            Self::Download {
+                source,
+                output,
+                selection,
+                overwrite,
+                concurrency,
+            } => {
+                let concurrency = NonZeroUsize::new(concurrency)
+                    .ok_or_else(|| anyhow::anyhow!("--concurrency must be at least 1"))?;
+                download(
+                    client,
+                    &load_manifest(&source)?,
+                    output,
+                    selection,
+                    overwrite,
+                    concurrency,
+                    json,
+                )
+                .await
+            }
+            Self::Show { .. } | Self::Link { .. } => self.execute_offline(json),
+        }
+    }
+}
+
+struct CreateArgs {
+    paths: Vec<PathBuf>,
+    output: Option<PathBuf>,
+    name: Option<String>,
+    compact: bool,
+    public: bool,
+    follow_symlinks: bool,
+    public_files: Vec<String>,
+    payment_mode: PaymentMode,
+    overwrite: bool,
+    link: bool,
+}
+
+async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result<()> {
+    let single_dir = match args.paths.as_slice() {
+        [only] if only.is_dir() => Some(only.clone()),
+        _ => None,
+    };
+    let name = args.name.or_else(|| {
+        single_dir
+            .as_ref()
+            .and_then(|d| d.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+    });
+
+    let options = BuildOptions {
+        name,
+        reference_mode: if args.compact {
+            ReferenceMode::Compact
+        } else {
+            ReferenceMode::Embedded
+        },
+        visibility: if args.public {
+            Visibility::Public
+        } else {
+            Visibility::Private
+        },
+        payment_mode: args.payment_mode,
+        follow_symlinks: args.follow_symlinks,
+    };
+    let mut builder = ManifestBuilder::new(client, options);
+    if let Some(dir) = &single_dir {
+        builder.add_directory(dir, None)?;
+    } else {
+        for path in &args.paths {
+            builder.add_path(path)?;
+        }
+    }
+    for spec in &args.public_files {
+        let (address, path) = parse_public_file(spec)?;
+        builder.add_public(address, path, None)?;
+    }
+    if builder.pending_count() == 0 && args.public_files.is_empty() {
+        anyhow::bail!("nothing to add: the given paths contain no regular files");
+    }
+
+    info!("Building manifest from {} file(s)", builder.pending_count());
+    let start = Instant::now();
+    let result = if json {
+        builder.finish(None).await?
+    } else {
+        let (tx, rx) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let ui = tokio::spawn(drive_build_progress(rx));
+        let result = builder.finish(Some(tx)).await;
+        let _ = ui.await;
+        result?
+    };
+
+    let out = write_manifest(&result.manifest, args.output, args.overwrite)?;
+    if !json {
+        eprintln!(
+            "Uploaded {} file(s), {} new chunk(s) in {:.1}s",
+            result.files_uploaded,
+            result.chunks_stored,
+            start.elapsed().as_secs_f64()
+        );
+        for skipped in &result.skipped_symlinks {
+            eprintln!("Skipped symlink: {}", skipped.display());
+        }
+    }
+    report_created(&result.manifest, &out, Some(&result), args.link, json)
+}
+
+fn write_manifest(
+    manifest: &Manifest,
+    output: Option<PathBuf>,
+    overwrite: bool,
+) -> anyhow::Result<PathBuf> {
+    let out =
+        output.unwrap_or_else(|| PathBuf::from(manifest_filename_for(manifest.name.as_deref())));
+    write_manifest_file(&out, manifest, overwrite)
+        .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", out.display()))?;
+    Ok(out)
+}
+
+fn report_created(
+    manifest: &Manifest,
+    out: &Path,
+    result: Option<&ant_core::data::BuildResult>,
+    with_link: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let link_text = if with_link {
+        Some(manifest_link(manifest)?)
+    } else {
+        None
+    };
+    if json {
+        let mut value = json!({
+            "manifest_file": out.display().to_string(),
+            "name": manifest.name,
+            "entries": entries_json(manifest)?,
+            "total_size": manifest.total_size(),
+            "link": link_text,
+        });
+        if let Some(r) = result {
+            value["files_uploaded"] = json!(r.files_uploaded);
+            value["chunks_stored"] = json!(r.chunks_stored);
+            value["storage_cost_atto"] = json!(r.storage_cost_atto.to_string());
+            value["gas_cost_wei"] = json!(r.gas_cost_wei.to_string());
+            value["skipped_symlinks"] = json!(r
+                .skipped_symlinks
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>());
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    println!(
+        "Wrote {} ({} entr{})",
+        out.display(),
+        manifest.entries.len(),
+        if manifest.entries.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        }
+    );
+    if let Some(link) = link_text {
+        warn_if_long_link(manifest)?;
+        println!("{link}");
+    }
+    Ok(())
+}
+
+fn show(manifest: &Manifest, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "name": manifest.name,
+                "total_size": manifest.total_size(),
+                "entries": entries_json(manifest)?,
+            }))?
+        );
+        return Ok(());
+    }
+    println!("Name:    {}", manifest.name.as_deref().unwrap_or("(none)"));
+    println!("Entries: {}", manifest.entries.len());
+    if let Some(total) = manifest.total_size() {
+        println!("Size:    {total} bytes");
+    }
+    println!();
+    for entry in &manifest.entries {
+        let size = entry
+            .size
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        println!(
+            "{:>12}  {:<9} {}",
+            size,
+            entry.source.kind(),
+            entry.effective_name()?
+        );
+    }
+    Ok(())
+}
+
+fn link(manifest: &Manifest, json: bool) -> anyhow::Result<()> {
+    let bytes = manifest.encode()?;
+    let link = manifest_link(manifest)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "link": link,
+                "manifest_bytes": bytes.len(),
+                "recommended_max_bytes": MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+            }))?
+        );
+        return Ok(());
+    }
+    warn_if_long_link(manifest)?;
+    println!("{link}");
+    Ok(())
+}
+
+fn warn_if_long_link(manifest: &Manifest) -> anyhow::Result<()> {
+    let len = manifest.encode()?.len();
+    if len > MANIFEST_LINK_RECOMMENDED_MAX_BYTES {
+        eprintln!(
+            "warning: this manifest is {len} bytes; links above \
+             {MANIFEST_LINK_RECOMMENDED_MAX_BYTES} bytes are long for a chat message. \
+             Consider sharing the .ant file instead."
+        );
+    }
+    Ok(())
+}
+
+async fn download(
+    client: &Client,
+    manifest: &Manifest,
+    output: Option<PathBuf>,
+    selection: Vec<String>,
+    overwrite: bool,
+    concurrency: NonZeroUsize,
+    json: bool,
+) -> anyhow::Result<()> {
+    let output_root = output.unwrap_or_else(|| {
+        manifest
+            .name
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
+    let options = ExtractOptions {
+        output_root: output_root.clone(),
+        selection,
+        overwrite,
+        concurrency,
+        cancel: CancellationToken::new(),
+    };
+    info!("Extracting manifest into {}", output_root.display());
+    let start = Instant::now();
+
+    let report = if json {
+        extract_manifest(client, manifest, &options, None).await?
+    } else {
+        let (tx, rx) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        let ui = tokio::spawn(drive_extract_progress(rx));
+        let report = extract_manifest(client, manifest, &options, Some(tx)).await;
+        let _ = ui.await;
+        report?
+    };
+
+    if json {
+        let entries: Vec<_> = report
+            .entries
+            .iter()
+            .map(|e| match &e.status {
+                EntryStatus::Written { bytes } => {
+                    json!({"name": e.name, "status": "written", "bytes": bytes})
+                }
+                EntryStatus::Failed { error } => {
+                    json!({"name": e.name, "status": "failed", "error": error})
+                }
+                EntryStatus::Cancelled => json!({"name": e.name, "status": "cancelled"}),
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "output": output_root.display().to_string(),
+                "written": report.written(),
+                "failed": report.failed(),
+                "cancelled": report.cancelled(),
+                "entries": entries,
+            }))?
+        );
+    } else {
+        for e in &report.entries {
+            match &e.status {
+                EntryStatus::Written { bytes } => println!("written   {} ({bytes} bytes)", e.name),
+                EntryStatus::Failed { error } => println!("failed    {}: {error}", e.name),
+                EntryStatus::Cancelled => println!("cancelled {}", e.name),
+            }
+        }
+        eprintln!(
+            "{} written, {} failed in {:.1}s -> {}",
+            report.written(),
+            report.failed(),
+            start.elapsed().as_secs_f64(),
+            output_root.display()
+        );
+    }
+    if report.failed() > 0 {
+        anyhow::bail!("{} entr(y/ies) failed to download", report.failed());
+    }
+    Ok(())
+}
+
+/// Load a manifest from a `.ant` path or an `ant://manifest/...` link.
+fn load_manifest(source: &str) -> anyhow::Result<Manifest> {
+    if is_link(source) {
+        return match parse_link(source)? {
+            Link::Manifest(m) => Ok(m),
+            Link::File(_) => anyhow::bail!(
+                "this is a file link, not a manifest link; use `ant file download` for it"
+            ),
+        };
+    }
+    read_manifest_file(Path::new(source))
+        .map_err(|e| anyhow::anyhow!("Failed to read manifest {source}: {e}"))
+}
+
+/// Parse `ADDRESS[=PATH]` for `--public-file`.
+fn parse_public_file(spec: &str) -> anyhow::Result<([u8; 32], Option<String>)> {
+    let (address_text, path) = match spec.split_once(PUBLIC_FILE_SEPARATOR) {
+        Some((a, p)) => (a, Some(p.to_string())),
+        None => (spec, None),
+    };
+    match parse_link(address_text)? {
+        Link::File(address) => Ok((address, path)),
+        Link::Manifest(_) => anyhow::bail!("--public-file takes a file address, not a manifest"),
+    }
+}
+
+fn entries_json(manifest: &Manifest) -> anyhow::Result<Vec<serde_json::Value>> {
+    manifest
+        .entries
+        .iter()
+        .map(|entry| {
+            Ok(json!({
+                "name": entry.effective_name()?,
+                "path": entry.path,
+                "size": entry.size,
+                "kind": entry.source.kind(),
+                "address": hex::encode(entry.source.content_address()?),
+            }))
+        })
+        .collect()
+}
+
+async fn drive_build_progress(mut rx: mpsc::Receiver<BuildEvent>) {
+    let spinner = progress::new_spinner("Preparing upload...");
+    let mut current = String::new();
+    let mut position = String::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            BuildEvent::FileStarted { path, index, total } => {
+                current = path;
+                position = format!("[{}/{total}]", index + 1);
+                spinner.set_message(format!("{position} {current}: encrypting"));
+            }
+            BuildEvent::Upload { event, .. } => {
+                let phase = match event {
+                    UploadEvent::Encrypting { chunks_done } => {
+                        format!("encrypting ({chunks_done})")
+                    }
+                    UploadEvent::Encrypted { total_chunks } => {
+                        format!("encrypted {total_chunks} chunks")
+                    }
+                    UploadEvent::QuotingChunks {
+                        wave, total_waves, ..
+                    } => {
+                        format!("quoting wave {wave}/{total_waves}")
+                    }
+                    UploadEvent::ChunkQuoted { quoted, total } => {
+                        format!("quoted {quoted}/{total}")
+                    }
+                    UploadEvent::ChunkStored { stored, total } => {
+                        format!("stored {stored}/{total}")
+                    }
+                };
+                spinner.set_message(format!("{position} {current}: {phase}"));
+            }
+            BuildEvent::FileFinished {
+                path,
+                chunks_stored,
+                reference,
+            } => {
+                spinner.println(format!(
+                    "uploaded {path} ({chunks_stored} new chunks, {reference})"
+                ));
+            }
+        }
+    }
+    spinner.finish_and_clear();
+}
+
+async fn drive_extract_progress(mut rx: mpsc::Receiver<ExtractEvent>) {
+    let spinner = progress::new_spinner("Preparing download...");
+    while let Some(event) = rx.recv().await {
+        match event {
+            ExtractEvent::EntryStarted { name, index, total } => {
+                spinner.set_message(format!("[{}/{total}] {name}: resolving", index + 1));
+            }
+            ExtractEvent::Download { name, event } => {
+                let phase = match event {
+                    DownloadEvent::ResolvingDataMap { total_map_chunks } => {
+                        format!("resolving data map ({total_map_chunks} chunks)")
+                    }
+                    DownloadEvent::MapChunkFetched { fetched } => {
+                        format!("resolving data map ({fetched} fetched)")
+                    }
+                    DownloadEvent::DataMapResolved { total_chunks } => {
+                        format!("fetching {total_chunks} chunks")
+                    }
+                    DownloadEvent::ChunksFetched { fetched, total } => {
+                        format!("fetched {fetched}/{total}")
+                    }
+                };
+                spinner.set_message(format!("{name}: {phase}"));
+            }
+            ExtractEvent::EntryFinished { .. } => {}
+        }
+    }
+    spinner.finish_and_clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_file_spec_parses_with_and_without_path() {
+        let hex64 = "ab".repeat(32);
+        let (addr, path) = parse_public_file(&hex64).unwrap();
+        assert_eq!(addr, [0xab; 32]);
+        assert_eq!(path, None);
+        let (addr, path) = parse_public_file(&format!("ant://{hex64}=docs/a.pdf")).unwrap();
+        assert_eq!(addr, [0xab; 32]);
+        assert_eq!(path.as_deref(), Some("docs/a.pdf"));
+        assert!(parse_public_file("nope").is_err());
+    }
+
+    #[test]
+    fn network_and_wallet_needs() {
+        let create_offline = ManifestAction::Create {
+            paths: vec![],
+            output: None,
+            name: None,
+            compact: false,
+            public: false,
+            follow_symlinks: false,
+            public_files: vec!["ab".repeat(32)],
+            merkle: false,
+            no_merkle: false,
+            overwrite: false,
+            link: false,
+        };
+        assert!(!create_offline.needs_network());
+        assert!(!create_offline.needs_wallet());
+        let show = ManifestAction::Show {
+            source: "x.ant".into(),
+        };
+        assert!(!show.needs_network());
+        let download = ManifestAction::Download {
+            source: "x.ant".into(),
+            output: None,
+            selection: vec![],
+            overwrite: false,
+            concurrency: DEFAULT_CONCURRENCY,
+        };
+        assert!(download.needs_network());
+        assert!(!download.needs_wallet());
+    }
+}
