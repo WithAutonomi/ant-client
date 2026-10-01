@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.3.9-rc.1"
+version = "0.3.9"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.11.0-rc.1"
+version = "0.11.0"
 dependencies = [
  "alloy",
  "ant-node",
@@ -910,8 +910,9 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.21.0-rc.1"
-source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.9.4#5aa11dedbeb05fdeda4a7d28879e5882c491f841"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8afebae6037bc8d219f3089305cad8803bde439484aa9d00979486c5ea554271"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -962,8 +963,9 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "3.1.0-rc.1"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.9.4#39dd24710c486d954114e203eb87c066a80ab284"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb1f2e060c4283457a718c094d5fd594efd1d4eeec7cc6ca3ea113df17cce382"
 dependencies = [
  "blake3",
  "bytes",
@@ -3456,7 +3458,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
