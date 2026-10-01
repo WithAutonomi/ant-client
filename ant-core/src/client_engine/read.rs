@@ -7,9 +7,23 @@ use std::{collections::HashSet, future::Future, time::Duration};
 pub(crate) const MAX_GET_FALLBACK_PEERS: usize = 20;
 pub(crate) const CLOSE_GROUP_RETRY_DELAY: Duration = Duration::from_secs(1);
 const EARLY_READ_HEDGE_DELAY: Duration = Duration::from_secs(1);
+/// Speculative GETs per round are bounded by this multiple of the early
+/// allowance, including hints that may hold the record after stale hints used it.
+const MAX_EARLY_READS_PER_ALLOWANCE: usize = 2;
 
 pub(crate) fn is_authoritative_not_found(not_found: usize, queried: usize) -> bool {
     queried >= ant_protocol::CLOSE_GROUP_MAJORITY && not_found == queried
+}
+
+/// Discovery converges on the target, so a hint with fewer than a close group of
+/// attempted peers nearer the target may still hold the record.
+fn may_hold(attempted: &HashSet<[u8; 32]>, candidate: &[u8; 32], target: &[u8; 32]) -> bool {
+    let distance = ant_protocol::transport::xor_distance(candidate, target);
+    attempted
+        .iter()
+        .filter(|peer| ant_protocol::transport::xor_distance(peer, target) < distance)
+        .count()
+        < ant_protocol::CLOSE_GROUP_SIZE
 }
 
 /// Race one already-connected, known candidate against ordinary discovery and
@@ -93,6 +107,8 @@ where
     S: Fn(Duration) -> SF,
     SF: Future<Output = ()>,
 {
+    let allowance = early_limit.min(MAX_GET_FALLBACK_PEERS);
+    let max_early_reads = allowance * MAX_EARLY_READS_PER_ALLOWANCE;
     for attempt in 0..2 {
         if attempt > 0 {
             sleep(CLOSE_GROUP_RETRY_DELAY).await;
@@ -107,13 +123,17 @@ where
         let mut updates_open = true;
         let candidates = loop {
             if (active.is_empty() || (active.len() == 1 && hedge_ready))
-                && attempted.len() < early_limit.min(MAX_GET_FALLBACK_PEERS)
+                && attempted.len() < max_early_reads
             {
+                // Stale hints can use the allowance before discovery reaches the
+                // holders; hints converging on the target remain eligible.
+                let within_allowance = attempted.len() < allowance;
                 let next = updates
                     .borrow_and_update()
                     .iter()
                     .filter(|peer| !attempted.contains(&key(peer)))
                     .min_by_key(|peer| ant_protocol::transport::xor_distance(&key(peer), &target))
+                    .filter(|peer| within_allowance || may_hold(&attempted, &key(peer), &target))
                     .cloned();
                 if let Some(peer) = next {
                     let id = key(&peer);
@@ -390,6 +410,103 @@ mod tests {
         assert_eq!(
             *gets.borrow(),
             vec![(peer(1), true), (peer(2), true), (peer(3), false)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hint_near_the_target_is_read_after_stale_hints_use_the_allowance() {
+        let allowance = ant_protocol::CLOSE_GROUP_SIZE;
+        let gets = RefCell::new(Vec::new());
+        let read = retrieve_progressive(
+            peer(0),
+            allowance,
+            |updates| async move {
+                updates.send_replace((200..).take(allowance).map(peer).collect());
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                updates.send_replace(vec![peer(1)]);
+                futures::future::pending().await
+            },
+            |p| *p,
+            |p, early| {
+                gets.borrow_mut().push((p, early));
+                async move { Ok::<_, ReadError>((p == peer(1)).then_some(42)) }
+            },
+            |_| true,
+            tokio::time::sleep,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(20), read)
+            .await
+            .expect("the read waited for discovery to finish");
+        assert_eq!(result, Ok(Some(42)));
+        assert_eq!(gets.borrow().len(), allowance + 1);
+        assert_eq!(gets.borrow().last(), Some(&(peer(1), true)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_far_hint_is_not_read_after_the_allowance_is_used() {
+        let allowance = ant_protocol::CLOSE_GROUP_SIZE;
+        let gets = RefCell::new(Vec::new());
+        let read = retrieve_progressive(
+            peer(0),
+            allowance,
+            |updates| async move {
+                // A close group of attempted peers is nearer than the late hint.
+                updates.send_replace((1..).take(allowance).map(peer).collect());
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                updates.send_replace(vec![peer(200)]);
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                ReadCandidates {
+                    closest: vec![peer(100)],
+                    known: vec![],
+                }
+            },
+            |p| *p,
+            |p, early| {
+                gets.borrow_mut().push((p, early));
+                async move { Ok::<_, ReadError>((p == peer(100)).then_some(42)) }
+            },
+            |_| true,
+            tokio::time::sleep,
+        );
+        assert_eq!(read.await, Ok(Some(42)));
+        assert!(!gets.borrow().contains(&(peer(200), true)));
+        assert_eq!(gets.borrow().last(), Some(&(peer(100), false)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn speculative_reads_stop_at_twice_the_allowance() {
+        let gets = RefCell::new(Vec::new());
+        let read = retrieve_progressive(
+            peer(0),
+            1,
+            |updates| async move {
+                updates.send_replace(vec![peer(200)]);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                // Each of these may hold the record, but only one fits the bound.
+                updates.send_replace(vec![peer(1), peer(2), peer(3)]);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                ReadCandidates {
+                    closest: vec![peer(1), peer(2), peer(3)],
+                    known: vec![],
+                }
+            },
+            |p| *p,
+            |p, early| {
+                gets.borrow_mut().push((p, early));
+                async move { Ok::<_, ReadError>((p == peer(3)).then_some(42)) }
+            },
+            |_| true,
+            tokio::time::sleep,
+        );
+        assert_eq!(read.await, Ok(Some(42)));
+        assert_eq!(
+            *gets.borrow(),
+            vec![
+                (peer(200), true),
+                (peer(1), true),
+                (peer(2), false),
+                (peer(3), false)
+            ]
         );
     }
 

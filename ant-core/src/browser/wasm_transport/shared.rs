@@ -4,6 +4,7 @@
 //! Browser I/O adapter for the ordinary ant-core data client.
 
 use super::*;
+use crate::client_engine::read_budget::ReadPermit;
 use crate::data::error::{Error as DataError, Result as DataResult};
 use crate::data::network::BrowserNetwork;
 use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, WitnessedCloseGroup};
@@ -15,6 +16,8 @@ pub(super) struct SharedNetworkAdapter {
     local_peer: PeerId,
     pub(super) sources: RefCell<lru::LruCache<LookupKey, BrowserNode>>,
     pub(super) payment_network: Option<BrowserPaymentNetwork>,
+    /// Set for read-ahead: a GET is speculative unless a read awaits its record.
+    awaited: Option<Rc<read_ahead::AwaitedRecords>>,
 }
 
 impl SharedNetworkAdapter {
@@ -26,7 +29,45 @@ impl SharedNetworkAdapter {
                 std::num::NonZeroUsize::new(256).unwrap_or(std::num::NonZeroUsize::MIN),
             )),
             payment_network: None,
+            awaited: None,
         }
+    }
+
+    /// An adapter for read-ahead, whose GETs for records no read awaits hold at
+    /// most the read budget's speculative share.
+    pub(super) fn read_ahead(
+        inner: Rc<BrowserNetworkCore>,
+        awaited: Rc<read_ahead::AwaitedRecords>,
+    ) -> Self {
+        Self {
+            awaited: Some(awaited),
+            ..Self::new(inner)
+        }
+    }
+
+    fn is_speculative(&self, request: &ChunkMessage) -> bool {
+        match (&self.awaited, &request.body) {
+            (Some(awaited), ChunkMessageBody::GetRequest(get)) => !awaited.contains(&get.address),
+            _ => false,
+        }
+    }
+
+    /// Reserve the read budget for one GET within the request's admission.
+    async fn reserve_read(
+        &self,
+        request: &ChunkMessage,
+        admission: &TransferDeadline,
+    ) -> DataResult<ReadPermit> {
+        crate::runtime::timeout(
+            admission.remaining(),
+            self.inner.pool.read_budget.acquire(
+                || self.inner.pool.read_limit(),
+                || self.is_speculative(request),
+            ),
+        )
+        .await
+        .map_err(|_| DataError::Timeout("read admission timed out".into()))?
+        .map_err(|error| DataError::Network(error.into()))
     }
 }
 
@@ -228,10 +269,20 @@ impl BrowserNetwork for SharedNetworkAdapter {
             if parsed.peer_id != peer.to_hex() {
                 return Err(DataError::Network("endpoint peer mismatch".into()));
             }
+            let admission = TransferDeadline::new(RPC_ADMISSION_TIMEOUT);
+            let is_read = matches!(&request.body, ChunkMessageBody::GetRequest(_));
+            // Read-ahead reserves before peer admission, so a GET queued as
+            // speculative holds no peer session slot that a read waits for.
+            // Other reads reserve after it, so they hold no read budget while
+            // waiting for a busy peer.
+            let mut read_permit = if is_read && self.awaited.is_some() {
+                Some(self.reserve_read(&request, &admission).await?)
+            } else {
+                None
+            };
             // Bulk records cannot hold the discovery/quote lane's RPC lock.
             // The node already accepts two independently authenticated channels
             // on one association; application request/witness semantics stay intact.
-            let admission = TransferDeadline::new(RPC_ADMISSION_TIMEOUT);
             let client = if matches!(
                 &request.body,
                 ChunkMessageBody::GetRequest(_)
@@ -287,25 +338,11 @@ impl BrowserNetwork for SharedNetworkAdapter {
                     assert_upload_node(&hello, &network).map_err(DataError::Network)?;
                 }
             }
-            let is_read = matches!(&request.body, ChunkMessageBody::GetRequest(_));
-            // Reserve after peer RPC admission. The transport owns this permit
-            // across cancellation, then returns it through response decoding.
-            let read_permit = if is_read {
-                Some(
-                    crate::runtime::timeout(
-                        admission.remaining(),
-                        self.inner
-                            .pool
-                            .read_budget
-                            .acquire(|| self.inner.pool.read_limit()),
-                    )
-                    .await
-                    .map_err(|_| DataError::Timeout("read admission timed out".into()))?
-                    .map_err(|error| DataError::Network(error.into()))?,
-                )
-            } else {
-                None
-            };
+            // The transport owns the read permit across cancellation, then
+            // returns it through response decoding.
+            if is_read && read_permit.is_none() {
+                read_permit = Some(self.reserve_read(&request, &admission).await?);
+            }
             let exclusive = matches!(
                 &request.body,
                 ChunkMessageBody::PutRequest(_) | ChunkMessageBody::PointerPutRequest(_)

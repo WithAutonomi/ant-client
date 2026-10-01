@@ -514,3 +514,104 @@ caller-held DataMap, fetch nested DataMap records and chunks from the network,
 and apply the same verification as public reads. A private DataMap is bounded by
 the maximum record size before it is decoded. Wire messages, stored formats, and
 native APIs are unchanged.
+
+## Streaming reads (2026-09-28)
+
+Media playback of a 612 MB mainnet video froze after eight seconds. The service
+worker requested the next block, and that range read did not return for 45 to 60
+seconds. Browser discovery of a record's close group routinely takes 40 to 55
+seconds on mainnet. Meanwhile, speculation spent its twenty-peer allowance on
+connected peers far from the target within two seconds. Discovery offered the
+record's holders about ten seconds in, but the exhausted allowance left them
+unread until discovery completed.
+
+Speculation now continues past the allowance for a hint that may hold the
+record: one with fewer than `CLOSE_GROUP_SIZE` attempted peers nearer the target.
+Hints converging on the target therefore remain readable, while stale hints do
+not. Speculative GETs are bounded at twice the allowance per round. The limit of
+two simultaneous GETs, the hedge delay, deduplication, verification and
+absence rules are unchanged. Native and WASM share this policy.
+
+`BrowserFileReader` reads ahead. A sequential read, which continues one of the
+last four reads or comes from a streaming reader, moves a window of 32 MiB, and
+at most ten records, to its start. Up to four records in that window are fetched
+in parallel, alongside the read. A read's own records are fetched the same way
+while fetches are admitted, so a read that needs a record being fetched waits
+for that fetch rather than issuing a second one. It waits for each such record
+alongside fetching the records read-ahead refused it, never before. A failed
+read-ahead fetch counts as the read's first attempt at the record, so a read
+makes as many attempts as before. Another read fetches only the record after
+it. A read that needs no records, such as one of zero length, changes nothing.
+A streaming read from the start of the file also fetches the last record, where
+MP4 and WebM usually keep their index.
+
+Readers hold the records they fetch ahead. The client's shared chunk cache keeps
+eight records, fewer than a window spans, so read-ahead through it would evict
+records before their read and fetch them again without end. Read-ahead fetches
+through a client of its own, whose records stay out of that cache. A window
+position fetches each record once. A failed fetch is not retried in the
+background: a read that needs the record fetches it itself, and each later read
+retries it once.
+
+DataMap record sizes are untrusted: admission checks only the total size and
+record count. Read-ahead therefore counts records, each at most one browser
+response, and never declared bytes, so undersized records shorten the window
+rather than lengthen it. The readers of one client together hold or fetch at
+most 24 records, about 100 MB of full-size records: the window and last record
+of two streams, and two more. The bound follows the window, so a build with a
+smaller chunk size still covers both streams. To admit a fetch, read-ahead
+releases held records over that budget: first every record of an idle reader,
+one without a read for a minute; then records behind the reader, farthest
+first, then those farthest ahead; then other readers' records in the same
+order. The window and the records of every read in progress are kept, so a
+fetch that fits neither bound is refused, and a read fetches the records refused
+to it itself. A reader that JavaScript drops without closing therefore keeps
+nothing another reader needs. Once a read's records fail to decrypt, the reader
+stops reading ahead. A DataMap whose records range reads reject still opens,
+with read-ahead off, and its reads report the error.
+
+Fetches left behind by a seek continue until five are in flight: the window's
+four and one more, such as the start of a file that a player returns to after
+reading the index at its end. Each new fetch then cancels the most recently
+started stale fetch, which has made the least progress. A cancelled fetch's GETs
+already on the wire still drain, because the transport keeps their read budget
+reservations until the response arrives. Read-ahead GETs are therefore
+speculative in the read budget, unless a read in progress waits for their
+record: speculative GETs, draining ones included, hold at most half its cap, so
+reads always have the rest. A GET queued as speculative is admitted as an
+ordinary one once a read comes to wait for its record. Only fetches a read waited
+for inform the reads' adaptive concurrency. Closing or dropping the reader
+cancels its fetches and releases its records.
+
+`openPublicFile` and `openPrivateFile` take an optional options object as their
+third argument, `{ streaming: true }`. A streaming reader treats every read as
+sequential, so a seek fetches the window alongside its first read. The SDK sets
+it only for media sources. Other readers read ahead only once a read continues
+another, because scattered reads and a single header read would waste
+bandwidth. Wire messages and stored formats are unchanged.
+
+Validation: `a_hint_near_the_target_is_read_after_stale_hints_use_the_allowance`
+fails without the rule and passes with it.
+`a_far_hint_is_not_read_after_the_allowance_is_used` keeps stale hints bounded,
+and `speculative_reads_stop_at_twice_the_allowance` bounds the rest. Read budget
+tests check that speculative reads leave half the cap to awaited reads and that
+a queued speculative read is admitted once a caller waits for it. WASM tests
+check that a streaming reader serves a later record from read-ahead while an
+ordinary reader fetches it. They also check that read-ahead of a file larger
+than its window fetches each record once and then stops, that an ordinary
+reader's header read fetches two records, even after a zero-length read, and
+that a failed record is retried only after another read. A seek's read finishes
+while read-ahead GETs it cancelled still drain. A read fetches the records
+read-ahead refuses it alongside the admitted ones, and a second read does not
+cancel a first read's fetch. A DataMap of forty records that each declare one
+KiB puts every record in the window's bytes; read-ahead fetches at most eleven
+of them, keeps at most five in flight and 24 held or in flight, and stops after
+a read fails to decrypt. Three readers of that map hold or fetch at most 24
+records together. A DataMap with non-contiguous indices opens, and its reads
+report the error. On mainnet, the video that froze permanently at 8.5
+seconds played two minutes without a stall in the vault, with about 30 seconds
+buffered. After seeks, playback resumed in 2 to 21 seconds, and the first frame
+appeared 16 to 26 seconds after connecting. Both waits are bound by discovery
+latency, which this change does not alter. These mainnet runs used an earlier
+revision that read ahead through the shared chunk cache; repeat them before
+acceptance.

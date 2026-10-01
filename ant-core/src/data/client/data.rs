@@ -22,6 +22,7 @@ use bytes::Bytes;
 #[cfg(feature = "native")]
 use futures::stream::StreamExt;
 use self_encryption::{encrypt, DataMap};
+use std::future::{ready, Future};
 use std::num::NonZeroUsize;
 use tracing::{debug, info};
 
@@ -418,7 +419,34 @@ impl Client {
         start: usize,
         length: usize,
     ) -> Result<Bytes> {
-        let fetch = |address| self.fetch_data_record(address);
+        self.data_download_range_with(data_map, start, length, |_| ready(None))
+            .await
+    }
+
+    /// As [`Client::data_download_range`], taking records from `held` and
+    /// fetching those it resolves to `None`. A record that `held` resolves to
+    /// an error counts as a failed fetch attempt, which the read retries by
+    /// fetching. Every record is requested at once, within the fetch cap, and
+    /// held records are verified too.
+    pub(crate) async fn data_download_range_with<H>(
+        &self,
+        data_map: &DataMap,
+        start: usize,
+        length: usize,
+        held: impl Fn([u8; 32]) -> H,
+    ) -> Result<Bytes>
+    where
+        H: Future<Output = Option<Result<Bytes>>>,
+    {
+        let fetch = |address| {
+            let held = held(address);
+            async move {
+                match held.await {
+                    Some(result) => result,
+                    None => self.fetch_data_record(address).await,
+                }
+            }
+        };
         let cap = || self.controller().fetch.current();
         let root = crate::client_engine::files::resolve(data_map, &fetch, &cap)
             .await

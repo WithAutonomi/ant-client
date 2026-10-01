@@ -3,8 +3,10 @@
 //! all traverse the same ant-core implementation used by browser callers.
 
 use super::*;
+use crate::browser::{BrowserChunkInfo, BrowserRecord};
 use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
 use ant_protocol::pointer::Pointer;
+use self_encryption::{ChunkInfo, DataMap, XorName};
 
 mod node_session;
 use base64::Engine;
@@ -332,6 +334,7 @@ pub struct BrowserTestNode {
     committed_key_count: u32,
     last_put_address: String,
     last_put_quote_hash: String,
+    last_get_address: String,
     closest_peers: Vec<BrowserNode>,
     put_error: Option<(String, String)>,
     pointers_enabled: bool,
@@ -385,6 +388,7 @@ impl BrowserTestNode {
             committed_key_count: 0,
             last_put_address: String::new(),
             last_put_quote_hash: String::new(),
+            last_get_address: String::new(),
             closest_peers: Vec::new(),
             put_error: None,
             pointers_enabled: true,
@@ -441,6 +445,9 @@ impl BrowserTestNode {
     }
     pub fn last_put_quote_hash(&self) -> String {
         self.last_put_quote_hash.clone()
+    }
+    pub fn last_get_address(&self) -> String {
+        self.last_get_address.clone()
     }
     pub fn push(&mut self, message: &[u8]) -> Vec<u8> {
         self.received.extend_from_slice(message);
@@ -616,6 +623,7 @@ impl BrowserTestNode {
             }
             BrowserRequestBody::GetChunk { address } => {
                 self.last_method = "get_chunk".into();
+                self.last_get_address.clone_from(&address);
                 if let Some(content) = self.records.get(&address) {
                     self.chunk = content.clone();
                 }
@@ -870,6 +878,7 @@ impl BrowserTestNode {
             }
             Body::GetRequest(request) => {
                 self.last_method = "get_chunk".into();
+                self.last_get_address = hex::encode(request.address);
                 let content = self
                     .records
                     .get(&hex::encode(request.address))
@@ -1271,7 +1280,7 @@ pub async fn test_cancelled_read_reservation(endpoint: &str) {
     let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
     client.hello().await.unwrap();
     let budget = crate::client_engine::read_budget::ReadBudget::new(1, 1);
-    let permit = budget.acquire(|| 1).await.unwrap();
+    let permit = budget.acquire(|| 1, || false).await.unwrap();
     let authenticated = client.authenticated().await.unwrap();
     let request = authenticated.request_reserved(
         BrowserRequestBody::GetChunk {
@@ -1286,12 +1295,12 @@ pub async fn test_cancelled_read_reservation(endpoint: &str) {
         .await
         .is_err());
     assert!(
-        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1))
+        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1, || false))
             .await
             .is_err()
     );
     crate::runtime::sleep(Duration::from_millis(120)).await;
-    let permit = crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1))
+    let permit = crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1, || false))
         .await
         .unwrap()
         .unwrap();
@@ -1311,13 +1320,13 @@ pub async fn test_cancelled_read_reservation(endpoint: &str) {
         .await
         .unwrap();
     assert!(
-        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1))
+        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1, || false))
             .await
             .is_err()
     );
     drop(retained);
     assert!(
-        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1))
+        crate::runtime::timeout(Duration::from_millis(20), budget.acquire(|| 1, || false))
             .await
             .is_ok()
     );
@@ -1449,4 +1458,44 @@ pub async fn test_multiplex_puts(endpoint: &str) -> JsValue {
     .await;
     client.close();
     serde_wasm_bindgen::to_value(&results).unwrap()
+}
+
+/// Encode chunk descriptors as a public DataMap record without validating them,
+/// so tests can publish DataMaps that misdeclare their records.
+#[wasm_bindgen]
+pub fn test_encode_public_data_map(chunks: JsValue) -> JsValue {
+    let chunks: Vec<BrowserChunkInfo> = serde_wasm_bindgen::from_value(chunks).unwrap();
+    let hash = |hex: &str| XorName(<[u8; 32]>::try_from(hex::decode(hex).unwrap()).unwrap());
+    let infos = chunks
+        .iter()
+        .map(|chunk| ChunkInfo {
+            index: chunk.index,
+            dst_hash: hash(&chunk.dst_hash),
+            src_hash: hash(&chunk.src_hash),
+            src_size: chunk.src_size,
+        })
+        .collect();
+    let (address, content) =
+        crate::client_engine::files::public_map_record(&DataMap::new(infos)).unwrap();
+    serde_wasm_bindgen::to_value(&BrowserRecord {
+        address: hex::encode(address),
+        content: content.to_vec(),
+    })
+    .unwrap()
+}
+
+#[derive(Serialize)]
+struct ReadAheadUsage {
+    fetching: usize,
+    held: usize,
+}
+
+#[wasm_bindgen(js_class = BrowserFileReader)]
+impl BrowserFileReader {
+    /// Records the reader's read-ahead has in flight and holds.
+    #[wasm_bindgen(js_name = testReadAhead)]
+    pub fn test_read_ahead(&self) -> JsValue {
+        let (fetching, held) = self.read_ahead.usage();
+        serde_wasm_bindgen::to_value(&ReadAheadUsage { fetching, held }).unwrap()
+    }
 }

@@ -1,5 +1,9 @@
 //! Physical GET admission, independently bounded by bytes and local processing.
 //! Network failures never lower the local processing allowance.
+#[cfg(test)]
+use futures::{executor::block_on, FutureExt};
+#[cfg(test)]
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -9,9 +13,15 @@ use web_time::Instant;
 // several healthy observations so a single small response cannot undo stress.
 const PROCESSING_TARGET: Duration = Duration::from_millis(50);
 const PROCESSING_WINDOW_SAMPLES: usize = 8;
+/// Speculative reads, such as read-ahead, hold at most this fraction (one in N)
+/// of the read cap, so reads a caller waits for always have the rest. This
+/// includes speculative reads whose caller was cancelled: the transport keeps
+/// their permits until their responses are drained.
+const SPECULATIVE_SHARE_DIVISOR: usize = 2;
 
 struct State {
     active: usize,
+    speculative: usize,
     queued: usize,
     processing_cap: usize,
     processing_started: Option<Instant>,
@@ -34,6 +44,7 @@ impl ReadBudget {
         Arc::new(Self {
             state: Mutex::new(State {
                 active: 0,
+                speculative: 0,
                 queued: 0,
                 processing_cap: capacity,
                 processing_started: None,
@@ -54,27 +65,38 @@ impl ReadBudget {
 
     /// Only admitted physical reads consume reservations. Cancellation drops
     /// both queued admissions and acquired permits without leaking capacity.
+    ///
+    /// While `speculative()` holds, no caller waits for the read, and it is
+    /// admitted only within the speculative share of the cap. It is
+    /// re-evaluated while queued, so a read a caller comes to wait for is
+    /// admitted as an ordinary one once [`ReadBudget::notify`] wakes the queue.
     pub(crate) async fn acquire(
         self: &Arc<Self>,
         desired: impl Fn() -> usize,
+        speculative: impl Fn() -> bool,
     ) -> Result<ReadPermit, &'static str> {
         let mut changed = self.changed.subscribe();
         let queued = QueuedRead::new(Arc::clone(self));
         loop {
             let desired = desired();
+            let speculative = speculative();
             {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 let cap = desired.max(1).min(self.capacity).min(state.processing_cap);
                 if state.closed {
                     return Err("read admission is closed");
                 }
-                if state.active < cap {
+                let within_share =
+                    !speculative || state.speculative < cap / SPECULATIVE_SHARE_DIVISOR;
+                if state.active < cap && within_share {
                     state.processing_started.get_or_insert_with(Instant::now);
                     state.active += 1;
+                    state.speculative += usize::from(speculative);
                     drop(state);
                     drop(queued);
                     return Ok(ReadPermit {
                         budget: Arc::clone(self),
+                        speculative,
                     });
                 }
             }
@@ -83,6 +105,11 @@ impl ReadBudget {
                 .await
                 .map_err(|_| "read admission is closed")?;
         }
+    }
+
+    /// Wake queued reads to re-evaluate whether they are speculative.
+    pub(crate) fn notify(&self) {
+        self.changed.send_replace(());
     }
 
     /// Reduce concurrency only for sustained CPU occupation with responsiveness
@@ -139,11 +166,13 @@ impl ReadBudget {
 
 pub(crate) struct ReadPermit {
     budget: Arc<ReadBudget>,
+    speculative: bool,
 }
 impl Drop for ReadPermit {
     fn drop(&mut self) {
         let mut state = self.budget.state.lock().unwrap_or_else(|e| e.into_inner());
         state.active -= 1;
+        state.speculative -= usize::from(self.speculative);
         drop(state);
         self.budget.changed.send_replace(());
     }
@@ -175,18 +204,17 @@ impl Drop for QueuedRead {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::{executor::block_on, FutureExt};
 
     #[test]
     fn admissions_obey_both_the_adaptive_and_byte_limits() {
         let budget = ReadBudget::new(100, 20);
         assert_eq!(budget.limit(256), 5);
-        let a = block_on(budget.acquire(|| 2)).unwrap();
-        let b = block_on(budget.acquire(|| 2)).unwrap();
-        assert!(budget.acquire(|| 2).now_or_never().is_none());
+        let a = block_on(budget.acquire(|| 2, || false)).unwrap();
+        let b = block_on(budget.acquire(|| 2, || false)).unwrap();
+        assert!(budget.acquire(|| 2, || false).now_or_never().is_none());
         assert_eq!(budget.state.lock().unwrap().queued, 0);
         drop(a);
-        let c = block_on(budget.acquire(|| 2)).unwrap();
+        let c = block_on(budget.acquire(|| 2, || false)).unwrap();
         drop((b, c));
         assert_eq!(budget.state.lock().unwrap().active, 0);
     }
@@ -241,16 +269,55 @@ mod tests {
     #[test]
     fn shrinking_does_not_abort_admitted_reads_and_closure_wakes_queue() {
         let budget = ReadBudget::new(100, 10);
-        let a = block_on(budget.acquire(|| 2)).unwrap();
-        let b = block_on(budget.acquire(|| 2)).unwrap();
+        let a = block_on(budget.acquire(|| 2, || false)).unwrap();
+        let b = block_on(budget.acquire(|| 2, || false)).unwrap();
         processing_window(&budget, 80, 100, 0, 2);
         assert_eq!(budget.state.lock().unwrap().active, 2);
-        let mut wait = Box::pin(budget.acquire(|| 2));
+        let mut wait = Box::pin(budget.acquire(|| 2, || false));
         assert!(wait.as_mut().now_or_never().is_none());
         budget.close();
         assert!(block_on(wait).is_err());
         drop((a, b));
         assert_eq!(budget.state.lock().unwrap().active, 0);
         assert_eq!(budget.state.lock().unwrap().queued, 0);
+    }
+
+    #[test]
+    fn speculative_reads_leave_the_rest_of_the_cap_to_awaited_reads() {
+        let budget = ReadBudget::new(100, 10);
+        let speculative = (0..2)
+            .map(|_| block_on(budget.acquire(|| 4, || true)).unwrap())
+            .collect::<Vec<_>>();
+        assert!(budget.acquire(|| 4, || true).now_or_never().is_none());
+        let awaited = (0..2)
+            .map(|_| block_on(budget.acquire(|| 4, || false)).unwrap())
+            .collect::<Vec<_>>();
+        assert!(budget.acquire(|| 4, || false).now_or_never().is_none());
+        drop(awaited);
+        assert!(budget.acquire(|| 4, || true).now_or_never().is_none());
+        drop(speculative);
+        let state = budget.state.lock().unwrap();
+        assert_eq!((state.active, state.speculative, state.queued), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_queued_speculative_read_is_admitted_once_a_caller_waits_for_it() {
+        let budget = ReadBudget::new(100, 10);
+        let _held = block_on(budget.acquire(|| 2, || true)).unwrap();
+        let awaited = Cell::new(false);
+        let mut wait = Box::pin(budget.acquire(|| 2, || !awaited.get()));
+        assert!(wait.as_mut().now_or_never().is_none());
+        awaited.set(true);
+        budget.notify();
+        let permit = block_on(wait).unwrap();
+        assert!(!permit.speculative);
+        assert_eq!(budget.state.lock().unwrap().speculative, 1);
+    }
+
+    #[test]
+    fn under_a_cap_of_one_only_awaited_reads_are_admitted() {
+        let budget = ReadBudget::new(100, 10);
+        assert!(budget.acquire(|| 1, || true).now_or_never().is_none());
+        assert!(block_on(budget.acquire(|| 1, || false)).is_ok());
     }
 }
