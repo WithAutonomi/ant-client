@@ -2,3 +2,12 @@
 members = ["ant-core", "ant-cli"]
 resolver = "2"
 
+[patch.crates-io]
+# Copy-free send path (ADR-0017), pinned as a chain because `[patch]` is only
+# honoured in the workspace root: ant-node carries the bounded fresh-offer and
+# copy-free send work, and it in turn needs the saorsa-core/saorsa-transport
+# revs that work is built on. Revs, not branches, so the pins are immutable.
+# Drop all three once releases include them.
+ant-node = { git = "https://github.com/WithAutonomi/ant-node", rev = "289b89d22791ab0980bdd47905a300982e38d3ca" }
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "7f815141ff8d5e07f443c25c99607586fa7099cf" }
+saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "6a772bd3cf806e381cf5706cfe34492bede3141e" }

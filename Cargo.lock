@@ -911,8 +911,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8afebae6037bc8d219f3089305cad8803bde439484aa9d00979486c5ea554271"
+source = "git+https://github.com/WithAutonomi/ant-node?rev=289b89d22791ab0980bdd47905a300982e38d3ca#289b89d22791ab0980bdd47905a300982e38d3ca"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -946,6 +945,7 @@ dependencies = [
  "self_encryption",
  "semver 1.0.28",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2",
  "tar",
@@ -5530,8 +5530,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84923dc4955c42dfad8e06cfc34ef75b8e89d4d2fed048b18b81dc9ebadf790b"
+source = "git+https://github.com/WithAutonomi/saorsa-core?rev=7f815141ff8d5e07f443c25c99607586fa7099cf#7f815141ff8d5e07f443c25c99607586fa7099cf"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5599,8 +5598,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.37.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "261ed20ee1ed8555594fef412b428fa20c21d2cbeebfe3f11868c7df9489a410"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=6a772bd3cf806e381cf5706cfe34492bede3141e#6a772bd3cf806e381cf5706cfe34492bede3141e"
 dependencies = [
  "anyhow",
  "async-trait",
