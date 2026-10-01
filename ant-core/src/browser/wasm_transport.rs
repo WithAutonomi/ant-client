@@ -69,6 +69,13 @@ const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 // remain non-evictable, and the pool still imposes a hard resource bound.
 const DEFAULT_MAX_POOLED_CLIENTS: usize = 64;
 const MAX_LOOKUP_PRECONNECTS: usize = 8;
+/// Queries in flight per browser lookup round. A third to a half of the WebRTC
+/// Direct endpoints discovered on mainnet time out when dialled, so most rounds
+/// wait out the lookup grace period at any width. A wider round gets more
+/// answers for that wait, so lookups need fewer rounds. Ten stalled playback
+/// after seeks while read-ahead ran several lookups against the client pool.
+/// ADR-0004 records the measurements.
+const BROWSER_LOOKUP_ALPHA: usize = 6;
 const MAX_BOOTSTRAP_CONNECTIONS: usize = 4;
 const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const MAX_BROWSER_ROUTING_ENTRIES: usize = 256;
@@ -1625,7 +1632,10 @@ impl BrowserNetworkCore {
         let target_key = parse_lookup_key(target, "lookup target")?;
         let failures = Rc::new(RefCell::new(Vec::new()));
         let views = Rc::new(RefCell::new(HashMap::new()));
-        let config = LookupConfig::saorsa(count);
+        let config = LookupConfig {
+            alpha: BROWSER_LOOKUP_ALPHA,
+            ..LookupConfig::saorsa(count)
+        };
         let mut lookup =
             IterativeLookup::new(target_key, config).map_err(|error| error.to_string())?;
         let mut known_endpoints = self

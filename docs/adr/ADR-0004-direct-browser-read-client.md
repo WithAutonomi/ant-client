@@ -615,3 +615,43 @@ appeared 16 to 26 seconds after connecting. Both waits are bound by discovery
 latency, which this change does not alter. These mainnet runs used an earlier
 revision that read ahead through the shared chunk cache; repeat them before
 acceptance.
+
+## Browser lookup parallelism (2026-09-29)
+
+Browser lookups query six peers per round instead of the Kademlia default of
+three. Between a third and half of the WebRTC Direct endpoints that mainnet
+lookups dial time out after ten seconds. A round takes its first answer and then
+waits up to the protocol's five-second grace for the rest, so a round with an
+unreachable peer pays most of that grace. Most rounds have one at either width:
+if a third of peers are unreachable, about 70% of rounds of three and 91% of
+rounds of six. A round of six therefore waits about as long as a round of three,
+but returns about twice as many answers, so a lookup needs fewer rounds. Read
+lookups need several rounds, which is why cold records took tens of seconds.
+
+On mainnet, cold record reads of the test video took a mean of 11.5 s, with a
+p90 of 29.2 s, at three peers per round. At six they took a mean of 6.1 s, with
+a p90 of 17.2 s. Ten was faster for isolated reads, but during playback, whose
+read-ahead ran several lookups at once, it opened dozens of connections against
+the 64-connection pool and stalled for 12 to 21 s after four of six seeks. Six
+waited at most two seconds after its three seeks, but those runs were watched
+for only 26 to 46 s after resuming and one ended mid-stall, so they do not
+separate six from ten. Six is the conservative choice: it keeps most of ten's
+cold-read gain with fewer connections. Seek resume did not improve at any width.
+A two-second grace did not help, because it dropped slow but live responders.
+The same setting
+applies to upload quoting, whose lookups find and cross-check each record's
+close group. On mainnet, uploads of four records reached the payment request in
+a mean of 120 s instead of 155 s. They opened about 40% more authenticated
+connections. The same builds on a 2-vCPU cloud machine gained less on reads:
+the cold-read mean fell from 8.0 s to 6.2 s, while the p90 rose from 13.9 s to
+14.6 s. Upload quoting there took 105 s instead of 161 s.
+
+A lookup still stops after twenty rounds, so one that never converges can now
+query up to 120 peers instead of 60. The grace period, the dial timeout, the
+lookup termination rules and native lookups are unchanged.
+
+These runs used an earlier read-ahead revision, which kept up to eight fetches
+in flight through the shared chunk cache. The bounded read-ahead described under
+streaming reads keeps at most five, so repeat the playback comparison of six and
+ten on it. The method, raw results and scripts are in
+`docs/investigations/2026-09-29-browser-lookup-alpha`.
