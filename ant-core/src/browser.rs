@@ -31,10 +31,10 @@ use self_encryption::{DataMap, EncryptedChunk};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-/// Maximum file size accepted by the browser API (1 GB decimal).
+/// Maximum file size accepted by the browser upload API (1 GB decimal).
 ///
 /// The page upload path streams through a worker and browser storage. Complete
-/// downloads and the legacy whole-buffer encryption binding remain memory-bound.
+/// downloads use bounded ranges; the legacy encryption binding remains memory-bound.
 pub const MAX_BROWSER_FILE_BYTES: usize = 1_000_000_000;
 
 /// One native self-encryption chunk descriptor exposed to the browser.

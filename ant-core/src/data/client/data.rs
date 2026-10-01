@@ -418,6 +418,17 @@ impl Client {
         start: usize,
         length: usize,
     ) -> Result<Bytes> {
+        self.data_download_range_u64(data_map, start as u64, length)
+            .await
+    }
+
+    /// Download a bounded range with a 64-bit file offset, including on wasm32.
+    pub async fn data_download_range_u64(
+        &self,
+        data_map: &DataMap,
+        start: u64,
+        length: usize,
+    ) -> Result<Bytes> {
         let fetch = |address| self.fetch_data_record(address);
         let cap = || self.controller().fetch.current();
         let root = crate::client_engine::files::resolve(data_map, &fetch, &cap)
@@ -429,6 +440,28 @@ impl Client {
             length,
             &fetch,
             &cap,
+            &crate::runtime::sleep,
+            retry_data_fetch,
+        )
+        .await
+        .map_err(map_read_error)
+    }
+
+    /// Reuse a validated index across browser seeks and sequential downloads.
+    #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
+    pub(crate) async fn data_download_indexed_range(
+        &self,
+        index: &crate::client_engine::files::FileIndex,
+        start: u64,
+        length: usize,
+        concurrency: usize,
+    ) -> Result<Bytes> {
+        crate::client_engine::files::read_indexed_range(
+            index,
+            start,
+            length,
+            &|address| self.fetch_data_record(address),
+            &|| self.controller().fetch.current().min(concurrency),
             &crate::runtime::sleep,
             retry_data_fetch,
         )

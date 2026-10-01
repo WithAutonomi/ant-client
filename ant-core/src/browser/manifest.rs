@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 /// Current browser testnet manifest version.
 pub const BROWSER_MANIFEST_VERSION: u16 = 6;
 const MAX_DATA_MAP_BYTES: usize = 4 * 1024 * 1024;
-const MAX_FILE_CHUNKS: usize = 1024;
+/// Largest exact byte position exposed through the JavaScript number API.
+pub const MAX_BROWSER_FILE_POSITION: u64 = 9_007_199_254_740_991;
 
 /// A validated WebRTC Direct bootstrap endpoint.
 pub type BrowserManifestEndpoint = BrowserEndpoint;
@@ -21,7 +22,7 @@ pub struct PublicFileDescriptor {
     /// Public DataMap content address.
     pub address: String,
     /// Plaintext file size.
-    pub size: usize,
+    pub size: u64,
     /// Browser MIME type.
     pub content_type: String,
     /// Whole-file plaintext BLAKE3 hash.
@@ -150,7 +151,7 @@ fn normalize_file(file: &mut PublicFileDescriptor) -> Result<(), BrowserManifest
         ));
     }
     file.address = normalize_hex(&file.address, 32).map_err(BrowserManifestError)?;
-    if !(self_encryption::MIN_ENCRYPTABLE_BYTES..=super::MAX_BROWSER_FILE_BYTES)
+    if !(self_encryption::MIN_ENCRYPTABLE_BYTES as u64..=MAX_BROWSER_FILE_POSITION)
         .contains(&file.size)
     {
         return Err(BrowserManifestError(format!(
@@ -165,13 +166,13 @@ fn normalize_file(file: &mut PublicFileDescriptor) -> Result<(), BrowserManifest
             file.data_map_size
         )));
     }
-    if !(3..=MAX_FILE_CHUNKS).contains(&file.chunks.len()) {
+    if file.chunks.len() < 3 {
         return Err(BrowserManifestError(
             "public file has an invalid self-encryption chunk list".to_string(),
         ));
     }
     file.chunks.sort_by_key(|chunk| chunk.index);
-    let mut reconstructed_size = 0usize;
+    let mut reconstructed_size = 0u64;
     for (expected_index, chunk) in file.chunks.iter_mut().enumerate() {
         if chunk.index != expected_index {
             return Err(BrowserManifestError(
@@ -180,14 +181,14 @@ fn normalize_file(file: &mut PublicFileDescriptor) -> Result<(), BrowserManifest
         }
         chunk.dst_hash = normalize_hex(&chunk.dst_hash, 32).map_err(BrowserManifestError)?;
         chunk.src_hash = normalize_hex(&chunk.src_hash, 32).map_err(BrowserManifestError)?;
-        if chunk.src_size == 0 {
+        if chunk.src_size == 0 || chunk.src_size > self_encryption::MAX_CHUNK_SIZE {
             return Err(BrowserManifestError(format!(
                 "invalid plaintext chunk size {}",
                 chunk.src_size
             )));
         }
         reconstructed_size = reconstructed_size
-            .checked_add(chunk.src_size)
+            .checked_add(chunk.src_size as u64)
             .ok_or_else(|| BrowserManifestError("file size overflow".to_string()))?;
     }
     if reconstructed_size != file.size {
@@ -285,5 +286,32 @@ mod tests {
         assert_eq!(manifest.files[0].address, "cc".repeat(32));
         assert_eq!(manifest.files[0].chunks[0].index, 0);
         assert_eq!(manifest.payment.chain_id, 31337);
+    }
+
+    #[test]
+    fn file_descriptors_allow_more_than_four_gib_and_1024_chunks() {
+        let mut file = PublicFileDescriptor {
+            name: "large.bin".into(),
+            address: "11".repeat(32),
+            size: 1030 * self_encryption::MAX_CHUNK_SIZE as u64,
+            content_type: "application/octet-stream".into(),
+            blake3: "22".repeat(32),
+            data_map_size: 256,
+            replicas: 4,
+            chunks: (0..1030)
+                .map(|index| BrowserChunkInfo {
+                    index,
+                    src_size: self_encryption::MAX_CHUNK_SIZE,
+                    src_hash: "33".repeat(32),
+                    dst_hash: "44".repeat(32),
+                })
+                .collect(),
+        };
+        assert!(file.size > u32::MAX as u64);
+        normalize_file(&mut file).unwrap();
+        file.size += 1;
+        assert!(normalize_file(&mut file).is_err());
+        file.size = MAX_BROWSER_FILE_POSITION + 1;
+        assert!(normalize_file(&mut file).is_err());
     }
 }
