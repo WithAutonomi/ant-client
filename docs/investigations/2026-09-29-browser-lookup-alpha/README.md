@@ -5,7 +5,10 @@ Test file: `134e4537ad1b2e29f0dc48f8e025a560989e91055ebf1c66bca2208ca8bba889`
 [read-startup investigation](../2026-09-25-read-startup/README.md). All runs
 used headless Chromium against mainnet, starting from the bundled seeds. The
 code was ant-client `fix/browser-media-streaming` (`e85cc57`) plus the lookup
-change under test.
+change under test. That revision predates the read-ahead bounds #209 gained
+before it merged: it kept up to eight fetches in flight through the shared chunk
+cache, where the merged read-ahead keeps at most five. The playback comparison
+below should be repeated on the merged read-ahead.
 
 ## What a lookup waits on
 
@@ -17,11 +20,13 @@ change under test.
 | `WebRTC DataChannel opening timed out` | 106 | 10.0 s each |
 
 About half of the WebRTC Direct endpoints these lookups dialled were
-unreachable from a browser. In the cold-read runs below, 232 of 701 dials
-failed. A lookup round queries `alpha` peers, takes the
+unreachable from a browser. In the second cold-read run below, 232 of the alpha 3
+build's 701 dials failed. A lookup round queries `alpha` peers, takes the
 first answer, and waits up to `ITERATION_GRACE_TIMEOUT_SECS` (5 s) for the rest.
-With the Kademlia default `alpha` of 3, most rounds include an unreachable
-peer and pay most of the grace period. Read lookups need several rounds.
+A round with an unreachable peer pays most of that grace, and most rounds have
+one at either width: if a third of peers are unreachable, about 70% of rounds of
+three and 91% of rounds of six. A wider round waits about as long but returns
+more answers, so a lookup needs fewer rounds. Read lookups need several rounds.
 
 ## Cold record reads
 
@@ -29,7 +34,20 @@ peer and pay most of the grace period. Read lookups need several rounds.
 each of 12 records spread across the file (indices 4, 16, …, 136). No record
 is cached, so every read discovers that record's holders. Variants run
 interleaved in rounds, so network conditions change for all of them alike.
-Raw data is in [`results/`](results).
+Raw data is in [`results/`](results), where each variant is named by its build:
+
+| Build | alpha | Grace |
+| --- | ---: | ---: |
+| `pkg-v0` | 3 | 5 s |
+| `pkg-v1` | 3 | 2 s |
+| `pkg-v2` | 6 | 2 s |
+| `pkg-v3` | 6 | 5 s |
+| `pkg-v4` | 10 | 5 s |
+
+The grace 2 s rows come from the first run, `reads-1790670357573`, whose own
+alpha 3, grace 5 s baseline had a mean of 12.1 s over 24 reads. The other rows
+come from the second run, `reads-1790671278653`. The first run records every
+dial as failed, so its dial counts are not used.
 
 | Variant | Reads | p50 | p75 | p90 | Max | Mean | Over 10 s |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -39,7 +57,9 @@ Raw data is in [`results/`](results).
 | alpha 3, grace 2 s | 24 | 6.1 s | 23.8 s | 31.2 s | 55.7 s | 12.9 s | 10 |
 | alpha 6, grace 2 s | 24 | 3.1 s | 7.2 s | 20.8 s | 81.9 s | 8.2 s | 4 |
 
-The 120-second baseline read hit the bench's read timeout. A shorter grace
+The 120-second baseline read hit the bench's read timeout. `reads.js` does not
+cancel a timed-out read, so its lookups kept running alongside that page's
+later reads and may have slowed them. A shorter grace
 period did not help: it drops slow but live responders, so lookups converge
 less well. A wider round did help.
 
@@ -56,9 +76,11 @@ after the seek.
 | 6 | 16.9 / 14.2 / 19.0 s | 3.7 / 17.6 / 24.0 s | 0 / 1.9 / 0.1 s |
 | 10 | 20.1 / 24.5 / 20.5 / 18.3 / 19.3 / 22.4 s | 11.3 / 35.8 / 11.2 / 6.4 / 4.0 / 11.0 s | 12.6 / 0 / 18.9 / 0 / 17.6 / 21.2 s |
 
-Playback read-ahead runs several lookups at once, so alpha 10 opens dozens of
+Playback read-ahead ran several lookups at once, so alpha 10 opened dozens of
 WebRTC connections together against a 64-connection pool. It waited 12 to 21
 seconds after four of six seeks. Alpha 6 never waited more than two seconds.
+The run logs are in `results/stream-*.log.gz` and `results/alpha-seek-*.log.gz`,
+and `results/streaming-summary.txt` is their summary.
 
 ## Upload quoting
 
@@ -93,15 +115,17 @@ Playwright 1.63.0 Chromium. Raw data is in `results/droplet-*`.
 
 Alpha 6 also helped on the 2-vCPU machine. The extra concurrency cost no CPU
 headroom there: upload quoting improved by 35%, against 23% on the M3 Ultra.
-Cold reads gained less on the droplet because its alpha 3 tail was already
-shorter, which fits its data-centre network rather than its CPU. No read or
-upload failed on either machine.
+Cold reads gained less on the droplet, and their p90 rose slightly, because its
+alpha 3 tail was already shorter, which fits its data-centre network rather than
+its CPU. No read or upload failed on the droplet. On the M3 Ultra every upload
+reached the payment request, and one alpha 3 read timed out.
 
 ## Decision
 
-Browser lookups use an `alpha` of 6. For cold reads, that roughly halves the
-mean read time and the p90 relative to 3. It also shortened upload quoting by
-about a quarter. It gave the steadiest first frame
+Browser lookups use an `alpha` of 6. Relative to 3, it roughly halved the
+cold-read mean on the M3 Ultra and cut the p90 by two fifths. On the droplet it
+cut the mean by about a fifth and left the p90 about the same. It shortened
+upload quoting by a quarter to a third. It gave the steadiest first frame
 during playback without the contention seen at 10. The grace period stays at the
 protocol's 5 seconds. Seek resume time remains variable at every alpha and is
 bound by how quickly a new region's holders are found.
@@ -109,7 +133,9 @@ bound by how quickly a new region's holders are found.
 ## Reproduce
 
 From the ant-client root, build `test-utils` bindings for each variant into a
-scratch copy of this directory, then serve and run it:
+scratch copy of this directory, then serve and run it. A variant sets
+`BROWSER_LOOKUP_ALPHA` and, for the grace variants, the
+`ITERATION_GRACE_TIMEOUT_SECS` duration in the browser lookup's `query_batch`:
 
 ```sh
 wasm-pack build --target web --release --out-dir <scratch>/pkg-v0 ant-core \

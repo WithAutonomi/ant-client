@@ -70,10 +70,11 @@ const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 const DEFAULT_MAX_POOLED_CLIENTS: usize = 64;
 const MAX_LOOKUP_PRECONNECTS: usize = 8;
 /// Queries in flight per browser lookup round. A third to a half of the WebRTC
-/// Direct endpoints discovered on mainnet time out when dialled, so a round of
-/// the Kademlia default of three often waits on one. Six halved the mean
-/// cold-record read time on mainnet; ten was faster for isolated reads but
-/// slowed playback, whose read-ahead runs several lookups at once.
+/// Direct endpoints discovered on mainnet time out when dialled, so most rounds
+/// wait out the lookup grace period at any width. A wider round gets more
+/// answers for that wait, so lookups need fewer rounds. Ten stalled playback
+/// after seeks while read-ahead ran several lookups against the client pool.
+/// ADR-0004 records the measurements.
 const BROWSER_LOOKUP_ALPHA: usize = 6;
 const MAX_BOOTSTRAP_CONNECTIONS: usize = 4;
 const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);

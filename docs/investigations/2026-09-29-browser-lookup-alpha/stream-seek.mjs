@@ -8,7 +8,7 @@ const PORT = Number(process.env.PORT ?? 5195);
 const WATCH_SECONDS = Number(process.env.WATCH_SECONDS ?? 120);
 const pw = await import(process.env.PLAYWRIGHT ?? "@playwright/test");
 
-const server = spawn(process.execPath, [`${SDK}/node_modules/vite/bin/vite.js`, "--config", "examples/all-in-one/vite.config.ts",
+const server = spawn(process.execPath, ["node_modules/vite/bin/vite.js", "--config", "examples/all-in-one/vite.config.ts",
   "--port", String(PORT), "--strictPort"], { cwd: SDK, stdio: "ignore" });
 for (let i = 0; i < 150; i++) {
   try { if ((await fetch(`http://127.0.0.1:${PORT}/`)).ok) break; } catch {}
