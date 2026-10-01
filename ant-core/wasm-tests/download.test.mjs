@@ -1,7 +1,7 @@
 import { BrowserNetworkClient } from "./client-fixture.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { encryptPublicFile, parseWebRtcDirectMultiaddr } from "./pkg/ant_core.js";
+import { contentAddress, encryptPublicFile, parseWebRtcDirectMultiaddr, test_encode_public_data_map } from "./pkg/ant_core.js";
 import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 
 const content = new TextEncoder().encode("Discoverable storage holder regression.".repeat(100));
@@ -279,6 +279,58 @@ test("read-ahead retries a failed record only after another read", async () => {
     assert.equal(gets(rtc), failed, "an idle reader retried a failed record");
     assert.deepEqual(await reader.readRange(starts[1], 10), original.slice(starts[1], starts[1] + 10));
     assert(await settled(rtc, 1_500) > failed, "the next read retried the failed record");
+  } finally { reader?.close(); client.close(); }
+});
+
+test("read-ahead of a misdeclared DataMap stays within its record bounds and stops when a read fails", async () => {
+  // Forty records that each declare one KiB, so all of them overlap the 32 MiB
+  // window. Read-ahead counts records, not declared bytes: at most the window
+  // cap of ten plus the last record, five in flight and 24 held or in flight.
+  const declared = 1024;
+  const maxReadAhead = 11;
+  const records = Array.from({ length: 40 }, (_, index) => {
+    const content = Uint8Array.from({ length: 16 * 1024 }, (_, byte) => (byte * 7 + index) & 0xff);
+    return { address: contentAddress(content), content };
+  });
+  const map = test_encode_public_data_map(records.map((record, index) => ({
+    index, dst_hash: record.address, src_hash: "00".repeat(32), src_size: declared,
+  })));
+  const rtc = mockWebRtc([{ delay: method => method === "get_chunk" ? 20 : 0 }]);
+  for (const record of [...records, map]) rtc.stores[0].set(record.address, record.content);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let reader;
+  const peak = { fetching: 0, total: 0 };
+  // Sample read-ahead until no GET has been sent for a while.
+  async function watch() {
+    const deadline = Date.now() + 10_000;
+    for (let count = -1, quietSince = Date.now(); ;) {
+      const { fetching, held } = reader.testReadAhead();
+      peak.fetching = Math.max(peak.fetching, fetching);
+      peak.total = Math.max(peak.total, fetching + held);
+      if (gets(rtc) !== count) [count, quietSince] = [gets(rtc), Date.now()];
+      else if (Date.now() - quietSince >= 200) return count;
+      assert(Date.now() < deadline, `read-ahead never settled after ${gets(rtc)} GETs`);
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+  }
+  try {
+    reader = await client.openPublicFile(map.address, undefined, true);
+    const opened = gets(rtc);
+    // A zero-length read moves the window without decrypting anything.
+    assert.equal((await reader.readRange(0, 0)).length, 0);
+    const fetched = await watch() - opened;
+    assert(fetched <= maxReadAhead, `read ahead ${fetched} records`);
+    // A read needing every record admits only what fits; it fetches the rest.
+    const failing = assert.rejects(reader.readRange(0, records.length * declared));
+    await watch();
+    await failing;
+    assert(peak.fetching <= 5, `${peak.fetching} records in flight`);
+    assert(peak.total <= 24, `${peak.total} records held or in flight`);
+    // The records do not decrypt, so read-ahead stops and releases them.
+    assert.deepEqual(reader.testReadAhead(), { fetching: 0, held: 0 });
+    const stopped = gets(rtc);
+    assert.equal((await reader.readRange(20 * declared, 0)).length, 0);
+    assert.equal(await watch(), stopped);
   } finally { reader?.close(); client.close(); }
 });
 

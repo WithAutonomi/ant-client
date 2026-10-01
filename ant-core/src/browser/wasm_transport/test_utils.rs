@@ -3,8 +3,10 @@
 //! all traverse the same ant-core implementation used by browser callers.
 
 use super::*;
+use crate::browser::{BrowserChunkInfo, BrowserRecord};
 use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
 use ant_protocol::pointer::Pointer;
+use self_encryption::{ChunkInfo, DataMap, XorName};
 
 mod node_session;
 use base64::Engine;
@@ -1449,4 +1451,44 @@ pub async fn test_multiplex_puts(endpoint: &str) -> JsValue {
     .await;
     client.close();
     serde_wasm_bindgen::to_value(&results).unwrap()
+}
+
+/// Encode chunk descriptors as a public DataMap record without validating them,
+/// so tests can publish DataMaps that misdeclare their records.
+#[wasm_bindgen]
+pub fn test_encode_public_data_map(chunks: JsValue) -> JsValue {
+    let chunks: Vec<BrowserChunkInfo> = serde_wasm_bindgen::from_value(chunks).unwrap();
+    let hash = |hex: &str| XorName(<[u8; 32]>::try_from(hex::decode(hex).unwrap()).unwrap());
+    let infos = chunks
+        .iter()
+        .map(|chunk| ChunkInfo {
+            index: chunk.index,
+            dst_hash: hash(&chunk.dst_hash),
+            src_hash: hash(&chunk.src_hash),
+            src_size: chunk.src_size,
+        })
+        .collect();
+    let (address, content) =
+        crate::client_engine::files::public_map_record(&DataMap::new(infos)).unwrap();
+    serde_wasm_bindgen::to_value(&BrowserRecord {
+        address: hex::encode(address),
+        content: content.to_vec(),
+    })
+    .unwrap()
+}
+
+#[derive(Serialize)]
+struct ReadAheadUsage {
+    fetching: usize,
+    held: usize,
+}
+
+#[wasm_bindgen(js_class = BrowserFileReader)]
+impl BrowserFileReader {
+    /// Records the reader's read-ahead has in flight and holds.
+    #[wasm_bindgen(js_name = testReadAhead)]
+    pub fn test_read_ahead(&self) -> JsValue {
+        let (fetching, held) = self.read_ahead.usage();
+        serde_wasm_bindgen::to_value(&ReadAheadUsage { fetching, held }).unwrap()
+    }
 }

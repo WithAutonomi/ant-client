@@ -533,10 +533,11 @@ two simultaneous GETs, the hedge delay, deduplication, verification and
 absence rules are unchanged. Native and WASM share this policy.
 
 `BrowserFileReader` reads ahead. A sequential read, which continues one of the
-last four reads or comes from a streaming reader, moves a 32 MiB window to its
-start. Up to four records in that window are fetched in parallel, alongside the
-read. A read's own records are fetched the same way, so a read that needs a
-record being fetched waits for that fetch rather than issuing a second one.
+last four reads or comes from a streaming reader, moves a window of 32 MiB, and
+at most ten records, to its start. Up to four records in that window are fetched
+in parallel, alongside the read. A read's own records are fetched the same way
+while fetches are admitted, so a read that needs a record being fetched waits
+for that fetch rather than issuing a second one.
 Another read fetches only the record after it. A streaming read from the start
 of the file also fetches the last record, where MP4 and WebM usually keep their
 index.
@@ -546,9 +547,17 @@ keeps eight records, fewer than a window spans, so read-ahead through it would
 evict records before their read and fetch them again without end. A window
 position fetches each record once. A failed fetch is not retried in the
 background: a read that needs the record fetches it itself, and each later read
-retries it once. Once the reader holds more than 24 records, about 100 MB, it
-releases those behind it, farthest first, then those farthest ahead. The window
-and the current read's records are kept.
+retries it once.
+
+DataMap record sizes are untrusted: admission checks only the total size and
+record count. Read-ahead therefore counts records, each at most one browser
+response, and never declared bytes, so undersized records shorten the window
+rather than lengthen it. A reader holds or fetches at most 24 records, about
+100 MB of full-size records. To admit a fetch, it releases held records behind
+the reader, farthest first, then those farthest ahead. The window and the
+current read's records are kept, so a fetch that fits neither bound is refused,
+and a read fetches the records refused to it itself. Once a read's records fail
+to decrypt, the reader stops reading ahead.
 
 Fetches left behind by a seek continue until five are in flight: the window's
 four and one more, such as the start of a file that a player returns to after
@@ -573,7 +582,10 @@ check that a streaming reader serves a later record from read-ahead while an
 ordinary reader fetches it. They also check that read-ahead of a file larger
 than its window fetches each record once and then stops, that an ordinary
 reader's header read fetches two records, and that a failed record is retried
-only after another read. On mainnet, the video that froze permanently at 8.5
+only after another read. A DataMap of forty records that each declare one KiB
+puts every record in the window's bytes; read-ahead fetches at most eleven of
+them, keeps at most five in flight and 24 held or in flight, and stops after a
+read fails to decrypt. On mainnet, the video that froze permanently at 8.5
 seconds played two minutes without a stall in the vault, with about 30 seconds
 buffered. After seeks, playback resumed in 2 to 21 seconds, and the first frame
 appeared 16 to 26 seconds after connecting. Both waits are bound by discovery

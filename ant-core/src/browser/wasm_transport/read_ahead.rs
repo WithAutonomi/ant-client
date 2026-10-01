@@ -3,7 +3,12 @@
 //! each record's discovery with playback, instead of stalling playback on it.
 //! The reader holds the records it fetches within its own budget, so neither the
 //! client's shared chunk cache nor another reader can evict them before use.
+//!
+//! DataMap sizes are untrusted, so every bound counts records, each at most one
+//! browser response, and never declared plaintext bytes. A fetch is admitted
+//! only within those bounds; the read fetches any record refused here itself.
 use crate::client_engine::files::RecordLayout;
+use crate::client_engine::read_ahead::releasable;
 use bytes::Bytes;
 use futures::future::{join_all, AbortHandle, Abortable, FutureExt, LocalBoxFuture, Shared};
 use self_encryption::{DataMap, MAX_CHUNK_SIZE};
@@ -14,6 +19,10 @@ use std::rc::Rc;
 
 /// Plaintext fetched ahead of a sequential read: about a minute of 5 Mbit/s video.
 const READ_AHEAD_BYTES: usize = 32 * 1024 * 1024;
+/// Records in the window at most: as many as a window of full-size records
+/// overlaps when it starts on a record's last byte. Undersized records declared
+/// by a DataMap shorten the window rather than lengthen it.
+const MAX_WINDOW_RECORDS: usize = (READ_AHEAD_BYTES - 1) / MAX_CHUNK_SIZE + 2;
 /// Records fetched in parallel within the read-ahead window.
 const READ_AHEAD_CONCURRENCY: usize = 4;
 /// Records in flight in total: the window's fetches plus one left behind by a
@@ -25,11 +34,11 @@ const _: () = assert!(
     MAX_IN_FLIGHT <= super::MAX_READ_RESPONSE_MEMORY / super::READ_RESPONSE_RESERVATION,
     "every fetch in flight must be able to run a GET within the read budget"
 );
-/// Records a reader holds, about 100 MB, before releasing some. Covers the
-/// window, the last record and recent records for short seeks back.
+/// Records a reader holds or fetches at most. Each is at most one browser
+/// response, so this bounds memory whatever a DataMap declares: about 100 MB of
+/// full-size records. Covers the window, the last record and recent records for
+/// short seeks back.
 const MAX_HELD_RECORDS: usize = 24;
-/// Most full-size records a window overlaps, when it starts on a record's last byte.
-const MAX_WINDOW_RECORDS: usize = (READ_AHEAD_BYTES - 1) / MAX_CHUNK_SIZE + 2;
 const _: () = assert!(
     MAX_HELD_RECORDS > MAX_WINDOW_RECORDS + 1,
     "held records must cover the window and the last record"
@@ -92,13 +101,14 @@ impl ReadAhead {
         }))
     }
 
-    /// Before a read, fetch the records it needs through read-ahead, so no record
-    /// is fetched twice. A sequential read also moves the read-ahead window to its
-    /// start, so the records ahead are fetched alongside it. A read is sequential
-    /// when it continues a recent read or the reader streams. Another read fetches
-    /// only the record after it, in case it starts a new stream. A streaming read
-    /// from the start of the file also fetches the last record, where containers
-    /// such as MP4 and WebM often keep the index a player reads next.
+    /// Before a read, fetch the records it needs through read-ahead while fetches
+    /// are admitted, so no record is fetched twice. A sequential read also moves
+    /// the read-ahead window to its start, so the records ahead are fetched
+    /// alongside it. A read is sequential when it continues a recent read or the
+    /// reader streams. Another read fetches only the record after it, in case it
+    /// starts a new stream. A streaming read from the start of the file also
+    /// fetches the last record, where containers such as MP4 and WebM often keep
+    /// the index a player reads next.
     ///
     /// Returns the needed records read-ahead holds once their fetches settle. The
     /// read fetches the others itself.
@@ -118,7 +128,9 @@ impl ReadAhead {
         }
         self.reading.replace(needed.clone());
         for index in needed.clone() {
-            self.prefetch(index);
+            if !self.prefetch(index) {
+                break;
+            }
         }
         if sequential {
             self.fill();
@@ -137,41 +149,24 @@ impl ReadAhead {
             }
             recent.push_back(start.saturating_add(length));
         }
-        let pending = {
-            let slots = self.slots.borrow();
-            needed
-                .clone()
-                .filter_map(|index| match slots.get(&index) {
-                    Some(Slot::Fetching { fetch, .. }) => Some(fetch.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
+        let pending = self
+            .slots
+            .borrow()
+            .range(needed.clone())
+            .filter_map(|(_, slot)| match slot {
+                Slot::Fetching { fetch, .. } => Some(fetch.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         join_all(pending).await;
-        let slots = self.slots.borrow();
-        needed
-            .filter_map(|index| match slots.get(&index) {
-                Some(Slot::Held(content)) => Some((self.layout.address(index), content.clone())),
+        self.slots
+            .borrow()
+            .range(needed)
+            .filter_map(|(&index, slot)| match slot {
+                Slot::Held(content) => Some((self.layout.address(index), content.clone())),
                 _ => None,
             })
             .collect()
-    }
-
-    /// After a read, release held records beyond the budget, behind the reader
-    /// first. The window and the latest read's records are kept.
-    pub(super) fn after_read(&self, start: usize) {
-        let window = self.window();
-        let reading = self.reading.borrow().clone();
-        let mut slots = self.slots.borrow_mut();
-        let held = slots
-            .iter()
-            .filter(|(_, slot)| matches!(slot, Slot::Held(_)))
-            .map(|(&index, _)| index)
-            .collect::<Vec<_>>();
-        let kept = |index| window.contains(&index) || reading.contains(&index);
-        for index in self.layout.releasable(start, MAX_HELD_RECORDS, &held, kept) {
-            slots.remove(&index);
-        }
     }
 
     /// Stop read-ahead, cancel its fetches and release the records it holds.
@@ -185,10 +180,33 @@ impl ReadAhead {
         }
     }
 
+    /// Records read-ahead has in flight and holds.
+    #[cfg(feature = "test-utils")]
+    pub(super) fn usage(&self) -> (usize, usize) {
+        (self.fetching(), self.held())
+    }
+
     fn window(&self) -> Range<usize> {
         self.anchor.get().map_or(0..0, |anchor| {
-            self.layout.overlapping(anchor, READ_AHEAD_BYTES)
+            self.layout
+                .window(anchor, READ_AHEAD_BYTES, MAX_WINDOW_RECORDS)
         })
+    }
+
+    fn fetching(&self) -> usize {
+        self.slots
+            .borrow()
+            .values()
+            .filter(|slot| matches!(slot, Slot::Fetching { .. }))
+            .count()
+    }
+
+    fn held(&self) -> usize {
+        self.slots
+            .borrow()
+            .values()
+            .filter(|slot| matches!(slot, Slot::Held(_)))
+            .count()
     }
 
     /// Keep up to `READ_AHEAD_CONCURRENCY` fetches running in the window, nearest
@@ -203,19 +221,25 @@ impl ReadAhead {
                 .range(window.clone())
                 .filter(|(_, slot)| matches!(slot, Slot::Fetching { .. }))
                 .count();
-            if self.closed.get() || active >= READ_AHEAD_CONCURRENCY {
+            if active >= READ_AHEAD_CONCURRENCY || !self.prefetch(index) {
                 return;
             }
-            self.prefetch(index);
         }
     }
 
-    /// Fetch one record in the background, unless read-ahead already has it.
-    fn prefetch(self: &Rc<Self>, index: usize) {
-        if self.closed.get() || self.slots.borrow().contains_key(&index) {
-            return;
+    /// Fetch one record in the background unless read-ahead already has it.
+    /// Returns whether read-ahead fetches, holds or failed the record: false once
+    /// it is closed or when no fetch can be admitted within its bounds.
+    fn prefetch(self: &Rc<Self>, index: usize) -> bool {
+        if self.closed.get() {
+            return false;
         }
-        self.cancel_stale();
+        if self.slots.borrow().contains_key(&index) {
+            return true;
+        }
+        if !self.admit() {
+            return false;
+        }
         let id = self.next_id.replace(self.next_id.get() + 1);
         let (abort, registration) = AbortHandle::new_pair();
         let address = self.layout.address(index);
@@ -248,11 +272,27 @@ impl ReadAhead {
             },
         );
         wasm_bindgen_futures::spawn_local(fetch);
+        true
     }
 
-    /// Before a new fetch, cancel fetches outside the window and the latest read
-    /// until it fits within the in-flight bound. The most recently started goes
-    /// first, as an earlier fetch has made more progress.
+    /// Make room for one more fetch within both bounds: cancel stale fetches over
+    /// the in-flight bound, then release held records over the held budget. The
+    /// window and the latest read's records are neither cancelled nor released,
+    /// so admission is refused when they fill a bound.
+    fn admit(&self) -> bool {
+        self.cancel_stale();
+        let fetching = self.fetching();
+        if fetching >= MAX_IN_FLIGHT {
+            return false;
+        }
+        // Leave room for every fetch in flight, and this one, to land.
+        self.release(MAX_HELD_RECORDS.saturating_sub(fetching + 1));
+        fetching + self.held() < MAX_HELD_RECORDS
+    }
+
+    /// Cancel fetches outside the window and the latest read until another fits
+    /// within the in-flight bound. The most recently started goes first, as an
+    /// earlier fetch has made more progress.
     fn cancel_stale(&self) {
         let window = self.window();
         let reading = self.reading.borrow().clone();
@@ -274,6 +314,23 @@ impl ReadAhead {
                 return;
             };
             abort.abort();
+        }
+    }
+
+    /// Release held records over `budget`, behind the latest read first. The
+    /// window and the latest read's records are kept.
+    fn release(&self, budget: usize) {
+        let window = self.window();
+        let reading = self.reading.borrow().clone();
+        let mut slots = self.slots.borrow_mut();
+        let held = slots
+            .iter()
+            .filter(|(_, slot)| matches!(slot, Slot::Held(_)))
+            .map(|(&index, _)| index)
+            .collect::<Vec<_>>();
+        let kept = |index| window.contains(&index) || reading.contains(&index);
+        for index in releasable(reading.start, budget, &held, kept) {
+            slots.remove(&index);
         }
     }
 }

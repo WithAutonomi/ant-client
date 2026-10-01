@@ -2209,7 +2209,11 @@ impl BrowserFileReader {
                 held.get(address).cloned()
             })
             .await;
-        self.read_ahead.after_read(start);
+        if matches!(bytes, Err(crate::data::Error::Encryption(_))) {
+            // The records do not decrypt as the DataMap declares, so reading
+            // further ahead would only spend bandwidth and memory.
+            self.read_ahead.close();
+        }
         bytes
             .map(|bytes| bytes.to_vec())
             .map_err(|error| error.to_string())
