@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "alloy",
  "ant-node",
@@ -910,8 +910,9 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.20.0"
-source = "git+https://github.com/WithAutonomi/ant-node.git?rev=7353c9ea2740de33495e78a3c36ff75b75116d4b#7353c9ea2740de33495e78a3c36ff75b75116d4b"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8afebae6037bc8d219f3089305cad8803bde439484aa9d00979486c5ea554271"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -962,8 +963,9 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "3.0.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=d11d1010d93958fee6e63e4aace8770f39a0678b#d11d1010d93958fee6e63e4aace8770f39a0678b"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb1f2e060c4283457a718c094d5fd594efd1d4eeec7cc6ca3ea113df17cce382"
 dependencies = [
  "blake3",
  "bytes",

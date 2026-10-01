@@ -2,8 +2,3 @@
 members = ["ant-core", "ant-cli"]
 resolver = "2"
 
-[patch.crates-io]
-# The published ant-protocol 3.0.0 has no `Pointer` record or wire messages
-# (ADR-0016). Pin the pointer revision until a release includes it.
-# Versions are bumped at release; this immutable revision remains 3.0.0.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "d11d1010d93958fee6e63e4aace8770f39a0678b" }
