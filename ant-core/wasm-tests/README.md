@@ -63,6 +63,16 @@ on a current-thread runtime, verified records, and range boundaries. Generated
 WASM additionally downloads a native shrunk DataMap through the mock network and
 checks media ranges across chunk boundaries and EOF.
 
+`large-download.test.mjs` streams a native-encrypted 4,303,347,835-byte file
+through the real WASM decryptor and checks its complete BLAKE3 without retaining
+the plaintext. It also covers public/private seeks across 4 GiB, actual disk
+writes, write backpressure, cancellation, writer errors, JS allocation failures,
+memory budgets and invalid offsets. The compressed fixture is about 250 KiB;
+regenerate it from the repository root with
+`cargo run -p ant-core --release --example generate-browser-large-file`.
+Generation processes the entire plaintext using bounded buffers. The full-stream
+test normally takes around twenty seconds locally; it has a three-minute timeout.
+
 Upload discovery regressions verify native's twenty-to-seven fallback, reject
 persistent five-peer results without payment or PUT, and ensure the browser
 adapter does not bypass genuine failed-connection suppression on fallback.

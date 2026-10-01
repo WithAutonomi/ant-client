@@ -200,25 +200,78 @@ impl RecordLayout {
     }
 }
 
-/// Half-open plaintext ranges. EOF and zero-length reads have the same
-/// semantics on every platform.
-pub(crate) fn range_records(
+/// Validated root-map index. File positions are independent of the platform's
+/// pointer width; only individual chunk buffers and indices use `usize`.
+/// Build once per reader so each seek is O(log chunks + overlapping chunks).
+pub(crate) struct FileIndex {
+    infos: Vec<self_encryption::ChunkInfo>,
+    hashes: Vec<XorName>,
+    offsets: Vec<u64>,
+}
+
+impl FileIndex {
+    pub(crate) fn new(map: &DataMap) -> Result<Self, String> {
+        if map.is_child() {
+            return Err("range reads require a resolved root DataMap".into());
+        }
+        let mut infos = map.infos().to_vec();
+        infos.sort_by_key(|info| info.index);
+        if infos.len() < 3 {
+            return Err("DataMap requires at least three chunks".into());
+        }
+        let mut offsets = Vec::with_capacity(infos.len() + 1);
+        offsets.push(0u64);
+        for (index, info) in infos.iter().enumerate() {
+            if info.index != index {
+                return Err("DataMap chunk indices must be contiguous".into());
+            }
+            if info.src_size == 0 || info.src_size > self_encryption::MAX_CHUNK_SIZE {
+                return Err("invalid DataMap plaintext chunk size".into());
+            }
+            let end = offsets[index]
+                .checked_add(info.src_size as u64)
+                .ok_or("DataMap plaintext size overflow")?;
+            offsets.push(end);
+        }
+        let hashes = infos.iter().map(|info| info.src_hash).collect();
+        Ok(Self {
+            infos,
+            hashes,
+            offsets,
+        })
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        *self.offsets.last().expect("index includes zero offset")
+    }
+
+    fn range_records(&self, start: u64, length: usize) -> (usize, Vec<RecordRequest>) {
+        let end = start.saturating_add(length as u64).min(self.size());
+        if start >= end {
+            return (0, Vec::new());
+        }
+        let first = self.offsets.partition_point(|offset| *offset <= start) - 1;
+        let last = self.offsets.partition_point(|offset| *offset < end);
+        let records = self.infos[first..last]
+            .iter()
+            .map(|info| (info.index, info.dst_hash.0))
+            .collect();
+        ((end - start) as usize, records)
+    }
+}
+
+#[cfg(test)]
+fn range_records(
     map: &DataMap,
     start: usize,
     length: usize,
 ) -> Result<(usize, Vec<RecordRequest>), String> {
-    let layout = RecordLayout::new(map)?;
-    let records = layout
-        .overlapping(start, length)
-        .map(|index| (index, layout.address(index)))
-        .collect();
-    let end = start.saturating_add(length).min(layout.size());
-    Ok((end.saturating_sub(start), records))
+    Ok(FileIndex::new(map)?.range_records(start as u64, length))
 }
 
 pub(crate) async fn read_range<E, F, Fut, C, S, SF>(
     root: &DataMap,
-    start: usize,
+    start: u64,
     length: usize,
     fetch: &F,
     cap: &C,
@@ -232,39 +285,61 @@ where
     S: Fn(std::time::Duration) -> SF,
     SF: Future<Output = ()>,
 {
-    let (length, required) = range_records(root, start, length).map_err(ReadError::Invalid)?;
+    let index = FileIndex::new(root).map_err(ReadError::Invalid)?;
+    read_indexed_range(&index, start, length, fetch, cap, sleep, retryable).await
+}
+
+pub(crate) async fn read_indexed_range<E, F, Fut, C, S, SF>(
+    index: &FileIndex,
+    start: u64,
+    length: usize,
+    fetch: &F,
+    cap: &C,
+    sleep: &S,
+    retryable: fn(&E) -> bool,
+) -> Result<Bytes, ReadError<E>>
+where
+    F: Fn([u8; 32]) -> Fut,
+    Fut: Future<Output = Result<Bytes, E>>,
+    C: Fn() -> usize,
+    S: Fn(std::time::Duration) -> SF,
+    SF: Future<Output = ()>,
+{
+    let (length, required) = index.range_records(start, length);
     if length == 0 {
         return Ok(Bytes::new());
     }
-    let records = fetch_records_deferred(required.clone(), fetch, cap, sleep, retryable).await?;
-    let available: HashMap<_, _> = records.into_iter().collect();
-    let fetch_cached = |batch: &[(usize, XorName)]| {
-        batch
-            .iter()
-            .map(|(index, _)| {
-                available
-                    .get(index)
-                    .cloned()
-                    .map(|content| (*index, content))
-                    .ok_or_else(|| {
-                        self_encryption::Error::Generic(format!("range omitted chunk {index}"))
-                    })
-            })
-            .collect()
-    };
-    let stream =
-        self_encryption::streaming_decrypt_with_batch_size(root, fetch_cached, required.len())
+    let records = fetch_records_deferred(required, fetch, cap, sleep, retryable).await?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(length)
+        .map_err(|e| ReadError::Invalid(format!("cannot allocate range: {e}")))?;
+    let end = start + length as u64;
+    for (position, encrypted) in records {
+        let info = &index.infos[position];
+        // The dependency's get_range uses usize file offsets. Its public
+        // per-chunk primitive has no whole-file arithmetic and retains the
+        // canonical KDF (original chunk index and neighbouring hashes).
+        let plaintext = self_encryption::decrypt_chunk(position, &encrypted, &index.hashes, 0)
             .map_err(|e| ReadError::Invalid(e.to_string()))?;
-    let bytes = stream
-        .get_range(start, length)
-        .map_err(|e| ReadError::Invalid(e.to_string()))?;
-    if bytes.len() != length {
+        if plaintext.len() != info.src_size {
+            return Err(ReadError::Invalid(
+                "decrypted chunk size differs from DataMap".into(),
+            ));
+        }
+        crate::record::verify(&info.src_hash.0, &plaintext).map_err(ReadError::Invalid)?;
+        let chunk_start = index.offsets[position];
+        let from = start.saturating_sub(chunk_start) as usize;
+        let to = (end - chunk_start).min(info.src_size as u64) as usize;
+        output.extend_from_slice(&plaintext[from..to]);
+    }
+    if output.len() != length {
         return Err(ReadError::Invalid(format!(
             "range returned {} bytes, expected {length}",
-            bytes.len()
+            output.len()
         )));
     }
-    Ok(bytes)
+    Ok(Bytes::from(output))
 }
 
 /// Native file-download retry rounds: retry missing records together after the
@@ -460,9 +535,17 @@ mod tests {
                 let bytes = records[&address].clone();
                 async move { Ok::<_, String>(bytes) }
             };
-            let actual = read_range(&map, start, length, &fetch, &|| 3, &|_| async {}, |_| true)
-                .await
-                .unwrap();
+            let actual = read_range(
+                &map,
+                start as u64,
+                length,
+                &fetch,
+                &|| 3,
+                &|_| async {},
+                |_| true,
+            )
+            .await
+            .unwrap();
             let expected =
                 &content[start.min(content.len())..start.saturating_add(length).min(content.len())];
             assert_eq!(actual.as_ref(), expected);
@@ -607,5 +690,57 @@ mod tests {
         let mut infos = map.infos().to_vec();
         infos[0].src_size = usize::MAX;
         assert!(range_records(&DataMap::new(infos), 0, 1).is_err());
+    }
+
+    #[test]
+    fn indexed_ranges_cross_four_gib_without_pointer_width_arithmetic() {
+        let size = self_encryption::MAX_CHUNK_SIZE;
+        let infos = (0..1030)
+            .map(|index| self_encryption::ChunkInfo {
+                index,
+                src_size: size,
+                src_hash: XorName([1; 32]),
+                dst_hash: XorName([2; 32]),
+            })
+            .collect();
+        let index = FileIndex::new(&DataMap::new(infos)).unwrap();
+        assert_eq!(index.size(), 1030 * size as u64);
+        let start = (1u64 << 32) - 4;
+        let (length, records) = index.range_records(start, 8);
+        assert_eq!(length, 8);
+        assert_eq!(records[0].0 as u64, start / size as u64);
+        let boundary = 1026 * size as u64;
+        assert!(boundary > u32::MAX as u64);
+        let (length, records) = index.range_records(boundary - 1, 2);
+        assert_eq!(length, 2);
+        assert_eq!(
+            records.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![1025, 1026]
+        );
+        assert_eq!(index.range_records(index.size() - 1, 10).0, 1);
+        assert_eq!(index.range_records(u64::MAX, 10).0, 0);
+    }
+
+    #[tokio::test]
+    async fn ranges_reject_mismatched_plaintext_size() {
+        let (_, map, records) = fixture();
+        let mut infos = map.infos().to_vec();
+        infos[0].src_size += 1;
+        let fetch = |address| {
+            let bytes = records[&address].clone();
+            async move { Ok::<_, String>(bytes) }
+        };
+        let error = read_range(
+            &DataMap::new(infos),
+            0,
+            1,
+            &fetch,
+            &|| 1,
+            &|_| async {},
+            |_| true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("chunk size differs"));
     }
 }
