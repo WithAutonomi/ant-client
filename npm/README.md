@@ -166,13 +166,18 @@ step being tested.
 
 ```sh
 # 1. Build ant for your host, and stage an archive in the shape the release workflow produces.
-cargo build --release --bin ant
 VERSION=0.0.0-dryrun
 TARGET=x86_64-unknown-linux-musl          # the target matching your machine
+cargo build --release --target "$TARGET" --bin ant
 STAGE=$(mktemp -d)
 mkdir -p "$STAGE/ant-$VERSION-$TARGET"
-cp target/release/ant "$STAGE/ant-$VERSION-$TARGET/"
-cp ant-core/resources/bootstrap_peers.toml "$STAGE/ant-$VERSION-$TARGET/"
+cp "target/$TARGET/release/ant" "$STAGE/ant-$VERSION-$TARGET/"
+cp ant-core/resources/bootstrap_peers.toml LICENSE-MIT LICENSE-APACHE "$STAGE/ant-$VERSION-$TARGET/"
+python3 scripts/third_party_notices/generate.py --package ant-cli \
+  --config scripts/third_party_notices/config.toml --target "$TARGET" \
+  --output "$STAGE/ant-$VERSION-$TARGET/THIRD-PARTY-NOTICES.txt"
+cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" \
+  "$STAGE/ant-$VERSION-$TARGET/RUST-STD-COPYRIGHT.html"
 (cd "$STAGE" && tar czf "ant-$VERSION-$TARGET.tar.gz" "ant-$VERSION-$TARGET" \
   && sha256sum ant-*.tar.gz > SHA256SUMS.txt)
 

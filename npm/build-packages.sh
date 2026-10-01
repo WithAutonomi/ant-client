@@ -44,6 +44,10 @@ PLATFORM_TARGETS=(
   'x86_64-pc-windows-msvc|win32-x64|"win32"|"x64", "arm64"|zip|ant.exe|Windows x86_64'
 )
 
+# Licence files and third-party notices that each release archive carries next to the binary
+# (ant-cli-release.yml), copied into every platform package.
+NOTICE_FILES=(LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt RUST-STD-COPYRIGHT.html)
+
 VERSION=""
 ARTIFACTS_DIR=""
 OUT_DIR=""
@@ -190,11 +194,18 @@ for entry in "${PLATFORM_TARGETS[@]}"; do
   [ -d "$staged" ] || die "expected directory $(basename "$staged") inside ${archive}"
   [ -f "${staged}/${binary}" ] || die "expected ${binary} inside $(basename "$archive")"
   [ -f "${staged}/bootstrap_peers.toml" ] || die "expected bootstrap_peers.toml inside $(basename "$archive")"
+  # The licences and third-party notices travel with the binary they cover.
+  for notice in "${NOTICE_FILES[@]}"; do
+    [ -f "${staged}/${notice}" ] || die "expected ${notice} inside $(basename "$archive")"
+  done
 
   rm -rf "$pkg_dir"
   mkdir -p "${pkg_dir}/bin"
   cp "${staged}/${binary}" "${pkg_dir}/bin/${binary}"
   cp "${staged}/bootstrap_peers.toml" "${pkg_dir}/bootstrap_peers.toml"
+  for notice in "${NOTICE_FILES[@]}"; do
+    cp "${staged}/${notice}" "${pkg_dir}/${notice}"
+  done
   chmod 755 "${pkg_dir}/bin/${binary}"
 
   render "${SCRIPT_DIR}/platform/package.json.tmpl" "${pkg_dir}/package.json" \
@@ -226,6 +237,7 @@ mkdir -p "${META_DIR}/bin" "${META_DIR}/lib"
 cp "${SCRIPT_DIR}/ant/bin/ant.js" "${META_DIR}/bin/ant.js"
 cp "${SCRIPT_DIR}/ant/lib/resolve.js" "${META_DIR}/lib/resolve.js"
 cp "${SCRIPT_DIR}/ant/postinstall.js" "${META_DIR}/postinstall.js"
+cp "${REPO_ROOT}/LICENSE-MIT" "${REPO_ROOT}/LICENSE-APACHE" "${META_DIR}/"
 chmod 755 "${META_DIR}/bin/ant.js"
 
 render "${SCRIPT_DIR}/ant/package.json.tmpl" "${META_DIR}/package.json" \
