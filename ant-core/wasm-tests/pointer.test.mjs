@@ -119,6 +119,40 @@ test("a node that does not advertise pointers is never sent one", async () => {
   }
 });
 
+test("a write too few peers can accept is refused before anything is paid", async () => {
+  // Mid-rollout: four of the seven advertise pointers, and a write needs five.
+  const rtc = mockWebRtc(Array.from({ length: 7 }, (_, i) => ({ pointers: i >= 3 })));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    await assert.rejects(
+      client.createPointer(seed, target(1), "chunk", paymentNetwork, signer.pay),
+      /accept pointer writes/,
+    );
+    await assert.rejects(
+      client.updatePointer(seed, target(2), "chunk", paymentNetwork, signer.pay),
+      /accept pointer writes/,
+    );
+    assert.equal(signer.calls.length, 0, "nothing is paid for a write that cannot land");
+    assert.equal(puts(rtc).length, 0, "and nothing is sent");
+  } finally {
+    client.close();
+  }
+});
+
+test("a write five of seven can accept still goes ahead", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, (_, i) => ({ pointers: i >= 2 })));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    const written = await client.createPointer(seed, target(1), "chunk", paymentNetwork, signer.pay);
+    assert.equal(signer.calls.length, 1);
+    assert.deepEqual(await client.getPointer(written.pointer.address), written.pointer);
+  } finally {
+    client.close();
+  }
+});
+
 test("an owner seed of the wrong length is refused before anything is paid", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
   const client = new BrowserNetworkClient(rtc.endpoints);
@@ -150,6 +184,150 @@ test("creating a pointer that exists is refused before anything is paid", async 
       /already exists at counter 0; update it instead/,
     );
     assert.equal(signer.calls.length, 1, "the refused create paid nothing");
+  } finally {
+    client.close();
+  }
+});
+
+test("one peer claiming the pointer moved on does not end a paid write", async () => {
+  // A newer state for the same owner, signed and paid for elsewhere.
+  const elsewhere = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const other = new BrowserNetworkClient(elsewhere.endpoints);
+  let newer;
+  try {
+    await other.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay);
+    await other.updatePointer(seed, target(2), "chunk", paymentNetwork, wallet().pay,
+      value => { newer = value.record; });
+  } finally {
+    other.close();
+  }
+
+  const nodes = Array.from({ length: 7 }, () => ({}));
+  const rtc = mockWebRtc(nodes);
+  let paid;
+  const first = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    await first.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
+      value => { paid = value; });
+  } finally {
+    first.close();
+  }
+
+  // One node now claims the newer state and two cannot be reached, so four
+  // hold the paid state: one short of a write quorum.
+  rtc.stores[0].set(`pointer:${pointerAddress(seed)}`, newer);
+  nodes[5].connectError = "unreachable";
+  nodes[6].connectError = "unreachable";
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    await assert.rejects(
+      client.storePaidPointer(paid.record, paid.proof, paymentNetwork),
+      error => /stored on 4 of 5/.test(String(error)) && !/moved/.test(String(error)),
+      "one peer's word is a shortfall to retry, not a final answer",
+    );
+  } finally {
+    client.close();
+  }
+
+  // Once the group really holds the newer state, the write ends at once.
+  for (let i = 0; i < 5; i += 1) rtc.stores[i].set(`pointer:${pointerAddress(seed)}`, newer);
+  const again = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    await assert.rejects(
+      again.storePaidPointer(paid.record, paid.proof, paymentNetwork),
+      /moved while this update was in flight/,
+    );
+  } finally {
+    again.close();
+  }
+});
+
+test("an onPaid callback that never settles does not keep a paid state from being stored", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  let paid;
+  let deadline;
+  try {
+    const written = await Promise.race([
+      client.createPointer(seed, target(1), "chunk", paymentNetwork, signer.pay,
+        value => { paid = value; return new Promise(() => {}); }),
+      new Promise((_, reject) => deadline = setTimeout(
+        () => reject(new Error("the write waited on onPaid")), 10000)),
+    ]);
+    assert.ok(paid.record instanceof Uint8Array, "the paid state was handed over first");
+    assert.equal(signer.calls.length, 1, "and paid for once");
+    assert.ok(puts(rtc).length > 0, "then stored");
+    assert.deepEqual(await client.getPointer(written.pointer.address), written.pointer);
+  } finally {
+    clearTimeout(deadline);
+    client.close();
+  }
+});
+
+test("one node refusing while the rest miss a round does not end a paid write", async () => {
+  // A paid state, from a network that stored it.
+  const elsewhere = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const first = new BrowserNetworkClient(elsewhere.endpoints);
+  let paid;
+  try {
+    await first.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
+      value => { paid = value; });
+  } finally {
+    first.close();
+  }
+
+  // One node refuses every write; the other six drop the answer to their
+  // first write, so the first round hears nothing but that refusal.
+  const missed = new Set();
+  const nodes = Array.from({ length: 7 }, (_, index) => index === 0
+    ? { putError: { code: "payment_required", message: "pay up" } }
+    : {
+      respond: (_channel, method) => {
+        if (method !== "put_pointer" || missed.has(index)) return true;
+        missed.add(index);
+        return false;
+      },
+    });
+  const rtc = mockWebRtc(nodes);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const stored = await client.storePaidPointer(paid.record, paid.proof, paymentNetwork);
+    assert.equal(stored.address, pointerAddress(seed));
+    assert.equal(missed.size, 6, "every other node missed the first round");
+  } finally {
+    client.close();
+  }
+});
+
+test("nodes that cannot store just then do not end a paid write", async () => {
+  const elsewhere = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const first = new BrowserNetworkClient(elsewhere.endpoints);
+  let paid;
+  try {
+    await first.createPointer(seed, target(1), "chunk", paymentNetwork, wallet().pay,
+      value => { paid = value; });
+  } finally {
+    first.close();
+  }
+
+  // Two nodes have no room; the other five miss the first round.
+  const missed = new Set();
+  const nodes = Array.from({ length: 7 }, (_, index) => index < 2
+    ? { putError: { code: "storage_full", message: "disk full" } }
+    : {
+      respond: (_channel, method) => {
+        if (method !== "put_pointer" || missed.has(index)) return true;
+        missed.add(index);
+        return false;
+      },
+    });
+  const rtc = mockWebRtc(nodes);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const stored = await client.storePaidPointer(paid.record, paid.proof, paymentNetwork);
+    assert.equal(stored.address, pointerAddress(seed));
+    assert.equal(missed.size, 5);
   } finally {
     client.close();
   }

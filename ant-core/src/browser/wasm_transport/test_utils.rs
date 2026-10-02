@@ -971,15 +971,23 @@ impl BrowserTestNode {
                     .records
                     .get(&key)
                     .and_then(|bytes| Pointer::from_bytes(bytes).ok());
-                Body::PointerPutResponse(match held {
-                    Some(held) if held.state_id() == state_id => {
+                Body::PointerPutResponse(match (&self.put_error, held) {
+                    (Some((code, message)), _) if code == "payment_required" => {
+                        PointerPutResponse::PaymentRequired {
+                            message: message.clone(),
+                        }
+                    }
+                    (Some((_, message)), _) => PointerPutResponse::Error(
+                        ant_protocol::ProtocolError::StorageFailed(message.clone()),
+                    ),
+                    (None, Some(held)) if held.state_id() == state_id => {
                         PointerPutResponse::Unchanged { address, state_id }
                     }
-                    Some(held) if !record.replaces(&held) => PointerPutResponse::Stale {
+                    (None, Some(held)) if !record.replaces(&held) => PointerPutResponse::Stale {
                         address,
                         state_id: held.state_id(),
                     },
-                    _ => {
+                    (None, _) => {
                         self.records.insert(key, request.record.to_vec());
                         PointerPutResponse::Success { address, state_id }
                     }
