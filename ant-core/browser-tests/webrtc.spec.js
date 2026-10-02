@@ -14,7 +14,7 @@ test("real Chromium authenticates, resumes one paid upload, and downloads by add
   expect(result.records).toBeGreaterThan(1); expect(result.replicas).toBeGreaterThanOrEqual(4);
   expect(errors).toEqual([]);
 });
-test("real Chromium creates, updates, reads and resolves pointers on real nodes", async ({ page, request }) => {
+test("real Chromium creates, updates, reads, resolves and hands over pointers on real nodes", async ({ page, request }) => {
   const manifest = await (await request.get("http://127.0.0.1:35000/api/browser-manifest.json")).json();
   const info = await (await request.get("http://127.0.0.1:35000/api/info")).json();
   const errors = []; page.on("pageerror", error => errors.push(error.message));
@@ -23,12 +23,15 @@ test("real Chromium creates, updates, reads and resolves pointers on real nodes"
   const result = await page.evaluate(options => globalThis.runPointerIntegration(options), {
     endpoint: manifest.endpoints[0], payment: manifest.payment, rpcUrl: info.evm.rpc_url,
   });
-  expect(result.payments).toBe(4);
+  expect(result.payments).toBe(5);
   expect(result.address).toBe(result.expectedAddress);
   expect(result.createdCounter).toBe("0"); expect(result.updatedCounter).toBe("1");
   expect(result.readCounter).toBe("2"); expect(result.readKind).toBe("pointer");
   expect(result.readTarget).toBe(result.endAddress);
   expect(result.resolved).toEqual({ kind: "chunk", kindTag: 0, target: "03".repeat(32) });
   expect(result.absent).toBeNull();
+  expect(result.transferredCounter).toBe("18446744073709551615");
+  expect(result.finalityStatus).toBe("final");
+  expect(result.finalityTransferredTo).toBe(result.endAddress);
   expect(errors).toEqual([]);
 });

@@ -177,6 +177,18 @@ pub trait BrowserNetwork {
     fn connected_read_peers(&self) -> Vec<PeerId> {
         Vec::new()
     }
+    /// Whether `peer` would take a paid pointer write from this client, as
+    /// far as can be told before one is sent: `Some(true)` if it would,
+    /// `Some(false)` if it would refuse, `None` if it cannot be told in time.
+    /// Adapters that cannot tell answer `None` and leave the write itself to
+    /// find out.
+    fn accepts_pointer_writes<'a>(
+        &'a self,
+        _peer: &'a PeerId,
+        _addrs: &'a [MultiAddr],
+    ) -> futures::future::LocalBoxFuture<'a, Option<bool>> {
+        Box::pin(async { None })
+    }
     /// Execute one authenticated request, preserving its request identifier.
     fn request<'a>(
         &'a self,
@@ -520,6 +532,28 @@ impl Network {
                 })
                 .collect(),
         );
+    }
+
+    /// Whether `peer` would take a paid pointer write from this client, as
+    /// far as can be told before one is sent: `None` if it cannot be told.
+    ///
+    /// A browser learns it from the capabilities a node advertises when the
+    /// session opens. A native node advertises none, so a native client
+    /// cannot tell and its write finds out.
+    pub(crate) async fn accepts_pointer_writes(
+        &self,
+        peer: &PeerId,
+        addrs: &[MultiAddr],
+    ) -> Option<bool> {
+        #[cfg(feature = "native")]
+        {
+            let _ = (peer, addrs);
+            None
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.backend.accepts_pointer_writes(peer, addrs).await
+        }
     }
 
     #[cfg(not(feature = "native"))]

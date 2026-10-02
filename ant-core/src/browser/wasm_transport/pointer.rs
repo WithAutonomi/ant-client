@@ -1,8 +1,9 @@
 // Copyright 2026 MaidSafe.net limited.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Pointers from the browser (ADR-0016 in `ant-node`): read, resolve, create
-//! and update, over the same client the native API uses.
+//! Pointers from the browser (ADR-0016 in `ant-node`): read, resolve, create,
+//! update, and hand over for good (ADR-0018), over the same client the native
+//! API uses.
 //!
 //! Reads, the quorum and corroboration rules, the payment plan and the write
 //! fan-out are the native client's own; only the wallet is the page's. The
@@ -14,13 +15,23 @@ use super::upload_adapter::{paid_transactions, wallet_quotes};
 use super::*;
 use crate::data::client::batch::ChunkPaymentPlan;
 use crate::data::{
-    ml_dsa_65, pointer_address, MlDsaPublicKey, MlDsaSecretKey, Pointer, PointerTarget,
-    PointerTargetKind,
+    ml_dsa_65, pointer_address, FinalState, FinalityStatus, MlDsaPublicKey, MlDsaSecretKey,
+    Pointer, PointerFinality, PointerTarget, PointerTargetKind,
 };
 use ant_protocol::evm::{QuoteHash, TxHash};
 
 /// Length of an owner key seed.
 const OWNER_SEED_LEN: usize = 32;
+
+/// How long a paid state waits on the page's `onPaid` callback before it is
+/// stored anyway. The payment is spent either way, so a callback that never
+/// settles must not keep the state from being stored.
+#[cfg(not(feature = "test-utils"))]
+const ON_PAID_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Short enough that a test can wait out a callback that never settles.
+#[cfg(feature = "test-utils")]
+const ON_PAID_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A pointer as JavaScript sees it.
 #[derive(Debug, Serialize)]
@@ -66,6 +77,84 @@ struct BrowserPointerWrite {
     #[serde(skip_serializing_if = "Option::is_none")]
     transaction_hash: Option<String>,
     storage_cost_atto: String,
+}
+
+/// A final state as JavaScript sees it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserFinalState {
+    state_id: String,
+    kind: String,
+    kind_tag: u8,
+    target: String,
+    holders: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transferred_to: Option<String>,
+}
+
+impl From<&FinalState> for BrowserFinalState {
+    fn from(state: &FinalState) -> Self {
+        let target = PointerTarget::from_raw_tag(state.kind_tag, state.target);
+        Self {
+            state_id: hex::encode(state.state_id),
+            kind: kind_name(&target).to_string(),
+            kind_tag: state.kind_tag,
+            target: hex::encode(state.target),
+            holders: state.holders,
+            transferred_to: state.transferred_to().map(hex::encode),
+        }
+    }
+}
+
+/// Where a pointer stands with respect to finality, as JavaScript sees it.
+///
+/// `status` is `"open"`, `"settling"`, `"final"`, `"unconfirmed"` (final on a
+/// majority, but not every peer answered) or `"forked"`. `states` holds every
+/// final state seen, most-held first; `majority` the one reads return.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserPointerFinality {
+    address: String,
+    group: usize,
+    answered: usize,
+    status: &'static str,
+    /// Decimal, for an open pointer: a counter can exceed JavaScript's safe
+    /// integers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    counter: Option<String>,
+    states: Vec<BrowserFinalState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    majority: Option<BrowserFinalState>,
+}
+
+impl From<&PointerFinality> for BrowserPointerFinality {
+    fn from(finality: &PointerFinality) -> Self {
+        let (status, counter, states, majority) = match &finality.status {
+            FinalityStatus::Open { counter } => {
+                ("open", counter.map(|c| c.to_string()), Vec::new(), None)
+            }
+            FinalityStatus::Settling(state) => ("settling", None, vec![state.into()], None),
+            FinalityStatus::Final(state) => ("final", None, vec![state.into()], Some(state.into())),
+            FinalityStatus::Unconfirmed(state) => {
+                ("unconfirmed", None, vec![state.into()], Some(state.into()))
+            }
+            FinalityStatus::Forked { states, majority } => (
+                "forked",
+                None,
+                states.iter().map(BrowserFinalState::from).collect(),
+                majority.as_ref().map(BrowserFinalState::from),
+            ),
+        };
+        Self {
+            address: hex::encode(finality.address),
+            group: finality.group,
+            answered: finality.answered,
+            status,
+            counter,
+            states,
+            majority,
+        }
+    }
 }
 
 /// A target kind by name. A tag this build does not know is reported as
@@ -212,6 +301,54 @@ impl BrowserNetworkClient {
         to_js(&written)
     }
 
+    /// Hand the pointer `owner_seed` controls over to the pointer at
+    /// `recipient`, for good, and pay for the final state. `on_paid` is as for
+    /// [`Self::create_pointer`].
+    ///
+    /// Readers of the pointer's address are redirected to `recipient`, which
+    /// only its owner can move, and `owner_seed` can change nothing any more.
+    /// Refused before anything is paid if the pointer is already final, or if
+    /// `recipient` does not exist or leads back to this pointer. Check the
+    /// result with [`Self::pointer_finality`] before relying on it.
+    #[wasm_bindgen(js_name = transferPointer)]
+    pub async fn transfer_pointer(
+        &self,
+        owner_seed: &[u8],
+        recipient: &str,
+        payment_network: JsValue,
+        pay_for_quotes: js_sys::Function,
+        on_paid: Option<js_sys::Function>,
+    ) -> Result<JsValue, JsValue> {
+        let payment_network = parse_payment_network(payment_network)?;
+        let written = self
+            .write_pointer(
+                PointerWrite::Transfer,
+                owner_seed,
+                recipient,
+                "pointer",
+                &payment_network,
+                &pay_for_quotes,
+                on_paid.as_ref(),
+            )
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
+        to_js(&written)
+    }
+
+    /// Ask the whole close group whether the pointer at `address` is final,
+    /// and on what. Only `status: "final"` means one final state, held by a
+    /// majority of the group, with no rival.
+    #[wasm_bindgen(js_name = pointerFinality)]
+    pub async fn pointer_finality(&self, address: &str) -> Result<JsValue, JsValue> {
+        let at = parse_lookup_key(address, "pointer address").map_err(|e| JsValue::from_str(&e))?;
+        let finality = self
+            .shared
+            .pointer_finality(&at)
+            .await
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        to_js(&BrowserPointerFinality::from(&finality))
+    }
+
     /// Store a pointer state already paid for, from the `record` and `proof`
     /// an earlier write handed to its `on_paid` callback. Pays nothing.
     #[wasm_bindgen(js_name = storePaidPointer)]
@@ -224,10 +361,18 @@ impl BrowserNetworkClient {
         let payment_network = parse_payment_network(payment_network)?;
         let record = Pointer::from_bytes(record)
             .map_err(|error| JsValue::from_str(&format!("invalid pointer record: {error}")))?;
-        self.paying_client(&payment_network)
-            .pointer_put_paid(&record, proof.to_vec())
-            .await
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let client = self.paying_client(&payment_network);
+        if let Err(error) = client.pointer_put_paid(&record, proof.to_vec()).await {
+            // As for a transfer written the first time: a final state whose
+            // acknowledgements were all lost may have landed anyway.
+            if !record.is_terminal() {
+                return Err(JsValue::from_str(&error.to_string()));
+            }
+            client
+                .recover_final_write(&record, error)
+                .await
+                .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        }
         to_js(&BrowserPointer::from(&record))
     }
 }
@@ -239,6 +384,8 @@ enum PointerWrite {
     Create,
     /// One past what the network serves, or a creation.
     Update,
+    /// The final state, handing the pointer over to the target pointer.
+    Transfer,
 }
 
 impl BrowserNetworkClient {
@@ -259,6 +406,11 @@ impl BrowserNetworkClient {
         let record = match write {
             PointerWrite::Create => client.pointer_sign_create(&secret, &owner, target).await,
             PointerWrite::Update => client.pointer_sign_update(&secret, &owner, target).await,
+            PointerWrite::Transfer => {
+                client
+                    .pointer_sign_transfer(&secret, &owner, target.address)
+                    .await
+            }
         }
         .map_err(|error| error.to_string())?;
         self.store_pointer(&client, &record, payment_network, pay_for_quotes, on_paid)
@@ -298,13 +450,24 @@ impl BrowserNetworkClient {
             .map_err(|error| error.to_string())?;
         if let Some(on_paid) = on_paid {
             // The payment is spent whatever the page does with this, so a
-            // callback that fails does not stop the state being stored.
-            let _ = hand_over_paid(on_paid, record, &proof).await;
+            // callback that fails, or never settles, does not stop the state
+            // being stored.
+            let _ =
+                crate::runtime::timeout(ON_PAID_TIMEOUT, hand_over_paid(on_paid, record, &proof))
+                    .await;
         }
-        client
-            .pointer_put_paid(record, proof)
-            .await
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = client.pointer_put_paid(record, proof).await {
+            // A final state cannot be taken back, and a write whose
+            // acknowledgements were all lost may have landed anyway; the
+            // group says, as it does for a native transfer.
+            if !record.is_terminal() {
+                return Err(error.to_string());
+            }
+            client
+                .recover_final_write(record, error)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         Ok(BrowserPointerWrite {
             pointer: BrowserPointer::from(record),
             transaction_hash: submission.transaction_hash,
