@@ -668,14 +668,22 @@ Manifest validation no longer rejects files over 1 GB or over 1,024 chunks. It
 caps a file's chunk list at 262,144 entries (about 1 TiB at the native chunk
 size), which bounds the work an untrusted manifest can cause. Chunk sizes come
 from the DataMap rather than this build's `MAX_CHUNK_SIZE`, so maps produced
-with another self-encryption chunk size remain readable.
+with another self-encryption chunk size remain readable, up to 16 MiB per chunk.
 
 A reader retains a validated root-map index and uses binary searches to identify
-overlapping chunks. Decryption delegates to `self_encryption::decrypt_chunk`
-with the original indices and neighbouring source hashes. This avoids the
-dependency's pointer-sized whole-file range arithmetic without changing its KDF,
-DataMap representation or stored ciphertext. Encrypted records and reconstructed
-plaintext chunks are verified against their respective hashes and sizes.
+overlapping chunks. Chunks are decrypted one at a time with the original
+indices and neighbouring source hashes, which avoids the dependency's
+pointer-sized whole-file range arithmetic without changing its KDF, DataMap
+representation or stored ciphertext. `self_encryption::decrypt_chunk`
+decompresses without an output limit, so a crafted record could expand to
+gigabytes before its declared size is checked and abort the WASM instance.
+`client_engine/chunk_decrypt.rs` therefore performs the same steps (BLAKE3 KDF,
+XOR pad, ChaCha20-Poly1305, Brotli) and stops decompressing one byte past the
+declared size. It uses the dependency's own `chacha20poly1305` and
+`brotli-decompressor` versions, and a test pins its output to `decrypt_chunk`
+so a change to the dependency's KDF fails it; a bounded primitive upstream
+would replace it. Encrypted records and reconstructed plaintext chunks are
+verified against their respective hashes and sizes.
 
 Reads are chunk-aligned. A shared engine primitive fetches a set of chunks in
 one deferred retry pass and hands each decrypted chunk on as it completes, so a
@@ -687,9 +695,12 @@ every chunk in a single pass at the requested concurrency, and copy each chunk
 into the output as it is decrypted. WASM holds only the records in flight. The
 whole-file BLAKE3 is computed in file order; a chunk that completes ahead of
 that order is read back from the output when its turn comes. Progress is still
-reported as `Downloaded chunk n/total`. Options are passed as
-`{ concurrency?, maxMemoryBytes?, onProgress? }`, and the earlier
-`(file, concurrency?, onProgress?)` form remains supported. `maxMemoryBytes`
+reported as `Downloaded chunk n/total`; chunks that complete ahead of file
+order are hashed between event-loop turns rather than in one blocking step.
+Options are passed as `{ concurrency?, maxMemoryBytes?, onProgress?, signal? }`.
+An `AbortSignal` cancels resolution and transfer alike. The earlier
+`(file, concurrency?, onProgress?)` form remains supported, coercing the
+concurrency number as wasm-bindgen did. `maxMemoryBytes`
 limits the output allocation. Allocation failure rejects before file-content
 transfer and directs the caller to streaming. Automatic free-memory detection
 and implicit disk spill are not portable browser capabilities; applications own
@@ -697,15 +708,21 @@ the memory budget and selection of a storage destination.
 
 `BrowserFileReader.pipeTo(writable, { start?, end?, signal?, onProgress? })`
 streams the whole file or a half-open range to a caller-owned `WritableStream`.
-It fetches windows of whole chunks holding up to 32 MiB of plaintext, then
-writes them in order, at most 4 MiB per write, and waits for every write before
-fetching the next window. Retry waits overlap within a window; holding more
-than one window would trade that bound on memory for overlap across windows.
+An ordered pipeline fetches chunks concurrently and writes them in file order,
+at most 4 MiB per write, each awaited before the next. Chunks are launched while
+those in flight or awaiting their turn total at most 32 MiB, so fetching
+continues behind a pending write but a slow destination still bounds memory.
+Each missing record is retried on its own deferred schedule while the rest of
+the buffer keeps fetching, so retry waits overlap rather than adding up per
+batch. Only a record that stays missing longer than the buffer takes to fill
+holds the stream back.
 It computes BLAKE3 incrementally, closes the destination on success, aborts it
 on any failure including invalid options, and releases the writer lock. An
 `AbortSignal` cancels one operation without closing the reader. Closing the
 reader cancels its operations at once, including fetches waiting to be retried,
-and evicts only that reader's records from the client's shared cache. The core
+and evicts only that reader's records from the client's shared cache.
+Cancellation is checked before an operation is resumed, so a cancelled
+operation never completes or refills the cache afterwards. The core
 does not open file pickers, own browser filesystem policy, or change the
 companion SDK.
 
@@ -732,6 +749,7 @@ through generated WASM with a matching BLAKE3; public/private seeks beyond 4 GiB
 disk output; backpressure; cancellation by `AbortSignal`, by closing the reader
 and during retry waits; writer errors; destinations aborted for invalid calls;
 allocation failures; invalid offsets and options; manifest validation; and
-shared native range, single-pass retry and ordered-hash tests. The generated
+shared native range, single-pass retry, ordered-pipeline, ordered-hash, bounded
+decryption and decompression-bomb tests. The generated
 WASM tests use mocked WebRTC hosts with real Rust protocol and crypto processing.
 They do not establish real-browser or live-network compatibility by themselves.

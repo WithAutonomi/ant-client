@@ -2400,15 +2400,17 @@ impl BrowserNetworkClient {
     }
 
     /// Download a public file into one JavaScript Uint8Array, using bounded
-    /// WASM buffers. `options` is `{ concurrency?, maxMemoryBytes?, onProgress? }`;
-    /// `maxMemoryBytes` limits the output allocation. A number is the legacy
-    /// concurrency argument, paired with a positional `onProgress`. For
-    /// disk-backed downloads use openPublicFile and reader.pipeTo(writable).
+    /// WASM buffers. `options` is
+    /// `{ concurrency?, maxMemoryBytes?, onProgress?, signal? }`:
+    /// `maxMemoryBytes` limits the output allocation and an AbortSignal
+    /// cancels the download. A number is the legacy concurrency argument,
+    /// paired with a positional `onProgress`. For disk-backed downloads use
+    /// openPublicFile and reader.pipeTo(writable).
     #[wasm_bindgen(js_name = downloadPublicFile)]
     pub async fn download_public_file(
         &self,
         file: JsValue,
-        options: JsValue,
+        options: Option<JsValue>,
         on_progress: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
         let file: BrowserPublicFileInput = serde_wasm_bindgen::from_value(file)
@@ -2424,7 +2426,7 @@ impl BrowserNetworkClient {
     pub async fn download_private_file(
         &self,
         file: JsValue,
-        options: JsValue,
+        options: Option<JsValue>,
         on_progress: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
         let file: BrowserPrivateFileInput = serde_wasm_bindgen::from_value(file)
@@ -2649,15 +2651,12 @@ impl BrowserNetworkClient {
     async fn download_file(
         &self,
         source: BrowserFileSource,
-        options: JsValue,
+        options: Option<JsValue>,
         on_progress: Option<js_sys::Function>,
     ) -> Result<JsValue, JsValue> {
         let settings = download::DownloadSettings::from_js(options, on_progress)
             .map_err(|error| JsValue::from_str(&error))?;
-        let result = self
-            .download_file_inner(source, settings)
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
+        let result = self.download_file_inner(source, settings).await?;
         serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
@@ -2681,19 +2680,27 @@ impl BrowserNetworkClient {
         ))
     }
 
+    /// Errors are JavaScript values so an AbortSignal's reason reaches the caller.
     async fn download_file_inner(
         &self,
         source: BrowserFileSource,
         settings: download::DownloadSettings,
-    ) -> Result<BrowserDownloadResult, String> {
-        let progress = &settings.progress;
-        let resolved = self.resolve_file(source, progress).await?;
-        let reader = BrowserFileReader::new(Rc::clone(&self.shared), resolved.file, resolved.index);
-        let (content, hash) = reader
-            .collect(settings.concurrency, settings.memory_budget, progress)
+    ) -> Result<BrowserDownloadResult, JsValue> {
+        // Validates the signal before any network work, and covers resolution.
+        let mut cancel = download::Cancellation::new(None, settings.signal.clone())?;
+        let resolved = cancel
+            .run(async {
+                self.resolve_file(source, &settings.progress)
+                    .await
+                    .map_err(|error| JsValue::from_str(&error))
+            })
             .await?;
+        let reader = BrowserFileReader::new(Rc::clone(&self.shared), resolved.file, resolved.index);
+        let (content, hash) = reader.collect(&settings, &mut cancel).await?;
         let file = reader.into_descriptor(hash.clone());
-        progress.report(&format!("Verified complete {} as {hash}", file.name));
+        settings
+            .progress
+            .report(&format!("Verified complete {} as {hash}", file.name));
         Ok(BrowserDownloadResult {
             content,
             hash,
@@ -2801,7 +2808,7 @@ impl BrowserNetworkClient {
         .map_err(|error| error.to_string())?;
 
         let index = crate::client_engine::files::FileIndex::new(&root_data_map)?;
-        if index.size() > super::manifest::MAX_BROWSER_FILE_POSITION {
+        if index.size() > super::manifest::MAX_SAFE_JS_INTEGER {
             return Err("file size exceeds JavaScript's exact integer range".into());
         }
 

@@ -40,16 +40,19 @@ use 64-bit arithmetic internally; the JavaScript API accepts exact, nonnegative
 `number` positions through `Number.MAX_SAFE_INTEGER` (just under 8 PiB). The
 resolved DataMap and seek index still occupy memory proportional to the number
 of chunks. Individual chunk buffers remain bounded, including for seeks past
-4 GiB. Uploads retain their existing size limits.
+4 GiB: a DataMap may declare chunks of up to 16 MiB, and decompression stops at
+the declared size, so a crafted record cannot expand inside WASM. Uploads
+retain their existing size limits.
 
-`downloadPublicFile(file, { concurrency?, maxMemoryBytes?, onProgress? })` and
-its private-file counterpart allocate the output as a JavaScript `Uint8Array`.
-They fetch every chunk in one deferred retry pass at the requested concurrency
-and copy each chunk into the output as soon as it is decrypted, so WASM holds
-only the records in flight, never the whole plaintext or ciphertext. Progress
-is still reported as `Downloaded chunk n/total`. The older
-`(file, concurrency?, onProgress?)` form remains supported. `maxMemoryBytes`
-limits the output buffer, not total process memory. Without a budget,
+`downloadPublicFile(file, { concurrency?, maxMemoryBytes?, onProgress?, signal? })`
+and its private-file counterpart allocate the output as a JavaScript
+`Uint8Array`. They fetch every chunk in one deferred retry pass at the requested
+concurrency and copy each chunk into the output as soon as it is decrypted, so
+WASM holds only the records in flight, never the whole plaintext or ciphertext.
+Progress is still reported as `Downloaded chunk n/total`, and an `AbortSignal`
+cancels the download at any point. The older `(file, concurrency?, onProgress?)`
+form remains supported, with the same coercion of the concurrency number as
+before. `maxMemoryBytes` limits the output buffer, not total process memory. Without a budget,
 allocation is attempted up to the JavaScript engine's buffer limit. Allocation
 errors reject with guidance to use streaming; browsers do not expose a
 reliable portable amount of free memory.
@@ -70,9 +73,11 @@ try {
 The same API works with `openPrivateFile({ data_map })`. `pipeTo(writable,
 { start?, end?, signal?, onProgress? })` optionally streams a half-open byte
 range and reports `(bytesWritten, totalBytes)` after each write. It fetches
-windows of whole chunks, up to 32 MiB of plaintext, concurrently in one
-deferred retry pass, then writes them in order, at most 4 MiB per write. It
-waits for every write before fetching the next window. It closes the
+chunks concurrently and writes them in order, at most 4 MiB per write, each
+awaited before the next. Fetching continues while a write is pending until
+32 MiB of chunks are in flight or waiting, so a slow destination holds memory
+at that bound. Each missing record is retried on its own schedule while the
+rest of the buffer keeps fetching, so retry waits overlap. It closes the
 destination on success, aborts it on any failure (including invalid options),
 and releases the writer lock. Its result contains the byte count and BLAKE3 of
 the written range. An `AbortSignal` cancels that one operation and leaves the

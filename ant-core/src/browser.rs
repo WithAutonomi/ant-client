@@ -33,8 +33,10 @@ use std::collections::HashSet;
 
 /// Maximum file size accepted by the browser upload API (1 GB decimal).
 ///
-/// The page upload path streams through a worker and browser storage. Complete
-/// downloads use bounded ranges; the legacy encryption binding remains memory-bound.
+/// The page upload path streams through a worker and browser storage; the
+/// legacy encryption binding remains memory-bound. Downloads are not limited by
+/// this constant: a complete download needs one buffer of the file's size,
+/// while `pipeTo` and range reads hold a bounded amount of plaintext.
 pub const MAX_BROWSER_FILE_BYTES: usize = 1_000_000_000;
 
 /// One native self-encryption chunk descriptor exposed to the browser.

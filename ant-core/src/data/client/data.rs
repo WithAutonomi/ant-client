@@ -438,6 +438,24 @@ impl Client {
         .map_err(map_read_error)
     }
 
+    /// Fetch and decrypt one chunk, retrying it on its own deferred schedule.
+    #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
+    pub(crate) async fn data_download_indexed_chunk(
+        &self,
+        index: &crate::client_engine::files::FileIndex,
+        chunk: usize,
+    ) -> Result<Bytes> {
+        crate::client_engine::files::fetch_chunk(
+            index,
+            chunk,
+            &|address| self.fetch_data_record(address),
+            &crate::runtime::sleep,
+            retry_data_fetch,
+        )
+        .await
+        .map_err(map_read_error)
+    }
+
     /// Fetch and decrypt whole chunks in one deferred retry pass, handing each
     /// plaintext chunk to `sink` in completion order.
     #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]

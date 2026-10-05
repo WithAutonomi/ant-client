@@ -1,30 +1,52 @@
 //! Bounded plaintext reads with 64-bit positions and caller-owned destinations.
 use super::*;
-use crate::client_engine::files::{FileIndex, OrderedHasher};
+use crate::browser::manifest::MAX_SAFE_JS_INTEGER;
+use crate::client_engine::files::{ordered_pipeline, FileIndex, OrderedHasher};
 use bytes::Bytes;
 use std::ops::Range;
 
-/// Plaintext one `pipeTo` window may hold. A window's whole chunks are
-/// fetched concurrently in one deferred retry pass, then written in order;
-/// nothing more is fetched while those writes are pending.
-const PIPE_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+/// Plaintext a `pipeTo` holds at once: chunks in flight or fetched but not yet
+/// written. Fetching continues while writes are pending until this is reached.
+const PIPE_BUFFER_BYTES: u64 = 32 * 1024 * 1024;
 const STREAM_HINT: &str =
     "use openPublicFile/openPrivateFile and reader.pipeTo(writable) to stream to disk";
 const CLOSED_READER: &str = "browser file reader is closed";
 const ABORTED: &str = "download aborted";
 const ABORT_EVENT: &str = "abort";
+const POSITIVE_CONCURRENCY: &str = "download concurrency must be a positive integer";
 const PIPE_OPTION_NAMES: [&str; 4] = ["start", "end", "signal", "onProgress"];
-const DOWNLOAD_OPTION_NAMES: [&str; 3] = ["concurrency", "maxMemoryBytes", "onProgress"];
+const DOWNLOAD_OPTION_NAMES: [&str; 4] = ["concurrency", "maxMemoryBytes", "onProgress", "signal"];
+/// JavaScript's ToUint32 wraps numbers modulo 2^32.
+const UINT32_RANGE: f64 = u32::MAX as f64 + 1.0;
 
-fn file_position(value: f64, label: &str) -> Result<u64, String> {
+/// A nonnegative integer that JavaScript represents exactly.
+fn safe_integer(value: f64, label: &str) -> Result<u64, String> {
     if !value.is_finite()
         || value < 0.0
         || value.fract() != 0.0
-        || value > super::super::manifest::MAX_BROWSER_FILE_POSITION as f64
+        || value > MAX_SAFE_JS_INTEGER as f64
     {
         return Err(format!("{label} must be a nonnegative safe integer"));
     }
     Ok(value as u64)
+}
+
+/// `value >>> 0`, which wasm-bindgen applied to the numeric concurrency
+/// argument before downloads took an options object.
+fn legacy_concurrency(value: &JsValue) -> usize {
+    if value.is_symbol() || value.is_bigint() {
+        return 0;
+    }
+    // Unary `+`, the ToNumber step of `>>>`; it throws only for the excluded types.
+    let number = value.unchecked_into_f64();
+    if !number.is_finite() {
+        return 0;
+    }
+    number.trunc().rem_euclid(UINT32_RANGE) as usize
+}
+
+fn js_string(error: impl std::fmt::Display) -> JsValue {
+    JsValue::from_str(&error.to_string())
 }
 
 fn method(object: &JsValue, name: &str) -> Result<js_sys::Function, JsValue> {
@@ -68,6 +90,11 @@ fn options_from_js<T: Default + serde::de::DeserializeOwned>(
     serde_wasm_bindgen::from_value(value).map_err(|error| error.to_string())
 }
 
+/// Let the page handle events between long stretches of synchronous work.
+async fn yield_to_event_loop() {
+    TimeoutFuture::new(0).await;
+}
+
 /// Release the writer even if the Rust future is dropped before it completes.
 struct Writer(JsValue);
 impl Drop for Writer {
@@ -101,7 +128,8 @@ struct PipeResult {
     hash: String,
 }
 
-/// Complete-download options: `{ concurrency?, maxMemoryBytes?, onProgress? }`.
+/// Complete-download options:
+/// `{ concurrency?, maxMemoryBytes?, onProgress?, signal? }`.
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DownloadOptions {
@@ -112,6 +140,9 @@ struct DownloadOptions {
     /// Called with progress messages.
     #[serde(default, with = "serde_wasm_bindgen::preserve")]
     on_progress: JsValue,
+    /// AbortSignal that cancels the download.
+    #[serde(default, with = "serde_wasm_bindgen::preserve")]
+    signal: JsValue,
 }
 
 /// Validated complete-download options.
@@ -119,40 +150,40 @@ pub(super) struct DownloadSettings {
     pub(super) concurrency: usize,
     pub(super) memory_budget: Option<u64>,
     pub(super) progress: ProgressReporter,
+    /// AbortSignal, or `undefined` when the caller passed none.
+    pub(super) signal: JsValue,
 }
 
 impl DownloadSettings {
-    /// `options` is an options object. A number is the legacy concurrency
-    /// argument, which pairs with the positional `legacy_progress` callback.
+    /// `options` is an options object. Any other value is the legacy
+    /// concurrency argument, coerced as before, which pairs with the
+    /// positional `legacy_progress` callback.
     pub(super) fn from_js(
-        options: JsValue,
+        options: Option<JsValue>,
         legacy_progress: Option<js_sys::Function>,
     ) -> Result<Self, String> {
-        let (options, progress) = match options.as_f64() {
-            Some(concurrency) => (
-                DownloadOptions {
-                    concurrency: Some(concurrency),
-                    ..DownloadOptions::default()
-                },
-                legacy_progress,
-            ),
-            None => {
-                let mut options: DownloadOptions =
-                    options_from_js(options, &DOWNLOAD_OPTION_NAMES)?;
-                let progress =
-                    optional_function(std::mem::take(&mut options.on_progress), "onProgress")?;
-                if progress.is_some() && legacy_progress.is_some() {
-                    return Err("pass onProgress in the options or as an argument, not both".into());
-                }
-                (options, progress.or(legacy_progress))
+        let options = options.unwrap_or(JsValue::UNDEFINED);
+        if !options.is_undefined() && !options.is_object() {
+            let concurrency = legacy_concurrency(&options);
+            if concurrency == 0 {
+                return Err(POSITIVE_CONCURRENCY.into());
             }
-        };
+            return Ok(Self {
+                concurrency,
+                memory_budget: None,
+                progress: ProgressReporter::from_js(legacy_progress),
+                signal: JsValue::UNDEFINED,
+            });
+        }
+        let options: DownloadOptions = options_from_js(options, &DOWNLOAD_OPTION_NAMES)?;
+        let progress = optional_function(options.on_progress, "onProgress")?;
+        if progress.is_some() && legacy_progress.is_some() {
+            return Err("pass onProgress in the options or as an argument, not both".into());
+        }
         let concurrency = match options.concurrency {
             None => usize::MAX,
-            Some(value) => match file_position(value, "download concurrency") {
-                Ok(0) | Err(_) => {
-                    return Err("download concurrency must be a positive integer".into())
-                }
+            Some(value) => match safe_integer(value, "download concurrency") {
+                Ok(0) | Err(_) => return Err(POSITIVE_CONCURRENCY.into()),
                 Ok(value) => usize::try_from(value).unwrap_or(usize::MAX),
             },
         };
@@ -160,9 +191,10 @@ impl DownloadSettings {
             concurrency,
             memory_budget: options
                 .max_memory_bytes
-                .map(|value| file_position(value, "memory budget"))
+                .map(|value| safe_integer(value, "memory budget"))
                 .transpose()?,
-            progress: ProgressReporter::from_js(progress),
+            progress: ProgressReporter::from_js(progress.or(legacy_progress)),
+            signal: options.signal,
         })
     }
 }
@@ -222,14 +254,19 @@ impl Drop for AbortListener {
     }
 }
 
-/// Stops one reader operation when its reader closes or its AbortSignal fires.
-struct Cancellation {
-    closed: watch::Receiver<bool>,
+/// Stops an operation when its AbortSignal fires or, for a reader
+/// operation, when the reader closes.
+pub(super) struct Cancellation {
+    closed: Option<watch::Receiver<bool>>,
     abort: Option<AbortListener>,
 }
 
 impl Cancellation {
-    fn new(closed: watch::Receiver<bool>, signal: JsValue) -> Result<Self, JsValue> {
+    /// `closed` follows the reader an operation belongs to, if any.
+    pub(super) fn new(
+        closed: Option<watch::Receiver<bool>>,
+        signal: JsValue,
+    ) -> Result<Self, JsValue> {
         let abort = if signal.is_undefined() || signal.is_null() {
             None
         } else {
@@ -243,22 +280,31 @@ impl Cancellation {
         if let Some(reason) = self.abort.as_ref().and_then(AbortListener::reason) {
             return Err(reason);
         }
-        if *self.closed.borrow() {
+        if self.closed.as_ref().is_some_and(|closed| *closed.borrow()) {
             return Err(JsValue::from_str(CLOSED_READER));
         }
         Ok(())
     }
 
-    /// Run `operation` unless it is cancelled first. Cancelling drops it,
-    /// which stops its in-flight fetches and retry waits at once.
-    async fn run<T>(
+    /// Run `operation` unless it is cancelled first. Cancellation is polled
+    /// before the operation, so once the reader closes or the signal aborts
+    /// the operation never runs again: it is dropped, stopping its in-flight
+    /// fetches and retry waits, before it can finish or refill the cache.
+    pub(super) async fn run<T>(
         &mut self,
-        operation: impl Future<Output = Result<T, String>>,
+        operation: impl Future<Output = Result<T, JsValue>>,
     ) -> Result<T, JsValue> {
         self.check()?;
         let finished = {
             let Self { closed, abort } = &mut *self;
-            let closed = closed.wait_for(|closed| *closed);
+            let closed = async move {
+                match closed {
+                    Some(closed) => {
+                        let _ = closed.wait_for(|closed| *closed).await;
+                    }
+                    None => futures_util::future::pending::<()>().await,
+                }
+            };
             let aborted = async move {
                 match abort {
                     Some(abort) => {
@@ -268,18 +314,17 @@ impl Cancellation {
                 }
             };
             futures_util::pin_mut!(operation, closed, aborted);
-            match select(operation, select(closed, aborted)).await {
-                Either::Left((result, _)) => Some(result),
-                Either::Right(_) => None,
+            match select(select(closed, aborted), operation).await {
+                Either::Left(_) => None,
+                Either::Right((result, _)) => Some(result),
             }
         };
-        match finished {
-            Some(result) => result.map_err(|error| JsValue::from_str(&error)),
-            None => Err(self
+        finished.unwrap_or_else(|| {
+            Err(self
                 .check()
                 .err()
-                .unwrap_or_else(|| JsValue::from_str(CLOSED_READER))),
-        }
+                .unwrap_or_else(|| JsValue::from_str(CLOSED_READER)))
+        })
     }
 }
 
@@ -317,22 +362,20 @@ impl BrowserFileReader {
     /// Closing the reader rejects a read in progress.
     #[wasm_bindgen(js_name = readRange)]
     pub async fn read_range(&self, start: f64, length: f64) -> Result<Uint8Array, JsValue> {
-        let start =
-            file_position(start, "range start").map_err(|error| JsValue::from_str(&error))?;
-        let length =
-            file_position(length, "range length").map_err(|error| JsValue::from_str(&error))?;
+        let start = safe_integer(start, "range start").map_err(js_string)?;
+        let length = safe_integer(length, "range length").map_err(js_string)?;
         if length > MAX_BROWSER_RANGE_BYTES as u64 {
             return Err(JsValue::from_str(&format!(
                 "browser range reads are limited to {MAX_BROWSER_RANGE_BYTES} bytes"
             )));
         }
-        let mut cancel = Cancellation::new(self.closed.subscribe(), JsValue::UNDEFINED)?;
+        let mut cancel = Cancellation::new(Some(self.closed.subscribe()), JsValue::UNDEFINED)?;
         let bytes = cancel
             .run(async {
                 self.shared
                     .data_download_indexed_range(&self.index, start, length as usize)
                     .await
-                    .map_err(|error| error.to_string())
+                    .map_err(js_string)
             })
             .await?;
         Ok(Uint8Array::from(bytes.as_ref()))
@@ -343,8 +386,10 @@ impl BrowserFileReader {
     /// half-open byte range, an AbortSignal that cancels this operation, and
     /// a `(bytesWritten, totalBytes)` callback run after each write.
     ///
-    /// Whole chunks are fetched a window at a time, and every write is awaited
-    /// before the next window is fetched. Writes are at most 4 MiB. Closes the
+    /// Chunks are fetched concurrently and written in order, at most 4 MiB per
+    /// write, each awaited before the next. Fetching continues during writes
+    /// until 32 MiB of chunks are in flight or waiting, and each missing record
+    /// is retried on its own schedule while the others continue. Closes the
     /// destination on success, aborts it on any failure (including invalid
     /// options), and always releases the writer lock. Returns the BLAKE3 and
     /// byte count of the written range. Closing the reader also cancels.
@@ -373,20 +418,19 @@ impl BrowserFileReader {
     /// AbortSignal to cancel a single pipeTo without closing the reader.
     pub fn close(&self) {
         self.closed.send_replace(true);
-        let cache = self.shared.chunk_cache();
-        for address in self.index.record_addresses() {
-            cache.remove(&address.0);
-        }
+        let records = self.index.record_addresses();
+        self.shared
+            .chunk_cache()
+            .remove_matching(|address| records.iter().any(|record| record.0 == *address));
     }
 }
 
 impl BrowserFileReader {
     pub(super) fn new(
         shared: Rc<crate::data::Client>,
-        mut file: PublicFileDescriptor,
+        file: PublicFileDescriptor,
         index: FileIndex,
     ) -> Self {
-        file.chunks = Vec::new();
         Self {
             shared,
             file,
@@ -408,105 +452,80 @@ impl BrowserFileReader {
     }
 
     async fn pipe_to_writer(&self, writer: &JsValue, options: JsValue) -> Result<JsValue, JsValue> {
-        let options: PipeOptions = options_from_js(options, &PIPE_OPTION_NAMES)
-            .map_err(|error| JsValue::from_str(&error))?;
-        let progress = optional_function(options.on_progress, "onProgress")
-            .map_err(|error| JsValue::from_str(&error))?;
-        let mut cancel = Cancellation::new(self.closed.subscribe(), options.signal)?;
+        let options: PipeOptions =
+            options_from_js(options, &PIPE_OPTION_NAMES).map_err(js_string)?;
+        let progress = optional_function(options.on_progress, "onProgress").map_err(js_string)?;
+        let mut cancel = Cancellation::new(Some(self.closed.subscribe()), options.signal)?;
         cancel.check()?;
         let range = self
             .stream_range(options.start, options.end)
-            .map_err(|error| JsValue::from_str(&error))?;
+            .map_err(js_string)?;
         let write = method(writer, "write")?;
+        let (write, progress) = (&write, &progress);
         let total = range.end - range.start;
-        let mut written = 0u64;
         let mut hasher = blake3::Hasher::new();
-        let chunks = self.index.chunks_overlapping(range.clone());
-        let mut next = chunks.start;
-        while next < chunks.end {
-            let window = next..self.index.window_end(next, chunks.end, PIPE_WINDOW_BYTES);
-            for plaintext in self
-                .fetch_window(window.clone(), &range, &mut cancel)
-                .await?
-            {
-                for piece in plaintext.chunks(MAX_BROWSER_RANGE_BYTES) {
-                    // Checked before each write, never after the last one:
-                    // a finished destination is closed, not aborted.
-                    cancel.check()?;
-                    hasher.update(piece);
-                    JsFuture::from(Promise::resolve(
-                        &write.call1(writer, &Uint8Array::from(piece))?,
-                    ))
-                    .await?;
-                    written += piece.len() as u64;
-                    if let Some(callback) = &progress {
-                        callback.call2(
-                            &JsValue::NULL,
-                            &JsValue::from_f64(written as f64),
-                            &JsValue::from_f64(total as f64),
-                        )?;
+        cancel
+            .run(ordered_pipeline(
+                self.index.chunks_overlapping(range.clone()),
+                |chunk| {
+                    let span = self.index.chunk_span(chunk);
+                    span.end - span.start
+                },
+                PIPE_BUFFER_BYTES,
+                &|| self.shared.controller().fetch.current(),
+                |chunk| async move {
+                    self.shared
+                        .data_download_indexed_chunk(&self.index, chunk)
+                        .await
+                        .map_err(js_string)
+                },
+                |chunk, plaintext: Bytes| {
+                    let span = self.index.chunk_span(chunk);
+                    let from = range.start.max(span.start);
+                    let to = range.end.min(span.end);
+                    let plaintext =
+                        plaintext.slice((from - span.start) as usize..(to - span.start) as usize);
+                    hasher.update(&plaintext);
+                    let mut written = from - range.start;
+                    async move {
+                        for piece in plaintext.chunks(MAX_BROWSER_RANGE_BYTES) {
+                            JsFuture::from(Promise::resolve(
+                                &write.call1(writer, &Uint8Array::from(piece))?,
+                            ))
+                            .await?;
+                            written += piece.len() as u64;
+                            if let Some(callback) = progress {
+                                callback.call2(
+                                    &JsValue::NULL,
+                                    &JsValue::from_f64(written as f64),
+                                    &JsValue::from_f64(total as f64),
+                                )?;
+                            }
+                        }
+                        Ok(())
                     }
-                }
-            }
-            next = window.end;
-        }
+                },
+            ))
+            .await?;
         JsFuture::from(Promise::resolve(&method(writer, "close")?.call0(writer)?)).await?;
         serde_wasm_bindgen::to_value(&PipeResult {
-            bytes_written: written,
+            bytes_written: total,
             hash: hasher.finalize().to_hex().to_string(),
         })
-        .map_err(|error| JsValue::from_str(&error.to_string()))
+        .map_err(js_string)
     }
 
     /// Validate a `pipeTo` range against the file.
     fn stream_range(&self, start: Option<f64>, end: Option<f64>) -> Result<Range<u64>, String> {
-        let start = file_position(start.unwrap_or(0.0), "stream start")?;
+        let start = safe_integer(start.unwrap_or(0.0), "stream start")?;
         let end = end
-            .map(|end| file_position(end, "stream end"))
+            .map(|end| safe_integer(end, "stream end"))
             .transpose()?
             .unwrap_or(self.file.size);
         if start > end || end > self.file.size {
             return Err("stream range is outside the file".into());
         }
         Ok(start..end)
-    }
-
-    /// Fetch one window of whole chunks, returning each chunk's plaintext
-    /// trimmed to the `pipeTo` range, in file order.
-    async fn fetch_window(
-        &self,
-        window: Range<usize>,
-        range: &Range<u64>,
-        cancel: &mut Cancellation,
-    ) -> Result<Vec<Bytes>, JsValue> {
-        let mut plaintexts = vec![None; window.len()];
-        cancel
-            .run(async {
-                self.shared
-                    .data_download_indexed_chunks(
-                        &self.index,
-                        window.clone(),
-                        usize::MAX,
-                        |chunk, plaintext| {
-                            plaintexts[chunk - window.start] = Some(plaintext);
-                            Ok(())
-                        },
-                    )
-                    .await
-                    .map_err(|error| error.to_string())
-            })
-            .await?;
-        window
-            .zip(plaintexts)
-            .map(|(chunk, plaintext)| {
-                let plaintext =
-                    plaintext.ok_or_else(|| JsValue::from_str("window chunk missing"))?;
-                let span = self.index.chunk_span(chunk);
-                let from = range.start.max(span.start) - span.start;
-                let to = range.end.min(span.end) - span.start;
-                Ok(plaintext.slice(from as usize..to as usize))
-            })
-            .collect()
     }
 
     /// Allocate output in JS, then copy each decrypted chunk into it as it
@@ -516,63 +535,85 @@ impl BrowserFileReader {
     /// disk-backed path without downloading the file first.
     pub(super) async fn collect(
         &self,
-        concurrency: usize,
-        budget: Option<u64>,
-        progress: &ProgressReporter,
-    ) -> Result<(Uint8Array, String), String> {
-        if budget.is_some_and(|limit| self.file.size > limit) {
-            return Err(format!(
+        settings: &DownloadSettings,
+        cancel: &mut Cancellation,
+    ) -> Result<(Uint8Array, String), JsValue> {
+        let progress = &settings.progress;
+        if settings
+            .memory_budget
+            .is_some_and(|limit| self.file.size > limit)
+        {
+            return Err(js_string(format_args!(
                 "file exceeds the download memory budget; {STREAM_HINT}"
-            ));
+            )));
         }
-        let constructor = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("Uint8Array"))
-            .map_err(js_error_message)?
-            .dyn_into::<js_sys::Function>()
-            .map_err(js_error_message)?;
+        let constructor =
+            js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("Uint8Array"))?
+                .dyn_into::<js_sys::Function>()?;
         let args = Array::new();
         args.push(&JsValue::from_f64(self.size()));
         let output = js_sys::Reflect::construct(&constructor, &args)
             .map_err(|error| {
-                format!(
+                js_string(format_args!(
                     "cannot allocate download buffer: {}; {STREAM_HINT}",
                     js_error_message(error)
-                )
+                ))
             })?
             .unchecked_into::<Uint8Array>();
         // Reflect calls preserve Number offsets above u32::MAX and catch JS
         // allocation exceptions instead of turning them into WASM traps.
-        let set = method(output.as_ref(), "set").map_err(js_error_message)?;
-        let subarray = method(output.as_ref(), "subarray").map_err(js_error_message)?;
-        let read_back = |chunk: usize| -> Result<Vec<u8>, String> {
+        let subarray = method(output.as_ref(), "subarray")?;
+        let chunk_view = |chunk: usize| -> Result<Uint8Array, JsValue> {
             let span = self.index.chunk_span(chunk);
-            subarray
+            Ok(subarray
                 .call2(
                     output.as_ref(),
                     &JsValue::from_f64(span.start as f64),
                     &JsValue::from_f64(span.end as f64),
-                )
-                .map(|view| view.unchecked_into::<Uint8Array>().to_vec())
-                .map_err(js_error_message)
+                )?
+                .unchecked_into())
         };
         let total = self.index.chunk_count();
         let mut hasher = OrderedHasher::new(total);
         let mut completed = 0usize;
         progress.report(&format!("Downloaded chunk {completed}/{total}"));
-        self.shared
-            .data_download_indexed_chunks(&self.index, 0..total, concurrency, |chunk, plaintext| {
-                set.call2(
-                    output.as_ref(),
-                    &Uint8Array::from(plaintext.as_ref()),
-                    &JsValue::from_f64(self.index.chunk_span(chunk).start as f64),
-                )
-                .map_err(js_error_message)?;
-                hasher.complete(chunk, &plaintext, &read_back)?;
-                completed += 1;
-                progress.report(&format!("Downloaded chunk {completed}/{total}"));
-                Ok(())
+        cancel
+            .run(async {
+                self.shared
+                    .data_download_indexed_chunks(
+                        &self.index,
+                        0..total,
+                        settings.concurrency,
+                        |chunk, plaintext| {
+                            // Copies straight from WASM memory into the output.
+                            chunk_view(chunk)
+                                .map_err(js_error_message)?
+                                .copy_from(&plaintext);
+                            hasher.complete(chunk, &plaintext);
+                            // At most one earlier chunk per arrival keeps each
+                            // callback short.
+                            if let Some(earlier) = hasher.pending_read_back() {
+                                let view = chunk_view(earlier).map_err(js_error_message)?;
+                                hasher.read_back(earlier, &view.to_vec())?;
+                            }
+                            completed += 1;
+                            progress.report(&format!("Downloaded chunk {completed}/{total}"));
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .map_err(js_string)
             })
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok((output, hasher.finish()?))
+            .await?;
+        // Hash the chunks that arrived ahead of file order, yielding between
+        // them so a large backlog cannot freeze the page.
+        while let Some(chunk) = hasher.pending_read_back() {
+            cancel.check()?;
+            hasher
+                .read_back(chunk, &chunk_view(chunk)?.to_vec())
+                .map_err(js_string)?;
+            yield_to_event_loop().await;
+        }
+        Ok((output, hasher.finish().map_err(js_string)?))
     }
 }

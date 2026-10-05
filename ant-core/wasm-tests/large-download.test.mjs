@@ -21,6 +21,19 @@ function fixture(source = records) {
   return { rtc, client: new BrowserNetworkClient(rtc.endpoints) };
 }
 
+const gets = rtc => rtc.requests.filter(r => r.method === "get_chunk").length;
+
+// Distinct, incompressible chunks, so every chunk is its own network GET.
+function randomBytes(length) {
+  const bytes = new Uint8Array(length);
+  let state = 0x9e3779b9;
+  for (let i = 0; i < length; i++) {
+    state ^= state << 13; state ^= state >>> 17; state ^= state << 5;
+    bytes[i] = state;
+  }
+  return bytes;
+}
+
 test("native files larger than 4 GiB support exact public and private seeks", async () => {
   const { rtc, client } = fixture();
   try {
@@ -37,13 +50,13 @@ test("native files larger than 4 GiB support exact public and private seeks", as
         }
         assert.equal((await reader.readRange(large.size, 1)).length, 0);
         assert.equal((await reader.readRange(Number.MAX_SAFE_INTEGER, 1)).length, 0);
-        const gets = rtc.requests.filter(r => r.method === "get_chunk").length;
+        const before = gets(rtc);
         for (const value of [-1, 0.5, NaN, Infinity, 2 ** 53]) {
           await assert.rejects(reader.readRange(value, 1), /safe integer/);
           await assert.rejects(reader.readRange(0, value), /safe integer/);
         }
         await assert.rejects(reader.readRange(0, 2 ** 32 + 1), /range reads are limited/);
-        assert.equal(rtc.requests.filter(r => r.method === "get_chunk").length, gets);
+        assert.equal(gets(rtc), before);
       } finally { reader.close(); }
     }
   } finally { client.close(); }
@@ -75,59 +88,123 @@ test("a complete native >4 GiB file streams with bounded writes and matching BLA
 });
 
 test("large-file memory budgets fail before content fetch, and allocation errors permit streaming", async () => {
+  // A budget rejection makes exactly the requests that resolving the file does.
+  const opened = fixture();
+  try { (await opened.client.openPublicFile(large.address)).close(); } finally { opened.client.close(); }
+  const maxMemoryBytes = 64 * 1024 * 1024;
+  for (const download of [
+    client => client.downloadPublicFile(large.address, { maxMemoryBytes }),
+    client => client.downloadPrivateFile({ data_map: map.content }, { maxMemoryBytes }),
+  ]) {
+    const { rtc, client } = fixture();
+    try {
+      await assert.rejects(download(client), /memory budget.*pipeTo/);
+      assert(gets(rtc) <= gets(opened.rtc), `${gets(rtc)} GETs for a budget rejection`);
+    } finally { client.close(); }
+  }
+
   const { rtc, client } = fixture();
   try {
-    const maxMemoryBytes = 64 * 1024 * 1024;
-    await assert.rejects(client.downloadPublicFile(large.address, { maxMemoryBytes }), /memory budget.*pipeTo/);
-    await assert.rejects(client.downloadPrivateFile({ data_map: map.content }, { maxMemoryBytes }), /memory budget.*pipeTo/);
-    const gets = rtc.requests.filter(r => r.method === "get_chunk").length;
     for (const value of [-1, 1.5, Infinity, NaN, 2 ** 53]) {
       await assert.rejects(client.downloadPublicFile(large.address, { maxMemoryBytes: value }), /safe integer/);
     }
     for (const concurrency of [0, -1, 1.5, NaN]) {
       await assert.rejects(client.downloadPublicFile(large.address, { concurrency }), /positive integer/);
+    }
+    // The legacy numeric argument keeps wasm-bindgen's `>>> 0` coercion.
+    for (const concurrency of [0, NaN, "none", 2 ** 32]) {
       await assert.rejects(client.downloadPublicFile(large.address, concurrency), /positive integer/);
     }
     await assert.rejects(client.downloadPublicFile(large.address, { maxMemory: 1 }), /unknown option `maxMemory`/);
     await assert.rejects(client.downloadPublicFile(large.address, { onProgress: 1 }), /onProgress must be a function/);
     await assert.rejects(client.downloadPublicFile(large.address, { onProgress() {} }, () => {}), /not both/);
-    assert.equal(rtc.requests.filter(r => r.method === "get_chunk").length, gets, "invalid options fail before any fetch");
+    await assert.rejects(client.downloadPublicFile(large.address, { signal: {} }), /AbortSignal/);
+    assert.equal(gets(rtc), 0, "invalid options fail before any fetch");
   } finally { client.close(); }
 });
 
-test("pipeTo writes ranges beyond 4 GiB to disk and honors write backpressure", async () => {
-  const { rtc, client } = fixture();
+test("download options stay optional in the generated typings", async () => {
+  const typings = await readFile(new URL("./pkg/ant_core.d.ts", import.meta.url), "utf8");
+  for (const name of ["downloadPublicFile", "downloadPrivateFile"]) {
+    assert.match(typings, new RegExp(`${name}\\(file: any, options\\?: any`));
+  }
+});
+
+test("an AbortSignal cancels a complete download, including during retry waits", async () => {
+  const original = new TextEncoder().encode("Download cancellation.".repeat(300));
+  const encrypted = encryptPublicFile(original);
+  const missing = encrypted.records.find(record => record.address !== encrypted.address);
+  const { rtc, client } = fixture(encrypted.records.filter(record => record !== missing));
+  try {
+    const reason = new Error("stop downloading");
+    await assert.rejects(client.downloadPublicFile(encrypted.address, { signal: AbortSignal.abort(reason) }),
+      error => error === reason);
+    const controller = new AbortController();
+    const started = Date.now();
+    const pending = client.downloadPublicFile(encrypted.address, { signal: controller.signal });
+    setTimeout(() => controller.abort(reason), 100);
+    await assert.rejects(pending, error => error === reason);
+    assert(Date.now() - started < 5_000, `abort took ${Date.now() - started} ms`);
+    rtc.stores[0].set(missing.address, missing.content);
+    const legacy = await client.downloadPublicFile(encrypted.address, 1.5);
+    assert.deepEqual(legacy.content, original);
+    assert.deepEqual((await client.downloadPublicFile(encrypted.address, "2")).content, original);
+  } finally { client.close(); }
+});
+
+test("pipeTo writes ranges beyond 4 GiB to disk", async () => {
+  const { client } = fixture();
   const directory = await mkdtemp(join(tmpdir(), "ant-wasm-download-"));
   let reader;
   try {
     reader = await client.openPublicFile(large.address);
-    let unblock, firstWrite;
-    const entered = new Promise(resolve => { firstWrite = resolve; });
-    const gate = new Promise(resolve => { unblock = resolve; });
     const path = join(directory, "tail.bin");
-    const disk = Writable.toWeb(createWriteStream(path));
-    const writer = disk.getWriter();
-    let writes = 0;
-    const sink = new WritableStream({
-      async write(bytes) {
-        if (++writes === 1) { firstWrite(); await gate; }
-        await writer.write(bytes);
-      },
-      async close() { await writer.close(); writer.releaseLock(); },
-      async abort(error) { await writer.abort(error); writer.releaseLock(); },
-    });
+    const sink = Writable.toWeb(createWriteStream(path));
     const start = 2 ** 32 - 8;
-    const completion = reader.pipeTo(sink, { start });
-    await entered;
-    const gets = rtc.requests.filter(r => r.method === "get_chunk").length;
-    await new Promise(resolve => setTimeout(resolve, 30));
-    assert.equal(rtc.requests.filter(r => r.method === "get_chunk").length, gets);
-    unblock();
-    const result = await completion;
+    const result = await reader.pipeTo(sink, { start });
     assert.equal(result.bytesWritten, large.size - start);
     assert.deepEqual(await readFile(path), Buffer.alloc(large.size - start, large.byte));
     assert.equal(sink.locked, false);
   } finally { reader?.close(); client.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("pipeTo keeps fetching behind a blocked write only up to its 32 MiB buffer", async () => {
+  // Twelve distinct chunks: about 50 MB, more than one buffer.
+  const original = randomBytes(12 * 4_190_208);
+  const encrypted = encryptPublicFile(original);
+  const { rtc, client } = fixture(encrypted.records);
+  let reader;
+  try {
+    reader = await client.openPublicFile(encrypted.address);
+    let unblock, firstWrite;
+    const entered = new Promise(resolve => { firstWrite = resolve; });
+    const gate = new Promise(resolve => { unblock = resolve; });
+    const chunks = [];
+    let writes = 0;
+    const sink = new WritableStream({
+      async write(bytes) {
+        if (++writes === 1) { firstWrite(); await gate; }
+        chunks.push(bytes);
+      },
+    });
+    const before = gets(rtc);
+    const completion = reader.pipeTo(sink);
+    await entered;
+    // Let fetching run as far as the buffer allows, then check that it stopped.
+    let settled = gets(rtc);
+    for (let previous = -1; previous !== settled; settled = gets(rtc)) {
+      previous = settled;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    const buffered = settled - before;
+    assert(buffered > 1, "fetching continues behind a pending write");
+    assert(buffered <= Math.floor(32 * 1024 * 1024 / 4_190_208), `${buffered} chunks fetched behind one blocked write`);
+    unblock();
+    const result = await completion;
+    assert.equal(result.bytesWritten, original.length);
+    assert.deepEqual(Buffer.concat(chunks), Buffer.from(original));
+    assert(chunks.every(chunk => chunk.length <= 4 * 1024 * 1024));
+  } finally { reader?.close(); client.close(); }
 });
 
 test("invalid pipeTo calls abort the destination they were given", async () => {

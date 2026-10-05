@@ -2,12 +2,20 @@
 //! filesystem or JS dependencies. Cryptography and recursive map semantics stay
 //! in self_encryption, the same implementation used by the native client.
 use bytes::Bytes;
+#[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
+use futures_util::future::{select, Either};
+#[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
+use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use self_encryption::{ChunkInfo, DataMap, EncryptedChunk, XorName};
 use std::{cell::RefCell, collections::HashMap, future::Future, ops::Range, time::Duration};
 
 /// self_encryption splits every encryptable file into at least three chunks.
 pub(crate) const MIN_FILE_CHUNKS: usize = 3;
+/// Largest plaintext chunk a DataMap may declare: four times the native chunk
+/// size. Maps from other chunk-size schemes stay readable, while a hostile map
+/// cannot make one chunk reserve an arbitrarily large buffer.
+pub(crate) const MAX_CHUNK_PLAINTEXT_BYTES: usize = 16 * 1024 * 1024;
 /// Content chunks of a resolved root DataMap are encrypted at KDF level zero.
 const CONTENT_CHUNK_KDF_LEVEL: usize = 0;
 /// Seconds to wait before each deferred fetch round: the first pass, one
@@ -228,8 +236,8 @@ pub(crate) struct FileIndex {
 }
 
 impl FileIndex {
-    /// Chunk sizes are taken from the map, so maps produced with another
-    /// self-encryption chunk size remain readable.
+    /// Chunk sizes are taken from the map, up to [`MAX_CHUNK_PLAINTEXT_BYTES`],
+    /// so maps produced with another self-encryption chunk size remain readable.
     pub(crate) fn new(map: &DataMap) -> Result<Self, String> {
         if map.is_child() {
             return Err("range reads require a resolved root DataMap".into());
@@ -247,7 +255,7 @@ impl FileIndex {
             if info.index != index {
                 return Err("DataMap chunk indices must be contiguous".into());
             }
-            if info.src_size == 0 {
+            if !(1..=MAX_CHUNK_PLAINTEXT_BYTES).contains(&info.src_size) {
                 return Err("invalid DataMap plaintext chunk size".into());
             }
             let end = offsets[index]
@@ -286,41 +294,30 @@ impl FileIndex {
     }
 
     /// Decrypt one verified record and check it against the map's plaintext
-    /// size and hash.
+    /// size and hash. Decompression stops at the size the map declares.
     fn decrypt(&self, chunk: usize, encrypted: &Bytes) -> Result<Bytes, String> {
-        // The dependency's get_range uses usize file offsets. Its public
-        // per-chunk primitive has no whole-file arithmetic and retains the
-        // canonical KDF (original chunk index and neighbouring hashes).
-        let plaintext = self_encryption::decrypt_chunk(
+        let span = self.chunk_span(chunk);
+        // Per-chunk decryption avoids self_encryption's pointer-sized
+        // whole-file range arithmetic and keeps the canonical KDF (original
+        // chunk index and neighbouring hashes).
+        let plaintext = super::chunk_decrypt::decrypt_chunk(
             chunk,
             encrypted,
             &self.src_hashes,
             CONTENT_CHUNK_KDF_LEVEL,
-        )
-        .map_err(|e| e.to_string())?;
-        let span = self.chunk_span(chunk);
-        if plaintext.len() as u64 != span.end - span.start {
-            return Err("decrypted chunk size differs from DataMap".into());
-        }
+            // Bounded by MAX_CHUNK_PLAINTEXT_BYTES when the index was built.
+            (span.end - span.start) as usize,
+        )?;
         crate::record::verify(&self.src_hashes[chunk].0, &plaintext)?;
         Ok(plaintext)
     }
 }
 
-/// Whole-file and windowed browser reads.
+/// Browser readers and complete downloads.
 #[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
 impl FileIndex {
     pub(crate) fn chunk_count(&self) -> usize {
         self.dst_hashes.len()
-    }
-
-    /// End of a chunk window that starts at `first`, holds at most `max_bytes`
-    /// of plaintext and stops at `limit`. A window always holds one chunk,
-    /// however large it is.
-    pub(crate) fn window_end(&self, first: usize, limit: usize, max_bytes: u64) -> usize {
-        let budget_end = self.offsets[first].saturating_add(max_bytes);
-        let fitting = self.offsets.partition_point(|offset| *offset <= budget_end) - 1;
-        fitting.clamp(first + 1, limit)
     }
 
     /// Encrypted record addresses in chunk order.
@@ -336,7 +333,7 @@ impl FileIndex {
                 index,
                 dst_hash: self.dst_hashes[index],
                 src_hash: self.src_hashes[index],
-                // Each size was a usize in the DataMap this index came from.
+                // Bounded by MAX_CHUNK_PLAINTEXT_BYTES when the index was built.
                 src_size: (span.end - span.start) as usize,
             }
         })
@@ -382,10 +379,128 @@ where
     .await
 }
 
-/// Whole-file BLAKE3 over chunks that complete out of order. Chunks are
-/// hashed in file order; one that completes ahead of that frontier is read
-/// back from the caller's output when the frontier reaches it, so no
-/// plaintext is retained here.
+/// Fetch, verify and decrypt one chunk, retrying a missing record on the
+/// deferred schedule independently of every other chunk.
+#[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
+pub(crate) async fn fetch_chunk<E, F, Fut, S, SF>(
+    index: &FileIndex,
+    chunk: usize,
+    fetch: &F,
+    sleep: &S,
+    retryable: fn(&E) -> bool,
+) -> Result<Bytes, ReadError<E>>
+where
+    F: Fn([u8; 32]) -> Fut,
+    Fut: Future<Output = Result<Bytes, E>>,
+    S: Fn(Duration) -> SF,
+    SF: Future<Output = ()>,
+{
+    let address = index.dst_hashes[chunk].0;
+    let mut last_error = None;
+    for delay in DEFERRED_ROUND_DELAYS_SECS {
+        if delay > 0 {
+            sleep(Duration::from_secs(delay)).await;
+        }
+        match fetch(address).await {
+            Ok(encrypted) => {
+                crate::record::verify(&address, &encrypted).map_err(ReadError::Invalid)?;
+                return index.decrypt(chunk, &encrypted).map_err(ReadError::Invalid);
+            }
+            Err(error) if !retryable(&error) => return Err(ReadError::Fetch(error)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(ReadError::Fetch(
+        last_error.expect("the deferred schedule makes at least one attempt"),
+    ))
+}
+
+#[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
+enum PipelineEvent<T, X> {
+    Written(Result<(), X>),
+    Fetched(usize, Result<T, X>),
+}
+
+/// Fetch `items` concurrently and hand each result to `write` in item order.
+/// Items launch in order while fewer than `cap()` are in flight and the cost
+/// of launched-but-unwritten items stays within `budget`; one item can always
+/// run. Fetching continues while a write is pending, so slow items and their
+/// retry waits overlap with every other item the budget admits.
+#[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
+pub(crate) async fn ordered_pipeline<T, X, F, FF, W, WF, C>(
+    items: Range<usize>,
+    cost: impl Fn(usize) -> u64,
+    budget: u64,
+    cap: &C,
+    fetch: F,
+    mut write: W,
+) -> Result<(), X>
+where
+    F: Fn(usize) -> FF,
+    FF: Future<Output = Result<T, X>>,
+    W: FnMut(usize, T) -> WF,
+    WF: Future<Output = Result<(), X>>,
+    C: Fn() -> usize,
+{
+    let fetch = &fetch;
+    let mut in_flight = FuturesUnordered::new();
+    let mut ready = HashMap::new();
+    let mut writing = None;
+    let (mut next_launch, mut next_write) = (items.start, items.start);
+    let mut outstanding = 0u64;
+    while next_write < items.end {
+        while next_launch < items.end
+            && in_flight.len() < cap().max(1)
+            && (outstanding == 0 || outstanding.saturating_add(cost(next_launch)) <= budget)
+        {
+            let item = next_launch;
+            in_flight.push(async move { (item, fetch(item).await) });
+            outstanding = outstanding.saturating_add(cost(item));
+            next_launch += 1;
+        }
+        if writing.is_none() {
+            if let Some(value) = ready.remove(&next_write) {
+                writing = Some(Box::pin(write(next_write, value)));
+            }
+        }
+        // `outstanding` covers the next item to write, so with nothing being
+        // written that item is in flight.
+        let event = match writing.as_mut() {
+            Some(pending) if in_flight.is_empty() => PipelineEvent::Written(pending.await),
+            Some(pending) => match select(pending, in_flight.next()).await {
+                Either::Left((written, _)) => PipelineEvent::Written(written),
+                Either::Right((fetched, _)) => {
+                    let (item, value) = fetched.expect("items are in flight");
+                    PipelineEvent::Fetched(item, value)
+                }
+            },
+            None => {
+                let (item, value) = in_flight
+                    .next()
+                    .await
+                    .expect("the next item to write is in flight");
+                PipelineEvent::Fetched(item, value)
+            }
+        };
+        match event {
+            PipelineEvent::Written(written) => {
+                written?;
+                writing = None;
+                outstanding -= cost(next_write);
+                next_write += 1;
+            }
+            PipelineEvent::Fetched(item, value) => {
+                ready.insert(item, value?);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whole-file BLAKE3 over chunks that complete out of order. Chunks are hashed
+/// in file order. One that completes ahead of that order is read back from the
+/// caller's output later, one chunk at a time, so no plaintext is retained
+/// here and the caller decides when that work runs.
 #[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
 pub(crate) struct OrderedHasher {
     hasher: blake3::Hasher,
@@ -403,23 +518,28 @@ impl OrderedHasher {
         }
     }
 
-    /// Record `chunk` as complete and hash every chunk the frontier can now
-    /// pass. `read_back` returns the plaintext of an earlier-completed chunk.
-    pub(crate) fn complete(
-        &mut self,
-        chunk: usize,
-        plaintext: &[u8],
-        mut read_back: impl FnMut(usize) -> Result<Vec<u8>, String>,
-    ) -> Result<(), String> {
+    /// Record `chunk` as complete, hashing it now if it is next in file order.
+    pub(crate) fn complete(&mut self, chunk: usize, plaintext: &[u8]) {
         self.completed[chunk] = true;
-        while self.completed.get(self.next) == Some(&true) {
-            if self.next == chunk {
-                self.hasher.update(plaintext);
-            } else {
-                self.hasher.update(&read_back(self.next)?);
-            }
+        if chunk == self.next {
+            self.hasher.update(plaintext);
             self.next += 1;
         }
+    }
+
+    /// The next chunk in file order, if it completed earlier and must now be
+    /// read back to be hashed.
+    pub(crate) fn pending_read_back(&self) -> Option<usize> {
+        (self.completed.get(self.next) == Some(&true)).then_some(self.next)
+    }
+
+    /// Hash the read-back plaintext of [`Self::pending_read_back`].
+    pub(crate) fn read_back(&mut self, chunk: usize, plaintext: &[u8]) -> Result<(), String> {
+        if self.pending_read_back() != Some(chunk) {
+            return Err(format!("chunk {chunk} is not waiting to be hashed"));
+        }
+        self.hasher.update(plaintext);
+        self.next += 1;
         Ok(())
     }
 
@@ -942,28 +1062,224 @@ mod tests {
             index.record_addresses(),
             infos.iter().map(|info| info.dst_hash).collect::<Vec<_>>()
         );
+        let mut infos = infos;
+        infos[1].src_size = MAX_CHUNK_PLAINTEXT_BYTES + 1;
+        assert!(FileIndex::new(&DataMap::new(infos)).is_err());
     }
 
-    #[test]
-    fn windows_hold_whole_chunks_within_their_byte_budget() {
-        let size = self_encryption::MAX_CHUNK_SIZE;
-        let infos = (0..10)
-            .map(|index| self_encryption::ChunkInfo {
-                index,
-                src_size: size,
-                src_hash: XorName([1; 32]),
-                dst_hash: XorName([2; 32]),
-            })
-            .collect();
-        let index = FileIndex::new(&DataMap::new(infos)).unwrap();
-        let chunk = size as u64;
-        assert_eq!(index.window_end(0, 10, 4 * chunk), 4);
-        assert_eq!(index.window_end(0, 10, 4 * chunk + 1), 4);
-        assert_eq!(index.window_end(2, 10, 4 * chunk - 1), 5);
-        // A window always makes progress, even past its budget.
-        assert_eq!(index.window_end(3, 10, 1), 4);
-        assert_eq!(index.window_end(8, 10, 4 * chunk), 10);
-        assert_eq!(index.window_end(0, 3, u64::MAX), 3);
+    #[tokio::test]
+    async fn pipeline_writes_in_order_within_its_budget() {
+        const ITEMS: usize = 6;
+        const COST: u64 = 10;
+        const BUDGET: u64 = 3 * COST;
+        let launched = std::cell::Cell::new(0u64);
+        let most_outstanding = std::cell::Cell::new(0u64);
+        let mut written = Vec::new();
+        ordered_pipeline(
+            0..ITEMS,
+            |_| COST,
+            BUDGET,
+            &|| ITEMS,
+            |item| {
+                launched.set(launched.get() + 1);
+                async move {
+                    // Later items finish first.
+                    for _ in item..ITEMS {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok::<_, String>(item)
+                }
+            },
+            |item, value| {
+                assert_eq!(item, value);
+                let outstanding = (launched.get() - written.len() as u64) * COST;
+                most_outstanding.set(most_outstanding.get().max(outstanding));
+                written.push(item);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(written, (0..ITEMS).collect::<Vec<_>>());
+        assert_eq!(most_outstanding.get(), BUDGET);
+    }
+
+    #[tokio::test]
+    async fn pipeline_keeps_fetching_while_a_write_is_pending() {
+        // One fetch at a time: the first write only finishes once the last
+        // item has been fetched, so fetching must continue behind it.
+        let (fetched_last, unblock) = tokio::sync::oneshot::channel();
+        let fetched_last = std::cell::RefCell::new(Some(fetched_last));
+        let unblock = std::cell::RefCell::new(Some(unblock));
+        let mut written = Vec::new();
+        let pipeline = ordered_pipeline(
+            0..4,
+            |_| 1,
+            u64::MAX,
+            &|| 1,
+            |item| {
+                if item == 3 {
+                    let _ = fetched_last.borrow_mut().take().unwrap().send(());
+                }
+                async move { Ok::<_, String>(item) }
+            },
+            |item, _| {
+                let unblock = (item == 0).then(|| unblock.borrow_mut().take().unwrap());
+                written.push(item);
+                async move {
+                    if let Some(unblock) = unblock {
+                        unblock.await.unwrap();
+                    }
+                    Ok(())
+                }
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(5), pipeline)
+            .await
+            .expect("fetching stalled behind a pending write")
+            .unwrap();
+        assert_eq!(written, vec![0, 1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_slow_item_does_not_hold_back_fetches_behind_it() {
+        // The first item stays in flight (as during a retry wait) until the
+        // third has been fetched.
+        let (fetched_third, released) = tokio::sync::oneshot::channel();
+        let fetched_third = std::cell::RefCell::new(Some(fetched_third));
+        let released = std::cell::RefCell::new(Some(released));
+        let completed = std::cell::RefCell::new(Vec::new());
+        let pipeline = ordered_pipeline(
+            0..3,
+            |_| 1,
+            3,
+            &|| 3,
+            |item| {
+                let released = (item == 0).then(|| released.borrow_mut().take().unwrap());
+                let fetched_third = (item == 2).then(|| fetched_third.borrow_mut().take().unwrap());
+                let completed = &completed;
+                async move {
+                    if let Some(released) = released {
+                        released.await.unwrap();
+                    }
+                    completed.borrow_mut().push(item);
+                    if let Some(fetched_third) = fetched_third {
+                        let _ = fetched_third.send(());
+                    }
+                    Ok::<_, String>(item)
+                }
+            },
+            |_, _| async { Ok(()) },
+        );
+        tokio::time::timeout(Duration::from_secs(5), pipeline)
+            .await
+            .expect("a slow item held back the items behind it")
+            .unwrap();
+        assert_eq!(*completed.borrow(), vec![1, 2, 0]);
+    }
+
+    #[tokio::test]
+    async fn pipeline_admits_an_oversized_item_and_stops_at_the_first_error() {
+        let mut written = Vec::new();
+        ordered_pipeline(
+            0..2,
+            |_| 100,
+            10,
+            &|| 4,
+            |item| async move { Ok::<_, String>(item) },
+            |item, _| {
+                written.push(item);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(written, vec![0, 1]);
+
+        let error = ordered_pipeline(
+            0..4,
+            |_| 1,
+            4,
+            &|| 4,
+            |item| async move {
+                if item == 2 {
+                    Err(format!("fetch {item}"))
+                } else {
+                    Ok(item)
+                }
+            },
+            |_, _| async { Ok(()) },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "fetch 2");
+        let error = ordered_pipeline(
+            0..4,
+            |_| 1,
+            4,
+            &|| 4,
+            |item| async move { Ok::<_, String>(item) },
+            |item, _| async move {
+                if item == 1 {
+                    Err(format!("write {item}"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "write 1");
+    }
+
+    #[tokio::test]
+    async fn a_missing_chunk_is_retried_on_its_own_schedule() {
+        let (content, map, records) = fixture();
+        let index = FileIndex::new(&map).unwrap();
+        let attempts = std::cell::Cell::new(0);
+        let sleeps = std::cell::RefCell::new(Vec::new());
+        let fetch_after = |available_from: usize| {
+            let (attempts, records) = (&attempts, &records);
+            move |address: [u8; 32]| {
+                attempts.set(attempts.get() + 1);
+                let found = attempts.get() >= available_from;
+                let bytes = records[&address].clone();
+                async move {
+                    if found {
+                        Ok(bytes)
+                    } else {
+                        Err("missing".to_string())
+                    }
+                }
+            }
+        };
+        let sleep = |delay: Duration| {
+            sleeps.borrow_mut().push(delay.as_secs());
+            async {}
+        };
+        let plaintext = fetch_chunk(&index, 1, &fetch_after(4), &sleep, |_| true)
+            .await
+            .unwrap();
+        let span = index.chunk_span(1);
+        assert_eq!(
+            plaintext,
+            content.slice(span.start as usize..span.end as usize)
+        );
+        assert_eq!(*sleeps.borrow(), vec![15, 45]);
+
+        attempts.set(0);
+        let error = fetch_chunk(&index, 1, &fetch_after(5), &sleep, |_| true)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ReadError::Fetch(message) if message == "missing"));
+        assert_eq!(attempts.get(), DEFERRED_ROUND_DELAYS_SECS.len());
+
+        attempts.set(0);
+        let error = fetch_chunk(&index, 1, &fetch_after(5), &sleep, |_| false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ReadError::Fetch(_)));
+        assert_eq!(attempts.get(), 1);
     }
 
     #[tokio::test]
@@ -1047,21 +1363,26 @@ mod tests {
         ] {
             let mut hasher = OrderedHasher::new(chunks.len());
             let mut read_backs = Vec::new();
+            let mut read_back = |hasher: &mut OrderedHasher| {
+                let chunk = hasher.pending_read_back()?;
+                read_backs.push(chunk);
+                hasher.read_back(chunk, &chunks[chunk]).unwrap();
+                Some(())
+            };
+            // As in a download: at most one read-back per completion, then
+            // the rest once every chunk has arrived.
             for chunk in order {
-                hasher
-                    .complete(chunk, &chunks[chunk], |earlier| {
-                        read_backs.push(earlier);
-                        Ok(chunks[earlier].clone())
-                    })
-                    .unwrap();
+                hasher.complete(chunk, &chunks[chunk]);
+                read_back(&mut hasher);
             }
+            while read_back(&mut hasher).is_some() {}
             assert_eq!(hasher.finish().unwrap(), expected);
             assert_eq!(read_backs, expected_read_backs);
         }
         let mut incomplete = OrderedHasher::new(chunks.len());
-        incomplete
-            .complete(1, &chunks[1], |_| unreachable!("chunk 0 is missing"))
-            .unwrap();
+        incomplete.complete(1, &chunks[1]);
+        assert_eq!(incomplete.pending_read_back(), None);
+        assert!(incomplete.read_back(1, &chunks[1]).is_err());
         assert!(incomplete.finish().is_err());
     }
 
