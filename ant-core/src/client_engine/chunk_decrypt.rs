@@ -9,7 +9,7 @@
 
 use super::files::MIN_FILE_CHUNKS;
 use bytes::Bytes;
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use self_encryption::XorName;
 use std::io::Read;
@@ -44,13 +44,14 @@ pub(super) fn decrypt_chunk(
     expected_len: usize,
 ) -> Result<Bytes, String> {
     let secrets = chunk_secrets(index, src_hashes, kdf_level)?;
-    let unpadded: Vec<u8> = content
+    // Unpad, then decrypt in the same buffer; the tag is truncated off.
+    let mut compressed: Vec<u8> = content
         .iter()
         .zip(secrets.pad.iter().cycle())
         .map(|(byte, pad)| byte ^ pad)
         .collect();
-    let compressed = ChaCha20Poly1305::new(Key::from_slice(&secrets.key))
-        .decrypt(Nonce::from_slice(&secrets.nonce), unpadded.as_slice())
+    ChaCha20Poly1305::new(Key::from_slice(&secrets.key))
+        .decrypt_in_place(Nonce::from_slice(&secrets.nonce), &[], &mut compressed)
         .map_err(|error| format!("chunk decryption failed: {error}"))?;
     let mut plaintext = Vec::new();
     plaintext

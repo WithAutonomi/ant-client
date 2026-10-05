@@ -2124,6 +2124,8 @@ struct ResolvedBrowserFile {
     file: PublicFileDescriptor,
     data_map_node: Option<BrowserNode>,
     index: crate::client_engine::files::FileIndex,
+    /// DataMap records fetched, and so cached, while resolving.
+    map_records: Vec<[u8; 32]>,
 }
 
 struct UploadRecord {
@@ -2333,6 +2335,7 @@ pub struct BrowserNetworkClient {
     shared: Rc<crate::data::Client>,
     adapter: Rc<SharedNetworkAdapter>,
     read_ahead: Rc<read_ahead::ReadAheadPool>,
+    open_files: download::OpenFiles,
 }
 
 #[wasm_bindgen(js_class = BrowserNetworkClient)]
@@ -2366,6 +2369,7 @@ impl BrowserNetworkClient {
             shared,
             adapter,
             read_ahead,
+            open_files: download::OpenFiles::default(),
         })
     }
 
@@ -2675,8 +2679,8 @@ impl BrowserNetworkClient {
         ));
         Ok(BrowserFileReader::new(
             Rc::clone(&self.shared),
-            resolved.file,
-            resolved.index,
+            resolved,
+            &self.open_files,
         ))
     }
 
@@ -2695,7 +2699,8 @@ impl BrowserNetworkClient {
                     .map_err(|error| JsValue::from_str(&error))
             })
             .await?;
-        let reader = BrowserFileReader::new(Rc::clone(&self.shared), resolved.file, resolved.index);
+        let data_map_node = resolved.data_map_node.clone();
+        let reader = BrowserFileReader::new(Rc::clone(&self.shared), resolved, &self.open_files);
         let (content, hash) = reader.collect(&settings, &mut cancel).await?;
         let file = reader.into_descriptor(hash.clone());
         settings
@@ -2705,7 +2710,7 @@ impl BrowserNetworkClient {
             content,
             hash,
             file,
-            data_map_node: resolved.data_map_node,
+            data_map_node,
         })
     }
 
@@ -2746,6 +2751,9 @@ impl BrowserNetworkClient {
         let mut resolved = self
             .resolve_data_map(&encoded_data_map, descriptor, progress)
             .await?;
+        resolved
+            .map_records
+            .push(parse_lookup_key(&address, "record address")?);
         resolved.file.address = address;
         resolved.data_map_node = Some(data_map_node);
         Ok(resolved)
@@ -2791,18 +2799,24 @@ impl BrowserNetworkClient {
         progress: &ProgressReporter,
     ) -> Result<ResolvedBrowserFile, String> {
         let published_data_map = crate::client_engine::files::decode_map(encoded_data_map)?;
+        let map_records = RefCell::new(Vec::new());
         let root_data_map = crate::client_engine::files::resolve(
             &published_data_map,
-            &|address| async move {
-                progress.report(&format!(
-                    "Resolving nested DataMap record {}",
-                    hex::encode(address)
-                ));
-                self.get_shared_chunk(&hex::encode(address), progress)
-                    .await
-                    .map(|(content, _)| bytes::Bytes::from(content))
+            &|address| {
+                let map_records = &map_records;
+                async move {
+                    progress.report(&format!(
+                        "Resolving nested DataMap record {}",
+                        hex::encode(address)
+                    ));
+                    map_records.borrow_mut().push(address);
+                    self.get_shared_chunk(&hex::encode(address), progress)
+                        .await
+                        .map(|(content, _)| bytes::Bytes::from(content))
+                }
             },
             &|| self.shared.controller().fetch.current(),
+            super::MAX_BROWSER_NESTED_MAP_BYTES,
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -2810,6 +2824,12 @@ impl BrowserNetworkClient {
         let index = crate::client_engine::files::FileIndex::new(&root_data_map)?;
         if index.size() > super::manifest::MAX_SAFE_JS_INTEGER {
             return Err("file size exceeds JavaScript's exact integer range".into());
+        }
+        if index.largest_chunk() > super::MAX_BROWSER_CHUNK_BYTES as u64 {
+            return Err(format!(
+                "DataMap chunks larger than {} bytes are not read in browsers",
+                super::MAX_BROWSER_CHUNK_BYTES
+            ));
         }
 
         file.size = index.size();
@@ -2821,6 +2841,7 @@ impl BrowserNetworkClient {
             file,
             data_map_node: None,
             index,
+            map_records: map_records.into_inner(),
         })
     }
 
@@ -2910,9 +2931,14 @@ impl BrowserNetworkClient {
         };
         let encoded_map = fetch(parse_lookup_key(&staged.address, "DataMap address")?).await?;
         let map = crate::client_engine::files::decode_map(&encoded_map)?;
-        let root = crate::client_engine::files::resolve(&map, &fetch, &|| 1)
-            .await
-            .map_err(|error| error.to_string())?;
+        let root = crate::client_engine::files::resolve(
+            &map,
+            &fetch,
+            &|| 1,
+            super::MAX_BROWSER_NESTED_MAP_BYTES,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         staged.chunks = super::chunk_infos(&root);
         staged.size = staged.chunks.iter().try_fold(0usize, |size, chunk| {
             size.checked_add(chunk.src_size).ok_or("file size overflow")

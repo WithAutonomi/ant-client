@@ -668,7 +668,8 @@ Manifest validation no longer rejects files over 1 GB or over 1,024 chunks. It
 caps a file's chunk list at 262,144 entries (about 1 TiB at the native chunk
 size), which bounds the work an untrusted manifest can cause. Chunk sizes come
 from the DataMap rather than this build's `MAX_CHUNK_SIZE`, so maps produced
-with another self-encryption chunk size remain readable, up to 16 MiB per chunk.
+with another self-encryption chunk size remain readable. Browsers accept chunks
+of up to 16 MiB; native range reads accept any size.
 
 A reader retains a validated root-map index and uses binary searches to identify
 overlapping chunks. Chunks are decrypted one at a time with the original
@@ -679,11 +680,19 @@ decompresses without an output limit, so a crafted record could expand to
 gigabytes before its declared size is checked and abort the WASM instance.
 `client_engine/chunk_decrypt.rs` therefore performs the same steps (BLAKE3 KDF,
 XOR pad, ChaCha20-Poly1305, Brotli) and stops decompressing one byte past the
-declared size. It uses the dependency's own `chacha20poly1305` and
-`brotli-decompressor` versions, and a test pins its output to `decrypt_chunk`
-so a change to the dependency's KDF fails it; a bounded primitive upstream
-would replace it. Encrypted records and reconstructed plaintext chunks are
-verified against their respective hashes and sizes.
+declared size. Nested DataMap levels are resolved through it too, instead of
+`get_root_data_map_parallel`, and browsers bound each decoded level at 64 MiB.
+It uses the dependency's own `chacha20poly1305` and `brotli-decompressor`
+versions, and tests pin its output to `decrypt_chunk` and to native nested-map
+resolution, so a change to the dependency's KDF fails them; a bounded primitive
+upstream would replace it. Native whole-file downloads still decrypt through
+`self_encryption::decrypt`.
+
+The fetch layer verifies every record's address. The engine does not hash
+content records again: ChaCha20-Poly1305 authentication and the plaintext hash
+reject an altered record, and decompression stops at the declared size. The
+native whole-file path keeps its own record check before handing records to
+`self_encryption`.
 
 Reads are chunk-aligned. A shared engine primitive fetches a set of chunks in
 one deferred retry pass and hands each decrypted chunk on as it completes, so a
@@ -717,10 +726,15 @@ the buffer keeps fetching, so retry waits overlap rather than adding up per
 batch. Only a record that stays missing longer than the buffer takes to fill
 holds the stream back.
 It computes BLAKE3 incrementally, closes the destination on success, aborts it
-on any failure including invalid options, and releases the writer lock. An
-`AbortSignal` cancels one operation without closing the reader. Closing the
-reader cancels its operations at once, including fetches waiting to be retried,
-and evicts only that reader's records from the client's shared cache.
+on any failure including invalid options, and releases the writer lock without
+waiting for a stalled destination to finish aborting. An `AbortSignal` cancels
+one operation without closing the reader. Closing the reader cancels its
+operations at once, including fetches waiting to be retried, until every byte
+is written; it may then be closed from the final progress callback. After that
+only the signal can cancel, and a destination that has started closing may
+already be committed. Readers are counted per file, and the last reader of a
+file to close evicts that file's content and DataMap records from the client's
+shared cache, looked up by address in O(log chunks) per cached entry.
 Cancellation is checked before an operation is resumed, so a cancelled
 operation never completes or refills the cache afterwards. The core
 does not open file pickers, own browser filesystem policy, or change the
@@ -746,10 +760,12 @@ claiming literally unlimited file sizes.
 
 Validation includes a complete 4,303,347,835-byte native-encrypted fixture streamed
 through generated WASM with a matching BLAKE3; public/private seeks beyond 4 GiB;
-disk output; backpressure; cancellation by `AbortSignal`, by closing the reader
-and during retry waits; writer errors; destinations aborted for invalid calls;
+disk output; backpressure; cancellation by `AbortSignal`, by closing the reader,
+during retry waits, during a stalled write and while the destination closes;
+cache eviction with two readers of one file; writer errors; destinations
+aborted for invalid calls;
 allocation failures; invalid offsets and options; manifest validation; and
 shared native range, single-pass retry, ordered-pipeline, ordered-hash, bounded
-decryption and decompression-bomb tests. The generated
+decryption, bounded nested-map and decompression-bomb tests. The generated
 WASM tests use mocked WebRTC hosts with real Rust protocol and crypto processing.
 They do not establish real-browser or live-network compatibility by themselves.

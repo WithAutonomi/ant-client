@@ -3,7 +3,8 @@
 pub use super::protocol::BrowserPaymentNetwork;
 use super::protocol::{normalize_hex, parse_webrtc_direct_multiaddr, BrowserEndpoint};
 use super::BrowserChunkInfo;
-use crate::client_engine::files::{MAX_CHUNK_PLAINTEXT_BYTES, MIN_FILE_CHUNKS};
+use super::MAX_BROWSER_CHUNK_BYTES;
+use crate::client_engine::files::MIN_FILE_CHUNKS;
 use serde::{Deserialize, Serialize};
 
 /// Current browser testnet manifest version.
@@ -185,7 +186,7 @@ fn normalize_file(file: &mut PublicFileDescriptor) -> Result<(), BrowserManifest
         chunk.dst_hash = normalize_hex(&chunk.dst_hash, 32).map_err(BrowserManifestError)?;
         chunk.src_hash = normalize_hex(&chunk.src_hash, 32).map_err(BrowserManifestError)?;
         // Sizes come from the DataMap, which may use another chunk size.
-        if !(1..=MAX_CHUNK_PLAINTEXT_BYTES).contains(&chunk.src_size) {
+        if !(1..=MAX_BROWSER_CHUNK_BYTES).contains(&chunk.src_size) {
             return Err(BrowserManifestError(format!(
                 "invalid plaintext chunk size {}",
                 chunk.src_size
@@ -341,8 +342,8 @@ mod tests {
                 .collect(),
         };
         normalize_file(&mut file).unwrap();
-        file.chunks[1].src_size = MAX_CHUNK_PLAINTEXT_BYTES + 1;
-        file.size += (MAX_CHUNK_PLAINTEXT_BYTES + 1 - large_chunk) as u64;
+        file.chunks[1].src_size = MAX_BROWSER_CHUNK_BYTES + 1;
+        file.size += (MAX_BROWSER_CHUNK_BYTES + 1 - large_chunk) as u64;
         let error = normalize_file(&mut file).unwrap_err();
         assert!(error.to_string().contains("chunk size"));
 

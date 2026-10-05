@@ -401,7 +401,8 @@ impl Client {
     ) -> Result<Bytes> {
         let fetch = |address| self.fetch_data_record(address);
         let cap = || self.controller().fetch.current();
-        let root = crate::client_engine::files::resolve(data_map, &fetch, &cap)
+        // Native range reads keep no limit on nested DataMap levels.
+        let root = crate::client_engine::files::resolve(data_map, &fetch, &cap, usize::MAX)
             .await
             .map_err(map_read_error)?;
         crate::client_engine::files::read_range(

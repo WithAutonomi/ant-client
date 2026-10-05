@@ -298,6 +298,65 @@ test("cancelling during a missing-record retry does not wait out the retry round
   } finally { client.close(); }
 });
 
+test("an AbortSignal settles pipeTo even while a destination write is stalled", async () => {
+  const { client } = fixture();
+  let reader;
+  try {
+    reader = await client.openPublicFile(large.address);
+    const controller = new AbortController();
+    const reason = new Error("stalled destination");
+    let writing;
+    const stalled = new Promise(resolve => { writing = resolve; });
+    const sink = new WritableStream({ write() { writing(); return new Promise(() => {}); } });
+    const pending = reader.pipeTo(sink, { signal: controller.signal });
+    await stalled;
+    const started = Date.now();
+    controller.abort(reason);
+    await assert.rejects(pending, error => error === reason);
+    assert(Date.now() - started < 2_000, `abort took ${Date.now() - started} ms`);
+  } finally { reader?.close(); client.close(); }
+});
+
+test("an AbortSignal during the destination's close rejects pipeTo", async () => {
+  const original = new TextEncoder().encode("Abort while committing.".repeat(200));
+  const encrypted = encryptPublicFile(original);
+  const { client } = fixture(encrypted.records);
+  let reader;
+  try {
+    reader = await client.openPublicFile(encrypted.address);
+    const controller = new AbortController();
+    const reason = new Error("cancelled during commit");
+    let closing;
+    const committing = new Promise(resolve => { closing = resolve; });
+    const sink = new WritableStream({ close() { closing(); return new Promise(() => {}); } });
+    const pending = reader.pipeTo(sink, { signal: controller.signal });
+    await committing;
+    controller.abort(reason);
+    await assert.rejects(pending, error => error === reason);
+  } finally { reader?.close(); client.close(); }
+});
+
+test("closing one reader keeps the records another reader of the file uses", async () => {
+  const original = new TextEncoder().encode("Two readers, one file.".repeat(300));
+  const encrypted = encryptPublicFile(original);
+  const { rtc, client } = fixture(encrypted.records);
+  try {
+    const first = await client.openPublicFile(encrypted.address);
+    const second = await client.openPublicFile(encrypted.address);
+    assert.deepEqual(await second.readRange(0, original.length), original);
+    first.close();
+    const cached = gets(rtc);
+    assert.deepEqual(await second.readRange(0, original.length), original);
+    assert.equal(gets(rtc), cached, "the open reader's records stay cached");
+    second.close();
+    const third = await client.openPublicFile(encrypted.address);
+    const reopened = gets(rtc);
+    assert.deepEqual(await third.readRange(0, original.length), original);
+    assert(gets(rtc) > reopened, "the last reader's close released the file's records");
+    third.close();
+  } finally { client.close(); }
+});
+
 test("writer rejection and reader cancellation stop a stream and release its lock", async () => {
   const { client } = fixture();
   try {

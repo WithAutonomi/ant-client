@@ -3336,6 +3336,8 @@ impl Client {
                     }
                 },
                 &|| self.controller().fetch.current(),
+                // Native downloads keep no limit on nested DataMap levels.
+                usize::MAX,
             )
             .await
             .map_err(super::super::data::map_read_error)?;

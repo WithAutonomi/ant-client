@@ -4,6 +4,7 @@ use crate::browser::manifest::MAX_SAFE_JS_INTEGER;
 use crate::client_engine::files::{ordered_pipeline, FileIndex, OrderedHasher};
 use bytes::Bytes;
 use std::ops::Range;
+use web_time::Instant;
 
 /// Plaintext a `pipeTo` holds at once: chunks in flight or fetched but not yet
 /// written. Fetching continues while writes are pending until this is reached.
@@ -18,6 +19,9 @@ const PIPE_OPTION_NAMES: [&str; 4] = ["start", "end", "signal", "onProgress"];
 const DOWNLOAD_OPTION_NAMES: [&str; 4] = ["concurrency", "maxMemoryBytes", "onProgress", "signal"];
 /// JavaScript's ToUint32 wraps numbers modulo 2^32.
 const UINT32_RANGE: f64 = u32::MAX as f64 + 1.0;
+/// Longest stretch of read-back hashing between event-loop turns. Yielding
+/// after every chunk would pay the browser's nested-timer clamp each time.
+const HASH_SLICE: Duration = Duration::from_millis(20);
 
 /// A nonnegative integer that JavaScript represents exactly.
 fn safe_integer(value: f64, label: &str) -> Result<u64, String> {
@@ -93,6 +97,51 @@ fn options_from_js<T: Default + serde::de::DeserializeOwned>(
 /// Let the page handle events between long stretches of synchronous work.
 async fn yield_to_event_loop() {
     TimeoutFuture::new(0).await;
+}
+
+/// Open readers per file key, so closing one reader keeps the cached records
+/// another reader of the same file is still using.
+pub(super) type OpenFiles = Rc<RefCell<HashMap<String, usize>>>;
+
+/// One reader's place in [`OpenFiles`], released on close or drop.
+struct OpenFile {
+    files: OpenFiles,
+    key: String,
+    open: Cell<bool>,
+}
+
+impl OpenFile {
+    fn register(files: &OpenFiles, key: String) -> Self {
+        *files.borrow_mut().entry(key.clone()).or_default() += 1;
+        Self {
+            files: Rc::clone(files),
+            key,
+            open: Cell::new(true),
+        }
+    }
+
+    /// Release this reader's place. True when it was the file's last open reader.
+    fn release(&self) -> bool {
+        if !self.open.replace(false) {
+            return false;
+        }
+        let mut files = self.files.borrow_mut();
+        let Some(count) = files.get_mut(&self.key) else {
+            return true;
+        };
+        *count -= 1;
+        if *count > 0 {
+            return false;
+        }
+        files.remove(&self.key);
+        true
+    }
+}
+
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// Release the writer even if the Rust future is dropped before it completes.
@@ -275,6 +324,11 @@ impl Cancellation {
         Ok(Self { closed, abort })
     }
 
+    /// Stop following the reader; only the AbortSignal can cancel from here.
+    fn ignore_reader(&mut self) {
+        self.closed = None;
+    }
+
     /// Fail with the abort reason, or the closed-reader error.
     fn check(&self) -> Result<(), JsValue> {
         if let Some(reason) = self.abort.as_ref().and_then(AbortListener::reason) {
@@ -336,6 +390,9 @@ pub struct BrowserFileReader {
     /// Descriptor without its chunk list; the index holds the chunk metadata.
     file: PublicFileDescriptor,
     index: FileIndex,
+    /// DataMap records cached while the file was resolved.
+    map_records: Vec<[u8; 32]>,
+    open_file: OpenFile,
     closed: watch::Sender<bool>,
 }
 
@@ -392,7 +449,9 @@ impl BrowserFileReader {
     /// is retried on its own schedule while the others continue. Closes the
     /// destination on success, aborts it on any failure (including invalid
     /// options), and always releases the writer lock. Returns the BLAKE3 and
-    /// byte count of the written range. Closing the reader also cancels.
+    /// byte count of the written range. Closing the reader also cancels until
+    /// every byte is written; after that only the AbortSignal can, and a
+    /// destination that has started closing may already be committed.
     #[wasm_bindgen(js_name = pipeTo)]
     pub async fn pipe_to(
         &self,
@@ -406,35 +465,43 @@ impl BrowserFileReader {
         if let Err(error) = &result {
             if let Ok(abort) = method(&writer.0, "abort") {
                 if let Ok(promise) = abort.call1(&writer.0, error) {
-                    let _ = JsFuture::from(Promise::resolve(&promise)).await;
+                    // Not awaited: an abort settles only once a stalled write
+                    // does, and the rejection must not wait for that.
+                    let settled = JsFuture::from(Promise::resolve(&promise));
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let _ = settled.await;
+                    });
                 }
             }
         }
         result
     }
 
-    /// Close the reader: cancel its operations and drop its records from the
-    /// client's shared cache, leaving other readers' records in place. Use an
-    /// AbortSignal to cancel a single pipeTo without closing the reader.
+    /// Close the reader: cancel its operations and, once no other reader of
+    /// the same file is open, drop the file's records from the client's shared
+    /// cache. Use an AbortSignal to cancel a single pipeTo without closing.
     pub fn close(&self) {
         self.closed.send_replace(true);
-        let records = self.index.record_addresses();
-        self.shared
-            .chunk_cache()
-            .remove_matching(|address| records.iter().any(|record| record.0 == *address));
+        if self.open_file.release() {
+            self.shared.chunk_cache().remove_matching(|address| {
+                self.map_records.contains(address) || self.index.contains_record(address)
+            });
+        }
     }
 }
 
 impl BrowserFileReader {
     pub(super) fn new(
         shared: Rc<crate::data::Client>,
-        file: PublicFileDescriptor,
-        index: FileIndex,
+        resolved: ResolvedBrowserFile,
+        open_files: &OpenFiles,
     ) -> Self {
         Self {
             shared,
-            file,
-            index,
+            open_file: OpenFile::register(open_files, resolved.file.address.clone()),
+            file: resolved.file,
+            index: resolved.index,
+            map_records: resolved.map_records,
             closed: watch::Sender::new(false),
         }
     }
@@ -507,7 +574,16 @@ impl BrowserFileReader {
                 },
             ))
             .await?;
-        JsFuture::from(Promise::resolve(&method(writer, "close")?.call0(writer)?)).await?;
+        // Every byte is written, so closing the reader no longer cancels: it
+        // may be closed from the final progress callback.
+        cancel.ignore_reader();
+        cancel
+            .run(async {
+                JsFuture::from(Promise::resolve(&method(writer, "close")?.call0(writer)?))
+                    .await
+                    .map(drop)
+            })
+            .await?;
         serde_wasm_bindgen::to_value(&PipeResult {
             bytes_written: total,
             hash: hasher.finalize().to_hex().to_string(),
@@ -605,14 +681,18 @@ impl BrowserFileReader {
                     .map_err(js_string)
             })
             .await?;
-        // Hash the chunks that arrived ahead of file order, yielding between
-        // them so a large backlog cannot freeze the page.
+        // Hash the chunks that arrived ahead of file order, yielding to the
+        // page between short slices so a large backlog cannot freeze it.
+        let mut slice_start = Instant::now();
         while let Some(chunk) = hasher.pending_read_back() {
             cancel.check()?;
             hasher
                 .read_back(chunk, &chunk_view(chunk)?.to_vec())
                 .map_err(js_string)?;
-            yield_to_event_loop().await;
+            if slice_start.elapsed() >= HASH_SLICE {
+                yield_to_event_loop().await;
+                slice_start = Instant::now();
+            }
         }
         Ok((output, hasher.finish().map_err(js_string)?))
     }

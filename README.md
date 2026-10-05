@@ -40,8 +40,10 @@ use 64-bit arithmetic internally; the JavaScript API accepts exact, nonnegative
 `number` positions through `Number.MAX_SAFE_INTEGER` (just under 8 PiB). The
 resolved DataMap and seek index still occupy memory proportional to the number
 of chunks. Individual chunk buffers remain bounded, including for seeks past
-4 GiB: a DataMap may declare chunks of up to 16 MiB, and decompression stops at
-the declared size, so a crafted record cannot expand inside WASM. Uploads
+4 GiB. In browsers a DataMap may declare chunks of up to 16 MiB and nested
+DataMap levels of up to 64 MiB, and every record, including nested DataMap
+records, is decompressed only up to its declared size, so a crafted record
+cannot expand inside WASM. Native range reads accept any chunk size. Uploads
 retain their existing size limits.
 
 `downloadPublicFile(file, { concurrency?, maxMemoryBytes?, onProgress?, signal? })`
@@ -79,11 +81,15 @@ awaited before the next. Fetching continues while a write is pending until
 at that bound. Each missing record is retried on its own schedule while the
 rest of the buffer keeps fetching, so retry waits overlap. It closes the
 destination on success, aborts it on any failure (including invalid options),
-and releases the writer lock. Its result contains the byte count and BLAKE3 of
-the written range. An `AbortSignal` cancels that one operation and leaves the
-reader open. `reader.close()` cancels the reader's operations at once, including
-fetches waiting to be retried, and evicts only that reader's records from the
-client's shared cache. `readRange(start, length)` remains available for media
+and releases the writer lock; a failure does not wait for a stalled destination
+to finish aborting. Its result contains the byte count and BLAKE3 of the written
+range. An `AbortSignal` cancels that one operation and leaves the reader open.
+`reader.close()` cancels the reader's operations at once, including fetches
+waiting to be retried, until every byte is written. After that only the signal
+can cancel, and a destination that has started closing may already be
+committed. Once no other reader of the same file is open, closing also evicts
+the file's records, including the DataMap records cached while resolving it,
+from the client's shared cache. `readRange(start, length)` remains available for media
 and custom streaming sinks, with a 4 MiB per-call limit. A sink must persist or
 consume the bytes instead of accumulating them to keep memory bounded. The
 application chooses a memory budget and supplies its disk destination; the core
