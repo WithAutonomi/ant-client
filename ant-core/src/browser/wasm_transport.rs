@@ -52,10 +52,13 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelState,
-    RtcDataChannelType, RtcPeerConnection, RtcSdpType, RtcSessionDescriptionInit,
+    RtcDataChannelType, RtcPeerConnection, RtcPeerConnectionState, RtcSdpType,
+    RtcSessionDescriptionInit,
 };
 
 const REQUEST_TIMEOUT_MS: u32 = 10_000;
+/// Lane failure reported when the browser declares the peer connection dead.
+const PEER_CONNECTION_FAILED: &str = "WebRTC peer connection failed";
 /// Advertised by a node whose `chunk_protocol` admits pointer reads and paid
 /// pointer writes (ADR-0016).
 const POINTER_PROTOCOL_CAPABILITY: &str = "pointer_protocol";
@@ -604,6 +607,7 @@ impl BrowserClientPool {
 struct PeerAssociation {
     connection: RtcPeerConnection,
     channels: RefCell<Vec<AssociationChannel>>,
+    _on_state_change: Closure<dyn FnMut(Event)>,
 }
 
 /// One lane's channel, with the inbox that records when this client stopped
@@ -634,20 +638,64 @@ impl Deref for PeerAssociation {
 }
 
 impl PeerAssociation {
+    /// Wrap a new peer connection. Its lanes fail as soon as the browser
+    /// reports the connection dead.
+    fn new(connection: RtcPeerConnection) -> Rc<Self> {
+        Rc::new_cyclic(|association: &Weak<Self>| {
+            let association = association.clone();
+            let on_state_change = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+                if let Some(association) = association.upgrade() {
+                    association.fail_lanes_if_dead();
+                }
+            });
+            connection.set_onconnectionstatechange(Some(on_state_change.as_ref().unchecked_ref()));
+            Self {
+                connection,
+                channels: RefCell::new(Vec::new()),
+                _on_state_change: on_state_change,
+            }
+        })
+    }
+
+    /// The browser reports that the association can carry nothing more.
+    /// WebKit keeps a failed association's channels reading "open" and opens
+    /// new channels on it at once, so channel state alone cannot tell. A
+    /// browser without `connectionState` never reports it dead here.
+    fn is_dead(&self) -> bool {
+        matches!(
+            self.connection.connection_state(),
+            RtcPeerConnectionState::Failed | RtcPeerConnectionState::Closed
+        )
+    }
+
+    /// Fail every lane of a dead association, as its channels' `close` events
+    /// would, so requests waiting on it fail now rather than at their deadlines.
+    fn fail_lanes_if_dead(&self) {
+        if !self.is_dead() {
+            return;
+        }
+        for lane in self.channels.borrow().iter() {
+            lane.inbox.fail(PEER_CONNECTION_FAILED.to_string());
+        }
+    }
+
     /// Reuse the association only while another lane still uses it. A
     /// channel this client has retired may still read "open", and reusing its
     /// association could put a new channel on a dead SCTP association without
     /// counting the failure as a dial.
     fn has_live_channel(&self) -> bool {
-        self.channels
-            .borrow()
-            .iter()
-            .any(AssociationChannel::is_live)
+        !self.is_dead()
+            && self
+                .channels
+                .borrow()
+                .iter()
+                .any(AssociationChannel::is_live)
     }
 }
 
 impl Drop for PeerAssociation {
     fn drop(&mut self) {
+        self.connection.set_onconnectionstatechange(None);
         self.connection.close();
     }
 }
@@ -706,11 +754,10 @@ impl Connection {
         } else {
             let configuration = RtcConfiguration::new();
             configuration.set_ice_servers(&Array::new());
-            Rc::new(PeerAssociation {
-                connection: RtcPeerConnection::new_with_configuration(&configuration)
+            PeerAssociation::new(
+                RtcPeerConnection::new_with_configuration(&configuration)
                     .map_err(js_error_message)?,
-                channels: RefCell::new(Vec::new()),
-            })
+            )
         };
         // Wait for a retired lane to finish closing before replacing it. The
         // server admits two channels, including channels still unwinding.
@@ -740,6 +787,9 @@ impl Connection {
                 inbox: Rc::clone(&inbox),
             });
         }
+        // The association may have died while this lane waited to replace a
+        // retired one; its state-change event will not fire again.
+        peer_connection.fail_lanes_if_dead();
 
         let (open_tx, open_rx) = oneshot::channel::<Result<(), String>>();
         let open_tx = Rc::new(RefCell::new(Some(open_tx)));
@@ -872,6 +922,7 @@ impl Connection {
     fn is_live(&self) -> bool {
         self.data_channel.ready_state() == RtcDataChannelState::Open
             && !self.inbox.is_failed()
+            && !self.peer_connection.is_dead()
             && self.rpc().is_some_and(|rpc| !rpc.is_closed())
     }
 

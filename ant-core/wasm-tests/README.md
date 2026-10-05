@@ -107,6 +107,12 @@ buffer drain with early responses, one HELLO for concurrent cold operations,
 reauthentication and capability checks after timeout, bounded admission without
 closing active work, pool closure during setup, and strict queued session handles.
 
+`failed-peer-connection.test.mjs` emulates WebKit, which reports a lost peer
+connection as `failed` but leaves its DataChannels "open" without a close event
+and opens channels created on it later. A request in flight must fail when the
+connection fails rather than at its response deadline, and the pool must redial
+rather than open a lane on the failed association.
+
 `lookup-reuse.test.mjs` covers draining admitted lookups after grace cancellation,
 retaining actual dial failures, cancelling queued work, closing background work,
 and bounded, deduplicated preconnections from verified owner-address hints. The
