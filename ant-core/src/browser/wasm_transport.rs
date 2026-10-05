@@ -2022,14 +2022,18 @@ fn parse_lookup_key(value: &str, label: &str) -> Result<LookupKey, String> {
     })
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BrowserDownloadResult {
     #[serde(with = "serde_wasm_bindgen::preserve")]
     content: Uint8Array,
     hash: String,
     file: PublicFileDescriptor,
     /// Node that served a public DataMap; absent for a caller-held private DataMap.
-    #[serde(rename = "dataMapNode", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "dataMapNode",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     data_map_node: Option<BrowserNode>,
 }
 
@@ -2124,8 +2128,6 @@ struct ResolvedBrowserFile {
     file: PublicFileDescriptor,
     data_map_node: Option<BrowserNode>,
     index: crate::client_engine::files::FileIndex,
-    /// DataMap records fetched, and so cached, while resolving.
-    map_records: Vec<[u8; 32]>,
 }
 
 struct UploadRecord {
@@ -2335,7 +2337,6 @@ pub struct BrowserNetworkClient {
     shared: Rc<crate::data::Client>,
     adapter: Rc<SharedNetworkAdapter>,
     read_ahead: Rc<read_ahead::ReadAheadPool>,
-    open_files: download::OpenFiles,
 }
 
 #[wasm_bindgen(js_class = BrowserNetworkClient)]
@@ -2369,7 +2370,6 @@ impl BrowserNetworkClient {
             shared,
             adapter,
             read_ahead,
-            open_files: download::OpenFiles::default(),
         })
     }
 
@@ -2677,11 +2677,7 @@ impl BrowserNetworkClient {
             resolved.file.size,
             resolved.index.chunk_count()
         ));
-        Ok(BrowserFileReader::new(
-            Rc::clone(&self.shared),
-            resolved,
-            &self.open_files,
-        ))
+        Ok(BrowserFileReader::new(Rc::clone(&self.shared), resolved))
     }
 
     /// Errors are JavaScript values so an AbortSignal's reason reaches the caller.
@@ -2700,7 +2696,7 @@ impl BrowserNetworkClient {
             })
             .await?;
         let data_map_node = resolved.data_map_node.clone();
-        let reader = BrowserFileReader::new(Rc::clone(&self.shared), resolved, &self.open_files);
+        let reader = BrowserFileReader::new(Rc::clone(&self.shared), resolved);
         let (content, hash) = reader.collect(&settings, &mut cancel).await?;
         let file = reader.into_descriptor(hash.clone());
         settings
@@ -2751,9 +2747,6 @@ impl BrowserNetworkClient {
         let mut resolved = self
             .resolve_data_map(&encoded_data_map, descriptor, progress)
             .await?;
-        resolved
-            .map_records
-            .push(parse_lookup_key(&address, "record address")?);
         resolved.file.address = address;
         resolved.data_map_node = Some(data_map_node);
         Ok(resolved)
@@ -2799,21 +2792,16 @@ impl BrowserNetworkClient {
         progress: &ProgressReporter,
     ) -> Result<ResolvedBrowserFile, String> {
         let published_data_map = crate::client_engine::files::decode_map(encoded_data_map)?;
-        let map_records = RefCell::new(Vec::new());
         let root_data_map = crate::client_engine::files::resolve(
             &published_data_map,
-            &|address| {
-                let map_records = &map_records;
-                async move {
-                    progress.report(&format!(
-                        "Resolving nested DataMap record {}",
-                        hex::encode(address)
-                    ));
-                    map_records.borrow_mut().push(address);
-                    self.get_shared_chunk(&hex::encode(address), progress)
-                        .await
-                        .map(|(content, _)| bytes::Bytes::from(content))
-                }
+            &|address| async move {
+                progress.report(&format!(
+                    "Resolving nested DataMap record {}",
+                    hex::encode(address)
+                ));
+                self.get_shared_chunk(&hex::encode(address), progress)
+                    .await
+                    .map(|(content, _)| bytes::Bytes::from(content))
             },
             &|| self.shared.controller().fetch.current(),
             super::MAX_BROWSER_NESTED_MAP_BYTES,
@@ -2841,7 +2829,6 @@ impl BrowserNetworkClient {
             file,
             data_map_node: None,
             index,
-            map_records: map_records.into_inner(),
         })
     }
 

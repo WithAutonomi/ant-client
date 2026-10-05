@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 /// Current browser testnet manifest version.
 pub const BROWSER_MANIFEST_VERSION: u16 = 6;
 const MAX_DATA_MAP_BYTES: usize = 4 * 1024 * 1024;
-/// Bounds the work an untrusted manifest entry can cause before its chunk
-/// list is checked. At the native chunk size this admits files of about 1 TiB.
+/// Bounds the sorting and hex normalisation of an untrusted entry's chunk list.
+/// The manifest is already parsed by then, so its size is the caller's bound.
+/// At the native chunk size this admits files of about 1 TiB.
 const MAX_FILE_CHUNKS: usize = 1 << 18;
 /// `Number.MAX_SAFE_INTEGER`: the largest integer JavaScript represents
 /// exactly, which bounds chain IDs, file sizes and byte positions.

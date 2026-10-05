@@ -34,8 +34,9 @@ struct ChunkSecrets {
 }
 
 /// Decrypt chunk `index` of a map with `src_hashes`, rejecting any record that
-/// decompresses to anything other than `expected_len` bytes. At most
-/// `expected_len + 1` bytes are ever produced.
+/// decompresses to anything other than `expected_len` bytes. Memory grows with
+/// the output actually produced, which stops at `expected_len + 1` bytes; a
+/// large declared size alone allocates nothing.
 pub(super) fn decrypt_chunk(
     index: usize,
     content: &[u8],
@@ -53,10 +54,7 @@ pub(super) fn decrypt_chunk(
     ChaCha20Poly1305::new(Key::from_slice(&secrets.key))
         .decrypt_in_place(Nonce::from_slice(&secrets.nonce), &[], &mut compressed)
         .map_err(|error| format!("chunk decryption failed: {error}"))?;
-    let mut plaintext = Vec::new();
-    plaintext
-        .try_reserve_exact(expected_len)
-        .map_err(|error| format!("cannot allocate chunk: {error}"))?;
+    let mut plaintext = Vec::with_capacity(expected_len.min(self_encryption::MAX_CHUNK_SIZE));
     brotli_decompressor::Decompressor::new(compressed.as_slice(), DECOMPRESS_BUFFER_BYTES)
         .take(expected_len as u64 + 1)
         .read_to_end(&mut plaintext)

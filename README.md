@@ -87,9 +87,8 @@ range. An `AbortSignal` cancels that one operation and leaves the reader open.
 `reader.close()` cancels the reader's operations at once, including fetches
 waiting to be retried, until every byte is written. After that only the signal
 can cancel, and a destination that has started closing may already be
-committed. Once no other reader of the same file is open, closing also evicts
-the file's records, including the DataMap records cached while resolving it,
-from the client's shared cache. `readRange(start, length)` remains available for media
+committed. Closing leaves records in the client's shared cache, which is
+bounded (32 MiB) and may serve other readers. `readRange(start, length)` remains available for media
 and custom streaming sinks, with a 4 MiB per-call limit. A sink must persist or
 consume the bytes instead of accumulating them to keep memory bounded. The
 application chooses a memory budget and supplies its disk destination; the core

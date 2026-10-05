@@ -682,6 +682,7 @@ gigabytes before its declared size is checked and abort the WASM instance.
 XOR pad, ChaCha20-Poly1305, Brotli) and stops decompressing one byte past the
 declared size. Nested DataMap levels are resolved through it too, instead of
 `get_root_data_map_parallel`, and browsers bound each decoded level at 64 MiB.
+Memory follows the data actually decrypted, never a size a map declares.
 It uses the dependency's own `chacha20poly1305` and `brotli-decompressor`
 versions, and tests pin its output to `decrypt_chunk` and to native nested-map
 resolution, so a change to the dependency's KDF fails them; a bounded primitive
@@ -732,10 +733,10 @@ one operation without closing the reader. Closing the reader cancels its
 operations at once, including fetches waiting to be retried, until every byte
 is written; it may then be closed from the final progress callback. After that
 only the signal can cancel, and a destination that has started closing may
-already be committed. Readers are counted per file, and the last reader of a
-file to close evicts that file's content and DataMap records from the client's
-shared cache, looked up by address in O(log chunks) per cached entry.
-Cancellation is checked before an operation is resumed, so a cancelled
+already be committed. Closing a reader no longer clears the client's shared
+cache: that cache is bounded (32 MiB) and may hold records other readers are
+using, including readers of the same content opened another way, so its LRU
+policy releases records instead. Cancellation is checked before an operation is resumed, so a cancelled
 operation never completes or refills the cache afterwards. The core
 does not open file pickers, own browser filesystem policy, or change the
 companion SDK.
@@ -762,8 +763,8 @@ Validation includes a complete 4,303,347,835-byte native-encrypted fixture strea
 through generated WASM with a matching BLAKE3; public/private seeks beyond 4 GiB;
 disk output; backpressure; cancellation by `AbortSignal`, by closing the reader,
 during retry waits, during a stalled write and while the destination closes;
-cache eviction with two readers of one file; writer errors; destinations
-aborted for invalid calls;
+a closed reader leaving another reader's cached records in place; writer and
+output errors; destinations aborted for invalid calls;
 allocation failures; invalid offsets and options; manifest validation; and
 shared native range, single-pass retry, ordered-pipeline, ordered-hash, bounded
 decryption, bounded nested-map and decompression-bomb tests. The generated

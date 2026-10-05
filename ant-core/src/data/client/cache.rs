@@ -81,21 +81,6 @@ impl ChunkCache {
         cache.pop(address);
     }
 
-    /// Remove every cached chunk whose address matches. Visits only the
-    /// cached entries, however many addresses `matches` recognises.
-    #[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
-    pub(crate) fn remove_matching(&self, mut matches: impl FnMut(&XorName) -> bool) {
-        let mut cache = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        let doomed: Vec<XorName> = cache
-            .iter()
-            .map(|(address, _)| *address)
-            .filter(|address| matches(address))
-            .collect();
-        for address in doomed {
-            cache.pop(&address);
-        }
-    }
-
     /// Clear all cached chunks.
     pub fn clear(&self) {
         let mut cache = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
@@ -226,17 +211,5 @@ mod tests {
 
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.get(&addr), Some(Bytes::from_static(b"second")));
-    }
-
-    #[test]
-    fn remove_matching_keeps_other_entries() {
-        let cache = ChunkCache::new(4);
-        for byte in 0..3u8 {
-            cache.put([byte; 32], Bytes::from(vec![byte]));
-        }
-        cache.remove_matching(|address| address[0] != 1);
-        assert!(cache.get(&[0; 32]).is_none());
-        assert!(cache.get(&[1; 32]).is_some());
-        assert!(cache.get(&[2; 32]).is_none());
     }
 }

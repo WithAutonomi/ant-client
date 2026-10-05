@@ -83,9 +83,11 @@ where
 /// Resolve a published, possibly nested DataMap to its root. Each level's
 /// records are fetched together and decrypted with self_encryption's KDF at
 /// that level, with decompression bounded by each chunk's declared size, so a
-/// crafted record cannot expand. `max_map_bytes` bounds each decoded level.
-/// Records are placed by position, not by the externally supplied chunk index,
-/// so malformed duplicate indices cannot misassociate bytes.
+/// crafted record cannot expand. `max_map_bytes` bounds each decoded level's
+/// declared size. Memory follows the data actually decrypted, never the sizes
+/// a map declares. Records are placed by position, not by the externally
+/// supplied chunk index, so malformed duplicate indices cannot misassociate
+/// bytes.
 pub(crate) async fn resolve<E, F, Fut, C>(
     map: &DataMap,
     fetch: &F,
@@ -103,22 +105,14 @@ where
             return Ok(current);
         };
         let infos = current.infos();
-        let mut offsets = Vec::with_capacity(infos.len() + 1);
-        offsets.push(0usize);
-        for info in infos {
-            let end = offsets[offsets.len() - 1]
-                .checked_add(info.src_size)
-                .filter(|end| *end <= max_map_bytes)
-                .ok_or_else(|| {
-                    ReadError::Invalid(format!("nested DataMap exceeds {max_map_bytes} bytes"))
-                })?;
-            offsets.push(end);
-        }
-        let mut encoded = Vec::new();
-        encoded
-            .try_reserve_exact(offsets[infos.len()])
-            .map_err(|e| ReadError::Invalid(format!("cannot allocate nested DataMap: {e}")))?;
-        encoded.resize(offsets[infos.len()], 0);
+        let declared = infos
+            .iter()
+            .try_fold(0usize, |total, info| total.checked_add(info.src_size))
+            .filter(|total| *total <= max_map_bytes)
+            .ok_or_else(|| {
+                ReadError::Invalid(format!("nested DataMap exceeds {max_map_bytes} bytes"))
+            })?;
+        let mut chunks: Vec<Option<Bytes>> = vec![None; infos.len()];
         let src_hashes: Vec<XorName> = infos.iter().map(|info| info.src_hash).collect();
         let requests = infos
             .iter()
@@ -136,10 +130,16 @@ where
             .map_err(ReadError::Invalid)?;
             crate::record::verify(&src_hashes[position].0, &plaintext)
                 .map_err(ReadError::Invalid)?;
-            encoded[offsets[position]..offsets[position + 1]].copy_from_slice(&plaintext);
+            chunks[position] = Some(plaintext);
             Ok(())
         })
         .await?;
+        // Every chunk decrypted to exactly its declared size, so `declared`
+        // is now the size of data actually received.
+        let mut encoded = Vec::with_capacity(declared);
+        for chunk in chunks.into_iter().flatten() {
+            encoded.extend_from_slice(&chunk);
+        }
         current = DataMap::from_bytes(&encoded)
             .map_err(|e| ReadError::Invalid(format!("Failed to deserialize DataMap: {e}")))?;
     }
@@ -251,9 +251,6 @@ pub(crate) struct FileIndex {
     dst_hashes: Vec<XorName>,
     /// Plaintext start of each chunk, followed by the file size.
     offsets: Vec<u64>,
-    /// Chunk positions ordered by record address, for address lookups.
-    #[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
-    records_by_address: Vec<usize>,
 }
 
 impl FileIndex {
@@ -284,19 +281,10 @@ impl FileIndex {
                 .ok_or("DataMap plaintext size overflow")?;
             offsets.push(end);
         }
-        let dst_hashes: Vec<XorName> = infos.iter().map(|info| info.dst_hash).collect();
-        #[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
-        let records_by_address = {
-            let mut order: Vec<usize> = (0..dst_hashes.len()).collect();
-            order.sort_unstable_by_key(|position| dst_hashes[*position].0);
-            order
-        };
         Ok(Self {
             src_hashes: infos.iter().map(|info| info.src_hash).collect(),
-            dst_hashes,
+            dst_hashes: infos.iter().map(|info| info.dst_hash).collect(),
             offsets,
-            #[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
-            records_by_address,
         })
     }
 
@@ -350,13 +338,6 @@ impl FileIndex {
 impl FileIndex {
     pub(crate) fn chunk_count(&self) -> usize {
         self.dst_hashes.len()
-    }
-
-    /// Whether one of this file's chunks is stored under `address`.
-    pub(crate) fn contains_record(&self, address: &[u8; 32]) -> bool {
-        self.records_by_address
-            .binary_search_by(|position| self.dst_hashes[*position].0.cmp(address))
-            .is_ok()
     }
 
     /// The size of the largest chunk.
@@ -1117,10 +1098,6 @@ mod tests {
             infos.iter().map(|info| info.dst_hash).collect::<Vec<_>>()
         );
         assert_eq!(index.largest_chunk(), size as u64);
-        for info in &infos {
-            assert!(index.contains_record(&info.dst_hash.0));
-        }
-        assert!(!index.contains_record(&[0x55; 32]));
         // Chunk sizes are not capped natively; browsers apply their own limit.
         let mut infos = infos;
         infos[1].src_size = 64 * size;
@@ -1158,6 +1135,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ReadError::Invalid(message) if message.contains("differs")));
+    }
+
+    #[tokio::test]
+    async fn declared_nested_sizes_allocate_nothing_before_data_arrives() {
+        const DECLARED_CHUNK: usize = 1 << 40;
+        let infos = (0..MIN_FILE_CHUNKS)
+            .map(|index| self_encryption::ChunkInfo {
+                index,
+                src_size: DECLARED_CHUNK,
+                src_hash: XorName([index as u8; 32]),
+                dst_hash: XorName([0xee - index as u8; 32]),
+            })
+            .collect();
+        let map = DataMap::with_child(infos, 1);
+        // Terabytes are declared, but the fetch fails before any data exists.
+        let error = resolve(&map, &|_| async { Err::<Bytes, _>(7u8) }, &|| 3, usize::MAX)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ReadError::Fetch(7)));
     }
 
     #[tokio::test]

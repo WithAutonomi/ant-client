@@ -67,13 +67,15 @@ checks media ranges across chunk boundaries and EOF.
 through the real WASM decryptor and checks its complete BLAKE3 without retaining
 the plaintext. It also covers public/private seeks across 4 GiB, actual disk
 writes, fetching bounded by the `pipeTo` buffer behind a blocked write,
-cancellation of `pipeTo`, range reads and complete downloads by `AbortSignal`
-and by closing the reader (including during retry waits, a stalled destination
-write and the destination's close), cache eviction with two readers of one
-file, destinations aborted
-for invalid calls, a reader closed from the final progress callback, writer
-errors, JS allocation failures, memory budgets, download options (including the
-legacy numeric form and optional typings) and progress, and invalid offsets. The compressed fixture is about 250 KiB;
+cancellation of `pipeTo` and complete downloads by `AbortSignal`, cancellation
+of `pipeTo` and range reads by closing the reader (including during retry
+waits), an abort during a stalled destination write and during the
+destination's close, a closed reader leaving another reader's cached records
+in place, destinations aborted for invalid calls, a reader closed from the
+final progress callback, writer errors, JS allocation and output failures,
+memory budgets, download options (including the legacy numeric and `null`
+forms and optional typings) and progress, and invalid offsets. The compressed
+fixture is about 250 KiB;
 regenerate it from the repository root with
 `cargo run -p ant-core --release --example generate-browser-large-file`.
 Generation processes the entire plaintext using bounded buffers. The full-stream

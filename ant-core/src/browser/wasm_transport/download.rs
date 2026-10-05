@@ -99,51 +99,6 @@ async fn yield_to_event_loop() {
     TimeoutFuture::new(0).await;
 }
 
-/// Open readers per file key, so closing one reader keeps the cached records
-/// another reader of the same file is still using.
-pub(super) type OpenFiles = Rc<RefCell<HashMap<String, usize>>>;
-
-/// One reader's place in [`OpenFiles`], released on close or drop.
-struct OpenFile {
-    files: OpenFiles,
-    key: String,
-    open: Cell<bool>,
-}
-
-impl OpenFile {
-    fn register(files: &OpenFiles, key: String) -> Self {
-        *files.borrow_mut().entry(key.clone()).or_default() += 1;
-        Self {
-            files: Rc::clone(files),
-            key,
-            open: Cell::new(true),
-        }
-    }
-
-    /// Release this reader's place. True when it was the file's last open reader.
-    fn release(&self) -> bool {
-        if !self.open.replace(false) {
-            return false;
-        }
-        let mut files = self.files.borrow_mut();
-        let Some(count) = files.get_mut(&self.key) else {
-            return true;
-        };
-        *count -= 1;
-        if *count > 0 {
-            return false;
-        }
-        files.remove(&self.key);
-        true
-    }
-}
-
-impl Drop for OpenFile {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
 /// Release the writer even if the Rust future is dropped before it completes.
 struct Writer(JsValue);
 impl Drop for Writer {
@@ -390,9 +345,6 @@ pub struct BrowserFileReader {
     /// Descriptor without its chunk list; the index holds the chunk metadata.
     file: PublicFileDescriptor,
     index: FileIndex,
-    /// DataMap records cached while the file was resolved.
-    map_records: Vec<[u8; 32]>,
-    open_file: OpenFile,
     closed: watch::Sender<bool>,
 }
 
@@ -477,31 +429,20 @@ impl BrowserFileReader {
         result
     }
 
-    /// Close the reader: cancel its operations and, once no other reader of
-    /// the same file is open, drop the file's records from the client's shared
-    /// cache. Use an AbortSignal to cancel a single pipeTo without closing.
+    /// Close the reader and cancel its operations. Cached records stay in the
+    /// client's shared cache, which is bounded and may serve other readers.
+    /// Use an AbortSignal to cancel a single pipeTo without closing.
     pub fn close(&self) {
         self.closed.send_replace(true);
-        if self.open_file.release() {
-            self.shared.chunk_cache().remove_matching(|address| {
-                self.map_records.contains(address) || self.index.contains_record(address)
-            });
-        }
     }
 }
 
 impl BrowserFileReader {
-    pub(super) fn new(
-        shared: Rc<crate::data::Client>,
-        resolved: ResolvedBrowserFile,
-        open_files: &OpenFiles,
-    ) -> Self {
+    pub(super) fn new(shared: Rc<crate::data::Client>, resolved: ResolvedBrowserFile) -> Self {
         Self {
             shared,
-            open_file: OpenFile::register(open_files, resolved.file.address.clone()),
             file: resolved.file,
             index: resolved.index,
-            map_records: resolved.map_records,
             closed: watch::Sender::new(false),
         }
     }
@@ -653,7 +594,10 @@ impl BrowserFileReader {
         let mut hasher = OrderedHasher::new(total);
         let mut completed = 0usize;
         progress.report(&format!("Downloaded chunk {completed}/{total}"));
-        cancel
+        // The engine reports a sink failure as invalid data, so the output's
+        // own error is kept here and returned instead.
+        let mut output_error = None;
+        let pass = cancel
             .run(async {
                 self.shared
                     .data_download_indexed_chunks(
@@ -661,17 +605,25 @@ impl BrowserFileReader {
                         0..total,
                         settings.concurrency,
                         |chunk, plaintext| {
-                            // Copies straight from WASM memory into the output.
-                            chunk_view(chunk)
-                                .map_err(js_error_message)?
-                                .copy_from(&plaintext);
-                            hasher.complete(chunk, &plaintext);
-                            // At most one earlier chunk per arrival keeps each
-                            // callback short.
-                            if let Some(earlier) = hasher.pending_read_back() {
-                                let view = chunk_view(earlier).map_err(js_error_message)?;
-                                hasher.read_back(earlier, &view.to_vec())?;
-                            }
+                            let mut place = || -> Result<(), JsValue> {
+                                // Copies straight from WASM memory into the output.
+                                chunk_view(chunk)?.copy_from(&plaintext);
+                                hasher.complete(chunk, &plaintext);
+                                // At most one earlier chunk per arrival keeps
+                                // each callback short.
+                                if let Some(earlier) = hasher.pending_read_back() {
+                                    let view = chunk_view(earlier)?;
+                                    hasher
+                                        .read_back(earlier, &view.to_vec())
+                                        .map_err(js_string)?;
+                                }
+                                Ok(())
+                            };
+                            place().map_err(|error| {
+                                let message = js_error_message(error.clone());
+                                output_error = Some(error);
+                                message
+                            })?;
                             completed += 1;
                             progress.report(&format!("Downloaded chunk {completed}/{total}"));
                             Ok(())
@@ -680,7 +632,11 @@ impl BrowserFileReader {
                     .await
                     .map_err(js_string)
             })
-            .await?;
+            .await;
+        if let Some(error) = output_error {
+            return Err(error);
+        }
+        pass?;
         // Hash the chunks that arrived ahead of file order, yielding to the
         // page between short slices so a large backlog cannot freeze it.
         let mut slice_start = Instant::now();

@@ -336,7 +336,7 @@ test("an AbortSignal during the destination's close rejects pipeTo", async () =>
   } finally { reader?.close(); client.close(); }
 });
 
-test("closing one reader keeps the records another reader of the file uses", async () => {
+test("closing a reader leaves records another reader of the file uses cached", async () => {
   const original = new TextEncoder().encode("Two readers, one file.".repeat(300));
   const encrypted = encryptPublicFile(original);
   const { rtc, client } = fixture(encrypted.records);
@@ -349,11 +349,6 @@ test("closing one reader keeps the records another reader of the file uses", asy
     assert.deepEqual(await second.readRange(0, original.length), original);
     assert.equal(gets(rtc), cached, "the open reader's records stay cached");
     second.close();
-    const third = await client.openPublicFile(encrypted.address);
-    const reopened = gets(rtc);
-    assert.deepEqual(await third.readRange(0, original.length), original);
-    assert(gets(rtc) > reopened, "the last reader's close released the file's records");
-    third.close();
   } finally { client.close(); }
 });
 
@@ -397,6 +392,9 @@ test("in-memory downloads use one JS output buffer and return recoverable alloca
     assert.deepEqual(chunkProgress, ["Downloaded chunk 0/3", "Downloaded chunk 1/3", "Downloaded chunk 2/3", "Downloaded chunk 3/3"]);
     const legacy = await client.downloadPublicFile(encrypted.address, 2, message => messages.push(message));
     assert.equal(legacy.hash, result.hash);
+    // `null` in the legacy concurrency position selects the default, as before.
+    const unset = await client.downloadPublicFile(encrypted.address, null, () => {});
+    assert.equal(unset.hash, result.hash);
     globalThis.Uint8Array = class extends NativeUint8Array {
       constructor(...args) {
         if (args.length === 1 && args[0] === original.length) throw new RangeError("allocation refused");
@@ -404,6 +402,15 @@ test("in-memory downloads use one JS output buffer and return recoverable alloca
       }
     };
     await assert.rejects(client.downloadPublicFile(encrypted.address), /cannot allocate download buffer.*pipeTo/);
+    // An output failure is returned as the output's own error, not as bad data.
+    const refused = new RangeError("output refused");
+    globalThis.Uint8Array = class extends NativeUint8Array {
+      subarray(...args) {
+        if (this.length === original.length) throw refused;
+        return super.subarray(...args);
+      }
+    };
+    await assert.rejects(client.downloadPublicFile(encrypted.address), error => error === refused);
     globalThis.Uint8Array = NativeUint8Array;
     reader = await client.openPublicFile(encrypted.address);
     const chunks = [];
