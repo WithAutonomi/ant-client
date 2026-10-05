@@ -113,6 +113,12 @@ and opens channels created on it later. A request in flight must fail when the
 connection fails rather than at its response deadline, and the pool must redial
 rather than open a lane on the failed association.
 
+`ice-gathering.test.mjs` checks that concurrent dials gather ICE candidates one
+connection at a time, and that a gathering which never completes hands the turn
+on after its timeout. WebKit opens many more UDP sockets for connections whose
+gathering overlaps and closes the oldest past its per-page cap, cutting
+established connections. The mock completes gathering after `gatheringMs`.
+
 `lookup-reuse.test.mjs` covers draining admitted lookups after grace cancellation,
 retaining actual dial failures, cancelling queued work, closing background work,
 and bounded, deduplicated preconnections from verified owner-address hints. The

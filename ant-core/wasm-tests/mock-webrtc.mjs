@@ -21,9 +21,13 @@ export async function closesSettled() {
 
 // Reset for each test. Only browser-owned RTC objects are mocked; all node
 // responses use the shared Rust wire contract and real session encryption.
-export function mockWebRtc(nodes = [{}]) {
+// ICE gathering completes `gatheringMs` after setLocalDescription; Infinity
+// never completes.
+export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
   const connections = [];
   const requests = [];
+  // When each connection started and completed ICE gathering.
+  const gathering = [];
   const stores = nodes.map(() => new Map());
   const endpoints = nodes.map((options, index) => {
     const node = new BrowserTestNode(index + 1, options.alreadyStored ?? false);
@@ -103,6 +107,7 @@ export function mockWebRtc(nodes = [{}]) {
 
   globalThis.RTCPeerConnection = class {
     connectionState = "new";
+    iceGatheringState = "new";
     constructor() {
       connections.push(this);
       this.channels = [];
@@ -130,6 +135,15 @@ export function mockWebRtc(nodes = [{}]) {
       };
     }
     async setLocalDescription(local) {
+      const span = { start: performance.now() };
+      gathering.push(span);
+      this.iceGatheringState = "gathering";
+      if (Number.isFinite(gatheringMs)) {
+        setTimeout(() => {
+          this.iceGatheringState = "complete";
+          span.complete = performance.now();
+        }, gatheringMs);
+      }
       this.localDescription = local;
     }
     async setRemoteDescription(remote) {
@@ -176,5 +190,5 @@ export function mockWebRtc(nodes = [{}]) {
       for (const channel of this.channels) channel.close();
     }
   };
-  return { endpoints, connections, requests, stores };
+  return { endpoints, connections, requests, stores, gathering };
 }
