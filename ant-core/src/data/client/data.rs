@@ -344,7 +344,7 @@ impl Client {
     /// primitive symmetric with `data_upload`.
     ///
     /// Map resolution and network fetching are fully async and also work on a
-    /// current-thread runtime. The same workflow drives browser downloads.
+    /// current-thread runtime.
     ///
     /// # Errors
     /// Returns the underlying fetch error, or an encryption error for invalid
@@ -360,44 +360,14 @@ impl Client {
         data_map: &DataMap,
         concurrency: usize,
     ) -> Result<Bytes> {
-        self.data_download_with_progress(data_map, concurrency, &|_, _| {})
-            .await
-    }
-
-    /// Internal observer for verified records; reconstruction still uses the shared engine.
-    pub(crate) async fn data_download_with_progress(
-        &self,
-        data_map: &DataMap,
-        concurrency: usize,
-        progress: &impl Fn(usize, usize),
-    ) -> Result<Bytes> {
         if concurrency == 0 {
             return Err(Error::Config(
                 "download concurrency must be positive".into(),
             ));
         }
-        let received = std::sync::Mutex::new(std::collections::HashSet::new());
-        let total = data_map.infos().len();
-        progress(0, total);
         crate::client_engine::files::download(
             data_map,
-            &|address| {
-                let received = &received;
-                async move {
-                    let bytes = self.fetch_data_record(address).await?;
-                    let mut received = received.lock().unwrap_or_else(|error| error.into_inner());
-                    if received.insert(address) {
-                        let completed = data_map
-                            .infos()
-                            .iter()
-                            .filter(|info| received.contains(&info.dst_hash.0))
-                            .count();
-                        drop(received);
-                        progress(completed, total);
-                    }
-                    Ok(bytes)
-                }
-            },
+            &|address| self.fetch_data_record(address),
             &|| self.controller().fetch.current().min(concurrency),
             &crate::runtime::sleep,
             retry_data_fetch,
@@ -406,8 +376,8 @@ impl Client {
         .map_err(map_read_error)
     }
 
-    /// Download a plaintext byte range using the shared streaming reader.
-    /// Resolves child maps first and fetches only records overlapping the range.
+    /// Download a plaintext byte range. Resolves child maps first, then fetches
+    /// and decrypts only the records overlapping the range, one chunk at a time.
     /// Length is clamped at EOF; a start at or beyond EOF returns empty bytes.
     ///
     /// # Errors
@@ -447,23 +417,45 @@ impl Client {
         .map_err(map_read_error)
     }
 
-    /// Reuse a validated index across browser seeks and sequential downloads.
+    /// Read a range through a validated index reused across browser seeks.
     #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
     pub(crate) async fn data_download_indexed_range(
         &self,
         index: &crate::client_engine::files::FileIndex,
         start: u64,
         length: usize,
-        concurrency: usize,
     ) -> Result<Bytes> {
         crate::client_engine::files::read_indexed_range(
             index,
             start,
             length,
             &|address| self.fetch_data_record(address),
+            &|| self.controller().fetch.current(),
+            &crate::runtime::sleep,
+            retry_data_fetch,
+        )
+        .await
+        .map_err(map_read_error)
+    }
+
+    /// Fetch and decrypt whole chunks in one deferred retry pass, handing each
+    /// plaintext chunk to `sink` in completion order.
+    #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
+    pub(crate) async fn data_download_indexed_chunks(
+        &self,
+        index: &crate::client_engine::files::FileIndex,
+        chunks: std::ops::Range<usize>,
+        concurrency: usize,
+        sink: impl FnMut(usize, Bytes) -> std::result::Result<(), String>,
+    ) -> Result<()> {
+        crate::client_engine::files::for_each_chunk(
+            index,
+            chunks,
+            &|address| self.fetch_data_record(address),
             &|| self.controller().fetch.current().min(concurrency),
             &crate::runtime::sleep,
             retry_data_fetch,
+            sink,
         )
         .await
         .map_err(map_read_error)

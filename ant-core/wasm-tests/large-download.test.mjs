@@ -75,13 +75,23 @@ test("a complete native >4 GiB file streams with bounded writes and matching BLA
 });
 
 test("large-file memory budgets fail before content fetch, and allocation errors permit streaming", async () => {
-  const { client } = fixture();
+  const { rtc, client } = fixture();
   try {
-    await assert.rejects(client.downloadPublicFile(large.address, undefined, undefined, 64 * 1024 * 1024), /memory budget.*pipeTo/);
-    await assert.rejects(client.downloadPrivateFile({ data_map: map.content }, undefined, undefined, 64 * 1024 * 1024), /memory budget.*pipeTo/);
+    const maxMemoryBytes = 64 * 1024 * 1024;
+    await assert.rejects(client.downloadPublicFile(large.address, { maxMemoryBytes }), /memory budget.*pipeTo/);
+    await assert.rejects(client.downloadPrivateFile({ data_map: map.content }, { maxMemoryBytes }), /memory budget.*pipeTo/);
+    const gets = rtc.requests.filter(r => r.method === "get_chunk").length;
     for (const value of [-1, 1.5, Infinity, NaN, 2 ** 53]) {
-      await assert.rejects(client.downloadPublicFile(large.address, undefined, undefined, value), /safe integer/);
+      await assert.rejects(client.downloadPublicFile(large.address, { maxMemoryBytes: value }), /safe integer/);
     }
+    for (const concurrency of [0, -1, 1.5, NaN]) {
+      await assert.rejects(client.downloadPublicFile(large.address, { concurrency }), /positive integer/);
+      await assert.rejects(client.downloadPublicFile(large.address, concurrency), /positive integer/);
+    }
+    await assert.rejects(client.downloadPublicFile(large.address, { maxMemory: 1 }), /unknown option `maxMemory`/);
+    await assert.rejects(client.downloadPublicFile(large.address, { onProgress: 1 }), /onProgress must be a function/);
+    await assert.rejects(client.downloadPublicFile(large.address, { onProgress() {} }, () => {}), /not both/);
+    assert.equal(rtc.requests.filter(r => r.method === "get_chunk").length, gets, "invalid options fail before any fetch");
   } finally { client.close(); }
 });
 
@@ -120,6 +130,97 @@ test("pipeTo writes ranges beyond 4 GiB to disk and honors write backpressure", 
   } finally { reader?.close(); client.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
+test("invalid pipeTo calls abort the destination they were given", async () => {
+  const { client } = fixture();
+  try {
+    const reader = await client.openPublicFile(large.address);
+    for (const [options, expected, close] of [
+      [{ end: large.size + 1 }, /outside the file/],
+      [{ start: 10, end: 5 }, /outside the file/],
+      [{ start: -1 }, /safe integer/],
+      [{ size: 1 }, /unknown option `size`/],
+      [{ onProgress: "no" }, /onProgress must be a function/],
+      [{ signal: {} }, /AbortSignal/],
+      [{}, /closed/, true],
+    ]) {
+      if (close) reader.close();
+      let aborted, closed = false;
+      const sink = new WritableStream({ write() { assert.fail("nothing is written"); }, close() { closed = true; }, abort(reason) { aborted = reason; } });
+      await assert.rejects(reader.pipeTo(sink, options), expected);
+      assert.match(String(aborted), expected);
+      assert.equal(closed, false);
+      assert.equal(sink.locked, false);
+    }
+  } finally { client.close(); }
+});
+
+test("an AbortSignal cancels one pipeTo and leaves its reader open", async () => {
+  const { client } = fixture();
+  let reader;
+  try {
+    reader = await client.openPublicFile(large.address);
+    const controller = new AbortController();
+    const reason = new Error("user cancelled");
+    let writes = 0, aborted;
+    const sink = new WritableStream({
+      write() { writes++; controller.abort(reason); },
+      abort(error) { aborted = error; },
+    });
+    await assert.rejects(reader.pipeTo(sink, { start: 2 ** 32, signal: controller.signal }), error => error === reason);
+    assert.equal(writes, 1);
+    assert.equal(aborted, reason);
+    assert.equal(sink.locked, false);
+
+    const early = new WritableStream({ write() { assert.fail("an aborted signal writes nothing"); } });
+    await assert.rejects(reader.pipeTo(early, { signal: AbortSignal.abort(reason) }), error => error === reason);
+    assert.equal(early.locked, false);
+    assert.deepEqual(await reader.readRange(2 ** 32, 4), new Uint8Array(4).fill(large.byte));
+  } finally { reader?.close(); client.close(); }
+});
+
+test("closing a reader from the final progress callback keeps the completed file", async () => {
+  const original = new TextEncoder().encode("Final progress callback.".repeat(200));
+  const encrypted = encryptPublicFile(original);
+  const { client } = fixture(encrypted.records);
+  try {
+    const reader = await client.openPublicFile(encrypted.address);
+    const chunks = [];
+    let closed = false, aborted = false;
+    const sink = new WritableStream({ write(bytes) { chunks.push(bytes); }, close() { closed = true; }, abort() { aborted = true; } });
+    const progress = [];
+    const result = await reader.pipeTo(sink, { onProgress(written, total) {
+      progress.push([written, total]);
+      if (written === total) reader.close();
+    } });
+    assert.equal(result.bytesWritten, original.length);
+    assert.deepEqual(progress.at(-1), [original.length, original.length]);
+    assert(closed);
+    assert(!aborted);
+    assert.deepEqual(Buffer.concat(chunks), Buffer.from(original));
+  } finally { client.close(); }
+});
+
+test("cancelling during a missing-record retry does not wait out the retry rounds", async () => {
+  const original = new TextEncoder().encode("Retry cancellation.".repeat(300));
+  const encrypted = encryptPublicFile(original);
+  const missing = encrypted.records.find(record => record.address !== encrypted.address);
+  const { client } = fixture(encrypted.records.filter(record => record !== missing));
+  try {
+    for (const cancel of ["close", "signal"]) {
+      const reader = await client.openPublicFile(encrypted.address);
+      const controller = new AbortController();
+      const started = Date.now();
+      const pending = cancel === "close"
+        ? reader.readRange(0, original.length)
+        : reader.pipeTo(new WritableStream(), { signal: controller.signal });
+      setTimeout(() => cancel === "close" ? reader.close() : controller.abort(new Error("stop")), 100);
+      await assert.rejects(pending, cancel === "close" ? /closed/ : /stop/);
+      assert(Date.now() - started < 5_000, `${cancel} took ${Date.now() - started} ms`);
+      reader.close();
+    }
+  } finally { client.close(); }
+});
+
 test("writer rejection and reader cancellation stop a stream and release its lock", async () => {
   const { client } = fixture();
   try {
@@ -150,8 +251,16 @@ test("in-memory downloads use one JS output buffer and return recoverable alloca
   const NativeUint8Array = globalThis.Uint8Array;
   let reader;
   try {
-    const result = await client.downloadPublicFile(encrypted.address, 2, undefined, original.length);
+    const messages = [];
+    const result = await client.downloadPublicFile(encrypted.address,
+      { concurrency: 2, maxMemoryBytes: original.length, onProgress: message => messages.push(message) });
     assert.deepEqual(result.content, original);
+    assert.equal(result.file.chunks.length, 3);
+    // Probes time the first chunks by these messages.
+    const chunkProgress = messages.filter(message => message.startsWith("Downloaded chunk "));
+    assert.deepEqual(chunkProgress, ["Downloaded chunk 0/3", "Downloaded chunk 1/3", "Downloaded chunk 2/3", "Downloaded chunk 3/3"]);
+    const legacy = await client.downloadPublicFile(encrypted.address, 2, message => messages.push(message));
+    assert.equal(legacy.hash, result.hash);
     globalThis.Uint8Array = class extends NativeUint8Array {
       constructor(...args) {
         if (args.length === 1 && args[0] === original.length) throw new RangeError("allocation refused");

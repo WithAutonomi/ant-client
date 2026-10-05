@@ -66,8 +66,10 @@ checks media ranges across chunk boundaries and EOF.
 `large-download.test.mjs` streams a native-encrypted 4,303,347,835-byte file
 through the real WASM decryptor and checks its complete BLAKE3 without retaining
 the plaintext. It also covers public/private seeks across 4 GiB, actual disk
-writes, write backpressure, cancellation, writer errors, JS allocation failures,
-memory budgets and invalid offsets. The compressed fixture is about 250 KiB;
+writes, write backpressure, cancellation by `AbortSignal` and by closing the
+reader (including during retry waits), destinations aborted for invalid calls,
+a reader closed from the final progress callback, writer errors, JS allocation
+failures, memory budgets, download options and progress, and invalid offsets. The compressed fixture is about 250 KiB;
 regenerate it from the repository root with
 `cargo run -p ant-core --release --example generate-browser-large-file`.
 Generation processes the entire plaintext using bounded buffers. The full-stream

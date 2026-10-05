@@ -3,11 +3,15 @@
 pub use super::protocol::BrowserPaymentNetwork;
 use super::protocol::{normalize_hex, parse_webrtc_direct_multiaddr, BrowserEndpoint};
 use super::BrowserChunkInfo;
+use crate::client_engine::files::MIN_FILE_CHUNKS;
 use serde::{Deserialize, Serialize};
 
 /// Current browser testnet manifest version.
 pub const BROWSER_MANIFEST_VERSION: u16 = 6;
 const MAX_DATA_MAP_BYTES: usize = 4 * 1024 * 1024;
+/// Bounds the work an untrusted manifest entry can cause before its chunk
+/// list is checked. At the native chunk size this admits files of about 1 TiB.
+const MAX_FILE_CHUNKS: usize = 1 << 18;
 /// Largest exact byte position exposed through the JavaScript number API.
 pub const MAX_BROWSER_FILE_POSITION: u64 = 9_007_199_254_740_991;
 
@@ -166,7 +170,7 @@ fn normalize_file(file: &mut PublicFileDescriptor) -> Result<(), BrowserManifest
             file.data_map_size
         )));
     }
-    if file.chunks.len() < 3 {
+    if !(MIN_FILE_CHUNKS..=MAX_FILE_CHUNKS).contains(&file.chunks.len()) {
         return Err(BrowserManifestError(
             "public file has an invalid self-encryption chunk list".to_string(),
         ));
@@ -181,7 +185,8 @@ fn normalize_file(file: &mut PublicFileDescriptor) -> Result<(), BrowserManifest
         }
         chunk.dst_hash = normalize_hex(&chunk.dst_hash, 32).map_err(BrowserManifestError)?;
         chunk.src_hash = normalize_hex(&chunk.src_hash, 32).map_err(BrowserManifestError)?;
-        if chunk.src_size == 0 || chunk.src_size > self_encryption::MAX_CHUNK_SIZE {
+        // Sizes come from the DataMap, which may use another chunk size.
+        if chunk.src_size == 0 {
             return Err(BrowserManifestError(format!(
                 "invalid plaintext chunk size {}",
                 chunk.src_size
@@ -313,5 +318,42 @@ mod tests {
         assert!(normalize_file(&mut file).is_err());
         file.size = MAX_BROWSER_FILE_POSITION + 1;
         assert!(normalize_file(&mut file).is_err());
+    }
+
+    #[test]
+    fn file_descriptors_accept_other_chunk_sizes_and_bound_chunk_lists() {
+        let chunk = |index, src_size| BrowserChunkInfo {
+            index,
+            src_size,
+            src_hash: "33".repeat(32),
+            dst_hash: "44".repeat(32),
+        };
+        let large_chunk = 2 * self_encryption::MAX_CHUNK_SIZE;
+        let mut file = PublicFileDescriptor {
+            name: "large-chunks.bin".into(),
+            address: "11".repeat(32),
+            size: (MIN_FILE_CHUNKS * large_chunk) as u64,
+            content_type: "application/octet-stream".into(),
+            blake3: "22".repeat(32),
+            data_map_size: 256,
+            replicas: 4,
+            chunks: (0..MIN_FILE_CHUNKS)
+                .map(|index| chunk(index, large_chunk))
+                .collect(),
+        };
+        normalize_file(&mut file).unwrap();
+
+        // Rejected on length alone, before the list is sorted or decoded.
+        file.chunks = (0..=MAX_FILE_CHUNKS)
+            .map(|index| BrowserChunkInfo {
+                index,
+                src_size: 1,
+                src_hash: String::new(),
+                dst_hash: String::new(),
+            })
+            .collect();
+        file.size = file.chunks.len() as u64;
+        let error = normalize_file(&mut file).unwrap_err();
+        assert!(error.to_string().contains("chunk list"));
     }
 }

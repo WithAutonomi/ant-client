@@ -42,13 +42,17 @@ resolved DataMap and seek index still occupy memory proportional to the number
 of chunks. Individual chunk buffers remain bounded, including for seeks past
 4 GiB. Uploads retain their existing size limits.
 
-`downloadPublicFile(file, concurrency?, onProgress?, maxMemoryBytes?)` and its
-private-file counterpart allocate the output as a JavaScript `Uint8Array`, then
-fill it using bounded WASM reads. They no longer retain a complete plaintext
-or ciphertext file in WASM memory. The optional budget limits the output buffer,
-not total process memory. Without a budget, allocation is attempted up to the
-JavaScript engine's buffer limit. Allocation errors reject with guidance to use
-streaming; browsers do not expose a reliable portable amount of free memory.
+`downloadPublicFile(file, { concurrency?, maxMemoryBytes?, onProgress? })` and
+its private-file counterpart allocate the output as a JavaScript `Uint8Array`.
+They fetch every chunk in one deferred retry pass at the requested concurrency
+and copy each chunk into the output as soon as it is decrypted, so WASM holds
+only the records in flight, never the whole plaintext or ciphertext. Progress
+is still reported as `Downloaded chunk n/total`. The older
+`(file, concurrency?, onProgress?)` form remains supported. `maxMemoryBytes`
+limits the output buffer, not total process memory. Without a budget,
+allocation is attempted up to the JavaScript engine's buffer limit. Allocation
+errors reject with guidance to use streaming; browsers do not expose a
+reliable portable amount of free memory.
 
 For large downloads, pass a `WritableStream` to `BrowserFileReader.pipeTo`.
 For example, after the application obtains a file handle from a user gesture:
@@ -64,16 +68,21 @@ try {
 ```
 
 The same API works with `openPrivateFile({ data_map })`. `pipeTo(writable,
-{ start?, end? }, onProgress?)` optionally streams a half-open byte range and
-reports `(bytesWritten, totalBytes)` after each write. It fetches and verifies
-at most 4 MiB of plaintext per write, waits for the destination before continuing,
-closes the destination on success, aborts on failure, and releases the writer
-lock. Its result contains the byte count and BLAKE3 of the written range.
-`reader.close()` cancels at a read/write boundary. `readRange(start, length)`
-remains available for media and custom streaming sinks, with a 4 MiB per-call
-limit. A sink must persist or consume the bytes instead of accumulating them to
-keep memory bounded. The application chooses a memory budget and supplies its
-disk destination; the core does not open file pickers or silently select a path.
+{ start?, end?, signal?, onProgress? })` optionally streams a half-open byte
+range and reports `(bytesWritten, totalBytes)` after each write. It fetches
+windows of whole chunks, up to 32 MiB of plaintext, concurrently in one
+deferred retry pass, then writes them in order, at most 4 MiB per write. It
+waits for every write before fetching the next window. It closes the
+destination on success, aborts it on any failure (including invalid options),
+and releases the writer lock. Its result contains the byte count and BLAKE3 of
+the written range. An `AbortSignal` cancels that one operation and leaves the
+reader open. `reader.close()` cancels the reader's operations at once, including
+fetches waiting to be retried, and evicts only that reader's records from the
+client's shared cache. `readRange(start, length)` remains available for media
+and custom streaming sinks, with a 4 MiB per-call limit. A sink must persist or
+consume the bytes instead of accumulating them to keep memory bounded. The
+application chooses a memory budget and supplies its disk destination; the core
+does not open file pickers or silently select a path.
 
 The adapters supply QUIC or WebRTC discovery/GET requests, runtime timers,
 caches, progress callbacks, and output handling. Browser descriptors and wallet

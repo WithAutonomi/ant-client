@@ -27,7 +27,7 @@ pub use protocol::{
 mod wasm_transport;
 
 use bytes::Bytes;
-use self_encryption::{DataMap, EncryptedChunk};
+use self_encryption::{ChunkInfo, DataMap, EncryptedChunk};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -255,16 +255,16 @@ pub fn decrypt_public_file(
 }
 
 fn chunk_infos(data_map: &DataMap) -> Vec<BrowserChunkInfo> {
-    data_map
-        .infos()
-        .iter()
-        .map(|info| BrowserChunkInfo {
-            index: info.index,
-            dst_hash: hex::encode(info.dst_hash.0),
-            src_hash: hex::encode(info.src_hash.0),
-            src_size: info.src_size,
-        })
-        .collect()
+    data_map.infos().iter().map(browser_chunk_info).collect()
+}
+
+fn browser_chunk_info(info: &ChunkInfo) -> BrowserChunkInfo {
+    BrowserChunkInfo {
+        index: info.index,
+        dst_hash: hex::encode(info.dst_hash.0),
+        src_hash: hex::encode(info.src_hash.0),
+        src_size: info.src_size,
+    }
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "browser-wasm"))]
