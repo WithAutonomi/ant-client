@@ -45,15 +45,16 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::Deref;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelState,
-    RtcDataChannelType, RtcPeerConnection, RtcPeerConnectionState, RtcSdpType,
-    RtcSessionDescriptionInit,
+    RtcDataChannelType, RtcIceGatheringState, RtcPeerConnection, RtcPeerConnectionState,
+    RtcSdpType, RtcSessionDescriptionInit,
 };
 
 const REQUEST_TIMEOUT_MS: u32 = 10_000;
@@ -67,6 +68,11 @@ const POINTER_PROTOCOL_CAPABILITY: &str = "pointer_protocol";
 // own ceiling and never spends the caller's response allowance.
 const RPC_ADMISSION_TIMEOUT: Duration = Duration::from_secs(400);
 const CONNECTION_SETUP_TIMEOUT_MS: u32 = 30_000;
+/// Longest one connection holds the page's ICE gathering turn. Gathering host
+/// candidates, the only kind without ICE servers, takes about a tenth of a second.
+const ICE_GATHERING_TURN_TIMEOUT: Duration = Duration::from_secs(1);
+/// How often the holder of the gathering turn checks whether its gathering completed.
+const ICE_GATHERING_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 // Retain useful associations across concurrent close-group walks. Active leases
 // remain non-evictable, and the pool still imposes a hard resource bound.
@@ -96,6 +102,15 @@ const MAX_UPLOAD_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
 // A 1 GB self-encrypted file needs only a few hundred records. Keep malformed
 // JavaScript metadata from creating unbounded quote work.
 const MAX_UPLOAD_RECORDS: usize = 4096;
+
+thread_local! {
+    /// One connection in the page gathers ICE candidates at a time. WebKit opens
+    /// up to thirty UDP sockets for each connection whose gathering overlaps
+    /// another's, instead of two, and past 256 sockets per page it closes the
+    /// oldest, silently cutting established connections. The cap is per page,
+    /// so the turn is shared by every client in it.
+    static ICE_GATHERING_TURN: Arc<Semaphore> = Arc::new(Semaphore::new(1));
+}
 
 mod bootstrap;
 mod failed_payment;
@@ -860,9 +875,12 @@ impl Connection {
                 .ok_or_else(|| "browser created an empty WebRTC offer".to_string())?;
             let local = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
             local.set_sdp(&offer_sdp);
+            // Setting the local description starts gathering.
+            let turn = ice_gathering_turn().await;
             JsFuture::from(connection.peer_connection.set_local_description(&local))
                 .await
                 .map_err(js_error_message)?;
+            pass_ice_gathering_turn(RtcPeerConnection::clone(&connection.peer_connection), turn);
             let local_sdp = connection
                 .peer_connection
                 .local_description()
@@ -3502,6 +3520,30 @@ where
 
 fn transfer_timeout_ms(content_bytes: usize) -> u32 {
     u32::try_from(transfer_timeout(content_bytes).as_millis()).unwrap_or(u32::MAX)
+}
+
+/// Wait for the page's ICE gathering turn. The semaphore is never closed, so
+/// this always returns a turn; `None` would only skip the wait.
+async fn ice_gathering_turn() -> Option<OwnedSemaphorePermit> {
+    ICE_GATHERING_TURN
+        .with(Arc::clone)
+        .acquire_owned()
+        .await
+        .ok()
+}
+
+/// Pass the turn on once `connection` finishes gathering, or after
+/// [`ICE_GATHERING_TURN_TIMEOUT`]. The connection itself carries on at once.
+fn pass_ice_gathering_turn(connection: RtcPeerConnection, turn: Option<OwnedSemaphorePermit>) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let deadline = web_time::Instant::now() + ICE_GATHERING_TURN_TIMEOUT;
+        while connection.ice_gathering_state() != RtcIceGatheringState::Complete
+            && web_time::Instant::now() < deadline
+        {
+            crate::runtime::sleep(ICE_GATHERING_POLL_INTERVAL).await;
+        }
+        drop(turn);
+    });
 }
 
 fn js_error_message(value: JsValue) -> String {
