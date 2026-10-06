@@ -56,7 +56,8 @@ pub enum ManifestAction {
         #[arg(long)]
         compact: bool,
         /// Upload the files as public (stores each DataMap chunk). Anyone
-        /// with a file's address can then download it.
+        /// with a file's address can then download it. The manifest still
+        /// embeds the DataMaps unless --compact is also given.
         #[arg(long)]
         public: bool,
         /// Follow symlinks to regular files instead of skipping them.

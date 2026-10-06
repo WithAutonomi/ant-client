@@ -310,19 +310,16 @@ async fn handle_file_upload(
         })?;
 
     // Every upload is remembered as a one-entry manifest in the upload
-    // history (ADR-0006), so it can be listed and downloaded again.
-    let source = match result.data_map_address {
-        Some(address) if public => ContentRef::Public { address },
-        _ => ContentRef::Embedded {
-            data_map: result.data_map.clone(),
-        },
-    };
+    // history (ADR-0006), so it can be listed and downloaded again. The
+    // DataMap is embedded whether or not the upload was public.
     let record = Manifest {
         name: None,
         entries: vec![ManifestEntry {
             path: Some(original_name.clone()),
             size: Some(file_size),
-            source,
+            source: ContentRef::Embedded {
+                data_map: result.data_map.clone(),
+            },
         }],
     };
     let manifest_id = record_upload_manifest(&record, Some(&original_name));

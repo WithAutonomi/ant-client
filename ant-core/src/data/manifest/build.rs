@@ -24,11 +24,13 @@ const UPLOAD_PROGRESS_CAPACITY: usize = 64;
 /// How a locally uploaded file is referenced from the manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReferenceMode {
-    /// Embed the DataMap. The recipient skips one fetch per file.
+    /// Always embed the DataMap, even for public uploads. The recipient
+    /// skips one fetch per file.
     #[default]
     Embedded,
-    /// Prefer a public address wherever the DataMap chunk is already on
-    /// the network; embed otherwise. Never stores a DataMap chunk itself.
+    /// Prefer a public address wherever the DataMap chunk is on the
+    /// network, because the upload was public or the chunk already exists;
+    /// embed otherwise. Never stores a DataMap chunk itself.
     Compact,
 }
 
@@ -40,7 +42,8 @@ pub struct BuildOptions {
     /// How uploaded files are referenced.
     pub reference_mode: ReferenceMode,
     /// Visibility of the file uploads themselves. `Public` stores each
-    /// file's DataMap chunk and makes the file public.
+    /// file's DataMap chunk and makes the file public; the manifest still
+    /// embeds the DataMap unless `reference_mode` is `Compact`.
     pub visibility: Visibility,
     /// Payment mode for the uploads.
     pub payment_mode: PaymentMode,
@@ -297,22 +300,27 @@ impl<'a> ManifestBuilder<'a> {
         })
     }
 
+    /// Embedded mode always embeds the DataMap, even when the upload was
+    /// public. Compact mode records the public address when the upload
+    /// stored the DataMap chunk, or when that chunk already exists on the
+    /// network, and embeds otherwise.
     async fn reference_for(
         &self,
         data_map: &self_encryption::DataMap,
         public_address: Option<[u8; ADDRESS_LEN]>,
     ) -> Result<ContentRef, ManifestError> {
-        if let Some(address) = public_address {
-            return Ok(ContentRef::Public { address });
-        }
         let embedded = ContentRef::Embedded {
             data_map: data_map.clone(),
         };
-        if self.options.reference_mode == ReferenceMode::Compact {
-            let address = embedded.content_address()?;
-            if self.client.chunk_exists(&address).await? {
-                return Ok(ContentRef::Public { address });
-            }
+        if self.options.reference_mode != ReferenceMode::Compact {
+            return Ok(embedded);
+        }
+        if let Some(address) = public_address {
+            return Ok(ContentRef::Public { address });
+        }
+        let address = embedded.content_address()?;
+        if self.client.chunk_exists(&address).await? {
+            return Ok(ContentRef::Public { address });
         }
         Ok(embedded)
     }

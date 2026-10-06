@@ -219,6 +219,26 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
     assert_eq!(kind_of("public.bin"), "public");
     assert_eq!(kind_of("private.bin"), "embedded");
 
+    // The default mode embeds every DataMap, even when the files are
+    // uploaded as public in the same run.
+    let mut embedded_builder = ManifestBuilder::new(
+        &client,
+        BuildOptions {
+            name: None,
+            reference_mode: ReferenceMode::Embedded,
+            visibility: Visibility::Public,
+            payment_mode: PaymentMode::Auto,
+            follow_symlinks: false,
+        },
+    );
+    embedded_builder.add_directory(source.path(), None).unwrap();
+    let embedded = embedded_builder.finish(None).await.expect("build embedded");
+    assert!(embedded
+        .manifest
+        .entries
+        .iter()
+        .all(|e| e.source.kind() == "embedded"));
+
     let out = TempDir::new().unwrap();
     let report = extract_manifest(
         &client,

@@ -235,9 +235,10 @@ optional path and size, and nothing is uploaded.
 
 Two reference modes for uploaded files:
 
-- **Embedded (default).** The DataMap goes into the manifest. The recipient
-  skips one fetch per file and the creator pays nothing extra. Wrapper
-  fetches for child maps still occur.
+- **Embedded (default).** The DataMap goes into the manifest, whether or not
+  the file was uploaded as public. The recipient skips one fetch per file
+  and the creator pays nothing extra. Wrapper fetches for child maps still
+  occur. Only entries added by address have no DataMap to embed.
 - **Compact (opt-in).** Record `Public` for every file whose DataMap chunk is
   on the network: files added by address, files the caller uploaded as
   public in this run, and files whose DataMap chunk is found to exist
@@ -264,8 +265,8 @@ recorded as itself. Records live under `<data dir>/uploads/` as ordinary
 `.ant` files named `<UTC timestamp>-<label>.ant`, where the filename stem is
 the record id. Nothing else is stored, so the history is a plain folder of
 manifests. The client lists records newest first and accepts a record id
-wherever it accepts a manifest file or link. A public upload is recorded by
-address, a private one by its embedded DataMap. Recording never fails an
+wherever it accepts a manifest file or link. Every record embeds the full
+DataMap, whether or not the upload was public. Recording never fails an
 upload that has already succeeded; an unusable history directory is reported
 and the upload result still shown.
 
