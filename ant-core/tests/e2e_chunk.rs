@@ -6,8 +6,10 @@ mod support;
 
 use ant_core::data::{compute_address, Client};
 use bytes::Bytes;
+use futures::future::join_all;
 use serial_test::serial;
 use std::sync::Arc;
+use std::time::Duration;
 use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 
 async fn setup() -> (Client, MiniTestnet) {
@@ -45,6 +47,53 @@ async fn test_chunk_put_get_round_trip() {
     let chunk = retrieved.expect("Chunk should be found after storing it");
     assert_eq!(chunk.content.as_ref(), content.as_ref());
     assert_eq!(chunk.address, address);
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// Concurrent reads of one chunk share a single fetch: with the cache empty,
+/// every concurrent `chunk_get` returns the chunk and no node is asked for it
+/// more than once. Without sharing, each reader sends its own GETs and the
+/// first holder is asked once per reader.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_concurrent_chunk_gets_share_one_fetch() {
+    const READERS: usize = 8;
+    let (client, testnet) = setup().await;
+
+    let content = Bytes::from("ant-core concurrent chunk_get payload");
+    let address = client
+        .chunk_put(content.clone())
+        .await
+        .expect("chunk_put should succeed with payment");
+    client.chunk_cache().clear();
+    let before = testnet.chunk_gets_received(&address);
+
+    let results = join_all((0..READERS).map(|_| client.chunk_get(&address))).await;
+    for result in results {
+        let chunk = result
+            .expect("chunk_get should succeed")
+            .expect("Chunk should be found after storing it");
+        assert_eq!(chunk.content.as_ref(), content.as_ref());
+    }
+
+    // Let any GET still on the wire, such as an unanswered hedge, arrive.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let sent: Vec<usize> = testnet
+        .chunk_gets_received(&address)
+        .iter()
+        .zip(&before)
+        .map(|(after, before)| after - before)
+        .collect();
+    assert!(
+        sent.iter().sum::<usize>() >= 1,
+        "the chunk should come from the network: {sent:?}"
+    );
+    assert!(
+        sent.iter().all(|&gets| gets <= 1),
+        "{READERS} concurrent readers should ask each node at most once: {sent:?}"
+    );
 
     drop(client);
     testnet.teardown().await;

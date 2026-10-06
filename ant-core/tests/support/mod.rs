@@ -37,9 +37,10 @@ use ant_protocol::transport::{
 };
 use ant_protocol::{CLOSE_GROUP_SIZE, MAX_WIRE_MESSAGE_SIZE};
 use rand::Rng;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -99,6 +100,8 @@ pub struct TestNode {
     pub protocol: Option<Arc<AntProtocol>>,
     /// Which pointer requests the node takes off the wire and ignores.
     pub pointer_silence: Arc<PointerSilence>,
+    /// Chunk GET requests the node has received.
+    pub chunk_gets: Arc<ChunkGetCounts>,
     _handler_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -140,6 +143,45 @@ impl PointerSilence {
             }) => puts,
             _ => false,
         }
+    }
+}
+
+/// Chunk GET requests a node has received, by chunk address, counted as each
+/// message arrives and before the node handles it.
+#[derive(Default)]
+pub struct ChunkGetCounts(Mutex<HashMap<[u8; 32], usize>>);
+
+impl ChunkGetCounts {
+    /// A GET request is a few dozen bytes, so anything larger, such as a PUT
+    /// carrying a chunk, is not decoded.
+    const MAX_GET_REQUEST_BYTES: usize = 1024;
+
+    fn note(&self, data: &[u8]) {
+        if data.len() > Self::MAX_GET_REQUEST_BYTES {
+            return;
+        }
+        if let Ok(ChunkMessage {
+            body: ChunkMessageBody::GetRequest(request),
+            ..
+        }) = ChunkMessage::decode(data)
+        {
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(request.address)
+                .or_default() += 1;
+        }
+    }
+
+    /// GET requests received for `address`.
+    pub fn get(&self, address: &[u8; 32]) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(address)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -195,7 +237,7 @@ impl MiniTestnet {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
             let temp_dir = tempfile::TempDir::new().expect("create temp dir");
-            let (node, protocol, pointer_silence, handler) = Self::spawn_node(
+            let (node, protocol, pointer_silence, chunk_gets, handler) = Self::spawn_node(
                 addr,
                 &bootstrap_addrs,
                 temp_dir.path(),
@@ -210,6 +252,7 @@ impl MiniTestnet {
                 p2p_node: Some(Arc::clone(&node)),
                 protocol: Some(protocol),
                 pointer_silence,
+                chunk_gets,
                 _handler_task: Some(handler),
             });
             temp_dirs.push(temp_dir);
@@ -222,7 +265,7 @@ impl MiniTestnet {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
             let temp_dir = tempfile::TempDir::new().expect("create temp dir");
-            let (node, protocol, pointer_silence, handler) = Self::spawn_node(
+            let (node, protocol, pointer_silence, chunk_gets, handler) = Self::spawn_node(
                 addr,
                 &bootstrap_addrs,
                 temp_dir.path(),
@@ -236,6 +279,7 @@ impl MiniTestnet {
                 p2p_node: Some(Arc::clone(&node)),
                 protocol: Some(protocol),
                 pointer_silence,
+                chunk_gets,
                 _handler_task: Some(handler),
             });
             temp_dirs.push(temp_dir);
@@ -341,6 +385,7 @@ impl MiniTestnet {
         Arc<P2PNode>,
         Arc<AntProtocol>,
         Arc<PointerSilence>,
+        Arc<ChunkGetCounts>,
         tokio::task::JoinHandle<()>,
     ) {
         // Generate ML-DSA-65 identity for this node
@@ -455,6 +500,8 @@ impl MiniTestnet {
         // Start message handler loop
         let pointer_silence = Arc::new(PointerSilence::default());
         let handler_silence = Arc::clone(&pointer_silence);
+        let chunk_gets = Arc::new(ChunkGetCounts::default());
+        let handler_gets = Arc::clone(&chunk_gets);
         let handler_node = Arc::clone(&node);
         let handler_protocol = Arc::clone(&protocol);
         let handler = tokio::spawn(async move {
@@ -467,9 +514,11 @@ impl MiniTestnet {
                         data,
                         ..
                     }) => {
-                        if topic == ant_protocol::CHUNK_PROTOCOL_ID && handler_silence.drops(&data)
-                        {
-                            continue;
+                        if topic == ant_protocol::CHUNK_PROTOCOL_ID {
+                            handler_gets.note(&data);
+                            if handler_silence.drops(&data) {
+                                continue;
+                            }
                         }
                         let protocol = Arc::clone(&handler_protocol);
                         let node = Arc::clone(&handler_node);
@@ -515,7 +564,7 @@ impl MiniTestnet {
             }
         });
 
-        (node, protocol, pointer_silence, handler)
+        (node, protocol, pointer_silence, chunk_gets, handler)
     }
 
     /// Shut down a node by index, simulating a failure.
@@ -530,6 +579,14 @@ impl MiniTestnet {
             node.protocol = None;
             node.p2p_node = None;
         }
+    }
+
+    /// Chunk GET requests each node has received for `address`, in node order.
+    pub fn chunk_gets_received(&self, address: &[u8; 32]) -> Vec<usize> {
+        self.nodes
+            .iter()
+            .map(|node| node.chunk_gets.get(address))
+            .collect()
     }
 
     /// Count how many nodes are still running (have a P2P node).

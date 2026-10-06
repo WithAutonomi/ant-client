@@ -26,6 +26,7 @@ pub mod quote;
 pub mod upload;
 pub mod upload_state;
 
+use crate::client_engine::single_flight::SingleFlight;
 use crate::data::client::adaptive::{AdaptiveConfig, AdaptiveController, ChannelStart, Outcome};
 use crate::data::client::cache::ChunkCache;
 use crate::data::error::{Error, Result};
@@ -627,6 +628,9 @@ pub struct Client {
     wallet: Option<Arc<Wallet>>,
     evm_network: Option<ant_protocol::evm::Network>,
     chunk_cache: ChunkCache,
+    /// Chunk GETs in flight, by address and peer count, so concurrent reads
+    /// of one chunk share a single network GET.
+    chunk_gets: SingleFlight<(XorName, usize), Result<Option<ant_protocol::DataChunk>>>,
     next_request_id: AtomicU64,
     /// Adaptive concurrency controller: replaces the static
     /// quote/store concurrency knobs. See `adaptive` module.
@@ -709,6 +713,7 @@ impl Client {
             wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
+            chunk_gets: SingleFlight::default(),
             next_request_id: AtomicU64::new(1),
             controller,
             #[cfg(feature = "native")]
@@ -755,6 +760,7 @@ impl Client {
             wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
+            chunk_gets: SingleFlight::default(),
             next_request_id: AtomicU64::new(1),
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
             versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
@@ -809,6 +815,7 @@ impl Client {
             wallet: None,
             evm_network: None,
             chunk_cache: ChunkCache::default(),
+            chunk_gets: SingleFlight::default(),
             next_request_id: AtomicU64::new(1),
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
             versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),

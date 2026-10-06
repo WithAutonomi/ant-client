@@ -225,6 +225,72 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// A copy of this error, for callers that shared the operation it ended.
+    /// An `Io` error keeps its kind and message.
+    pub(crate) fn duplicate(&self) -> Self {
+        match self {
+            Self::Network(m) => Self::Network(m.clone()),
+            Self::Storage(m) => Self::Storage(m.clone()),
+            Self::Payment(m) => Self::Payment(m.clone()),
+            Self::Protocol(m) => Self::Protocol(m.clone()),
+            Self::RemotePut { address, source } => Self::RemotePut {
+                address: address.clone(),
+                source: source.clone(),
+            },
+            Self::CloseGroupShortfall(m) => Self::CloseGroupShortfall(m.clone()),
+            Self::InvalidData(m) => Self::InvalidData(m.clone()),
+            Self::NotFound(m) => Self::NotFound(m.clone()),
+            Self::Serialization(m) => Self::Serialization(m.clone()),
+            Self::Crypto(m) => Self::Crypto(m.clone()),
+            Self::Io(e) => Self::Io(std::io::Error::new(e.kind(), e.to_string())),
+            Self::Config(m) => Self::Config(m.clone()),
+            Self::Timeout(m) => Self::Timeout(m.clone()),
+            Self::InsufficientPeers(m) => Self::InsufficientPeers(m.clone()),
+            Self::ClientUpdateRequired(m) => Self::ClientUpdateRequired(m.clone()),
+            Self::StorerUpdateRequired(m) => Self::StorerUpdateRequired(m.clone()),
+            Self::SignatureVerification(m) => Self::SignatureVerification(m.clone()),
+            Self::Encryption(m) => Self::Encryption(m.clone()),
+            Self::Cancelled(m) => Self::Cancelled(m.clone()),
+            Self::AlreadyStored => Self::AlreadyStored,
+            Self::BadQuoteBinding { peer_id, detail } => Self::BadQuoteBinding {
+                peer_id: peer_id.clone(),
+                detail: detail.clone(),
+            },
+            Self::BadQuoteCommitment { peer_id, detail } => Self::BadQuoteCommitment {
+                peer_id: peer_id.clone(),
+                detail: detail.clone(),
+            },
+            Self::InsufficientDiskSpace(m) => Self::InsufficientDiskSpace(m.clone()),
+            Self::MerkleBatchTooLarge {
+                addresses,
+                max_leaves,
+            } => Self::MerkleBatchTooLarge {
+                addresses: *addresses,
+                max_leaves: *max_leaves,
+            },
+            Self::CostEstimationInconclusive(m) => Self::CostEstimationInconclusive(m.clone()),
+            Self::PartialUpload {
+                stored,
+                stored_count,
+                failed,
+                failed_count,
+                total_chunks,
+                spend,
+                reason,
+            } => Self::PartialUpload {
+                stored: stored.clone(),
+                stored_count: *stored_count,
+                failed: failed.clone(),
+                failed_count: *failed_count,
+                total_chunks: *total_chunks,
+                spend: spend.clone(),
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
 /// On-chain spend recorded on a [`Error::PartialUpload`].
 ///
 /// A partial upload still spends money for the chunks it paid for. In the

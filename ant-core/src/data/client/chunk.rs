@@ -211,6 +211,7 @@ fn classify_peer_attempt(
         ),
     }
 }
+use crate::client_engine::single_flight::Flown;
 use crate::data::client::adaptive::Outcome;
 use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
 use crate::data::client::peer_xor_distance;
@@ -416,18 +417,61 @@ impl Client {
         peer_count: usize,
         #[cfg(feature = "native")] diag: Option<&ChunkFetchDiagnostics<'_>>,
     ) -> Result<Option<DataChunk>> {
-        let epoch = self.controller().fetch.observation_epoch();
-        let started = Instant::now();
-        let result = self
-            .chunk_get_from_closest_peers_with_diagnostics(
-                address,
-                peer_count,
-                #[cfg(feature = "native")]
-                diag,
+        // Diagnostics record the GETs their own caller sent, so a diagnosed
+        // fetch neither shares another caller's GET nor lends its own.
+        #[cfg(feature = "native")]
+        if let Some(diag) = diag {
+            let epoch = self.controller().fetch.observation_epoch();
+            let started = Instant::now();
+            let result = self
+                .chunk_get_from_closest_peers_with_diagnostics(address, peer_count, Some(diag))
+                .await;
+            self.observe_chunk_get(&result, started.elapsed(), epoch);
+            return result;
+        }
+        self.chunk_get_shared(address, peer_count, true).await
+    }
+
+    /// Fetch a chunk, or wait for this client's fetch of the same address and
+    /// peer count if one is already in flight, so concurrent reads of a chunk
+    /// send its GETs once. A shared fetch feeds the adaptive fetch limiter
+    /// once, if any caller sharing it observes.
+    async fn chunk_get_shared(
+        &self,
+        address: &XorName,
+        peer_count: usize,
+        observe: bool,
+    ) -> Result<Option<DataChunk>> {
+        let mut started = None;
+        let flown = self
+            .chunk_gets
+            .run(
+                (*address, peer_count),
+                observe,
+                || {
+                    started = Some((self.controller().fetch.observation_epoch(), Instant::now()));
+                    self.chunk_get_from_closest_peers_with_diagnostics(
+                        address,
+                        peer_count,
+                        #[cfg(feature = "native")]
+                        None,
+                    )
+                },
+                |result| match result {
+                    Ok(chunk) => Ok(chunk.clone()),
+                    Err(error) => Err(error.duplicate()),
+                },
             )
             .await;
-        self.observe_chunk_get(&result, started.elapsed(), epoch);
-        result
+        match flown {
+            Flown::Led { value, observe } => {
+                if let (true, Some((epoch, started))) = (observe, started) {
+                    self.observe_chunk_get(&value, started.elapsed(), epoch);
+                }
+                value
+            }
+            Flown::Joined(value) => value,
+        }
     }
 
     /// Feed one `chunk_get` outcome to the adaptive fetch limiter, including
@@ -744,7 +788,7 @@ impl Client {
     /// Queries all peers in the close group for the chunk address,
     /// returning the first successful response. This handles the case
     /// where the storing peer differs from the first peer returned by
-    /// DHT routing.
+    /// DHT routing. Concurrent calls for one address share a single fetch.
     ///
     /// ## Adaptive controller feedback
     ///
@@ -767,6 +811,10 @@ impl Client {
     /// where the storing peer differs from the first peer returned by
     /// DHT routing.
     ///
+    /// Concurrent calls for the same address and peer count share one
+    /// fetch: later callers wait for the first caller's result, including
+    /// its error, instead of sending their own GETs.
+    ///
     /// # Errors
     ///
     /// Returns an error if the network operation fails.
@@ -775,13 +823,7 @@ impl Client {
         address: &XorName,
         peer_count: usize,
     ) -> Result<Option<DataChunk>> {
-        self.chunk_get_from_closest_peers_with_diagnostics(
-            address,
-            peer_count,
-            #[cfg(feature = "native")]
-            None,
-        )
-        .await
+        self.chunk_get_shared(address, peer_count, false).await
     }
 
     async fn chunk_get_from_closest_peers_with_diagnostics(
