@@ -3,7 +3,6 @@
 pub use super::protocol::BrowserPaymentNetwork;
 use super::protocol::{normalize_hex, parse_webrtc_direct_multiaddr, BrowserEndpoint};
 use super::BrowserChunkInfo;
-use super::MAX_BROWSER_CHUNK_BYTES;
 use crate::client_engine::files::MIN_FILE_CHUNKS;
 use serde::{Deserialize, Serialize};
 
@@ -187,7 +186,7 @@ fn normalize_file(file: &mut PublicFileDescriptor) -> Result<(), BrowserManifest
         chunk.dst_hash = normalize_hex(&chunk.dst_hash, 32).map_err(BrowserManifestError)?;
         chunk.src_hash = normalize_hex(&chunk.src_hash, 32).map_err(BrowserManifestError)?;
         // Sizes come from the DataMap, which may use another chunk size.
-        if !(1..=MAX_BROWSER_CHUNK_BYTES).contains(&chunk.src_size) {
+        if chunk.src_size == 0 {
             return Err(BrowserManifestError(format!(
                 "invalid plaintext chunk size {}",
                 chunk.src_size
@@ -343,10 +342,6 @@ mod tests {
                 .collect(),
         };
         normalize_file(&mut file).unwrap();
-        file.chunks[1].src_size = MAX_BROWSER_CHUNK_BYTES + 1;
-        file.size += (MAX_BROWSER_CHUNK_BYTES + 1 - large_chunk) as u64;
-        let error = normalize_file(&mut file).unwrap_err();
-        assert!(error.to_string().contains("chunk size"));
 
         // Rejected on length alone, before the list is sorted or decoded.
         file.chunks = (0..=MAX_FILE_CHUNKS)

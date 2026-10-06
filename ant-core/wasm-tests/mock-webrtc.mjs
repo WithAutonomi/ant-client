@@ -47,10 +47,12 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
       if (this.connection.connectionState === "failed") return;
       // A real DataChannel copies the outgoing bytes. The mock re-enters WASM
       // instead, where allocating the server argument can grow memory and
-      // detach an outgoing view into that same memory. Copy before re-entry.
+      // detach an outgoing view into that same memory. Copy before re-entry,
+      // including loading the node's records below.
+      const outgoing = new Uint8Array(message);
       // One node has one store, whichever of its channels wrote to it.
       for (const [key, content] of stores[this.index]) this.server.set_record(key, content);
-      let response = this.server.push(new Uint8Array(message));
+      let response = this.server.push(outgoing);
       if (!response.length) return;
       const method = this.server.last_method();
       if (method === "put_chunk") {

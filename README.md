@@ -39,26 +39,17 @@ Browser downloads and range reads have no 1 GB file cap. File sizes and offsets
 use 64-bit arithmetic internally; the JavaScript API accepts exact, nonnegative
 `number` positions through `Number.MAX_SAFE_INTEGER` (just under 8 PiB). The
 resolved DataMap and seek index still occupy memory proportional to the number
-of chunks. Individual chunk buffers remain bounded, including for seeks past
-4 GiB. Browser readers, downloads and `pipeTo` accept chunks of up to 16 MiB
-and nested DataMap levels of up to 64 MiB, and decompress every record,
-including nested DataMap records, only up to its declared size, so a crafted
-record cannot expand inside WASM. The legacy whole-buffer `decryptPublicFile`
-binding still decrypts through self_encryption without that limit. Native range
-reads accept any chunk size. Uploads retain their existing size limits.
+of chunks; content buffers stay bounded, including for seeks past 4 GiB.
+Uploads retain their existing size limits.
 
-`downloadPublicFile(file, { concurrency?, maxMemoryBytes?, onProgress?, signal? })`
-and its private-file counterpart allocate the output as a JavaScript
-`Uint8Array`. They fetch every chunk in one deferred retry pass at the requested
-concurrency and copy each chunk into the output as soon as it is decrypted, so
-WASM holds only the records in flight, never the whole plaintext or ciphertext.
-Progress is still reported as `Downloaded chunk n/total`, and an `AbortSignal`
-cancels the download at any point. The older `(file, concurrency?, onProgress?)`
-form remains supported, with the same coercion of the concurrency number as
-before. `maxMemoryBytes` limits the output buffer, not total process memory. Without a budget,
-allocation is attempted up to the JavaScript engine's buffer limit. Allocation
-errors reject with guidance to use streaming; browsers do not expose a
-reliable portable amount of free memory.
+`downloadPublicFile(file, concurrency?, onProgress?, { maxMemoryBytes?, signal? })`
+and its private-file counterpart allocate the output as one JavaScript
+`Uint8Array` and copy each decrypted chunk into it, holding at most 32 MiB of
+plaintext in WASM. Progress is reported as `Downloaded chunk n/total`, and an
+`AbortSignal` cancels the download. `maxMemoryBytes` limits the output buffer,
+not total process memory; without it, allocation is attempted up to the
+JavaScript engine's buffer limit. Allocation errors reject with guidance to use
+streaming, since browsers do not expose a reliable amount of free memory.
 
 For large downloads, pass a `WritableStream` to `BrowserFileReader.pipeTo`.
 For example, after the application obtains a file handle from a user gesture:
@@ -75,26 +66,17 @@ try {
 
 The same API works with `openPrivateFile({ data_map })`. `pipeTo(writable,
 { start?, end?, signal?, onProgress? })` optionally streams a half-open byte
-range and reports `(bytesWritten, totalBytes)` after each write. It fetches
-chunks concurrently and writes them in order, at most 4 MiB per write, each
-awaited before the next. Fetching continues while a write is pending until
-32 MiB of chunks are in flight or waiting, so a slow destination holds memory
-at that bound. Each missing record is retried on its own schedule while the
-rest of the buffer keeps fetching, so retry waits overlap. It closes the
-destination on success, aborts it on any failure (including invalid options),
-and releases the writer lock; a failure does not wait for a stalled destination
-to finish aborting. Its result contains the byte count and BLAKE3 of the written
-range. An `AbortSignal` cancels that one operation and leaves the reader open.
-`reader.close()` releases the records its read-ahead holds and cancels the
-reader's operations at once, including fetches
-waiting to be retried, until every byte is written. After that only the signal
-can cancel, and a destination that has started closing may already be
-committed. Closing leaves records in the client's shared cache, which is
-bounded (32 MiB) and may serve other readers. `readRange(start, length)` remains available for media
-and custom streaming sinks, with a 4 MiB per-call limit. A sink must persist or
-consume the bytes instead of accumulating them to keep memory bounded. The
-application chooses a memory budget and supplies its disk destination; the core
-does not open file pickers or silently select a path.
+range and reports `(bytesWritten, totalBytes)` after each write. Chunks are
+fetched concurrently and written in order, at most 4 MiB per write; fetching
+continues during writes until 32 MiB of plaintext is held. Invalid calls reject
+without touching the destination; otherwise the destination is closed on
+success, aborted on failure, and its writer lock released. The result contains
+the byte count and BLAKE3 of the written range, and an `AbortSignal` cancels
+the call. `reader.close()` releases the records read-ahead holds and makes later
+calls fail. `readRange(start, length)` remains available for media and custom
+sinks, with a 4 MiB per-call limit. The application chooses a memory budget and
+supplies its disk destination; the core does not open file pickers or silently
+select a path.
 
 The adapters supply QUIC or WebRTC discovery/GET requests, runtime timers,
 caches, progress callbacks, and output handling. Browser descriptors and wallet

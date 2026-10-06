@@ -2404,39 +2404,48 @@ impl BrowserNetworkClient {
     }
 
     /// Download a public file into one JavaScript Uint8Array, using bounded
-    /// WASM buffers. `options` is
-    /// `{ concurrency?, maxMemoryBytes?, onProgress?, signal? }`:
-    /// `maxMemoryBytes` limits the output allocation and an AbortSignal
-    /// cancels the download. A number is the legacy concurrency argument,
-    /// paired with a positional `onProgress`. For disk-backed downloads use
-    /// openPublicFile and reader.pipeTo(writable).
+    /// WASM buffers. `options` is `{ maxMemoryBytes?, signal? }`: the largest
+    /// output buffer to allocate, and an AbortSignal that cancels the download.
+    /// For disk-backed downloads use openPublicFile and reader.pipeTo(writable).
     #[wasm_bindgen(js_name = downloadPublicFile)]
     pub async fn download_public_file(
         &self,
         file: JsValue,
-        options: Option<JsValue>,
+        concurrency: Option<usize>,
         on_progress: Option<js_sys::Function>,
+        options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
         let file: BrowserPublicFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        self.download_file(BrowserFileSource::Public(file), options, on_progress)
-            .await
+        self.download_file(
+            BrowserFileSource::Public(file),
+            concurrency,
+            on_progress,
+            options,
+        )
+        .await
     }
 
     /// Download a private file into one JavaScript Uint8Array. Takes the same
-    /// options as downloadPublicFile; openPrivateFile and pipeTo support files
-    /// that cannot fit in one JavaScript buffer.
+    /// arguments as downloadPublicFile; openPrivateFile and pipeTo support
+    /// files that cannot fit in one JavaScript buffer.
     #[wasm_bindgen(js_name = downloadPrivateFile)]
     pub async fn download_private_file(
         &self,
         file: JsValue,
-        options: Option<JsValue>,
+        concurrency: Option<usize>,
         on_progress: Option<js_sys::Function>,
+        options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
         let file: BrowserPrivateFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        self.download_file(BrowserFileSource::Private(file), options, on_progress)
-            .await
+        self.download_file(
+            BrowserFileSource::Private(file),
+            concurrency,
+            on_progress,
+            options,
+        )
+        .await
     }
 
     /// Resolve and validate a public file for random-access range reads.
@@ -2655,10 +2664,11 @@ impl BrowserNetworkClient {
     async fn download_file(
         &self,
         source: BrowserFileSource,
-        options: Option<JsValue>,
+        concurrency: Option<usize>,
         on_progress: Option<js_sys::Function>,
+        options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
-        let settings = download::DownloadSettings::from_js(options, on_progress)
+        let settings = download::DownloadSettings::new(concurrency, on_progress, options)
             .map_err(|error| JsValue::from_str(&error))?;
         let result = self.download_file_inner(source, settings).await?;
         serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
@@ -2692,7 +2702,7 @@ impl BrowserNetworkClient {
         settings: download::DownloadSettings,
     ) -> Result<BrowserDownloadResult, JsValue> {
         // Validates the signal before any network work, and covers resolution.
-        let mut cancel = download::Cancellation::new(None, settings.signal.clone())?;
+        let mut cancel = download::Cancellation::new(settings.signal.clone())?;
         let resolved = cancel
             .run(async {
                 self.resolve_file(source, &settings.progress)
@@ -2700,12 +2710,9 @@ impl BrowserNetworkClient {
                     .map_err(|error| JsValue::from_str(&error))
             })
             .await?;
-        let data_map_node = resolved.data_map_node.clone();
-        // A complete download reads no ranges, so its read-ahead stays idle.
-        let reader =
-            BrowserFileReader::new(Rc::clone(&self.shared), resolved, &self.read_ahead, false);
-        let (content, hash) = reader.collect(&settings, &mut cancel).await?;
-        let file = reader.descriptor(hash.clone());
+        let (content, hash) =
+            download::collect(&self.shared, &resolved.index, &settings, &mut cancel).await?;
+        let file = download::completed_descriptor(resolved.file, &resolved.index, hash.clone());
         settings
             .progress
             .report(&format!("Verified complete {} as {hash}", file.name));
@@ -2713,7 +2720,7 @@ impl BrowserNetworkClient {
             content,
             hash,
             file,
-            data_map_node,
+            data_map_node: resolved.data_map_node,
         })
     }
 
@@ -2811,7 +2818,6 @@ impl BrowserNetworkClient {
                     .map(|(content, _)| bytes::Bytes::from(content))
             },
             &|| self.shared.controller().fetch.current(),
-            super::MAX_BROWSER_NESTED_MAP_BYTES,
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -2819,12 +2825,6 @@ impl BrowserNetworkClient {
         let index = crate::client_engine::files::FileIndex::new(&root_data_map)?;
         if index.size() > super::manifest::MAX_SAFE_JS_INTEGER {
             return Err("file size exceeds JavaScript's exact integer range".into());
-        }
-        if index.largest_chunk() > super::MAX_BROWSER_CHUNK_BYTES as u64 {
-            return Err(format!(
-                "DataMap chunks larger than {} bytes are not read in browsers",
-                super::MAX_BROWSER_CHUNK_BYTES
-            ));
         }
 
         file.size = index.size();
@@ -2925,14 +2925,9 @@ impl BrowserNetworkClient {
         };
         let encoded_map = fetch(parse_lookup_key(&staged.address, "DataMap address")?).await?;
         let map = crate::client_engine::files::decode_map(&encoded_map)?;
-        let root = crate::client_engine::files::resolve(
-            &map,
-            &fetch,
-            &|| 1,
-            super::MAX_BROWSER_NESTED_MAP_BYTES,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+        let root = crate::client_engine::files::resolve(&map, &fetch, &|| 1)
+            .await
+            .map_err(|error| error.to_string())?;
         staged.chunks = super::chunk_infos(&root);
         staged.size = staged.chunks.iter().try_fold(0usize, |size, chunk| {
             size.checked_add(chunk.src_size).ok_or("file size overflow")

@@ -39,17 +39,6 @@ use std::collections::HashSet;
 /// while `pipeTo` and range reads hold a bounded amount of plaintext.
 pub const MAX_BROWSER_FILE_BYTES: usize = 1_000_000_000;
 
-/// Largest plaintext chunk a browser read accepts from a DataMap: four times
-/// the native chunk size. Maps from other chunk-size schemes stay readable,
-/// while a hostile map cannot make one chunk reserve an arbitrarily large
-/// buffer in WASM memory.
-pub(crate) const MAX_BROWSER_CHUNK_BYTES: usize = 16 * 1024 * 1024;
-
-/// Largest decoded nested DataMap level a browser read resolves. A root map
-/// with 262,144 chunks (about 1 TiB) encodes to roughly 21 MB.
-#[cfg(all(target_arch = "wasm32", feature = "browser-wasm"))]
-pub(crate) const MAX_BROWSER_NESTED_MAP_BYTES: usize = 64 * 1024 * 1024;
-
 /// One native self-encryption chunk descriptor exposed to the browser.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserChunkInfo {

@@ -93,8 +93,8 @@ test("large-file memory budgets fail before content fetch, and allocation errors
   try { (await opened.client.openPublicFile(large.address)).close(); } finally { opened.client.close(); }
   const maxMemoryBytes = 64 * 1024 * 1024;
   for (const download of [
-    client => client.downloadPublicFile(large.address, { maxMemoryBytes }),
-    client => client.downloadPrivateFile({ data_map: map.content }, { maxMemoryBytes }),
+    client => client.downloadPublicFile(large.address, undefined, undefined, { maxMemoryBytes }),
+    client => client.downloadPrivateFile({ data_map: map.content }, undefined, undefined, { maxMemoryBytes }),
   ]) {
     const { rtc, client } = fixture();
     try {
@@ -106,28 +106,12 @@ test("large-file memory budgets fail before content fetch, and allocation errors
   const { rtc, client } = fixture();
   try {
     for (const value of [-1, 1.5, Infinity, NaN, 2 ** 53]) {
-      await assert.rejects(client.downloadPublicFile(large.address, { maxMemoryBytes: value }), /safe integer/);
+      await assert.rejects(client.downloadPublicFile(large.address, undefined, undefined, { maxMemoryBytes: value }), /safe integer/);
     }
-    for (const concurrency of [0, -1, 1.5, NaN]) {
-      await assert.rejects(client.downloadPublicFile(large.address, { concurrency }), /positive integer/);
-    }
-    // The legacy numeric argument keeps wasm-bindgen's `>>> 0` coercion.
-    for (const concurrency of [0, NaN, "none", 2 ** 32]) {
-      await assert.rejects(client.downloadPublicFile(large.address, concurrency), /positive integer/);
-    }
-    await assert.rejects(client.downloadPublicFile(large.address, { maxMemory: 1 }), /unknown option `maxMemory`/);
-    await assert.rejects(client.downloadPublicFile(large.address, { onProgress: 1 }), /onProgress must be a function/);
-    await assert.rejects(client.downloadPublicFile(large.address, { onProgress() {} }, () => {}), /not both/);
-    await assert.rejects(client.downloadPublicFile(large.address, { signal: {} }), /AbortSignal/);
-    assert.equal(gets(rtc), 0, "invalid options fail before any fetch");
+    await assert.rejects(client.downloadPublicFile(large.address, 0), /positive integer/);
+    await assert.rejects(client.downloadPublicFile(large.address, undefined, undefined, { signal: {} }), /AbortSignal/);
+    assert.equal(gets(rtc), 0, "invalid arguments fail before any fetch");
   } finally { client.close(); }
-});
-
-test("download options stay optional in the generated typings", async () => {
-  const typings = await readFile(new URL("./pkg/ant_core.d.ts", import.meta.url), "utf8");
-  for (const name of ["downloadPublicFile", "downloadPrivateFile"]) {
-    assert.match(typings, new RegExp(`${name}\\(file: any, options\\?: any`));
-  }
 });
 
 test("an AbortSignal cancels a complete download, including during retry waits", async () => {
@@ -137,18 +121,16 @@ test("an AbortSignal cancels a complete download, including during retry waits",
   const { rtc, client } = fixture(encrypted.records.filter(record => record !== missing));
   try {
     const reason = new Error("stop downloading");
-    await assert.rejects(client.downloadPublicFile(encrypted.address, { signal: AbortSignal.abort(reason) }),
+    await assert.rejects(client.downloadPublicFile(encrypted.address, undefined, undefined, { signal: AbortSignal.abort(reason) }),
       error => error === reason);
     const controller = new AbortController();
     const started = Date.now();
-    const pending = client.downloadPublicFile(encrypted.address, { signal: controller.signal });
+    const pending = client.downloadPublicFile(encrypted.address, undefined, undefined, { signal: controller.signal });
     setTimeout(() => controller.abort(reason), 100);
     await assert.rejects(pending, error => error === reason);
     assert(Date.now() - started < 5_000, `abort took ${Date.now() - started} ms`);
     rtc.stores[0].set(missing.address, missing.content);
-    const legacy = await client.downloadPublicFile(encrypted.address, 1.5);
-    assert.deepEqual(legacy.content, original);
-    assert.deepEqual((await client.downloadPublicFile(encrypted.address, "2")).content, original);
+    assert.deepEqual((await client.downloadPublicFile(encrypted.address)).content, original);
   } finally { client.close(); }
 });
 
@@ -207,7 +189,7 @@ test("pipeTo keeps fetching behind a blocked write only up to its 32 MiB buffer"
   } finally { reader?.close(); client.close(); }
 });
 
-test("invalid pipeTo calls abort the destination they were given", async () => {
+test("invalid pipeTo calls reject without touching the destination", async () => {
   const { client } = fixture();
   let reader;
   try {
@@ -216,16 +198,15 @@ test("invalid pipeTo calls abort the destination they were given", async () => {
       [{ end: large.size + 1 }, /outside the file/],
       [{ start: 10, end: 5 }, /outside the file/],
       [{ start: -1 }, /safe integer/],
-      [{ size: 1 }, /unknown option `size`/],
       [{ onProgress: "no" }, /onProgress must be a function/],
       [{ signal: {} }, /AbortSignal/],
       [{}, /closed/, true],
     ]) {
       if (close) reader.close();
-      let aborted, closed = false;
-      const sink = new WritableStream({ write() { assert.fail("nothing is written"); }, close() { closed = true; }, abort(reason) { aborted = reason; } });
+      let aborted = false, closed = false;
+      const sink = new WritableStream({ write() { assert.fail("nothing is written"); }, close() { closed = true; }, abort() { aborted = true; } });
       await assert.rejects(reader.pipeTo(sink, options), expected);
-      assert.match(String(aborted), expected);
+      assert.equal(aborted, false);
       assert.equal(closed, false);
       assert.equal(sink.locked, false);
     }
@@ -256,49 +237,21 @@ test("an AbortSignal cancels one pipeTo and leaves its reader open", async () =>
   } finally { reader?.close(); client.close(); }
 });
 
-test("closing a reader from the final progress callback keeps the completed file", async () => {
-  const original = new TextEncoder().encode("Final progress callback.".repeat(200));
-  const encrypted = encryptPublicFile(original);
-  const { client } = fixture(encrypted.records);
-  let reader;
-  try {
-    reader = await client.openPublicFile(encrypted.address);
-    const chunks = [];
-    let closed = false, aborted = false;
-    const sink = new WritableStream({ write(bytes) { chunks.push(bytes); }, close() { closed = true; }, abort() { aborted = true; } });
-    const progress = [];
-    const result = await reader.pipeTo(sink, { onProgress(written, total) {
-      progress.push([written, total]);
-      if (written === total) reader.close();
-    } });
-    assert.equal(result.bytesWritten, original.length);
-    assert.deepEqual(progress.at(-1), [original.length, original.length]);
-    assert(closed);
-    assert(!aborted);
-    assert.deepEqual(Buffer.concat(chunks), Buffer.from(original));
-  } finally { reader?.close(); client.close(); }
-});
-
-test("cancelling during a missing-record retry does not wait out the retry rounds", async () => {
+test("an AbortSignal stops a pipeTo waiting to retry a missing record", async () => {
   const original = new TextEncoder().encode("Retry cancellation.".repeat(300));
   const encrypted = encryptPublicFile(original);
   const missing = encrypted.records.find(record => record.address !== encrypted.address);
   const { client } = fixture(encrypted.records.filter(record => record !== missing));
+  let reader;
   try {
-    for (const cancel of ["close", "signal"]) {
-      const reader = await client.openPublicFile(encrypted.address);
-      try {
-        const controller = new AbortController();
-        const started = Date.now();
-        const pending = cancel === "close"
-          ? reader.readRange(0, original.length)
-          : reader.pipeTo(new WritableStream(), { signal: controller.signal });
-        setTimeout(() => cancel === "close" ? reader.close() : controller.abort(new Error("stop")), 100);
-        await assert.rejects(pending, cancel === "close" ? /closed/ : /stop/);
-        assert(Date.now() - started < 5_000, `${cancel} took ${Date.now() - started} ms`);
-      } finally { reader.close(); }
-    }
-  } finally { client.close(); }
+    reader = await client.openPublicFile(encrypted.address);
+    const controller = new AbortController();
+    const started = Date.now();
+    const pending = reader.pipeTo(new WritableStream(), { signal: controller.signal });
+    setTimeout(() => controller.abort(new Error("stop")), 100);
+    await assert.rejects(pending, /stop/);
+    assert(Date.now() - started < 5_000, `abort took ${Date.now() - started} ms`);
+  } finally { reader?.close(); client.close(); }
 });
 
 test("an AbortSignal settles pipeTo even while a destination write is stalled", async () => {
@@ -339,43 +292,19 @@ test("an AbortSignal during the destination's close rejects pipeTo", async () =>
   } finally { reader?.close(); client.close(); }
 });
 
-test("closing a reader leaves records another reader of the file uses cached", async () => {
-  const original = new TextEncoder().encode("Two readers, one file.".repeat(300));
-  const encrypted = encryptPublicFile(original);
-  const { rtc, client } = fixture(encrypted.records);
-  let first, second;
-  try {
-    first = await client.openPublicFile(encrypted.address);
-    second = await client.openPublicFile(encrypted.address);
-    assert.deepEqual(await second.readRange(0, original.length), original);
-    first.close();
-    const cached = gets(rtc);
-    assert.deepEqual(await second.readRange(0, original.length), original);
-    assert.equal(gets(rtc), cached, "the open reader's records stay cached");
-  } finally { first?.close(); second?.close(); client.close(); }
-});
-
-test("writer rejection and reader cancellation stop a stream and release its lock", async () => {
+test("a writer rejection stops a stream and releases its lock", async () => {
   const { client } = fixture();
+  let reader;
   try {
-    for (const cancel of [false, true]) {
-      const reader = await client.openPublicFile(large.address);
-      let writes = 0, closed = false, aborted = false;
-      const failure = new Error("disk full");
-      const sink = new WritableStream({
-        write() { writes++; if (cancel) reader.close(); else throw failure; },
-        close() { closed = true; },
-        abort() { aborted = true; },
-      });
-      try {
-        await assert.rejects(reader.pipeTo(sink, { start: 2 ** 32 }), cancel ? /closed/ : error => error === failure);
-        assert.equal(writes, 1);
-        assert.equal(closed, false);
-        if (cancel) assert(aborted);
-        assert.equal(sink.locked, false);
-      } finally { reader.close(); }
-    }
-  } finally { client.close(); }
+    reader = await client.openPublicFile(large.address);
+    let writes = 0, closed = false;
+    const failure = new Error("disk full");
+    const sink = new WritableStream({ write() { writes++; throw failure; }, close() { closed = true; } });
+    await assert.rejects(reader.pipeTo(sink, { start: 2 ** 32 }), error => error === failure);
+    assert.equal(writes, 1);
+    assert.equal(closed, false);
+    assert.equal(sink.locked, false);
+  } finally { reader?.close(); client.close(); }
 });
 
 test("in-memory downloads use one JS output buffer and return recoverable allocation failures", async () => {
@@ -386,16 +315,13 @@ test("in-memory downloads use one JS output buffer and return recoverable alloca
   let reader;
   try {
     const messages = [];
-    const result = await client.downloadPublicFile(encrypted.address,
-      { concurrency: 2, maxMemoryBytes: original.length, onProgress: message => messages.push(message) });
+    const result = await client.downloadPublicFile(encrypted.address, 2, message => messages.push(message),
+      { maxMemoryBytes: original.length });
     assert.deepEqual(result.content, original);
     assert.equal(result.file.chunks.length, 3);
     // Probes time the first chunks by these messages.
     const chunkProgress = messages.filter(message => message.startsWith("Downloaded chunk "));
     assert.deepEqual(chunkProgress, ["Downloaded chunk 0/3", "Downloaded chunk 1/3", "Downloaded chunk 2/3", "Downloaded chunk 3/3"]);
-    const legacy = await client.downloadPublicFile(encrypted.address, 2, message => messages.push(message));
-    assert.equal(legacy.hash, result.hash);
-    // `null` in the legacy concurrency position selects the default, as before.
     const unset = await client.downloadPublicFile(encrypted.address, null, () => {});
     assert.equal(unset.hash, result.hash);
     globalThis.Uint8Array = class extends NativeUint8Array {

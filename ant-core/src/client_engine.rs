@@ -1,6 +1,5 @@
 //! Runtime-neutral scheduling and session state shared by native and browser clients.
 
-mod chunk_decrypt;
 pub(crate) mod files;
 pub(crate) mod read;
 #[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]

@@ -377,8 +377,8 @@ impl Client {
     }
 
     /// Download a plaintext byte range. Resolves child maps first, then fetches
-    /// only the records overlapping the range, concurrently, decrypting each
-    /// chunk as it completes.
+    /// only the records overlapping the range and decrypts them one chunk at a
+    /// time, with 64-bit file arithmetic on every platform.
     /// Length is clamped at EOF; a start at or beyond EOF returns empty bytes.
     ///
     /// # Errors
@@ -389,26 +389,14 @@ impl Client {
         start: usize,
         length: usize,
     ) -> Result<Bytes> {
-        self.data_download_range_u64(data_map, start as u64, length)
-            .await
-    }
-
-    /// Download a bounded range with a 64-bit file offset, including on wasm32.
-    pub async fn data_download_range_u64(
-        &self,
-        data_map: &DataMap,
-        start: u64,
-        length: usize,
-    ) -> Result<Bytes> {
         let fetch = |address| self.fetch_data_record(address);
         let cap = || self.controller().fetch.current();
-        // Native range reads keep no limit on nested DataMap levels.
-        let root = crate::client_engine::files::resolve(data_map, &fetch, &cap, usize::MAX)
+        let root = crate::client_engine::files::resolve(data_map, &fetch, &cap)
             .await
             .map_err(map_read_error)?;
         crate::client_engine::files::read_range(
             &root,
-            start,
+            start as u64,
             length,
             &fetch,
             &cap,
@@ -462,36 +450,20 @@ impl Client {
         index: &crate::client_engine::files::FileIndex,
         chunk: usize,
     ) -> Result<Bytes> {
-        let mut plaintext = None;
-        self.data_download_indexed_chunks(index, chunk..chunk + 1, 1, |_, content| {
-            plaintext = Some(content);
-            Ok(())
-        })
-        .await?;
-        Ok(plaintext.expect("a completed pass delivers its one chunk"))
-    }
-
-    /// Fetch and decrypt whole chunks in one deferred retry pass, handing each
-    /// plaintext chunk to `sink` in completion order.
-    #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
-    pub(crate) async fn data_download_indexed_chunks(
-        &self,
-        index: &crate::client_engine::files::FileIndex,
-        chunks: std::ops::Range<usize>,
-        concurrency: usize,
-        sink: impl FnMut(usize, Bytes) -> std::result::Result<(), String>,
-    ) -> Result<()> {
-        crate::client_engine::files::for_each_chunk(
+        let mut chunks = crate::client_engine::files::read_chunks(
             index,
-            chunks,
+            chunk..chunk + 1,
             &|address| self.fetch_data_record(address),
-            &|| self.controller().fetch.current().min(concurrency),
+            &|| 1,
             &crate::runtime::sleep,
             retry_data_fetch,
-            sink,
         )
         .await
-        .map_err(map_read_error)
+        .map_err(map_read_error)?;
+        let (_, plaintext) = chunks
+            .pop()
+            .expect("a completed pass delivers its one chunk");
+        Ok(plaintext)
     }
 
     async fn fetch_data_record(&self, address: [u8; 32]) -> Result<Bytes> {
