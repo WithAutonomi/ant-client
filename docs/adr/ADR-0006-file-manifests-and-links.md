@@ -231,7 +231,9 @@ difference. The manifest itself is not encrypted; that is a later decision.
 A builder walks a directory or takes explicit (path, source) pairs. Local
 files are uploaded through the ordinary file upload with the visibility the
 caller chose for them; already-public files are added by address, with
-optional path and size, and nothing is uploaded.
+optional path and size, and nothing is uploaded. A public file can also be
+added with its DataMap fetched from the network and embedded, which costs
+nothing and lets recipients skip the DataMap fetch.
 
 Two reference modes for uploaded files:
 
@@ -328,7 +330,9 @@ and marks every unstarted entry cancelled.
 
 The library exposes: encode, decode, validate, link parse and format, build,
 and extract. Encode, decode, validate and link handling are portable and
-available to the browser build; build and extract need a filesystem. The CLI
+exported to the browser build, where an embedded entry's DataMap bytes feed
+the existing private-file download directly; build and extract need a
+filesystem. The CLI
 exposes create, list, show, link, export and download for manifests, and its
 ordinary file download accepts a file link or a bare address. No daemon API
 is added.

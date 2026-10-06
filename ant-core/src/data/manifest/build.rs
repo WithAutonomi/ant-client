@@ -187,6 +187,29 @@ impl<'a> ManifestBuilder<'a> {
         Ok(())
     }
 
+    /// Add a file by a DataMap already in hand, embedded. Nothing is
+    /// uploaded. This is how a public file is brought into a manifest with
+    /// its DataMap embedded, so recipients skip the DataMap fetch.
+    pub fn add_embedded(
+        &mut self,
+        data_map: self_encryption::DataMap,
+        path: Option<String>,
+        size: Option<u64>,
+    ) -> Result<(), ManifestError> {
+        if let Some(p) = &path {
+            validate_path(p).map_err(|reason| ManifestError::InvalidPath {
+                path: p.clone(),
+                reason,
+            })?;
+        }
+        self.entries.push(ManifestEntry {
+            path,
+            size,
+            source: ContentRef::Embedded { data_map },
+        });
+        Ok(())
+    }
+
     /// Add an already-public file by address. Nothing is uploaded.
     pub fn add_public(
         &mut self,

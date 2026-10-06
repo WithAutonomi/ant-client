@@ -72,6 +72,11 @@ pub enum ManifestAction {
         /// Add an already-public file by address, optionally under PATH.
         #[arg(long = "public-file", value_name = "ADDRESS[=PATH]")]
         public_files: Vec<String>,
+        /// Add an already-public file by address but fetch its DataMap and
+        /// embed it, so recipients skip the DataMap fetch. Needs the network,
+        /// no wallet.
+        #[arg(long = "embed-public", value_name = "ADDRESS[=PATH]")]
+        embed_public: Vec<String>,
         /// Force merkle batch payment regardless of chunk count.
         #[arg(long, conflicts_with = "no_merkle")]
         merkle: bool,
@@ -149,7 +154,11 @@ impl ManifestAction {
     /// Whether the command talks to the network.
     pub fn needs_network(&self) -> bool {
         match self {
-            Self::Create { paths, .. } => !paths.is_empty(),
+            Self::Create {
+                paths,
+                embed_public,
+                ..
+            } => !paths.is_empty() || !embed_public.is_empty(),
             Self::Download { .. } => true,
             Self::Export { compact, .. } => *compact,
             Self::List | Self::Show { .. } | Self::Link { .. } => false,
@@ -177,10 +186,11 @@ impl ManifestAction {
                 output,
                 name,
                 public_files,
+                embed_public,
                 overwrite,
                 link,
                 ..
-            } if paths.is_empty() => {
+            } if paths.is_empty() && embed_public.is_empty() => {
                 // Nothing to upload: a manifest over already-public files.
                 let mut manifest = Manifest::new(name);
                 for spec in &public_files {
@@ -231,6 +241,7 @@ impl ManifestAction {
                 public,
                 follow_symlinks,
                 public_files,
+                embed_public,
                 merkle,
                 no_merkle,
                 overwrite,
@@ -253,6 +264,7 @@ impl ManifestAction {
                         public,
                         follow_symlinks,
                         public_files,
+                        embed_public,
                         payment_mode,
                         overwrite,
                         link,
@@ -428,6 +440,7 @@ struct CreateArgs {
     public: bool,
     follow_symlinks: bool,
     public_files: Vec<String>,
+    embed_public: Vec<String>,
     payment_mode: PaymentMode,
     overwrite: bool,
     link: bool,
@@ -478,7 +491,16 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         let (address, path) = parse_public_file(spec)?;
         builder.add_public(address, path, None)?;
     }
-    if builder.pending_count() == 0 && args.public_files.is_empty() {
+    for spec in &args.embed_public {
+        let (address, path) = parse_public_file(spec)?;
+        info!("Fetching public DataMap {}", hex::encode(address));
+        let data_map = client.data_map_fetch(&address).await.map_err(|e| {
+            anyhow::anyhow!("Failed to fetch DataMap {}: {e}", hex::encode(address))
+        })?;
+        builder.add_embedded(data_map, path, None)?;
+    }
+    if builder.pending_count() == 0 && args.public_files.is_empty() && args.embed_public.is_empty()
+    {
         anyhow::bail!("nothing to add: the given paths contain no regular files");
     }
 
@@ -1008,6 +1030,7 @@ mod tests {
             public: false,
             follow_symlinks: false,
             public_files: vec!["ab".repeat(32)],
+            embed_public: vec![],
             merkle: false,
             no_merkle: false,
             overwrite: false,
