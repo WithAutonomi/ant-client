@@ -6,59 +6,85 @@ a protocol change?
 
 ## Summary
 
+Round 1 measured where read time goes and compared the issue's combined
+request with the no-protocol alternative. Round 2 tried to keep the combined
+request's speed without its duplicate downloads.
+
 - **Native reads spend most of their time finding a holder, not fetching from
   it.** Discovery is 5.1 s at p50 and transfer 0.8 s (82% of the mean). The
   closest-peers lookup runs to convergence, about 6 s, before ordinary GETs
-  start. Early GETs to already-connected peers found the chunk in only 23 of
-  88 reads.
+  start.
 - **Browser reads split their time evenly.** Fetching 4 MB over a WebRTC
-  DataChannel takes 2.7 s at p50, about as long as discovery (2.4 s). The
-  browser already turns lookup progress into early GETs.
-- **An emulated combined request is the fastest option, but it downloads
-  several copies.**
-  - Natively it cuts p50 from 5.95 s to 0.97 s and p90 from 13.0 s to 1.9 s.
-    On average it downloads 3.3 copies of each chunk (at most 11), because the
-    round that reaches the close group queries several holders at once.
-  - In the browser it cuts p50 only from 5.2 s to 4.2 s and p90 from 13.5 s to
-    9.0 s, with 2.75 copies. The copies slow each other down: one successful
-    GET slows from 2.7 s to 4.5 s.
-- **Most of the native gain needs no protocol change.** If lookup progress
-  feeds the existing early-GET path, as the browser already does, native p50 is
-  1.8 s and p90 4.9 s, with one copy.
-- **Offering peers as they are queried ("eager") is not safe.** It helps a
-  little natively (1.5 s p50, 4.2 s p90) but doubles browser read time (10.3 s
-  p50, 25 s p90). Endpoints that have not answered yet take the two early-GET
-  slots, and 36% of browser WebRTC dials fail.
-- **A protocol change is not needed to get combined-request latency.** The
-  emulation is just a GET sent beside each FIND_NODE. What only a protocol
-  change can add is a cheap "I hold it" answer, so the client downloads fewer
-  copies. Estimated from the traces:
+  DataChannel takes 2.2–2.7 s at p50, about as long as discovery. The browser
+  already turns lookup progress into early GETs.
+- **The combined request is fast but wasteful.** An emulated combined request
+  ("chunk or closer peers") cuts native p50 from 5.95 s to about 1.0 s. It
+  downloads 2.5–3.3 copies of each chunk, because the round that reaches the
+  close group asks several holders at once. Its speed needs no protocol change:
+  the emulation is just a GET sent beside each FIND_NODE.
+- **Feeding lookup progress to the early GETs needs no protocol change.**
+  Native p50 drops to 1.8–2.2 s, with one copy.
+- **A "do you hold it?" answer gets the combined request's speed with one
+  copy.** This is the "have" policy (round 2):
+  - The client asks each queried peer whether it holds the chunk, beside the
+    FIND_NODE. It fetches from the first holder, and asks a second holder only
+    if the first is still sending after 1.5 s.
+  - A storage quote's `already_stored` flag stood in for the answer, so no node
+    changed.
+  - Native results in one interleaved run:
 
-  | Variant | Native p50 | Native p90 | Copies | Browser p50 |
-  | --- | ---: | ---: | ---: | ---: |
-  | Only the closest peer per round inlines the chunk | 1.17 s | 3.0 s | 1.6 | 5.0 s |
-  | "Have it + closer peers", then one fetch | ≤ 1.56 s | ≤ 5.7 s | 1 | ≤ 5.6 s |
+    | Policy | p50 | p90 | Copies (mean) | GETs per read |
+    | --- | ---: | ---: | ---: | ---: |
+    | have | 1.16 s | 2.32 s | 1.07 | 1 |
+    | combined | 1.04 s | 3.16 s | 2.53 | 6 |
+    | progress | 2.24 s | 5.01 s | 1.0 | 8 |
 
-  The browser baseline is 5.2 s.
+- **Whole-file reads (612 MB, four chunks in flight):**
 
-**Recommendation: the combined request does not win. Do not add the protocol
-message.**
+  | Policy | Time |
+  | --- | ---: |
+  | baseline | 199–205 s |
+  | progress | 83–91 s |
+  | combined | 49–55 s |
+  | capped (two GETs, closest first; no protocol change) | 54 s |
+  | have | 55–57 s |
 
-1. **Native: give the lookup progress hints the browser already gets.** Add
-   the small saorsa-core `LookupObserver` hook prototyped here. Offer each
-   FIND_NODE responder, and each already-connected peer it returns, to
-   `retrieve_progressive`. Measured: p50 5.95 s → 1.83 s, p90 13.0 s → 4.9 s,
-   max 29.2 s → 12.8 s, one copy, 6 GETs per read instead of 15. Do not offer
-   cold queried peers ("eager").
-2. **Browser: nothing from this issue.** Its remaining time is DataChannel
-   transfer and dead WebRTC endpoints. Neither a combined message nor more
-   hints addresses those.
-3. **Revisit "have it + closer peers" only if native tails stay well above the
-   estimates above** once step 1 ships. Its estimated gain over step 1 is
-   0.3–0.7 s at p50. In exchange it needs:
-   - a new message
-   - a native lookup outside saorsa-core
-   - a capability fallback for old nodes
+- **In the browser, no policy clearly beats today's reads.**
+  - Combined pooled over three runs: 4.6 s against 5.2 s at p50, with 2.8
+    copies. In round 2 every policy landed between 4.7 s and 6.8 s at p50.
+  - Transfer and dead WebRTC endpoints dominate.
+  - Have's 1.5 s hedge is shorter than a browser transfer, so it fetched 1.5
+    copies there.
+- **Offering peers before they answer ("eager") is not safe.** It doubled
+  browser read time, because 36% of browser WebRTC dials fail and the dead
+  endpoints took the two early-GET slots.
+
+## Recommendation
+
+The issue's combined request does not win. Its speed needs no protocol change,
+and it downloads 2.5–3.3 copies. A smaller protocol change does win natively:
+
+1. **Protocol: add a "do you hold this chunk?" request.**
+   - `ChunkHasRequest { address }` → `ChunkHasResponse { address, held }`,
+     answered from a storage existence check. The node does no lookup and no
+     signing.
+   - It returns no peers. The client keeps sending FIND_NODE through
+     saorsa-core, so peer validation stays there and ant-core needs no lookup
+     of its own.
+   - Advertise it: the native user agent's node version, and a browser HELLO
+     capability. Treat an unanswered probe as "unknown".
+   - This is a wire change, so it needs an ant-node ADR.
+2. **Client: drive reads from the lookup.**
+   - Use saorsa-core's new `LookupObserver` hook to have-probe each peer as it
+     is queried. Fetch from the first holder, hedged.
+   - Where peers don't answer the new request, GET the two closest queried
+     peers instead (capped). Capped needs only the saorsa-core hook and works
+     against today's nodes, so it can ship first: native p50 1.49 s, p90
+     3.48 s, 1.67 copies, whole file 54 s.
+3. **Browser: use the same path.**
+   - Size the hedge for DataChannel transfers (3 s or more).
+   - Do not cap GETs on peers that have not connected.
+   - Its main cost, transfer, needs separate work.
 
 ## Method
 
@@ -72,6 +98,9 @@ the bundled seeds:
 | Browser run s1 | 14:35–15:02 |
 | Native run s2 | 15:03–15:18 |
 | Browser run s2 | 15:18–15:49 |
+| Native run s3 (round 2) | 16:22–16:38 |
+| Browser run s3 (round 2) | 20:14–20:43 |
+| Whole-file runs (round 2) | 20:43–21:00 |
 
 The connected nodes reported `node/0.21.0` (937) and `node/0.20.0` (23).
 
@@ -128,7 +157,7 @@ traces:
   upper bound. It can only be computed when the holder's FIND_NODE answer
   arrived before the lookup was cancelled (49 of 87 native reads).
 
-## Results
+## Round 1 results
 
 ### Where native read time goes today (full download)
 
@@ -224,53 +253,119 @@ WebRTC Direct dials failed (1,775 of 4,967).
   estimates are 5.0 s p50 (inline-closest) and at most 5.6 s (have+fetch),
   against a 5.2 s baseline.
 
-## What a protocol change would and would not buy
+## Round 2: keeping the speed without the copies
+
+The round 2 policies act on each peer the lookup queries, at the moment it is
+queried, and stop at the first verified chunk:
+
+| Policy | What it does | Protocol change |
+| --- | --- | --- |
+| combined | GET every queried peer (round 1). | none |
+| capped | GET queried peers closest-first, two at a time. | none |
+| have | Ask every queried peer whether it holds the chunk. GET from the first holder; GET a second holder if the first is still running after 1.5 s. | "have" request, emulated with a storage quote's `already_stored` |
+| have_inline | Like have, but the closest queried peer of each round gets a GET instead of the question. | "have" request plus an inline flag |
+
+Round 1's combined traces were first replayed under capped and hedged
+policies (`simulate_probe_policy.py`, `estimate_capped.py`):
+
+- **Native.** Two GETs, closest first, came out at an estimated p50 of 1.07 s
+  with 1.84 copies.
+- **Browser.** Every cap was much worse. Dead endpoints hold the capped slots
+  for up to 10 s.
+
+### Native (run s3, 30 reads per policy)
+
+| Policy | p50 | p75 | p90 | max | GETs per read | Copies (mean / max) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| progress | 2.24 s | 3.60 s | 5.01 s | 9.66 s | 8 | 1.00 / 1 |
+| combined | 1.04 s | 1.90 s | 3.16 s | 6.02 s | 6 | 2.53 / 9 |
+| capped | 1.49 s | 2.67 s | 3.48 s | 6.74 s | 4 | 1.67 / 2 |
+| have | 1.16 s | 1.89 s | 2.32 s | 3.05 s | 1 | 1.07 / 2 |
+| have_inline | 1.65 s | 2.58 s | 3.53 s | 4.92 s | 3 | 1.73 / 3 |
+
+- Have sent 5 have-probes per read, answered in 0.21 s at p50 and 0.67 s at
+  p90.
+- **Have_inline is worse than have, for two reasons.** An inline GET to a slow
+  or dead peer holds back the holder GET until the hedge. And inline GETs that
+  reach holders add copies.
+
+### Browser (run s3, 30 reads per policy)
+
+| Policy | p50 | p75 | p90 | max | GETs per read | Copies (mean / max) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline | 5.08 s | 8.69 s | 11.55 s | 15.66 s | 14 | 1.00 / 1 |
+| combined | 5.41 s | 10.34 s | 11.78 s | 27.06 s | 13 | 3.10 / 6 |
+| capped | 4.74 s | 12.51 s | 16.27 s | 21.99 s | 7 | 1.53 / 2 |
+| have | 5.03 s | 7.88 s | 11.71 s | 15.97 s | 2 | 1.53 / 2 |
+| have_inline | 6.80 s | 9.11 s | 10.63 s | 18.88 s | 3 | 1.40 / 3 |
+
+- **Thirty reads per policy is too few to separate these.** Combined, which
+  beat the baseline in runs s1 and s2, did not here.
+- **Have answers took longer in the browser.** p50 was 0.40 s and p90 2.8 s,
+  and a successful GET took 2.2 s at p50. So the 1.5 s hedge fired on most
+  reads, and have fetched 1.5 copies.
+- **Capped's tail comes from dead endpoints.** They hold its two slots, which
+  pushes p90 to 16 s.
+
+### Whole file (four chunks in flight, two passes in opposite order)
+
+`--concurrency 4 --drain-secs 0`, one policy per process, all 150 records:
+
+| Policy | Pass 1 | Pass 2 |
+| --- | ---: | ---: |
+| baseline | 199.0 s | 204.9 s |
+| progress | 83.0 s | 91.0 s |
+| combined | 54.8 s | 49.4 s |
+| capped | 53.9 s | 53.5 s |
+| have | 57.3 s | 55.3 s |
+
+- **The lookup-driven policies all finish within a few seconds of each other.**
+  They are about 3.7 times faster than the baseline and 1.6 times faster than
+  progress.
+- **Duplicates cost bytes here, not wall time.** On this link, combined's
+  extra copies did not cost wall time. They are still 2.5–3.3 times the bytes,
+  for the client and for the nodes that send them.
+
+## Protocol notes
 
 - **"No separate GET round trip after the lookup."**
   - Confirmed as the dominant native cost: baseline discovery is 5.1 s at p50.
-  - Removing most of that wait does not need a new message. Feeding FIND_NODE
-    responders to the early-GET path (progress) cuts it to 1.0 s. A GET sent
-    beside each FIND_NODE (combined) cuts it to 0.3 s, also without a new
-    message.
+  - It is removed by acting on each peer as the lookup queries it. Combined
+    and capped do that with no protocol change.
 - **"No waiting for the lookup's final rounds when the chunk exists."**
-  - Confirmed. Combined, progress and eager reads almost never wait for the
-    lookup to finish (5 of 212 reads), against 67 of 88 baseline reads.
-  - The same is true of every strategy that observes the lookup, including
-    those with no protocol change.
-- **Duplicate downloads.** These are the real cost of returning the value
-  inline:
-  - Natively, 3.3 copies per chunk on average, or 13 MB to read a 4 MB chunk.
-  - Under load, the copies compete for the client's downlink and the holders'
-    uplinks. In the browser this already shows: one successful GET slowed from
-    2.65 s to 4.6 s.
-  - A protocol change could carry a "have it" flag instead of the chunk. Only
-    then could the client keep the round trip and download one copy. The
-    estimates above put that variant at about 1.2–1.6 s p50 natively, against
-    progress's measured 1.8 s.
-
-If the protocol change is pursued later, these points from the issue still
-apply:
-
-- **Message size and validation.** saorsa-core's FIND_NODE runs on the DHT
-  topic, which caps a message at 64 KiB, so it cannot carry a 4 MB chunk. A
-  chunk-carrying lookup response would have to be a new ant-protocol
-  `ChunkMessageBody` variant, and ant-core would need its own native lookup.
-  That lookup would have to validate returned peers as FIND_NODE does, which
-  means exposing these private saorsa-core functions:
-  - `trusted_find_node_response_nodes`
-  - `validate_transport_address_records`
-  - the LAN filter
-  - `lookup_candidate_dial_plan_is_exhausted`
-
-  `client_routing::compute_winner` is already public.
-- **Capability.** Native QUIC has no capability exchange. An old node silently
-  drops an unknown `ChunkMessageBody` variant, so a client would wait for its
-  timeout. That is the `QuoteRequestV2` probe-and-fallback problem again. The
-  node's user agent (`node/0.21.0`) is available for connected peers and could
-  gate the request. The browser would use a HELLO capability, like
-  `pointer_protocol`.
-- **Absence.** Deciding that a chunk is missing would still need a completed
-  lookup and a majority of `NotFound`s. No strategy here changes that rule.
+  - Confirmed. The lookup-driven policies almost never wait for the lookup to
+    finish.
+- **Duplicate downloads.** This is the real cost of returning the chunk
+  inline.
+  - Without some way to learn who holds a chunk before it arrives, a client
+    either races holders and gets copies (combined), or caps its GETs and
+    waits on slow or dead peers (capped).
+  - A "have" answer removes that choice: have reaches combined's speed with
+    one copy.
+- **Why the request should not return peers.**
+  - saorsa-core's FIND_NODE validates returned peers in private code:
+    - `trusted_find_node_response_nodes`
+    - `validate_transport_address_records`
+    - the LAN filter
+    - `lookup_candidate_dial_plan_is_exhausted`
+  - A peer-returning ant-protocol message would need ant-core to run its own
+    native lookup and duplicate that validation.
+  - Sending a small have request beside FIND_NODE keeps discovery in
+    saorsa-core. The `LookupObserver` hook is all the client needs.
+- **Capability.**
+  - Native QUIC has no capability exchange, and an old node silently drops an
+    unknown `ChunkMessageBody` variant.
+  - The node's user agent (`node/0.21.0`) is known once a peer is connected,
+    and can gate the request.
+  - A have-probe that gets no answer is only "unknown". The client still has
+    the peer's FIND_NODE answer, and can fall back to a capped GET.
+  - The browser would use a HELLO capability, like `pointer_protocol`.
+- **Absence.** Deciding that a chunk is missing still needs a completed lookup
+  and a majority of `NotFound`s, which `held: false` answers can count as. No
+  policy here changes that rule.
+- **Node cost.** A have answer is one file existence check and a few bytes.
+  The emulation's quotes are heavier: they are signed. Their answer times are
+  therefore an upper bound for a real have answer.
 
 ## Caveats
 
@@ -291,6 +386,10 @@ apply:
   in s2. The browser differences between baseline and combined are smaller,
   and should be read as direction, not size.
 - **Eager has one run per platform** (37 native reads, 50 browser reads).
+- **Round 2 ran later than round 1.** It has 30 reads per policy, and
+  compares policies only within each run. Native p50 for progress was 1.83 s
+  in round 1 and 2.24 s in round 2.
+- **Have's hedge (1.5 s) and capped's limit (2) were not tuned.**
 
 ## Reproduction
 
@@ -301,19 +400,25 @@ The bench needs saorsa-core with `LookupObserver`. ant-client's root
 # Native strategy runs
 cargo run --release --example read-strategy-bench -- \
   --addresses docs/investigations/2026-10-06-kademlia-chunk-get/chunks.txt \
-  --out run-s1.jsonl --seed 1 --strategies baseline,progress,eager,combined
+  --out run-s3.jsonl --seed 3 --strategies progress,combined,capped,have,have_inline
+
+# Native whole-file run for one policy
+cargo run --release --example read-strategy-bench -- \
+  --addresses docs/investigations/2026-10-06-kademlia-chunk-get/chunks.txt \
+  --out tp-have.jsonl --seed 10 --strategies have --concurrency 4 --drain-secs 0
 
 # Browser strategy runs (Playwright with Chromium installed)
 wasm-pack build --target web --release \
   --out-dir docs/investigations/2026-10-06-kademlia-chunk-get/browser/pkg ant-core \
   --no-default-features --features browser-wasm,test-utils
 cd docs/investigations/2026-10-06-kademlia-chunk-get/browser
-PLAYWRIGHT=<path to playwright/index.mjs> node run.mjs ../chunks.txt run-s1.jsonl 1 5 30 baseline,eager,combined
+PLAYWRIGHT=<path to playwright/index.mjs> node run.mjs ../chunks.txt run-s3.jsonl 3 5 30 baseline,combined,capped,have,have_inline
 
 # Analysis
 python3 analyze_strategies.py results/native-strategies-run-s1.jsonl.gz results/native-strategies-run-s2.jsonl.gz
 python3 split.py results/native-strategies-run-s1.jsonl.gz results/native-strategies-run-s2.jsonl.gz
 python3 analyze_native.py results/native-download-diagnostics.jsonl.gz
+python3 simulate_probe_policy.py results/native-strategies-run-s1.jsonl.gz results/native-strategies-run-s2.jsonl.gz
 ```
 
 Raw traces are in [`results/`](results):

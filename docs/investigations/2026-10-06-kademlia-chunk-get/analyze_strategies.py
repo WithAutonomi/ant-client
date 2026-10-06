@@ -24,7 +24,7 @@ def row_f(name, xs):
     return (f"  {name:34s} n={len(xs):3d} p50={pct(xs,50):6.2f} p90={pct(xs,90):6.2f} max={max(xs):6.2f} mean={st.mean(xs):6.2f}")
 
 lines = []
-for path in sys.argv[1:]:
+for path in [a for a in sys.argv[1:] if not a.startswith('--')]:
     lines += [json.loads(l) for l in open_any(path) if l.strip()]
 by = defaultdict(list)
 timeouts = defaultdict(int)
@@ -34,7 +34,7 @@ for l in lines:
         continue
     by[l['strategy']].append(l['trace'])
 
-for strategy in ['baseline', 'progress', 'eager', 'combined']:
+for strategy in ['baseline', 'progress', 'eager', 'combined', 'capped', 'have', 'have_inline']:
     ts = by.get(strategy)
     if not ts: continue
     found = [t for t in ts if t['found']]
@@ -54,7 +54,11 @@ for strategy in ['baseline', 'progress', 'eager', 'combined']:
     for t in ts:
         for a in t['attempts']: outcomes[a['outcome']] += 1
     print("  GET outcomes:", dict(outcomes))
-    if strategy != 'combined':
+    probes = [t.get('have_probes', []) for t in ts]
+    if any(probes):
+        print(row("have-probes per read", [len(p) for p in probes]))
+        print(row("have answer time (ms)", [h['completed_ms'] - h['started_ms'] for p in probes for h in p if h['outcome'] in ('have', 'not_have')]))
+    if strategy not in ('combined', 'capped', 'have', 'have_inline'):
         early = sum(1 for t in found if any(a['outcome'] == 'found' and a['early'] and a['completed_ms'] <= t['total_ms'] + 1 for a in t['attempts']))
         print(f"  won by early GET:                 {early}/{len(found)}")
         print(row("successful GET duration (ms)", [a['completed_ms'] - a['started_ms'] for t in found for a in t['attempts'] if a['outcome'] == 'found']))
@@ -90,7 +94,7 @@ def xor(a_hex, b_hex):
 #  - inline-closest: per lookup round, only the peer closest to the target is
 #    asked to inline the chunk; other holders answer "have + peers".
 ts = [t for t in by.get('combined', []) if t['found']]
-if ts:
+if ts and '--variants' in sys.argv:
     hf_t, hf_n, ic_t, ic_copies, ic_n = [], 0, [], [], 0
     for t in ts:
         answers = {a['peer']: a for a in t['answers']}

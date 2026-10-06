@@ -1,0 +1,10 @@
+tp-baseline-p1: done: 150 reads at concurrency 4 in 199021 ms
+tp-baseline-p2: done: 150 reads at concurrency 4 in 204911 ms
+tp-capped-p1: done: 150 reads at concurrency 4 in 53901 ms
+tp-capped-p2: done: 150 reads at concurrency 4 in 53547 ms
+tp-combined-p1: done: 150 reads at concurrency 4 in 54812 ms
+tp-combined-p2: done: 150 reads at concurrency 4 in 49416 ms
+tp-have-p1: done: 150 reads at concurrency 4 in 57327 ms
+tp-have-p2: done: 150 reads at concurrency 4 in 55314 ms
+tp-progress-p1: done: 150 reads at concurrency 4 in 82956 ms
+tp-progress-p2: done: 150 reads at concurrency 4 in 90988 ms

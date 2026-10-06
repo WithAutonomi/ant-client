@@ -15,7 +15,7 @@ for l in lines:
     win = min((a for a in t['attempts'] if a['outcome'] == 'found'), key=lambda a: a['completed_ms'])
     by[l['strategy']].append((t['total_ms'], win['started_ms'], win['completed_ms'] - win['started_ms']))
 print(f"{'strategy':10s} {'n':>4s} | {'total p50':>9s} {'p90':>7s} | {'discovery p50':>13s} {'p90':>7s} | {'transfer p50':>12s} {'p90':>7s} | discovery share of mean")
-for s in ['baseline', 'progress', 'eager', 'combined']:
+for s in ['baseline', 'progress', 'eager', 'combined', 'capped', 'have', 'have_inline']:
     rs = by.get(s)
     if not rs: continue
     tot = [r[0] for r in rs]; disc = [r[1] for r in rs]; xfer = [r[2] for r in rs]
