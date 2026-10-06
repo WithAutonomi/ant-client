@@ -680,10 +680,12 @@ read-ahead off as described under streaming reads. Read-ahead plans its windows
 over the same 64-bit index, so it follows reads past 4 GiB on wasm32.
 
 Complete downloads and `BrowserFileReader.pipeTo` share one transfer: chunks are
-fetched concurrently within the client's adaptive fetch cap, each retried on the
-deferred schedule on its own, and handed on in file order. Fetching continues
-while the consumer works, holding at most 32 MiB of plaintext. A complete download copies each chunk into one
-JavaScript `Uint8Array` allocated up front, hashes it in order and keeps the
+fetched concurrently within the client's adaptive fetch cap (and a complete
+download's `concurrency` argument), each retried on the deferred schedule on its
+own, and handed on in file order. Fetching continues while the consumer works,
+holding at most 32 MiB of plaintext; a record waiting to retry keeps its place
+under the cap. A complete download copies each chunk into one JavaScript
+`Uint8Array` allocated up front, hashes it in order and keeps the
 `Downloaded chunk n/total` progress. Its optional `maxMemoryBytes` limits that
 allocation; allocation failure rejects before file-content transfer and directs
 the caller to streaming. Automatic free-memory detection and implicit disk spill

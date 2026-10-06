@@ -236,7 +236,8 @@ impl Cancellation {
 /// continues while a write is pending, within the client's adaptive fetch cap
 /// and `concurrency`, until the chunks in flight, fetched and being written
 /// hold `STREAM_BUFFER_BYTES` of plaintext. Each missing record is retried on
-/// its own schedule, so retry waits overlap with the other fetches.
+/// its own schedule, so retry waits overlap with the other fetches; a record
+/// waiting to retry still holds its place under the cap.
 async fn stream_chunks<W, WF>(
     shared: &crate::data::Client,
     index: &FileIndex,

@@ -172,16 +172,17 @@ test("pipeTo keeps fetching behind a blocked write only up to its 32 MiB buffer"
     });
     const before = gets(rtc);
     const completion = reader.pipeTo(sink);
-    await entered;
-    const blocked = gets(rtc);
-    // Let fetching run as far as the buffer allows, then check that it stopped.
-    let settled = blocked;
-    for (let previous = -1; previous !== settled; settled = gets(rtc)) {
-      previous = settled;
-      await new Promise(resolve => setTimeout(resolve, 100));
+    await Promise.race([entered, completion.then(() => assert.fail("pipeTo finished without writing"))]);
+    // Fetching continues behind the blocked write until the buffer is full,
+    // and stops there.
+    const bufferChunks = Math.floor(32 * 1024 * 1024 / 4_190_208);
+    const deadline = Date.now() + 10_000;
+    while (gets(rtc) - before < bufferChunks && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 20));
     }
-    assert(settled > blocked, `no GET was sent while the write was blocked (${blocked})`);
-    assert(settled - before <= Math.floor(32 * 1024 * 1024 / 4_190_208), `${settled - before} chunks fetched behind one blocked write`);
+    assert.equal(gets(rtc) - before, bufferChunks, "chunks fetched behind one blocked write");
+    await new Promise(resolve => setTimeout(resolve, 200));
+    assert.equal(gets(rtc) - before, bufferChunks, "fetching stops at the buffer bound");
     unblock();
     const result = await completion;
     assert.equal(result.bytesWritten, original.length);

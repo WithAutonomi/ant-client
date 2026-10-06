@@ -371,7 +371,8 @@ enum PipelineEvent<T, X> {
 /// Items launch in order while fewer than `cap()` are in flight and the cost
 /// of launched-but-unwritten items stays within `budget`; one item can always
 /// run. Fetching continues while a write is pending, so slow items and their
-/// retry waits overlap with every other item the budget admits.
+/// retry waits overlap with the other items the cap and budget admit. An item
+/// waiting to retry still holds its place under the cap.
 #[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
 pub(crate) async fn ordered_pipeline<T, X, F, FF, W, WF, C>(
     items: Range<usize>,
@@ -544,6 +545,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Long enough that only a stalled pipeline reaches it.
+    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     fn fixture() -> (Bytes, DataMap, HashMap<[u8; 32], Bytes>) {
         let content = Bytes::from((0..18000).map(|i| (i * 37) as u8).collect::<Vec<_>>());
@@ -1044,6 +1048,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pipeline_keeps_no_more_than_its_cap_in_flight() {
+        const ITEMS: usize = 20;
+        const CAP: usize = 3;
+        let in_flight = std::cell::Cell::new(0);
+        let most_in_flight = std::cell::Cell::new(0);
+        ordered_pipeline(
+            0..ITEMS,
+            |_| 1,
+            u64::MAX,
+            &|| CAP,
+            |item| {
+                let (in_flight, most_in_flight) = (&in_flight, &most_in_flight);
+                async move {
+                    in_flight.set(in_flight.get() + 1);
+                    most_in_flight.set(most_in_flight.get().max(in_flight.get()));
+                    tokio::task::yield_now().await;
+                    in_flight.set(in_flight.get() - 1);
+                    Ok::<_, String>(item)
+                }
+            },
+            |_, _| async { Ok(()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(most_in_flight.get(), CAP);
+    }
+
+    #[tokio::test]
     async fn pipeline_keeps_fetching_while_a_write_is_pending() {
         // One fetch at a time: the first write only finishes once the last
         // item has been fetched, so fetching must continue behind it.
@@ -1073,7 +1105,7 @@ mod tests {
                 }
             },
         );
-        tokio::time::timeout(std::time::Duration::from_secs(5), pipeline)
+        tokio::time::timeout(STALL_TIMEOUT, pipeline)
             .await
             .expect("fetching stalled behind a pending write")
             .unwrap();
@@ -1110,7 +1142,7 @@ mod tests {
             },
             |_, _| async { Ok(()) },
         );
-        tokio::time::timeout(std::time::Duration::from_secs(5), pipeline)
+        tokio::time::timeout(STALL_TIMEOUT, pipeline)
             .await
             .expect("a slow item held back the items behind it")
             .unwrap();
