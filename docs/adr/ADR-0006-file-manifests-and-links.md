@@ -255,6 +255,20 @@ File permissions and timestamps are not recorded.
 
 Per-file payments are unchanged by this decision.
 
+### Upload history
+
+Every upload the client performs is also recorded as a manifest, so no
+upload is ever remembered only by a printed address or a loose DataMap file.
+A single-file upload becomes a one-entry manifest; a manifest build is
+recorded as itself. Records live under `<data dir>/uploads/` as ordinary
+`.ant` files named `<UTC timestamp>-<label>.ant`, where the filename stem is
+the record id. Nothing else is stored, so the history is a plain folder of
+manifests. The client lists records newest first and accepts a record id
+wherever it accepts a manifest file or link. A public upload is recorded by
+address, a private one by its embedded DataMap. Recording never fails an
+upload that has already succeeded; an unusable history directory is reported
+and the upload result still shown.
+
 ### Download and extraction
 
 Input: a manifest, an output root, and an optional selection by exact
@@ -292,8 +306,8 @@ and marks every unstarted entry cancelled.
 The library exposes: encode, decode, validate, link parse and format, build,
 and extract. Encode, decode, validate and link handling are portable and
 available to the browser build; build and extract need a filesystem. The CLI
-exposes create, show, link and download for manifests, and its ordinary file
-download accepts a file link or a bare address. No daemon API is added.
+exposes create, list, show, link and download for manifests, and its ordinary
+file download accepts a file link or a bare address. No daemon API is added.
 
 ## Consequences
 
@@ -301,6 +315,8 @@ download accepts a file link or a bare address. No daemon API is added.
 
 - A folder is one shareable artefact, as a file or a self-contained link,
   and the recipient picks what to fetch.
+- Every upload is recoverable later from the upload history, by id, without
+  the user having kept an address or a DataMap file.
 - Nothing about a manifest touches the network, so there is nothing to pay
   for, nothing to resolve, and no ambiguity about what an address is.
 - Mixed references let one manifest embed private files and point at public
@@ -330,6 +346,9 @@ download accepts a file link or a bare address. No daemon API is added.
   payments.
 - `.ant` and `ant://` are decided; changing either would not touch the bytes.
 - Unnamed entries extract under their hex address.
+- The upload history holds the DataMaps of private uploads in plain files
+  under the data directory, like `.datamap` files do today; protecting that
+  directory is the user's responsibility.
 
 ## Validation
 

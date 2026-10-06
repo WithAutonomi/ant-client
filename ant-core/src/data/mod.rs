@@ -65,6 +65,10 @@ pub use manifest::{
         ExtractReport,
     },
     file::{manifest_filename_for, read_manifest_file, write_manifest_file},
+    history::{
+        default_history_dir, format_timestamp, list_uploads, load_upload, record_upload,
+        UploadListing, UploadRecord, UPLOAD_HISTORY_DIR,
+    },
 };
 pub use manifest::{
     file_link, is_link, manifest_link, parse_link, ContentRef, Link, Manifest, ManifestEntry,

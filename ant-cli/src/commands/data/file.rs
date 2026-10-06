@@ -9,13 +9,15 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use ant_core::data::{
-    parse_link, spawn_download_diagnostics_writer, Client, CollisionPolicy, CostEstimateConfidence,
-    DownloadEvent, Error as DataError, FileChunkPeerReport, FileChunkPeerReportPeer,
-    FileChunkPeerStatus, FileChunkPeerSweepReport, Link, PaymentMode, UploadEvent,
+    parse_link, spawn_download_diagnostics_writer, Client, CollisionPolicy, ContentRef,
+    CostEstimateConfidence, DownloadEvent, Error as DataError, FileChunkPeerReport,
+    FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport, Link, Manifest,
+    ManifestEntry, PaymentMode, UploadEvent,
 };
 use ant_core::datamap_file::{original_name_from_datamap, read_datamap, write_datamap};
 
 use super::chunk::xor_distance_decimal;
+use super::manifest::record_upload_manifest;
 use crate::progress;
 
 /// File subcommands.
@@ -300,6 +302,31 @@ async fn handle_file_upload(
 
     let elapsed = start.elapsed();
 
+    let original_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Cannot determine source filename from {}", path.display())
+        })?;
+
+    // Every upload is remembered as a one-entry manifest in the upload
+    // history (ADR-0006), so it can be listed and downloaded again.
+    let source = match result.data_map_address {
+        Some(address) if public => ContentRef::Public { address },
+        _ => ContentRef::Embedded {
+            data_map: result.data_map.clone(),
+        },
+    };
+    let record = Manifest {
+        name: None,
+        entries: vec![ManifestEntry {
+            path: Some(original_name.clone()),
+            size: Some(file_size),
+            source,
+        }],
+    };
+    let manifest_id = record_upload_manifest(&record, Some(&original_name));
+
     if public {
         let dm_address = result
             .data_map_address
@@ -325,6 +352,7 @@ async fn handle_file_upload(
                 chunk_attempts_total: result.chunk_attempts_total,
                 store_durations_ms: result.store_durations_ms.clone(),
                 retries_histogram: result.retries_histogram,
+                manifest_id: manifest_id.clone(),
             };
             println!("{}", serde_json::to_string(&out)?);
         } else {
@@ -338,6 +366,7 @@ async fn handle_file_upload(
             println!();
             println!("Anyone can download this file with:");
             println!("  ant file download {hex_addr} -o <FILE>");
+            print_recorded(manifest_id.as_deref());
         }
 
         info!(
@@ -349,12 +378,6 @@ async fn handle_file_upload(
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let original_name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Cannot determine source filename from {}", path.display())
-            })?;
         let datamap_path =
             write_datamap(parent, &original_name, &result.data_map, collision_policy)
                 .map_err(|e| anyhow::anyhow!("Failed to persist datamap: {e}"))?;
@@ -377,6 +400,7 @@ async fn handle_file_upload(
                 chunk_attempts_total: result.chunk_attempts_total,
                 store_durations_ms: result.store_durations_ms.clone(),
                 retries_histogram: result.retries_histogram,
+                manifest_id: manifest_id.clone(),
             };
             println!("{}", serde_json::to_string(&out)?);
         } else {
@@ -390,6 +414,7 @@ async fn handle_file_upload(
             println!();
             println!("Download this file with:");
             println!("  ant file download --datamap {}", datamap_path.display());
+            print_recorded(manifest_id.as_deref());
         }
 
         info!(
@@ -750,6 +775,16 @@ struct UploadJsonResult {
     store_durations_ms: Vec<u64>,
     /// Stored-chunk count by retry round (index 0 = first attempt).
     retries_histogram: [usize; 4],
+    /// Id of the upload-history record, when it could be written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_id: Option<String>,
+}
+
+/// Tell the user where the upload was recorded.
+fn print_recorded(manifest_id: Option<&str>) {
+    if let Some(id) = manifest_id {
+        println!("Recorded as {id} (ant manifest download {id})");
+    }
 }
 
 #[derive(Serialize)]

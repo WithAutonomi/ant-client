@@ -3,16 +3,21 @@
 //! A manifest is a torrent-like description of a set of files. It is shared
 //! off the network as a `.ant` file or an `ant://manifest/...` link, never
 //! stored on the network.
+//!
+//! Every upload the CLI performs is also recorded as a manifest in the upload
+//! history under the data directory, so `ant manifest list` can show it and
+//! `ant manifest download <ID>` can fetch it again.
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ant_core::data::{
-    extract_manifest, is_link, manifest_filename_for, manifest_link, parse_link,
-    read_manifest_file, write_manifest_file, BuildEvent, BuildOptions, Client, ContentRef,
-    DownloadEvent, EntryStatus, ExtractEvent, ExtractOptions, Link, Manifest, ManifestBuilder,
-    PaymentMode, ReferenceMode, UploadEvent, Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+    default_history_dir, extract_manifest, format_timestamp, is_link, list_uploads, load_upload,
+    manifest_filename_for, manifest_link, parse_link, read_manifest_file, record_upload,
+    write_manifest_file, BuildEvent, BuildOptions, Client, ContentRef, DownloadEvent, EntryStatus,
+    ExtractEvent, ExtractOptions, Link, Manifest, ManifestBuilder, PaymentMode, ReferenceMode,
+    UploadEvent, UploadRecord, Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
 };
 use clap::Subcommand;
 use serde_json::json;
@@ -73,9 +78,12 @@ pub enum ManifestAction {
         #[arg(long)]
         link: bool,
     },
-    /// List the entries of a manifest file or link.
+    /// List every recorded upload, newest first.
+    List,
+    /// List the entries of a manifest.
     Show {
-        /// A `.ant` file or an `ant://manifest/...` link.
+        /// A `.ant` file, an `ant://manifest/...` link, or an upload id
+        /// from `ant manifest list`.
         source: String,
     },
     /// Print a manifest file as an `ant://manifest/...` link.
@@ -85,7 +93,8 @@ pub enum ManifestAction {
     },
     /// Download the files a manifest describes.
     Download {
-        /// A `.ant` file or an `ant://manifest/...` link.
+        /// A `.ant` file, an `ant://manifest/...` link, or an upload id
+        /// from `ant manifest list`.
         source: String,
         /// Directory to extract into. Defaults to the manifest name, or
         /// the current directory when it has none.
@@ -109,7 +118,7 @@ impl ManifestAction {
         match self {
             Self::Create { paths, .. } => !paths.is_empty(),
             Self::Download { .. } => true,
-            Self::Show { .. } | Self::Link { .. } => false,
+            Self::List | Self::Show { .. } | Self::Link { .. } => false,
         }
     }
 
@@ -121,6 +130,7 @@ impl ManifestAction {
     /// Run a command that needs no network.
     pub fn execute_offline(self, json: bool) -> anyhow::Result<()> {
         match self {
+            Self::List => list_history(json),
             Self::Show { source } => show(&load_manifest(&source)?, json),
             Self::Link { file } => link(&read_manifest_file(&file)?, json),
             Self::Create {
@@ -147,7 +157,8 @@ impl ManifestAction {
                 }
                 manifest.canonicalize()?;
                 let out = write_manifest(&manifest, output, overwrite)?;
-                report_created(&manifest, &out, None, link, json)
+                let history_id = record_upload_manifest(&manifest, None);
+                report_created(&manifest, &out, None, history_id, link, json)
             }
             Self::Create { .. } | Self::Download { .. } => {
                 anyhow::bail!("this command needs a network connection")
@@ -216,7 +227,7 @@ impl ManifestAction {
                 )
                 .await
             }
-            Self::Show { .. } | Self::Link { .. } => self.execute_offline(json),
+            Self::List | Self::Show { .. } | Self::Link { .. } => self.execute_offline(json),
         }
     }
 }
@@ -291,6 +302,7 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
     };
 
     let out = write_manifest(&result.manifest, args.output, args.overwrite)?;
+    let history_id = record_upload_manifest(&result.manifest, None);
     if !json {
         eprintln!(
             "Uploaded {} file(s), {} new chunk(s) in {:.1}s",
@@ -302,7 +314,14 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
             eprintln!("Skipped symlink: {}", skipped.display());
         }
     }
-    report_created(&result.manifest, &out, Some(&result), args.link, json)
+    report_created(
+        &result.manifest,
+        &out,
+        Some(&result),
+        history_id,
+        args.link,
+        json,
+    )
 }
 
 fn write_manifest(
@@ -317,10 +336,26 @@ fn write_manifest(
     Ok(out)
 }
 
+/// Record an upload in the history, warning instead of failing when the
+/// history directory is unusable: the upload itself has already succeeded.
+pub fn record_upload_manifest(manifest: &Manifest, label: Option<&str>) -> Option<String> {
+    let recorded = default_history_dir().and_then(|dir| record_upload(&dir, manifest, label));
+    match recorded {
+        Ok(record) => Some(record.id),
+        Err(e) => {
+            eprintln!(
+                "warning: upload succeeded but could not be recorded in the upload history: {e}"
+            );
+            None
+        }
+    }
+}
+
 fn report_created(
     manifest: &Manifest,
     out: &Path,
     result: Option<&ant_core::data::BuildResult>,
+    history_id: Option<String>,
     with_link: bool,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -336,6 +371,7 @@ fn report_created(
             "entries": entries_json(manifest)?,
             "total_size": manifest.total_size(),
             "link": link_text,
+            "history_id": history_id,
         });
         if let Some(r) = result {
             value["files_uploaded"] = json!(r.files_uploaded);
@@ -361,11 +397,82 @@ fn report_created(
             "ies"
         }
     );
+    if let Some(id) = history_id {
+        println!("Recorded as {id} (ant manifest download {id})");
+    }
     if let Some(link) = link_text {
         warn_if_long_link(manifest)?;
         println!("{link}");
     }
     Ok(())
+}
+
+fn list_history(json: bool) -> anyhow::Result<()> {
+    let dir = default_history_dir()?;
+    let listing = list_uploads(&dir)?;
+    if json {
+        let records: Vec<_> = listing
+            .records
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "recorded_at": r.recorded_at,
+                    "recorded_at_utc": format_timestamp(r.recorded_at),
+                    "name": r.manifest.name,
+                    "entries": r.manifest.entries.len(),
+                    "total_size": r.manifest.total_size(),
+                    "file": r.path.display().to_string(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "history_dir": dir.display().to_string(),
+                "records": records,
+                "unreadable": listing
+                    .unreadable
+                    .iter()
+                    .map(|(p, e)| json!({"file": p.display().to_string(), "error": e}))
+                    .collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+    if listing.records.is_empty() {
+        println!("No recorded uploads in {}", dir.display());
+    } else {
+        println!(
+            "{:<23}  {:>7}  {:>12}  ID",
+            "RECORDED (UTC)", "ENTRIES", "SIZE"
+        );
+        for r in &listing.records {
+            print_history_row(r);
+        }
+    }
+    for (path, error) in &listing.unreadable {
+        eprintln!("warning: unreadable record {}: {error}", path.display());
+    }
+    Ok(())
+}
+
+fn print_history_row(record: &UploadRecord) {
+    let size = record
+        .manifest
+        .total_size()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    // Drop the trailing " UTC"; the header already says so.
+    let stamp = format_timestamp(record.recorded_at);
+    let stamp = stamp.strip_suffix(" UTC").unwrap_or(&stamp);
+    println!(
+        "{:<23}  {:>7}  {:>12}  {}",
+        stamp,
+        record.manifest.entries.len(),
+        size,
+        record.id
+    );
 }
 
 fn show(manifest: &Manifest, json: bool) -> anyhow::Result<()> {
@@ -514,7 +621,8 @@ async fn download(
     Ok(())
 }
 
-/// Load a manifest from a `.ant` path or an `ant://manifest/...` link.
+/// Load a manifest from an `ant://manifest/...` link, a `.ant` path, or an
+/// upload id from the history, tried in that order.
 fn load_manifest(source: &str) -> anyhow::Result<Manifest> {
     if is_link(source) {
         return match parse_link(source)? {
@@ -524,8 +632,19 @@ fn load_manifest(source: &str) -> anyhow::Result<Manifest> {
             ),
         };
     }
-    read_manifest_file(Path::new(source))
-        .map_err(|e| anyhow::anyhow!("Failed to read manifest {source}: {e}"))
+    let path = Path::new(source);
+    if path.is_file() {
+        return read_manifest_file(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read manifest {source}: {e}"));
+    }
+    let dir = default_history_dir()?;
+    match load_upload(&dir, source)? {
+        Some(record) => Ok(record.manifest),
+        None => anyhow::bail!(
+            "{source} is not a manifest file, a manifest link, or a recorded upload id \
+             (see `ant manifest list`)"
+        ),
+    }
 }
 
 /// Parse `ADDRESS[=PATH]` for `--public-file`.

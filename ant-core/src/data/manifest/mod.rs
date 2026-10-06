@@ -38,6 +38,8 @@ pub mod build;
 pub mod extract;
 #[cfg(feature = "native")]
 pub mod file;
+#[cfg(feature = "native")]
+pub mod history;
 
 use ant_protocol::compute_address;
 use self_encryption::DataMap;

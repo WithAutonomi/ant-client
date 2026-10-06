@@ -80,6 +80,7 @@ ant-core/src/
 │       ├── path.rs           # Portable path rules (cross-platform, enforced everywhere)
 │       ├── link.rs           # ant://<address> and ant://manifest/<base64url> links
 │       ├── file.rs           # .ant file read/write
+│       ├── history.rs        # Upload history: one .ant per upload under <data dir>/uploads
 │       ├── build.rs          # ManifestBuilder (uploads files, embedded or compact refs)
 │       └── extract.rs        # Containment-safe extraction with per-entry results
 └── node/                     # Node management
@@ -117,7 +118,7 @@ ant-cli/src/
     │   ├── file.rs           # ant file upload/download
     │   ├── chunk.rs          # ant chunk put/get
     │   ├── pointer.rs        # ant pointer keygen/address/create/update/get/resolve
-    │   ├── manifest.rs       # ant manifest create/show/link/download
+    │   ├── manifest.rs       # ant manifest create/list/show/link/download
     │   └── wallet.rs         # ant wallet address/balance
     └── node/
         ├── mod.rs
@@ -155,7 +156,9 @@ cargo run --bin ant -- --help  # Run the CLI
 - **Binary source resolution**: Node binary sources are represented by the `BinarySource` enum (Latest, Version, Url, LocalPath). Download variants are stubbed until release infrastructure is available.
 - **Manifests never touch the network**: a manifest (`.ant` file or `ant://manifest/...` link)
   is shared off-network; only the files it references live on Autonomi. `ant://<hex>` is always
-  a plain file link. Entry paths obey the portable rules in `data/manifest/path.rs` at build,
+  a plain file link. Every upload (`ant file upload`, `ant manifest create`) is also recorded as
+  a manifest under `<data dir>/uploads/`; `ant manifest list` shows them and `show`/`download`
+  accept a record id. Entry paths obey the portable rules in `data/manifest/path.rs` at build,
   decode and extract time, and extraction never follows symlinks inside the output directory.
   See `docs/adr/ADR-0006-file-manifests-and-links.md`.
 - **Log forwarding is opt-in and node-logging-dependent**: `ant node logs forward enable` is the
