@@ -1,6 +1,7 @@
 import { defineConfig } from "@playwright/test";
 export default defineConfig({
-  testDir: ".", testMatch: "*.spec.js", workers: 1, timeout: 300_000, reporter: "line",
+  testDir: ".", testMatch: "*.spec.js", workers: 1, timeout: 300_000, forbidOnly: !!process.env.CI,
+  reporter: [["line"], ["./run-guard.js"]],
   use: { browserName: "chromium", headless: true, baseURL: "http://127.0.0.1:35173",
     launchOptions: { args: ["--force-fieldtrials=WebRTC-NoSdpMangleUfrag/Enabled/"] } },
   webServer: [
