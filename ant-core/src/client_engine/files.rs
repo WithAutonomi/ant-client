@@ -2,6 +2,10 @@
 //! filesystem or JS dependencies. Cryptography and recursive map semantics stay
 //! in self_encryption, the same implementation used by the native client.
 use bytes::Bytes;
+#[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
+use futures_util::future::{select, Either};
+#[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
+use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use self_encryption::{ChunkInfo, DataMap, EncryptedChunk, XorName};
 use std::{cell::RefCell, collections::HashMap, future::Future, ops::Range};
@@ -252,15 +256,6 @@ impl FileIndex {
         self.dst_hashes[chunk].0
     }
 
-    /// The size of the largest chunk.
-    pub(crate) fn largest_chunk(&self) -> u64 {
-        self.offsets
-            .windows(2)
-            .map(|bounds| bounds[1] - bounds[0])
-            .max()
-            .unwrap_or(0)
-    }
-
     /// The self-encryption chunk metadata in chunk order.
     pub(crate) fn chunk_infos(&self) -> impl Iterator<Item = ChunkInfo> + '_ {
         (0..self.chunk_count()).map(|index| {
@@ -364,6 +359,88 @@ where
         output.extend_from_slice(&plaintext[from as usize..to as usize]);
     }
     Ok(Bytes::from(output))
+}
+
+#[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
+enum PipelineEvent<T, X> {
+    Written(Result<(), X>),
+    Fetched(usize, Result<T, X>),
+}
+
+/// Fetch `items` concurrently and hand each result to `write` in item order.
+/// Items launch in order while fewer than `cap()` are in flight and the cost
+/// of launched-but-unwritten items stays within `budget`; one item can always
+/// run. Fetching continues while a write is pending, so slow items and their
+/// retry waits overlap with every other item the budget admits.
+#[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
+pub(crate) async fn ordered_pipeline<T, X, F, FF, W, WF, C>(
+    items: Range<usize>,
+    cost: impl Fn(usize) -> u64,
+    budget: u64,
+    cap: &C,
+    fetch: F,
+    mut write: W,
+) -> Result<(), X>
+where
+    F: Fn(usize) -> FF,
+    FF: Future<Output = Result<T, X>>,
+    W: FnMut(usize, T) -> WF,
+    WF: Future<Output = Result<(), X>>,
+    C: Fn() -> usize,
+{
+    let fetch = &fetch;
+    let mut in_flight = FuturesUnordered::new();
+    let mut ready = HashMap::new();
+    let mut writing = None;
+    let (mut next_launch, mut next_write) = (items.start, items.start);
+    let mut outstanding = 0u64;
+    while next_write < items.end {
+        while next_launch < items.end
+            && in_flight.len() < cap().max(1)
+            && (outstanding == 0 || outstanding.saturating_add(cost(next_launch)) <= budget)
+        {
+            let item = next_launch;
+            in_flight.push(async move { (item, fetch(item).await) });
+            outstanding = outstanding.saturating_add(cost(item));
+            next_launch += 1;
+        }
+        if writing.is_none() {
+            if let Some(value) = ready.remove(&next_write) {
+                writing = Some(Box::pin(write(next_write, value)));
+            }
+        }
+        // `outstanding` covers the next item to write, so with nothing being
+        // written that item is in flight.
+        let event = match writing.as_mut() {
+            Some(pending) if in_flight.is_empty() => PipelineEvent::Written(pending.await),
+            Some(pending) => match select(pending, in_flight.next()).await {
+                Either::Left((written, _)) => PipelineEvent::Written(written),
+                Either::Right((fetched, _)) => {
+                    let (item, value) = fetched.expect("items are in flight");
+                    PipelineEvent::Fetched(item, value)
+                }
+            },
+            None => {
+                let (item, value) = in_flight
+                    .next()
+                    .await
+                    .expect("the next item to write is in flight");
+                PipelineEvent::Fetched(item, value)
+            }
+        };
+        match event {
+            PipelineEvent::Written(written) => {
+                written?;
+                writing = None;
+                outstanding -= cost(next_write);
+                next_write += 1;
+            }
+            PipelineEvent::Fetched(item, value) => {
+                ready.insert(item, value?);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Native file-download retry rounds: retry missing records together after the
@@ -751,12 +828,11 @@ mod tests {
             infos.iter().map(|info| info.dst_hash).collect::<Vec<_>>()
         );
         assert_eq!(index.address(2), infos[2].dst_hash.0);
-        assert_eq!(index.largest_chunk(), size as u64);
-        // Chunk sizes are not capped natively; browsers apply their own limit.
+        // Chunk sizes are not capped; any positive size is indexed.
         let mut infos = infos;
         infos[1].src_size = 64 * size;
         let index = FileIndex::new(&DataMap::new(infos)).unwrap();
-        assert_eq!(index.largest_chunk(), 64 * size as u64);
+        assert_eq!(index.size(), (MIN_FILE_CHUNKS + 63) as u64 * size as u64);
     }
 
     #[tokio::test]
@@ -928,5 +1004,170 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("chunk size differs"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_writes_in_order_within_its_budget() {
+        const ITEMS: usize = 6;
+        const COST: u64 = 10;
+        const BUDGET: u64 = 3 * COST;
+        let launched = std::cell::Cell::new(0u64);
+        let most_outstanding = std::cell::Cell::new(0u64);
+        let mut written = Vec::new();
+        ordered_pipeline(
+            0..ITEMS,
+            |_| COST,
+            BUDGET,
+            &|| ITEMS,
+            |item| {
+                launched.set(launched.get() + 1);
+                async move {
+                    // Later items finish first.
+                    for _ in item..ITEMS {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok::<_, String>(item)
+                }
+            },
+            |item, value| {
+                assert_eq!(item, value);
+                let outstanding = (launched.get() - written.len() as u64) * COST;
+                most_outstanding.set(most_outstanding.get().max(outstanding));
+                written.push(item);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(written, (0..ITEMS).collect::<Vec<_>>());
+        assert_eq!(most_outstanding.get(), BUDGET);
+    }
+
+    #[tokio::test]
+    async fn pipeline_keeps_fetching_while_a_write_is_pending() {
+        // One fetch at a time: the first write only finishes once the last
+        // item has been fetched, so fetching must continue behind it.
+        let (fetched_last, unblock) = tokio::sync::oneshot::channel();
+        let fetched_last = std::cell::RefCell::new(Some(fetched_last));
+        let unblock = std::cell::RefCell::new(Some(unblock));
+        let mut written = Vec::new();
+        let pipeline = ordered_pipeline(
+            0..4,
+            |_| 1,
+            u64::MAX,
+            &|| 1,
+            |item| {
+                if item == 3 {
+                    let _ = fetched_last.borrow_mut().take().unwrap().send(());
+                }
+                async move { Ok::<_, String>(item) }
+            },
+            |item, _| {
+                let unblock = (item == 0).then(|| unblock.borrow_mut().take().unwrap());
+                written.push(item);
+                async move {
+                    if let Some(unblock) = unblock {
+                        unblock.await.unwrap();
+                    }
+                    Ok(())
+                }
+            },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), pipeline)
+            .await
+            .expect("fetching stalled behind a pending write")
+            .unwrap();
+        assert_eq!(written, vec![0, 1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_slow_item_does_not_hold_back_fetches_behind_it() {
+        // The first item stays in flight (as during a retry wait) until the
+        // third has been fetched.
+        let (fetched_third, released) = tokio::sync::oneshot::channel();
+        let fetched_third = std::cell::RefCell::new(Some(fetched_third));
+        let released = std::cell::RefCell::new(Some(released));
+        let completed = std::cell::RefCell::new(Vec::new());
+        let pipeline = ordered_pipeline(
+            0..3,
+            |_| 1,
+            3,
+            &|| 3,
+            |item| {
+                let released = (item == 0).then(|| released.borrow_mut().take().unwrap());
+                let fetched_third = (item == 2).then(|| fetched_third.borrow_mut().take().unwrap());
+                let completed = &completed;
+                async move {
+                    if let Some(released) = released {
+                        released.await.unwrap();
+                    }
+                    completed.borrow_mut().push(item);
+                    if let Some(fetched_third) = fetched_third {
+                        let _ = fetched_third.send(());
+                    }
+                    Ok::<_, String>(item)
+                }
+            },
+            |_, _| async { Ok(()) },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), pipeline)
+            .await
+            .expect("a slow item held back the items behind it")
+            .unwrap();
+        assert_eq!(*completed.borrow(), vec![1, 2, 0]);
+    }
+
+    #[tokio::test]
+    async fn pipeline_admits_an_oversized_item_and_stops_at_the_first_error() {
+        let mut written = Vec::new();
+        ordered_pipeline(
+            0..2,
+            |_| 100,
+            10,
+            &|| 4,
+            |item| async move { Ok::<_, String>(item) },
+            |item, _| {
+                written.push(item);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(written, vec![0, 1]);
+
+        let error = ordered_pipeline(
+            0..4,
+            |_| 1,
+            4,
+            &|| 4,
+            |item| async move {
+                if item == 2 {
+                    Err(format!("fetch {item}"))
+                } else {
+                    Ok(item)
+                }
+            },
+            |_, _| async { Ok(()) },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "fetch 2");
+        let error = ordered_pipeline(
+            0..4,
+            |_| 1,
+            4,
+            &|| 4,
+            |item| async move { Ok::<_, String>(item) },
+            |item, _| async move {
+                if item == 1 {
+                    Err(format!("write {item}"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "write 1");
     }
 }

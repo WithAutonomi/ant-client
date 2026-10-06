@@ -680,9 +680,9 @@ read-ahead off as described under streaming reads. Read-ahead plans its windows
 over the same 64-bit index, so it follows reads past 4 GiB on wasm32.
 
 Complete downloads and `BrowserFileReader.pipeTo` share one transfer: chunks are
-fetched concurrently, each retried on the deferred schedule on its own, and
-handed on in file order. Fetching continues while the consumer works, holding
-at most 32 MiB of plaintext. A complete download copies each chunk into one
+fetched concurrently within the client's adaptive fetch cap, each retried on the
+deferred schedule on its own, and handed on in file order. Fetching continues
+while the consumer works, holding at most 32 MiB of plaintext. A complete download copies each chunk into one
 JavaScript `Uint8Array` allocated up front, hashes it in order and keeps the
 `Downloaded chunk n/total` progress. Its optional `maxMemoryBytes` limits that
 allocation; allocation failure rejects before file-content transfer and directs
@@ -695,6 +695,8 @@ or a half-open range to a caller-owned `WritableStream`, at most 4 MiB per write
 awaiting each write. Like `ReadableStream.pipeTo`, it rejects invalid calls
 without touching the destination, closes the destination on success, aborts it
 on failure without waiting for a stalled write, and releases the writer lock.
+An abort while the destination is closing still rejects, but per the Streams
+specification the close completes, so the destination may already be committed.
 An `AbortSignal` cancels a `pipeTo` or a complete download, including resolution
 and retry waits. Closing a reader releases its read-ahead records and makes
 later calls fail; it no longer clears the client's shared, bounded chunk cache,

@@ -15,8 +15,8 @@ const records = large.records.map(record => ({
 }));
 const map = records.find(record => record.address === large.address);
 
-function fixture(source = records) {
-  const rtc = mockWebRtc([{}]);
+function fixture(source = records, node = {}) {
+  const rtc = mockWebRtc([node]);
   for (const record of source) rtc.stores[0].set(record.address, record.content);
   return { rtc, client: new BrowserNetworkClient(rtc.endpoints) };
 }
@@ -154,7 +154,8 @@ test("pipeTo keeps fetching behind a blocked write only up to its 32 MiB buffer"
   // Twelve distinct chunks: about 50 MB, more than one buffer.
   const original = randomBytes(12 * 4_190_208);
   const encrypted = encryptPublicFile(original);
-  const { rtc, client } = fixture(encrypted.records);
+  // Slow GETs are still in flight when the first write blocks.
+  const { rtc, client } = fixture(encrypted.records, { delay: method => method === "get_chunk" ? 30 : 0 });
   let reader;
   try {
     reader = await client.openPublicFile(encrypted.address);
@@ -172,15 +173,15 @@ test("pipeTo keeps fetching behind a blocked write only up to its 32 MiB buffer"
     const before = gets(rtc);
     const completion = reader.pipeTo(sink);
     await entered;
+    const blocked = gets(rtc);
     // Let fetching run as far as the buffer allows, then check that it stopped.
-    let settled = gets(rtc);
+    let settled = blocked;
     for (let previous = -1; previous !== settled; settled = gets(rtc)) {
       previous = settled;
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
-    const buffered = settled - before;
-    assert(buffered > 1, "fetching continues behind a pending write");
-    assert(buffered <= Math.floor(32 * 1024 * 1024 / 4_190_208), `${buffered} chunks fetched behind one blocked write`);
+    assert(settled > blocked, `no GET was sent while the write was blocked (${blocked})`);
+    assert(settled - before <= Math.floor(32 * 1024 * 1024 / 4_190_208), `${settled - before} chunks fetched behind one blocked write`);
     unblock();
     const result = await completion;
     assert.equal(result.bytesWritten, original.length);

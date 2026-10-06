@@ -2107,11 +2107,7 @@ struct BrowserFileReaderOptions {
 
 impl BrowserFileReaderOptions {
     fn from_js(options: Option<JsValue>) -> Result<Self, JsValue> {
-        options
-            .map(serde_wasm_bindgen::from_value)
-            .transpose()
-            .map(Option::unwrap_or_default)
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+        download::options_from_js(options).map_err(|error| JsValue::from_str(&error))
     }
 }
 

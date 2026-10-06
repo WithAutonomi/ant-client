@@ -1,18 +1,13 @@
 //! Bounded plaintext reads with 64-bit positions and caller-owned destinations.
 use super::*;
 use crate::browser::manifest::MAX_SAFE_JS_INTEGER;
-use crate::client_engine::files::FileIndex;
+use crate::client_engine::files::{ordered_pipeline, FileIndex};
 use bytes::Bytes;
-use futures_channel::mpsc;
-use futures_util::{stream, SinkExt, StreamExt};
 use std::ops::Range;
 
-/// Plaintext a stream holds at once: chunks in flight, fetched, handed to the
-/// writer or being written. Fetching continues during writes up to this bound.
+/// Plaintext a stream holds at once: chunks in flight, fetched or being
+/// written. Fetching continues during writes up to this bound.
 const STREAM_BUFFER_BYTES: u64 = 32 * 1024 * 1024;
-/// Chunks a stream holds outside its fetch buffer: one handed to the writer
-/// and one being written.
-const CHUNKS_OUTSIDE_FETCH_BUFFER: u64 = 2;
 const STREAM_HINT: &str =
     "use openPublicFile/openPrivateFile and reader.pipeTo(writable) to stream to disk";
 const CLOSED_READER: &str = "browser file reader is closed";
@@ -42,8 +37,13 @@ fn method(object: &JsValue, name: &str) -> Result<js_sys::Function, JsValue> {
         .map_err(|_| JsValue::from_str(&format!("destination has no {name} method")))
 }
 
+/// Progress of a complete download, which startup probes parse.
+fn chunk_progress(written: usize, total: usize) -> String {
+    format!("Downloaded chunk {written}/{total}")
+}
+
 /// An optional options object; `undefined` and `null` select the defaults.
-fn options_from_js<T: Default + serde::de::DeserializeOwned>(
+pub(super) fn options_from_js<T: Default + serde::de::DeserializeOwned>(
     value: Option<JsValue>,
 ) -> Result<T, String> {
     match value {
@@ -233,54 +233,38 @@ impl Cancellation {
 }
 
 /// Fetch and decrypt `chunks` and hand each to `write` in file order. Fetching
-/// continues while a write is pending, and the chunks in flight, fetched,
-/// handed over and being written together hold at most `STREAM_BUFFER_BYTES`
-/// of plaintext. Each missing record is retried on its own schedule, so retry
-/// waits overlap with the other fetches.
+/// continues while a write is pending, within the client's adaptive fetch cap
+/// and `concurrency`, until the chunks in flight, fetched and being written
+/// hold `STREAM_BUFFER_BYTES` of plaintext. Each missing record is retried on
+/// its own schedule, so retry waits overlap with the other fetches.
 async fn stream_chunks<W, WF>(
     shared: &crate::data::Client,
     index: &FileIndex,
     chunks: Range<usize>,
     concurrency: usize,
-    mut write: W,
+    write: W,
 ) -> Result<(), JsValue>
 where
     W: FnMut(usize, Bytes) -> WF,
     WF: Future<Output = Result<(), JsValue>>,
 {
-    let buffered = (STREAM_BUFFER_BYTES / index.largest_chunk().max(1))
-        .saturating_sub(CHUNKS_OUTSIDE_FETCH_BUFFER)
-        .max(1);
-    let buffered = usize::try_from(buffered)
-        .unwrap_or(usize::MAX)
-        .min(concurrency);
-    // A zero-capacity channel holds one chunk per sender.
-    let (mut handed, mut received) = mpsc::channel(0);
-    let fetch = async move {
-        let mut fetched = stream::iter(chunks)
-            .map(|chunk| async move {
-                let plaintext = shared.data_download_indexed_chunk(index, chunk).await;
-                (chunk, plaintext)
-            })
-            .buffered(buffered);
-        while let Some(fetched) = fetched.next().await {
-            if handed.send(fetched).await.is_err() {
-                return;
-            }
-        }
-    };
-    let deliver = async {
-        while let Some((chunk, plaintext)) = received.next().await {
-            write(chunk, plaintext.map_err(js_string)?).await?;
-        }
-        Ok(())
-    };
-    futures_util::pin_mut!(fetch, deliver);
-    match select(fetch, deliver).await {
-        // Every chunk has been handed over; finish writing them.
-        Either::Left(((), deliver)) => deliver.await,
-        Either::Right((delivered, _)) => delivered,
-    }
+    ordered_pipeline(
+        chunks,
+        |chunk| {
+            let span = index.chunk_span(chunk);
+            span.end - span.start
+        },
+        STREAM_BUFFER_BYTES,
+        &|| shared.controller().fetch.current().min(concurrency),
+        |chunk| async move {
+            shared
+                .data_download_indexed_chunk(index, chunk)
+                .await
+                .map_err(js_string)
+        },
+        write,
+    )
+    .await
 }
 
 /// Download a whole file into one JavaScript `Uint8Array`, writing each chunk
@@ -317,9 +301,7 @@ pub(super) async fn collect(
     let total = index.chunk_count();
     let mut written = 0usize;
     let mut hasher = blake3::Hasher::new();
-    settings
-        .progress
-        .report(&format!("Downloaded chunk {written}/{total}"));
+    settings.progress.report(&chunk_progress(written, total));
     cancel
         .run(stream_chunks(
             shared,
@@ -338,9 +320,7 @@ pub(super) async fn collect(
                         view.unchecked_into::<Uint8Array>().copy_from(&plaintext);
                         hasher.update(&plaintext);
                         written += 1;
-                        settings
-                            .progress
-                            .report(&format!("Downloaded chunk {written}/{total}"));
+                        settings.progress.report(&chunk_progress(written, total));
                     });
                 std::future::ready(placed)
             },
@@ -440,8 +420,10 @@ impl BrowserFileReader {
     /// write, each awaited before the next; fetching continues during writes
     /// until 32 MiB of plaintext is held. Invalid calls reject without touching
     /// the destination. Otherwise the destination is closed on success and
-    /// aborted on failure, and the writer lock is always released. Returns the
-    /// BLAKE3 and byte count of the written range.
+    /// aborted on failure, and the writer lock is always released. An abort
+    /// while the destination is closing still rejects, but the destination may
+    /// already be committed. Returns the BLAKE3 and byte count of the written
+    /// range.
     #[wasm_bindgen(js_name = pipeTo)]
     pub async fn pipe_to(
         &self,

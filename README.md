@@ -70,7 +70,8 @@ range and reports `(bytesWritten, totalBytes)` after each write. Chunks are
 fetched concurrently and written in order, at most 4 MiB per write; fetching
 continues during writes until 32 MiB of plaintext is held. Invalid calls reject
 without touching the destination; otherwise the destination is closed on
-success, aborted on failure, and its writer lock released. The result contains
+success, aborted on failure (an abort during its close may come too late to
+undo the commit), and its writer lock released. The result contains
 the byte count and BLAKE3 of the written range, and an `AbortSignal` cancels
 the call. `reader.close()` releases the records read-ahead holds and makes later
 calls fail. `readRange(start, length)` remains available for media and custom
