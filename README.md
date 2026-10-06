@@ -40,11 +40,12 @@ use 64-bit arithmetic internally; the JavaScript API accepts exact, nonnegative
 `number` positions through `Number.MAX_SAFE_INTEGER` (just under 8 PiB). The
 resolved DataMap and seek index still occupy memory proportional to the number
 of chunks. Individual chunk buffers remain bounded, including for seeks past
-4 GiB. In browsers a DataMap may declare chunks of up to 16 MiB and nested
-DataMap levels of up to 64 MiB, and every record, including nested DataMap
-records, is decompressed only up to its declared size, so a crafted record
-cannot expand inside WASM. Native range reads accept any chunk size. Uploads
-retain their existing size limits.
+4 GiB. Browser readers, downloads and `pipeTo` accept chunks of up to 16 MiB
+and nested DataMap levels of up to 64 MiB, and decompress every record,
+including nested DataMap records, only up to its declared size, so a crafted
+record cannot expand inside WASM. The legacy whole-buffer `decryptPublicFile`
+binding still decrypts through self_encryption without that limit. Native range
+reads accept any chunk size. Uploads retain their existing size limits.
 
 `downloadPublicFile(file, { concurrency?, maxMemoryBytes?, onProgress?, signal? })`
 and its private-file counterpart allocate the output as a JavaScript

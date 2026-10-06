@@ -3,17 +3,16 @@
 //! self_encryption, the same implementation used by the native client; nested
 //! DataMaps and individual chunks use its KDF through `chunk_decrypt`, which
 //! bounds decompression.
-use bytes::Bytes;
+pub(crate) use super::chunk_decrypt::MIN_FILE_CHUNKS;
+use bytes::{Buf, Bytes};
 #[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
 use futures_util::future::{select, Either};
 #[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use self_encryption::{ChunkInfo, DataMap, EncryptedChunk, XorName};
-use std::{collections::HashMap, future::Future, ops::Range, time::Duration};
+use std::{collections::HashMap, future::Future, io::Read, ops::Range, time::Duration};
 
-/// self_encryption splits every encryptable file into at least three chunks.
-pub(crate) const MIN_FILE_CHUNKS: usize = 3;
 /// Deepest DataMap nesting resolved, as in self_encryption.
 const MAX_DATA_MAP_DEPTH: usize = 100;
 /// Content chunks of a resolved root DataMap are encrypted at KDF level zero.
@@ -50,8 +49,9 @@ pub(crate) fn decode_map(bytes: &[u8]) -> Result<DataMap, String> {
     rmp_serde::from_slice(bytes).map_err(|e| format!("Failed to deserialize DataMap: {e}"))
 }
 
-/// Fetch and verify records once each, handing every record to `on_record`
-/// as it arrives.
+/// Fetch records once each, handing every record to `on_record` as it
+/// arrives. Records are not re-hashed: the fetcher verifies addresses, and
+/// decryption authenticates every record.
 async fn fetch_records<E, F, Fut, C>(
     requests: Vec<RecordRequest>,
     fetch: &F,
@@ -67,7 +67,6 @@ where
         requests,
         |(index, address)| async move {
             let bytes = fetch(address).await.map_err(ReadError::Fetch)?;
-            crate::record::verify(&address, &bytes).map_err(ReadError::Invalid)?;
             Ok((index, bytes))
         },
         cap,
@@ -78,6 +77,26 @@ where
         on_record(index, bytes)?;
     }
     Ok(())
+}
+
+/// The decrypted chunks of a nested DataMap level read as one stream.
+struct ChunksReader {
+    remaining: std::vec::IntoIter<Bytes>,
+    current: Bytes,
+}
+
+impl Read for ChunksReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while !self.current.has_remaining() {
+            match self.remaining.next() {
+                Some(next) => self.current = next,
+                None => return Ok(0),
+            }
+        }
+        let length = buf.len().min(self.current.remaining());
+        self.current.copy_to_slice(&mut buf[..length]);
+        Ok(length)
+    }
 }
 
 /// Resolve a published, possibly nested DataMap to its root. Each level's
@@ -105,7 +124,12 @@ where
             return Ok(current);
         };
         let infos = current.infos();
-        let declared = infos
+        if infos.iter().any(|info| info.src_size == 0) {
+            return Err(ReadError::Invalid(
+                "invalid nested DataMap chunk size".into(),
+            ));
+        }
+        infos
             .iter()
             .try_fold(0usize, |total, info| total.checked_add(info.src_size))
             .filter(|total| *total <= max_map_bytes)
@@ -134,13 +158,13 @@ where
             Ok(())
         })
         .await?;
-        // Every chunk decrypted to exactly its declared size, so `declared`
-        // is now the size of data actually received.
-        let mut encoded = Vec::with_capacity(declared);
-        for chunk in chunks.into_iter().flatten() {
-            encoded.extend_from_slice(&chunk);
-        }
-        current = DataMap::from_bytes(&encoded)
+        // Decode straight from the chunks rather than joining them first.
+        // These are DataMap::from_bytes' bincode options, for a reader.
+        let chunks = ChunksReader {
+            remaining: chunks.into_iter().flatten().collect::<Vec<_>>().into_iter(),
+            current: Bytes::new(),
+        };
+        current = bincode::deserialize_from(chunks)
             .map_err(|e| ReadError::Invalid(format!("Failed to deserialize DataMap: {e}")))?;
     }
     Err(ReadError::Invalid(format!(
@@ -164,12 +188,16 @@ where
 {
     // The native whole-file path keeps no limit on nested DataMap levels.
     let root = resolve(map, fetch, cap, usize::MAX).await?;
-    let addresses: Vec<[u8; 32]> = root.infos().iter().map(|info| info.dst_hash.0).collect();
-    let requests = addresses.iter().copied().enumerate().collect();
+    let requests = root
+        .infos()
+        .iter()
+        .enumerate()
+        .map(|(index, info)| (index, info.dst_hash.0))
+        .collect();
     let mut records = Vec::new();
+    // self_encryption matches records to the map by content hash and
+    // authenticates each one, so they are not hashed here as well.
     fetch_records_deferred(requests, fetch, cap, sleep, retryable, |index, content| {
-        // self_encryption decrypts these without authenticating each record.
-        crate::record::verify(&addresses[index], &content).map_err(ReadError::Invalid)?;
         records.push((index, content));
         Ok(())
     })
@@ -401,43 +429,6 @@ where
         },
     )
     .await
-}
-
-/// Fetch and decrypt one chunk, retrying a missing record on the deferred
-/// schedule independently of every other chunk.
-#[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
-pub(crate) async fn fetch_chunk<E, F, Fut, S, SF>(
-    index: &FileIndex,
-    chunk: usize,
-    fetch: &F,
-    sleep: &S,
-    retryable: fn(&E) -> bool,
-) -> Result<Bytes, ReadError<E>>
-where
-    F: Fn([u8; 32]) -> Fut,
-    Fut: Future<Output = Result<Bytes, E>>,
-    S: Fn(Duration) -> SF,
-    SF: Future<Output = ()>,
-{
-    let mut plaintext = None;
-    let request = vec![(chunk, index.dst_hashes[chunk].0)];
-    fetch_records_deferred(
-        request,
-        fetch,
-        &|| 1,
-        sleep,
-        retryable,
-        |chunk, encrypted| {
-            plaintext = Some(
-                index
-                    .decrypt(chunk, &encrypted)
-                    .map_err(ReadError::Invalid)?,
-            );
-            Ok(())
-        },
-    )
-    .await?;
-    Ok(plaintext.expect("a completed pass delivers its one chunk"))
 }
 
 #[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
@@ -726,8 +717,8 @@ where
 }
 
 /// Deferred retry rounds over records, preserving each record's last typed
-/// fetch error. Records reach `on_record` unhashed: content chunks are
-/// authenticated by decryption, and the whole-file path verifies them there.
+/// fetch error. Records reach `on_record` unhashed: the fetcher verifies
+/// addresses, and decryption authenticates every record.
 async fn fetch_records_deferred<E, F, Fut, C, S, SF>(
     requests: Vec<RecordRequest>,
     fetch: &F,
@@ -965,9 +956,8 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            matches!(error, ReadError::Invalid(message) if message.contains("BLAKE3 mismatch"))
-        );
+        // self_encryption finds no record matching the map's addresses.
+        assert!(matches!(error, ReadError::Invalid(_)));
         let error = download(
             &map,
             &|_| async { Err::<Bytes, _>(42u8) },
@@ -1360,27 +1350,56 @@ mod tests {
             sleeps.borrow_mut().push(delay.as_secs());
             async {}
         };
-        let plaintext = fetch_chunk(&index, 1, &fetch_after(4), &sleep, |_| true)
-            .await
-            .unwrap();
+        // One chunk on its own, as each pipeTo fetch is.
+        let mut plaintext = None;
+        for_each_chunk(
+            &index,
+            1..2,
+            &fetch_after(4),
+            &|| 1,
+            &sleep,
+            |_| true,
+            |_, chunk| {
+                plaintext = Some(chunk);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
         let span = index.chunk_span(1);
         assert_eq!(
-            plaintext,
+            plaintext.unwrap(),
             content.slice(span.start as usize..span.end as usize)
         );
         assert_eq!(*sleeps.borrow(), vec![15, 45]);
 
         attempts.set(0);
-        let error = fetch_chunk(&index, 1, &fetch_after(5), &sleep, |_| true)
-            .await
-            .unwrap_err();
+        let error = for_each_chunk(
+            &index,
+            1..2,
+            &fetch_after(5),
+            &|| 1,
+            &sleep,
+            |_| true,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, ReadError::Fetch(message) if message == "missing"));
         assert_eq!(attempts.get(), DEFERRED_ROUND_DELAYS_SECS.len());
 
         attempts.set(0);
-        let error = fetch_chunk(&index, 1, &fetch_after(5), &sleep, |_| false)
-            .await
-            .unwrap_err();
+        let error = for_each_chunk(
+            &index,
+            1..2,
+            &fetch_after(5),
+            &|| 1,
+            &sleep,
+            |_| false,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, ReadError::Fetch(_)));
         assert_eq!(attempts.get(), 1);
     }

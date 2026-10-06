@@ -848,6 +848,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "bincode",
  "blake3",
  "brotli-decompressor",
  "bytes",

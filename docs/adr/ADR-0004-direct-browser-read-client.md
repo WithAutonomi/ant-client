@@ -686,14 +686,15 @@ Memory follows the data actually decrypted, never a size a map declares.
 It uses the dependency's own `chacha20poly1305` and `brotli-decompressor`
 versions, and tests pin its output to `decrypt_chunk` and to native nested-map
 resolution, so a change to the dependency's KDF fails them; a bounded primitive
-upstream would replace it. Native whole-file downloads still decrypt through
-`self_encryption::decrypt`.
+upstream would replace it. Native whole-file downloads and the legacy
+whole-buffer `decryptPublicFile` binding still decrypt through `self_encryption`,
+so neither bounds decompression.
 
 The fetch layer verifies every record's address. The engine does not hash
-content records again: ChaCha20-Poly1305 authentication and the plaintext hash
-reject an altered record, and decompression stops at the declared size. The
-native whole-file path keeps its own record check before handing records to
-`self_encryption`.
+records again: ChaCha20-Poly1305 authentication and the plaintext hash reject
+an altered content or nested DataMap record, and decompression stops at the
+declared size. On the native whole-file path, `self_encryption` matches records
+to the map by content hash and authenticates them itself.
 
 Reads are chunk-aligned. A shared engine primitive fetches a set of chunks in
 one deferred retry pass and hands each decrypted chunk on as it completes, so a

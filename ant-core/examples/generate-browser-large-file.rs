@@ -6,9 +6,17 @@
 use bytes::Bytes;
 use std::collections::HashMap;
 
+/// Plaintext byte repeated through the file; the tests check it on every read.
+const FILL_BYTE: u8 = 0x5a;
+/// Whole chunks past the 4 GiB position, so reads and seeks cross it.
+const CHUNKS_PAST_4_GIB: u64 = 2;
+/// A short final chunk, so the file does not end on a chunk boundary.
+const TAIL_BYTES: u64 = 123;
+
 fn main() {
-    let size = (1u64 << 32) + 2 * self_encryption::MAX_CHUNK_SIZE as u64 + 123;
-    let block = Bytes::from(vec![0x5a; self_encryption::MAX_CHUNK_SIZE]);
+    let size =
+        (1u64 << 32) + CHUNKS_PAST_4_GIB * self_encryption::MAX_CHUNK_SIZE as u64 + TAIL_BYTES;
+    let block = Bytes::from(vec![FILL_BYTE; self_encryption::MAX_CHUNK_SIZE]);
     let mut remaining = size as usize;
     let mut hasher = blake3::Hasher::new();
     let input = std::iter::from_fn(|| {
@@ -36,7 +44,7 @@ fn main() {
     }).collect();
     records.sort_by(|a, b| a["address"].as_str().cmp(&b["address"].as_str()));
     let fixture = serde_json::json!({
-        "size": size, "byte": 0x5a, "hash": hasher.finalize().to_hex().to_string(),
+        "size": size, "byte": FILL_BYTE, "hash": hasher.finalize().to_hex().to_string(),
         "address": hex::encode(address), "records": records,
     });
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

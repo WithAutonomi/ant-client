@@ -7,13 +7,15 @@
 //! Brotli — and stops decompressing one byte past the declared size. Tests pin
 //! the result to `decrypt_chunk`, so a KDF change in the dependency fails them.
 
-use super::files::MIN_FILE_CHUNKS;
 use bytes::Bytes;
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use self_encryption::XorName;
 use std::io::Read;
 
+/// self_encryption splits every encryptable file into at least three chunks:
+/// each chunk's key depends on the two before it, wrapping around.
+pub(crate) const MIN_FILE_CHUNKS: usize = 3;
 /// Domain separation context of self_encryption's chunk KDF.
 const KDF_CONTEXT: &str = "self_encryption/chunk/v2";
 const HASH_SIZE: usize = 32;
@@ -56,7 +58,7 @@ pub(super) fn decrypt_chunk(
         .map_err(|error| format!("chunk decryption failed: {error}"))?;
     let mut plaintext = Vec::with_capacity(expected_len.min(self_encryption::MAX_CHUNK_SIZE));
     brotli_decompressor::Decompressor::new(compressed.as_slice(), DECOMPRESS_BUFFER_BYTES)
-        .take(expected_len as u64 + 1)
+        .take((expected_len as u64).saturating_add(1))
         .read_to_end(&mut plaintext)
         .map_err(|_| "chunk decompression failed".to_string())?;
     if plaintext.len() != expected_len {

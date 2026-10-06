@@ -209,8 +209,9 @@ test("pipeTo keeps fetching behind a blocked write only up to its 32 MiB buffer"
 
 test("invalid pipeTo calls abort the destination they were given", async () => {
   const { client } = fixture();
+  let reader;
   try {
-    const reader = await client.openPublicFile(large.address);
+    reader = await client.openPublicFile(large.address);
     for (const [options, expected, close] of [
       [{ end: large.size + 1 }, /outside the file/],
       [{ start: 10, end: 5 }, /outside the file/],
@@ -228,7 +229,7 @@ test("invalid pipeTo calls abort the destination they were given", async () => {
       assert.equal(closed, false);
       assert.equal(sink.locked, false);
     }
-  } finally { client.close(); }
+  } finally { reader?.close(); client.close(); }
 });
 
 test("an AbortSignal cancels one pipeTo and leaves its reader open", async () => {
@@ -259,8 +260,9 @@ test("closing a reader from the final progress callback keeps the completed file
   const original = new TextEncoder().encode("Final progress callback.".repeat(200));
   const encrypted = encryptPublicFile(original);
   const { client } = fixture(encrypted.records);
+  let reader;
   try {
-    const reader = await client.openPublicFile(encrypted.address);
+    reader = await client.openPublicFile(encrypted.address);
     const chunks = [];
     let closed = false, aborted = false;
     const sink = new WritableStream({ write(bytes) { chunks.push(bytes); }, close() { closed = true; }, abort() { aborted = true; } });
@@ -274,7 +276,7 @@ test("closing a reader from the final progress callback keeps the completed file
     assert(closed);
     assert(!aborted);
     assert.deepEqual(Buffer.concat(chunks), Buffer.from(original));
-  } finally { client.close(); }
+  } finally { reader?.close(); client.close(); }
 });
 
 test("cancelling during a missing-record retry does not wait out the retry rounds", async () => {
@@ -285,15 +287,16 @@ test("cancelling during a missing-record retry does not wait out the retry round
   try {
     for (const cancel of ["close", "signal"]) {
       const reader = await client.openPublicFile(encrypted.address);
-      const controller = new AbortController();
-      const started = Date.now();
-      const pending = cancel === "close"
-        ? reader.readRange(0, original.length)
-        : reader.pipeTo(new WritableStream(), { signal: controller.signal });
-      setTimeout(() => cancel === "close" ? reader.close() : controller.abort(new Error("stop")), 100);
-      await assert.rejects(pending, cancel === "close" ? /closed/ : /stop/);
-      assert(Date.now() - started < 5_000, `${cancel} took ${Date.now() - started} ms`);
-      reader.close();
+      try {
+        const controller = new AbortController();
+        const started = Date.now();
+        const pending = cancel === "close"
+          ? reader.readRange(0, original.length)
+          : reader.pipeTo(new WritableStream(), { signal: controller.signal });
+        setTimeout(() => cancel === "close" ? reader.close() : controller.abort(new Error("stop")), 100);
+        await assert.rejects(pending, cancel === "close" ? /closed/ : /stop/);
+        assert(Date.now() - started < 5_000, `${cancel} took ${Date.now() - started} ms`);
+      } finally { reader.close(); }
     }
   } finally { client.close(); }
 });
@@ -340,16 +343,16 @@ test("closing a reader leaves records another reader of the file uses cached", a
   const original = new TextEncoder().encode("Two readers, one file.".repeat(300));
   const encrypted = encryptPublicFile(original);
   const { rtc, client } = fixture(encrypted.records);
+  let first, second;
   try {
-    const first = await client.openPublicFile(encrypted.address);
-    const second = await client.openPublicFile(encrypted.address);
+    first = await client.openPublicFile(encrypted.address);
+    second = await client.openPublicFile(encrypted.address);
     assert.deepEqual(await second.readRange(0, original.length), original);
     first.close();
     const cached = gets(rtc);
     assert.deepEqual(await second.readRange(0, original.length), original);
     assert.equal(gets(rtc), cached, "the open reader's records stay cached");
-    second.close();
-  } finally { client.close(); }
+  } finally { first?.close(); second?.close(); client.close(); }
 });
 
 test("writer rejection and reader cancellation stop a stream and release its lock", async () => {

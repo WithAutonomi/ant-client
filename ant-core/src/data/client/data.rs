@@ -377,7 +377,8 @@ impl Client {
     }
 
     /// Download a plaintext byte range. Resolves child maps first, then fetches
-    /// and decrypts only the records overlapping the range, one chunk at a time.
+    /// only the records overlapping the range, concurrently, decrypting each
+    /// chunk as it completes.
     /// Length is clamped at EOF; a start at or beyond EOF returns empty bytes.
     ///
     /// # Errors
@@ -446,15 +447,13 @@ impl Client {
         index: &crate::client_engine::files::FileIndex,
         chunk: usize,
     ) -> Result<Bytes> {
-        crate::client_engine::files::fetch_chunk(
-            index,
-            chunk,
-            &|address| self.fetch_data_record(address),
-            &crate::runtime::sleep,
-            retry_data_fetch,
-        )
-        .await
-        .map_err(map_read_error)
+        let mut plaintext = None;
+        self.data_download_indexed_chunks(index, chunk..chunk + 1, 1, |_, content| {
+            plaintext = Some(content);
+            Ok(())
+        })
+        .await?;
+        Ok(plaintext.expect("a completed pass delivers its one chunk"))
     }
 
     /// Fetch and decrypt whole chunks in one deferred retry pass, handing each
