@@ -125,6 +125,8 @@ use shared::{native_quote_artifact, SharedNetworkAdapter};
 #[cfg(feature = "test-utils")]
 mod diagnostics;
 #[cfg(feature = "test-utils")]
+mod read_bench;
+#[cfg(feature = "test-utils")]
 mod test_utils;
 use inbox::ResponseInbox;
 
@@ -1485,6 +1487,9 @@ struct BrowserNetworkCore {
     contacted: Rc<RefCell<HashMap<LookupKey, web_time::Instant>>>,
     owner_views: Rc<RefCell<lru::LruCache<LookupKey, BrowserLookupCandidate>>>,
     bootstrap: bootstrap::Bootstrap,
+    /// V2-1358 read-strategy bench: reports each lookup query and answer.
+    #[cfg(feature = "test-utils")]
+    bench_hook: RefCell<Option<read_bench::BenchHook>>,
 }
 
 impl BrowserNetworkCore {
@@ -1512,6 +1517,8 @@ impl BrowserNetworkCore {
                 std::num::NonZeroUsize::new(MAX_BROWSER_ROUTING_ENTRIES)
                     .ok_or("routing cache must be nonempty")?,
             ))),
+            #[cfg(feature = "test-utils")]
+            bench_hook: RefCell::new(None),
         })
     }
 
@@ -1736,6 +1743,8 @@ impl BrowserNetworkCore {
             owner_views: Rc::clone(&self.owner_views),
             reports: HashMap::new(),
             read_progress,
+            #[cfg(feature = "test-utils")]
+            bench_hook: self.bench_hook.borrow().clone(),
         };
         run_iterative_lookup(
             &mut lookup,
@@ -1786,6 +1795,8 @@ impl BrowserNetworkCore {
 
 struct BrowserNetworkLookupQuery {
     read_progress: Option<crate::data::network::ReadProgress>,
+    #[cfg(feature = "test-utils")]
+    bench_hook: Option<read_bench::BenchHook>,
     pool: Rc<BrowserClientPool>,
     progress: ProgressReporter,
     failures: Rc<RefCell<Vec<BrowserLookupFailure>>>,
@@ -1824,6 +1835,12 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
             .iter()
             .map(|candidate| candidate.peer_id)
             .collect::<HashSet<_>>();
+        #[cfg(feature = "test-utils")]
+        if let Some(hook) = &self.bench_hook {
+            for candidate in &batch {
+                hook.query(iteration, &candidate.wire);
+            }
+        }
         let futures: FuturesUnordered<_> = batch
             .into_iter()
             .map(|candidate| {
@@ -1834,6 +1851,8 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                 let routing = Rc::clone(&self.routing);
                 let contacted = Rc::clone(&self.contacted);
                 let read_progress = self.read_progress.clone();
+                #[cfg(feature = "test-utils")]
+                let bench_hook = self.bench_hook.clone();
                 let target = target.clone();
                 async move {
                     let responder = candidate.peer_id;
@@ -1853,6 +1872,10 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                     .await;
                     match result {
                         Ok(nodes) => {
+                            #[cfg(feature = "test-utils")]
+                            if let Some(hook) = &bench_hook {
+                                hook.response(iteration, &candidate.wire, &nodes);
+                            }
                             if let Some(progress) = &read_progress {
                                 let hints = std::iter::once(&candidate.wire)
                                     .chain(nodes.iter())

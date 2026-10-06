@@ -2,3 +2,7 @@
 members = ["ant-core", "ant-cli"]
 resolver = "2"
 
+
+# V2-1358 prototype: saorsa-core with the lookup observer hook.
+[patch.crates-io]
+saorsa-core = { path = "../saorsa-core-v2-1358" }

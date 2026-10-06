@@ -1059,7 +1059,7 @@ impl Client {
     }
 
     /// Fetch a chunk from a specific peer.
-    async fn chunk_get_from_peer(
+    pub(crate) async fn chunk_get_from_peer(
         &self,
         address: &XorName,
         peer: &PeerId,

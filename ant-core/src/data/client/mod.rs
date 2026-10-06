@@ -23,6 +23,8 @@ mod native_payment;
 pub mod payment;
 pub mod pointer;
 pub mod quote;
+#[cfg(any(feature = "native", feature = "test-utils"))]
+pub mod read_bench;
 pub mod upload;
 pub mod upload_state;
 

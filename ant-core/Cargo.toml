@@ -58,6 +58,9 @@ tower-http = { version = "0.6.8", features = ["cors"], optional = true }
 # those three deps — do not add direct evmlib/saorsa-core/saorsa-pqc
 # deps here or the version can skew between ant-client and ant-node.
 ant-protocol = { version = "3.1.0", default-features = false, features = ["rpc"] }
+# V2-1358 prototype only: the read-strategy bench implements saorsa-core's
+# `LookupObserver`, which ant-protocol does not re-export yet.
+saorsa-core = { version = "0.28.0", optional = true }
 xor_name = { version = "5" }
 futures = { version = "0.3" }
 tracing = { version = "0.1" }
@@ -128,6 +131,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 default = ["native"]
 native = [
     "ant-protocol/native",
+    "dep:saorsa-core",
     "ant-protocol/logging",
     "dep:async-stream",
     "dep:axum",
@@ -199,6 +203,10 @@ path = "examples/start-devnet-sepolia.rs"
 [[example]]
 name = "bench-quoting"
 path = "examples/bench-quoting.rs"
+
+[[example]]
+name = "read-strategy-bench"
+path = "examples/read-strategy-bench.rs"
 
 [[test]]
 name = "e2e_chunk"
