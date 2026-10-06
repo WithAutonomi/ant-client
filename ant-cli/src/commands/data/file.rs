@@ -8,6 +8,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use ant_core::data::manifest::path::portable_component;
 use ant_core::data::{
     parse_link, spawn_download_diagnostics_writer, Client, CollisionPolicy, ContentRef,
     CostEstimateConfidence, DownloadEvent, Error as DataError, FileChunkPeerReport,
@@ -311,11 +312,14 @@ async fn handle_file_upload(
 
     // Every upload is remembered as a one-entry manifest in the upload
     // history (ADR-0006), so it can be listed and downloaded again. The
-    // DataMap is embedded whether or not the upload was public.
+    // DataMap is embedded whether or not the upload was public. A file
+    // name that breaks the portable path rules is repaired, or dropped so
+    // the entry extracts under its content address, rather than losing
+    // the record.
     let record = Manifest {
         name: None,
         entries: vec![ManifestEntry {
-            path: Some(original_name.clone()),
+            path: portable_component(&original_name),
             size: Some(file_size),
             source: ContentRef::Embedded {
                 data_map: result.data_map.clone(),

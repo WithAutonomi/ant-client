@@ -247,6 +247,12 @@ Two reference modes for uploaded files:
   explicit upload choice. Compact is what makes a manifest link fit in a
   message for more than a handful of files.
 
+Everything that could make the finished manifest invalid, such as file sizes,
+the name and path collisions, is checked before the first paid upload, and
+the output location is checked before it too. Cancellation stops between
+files or abandons the upload in flight and returns the partial manifest,
+which the client records in the upload history so paid uploads are not lost.
+
 Directory walks sort by path, use paths relative to the root, and record
 `size` for every uploaded file. Symlinks are skipped and reported, whether
 they point at files or directories; an opt-in flag follows symlinks to
@@ -266,7 +272,9 @@ recorded as itself. Records live under `<data dir>/uploads/` as ordinary
 the record id. Nothing else is stored, so the history is a plain folder of
 manifests. The client lists records newest first and accepts a record id
 wherever it accepts a manifest file or link. Every record embeds the full
-DataMap, whether or not the upload was public. Recording never fails an
+DataMap, whether or not the upload was public. A file name that breaks the
+portable path rules is repaired for the record, or dropped so the entry
+extracts under its content address, rather than losing the record. Recording never fails an
 upload that has already succeeded; an unusable history directory is reported
 and the upload result still shown.
 
@@ -277,8 +285,9 @@ can be exported as a `.ant` file. Export can also **compact** the manifest:
 each embedded DataMap is replaced by its public address. That is possible
 only for DataMaps whose chunk is on the network, so compaction is planned
 first: every embedded entry is checked and sorted into already public or
-still private. If any are still private the user is told which, and asked
-whether to publish them. Publishing stores those DataMap chunks, is paid,
+still private; the checks run concurrently and honour cancellation. The
+output location is checked before anything is published. If any are still
+private the user is told which, and asked whether to publish them. Publishing stores those DataMap chunks, is paid,
 and makes those files public; it never happens without an explicit yes, and
 a non-interactive run must pass that yes as a flag. Declining leaves the
 manifest untouched. Entries already referenced by address are unaffected.

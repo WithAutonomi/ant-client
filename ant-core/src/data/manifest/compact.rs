@@ -7,6 +7,10 @@
 
 use std::collections::BTreeSet;
 
+use futures::stream::{self, StreamExt};
+use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+
 use crate::data::Client;
 
 use super::{ContentRef, Manifest, ManifestError, ADDRESS_LEN};
@@ -18,8 +22,11 @@ use self_encryption::{ChunkInfo, DataMap};
 #[cfg(test)]
 use xor_name::XorName;
 
+/// Existence checks run against the network at once while planning.
+const PLAN_CONCURRENCY: usize = 8;
+
 /// One embedded entry and where its DataMap chunk would live.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddedEntry {
     /// Index into `manifest.entries`.
     pub index: usize,
@@ -30,7 +37,7 @@ pub struct EmbeddedEntry {
 }
 
 /// What compacting a manifest would involve.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactPlan {
     /// Embedded entries whose DataMap chunk is already on the network.
     pub already_public: Vec<EmbeddedEntry>,
@@ -54,25 +61,43 @@ impl CompactPlan {
     }
 }
 
-/// Check every embedded entry against the network.
+/// Check every embedded entry against the network, several at a time.
+/// Entries in the plan keep manifest order.
 pub async fn plan_compaction(
     client: &Client,
     manifest: &Manifest,
+    cancel: &CancellationToken,
 ) -> Result<CompactPlan, ManifestError> {
-    let mut plan = CompactPlan::default();
+    let mut embedded = Vec::new();
     for (index, entry) in manifest.entries.iter().enumerate() {
-        if !matches!(entry.source, ContentRef::Embedded { .. }) {
-            continue;
+        if matches!(entry.source, ContentRef::Embedded { .. }) {
+            embedded.push(EmbeddedEntry {
+                index,
+                name: entry.effective_name()?,
+                address: entry.source.content_address()?,
+            });
         }
-        let embedded = EmbeddedEntry {
-            index,
-            name: entry.effective_name()?,
-            address: entry.source.content_address()?,
-        };
-        if client.chunk_exists(&embedded.address).await? {
-            plan.already_public.push(embedded);
+    }
+
+    let checks = stream::iter(embedded)
+        .map(|entry| async move {
+            let exists = client.chunk_exists(&entry.address).await;
+            (entry, exists)
+        })
+        .buffer_unordered(PLAN_CONCURRENCY)
+        .collect::<Vec<_>>();
+    let mut results = tokio::select! {
+        _ = cancel.cancelled() => return Err(ManifestError::Cancelled),
+        results = checks => results,
+    };
+    results.sort_by_key(|(entry, _)| entry.index);
+
+    let mut plan = CompactPlan::default();
+    for (entry, exists) in results {
+        if exists? {
+            plan.already_public.push(entry);
         } else {
-            plan.needs_publish.push(embedded);
+            plan.needs_publish.push(entry);
         }
     }
     Ok(plan)
@@ -80,13 +105,18 @@ pub async fn plan_compaction(
 
 /// Store the DataMap chunk of each entry in `entries`. Paid; makes those
 /// files public. Returns the addresses stored, in the same order.
+/// Cancellation is honoured between stores, never in the middle of one.
 pub async fn publish_data_maps(
     client: &Client,
     manifest: &Manifest,
     entries: &[EmbeddedEntry],
+    cancel: &CancellationToken,
 ) -> Result<Vec<[u8; ADDRESS_LEN]>, ManifestError> {
     let mut stored = Vec::with_capacity(entries.len());
     for embedded in entries {
+        if cancel.is_cancelled() {
+            return Err(ManifestError::Cancelled);
+        }
         let entry = manifest.entries.get(embedded.index).ok_or_else(|| {
             ManifestError::Build(format!("entry {} is out of range", embedded.index))
         })?;

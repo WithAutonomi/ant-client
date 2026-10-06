@@ -75,6 +75,7 @@ async fn manifest_round_trips_through_file_and_link() {
             visibility: Visibility::Private,
             payment_mode: PaymentMode::Auto,
             follow_symlinks: false,
+            cancel: CancellationToken::new(),
         },
     );
     builder.add_directory(source.path(), None).unwrap();
@@ -202,6 +203,7 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
             visibility: Visibility::Private,
             payment_mode: PaymentMode::Auto,
             follow_symlinks: false,
+            cancel: CancellationToken::new(),
         },
     );
     builder.add_directory(source.path(), None).unwrap();
@@ -229,6 +231,7 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
             visibility: Visibility::Public,
             payment_mode: PaymentMode::Auto,
             follow_symlinks: false,
+            cancel: CancellationToken::new(),
         },
     );
     embedded_builder.add_directory(source.path(), None).unwrap();
@@ -277,20 +280,25 @@ async fn compact_export_publishes_private_data_maps_then_replaces_them() {
         .all(|e| e.source.kind() == "embedded"));
 
     // Nothing is public yet, so every entry needs publishing.
-    let plan = plan_compaction(&client, &built.manifest)
+    let plan = plan_compaction(&client, &built.manifest, &CancellationToken::new())
         .await
         .expect("plan");
     assert!(plan.already_public.is_empty());
     assert_eq!(plan.needs_publish.len(), 2);
     assert!(!plan.is_free());
 
-    let stored = publish_data_maps(&client, &built.manifest, &plan.needs_publish)
-        .await
-        .expect("publish");
+    let stored = publish_data_maps(
+        &client,
+        &built.manifest,
+        &plan.needs_publish,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("publish");
     assert_eq!(stored.len(), 2);
 
     // A second plan sees them as public, and compaction is free.
-    let plan = plan_compaction(&client, &built.manifest)
+    let plan = plan_compaction(&client, &built.manifest, &CancellationToken::new())
         .await
         .expect("replan");
     assert!(plan.is_free());

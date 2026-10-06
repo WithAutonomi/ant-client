@@ -3,10 +3,12 @@
 //! Containment is a filesystem contract, not a string check. Inside the
 //! output root the extractor never follows a symlink, junction or reparse
 //! point: every intermediate directory is created, or confirmed to be a
-//! real directory, without following links, immediately before use, and
-//! the file is written through a reserved temporary name in its parent and
-//! renamed into place. An existing target is a per-entry failure unless
-//! overwrite was requested, and even then only a regular file is replaced.
+//! real directory, without following links, before the download, and the
+//! whole parent chain and the target are checked again, without following
+//! links, immediately before the final rename. The file is written through
+//! a reserved temporary name in its parent. An existing target is a
+//! per-entry failure unless overwrite was requested, and even then only a
+//! regular file is replaced.
 
 use std::fs;
 use std::io;
@@ -15,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use futures::stream::{self, StreamExt};
 use self_encryption::DataMap;
+use serde::{Deserialize, Serialize};
 use tempfile::Builder as TempBuilder;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -77,7 +80,8 @@ pub enum ExtractEvent {
 }
 
 /// How one entry ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum EntryStatus {
     /// Written to its target.
     Written {
@@ -94,7 +98,7 @@ pub enum EntryStatus {
 }
 
 /// Outcome of one entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryOutcome {
     /// Effective name.
     pub name: String,
@@ -103,7 +107,7 @@ pub struct EntryOutcome {
 }
 
 /// Outcome of an extraction, one row per selected entry in manifest order.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExtractReport {
     /// Per-entry outcomes.
     pub entries: Vec<EntryOutcome>,
@@ -289,8 +293,9 @@ async fn download_entry(
         .file_download_with_progress(&data_map, &temp, download_progress)
         .await?;
 
-    // Re-check the target immediately before the rename; it may have
-    // changed while the download ran.
+    // Re-check the parent chain and the target immediately before the
+    // rename; either may have changed while the download ran.
+    verify_parent_chain(&options.output_root, name)?;
     check_target(&target, options.overwrite)?;
     let persisted = if options.overwrite {
         temp.persist(&target)
@@ -323,6 +328,22 @@ pub fn prepare_target(root: &Path, name: &str, overwrite: bool) -> Result<PathBu
         ensure_real_directory(&current)?;
     }
     Err(ManifestError::Build("empty effective name".to_string()))
+}
+
+/// Confirm, without creating anything or following links, that every
+/// directory component of `name` beneath `root` is still a real directory.
+fn verify_parent_chain(root: &Path, name: &str) -> Result<(), ManifestError> {
+    let mut components = name.split(PATH_SEPARATOR).peekable();
+    let mut current = root.to_path_buf();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            return Ok(());
+        }
+        current.push(component);
+        let meta = fs::symlink_metadata(&current)?;
+        verify_directory(&current, &meta)?;
+    }
+    Ok(())
 }
 
 fn ensure_real_directory(path: &Path) -> Result<(), ManifestError> {
@@ -451,5 +472,13 @@ mod tests {
         assert!(prepare_target(root.path(), "t.txt", false).is_err());
         assert!(prepare_target(root.path(), "t.txt", true).is_err());
         assert!(!outside.path().join("victim").exists());
+
+        // A directory swapped for a symlink after preparation is caught by
+        // the pre-rename check.
+        prepare_target(root.path(), "late/file", false).unwrap();
+        fs::remove_dir(root.path().join("late")).unwrap();
+        symlink(outside.path(), root.path().join("late")).unwrap();
+        assert!(verify_parent_chain(root.path(), "late/file").is_err());
+        assert!(verify_parent_chain(root.path(), "real/f").is_ok());
     }
 }

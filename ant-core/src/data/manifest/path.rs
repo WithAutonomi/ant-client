@@ -27,6 +27,11 @@ const RESERVED_DEVICE_NAMES: &[&str] = &[
 const FIRST_PRINTABLE: char = '\u{20}';
 /// The DEL control character.
 const DELETE: char = '\u{7F}';
+/// Replacement for a forbidden character when reducing a name to a
+/// portable component.
+const COMPONENT_REPLACEMENT: char = '_';
+/// Prefix that turns a reserved device name into an ordinary one.
+const RESERVED_NAME_PREFIX: char = '_';
 
 /// Which portable rule a path broke.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -124,6 +129,35 @@ pub fn validate_component(component: &str) -> Result<(), PathError> {
         return Err(PathError::ReservedName(component.to_string()));
     }
     Ok(())
+}
+
+/// Reduce an arbitrary file name to a valid portable component, or `None`
+/// when nothing usable remains. Forbidden characters become `_`, trailing
+/// spaces and dots are dropped, the name is cut to the component limit and
+/// a reserved device name gains a leading `_`.
+pub fn portable_component(name: &str) -> Option<String> {
+    let mut replaced: String = name
+        .chars()
+        .map(|c| {
+            if c < FIRST_PRINTABLE || c == DELETE || FORBIDDEN_CHARS.contains(&c) {
+                COMPONENT_REPLACEMENT
+            } else {
+                c
+            }
+        })
+        .collect();
+    while replaced.len() > MAX_PATH_COMPONENT_BYTES {
+        replaced.pop();
+    }
+    let trimmed = replaced.trim_end_matches([' ', '.']);
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return None;
+    }
+    let candidate = match validate_component(trimmed) {
+        Err(PathError::ReservedName(_)) => format!("{RESERVED_NAME_PREFIX}{trimmed}"),
+        _ => trimmed.to_string(),
+    };
+    validate_component(&candidate).ok().map(|()| candidate)
 }
 
 /// The key two paths are compared under: NFC normalised and lowercased.
@@ -240,6 +274,28 @@ mod tests {
             .collect::<Vec<_>>()
             .join("/");
         assert_eq!(validate_path(&deep), Err(PathError::PathTooLong));
+    }
+
+    #[test]
+    fn portable_component_repairs_or_rejects() {
+        assert_eq!(
+            portable_component("photo.jpg").as_deref(),
+            Some("photo.jpg")
+        );
+        assert_eq!(
+            portable_component("notes:v2.txt").as_deref(),
+            Some("notes_v2.txt")
+        );
+        assert_eq!(portable_component("draft. ").as_deref(), Some("draft"));
+        assert_eq!(portable_component("CON.txt").as_deref(), Some("_CON.txt"));
+        assert_eq!(portable_component("a\\b").as_deref(), Some("a_b"));
+        assert_eq!(portable_component("..."), None);
+        assert_eq!(portable_component(""), None);
+        let long = "x".repeat(MAX_PATH_COMPONENT_BYTES + 50);
+        assert_eq!(
+            portable_component(&long).unwrap().len(),
+            MAX_PATH_COMPONENT_BYTES
+        );
     }
 
     #[test]

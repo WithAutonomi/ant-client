@@ -12,6 +12,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use super::file::{read_manifest_file, write_manifest_file};
 use super::{Manifest, ManifestError, MANIFEST_EXTENSION};
 
@@ -46,9 +48,27 @@ const DAYS_PER_YEAR: u64 = 365;
 const DAYS_PER_4_YEARS: u64 = 1_460;
 const DAYS_PER_100_YEARS: u64 = 36_524;
 const MONTHS_PER_YEAR: u32 = 12;
+// The date conversions below are Howard Hinnant's `days_from_civil` and
+// `civil_from_days` (https://howardhinnant.github.io/date_algorithms.html).
+// They count months from March so leap days fall at the end of the year.
+/// Any five consecutive months counted from March span 153 days, so
+/// `(153 * m + 2) / 5` is the day of the March-based year a month starts on.
+const DAYS_PER_FIVE_MONTHS: u64 = 153;
+/// Rounding offset in the month-start formula above.
+const MONTH_START_ROUNDING: u64 = 2;
+/// Months per `DAYS_PER_FIVE_MONTHS` span.
+const MONTHS_PER_SPAN: u64 = 5;
+/// Added to a calendar month, modulo twelve, to count it from March.
+const MONTH_SHIFT_TO_MARCH: u32 = 9;
+/// March-based month index of January: March..December are 0..=9.
+const FIRST_MONTH_OF_NEXT_YEAR: u64 = 10;
+/// Calendar number of March, the first March-based month.
+const MARCH: u32 = 3;
+/// Calendar number of February, the last month before the year rolls.
+const FEBRUARY: u32 = 2;
 
 /// One recorded upload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadRecord {
     /// Filename stem: `<timestamp>-<label>`.
     pub id: String,
@@ -63,7 +83,7 @@ pub struct UploadRecord {
 }
 
 /// Result of listing a history directory.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UploadListing {
     /// Readable records, newest first.
     pub records: Vec<UploadRecord>,
@@ -259,19 +279,19 @@ fn split_unix(unix_secs: u64) -> (i64, u32, u32, u64, u64, u64) {
     )
 }
 
-/// Days since 1970-01-01 for a proleptic Gregorian date.
+/// Days since 1970-01-01 for a proleptic Gregorian date (Hinnant).
 fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
+    let year = if month <= FEBRUARY { year - 1 } else { year };
     let era = year.div_euclid(YEARS_PER_ERA);
     let year_of_era = (year - era * YEARS_PER_ERA) as u64;
-    let month_from_march = u64::from((month + 9) % MONTHS_PER_YEAR);
-    let day_of_year = (153 * month_from_march + 2) / 5 + u64::from(day) - 1;
+    let month_from_march = u64::from((month + MONTH_SHIFT_TO_MARCH) % MONTHS_PER_YEAR);
+    let day_of_year = month_start_day(month_from_march) + u64::from(day) - 1;
     let day_of_era =
         year_of_era * DAYS_PER_YEAR + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * DAYS_PER_ERA + day_of_era as i64 - DAYS_TO_UNIX_EPOCH
 }
 
-/// Proleptic Gregorian date for days since 1970-01-01.
+/// Proleptic Gregorian date for days since 1970-01-01 (Hinnant).
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let shifted = days + DAYS_TO_UNIX_EPOCH;
     let era = shifted.div_euclid(DAYS_PER_ERA);
@@ -283,14 +303,20 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let year = year_of_era as i64 + era * YEARS_PER_ERA;
     let day_of_year =
         day_of_era - (DAYS_PER_YEAR * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_from_march = (5 * day_of_year + 2) / 153;
-    let day = (day_of_year - (153 * month_from_march + 2) / 5 + 1) as u32;
-    let month = if month_from_march < 10 {
-        month_from_march + 3
+    let month_from_march =
+        (MONTHS_PER_SPAN * day_of_year + MONTH_START_ROUNDING) / DAYS_PER_FIVE_MONTHS;
+    let day = (day_of_year - month_start_day(month_from_march) + 1) as u32;
+    let month = if month_from_march < FIRST_MONTH_OF_NEXT_YEAR {
+        month_from_march as u32 + MARCH
     } else {
-        month_from_march - 9
-    } as u32;
-    (if month <= 2 { year + 1 } else { year }, month, day)
+        month_from_march as u32 - MONTH_SHIFT_TO_MARCH
+    };
+    (if month <= FEBRUARY { year + 1 } else { year }, month, day)
+}
+
+/// Day of the March-based year on which `month_from_march` starts.
+fn month_start_day(month_from_march: u64) -> u64 {
+    (DAYS_PER_FIVE_MONTHS * month_from_march + MONTH_START_ROUNDING) / MONTHS_PER_SPAN
 }
 
 #[cfg(test)]

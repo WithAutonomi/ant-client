@@ -176,6 +176,9 @@ pub enum ManifestError {
     /// Building or extracting hit a filesystem or layout problem.
     #[error("{0}")]
     Build(String),
+    /// The caller cancelled the operation.
+    #[error("operation cancelled")]
+    Cancelled,
     /// A filesystem error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

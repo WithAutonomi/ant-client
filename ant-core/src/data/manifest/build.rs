@@ -9,13 +9,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use self_encryption::MIN_ENCRYPTABLE_BYTES;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::data::client::file::{UploadEvent, Visibility};
 use crate::data::client::merkle::PaymentMode;
 use crate::data::Client;
 
-use super::path::PATH_SEPARATOR;
+use super::path::{check_collisions, validate_component, validate_path, PATH_SEPARATOR};
 use super::{ContentRef, Manifest, ManifestEntry, ManifestError, ADDRESS_LEN};
 
 /// Capacity of the per-file upload progress channel.
@@ -49,6 +51,9 @@ pub struct BuildOptions {
     pub payment_mode: PaymentMode,
     /// Follow symlinks to regular files instead of skipping them.
     pub follow_symlinks: bool,
+    /// Cancels the build between files, or during an upload. Files already
+    /// uploaded are kept in the partial result.
+    pub cancel: CancellationToken,
 }
 
 /// Progress during [`ManifestBuilder::finish`].
@@ -82,10 +87,13 @@ pub enum BuildEvent {
 }
 
 /// What [`ManifestBuilder::finish`] produced.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildResult {
-    /// The finished, canonical manifest.
+    /// The canonical manifest. Partial when `cancelled` is set: it holds
+    /// only the files uploaded before cancellation, plus address entries.
     pub manifest: Manifest,
+    /// Whether the build was cancelled before every file was uploaded.
+    pub cancelled: bool,
     /// Symlinks skipped during directory walks.
     pub skipped_symlinks: Vec<PathBuf>,
     /// Files uploaded.
@@ -150,7 +158,7 @@ impl<'a> ManifestBuilder<'a> {
 
     /// Queue one local file under `path`.
     pub fn add_file(&mut self, local: &Path, path: String) -> Result<(), ManifestError> {
-        super::path::validate_path(&path).map_err(|reason| ManifestError::InvalidPath {
+        validate_path(&path).map_err(|reason| ManifestError::InvalidPath {
             path: path.clone(),
             reason,
         })?;
@@ -187,7 +195,7 @@ impl<'a> ManifestBuilder<'a> {
         size: Option<u64>,
     ) -> Result<(), ManifestError> {
         if let Some(p) = &path {
-            super::path::validate_path(p).map_err(|reason| ManifestError::InvalidPath {
+            validate_path(p).map_err(|reason| ManifestError::InvalidPath {
                 path: p.clone(),
                 reason,
             })?;
@@ -200,19 +208,15 @@ impl<'a> ManifestBuilder<'a> {
         Ok(())
     }
 
-    /// Upload every queued file and assemble the manifest.
-    pub async fn finish(
-        mut self,
-        progress: Option<mpsc::Sender<BuildEvent>>,
-    ) -> Result<BuildResult, ManifestError> {
-        let total = self.pending.len();
-        let mut files_uploaded = 0;
-        let mut chunks_stored = 0;
-        let mut storage_cost_atto: u128 = 0;
-        let mut gas_cost_wei: u128 = 0;
-
-        let pending = std::mem::take(&mut self.pending);
-        for (index, file) in pending.into_iter().enumerate() {
+    /// Check everything that could make the finished manifest invalid
+    /// before the first paid upload: file sizes, the name, and collisions
+    /// among all queued paths and address entries.
+    fn preflight(&self) -> Result<(), ManifestError> {
+        if let Some(name) = &self.options.name {
+            validate_component(name).map_err(ManifestError::InvalidName)?;
+        }
+        let mut names = Vec::with_capacity(self.pending.len() + self.entries.len());
+        for file in &self.pending {
             let size = fs::metadata(&file.local)?.len();
             if size < MIN_ENCRYPTABLE_BYTES as u64 {
                 return Err(ManifestError::Build(format!(
@@ -220,6 +224,39 @@ impl<'a> ManifestBuilder<'a> {
                     file.local.display()
                 )));
             }
+            names.push(file.path.clone());
+        }
+        for entry in &self.entries {
+            names.push(entry.effective_name()?);
+        }
+        check_collisions(names.iter().map(String::as_str)).map_err(ManifestError::Conflict)
+    }
+
+    /// Upload every queued file and assemble the manifest.
+    ///
+    /// Validation runs first so no upload is paid for a manifest that
+    /// could not be finished. Cancellation stops before the next file, or
+    /// abandons the upload in flight, and returns the partial result with
+    /// `cancelled` set so already-paid uploads are not lost.
+    pub async fn finish(
+        mut self,
+        progress: Option<mpsc::Sender<BuildEvent>>,
+    ) -> Result<BuildResult, ManifestError> {
+        self.preflight()?;
+        let total = self.pending.len();
+        let mut files_uploaded = 0;
+        let mut chunks_stored = 0;
+        let mut storage_cost_atto: u128 = 0;
+        let mut gas_cost_wei: u128 = 0;
+        let mut cancelled = false;
+
+        let pending = std::mem::take(&mut self.pending);
+        for (index, file) in pending.into_iter().enumerate() {
+            if self.options.cancel.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+            let size = fs::metadata(&file.local)?.len();
             if let Some(tx) = &progress {
                 let _ = tx
                     .send(BuildEvent::FileStarted {
@@ -247,15 +284,19 @@ impl<'a> ManifestBuilder<'a> {
                 upload_tx
             });
 
-            let result = self
-                .client
-                .file_upload_with_visibility_and_progress(
-                    &file.local,
-                    self.options.payment_mode,
-                    self.options.visibility,
-                    upload_progress,
-                )
-                .await?;
+            let upload = self.client.file_upload_with_visibility_and_progress(
+                &file.local,
+                self.options.payment_mode,
+                self.options.visibility,
+                upload_progress,
+            );
+            let result = tokio::select! {
+                _ = self.options.cancel.cancelled() => {
+                    cancelled = true;
+                    break;
+                }
+                result = upload => result?,
+            };
 
             files_uploaded += 1;
             chunks_stored += result.chunks_stored;
@@ -292,6 +333,7 @@ impl<'a> ManifestBuilder<'a> {
 
         Ok(BuildResult {
             manifest,
+            cancelled,
             skipped_symlinks: self.skipped_symlinks,
             files_uploaded,
             chunks_stored,

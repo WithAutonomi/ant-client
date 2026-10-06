@@ -37,6 +37,8 @@ const PROGRESS_CHANNEL_CAPACITY: usize = 64;
 const PUBLIC_FILE_SEPARATOR: char = '=';
 /// Answers accepted as "yes" at the publish prompt.
 const YES_ANSWERS: &[&str] = &["y", "yes"];
+/// Exit code for a second Ctrl-C, matching the shell convention for SIGINT.
+const FORCE_QUIT_EXIT_CODE: i32 = 130;
 
 /// Manifest subcommands.
 #[derive(Subcommand, Debug)]
@@ -193,7 +195,9 @@ impl ManifestAction {
                     anyhow::bail!("nothing to add: pass files, directories or --public-file");
                 }
                 manifest.canonicalize()?;
-                let out = write_manifest(&manifest, output, overwrite)?;
+                let out = resolve_output(manifest.name.as_deref(), output);
+                check_output_writable(&out, overwrite)?;
+                write_manifest(&manifest, &out, overwrite)?;
                 let history_id = record_upload_manifest(&manifest, None);
                 report_created(&manifest, &out, None, history_id, link, json)
             }
@@ -206,7 +210,8 @@ impl ManifestAction {
                 ..
             } => {
                 let manifest = load_manifest(&source)?;
-                let out = write_manifest(&manifest, output, overwrite)?;
+                let out = resolve_output(manifest.name.as_deref(), output);
+                write_manifest(&manifest, &out, overwrite)?;
                 report_exported(&manifest, &out, 0, link, json)
             }
             Self::Create { .. } | Self::Download { .. } | Self::Export { .. } => {
@@ -303,11 +308,17 @@ async fn export_compact(
     with_link: bool,
     json: bool,
 ) -> anyhow::Result<()> {
+    // Nothing is published until the output is known to be writable.
+    let out = resolve_output(manifest.name.as_deref(), output);
+    check_output_writable(&out, overwrite)?;
+    let cancel = CancellationToken::new();
+    spawn_ctrl_c(cancel.clone());
+
     let plan = if json {
-        plan_compaction(client, manifest).await?
+        plan_compaction(client, manifest, &cancel).await?
     } else {
         let spinner = progress::new_spinner("Checking which DataMaps are on the network...");
-        let plan = plan_compaction(client, manifest).await;
+        let plan = plan_compaction(client, manifest, &cancel).await;
         spinner.finish_and_clear();
         plan?
     };
@@ -328,20 +339,20 @@ async fn export_compact(
         }
         info!("Publishing {} DataMap chunk(s)", plan.needs_publish.len());
         if json {
-            publish_data_maps(client, manifest, &plan.needs_publish).await?;
+            publish_data_maps(client, manifest, &plan.needs_publish, &cancel).await?;
         } else {
             let spinner = progress::new_spinner(&format!(
                 "Publishing {} DataMap chunk(s)...",
                 plan.needs_publish.len()
             ));
-            let result = publish_data_maps(client, manifest, &plan.needs_publish).await;
+            let result = publish_data_maps(client, manifest, &plan.needs_publish, &cancel).await;
             spinner.finish_and_clear();
             result?;
         }
     }
 
     let compacted = apply_compaction(manifest, &plan.all_indices())?;
-    let out = write_manifest(&compacted, output, overwrite)?;
+    write_manifest(&compacted, &out, overwrite)?;
     report_exported(&compacted, &out, plan.needs_publish.len(), with_link, json)
 }
 
@@ -449,7 +460,12 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         },
         payment_mode: args.payment_mode,
         follow_symlinks: args.follow_symlinks,
+        cancel: CancellationToken::new(),
     };
+    // Fail before any paid upload if the manifest could not be written.
+    let out = resolve_output(options.name.as_deref(), args.output.clone());
+    check_output_writable(&out, args.overwrite)?;
+    spawn_ctrl_c(options.cancel.clone());
     let mut builder = ManifestBuilder::new(client, options);
     if let Some(dir) = &single_dir {
         builder.add_directory(dir, None)?;
@@ -478,8 +494,25 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         result?
     };
 
-    let out = write_manifest(&result.manifest, args.output, args.overwrite)?;
+    // Record first: the history is the safety net for paid uploads, so it
+    // must exist even if writing the output file fails.
     let history_id = record_upload_manifest(&result.manifest, None);
+    if result.cancelled {
+        let recorded = history_id
+            .map(|id| format!("; the partial manifest is recorded as {id}"))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "cancelled after {} of {} file(s){recorded}",
+            result.files_uploaded,
+            result.files_uploaded
+                + result
+                    .manifest
+                    .entries
+                    .len()
+                    .saturating_sub(result.files_uploaded)
+        );
+    }
+    write_manifest(&result.manifest, &out, args.overwrite)?;
     if !json {
         eprintln!(
             "Uploaded {} file(s), {} new chunk(s) in {:.1}s",
@@ -501,16 +534,42 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
     )
 }
 
-fn write_manifest(
-    manifest: &Manifest,
-    output: Option<PathBuf>,
-    overwrite: bool,
-) -> anyhow::Result<PathBuf> {
-    let out =
-        output.unwrap_or_else(|| PathBuf::from(manifest_filename_for(manifest.name.as_deref())));
-    write_manifest_file(&out, manifest, overwrite)
-        .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", out.display()))?;
-    Ok(out)
+/// The output path: the one given, or `<name>.ant` in the current directory.
+fn resolve_output(name: Option<&str>, output: Option<PathBuf>) -> PathBuf {
+    output.unwrap_or_else(|| PathBuf::from(manifest_filename_for(name)))
+}
+
+/// Refuse up front when the output exists and may not be replaced, so no
+/// paid work happens for a manifest that could not be written.
+fn check_output_writable(out: &Path, overwrite: bool) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(out) {
+        Ok(meta) if meta.is_dir() => anyhow::bail!("{} is a directory", out.display()),
+        Ok(_) if !overwrite => anyhow::bail!(
+            "{} already exists; pass --overwrite to replace it",
+            out.display()
+        ),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("cannot check {}: {e}", out.display())),
+    }
+}
+
+fn write_manifest(manifest: &Manifest, out: &Path, overwrite: bool) -> anyhow::Result<()> {
+    write_manifest_file(out, manifest, overwrite)
+        .map_err(|e| anyhow::anyhow!("Failed to write {}: {e}", out.display()))
+}
+
+/// Turn the first Ctrl-C into a cancellation and a second one into an exit.
+fn spawn_ctrl_c(cancel: CancellationToken) {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("Cancelling... press Ctrl-C again to quit immediately");
+            cancel.cancel();
+        }
+        if tokio::signal::ctrl_c().await.is_ok() {
+            std::process::exit(FORCE_QUIT_EXIT_CODE);
+        }
+    });
 }
 
 /// Record an upload in the history, warning instead of failing when the
@@ -739,6 +798,7 @@ async fn download(
         concurrency,
         cancel: CancellationToken::new(),
     };
+    spawn_ctrl_c(options.cancel.clone());
     info!("Extracting manifest into {}", output_root.display());
     let start = Instant::now();
 
@@ -753,19 +813,6 @@ async fn download(
     };
 
     if json {
-        let entries: Vec<_> = report
-            .entries
-            .iter()
-            .map(|e| match &e.status {
-                EntryStatus::Written { bytes } => {
-                    json!({"name": e.name, "status": "written", "bytes": bytes})
-                }
-                EntryStatus::Failed { error } => {
-                    json!({"name": e.name, "status": "failed", "error": error})
-                }
-                EntryStatus::Cancelled => json!({"name": e.name, "status": "cancelled"}),
-            })
-            .collect();
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -773,7 +820,7 @@ async fn download(
                 "written": report.written(),
                 "failed": report.failed(),
                 "cancelled": report.cancelled(),
-                "entries": entries,
+                "entries": report.entries,
             }))?
         );
     } else {
@@ -790,6 +837,12 @@ async fn download(
             report.failed(),
             start.elapsed().as_secs_f64(),
             output_root.display()
+        );
+    }
+    if report.cancelled() > 0 {
+        anyhow::bail!(
+            "cancelled with {} entr(y/ies) not downloaded",
+            report.cancelled()
         );
     }
     if report.failed() > 0 {
