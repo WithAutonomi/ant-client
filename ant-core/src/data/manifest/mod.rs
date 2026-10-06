@@ -497,9 +497,7 @@ mod tests {
         deep.push(0x81);
         deep.push(0xa4);
         deep.extend_from_slice(b"name");
-        for _ in 0..(MAX_DECODE_DEPTH * 2) {
-            deep.push(0x91);
-        }
+        deep.extend(std::iter::repeat_n(0x91, MAX_DECODE_DEPTH * 2));
         deep.push(0xc0);
         assert!(matches!(
             Manifest::decode(&deep),
