@@ -303,6 +303,8 @@ mod settlement_refusal_tests {
 /// - `RemotePut` -> `ApplicationError` (the remote node responded with a
 ///   structured rejection — the transport succeeded, so the node declined
 ///   at the application layer; not a local capacity signal)
+/// - `PointerFinal`, `PointerForked` -> `ApplicationError` (a verdict about
+///   one pointer's state, read over a working link)
 /// - `ClientUpdateRequired` -> `ApplicationError` (the storer refused to quote
 ///   a client that settles under superseded rules — a terminal verdict about
 ///   this build, not about link capacity, and no retry rate clears it)
@@ -341,6 +343,11 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         // run on the basis of a fault no retry can clear.
         | Error::ClientUpdateRequired(_)
         | Error::StorerUpdateRequired(_)
+        // A pointer that is final, or whose owner forked it, is a verdict
+        // about that pointer read over a working link. No retry rate changes
+        // it.
+        | Error::PointerFinal(_)
+        | Error::PointerForked(_)
         | Error::BadQuoteBinding { .. }
         | Error::BadQuoteCommitment { .. }
         // An external-signer merkle batch larger than one tree can hold —
@@ -1251,6 +1258,8 @@ mod tests {
             | Error::RemotePut { .. }
             | Error::ClientUpdateRequired(_)
             | Error::StorerUpdateRequired(_)
+            | Error::PointerFinal(_)
+            | Error::PointerForked(_)
             | Error::CloseGroupShortfall(_) => (),
         };
     }

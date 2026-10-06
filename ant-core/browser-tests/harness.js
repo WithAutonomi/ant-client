@@ -90,9 +90,18 @@ globalThis.runPointerIntegration = async ({ endpoint, payment, rpcUrl }) => {
   const resolved = await reader.resolvePointer(created.pointer.address);
   const absent = await reader.getPointer(chunk(0x42));
   reader.close(); reader.free();
+  // Hand the pointer over for good to the one `inner` controls (ADR-0018 in
+  // ant-node), then ask the whole group whether that is final.
+  const handover = new BrowserNetworkClient([endpoint]);
+  const transferred = await paced(() => handover.transferPointer(seed, end.pointer.address, payment, pay));
+  handover.close(); handover.free();
+  const checker = new BrowserNetworkClient([endpoint]);
+  const finality = await checker.pointerFinality(created.pointer.address);
+  checker.close(); checker.free();
   provider.destroy();
   return { payments, address: created.pointer.address, expectedAddress: pointerAddress(seed),
     createdCounter: created.pointer.counter, updatedCounter: updated.pointer.counter,
     readCounter: read?.counter, readKind: read?.kind, readTarget: read?.target, endAddress: end.pointer.address,
-    resolved, absent };
+    resolved, absent, transferredCounter: transferred.pointer.counter,
+    finalityStatus: finality.status, finalityTransferredTo: finality.majority?.transferredTo };
 };

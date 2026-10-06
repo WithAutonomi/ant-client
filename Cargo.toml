@@ -2,3 +2,9 @@
 members = ["ant-core", "ant-cli"]
 resolver = "2"
 
+[patch.crates-io]
+# The published ant-protocol 3.1.0 has pointers (ADR-0016) but not the final
+# state that ownership transfer relies on (ADR-0018 in ant-node). Pin the
+# companion revision until a release includes it. Versions are bumped at
+# release; this immutable revision remains 3.1.0.
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "ab459e52b3db19c0db15ed33a97fe6282dfd4ae0" }
