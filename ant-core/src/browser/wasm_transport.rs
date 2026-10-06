@@ -2677,7 +2677,12 @@ impl BrowserNetworkClient {
             resolved.file.size,
             resolved.index.chunk_count()
         ));
-        Ok(BrowserFileReader::new(Rc::clone(&self.shared), resolved))
+        Ok(BrowserFileReader::new(
+            Rc::clone(&self.shared),
+            resolved,
+            &self.read_ahead,
+            options.streaming,
+        ))
     }
 
     /// Errors are JavaScript values so an AbortSignal's reason reaches the caller.
@@ -2696,9 +2701,11 @@ impl BrowserNetworkClient {
             })
             .await?;
         let data_map_node = resolved.data_map_node.clone();
-        let reader = BrowserFileReader::new(Rc::clone(&self.shared), resolved);
+        // A complete download reads no ranges, so its read-ahead stays idle.
+        let reader =
+            BrowserFileReader::new(Rc::clone(&self.shared), resolved, &self.read_ahead, false);
         let (content, hash) = reader.collect(&settings, &mut cancel).await?;
-        let file = reader.into_descriptor(hash.clone());
+        let file = reader.descriptor(hash.clone());
         settings
             .progress
             .report(&format!("Verified complete {} as {hash}", file.name));

@@ -419,19 +419,34 @@ impl Client {
         .map_err(map_read_error)
     }
 
-    /// Read a range through a validated index reused across browser seeks.
+    /// Read a range through a validated index reused across browser seeks,
+    /// taking records from `held` and fetching those it resolves to `None`. A
+    /// record that `held` resolves to an error counts as a failed fetch
+    /// attempt, which the read retries by fetching.
     #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
-    pub(crate) async fn data_download_indexed_range(
+    pub(crate) async fn data_download_indexed_range<H>(
         &self,
         index: &crate::client_engine::files::FileIndex,
         start: u64,
         length: usize,
-    ) -> Result<Bytes> {
+        held: impl Fn([u8; 32]) -> H,
+    ) -> Result<Bytes>
+    where
+        H: std::future::Future<Output = Option<Result<Bytes>>>,
+    {
         crate::client_engine::files::read_indexed_range(
             index,
             start,
             length,
-            &|address| self.fetch_data_record(address),
+            &|address| {
+                let held = held(address);
+                async move {
+                    match held.await {
+                        Some(result) => result,
+                        None => self.fetch_data_record(address).await,
+                    }
+                }
+            },
             &|| self.controller().fetch.current(),
             &crate::runtime::sleep,
             retry_data_fetch,

@@ -368,7 +368,7 @@ test("a read in progress keeps its records when another read needs room", async 
   } finally { reader?.close(); client.close(); }
 });
 
-test("a DataMap whose records range reads reject still opens", async () => {
+test("a DataMap whose records range reads reject fails to open", async () => {
   const records = [0, 1, 2].map(index => {
     const content = Uint8Array.from({ length: 1024 }, (_, byte) => (byte + index) & 0xff);
     return { address: contentAddress(content), content };
@@ -380,12 +380,11 @@ test("a DataMap whose records range reads reject still opens", async () => {
   const rtc = mockWebRtc([{}]);
   for (const record of [...records, map]) rtc.stores[0].set(record.address, record.content);
   const client = new BrowserNetworkClient(rtc.endpoints);
-  let reader;
   try {
-    reader = await client.openPublicFile(map.address, undefined, { streaming: true });
-    assert.equal(reader.size, 3 * 1024);
-    await assert.rejects(reader.readRange(0, 10), /contiguous/);
-  } finally { reader?.close(); client.close(); }
+    // The reader's index is validated when it opens, before any read-ahead.
+    await assert.rejects(client.openPublicFile(map.address, undefined, { streaming: true }), /contiguous/);
+    assert.equal(rtc.requests.filter(r => r.method === "get_chunk").length, 1, "only the DataMap was fetched");
+  } finally { client.close(); }
 });
 
 test("read-ahead retries a failed record only after another read", async () => {

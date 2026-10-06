@@ -344,7 +344,9 @@ pub struct BrowserFileReader {
     shared: Rc<crate::data::Client>,
     /// Descriptor without its chunk list; the index holds the chunk metadata.
     file: PublicFileDescriptor,
-    index: FileIndex,
+    index: Rc<FileIndex>,
+    /// Fetches ahead of sequential range reads; see `read_ahead`.
+    pub(super) read_ahead: Rc<read_ahead::ReadAhead>,
     closed: watch::Sender<bool>,
 }
 
@@ -379,12 +381,21 @@ impl BrowserFileReader {
             )));
         }
         let mut cancel = Cancellation::new(Some(self.closed.subscribe()), JsValue::UNDEFINED)?;
+        let lease = self.read_ahead.begin_read(start, length as usize);
         let bytes = cancel
             .run(async {
-                self.shared
-                    .data_download_indexed_range(&self.index, start, length as usize)
-                    .await
-                    .map_err(js_string)
+                let bytes = self
+                    .shared
+                    .data_download_indexed_range(&self.index, start, length as usize, |address| {
+                        lease.record(address)
+                    })
+                    .await;
+                if matches!(bytes, Err(crate::data::Error::Encryption(_))) {
+                    // The records do not decrypt as the DataMap declares, so
+                    // reading further ahead would only spend bandwidth and memory.
+                    self.read_ahead.close();
+                }
+                bytes.map_err(js_string)
             })
             .await?;
         Ok(Uint8Array::from(bytes.as_ref()))
@@ -429,27 +440,44 @@ impl BrowserFileReader {
         result
     }
 
-    /// Close the reader and cancel its operations. Cached records stay in the
-    /// client's shared cache, which is bounded and may serve other readers.
-    /// Use an AbortSignal to cancel a single pipeTo without closing.
+    /// Close the reader: cancel its operations and release the records its
+    /// read-ahead holds. Records in the client's shared cache stay; that cache
+    /// is bounded and may serve other readers. Use an AbortSignal to cancel a
+    /// single pipeTo without closing.
     pub fn close(&self) {
         self.closed.send_replace(true);
+        self.read_ahead.close();
+    }
+}
+
+impl Drop for BrowserFileReader {
+    fn drop(&mut self) {
+        self.read_ahead.close();
     }
 }
 
 impl BrowserFileReader {
-    pub(super) fn new(shared: Rc<crate::data::Client>, resolved: ResolvedBrowserFile) -> Self {
+    /// `streaming` treats every read as part of a sequential stream for
+    /// read-ahead, as media playback needs.
+    pub(super) fn new(
+        shared: Rc<crate::data::Client>,
+        resolved: ResolvedBrowserFile,
+        read_ahead: &Rc<read_ahead::ReadAheadPool>,
+        streaming: bool,
+    ) -> Self {
+        let index = Rc::new(resolved.index);
         Self {
             shared,
             file: resolved.file,
-            index: resolved.index,
+            read_ahead: read_ahead::ReadAhead::new(read_ahead, Rc::clone(&index), streaming),
+            index,
             closed: watch::Sender::new(false),
         }
     }
 
     /// The descriptor of a completely read file, with its chunk list and hash.
-    pub(super) fn into_descriptor(self, hash: String) -> PublicFileDescriptor {
-        let mut file = self.file;
+    pub(super) fn descriptor(&self, hash: String) -> PublicFileDescriptor {
+        let mut file = self.file.clone();
         file.chunks = self
             .index
             .chunk_infos()

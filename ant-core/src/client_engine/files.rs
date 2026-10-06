@@ -210,64 +210,6 @@ where
     self_encryption::decrypt(&root, &chunks).map_err(|e| ReadError::Invalid(e.to_string()))
 }
 
-/// Plaintext layout of a resolved root DataMap, in record order. Chunk sizes are
-/// read from the native DataMap; checked sums avoid overflow on untrusted maps.
-#[derive(Default)]
-pub(crate) struct RecordLayout {
-    /// Plaintext end offset and content address of each record.
-    records: Vec<(usize, [u8; 32])>,
-}
-
-impl RecordLayout {
-    pub(crate) fn new(map: &DataMap) -> Result<Self, String> {
-        if map.is_child() {
-            return Err("range reads require a resolved root DataMap".into());
-        }
-        let mut infos = map.infos().to_vec();
-        infos.sort_by_key(|info| info.index);
-        let mut end = 0usize;
-        let mut records = Vec::with_capacity(infos.len());
-        for (index, info) in infos.into_iter().enumerate() {
-            if info.index != index {
-                return Err("DataMap chunk indices must be contiguous".into());
-            }
-            end = end
-                .checked_add(info.src_size)
-                .ok_or("DataMap plaintext size overflow")?;
-            records.push((end, info.dst_hash.0));
-        }
-        Ok(Self { records })
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.records.len()
-    }
-
-    /// Plaintext size of the file.
-    pub(crate) fn size(&self) -> usize {
-        self.records.last().map_or(0, |(end, _)| *end)
-    }
-
-    pub(crate) fn address(&self, index: usize) -> [u8; 32] {
-        self.records[index].1
-    }
-
-    /// Index of the record holding plaintext byte `offset`; `len()` at or past EOF.
-    pub(crate) fn record_at(&self, offset: usize) -> usize {
-        self.records.partition_point(|(end, _)| *end <= offset)
-    }
-
-    /// Records overlapping the plaintext range `[start, start + length)`.
-    pub(crate) fn overlapping(&self, start: usize, length: usize) -> Range<usize> {
-        let first = self.record_at(start);
-        if length == 0 {
-            return first..first;
-        }
-        let last = self.record_at(start.saturating_add(length - 1));
-        first..(last + 1).min(self.len())
-    }
-}
-
 /// Validated root-map index. File positions are independent of the platform's
 /// pointer width; only individual chunk buffers and indices use `usize`.
 /// Build once per reader so each seek is O(log chunks + overlapping chunks).
@@ -366,6 +308,11 @@ impl FileIndex {
 impl FileIndex {
     pub(crate) fn chunk_count(&self) -> usize {
         self.dst_hashes.len()
+    }
+
+    /// Encrypted record address of one chunk.
+    pub(crate) fn address(&self, chunk: usize) -> [u8; 32] {
+        self.dst_hashes[chunk].0
     }
 
     /// The size of the largest chunk.
@@ -1001,28 +948,6 @@ mod tests {
     }
 
     #[test]
-    fn layout_maps_plaintext_ranges_to_records() {
-        let infos = [10, 10, 10]
-            .into_iter()
-            .enumerate()
-            .map(|(index, src_size)| self_encryption::ChunkInfo {
-                index,
-                dst_hash: XorName([index as u8 + 1; 32]),
-                src_hash: XorName([0; 32]),
-                src_size,
-            })
-            .collect();
-        let layout = RecordLayout::new(&DataMap::new(infos)).unwrap();
-        assert_eq!(layout.size(), 30);
-        assert_eq!(layout.overlapping(0, 10), 0..1);
-        assert_eq!(layout.overlapping(9, 2), 0..2);
-        assert_eq!(layout.overlapping(10, 25), 1..3);
-        assert_eq!(layout.overlapping(25, 0), 2..2);
-        assert_eq!(layout.overlapping(30, 10), 3..3);
-        assert_eq!(layout.address(1), [2; 32]);
-    }
-
-    #[test]
     fn malformed_range_maps_are_rejected() {
         let (_, map, _) = fixture();
         let mut infos = map.infos().to_vec();
@@ -1087,6 +1012,7 @@ mod tests {
             index.dst_hashes,
             infos.iter().map(|info| info.dst_hash).collect::<Vec<_>>()
         );
+        assert_eq!(index.address(2), infos[2].dst_hash.0);
         assert_eq!(index.largest_chunk(), size as u64);
         // Chunk sizes are not capped natively; browsers apply their own limit.
         let mut infos = infos;

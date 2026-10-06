@@ -734,13 +734,21 @@ one operation without closing the reader. Closing the reader cancels its
 operations at once, including fetches waiting to be retried, until every byte
 is written; it may then be closed from the final progress callback. After that
 only the signal can cancel, and a destination that has started closing may
-already be committed. Closing a reader no longer clears the client's shared
-cache: that cache is bounded (32 MiB) and may hold records other readers are
-using, including readers of the same content opened another way, so its LRU
-policy releases records instead. Cancellation is checked before an operation is resumed, so a cancelled
+already be committed. Closing a reader releases the records its read-ahead
+holds but no longer clears the client's shared cache: that cache is bounded
+(32 MiB) and may hold records other readers are using, including readers of the
+same content opened another way, so its LRU policy releases records instead.
+Cancellation is checked before an operation is resumed, so a cancelled
 operation never completes or refills the cache afterwards. The core
 does not open file pickers, own browser filesystem policy, or change the
 companion SDK.
+
+Read-ahead, described under streaming reads, now plans its windows over the
+reader's 64-bit index rather than a `usize` record layout, so it follows reads
+past 4 GiB on wasm32. The reader validates that index when it opens. A DataMap
+whose range reads reject, such as one with non-contiguous indices, therefore no
+longer opens with read-ahead off: opening it fails with the same error, before
+any content record is fetched.
 
 Removing only the 1 GB check was rejected because wasm32 offsets would still
 truncate around 4 GiB. Whole-file WASM buffering was rejected because it couples

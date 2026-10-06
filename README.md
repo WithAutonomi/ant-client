@@ -85,7 +85,8 @@ destination on success, aborts it on any failure (including invalid options),
 and releases the writer lock; a failure does not wait for a stalled destination
 to finish aborting. Its result contains the byte count and BLAKE3 of the written
 range. An `AbortSignal` cancels that one operation and leaves the reader open.
-`reader.close()` cancels the reader's operations at once, including fetches
+`reader.close()` releases the records its read-ahead holds and cancels the
+reader's operations at once, including fetches
 waiting to be retried, until every byte is written. After that only the signal
 can cancel, and a destination that has started closing may already be
 committed. Closing leaves records in the client's shared cache, which is
