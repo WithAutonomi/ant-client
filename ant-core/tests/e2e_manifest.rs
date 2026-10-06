@@ -12,9 +12,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ant_core::data::{
-    extract_manifest, manifest_link, parse_link, read_manifest_file, write_manifest_file,
-    BuildOptions, Client, ContentRef, EntryStatus, ExtractOptions, Link, ManifestBuilder,
-    PaymentMode, ReferenceMode, Visibility,
+    apply_compaction, extract_manifest, manifest_link, parse_link, plan_compaction,
+    publish_data_maps, read_manifest_file, write_manifest_file, BuildOptions, Client, ContentRef,
+    EntryStatus, ExtractOptions, Link, ManifestBuilder, PaymentMode, ReferenceMode, Visibility,
 };
 use serial_test::serial;
 use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
@@ -252,6 +252,70 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
     assert_eq!(
         fs::read(out.path().join("public.bin")).unwrap(),
         vec![0x66u8; FILE_BYTES]
+    );
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn compact_export_publishes_private_data_maps_then_replaces_them() {
+    let (client, testnet) = setup().await;
+
+    let source = TempDir::new().unwrap();
+    fs::write(source.path().join("x.bin"), vec![0x77u8; FILE_BYTES]).unwrap();
+    fs::write(source.path().join("y.bin"), vec![0x88u8; FILE_BYTES]).unwrap();
+
+    let mut builder = ManifestBuilder::new(&client, BuildOptions::default());
+    builder.add_directory(source.path(), None).unwrap();
+    let built = builder.finish(None).await.expect("build");
+    assert!(built
+        .manifest
+        .entries
+        .iter()
+        .all(|e| e.source.kind() == "embedded"));
+
+    // Nothing is public yet, so every entry needs publishing.
+    let plan = plan_compaction(&client, &built.manifest)
+        .await
+        .expect("plan");
+    assert!(plan.already_public.is_empty());
+    assert_eq!(plan.needs_publish.len(), 2);
+    assert!(!plan.is_free());
+
+    let stored = publish_data_maps(&client, &built.manifest, &plan.needs_publish)
+        .await
+        .expect("publish");
+    assert_eq!(stored.len(), 2);
+
+    // A second plan sees them as public, and compaction is free.
+    let plan = plan_compaction(&client, &built.manifest)
+        .await
+        .expect("replan");
+    assert!(plan.is_free());
+    assert_eq!(plan.already_public.len(), 2);
+
+    let compacted = apply_compaction(&built.manifest, &plan.all_indices()).unwrap();
+    assert!(compacted
+        .entries
+        .iter()
+        .all(|e| e.source.kind() == "public"));
+    assert!(compacted.encode().unwrap().len() < built.manifest.encode().unwrap().len());
+
+    let out = TempDir::new().unwrap();
+    let report = extract_manifest(
+        &client,
+        &compacted,
+        &extract_options(out.path(), vec![]),
+        None,
+    )
+    .await
+    .expect("extract compacted");
+    assert_eq!(report.written(), 2, "{:?}", report.entries);
+    assert_eq!(
+        fs::read(out.path().join("y.bin")).unwrap(),
+        vec![0x88u8; FILE_BYTES]
     );
 
     drop(client);

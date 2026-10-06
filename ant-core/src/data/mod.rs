@@ -60,6 +60,7 @@ pub use self_encryption::DataMap;
 #[cfg(feature = "native")]
 pub use manifest::{
     build::{BuildEvent, BuildOptions, BuildResult, ManifestBuilder, ReferenceMode},
+    compact::{apply_compaction, plan_compaction, publish_data_maps, CompactPlan, EmbeddedEntry},
     extract::{
         extract_manifest, select_entries, EntryOutcome, EntryStatus, ExtractEvent, ExtractOptions,
         ExtractReport,

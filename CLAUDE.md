@@ -82,6 +82,7 @@ ant-core/src/
 │       ├── file.rs           # .ant file read/write
 │       ├── history.rs        # Upload history: one .ant per upload under <data dir>/uploads
 │       ├── build.rs          # ManifestBuilder (uploads files, embedded or compact refs)
+│       ├── compact.rs        # Plan/publish/apply compaction (embedded DataMaps -> addresses)
 │       └── extract.rs        # Containment-safe extraction with per-entry results
 └── node/                     # Node management
     ├── mod.rs                # add_nodes, remove_node, reset
@@ -118,7 +119,7 @@ ant-cli/src/
     │   ├── file.rs           # ant file upload/download
     │   ├── chunk.rs          # ant chunk put/get
     │   ├── pointer.rs        # ant pointer keygen/address/create/update/get/resolve
-    │   ├── manifest.rs       # ant manifest create/list/show/link/download
+    │   ├── manifest.rs       # ant manifest create/list/show/link/export/download
     │   └── wallet.rs         # ant wallet address/balance
     └── node/
         ├── mod.rs

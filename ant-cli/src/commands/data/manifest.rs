@@ -8,16 +8,18 @@
 //! history under the data directory, so `ant manifest list` can show it and
 //! `ant manifest download <ID>` can fetch it again.
 
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ant_core::data::{
-    default_history_dir, extract_manifest, format_timestamp, is_link, list_uploads, load_upload,
-    manifest_filename_for, manifest_link, parse_link, read_manifest_file, record_upload,
-    write_manifest_file, BuildEvent, BuildOptions, Client, ContentRef, DownloadEvent, EntryStatus,
-    ExtractEvent, ExtractOptions, Link, Manifest, ManifestBuilder, PaymentMode, ReferenceMode,
-    UploadEvent, UploadRecord, Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+    apply_compaction, default_history_dir, extract_manifest, format_timestamp, is_link,
+    list_uploads, load_upload, manifest_filename_for, manifest_link, parse_link, plan_compaction,
+    publish_data_maps, read_manifest_file, record_upload, write_manifest_file, BuildEvent,
+    BuildOptions, Client, ContentRef, DownloadEvent, EntryStatus, ExtractEvent, ExtractOptions,
+    Link, Manifest, ManifestBuilder, PaymentMode, ReferenceMode, UploadEvent, UploadRecord,
+    Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
 };
 use clap::Subcommand;
 use serde_json::json;
@@ -33,6 +35,8 @@ const DEFAULT_CONCURRENCY: usize = 1;
 const PROGRESS_CHANNEL_CAPACITY: usize = 64;
 /// Separator between address and path in `--public-file ADDRESS=PATH`.
 const PUBLIC_FILE_SEPARATOR: char = '=';
+/// Answers accepted as "yes" at the publish prompt.
+const YES_ANSWERS: &[&str] = &["y", "yes"];
 
 /// Manifest subcommands.
 #[derive(Subcommand, Debug)]
@@ -92,6 +96,32 @@ pub enum ManifestAction {
         /// The `.ant` file.
         file: PathBuf,
     },
+    /// Write a manifest out as a `.ant` file, optionally compacted.
+    ///
+    /// Compacting replaces embedded DataMaps with public addresses, which
+    /// is only possible for DataMaps that are on the network. Any that are
+    /// still private are listed and you are asked whether to publish them
+    /// first; publishing is paid and makes those files public.
+    Export {
+        /// A `.ant` file, an `ant://manifest/...` link, or an upload id
+        /// from `ant manifest list`.
+        source: String,
+        /// Where to write the manifest. Defaults to `<name>.ant` here.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Replace embedded DataMaps with public addresses.
+        #[arg(long)]
+        compact: bool,
+        /// Publish still-private DataMaps without asking.
+        #[arg(long, short)]
+        yes: bool,
+        /// Replace an existing file at the output path.
+        #[arg(long)]
+        overwrite: bool,
+        /// Also print the exported manifest as an `ant://manifest/...` link.
+        #[arg(long)]
+        link: bool,
+    },
     /// Download the files a manifest describes.
     Download {
         /// A `.ant` file, an `ant://manifest/...` link, or an upload id
@@ -119,13 +149,19 @@ impl ManifestAction {
         match self {
             Self::Create { paths, .. } => !paths.is_empty(),
             Self::Download { .. } => true,
+            Self::Export { compact, .. } => *compact,
             Self::List | Self::Show { .. } | Self::Link { .. } => false,
         }
     }
 
     /// Whether the command pays for anything.
     pub fn needs_wallet(&self) -> bool {
-        matches!(self, Self::Create { paths, .. } if !paths.is_empty())
+        match self {
+            Self::Create { paths, .. } => !paths.is_empty(),
+            // Compacting may have to publish DataMap chunks, which is paid.
+            Self::Export { compact, .. } => *compact,
+            Self::List | Self::Show { .. } | Self::Link { .. } | Self::Download { .. } => false,
+        }
     }
 
     /// Run a command that needs no network.
@@ -161,7 +197,19 @@ impl ManifestAction {
                 let history_id = record_upload_manifest(&manifest, None);
                 report_created(&manifest, &out, None, history_id, link, json)
             }
-            Self::Create { .. } | Self::Download { .. } => {
+            Self::Export {
+                source,
+                output,
+                compact: false,
+                overwrite,
+                link,
+                ..
+            } => {
+                let manifest = load_manifest(&source)?;
+                let out = write_manifest(&manifest, output, overwrite)?;
+                report_exported(&manifest, &out, 0, link, json)
+            }
+            Self::Create { .. } | Self::Download { .. } | Self::Export { .. } => {
                 anyhow::bail!("this command needs a network connection")
             }
         }
@@ -228,9 +276,137 @@ impl ManifestAction {
                 )
                 .await
             }
-            Self::List | Self::Show { .. } | Self::Link { .. } => self.execute_offline(json),
+            Self::Export {
+                source,
+                output,
+                compact: true,
+                yes,
+                overwrite,
+                link,
+            } => {
+                let manifest = load_manifest(&source)?;
+                export_compact(client, &manifest, output, yes, overwrite, link, json).await
+            }
+            Self::List | Self::Show { .. } | Self::Link { .. } | Self::Export { .. } => {
+                self.execute_offline(json)
+            }
         }
     }
+}
+
+async fn export_compact(
+    client: &Client,
+    manifest: &Manifest,
+    output: Option<PathBuf>,
+    yes: bool,
+    overwrite: bool,
+    with_link: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let plan = if json {
+        plan_compaction(client, manifest).await?
+    } else {
+        let spinner = progress::new_spinner("Checking which DataMaps are on the network...");
+        let plan = plan_compaction(client, manifest).await;
+        spinner.finish_and_clear();
+        plan?
+    };
+
+    if !plan.is_free() {
+        if !json {
+            eprintln!(
+                "{} embedded DataMap(s) are already public; {} are still private:",
+                plan.already_public.len(),
+                plan.needs_publish.len()
+            );
+            for entry in &plan.needs_publish {
+                eprintln!("  {}", entry.name);
+            }
+        }
+        if !yes && !confirm_publish(plan.needs_publish.len(), json)? {
+            anyhow::bail!("export cancelled: the manifest was not compacted");
+        }
+        info!("Publishing {} DataMap chunk(s)", plan.needs_publish.len());
+        if json {
+            publish_data_maps(client, manifest, &plan.needs_publish).await?;
+        } else {
+            let spinner = progress::new_spinner(&format!(
+                "Publishing {} DataMap chunk(s)...",
+                plan.needs_publish.len()
+            ));
+            let result = publish_data_maps(client, manifest, &plan.needs_publish).await;
+            spinner.finish_and_clear();
+            result?;
+        }
+    }
+
+    let compacted = apply_compaction(manifest, &plan.all_indices())?;
+    let out = write_manifest(&compacted, output, overwrite)?;
+    report_exported(&compacted, &out, plan.needs_publish.len(), with_link, json)
+}
+
+/// Ask on the terminal whether to publish `count` DataMaps. Without a
+/// terminal, or in JSON mode, the answer must come from `--yes`.
+fn confirm_publish(count: usize, json: bool) -> anyhow::Result<bool> {
+    if json || !io::stdin().is_terminal() {
+        anyhow::bail!(
+            "{count} DataMap(s) must be published to compact this manifest; \
+             pass --yes to publish them (this is paid and makes those files public)"
+        );
+    }
+    eprint!("Publish {count} DataMap chunk(s)? This is paid and makes those files public. [y/N] ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().lock().read_line(&mut answer)?;
+    Ok(YES_ANSWERS.contains(&answer.trim().to_ascii_lowercase().as_str()))
+}
+
+fn report_exported(
+    manifest: &Manifest,
+    out: &Path,
+    published: usize,
+    with_link: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let link_text = if with_link {
+        Some(manifest_link(manifest)?)
+    } else {
+        None
+    };
+    let embedded = manifest
+        .entries
+        .iter()
+        .filter(|e| matches!(e.source, ContentRef::Embedded { .. }))
+        .count();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "manifest_file": out.display().to_string(),
+                "name": manifest.name,
+                "entries": entries_json(manifest)?,
+                "embedded_entries": embedded,
+                "public_entries": manifest.entries.len() - embedded,
+                "data_maps_published": published,
+                "link": link_text,
+            }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "Wrote {} ({} embedded, {} public)",
+        out.display(),
+        embedded,
+        manifest.entries.len() - embedded
+    );
+    if published > 0 {
+        println!("Published {published} DataMap chunk(s)");
+    }
+    if let Some(link) = link_text {
+        warn_if_long_link(manifest)?;
+        println!("{link}");
+    }
+    Ok(())
 }
 
 struct CreateArgs {

@@ -35,6 +35,8 @@ pub mod path;
 #[cfg(feature = "native")]
 pub mod build;
 #[cfg(feature = "native")]
+pub mod compact;
+#[cfg(feature = "native")]
 pub mod extract;
 #[cfg(feature = "native")]
 pub mod file;

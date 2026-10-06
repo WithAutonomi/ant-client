@@ -270,6 +270,19 @@ DataMap, whether or not the upload was public. Recording never fails an
 upload that has already succeeded; an unusable history directory is reported
 and the upload result still shown.
 
+### Export and compaction
+
+Any manifest the client can load, from a file, a link or the upload history,
+can be exported as a `.ant` file. Export can also **compact** the manifest:
+each embedded DataMap is replaced by its public address. That is possible
+only for DataMaps whose chunk is on the network, so compaction is planned
+first: every embedded entry is checked and sorted into already public or
+still private. If any are still private the user is told which, and asked
+whether to publish them. Publishing stores those DataMap chunks, is paid,
+and makes those files public; it never happens without an explicit yes, and
+a non-interactive run must pass that yes as a flag. Declining leaves the
+manifest untouched. Entries already referenced by address are unaffected.
+
 ### Download and extraction
 
 Input: a manifest, an output root, and an optional selection by exact
@@ -307,8 +320,9 @@ and marks every unstarted entry cancelled.
 The library exposes: encode, decode, validate, link parse and format, build,
 and extract. Encode, decode, validate and link handling are portable and
 available to the browser build; build and extract need a filesystem. The CLI
-exposes create, list, show, link and download for manifests, and its ordinary
-file download accepts a file link or a bare address. No daemon API is added.
+exposes create, list, show, link, export and download for manifests, and its
+ordinary file download accepts a file link or a bare address. No daemon API
+is added.
 
 ## Consequences
 
