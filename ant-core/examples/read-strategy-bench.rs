@@ -11,18 +11,24 @@
 //! ```
 //!
 //! `chunks.txt` holds one hex chunk address per line. No wallet or payment.
+//!
+//! `--concurrency N` keeps N reads in flight, as a file download does, and
+//! reports the wall time for the whole set. Use one strategy per run then, so
+//! strategies do not compete with each other, and `--drain-secs 0` so a read
+//! frees its slot as soon as it has its chunk.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::print_stdout)]
 
-use ant_core::data::client::read_bench::{ReadStrategy, ReadTrace};
+use ant_core::data::client::read_bench::{ReadStrategy, ReadTrace, DUPLICATE_DRAIN_TIMEOUT};
 use ant_core::data::{Client, ClientConfig};
+use futures::stream::{self, StreamExt};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde::Serialize;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Time for the routing table to fill before the first read.
 const DEFAULT_WARMUP: Duration = Duration::from_secs(10);
@@ -37,6 +43,8 @@ struct Args {
     seed: u64,
     limit: Option<usize>,
     warmup: Duration,
+    concurrency: usize,
+    drain: Duration,
 }
 
 impl Args {
@@ -48,6 +56,8 @@ impl Args {
         let mut seed = 0;
         let mut limit = None;
         let mut warmup = DEFAULT_WARMUP;
+        let mut concurrency = 1;
+        let mut drain = DUPLICATE_DRAIN_TIMEOUT;
         while let Some(arg) = args.next() {
             let mut value = || args.next().expect("flag needs a value");
             match arg.as_str() {
@@ -58,6 +68,12 @@ impl Args {
                 "--limit" => limit = Some(value().parse().expect("--limit is an integer")),
                 "--warmup-secs" => {
                     warmup = Duration::from_secs(value().parse().expect("--warmup-secs"));
+                }
+                "--concurrency" => {
+                    concurrency = value().parse().expect("--concurrency is an integer");
+                }
+                "--drain-secs" => {
+                    drain = Duration::from_secs(value().parse().expect("--drain-secs"));
                 }
                 other => panic!("unknown flag {other}"),
             }
@@ -72,6 +88,8 @@ impl Args {
             seed,
             limit,
             warmup,
+            concurrency,
+            drain,
         }
     }
 }
@@ -125,21 +143,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("connected; warming up for {:?}", args.warmup);
     tokio::time::sleep(args.warmup).await;
 
-    let mut out = std::fs::File::create(&args.out)?;
     let mut block = args.strategies.clone();
+    let mut reads = Vec::with_capacity(addresses.len());
     for (seq, address_hex) in addresses.iter().enumerate() {
         let position = seq % block.len();
         if position == 0 {
             block.shuffle(&mut rng);
         }
-        let strategy = block[position];
         let address: [u8; 32] = hex::decode(address_hex)?
             .try_into()
             .map_err(|_| "address is not 32 bytes")?;
-        let started_unix_ms = unix_ms();
-        let trace = tokio::time::timeout(READ_TIMEOUT, client.bench_chunk_read(&address, strategy))
+        reads.push((seq, block[position], address, address_hex.as_str()));
+    }
+
+    let mut out = std::fs::File::create(&args.out)?;
+    let started = Instant::now();
+    let client = &client;
+    let drain = args.drain;
+    let mut results = stream::iter(reads)
+        .map(|(seq, strategy, address, address_hex)| async move {
+            let started_unix_ms = unix_ms();
+            let trace = tokio::time::timeout(
+                READ_TIMEOUT,
+                client.bench_chunk_read_with_drain(&address, strategy, drain),
+            )
             .await
             .ok();
+            (seq, strategy, address_hex, started_unix_ms, trace)
+        })
+        .buffer_unordered(args.concurrency.max(1));
+    while let Some((seq, strategy, address_hex, started_unix_ms, trace)) = results.next().await {
         match &trace {
             Some(trace) => eprintln!(
                 "{seq:4} {strategy:?} found={} total={}ms lookup={:?} gets={}",
@@ -163,5 +196,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         writeln!(out)?;
         out.flush()?;
     }
+    eprintln!(
+        "done: {} reads at concurrency {} in {} ms",
+        addresses.len(),
+        args.concurrency,
+        started.elapsed().as_millis()
+    );
     Ok(())
 }

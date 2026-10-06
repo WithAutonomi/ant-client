@@ -1,22 +1,30 @@
 //! V2-1358 read-strategy prototype bench. Not a production path.
 //!
-//! Three ways to read one chunk on the same live client, each recording every
-//! GET it sends:
+//! Ways to read one chunk on the same live client, each recording every
+//! request it sends:
 //!
 //! - [`ReadStrategy::Baseline`]: today's `chunk_get` policy.
 //! - [`ReadStrategy::Progress`]: native only. The same policy, but each
 //!   FIND_NODE responder, and each connected peer it returns, becomes an
 //!   early-GET hint while the lookup runs. This is what the browser already
 //!   does, so on the browser it is the baseline.
-//! - [`ReadStrategy::Eager`]: native only. Like `Progress`, but each peer is
-//!   offered as a hint when the lookup queries it, not when it answers, so a
-//!   holder's GET shares the lookup's dial and round trip. Still at most two
+//! - [`ReadStrategy::Eager`]: like `Progress`, but each peer is offered as a
+//!   hint when the lookup queries it, not when it answers. Still at most two
 //!   GETs at once.
-//! - [`ReadStrategy::Combined`]: emulates a request that returns the chunk or
-//!   closer peers. Every peer the lookup queries also gets a GET at the same
-//!   moment, and the read stops at the first verified chunk. Nodes need no
-//!   change: a GET and a FIND_NODE sent together to one peer cost one round
-//!   trip, as the combined request would.
+//!
+//! The remaining strategies act on each peer the lookup queries, at the
+//! moment it is queried, and stop at the first verified chunk:
+//!
+//! - [`ReadStrategy::Combined`]: GET every queried peer. Emulates a request
+//!   that returns the chunk or closer peers, with no node change.
+//! - [`ReadStrategy::Capped`]: GET queried peers closest-first, at most
+//!   [`CAPPED_GETS`] at once. No protocol change.
+//! - [`ReadStrategy::Have`]: ask every queried peer whether it holds the
+//!   chunk, and GET from holders one at a time, hedged. Emulates a request
+//!   that answers "have it" or closer peers; a storage quote's
+//!   `already_stored` stands in for the "have it" answer.
+//! - [`ReadStrategy::HaveInline`]: like `Have`, but the closest queried peer
+//!   of each lookup round is sent a GET, as if asked to inline the chunk.
 //!
 //! The platform supplies the lookup and a stream of [`LookupEvent`]s; the
 //! read policy and the recording are shared.
@@ -30,12 +38,15 @@ use crate::data::network::ReadProgress;
 #[cfg(feature = "native")]
 use ant_protocol::transport::DHTNode;
 use ant_protocol::transport::{MultiAddr, PeerId};
-use ant_protocol::{DataChunk, XorName};
+use ant_protocol::{
+    ChunkMessage, ChunkMessageBody, ChunkQuoteRequestV2, ChunkQuoteResponse, DataChunk, XorName,
+    MAX_CHUNK_SIZE,
+};
 use futures::stream::{FuturesUnordered, StreamExt};
 #[cfg(feature = "native")]
 use saorsa_core::LookupObserver;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 #[cfg(feature = "native")]
 use std::sync::Arc;
@@ -44,9 +55,18 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use web_time::Instant;
 
-/// How long to keep collecting in-flight GETs after a Combined read has its
-/// chunk, so the duplicate bytes they carry are counted.
-const DUPLICATE_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long to keep collecting in-flight GETs after a lookup-driven read has
+/// its chunk, so the duplicate bytes they carry are counted.
+pub const DUPLICATE_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+/// GETs a [`ReadStrategy::Capped`] read keeps in flight.
+const CAPPED_GETS: usize = 2;
+/// GETs to known holders a [`ReadStrategy::Have`] read keeps in flight.
+const HOLDER_GETS: usize = 2;
+/// How long a holder GET runs before a second holder is asked too.
+const HOLDER_HEDGE_DELAY: Duration = Duration::from_millis(1500);
+/// Size declared by a have-probe quote. Any valid size works; the node only
+/// reports whether it already stores the address.
+const HAVE_PROBE_SIZE: u64 = MAX_CHUNK_SIZE as u64;
 
 /// A peer and the addresses to reach it by.
 pub(crate) type PeerAddrs = (PeerId, Vec<MultiAddr>);
@@ -63,6 +83,37 @@ pub enum ReadStrategy {
     Eager,
     /// Emulated chunk-or-closer-peers request.
     Combined,
+    /// GET queried peers closest-first, a few at a time.
+    Capped,
+    /// Emulated have-or-closer-peers request, then a hedged fetch.
+    Have,
+    /// `Have`, with the closest peer of each round asked for the chunk.
+    HaveInline,
+}
+
+/// How a lookup-driven read turns queried peers into requests.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbePolicy {
+    /// GET queried peers closest-first, at most `limit` at once.
+    Get { limit: usize },
+    /// Ask queried peers whether they hold the chunk; GET holders.
+    Have { inline_closest: bool },
+}
+
+impl ReadStrategy {
+    fn probe_policy(self) -> Option<ProbePolicy> {
+        match self {
+            Self::Combined => Some(ProbePolicy::Get { limit: usize::MAX }),
+            Self::Capped => Some(ProbePolicy::Get { limit: CAPPED_GETS }),
+            Self::Have => Some(ProbePolicy::Have {
+                inline_closest: false,
+            }),
+            Self::HaveInline => Some(ProbePolicy::Have {
+                inline_closest: true,
+            }),
+            Self::Baseline | Self::Progress | Self::Eager => None,
+        }
+    }
 }
 
 impl ReadStrategy {
@@ -74,6 +125,9 @@ impl ReadStrategy {
             "progress" => Some(Self::Progress),
             "eager" => Some(Self::Eager),
             "combined" => Some(Self::Combined),
+            "capped" => Some(Self::Capped),
+            "have" => Some(Self::Have),
+            "have_inline" => Some(Self::HaveInline),
             _ => None,
         }
     }
@@ -96,6 +150,21 @@ pub struct ReadAttempt {
     pub outcome: &'static str,
     /// Verified chunk bytes received.
     pub bytes: u64,
+}
+
+/// One "do you hold it?" probe sent while reading a chunk.
+#[derive(Clone, Debug, Serialize)]
+pub struct HaveProbe {
+    /// Peer asked.
+    pub peer: String,
+    /// Lookup round that queried the peer.
+    pub round: usize,
+    /// Milliseconds from the start of the read.
+    pub started_ms: u64,
+    /// Milliseconds from the start of the read.
+    pub completed_ms: u64,
+    /// `have`, `not_have`, `timeout`, `network`, `protocol` or `invalid`.
+    pub outcome: &'static str,
 }
 
 /// A FIND_NODE answer seen during the lookup.
@@ -131,6 +200,8 @@ pub struct ReadTrace {
     pub answers: Vec<LookupAnswer>,
     /// Every GET sent, including those still in flight when the chunk arrived.
     pub attempts: Vec<ReadAttempt>,
+    /// Every have-probe sent.
+    pub have_probes: Vec<HaveProbe>,
     /// Error that ended the read.
     pub error: Option<String>,
 }
@@ -169,6 +240,17 @@ fn outcome_of(result: &Result<Option<DataChunk>>) -> (&'static str, u64) {
     }
 }
 
+fn have_outcome_of(result: &Result<bool>) -> &'static str {
+    match result {
+        Ok(true) => "have",
+        Ok(false) => "not_have",
+        Err(Error::Timeout(_)) => "timeout",
+        Err(Error::Network(_)) => "network",
+        Err(Error::Protocol(_)) => "protocol",
+        Err(_) => "invalid",
+    }
+}
+
 fn is_retryable(error: &Error) -> bool {
     matches!(
         error,
@@ -186,6 +268,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub(crate) struct Recorder {
     pub(crate) started: Instant,
     attempts: Mutex<Vec<ReadAttempt>>,
+    have_probes: Mutex<Vec<HaveProbe>>,
     answers: Mutex<Vec<LookupAnswer>>,
     queried_at: Mutex<HashMap<PeerId, u64>>,
     lookup_ms: Mutex<Option<u64>>,
@@ -196,6 +279,7 @@ impl Recorder {
         Self {
             started: Instant::now(),
             attempts: Mutex::new(Vec::new()),
+            have_probes: Mutex::new(Vec::new()),
             answers: Mutex::new(Vec::new()),
             queried_at: Mutex::new(HashMap::new()),
             lookup_ms: Mutex::new(None),
@@ -223,6 +307,22 @@ impl Recorder {
             completed_ms: self.now_ms(),
             outcome,
             bytes,
+        });
+    }
+
+    fn record_have_probe(
+        &self,
+        peer: &PeerId,
+        round: usize,
+        started_ms: u64,
+        result: &Result<bool>,
+    ) {
+        lock(&self.have_probes).push(HaveProbe {
+            peer: peer.to_hex(),
+            round,
+            started_ms,
+            completed_ms: self.now_ms(),
+            outcome: have_outcome_of(result),
         });
     }
 
@@ -261,6 +361,7 @@ impl Recorder {
             found_round,
             answers: lock(&self.answers).clone(),
             attempts: lock(&self.attempts).clone(),
+            have_probes: lock(&self.have_probes).clone(),
             error: result.as_ref().err().map(ToString::to_string),
         }
     }
@@ -320,43 +421,58 @@ impl Client {
             .collect()
     }
 
-    /// Emulated chunk-or-closer-peers lookup: GET every peer `lookup` queries,
-    /// as it queries it, and stop at the first verified chunk.
-    pub(crate) async fn bench_combined_read<L>(
+    /// Read through `lookup`, acting on each peer as it is queried according
+    /// to `strategy`'s probe policy, and stop at the first verified chunk.
+    pub(crate) async fn bench_lookup_read<L>(
         &self,
         address: &XorName,
+        strategy: ReadStrategy,
         recorder: &Recorder,
         lookup: L,
         mut events: mpsc::UnboundedReceiver<LookupEvent>,
+        drain: Duration,
     ) -> ReadTrace
     where
         L: Future<Output = Result<Vec<PeerAddrs>>>,
     {
+        let Some(policy) = strategy.probe_policy() else {
+            let result = Err(Error::Protocol(format!(
+                "{strategy:?} is not lookup-driven"
+            )));
+            return recorder.finish(strategy, address, &result, 0, None);
+        };
         tokio::pin!(lookup);
-        let mut probes = FuturesUnordered::new();
-        let mut tried = HashSet::new();
+        let mut state = ProbeState::new(*address, policy);
+        let mut gets = FuturesUnordered::new();
+        let mut haves = FuturesUnordered::new();
         let mut lookup_result = None;
         let mut found = None;
 
-        // Run the lookup and the probes it triggers until a verified chunk
-        // arrives, or until the lookup is done and no probe is left.
-        while found.is_none() && (lookup_result.is_none() || !probes.is_empty()) {
-            // Events first, so every queried peer is probed before the
-            // lookup's completion is observed.
+        // Run the lookup and the requests it triggers until a verified chunk
+        // arrives, or until the lookup is done and nothing is left to ask.
+        while found.is_none() && (lookup_result.is_none() || state.has_work(&gets, &haves)) {
+            for (peer, round) in state.next_gets(gets.len(), recorder.now_ms()) {
+                gets.push(self.bench_get(address, peer, round, recorder));
+            }
+            let hedge = state.hedge_wait(gets.len(), recorder.now_ms());
+            // Events first, so a round's queries are all seen before its
+            // answers, and before the lookup's completion.
             tokio::select! {
                 biased;
-                Some(event) = events.recv() => match event {
-                    LookupEvent::Query { round, peer, at_ms } => {
-                        recorder.record_query(peer.0, at_ms);
-                        if tried.insert(peer.0) {
-                            probes.push(self.bench_probe(address, peer, round, recorder));
+                Some(event) = events.recv() => {
+                    let mut batch = vec![event];
+                    while let Ok(event) = events.try_recv() {
+                        batch.push(event);
+                    }
+                    for (peer, round, have) in state.on_events(batch, recorder) {
+                        if have {
+                            haves.push(self.bench_have_probe(address, peer, round, recorder));
+                        } else {
+                            state.queue_get(peer, round);
                         }
                     }
-                    LookupEvent::Response { round, responder, at_ms, .. } => {
-                        recorder.record_answer(round, &responder.0, at_ms);
-                    }
-                },
-                Some((round, result)) = probes.next(), if !probes.is_empty() => {
+                }
+                Some((round, result)) = gets.next(), if !gets.is_empty() => {
                     match result {
                         Ok(Some(chunk)) => found = Some((Some(round), Ok(Some(chunk)))),
                         Err(error) if !is_retryable(&error) => {
@@ -365,6 +481,12 @@ impl Client {
                         _ => {}
                     }
                 }
+                Some((peer, round, result)) = haves.next(), if !haves.is_empty() => {
+                    if matches!(result, Ok(true)) {
+                        state.add_holder(peer, round);
+                    }
+                }
+                () = crate::runtime::sleep(hedge.unwrap_or_default()), if hedge.is_some() => {}
                 result = &mut lookup, if lookup_result.is_none() => {
                     recorder.record_lookup_done();
                     lookup_result = Some(result);
@@ -378,7 +500,7 @@ impl Client {
                 let closest = lookup_result.and_then(Result::ok).unwrap_or_default();
                 (
                     None,
-                    self.bench_combined_fallback(address, closest, &tried, recorder)
+                    self.bench_combined_fallback(address, closest, &state.asked, recorder)
                         .await,
                 )
             }
@@ -386,20 +508,12 @@ impl Client {
         let total_ms = recorder.now_ms();
 
         // A holder that had the request in flight still sends its copy.
-        let _ = crate::runtime::timeout(DUPLICATE_DRAIN_TIMEOUT, async {
-            while probes.next().await.is_some() {}
-        })
-        .await;
-        recorder.finish(
-            ReadStrategy::Combined,
-            address,
-            &result,
-            total_ms,
-            found_round,
-        )
+        let _ =
+            crate::runtime::timeout(drain, async { while gets.next().await.is_some() {} }).await;
+        recorder.finish(strategy, address, &result, total_ms, found_round)
     }
 
-    async fn bench_probe(
+    async fn bench_get(
         &self,
         address: &XorName,
         (peer, addrs): PeerAddrs,
@@ -410,6 +524,52 @@ impl Client {
         let result = self.chunk_get_from_peer(address, &peer, &addrs).await;
         recorder.record_attempt(&peer, true, Some(round), started_ms, &result);
         (round, result)
+    }
+
+    /// Ask `peer` whether it holds `address`, through a storage quote's
+    /// `already_stored`. A measurement stand-in for a "have it" answer.
+    async fn bench_have_probe(
+        &self,
+        address: &XorName,
+        peer: PeerAddrs,
+        round: usize,
+        recorder: &Recorder,
+    ) -> (PeerAddrs, usize, Result<bool>) {
+        let started_ms = recorder.now_ms();
+        let request_id = self.next_request_id();
+        let message = ChunkMessage {
+            request_id,
+            body: ChunkMessageBody::QuoteRequestV2(ChunkQuoteRequestV2::new(
+                *address,
+                HAVE_PROBE_SIZE,
+            )),
+        };
+        let result = match message.encode() {
+            Ok(bytes) => {
+                crate::data::network::send_and_await_chunk_response(
+                    self.network(),
+                    &peer.0,
+                    bytes,
+                    request_id,
+                    Duration::from_secs(self.config().chunk_get_timeout_secs),
+                    &peer.1,
+                    |body| match body {
+                        ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                            already_stored,
+                            ..
+                        }) => Some(Ok(already_stored)),
+                        ChunkMessageBody::QuoteResponse(_) => Some(Ok(false)),
+                        _ => None,
+                    },
+                    |e| Error::Network(format!("have-probe send failed: {e}")),
+                    || Error::Timeout("have-probe timed out".to_string()),
+                )
+                .await
+            }
+            Err(e) => Err(Error::Protocol(format!("have-probe encode failed: {e}"))),
+        };
+        recorder.record_have_probe(&peer.0, round, started_ms, &result);
+        (peer, round, result)
     }
 
     /// The lookup finished without a holder answering: GET its closest
@@ -444,6 +604,148 @@ impl Client {
         }
         Ok(None)
     }
+}
+
+/// Which queried peers a lookup-driven read asks for the chunk, and when.
+struct ProbeState {
+    target: XorName,
+    policy: ProbePolicy,
+    /// Peers asked for the chunk or whether they hold it.
+    asked: HashSet<PeerId>,
+    /// Queried peers waiting for a GET slot (`ProbePolicy::Get`).
+    queued: Vec<(PeerAddrs, usize)>,
+    /// Peers that hold the chunk, in the order they said so.
+    holders: VecDeque<(PeerAddrs, usize)>,
+    /// When the newest GET started, in recorder milliseconds.
+    newest_get_ms: u64,
+}
+
+impl ProbeState {
+    fn new(target: XorName, policy: ProbePolicy) -> Self {
+        Self {
+            target,
+            policy,
+            asked: HashSet::new(),
+            queued: Vec::new(),
+            holders: VecDeque::new(),
+            newest_get_ms: 0,
+        }
+    }
+
+    fn distance(&self, peer: &PeerId) -> XorName {
+        ant_protocol::transport::xor_distance(peer.as_bytes(), &self.target)
+    }
+
+    /// Record lookup events. Returns each newly queried peer, its round, and
+    /// whether to have-probe it (`true`) or queue it for a GET (`false`).
+    fn on_events(
+        &mut self,
+        events: Vec<LookupEvent>,
+        recorder: &Recorder,
+    ) -> Vec<(PeerAddrs, usize, bool)> {
+        let mut queried: Vec<(PeerAddrs, usize)> = Vec::new();
+        for event in events {
+            match event {
+                LookupEvent::Query { round, peer, at_ms } => {
+                    recorder.record_query(peer.0, at_ms);
+                    if self.asked.insert(peer.0) {
+                        queried.push((peer, round));
+                    }
+                }
+                LookupEvent::Response {
+                    round,
+                    responder,
+                    at_ms,
+                    ..
+                } => recorder.record_answer(round, &responder.0, at_ms),
+            }
+        }
+        let inline: HashSet<PeerId> = match self.policy {
+            ProbePolicy::Have {
+                inline_closest: true,
+            } => {
+                let mut closest: HashMap<usize, (XorName, PeerId)> = HashMap::new();
+                for ((peer, _), round) in &queried {
+                    let distance = self.distance(peer);
+                    let entry = closest.entry(*round).or_insert((distance, *peer));
+                    if distance < entry.0 {
+                        *entry = (distance, *peer);
+                    }
+                }
+                closest.into_values().map(|(_, peer)| peer).collect()
+            }
+            _ => HashSet::new(),
+        };
+        queried
+            .into_iter()
+            .map(|(peer, round)| {
+                let have =
+                    matches!(self.policy, ProbePolicy::Have { .. }) && !inline.contains(&peer.0);
+                (peer, round, have)
+            })
+            .collect()
+    }
+
+    fn queue_get(&mut self, peer: PeerAddrs, round: usize) {
+        self.queued.push((peer, round));
+    }
+
+    fn add_holder(&mut self, peer: PeerAddrs, round: usize) {
+        self.holders.push_back((peer, round));
+    }
+
+    /// GETs to start now, given `running` GETs in flight.
+    fn next_gets(&mut self, running: usize, now_ms: u64) -> Vec<(PeerAddrs, usize)> {
+        let mut started = Vec::new();
+        // Queued peers (direct GETs and inline asks) go closest-first.
+        let limit = match self.policy {
+            ProbePolicy::Get { limit } => limit,
+            ProbePolicy::Have { .. } => usize::MAX,
+        };
+        let target = self.target;
+        self.queued.sort_by_key(|((peer, _), _)| {
+            std::cmp::Reverse(ant_protocol::transport::xor_distance(
+                peer.as_bytes(),
+                &target,
+            ))
+        });
+        while running + started.len() < limit {
+            let Some(next) = self.queued.pop() else { break };
+            started.push(next);
+        }
+        // Holders: one at a time, a second once the newest GET has run for
+        // the hedge delay.
+        if matches!(self.policy, ProbePolicy::Have { .. }) {
+            let busy = running + started.len();
+            let hedge_due = now_ms.saturating_sub(self.newest_get_ms) >= hedge_ms();
+            if busy == 0 || (busy < HOLDER_GETS && hedge_due) {
+                if let Some(holder) = self.holders.pop_front() {
+                    started.push(holder);
+                }
+            }
+        }
+        if !started.is_empty() {
+            self.newest_get_ms = now_ms;
+        }
+        started
+    }
+
+    /// How long until a hedged holder GET may start, if one is waiting.
+    fn hedge_wait(&self, running: usize, now_ms: u64) -> Option<Duration> {
+        if self.holders.is_empty() || running == 0 || running >= HOLDER_GETS {
+            return None;
+        }
+        let due_ms = self.newest_get_ms.saturating_add(hedge_ms());
+        Some(Duration::from_millis(due_ms.saturating_sub(now_ms)))
+    }
+
+    fn has_work<G, H>(&self, gets: &FuturesUnordered<G>, haves: &FuturesUnordered<H>) -> bool {
+        !gets.is_empty() || !haves.is_empty() || !self.queued.is_empty() || !self.holders.is_empty()
+    }
+}
+
+fn hedge_ms() -> u64 {
+    u64::try_from(HOLDER_HEDGE_DELAY.as_millis()).unwrap_or(u64::MAX)
 }
 
 // =============================================================================
@@ -487,6 +789,19 @@ impl Client {
     /// Read one chunk with `strategy`, bypassing the chunk cache, and return
     /// what happened on the wire.
     pub async fn bench_chunk_read(&self, address: &XorName, strategy: ReadStrategy) -> ReadTrace {
+        self.bench_chunk_read_with_drain(address, strategy, DUPLICATE_DRAIN_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::bench_chunk_read`], waiting at most `drain` after a
+    /// lookup-driven read for GETs still in flight. A zero drain stops
+    /// recording them; their bytes still arrive.
+    pub async fn bench_chunk_read_with_drain(
+        &self,
+        address: &XorName,
+        strategy: ReadStrategy,
+        drain: Duration,
+    ) -> ReadTrace {
         let recorder = Recorder::new();
         let count = self.config().close_group_size;
         let result = match strategy {
@@ -503,10 +818,13 @@ impl Client {
                 })
                 .await
             }
-            ReadStrategy::Combined => {
+            ReadStrategy::Combined
+            | ReadStrategy::Capped
+            | ReadStrategy::Have
+            | ReadStrategy::HaveInline => {
                 let (lookup, events) = self.bench_observed_lookup(address, count, &recorder);
                 return self
-                    .bench_combined_read(address, &recorder, lookup, events)
+                    .bench_lookup_read(address, strategy, &recorder, lookup, events, drain)
                     .await;
             }
         };

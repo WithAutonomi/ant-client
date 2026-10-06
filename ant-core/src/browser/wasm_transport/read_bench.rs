@@ -7,7 +7,7 @@
 use super::{shared, BrowserNetworkClient, ProgressReporter};
 use crate::browser::protocol::BrowserNode;
 use crate::data::client::read_bench::{
-    elapsed_ms, LookupEvent, PeerAddrs, ReadStrategy, ReadTrace, Recorder,
+    elapsed_ms, LookupEvent, PeerAddrs, ReadStrategy, ReadTrace, Recorder, DUPLICATE_DRAIN_TIMEOUT,
 };
 use crate::data::error::Error;
 use tokio::sync::mpsc;
@@ -58,15 +58,15 @@ impl BrowserNetworkClient {
     pub async fn bench_chunk_read(&self, address: &str, strategy: &str) -> Result<String, JsValue> {
         let strategy = ReadStrategy::parse(strategy)
             .filter(|strategy| *strategy != ReadStrategy::Progress)
-            .ok_or_else(|| JsValue::from_str("strategy must be baseline, eager or combined"))?;
+            .ok_or_else(|| JsValue::from_str("the browser has no separate progress strategy"))?;
         let address: [u8; 32] = hex::decode(address)
             .ok()
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or_else(|| JsValue::from_str("address must be 32 hex bytes"))?;
         let trace = match strategy {
-            ReadStrategy::Combined => self.bench_combined(&address).await,
+            ReadStrategy::Baseline => self.bench_baseline(&address).await,
             ReadStrategy::Eager => self.bench_eager(&address).await,
-            _ => self.bench_baseline(&address).await,
+            _ => self.bench_lookup_driven(&address, strategy).await,
         };
         serde_json::to_string(&trace).map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -124,7 +124,7 @@ impl BrowserNetworkClient {
         recorder.finish(ReadStrategy::Eager, address, &result, total_ms, None)
     }
 
-    async fn bench_combined(&self, address: &[u8; 32]) -> ReadTrace {
+    async fn bench_lookup_driven(&self, address: &[u8; 32], strategy: ReadStrategy) -> ReadTrace {
         let recorder = Recorder::new();
         let count = self.shared.config().close_group_size;
         let (events, received) = mpsc::unbounded_channel();
@@ -147,7 +147,14 @@ impl BrowserNetworkClient {
         };
         let trace = self
             .shared
-            .bench_combined_read(address, &recorder, lookup, received)
+            .bench_lookup_read(
+                address,
+                strategy,
+                &recorder,
+                lookup,
+                received,
+                DUPLICATE_DRAIN_TIMEOUT,
+            )
             .await;
         *self.inner.bench_hook.borrow_mut() = None;
         trace
