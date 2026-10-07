@@ -813,6 +813,24 @@ impl Client {
             self.chunk_cache().remove(address);
         }
 
+        // ADR-0020: ask every peer the lookup queries for the chunk as well as
+        // for closer peers, and stop at the first verified chunk. A lookup that
+        // finds no holder says nothing about absence, so the ordinary read
+        // below runs then, with its own discovery and absence rule.
+        #[cfg(feature = "native")]
+        if let Some(chunk) = self.chunk_get_kad(address, peer_count).await? {
+            if let Some(diag) = diag {
+                diag.emit_chunk_level(
+                    "kad",
+                    chunk.content.len() as u64,
+                    DownloadDiagnosticsOutcome::Found,
+                    None,
+                );
+            }
+            self.chunk_cache().put(chunk.address, chunk.content.clone());
+            return Ok(Some(chunk));
+        }
+
         #[cfg(feature = "native")]
         let observation = diag.map(|_| std::sync::Mutex::new(ReadObservation::default()));
         let result = crate::client_engine::read::retrieve_progressive(
@@ -1059,7 +1077,7 @@ impl Client {
     }
 
     /// Fetch a chunk from a specific peer.
-    async fn chunk_get_from_peer(
+    pub(crate) async fn chunk_get_from_peer(
         &self,
         address: &XorName,
         peer: &PeerId,

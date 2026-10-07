@@ -1,6 +1,8 @@
 //! Runtime-neutral scheduling and session state shared by native and browser clients.
 
 pub(crate) mod files;
+#[cfg(feature = "native")]
+pub(crate) mod kad_read;
 pub(crate) mod read;
 #[cfg(any(test, all(target_arch = "wasm32", feature = "browser-wasm")))]
 pub(crate) mod read_ahead;
