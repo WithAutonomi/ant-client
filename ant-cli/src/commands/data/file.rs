@@ -10,8 +10,8 @@ use tracing::info;
 
 use ant_core::data::manifest::path::portable_component;
 use ant_core::data::{
-    parse_link, spawn_download_diagnostics_writer, Client, CollisionPolicy, ContentRef,
-    CostEstimateConfidence, DownloadEvent, Error as DataError, FileChunkPeerReport,
+    embeddable_data_map, parse_link, spawn_download_diagnostics_writer, Client, CollisionPolicy,
+    ContentRef, CostEstimateConfidence, DownloadEvent, Error as DataError, FileChunkPeerReport,
     FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport, Link, Manifest,
     ManifestEntry, PaymentMode, UploadEvent,
 };
@@ -312,17 +312,26 @@ async fn handle_file_upload(
 
     // Every upload is remembered as a one-entry manifest in the upload
     // history (ADR-0006), so it can be listed and downloaded again. The
-    // DataMap is embedded whether or not the upload was public. A file
-    // name that breaks the portable path rules is repaired, or dropped so
-    // the entry extracts under its content address, rather than losing
-    // the record.
+    // DataMap is embedded whether or not the upload was public, as the root
+    // map when that is small enough so a later download starts on data
+    // chunks at once; if resolving the root fails the shrunk map is kept.
+    // A file name that breaks the portable path rules is repaired, or
+    // dropped so the entry extracts under its content address, rather than
+    // losing the record.
+    let recorded_map = match embeddable_data_map(client, &result.data_map).await {
+        Ok(map) => map,
+        Err(e) => {
+            eprintln!("warning: could not resolve the root DataMap for the upload record: {e}");
+            result.data_map.clone()
+        }
+    };
     let record = Manifest {
         name: None,
         entries: vec![ManifestEntry {
             path: portable_component(&original_name),
             size: Some(file_size),
             source: ContentRef::Embedded {
-                data_map: result.data_map.clone(),
+                data_map: recorded_map,
             },
         }],
     };

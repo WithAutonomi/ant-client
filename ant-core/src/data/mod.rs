@@ -61,6 +61,7 @@ pub use self_encryption::DataMap;
 pub use manifest::{
     build::{BuildEvent, BuildOptions, BuildResult, ManifestBuilder, ReferenceMode},
     compact::{apply_compaction, plan_compaction, publish_data_maps, CompactPlan, EmbeddedEntry},
+    embed::embeddable_data_map,
     extract::{
         extract_manifest, select_entries, EntryOutcome, EntryStatus, ExtractEvent, ExtractOptions,
         ExtractReport,
@@ -74,6 +75,7 @@ pub use manifest::{
 pub use manifest::{
     file_link, is_link, manifest_link, parse_link, ContentRef, Link, Manifest, ManifestEntry,
     ManifestError, MANIFEST_EXTENSION, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+    MAX_EMBEDDED_ROOT_MAP_BYTES,
 };
 
 // Datamap file persistence helpers. Canonical path is

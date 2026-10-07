@@ -109,7 +109,18 @@ content references is valid.
 Each entry has a **content address**: for `Public` the address itself; for
 `Embedded` the hash of the DataMap's canonical bytes, which are exactly the
 bytes a public DataMap chunk contains (its versioned positional msgpack
-form). Each entry has an **effective name**: its `path` when present,
+form).
+
+An embedded DataMap may be either form a DataMap takes: the **root** map that
+lists the file's data chunks, or the **shrunk** child map a large upload
+publishes, which points at wrapper records holding the root. Readers accept
+both, as they do for any DataMap. Writers embed the root whenever its
+encoding is at most `MAX_EMBEDDED_ROOT_MAP_BYTES` (64 KiB, roughly 2.5 GB
+of file), because a reader holding the root starts fetching data chunks with
+no wrapper-record fetches at all; above that the shrunk map is embedded. For
+an entry whose shrunk map was published, the content address is that of the
+published map, so compaction and the `Public` form keep working whichever
+form was embedded. Each entry has an **effective name**: its `path` when present,
 otherwise the 64-character lowercase hex of its content address.
 
 ### Encoding
@@ -238,9 +249,11 @@ nothing and lets recipients skip the DataMap fetch.
 Two reference modes for uploaded files:
 
 - **Embedded (default).** The DataMap goes into the manifest, whether or not
-  the file was uploaded as public. The recipient skips one fetch per file
-  and the creator pays nothing extra. Wrapper fetches for child maps still
-  occur. Only entries added by address have no DataMap to embed.
+  the file was uploaded as public, as the root map when it fits the cap
+  above. The recipient then skips the DataMap fetch and the wrapper-record
+  fetches, and the creator pays nothing extra: resolving the root reads the
+  wrapper records the upload just stored. Only entries added by address have
+  no DataMap to embed.
 - **Compact (opt-in).** Record `Public` for every file whose DataMap chunk is
   on the network: files added by address, files the caller uploaded as
   public in this run, and files whose DataMap chunk is found to exist

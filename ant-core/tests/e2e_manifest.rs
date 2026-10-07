@@ -12,18 +12,53 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ant_core::data::{
-    apply_compaction, extract_manifest, manifest_link, parse_link, plan_compaction,
-    publish_data_maps, read_manifest_file, write_manifest_file, BuildOptions, Client, ContentRef,
-    EntryStatus, ExtractOptions, Link, ManifestBuilder, PaymentMode, ReferenceMode, Visibility,
+    apply_compaction, embeddable_data_map, extract_manifest, manifest_link, parse_link,
+    plan_compaction, publish_data_maps, read_manifest_file, write_manifest_file, BuildOptions,
+    Client, ContentRef, EntryStatus, ExtractOptions, Link, ManifestBuilder, PaymentMode,
+    ReferenceMode, Visibility, MAX_EMBEDDED_ROOT_MAP_BYTES,
 };
+use self_encryption::{shrink_data_map, ChunkInfo, DataMap};
 use serial_test::serial;
 use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
+use xor_name::XorName;
 
 /// Payload size for each test file; comfortably above the self-encryption
 /// minimum and below one chunk so uploads stay quick.
 const FILE_BYTES: usize = 2048;
+/// Chunk infos in a synthetic root map small enough to embed.
+const SMALL_ROOT_CHUNKS: usize = 8;
+/// Chunk infos in a synthetic root map whose encoding exceeds the cap.
+const LARGE_ROOT_CHUNKS: usize = 1_000;
+
+/// A root DataMap with `chunks` synthetic infos; the hashes need not exist
+/// on the network because only the map's own encoding and shrinking matter.
+fn synthetic_root(chunks: usize, seed: u8) -> DataMap {
+    DataMap::new(
+        (0..chunks)
+            .map(|index| ChunkInfo {
+                index,
+                dst_hash: XorName([seed.wrapping_add(index as u8); 32]),
+                src_hash: XorName([seed.wrapping_mul(3).wrapping_add(index as u8); 32]),
+                src_size: FILE_BYTES,
+            })
+            .collect(),
+    )
+}
+
+/// Shrink `root` as an upload would and store its wrapper records.
+async fn shrink_and_store(client: &Client, root: DataMap) -> DataMap {
+    let (child, wrapper_chunks) = shrink_data_map(root, |_, _| Ok(())).expect("shrink");
+    assert!(child.is_child());
+    for chunk in wrapper_chunks {
+        client
+            .chunk_put(chunk.content)
+            .await
+            .expect("store wrapper record");
+    }
+    child
+}
 
 async fn setup() -> (Client, MiniTestnet) {
     let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
@@ -325,6 +360,40 @@ async fn compact_export_publishes_private_data_maps_then_replaces_them() {
         fs::read(out.path().join("y.bin")).unwrap(),
         vec![0x88u8; FILE_BYTES]
     );
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn embedding_uses_the_root_map_only_when_it_is_small_enough() {
+    let (client, testnet) = setup().await;
+
+    // A small file's shrunk map resolves back to its root for embedding, so a
+    // reader starts on data chunks with no wrapper-record fetches.
+    let small_root = synthetic_root(SMALL_ROOT_CHUNKS, 0x10);
+    assert!(rmp_serde::to_vec(&small_root).unwrap().len() <= MAX_EMBEDDED_ROOT_MAP_BYTES);
+    let small_child = shrink_and_store(&client, small_root.clone()).await;
+    let embedded = embeddable_data_map(&client, &small_child)
+        .await
+        .expect("resolve small");
+    assert!(!embedded.is_child());
+    assert_eq!(embedded, small_root);
+
+    // A huge file's root exceeds the cap, so the shrunk map is embedded.
+    let large_root = synthetic_root(LARGE_ROOT_CHUNKS, 0x40);
+    assert!(rmp_serde::to_vec(&large_root).unwrap().len() > MAX_EMBEDDED_ROOT_MAP_BYTES);
+    let large_child = shrink_and_store(&client, large_root).await;
+    let embedded = embeddable_data_map(&client, &large_child)
+        .await
+        .expect("resolve large");
+    assert!(embedded.is_child());
+    assert_eq!(embedded, large_child);
+
+    // A map that is already a root is returned without any fetch.
+    let root = synthetic_root(SMALL_ROOT_CHUNKS, 0x70);
+    assert_eq!(embeddable_data_map(&client, &root).await.unwrap(), root);
 
     drop(client);
     testnet.teardown().await;

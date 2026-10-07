@@ -17,6 +17,7 @@ use crate::data::client::file::{UploadEvent, Visibility};
 use crate::data::client::merkle::PaymentMode;
 use crate::data::Client;
 
+use super::embed::embeddable_data_map;
 use super::path::{check_collisions, validate_component, validate_path, PATH_SEPARATOR};
 use super::{ContentRef, Manifest, ManifestEntry, ManifestError, ADDRESS_LEN};
 
@@ -365,29 +366,36 @@ impl<'a> ManifestBuilder<'a> {
         })
     }
 
-    /// Embedded mode always embeds the DataMap, even when the upload was
-    /// public. Compact mode records the public address when the upload
-    /// stored the DataMap chunk, or when that chunk already exists on the
-    /// network, and embeds otherwise.
+    /// Embedded mode always embeds a DataMap, even when the upload was
+    /// public, and embeds the root map when it is small enough so readers
+    /// skip the wrapper-record fetches. Compact mode records the public
+    /// address when the upload stored the DataMap chunk, or when that chunk
+    /// already exists on the network, and embeds otherwise.
     async fn reference_for(
         &self,
         data_map: &self_encryption::DataMap,
         public_address: Option<[u8; ADDRESS_LEN]>,
     ) -> Result<ContentRef, ManifestError> {
-        let embedded = ContentRef::Embedded {
-            data_map: data_map.clone(),
-        };
         if self.options.reference_mode != ReferenceMode::Compact {
-            return Ok(embedded);
+            return Ok(ContentRef::Embedded {
+                data_map: embeddable_data_map(self.client, data_map).await?,
+            });
         }
         if let Some(address) = public_address {
             return Ok(ContentRef::Public { address });
         }
+        // The address is that of the published (shrunk) map, so it is
+        // computed from the map as uploaded, never from the root.
+        let embedded = ContentRef::Embedded {
+            data_map: data_map.clone(),
+        };
         let address = embedded.content_address()?;
         if self.client.chunk_exists(&address).await? {
             return Ok(ContentRef::Public { address });
         }
-        Ok(embedded)
+        Ok(ContentRef::Embedded {
+            data_map: embeddable_data_map(self.client, data_map).await?,
+        })
     }
 
     fn walk(

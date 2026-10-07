@@ -37,11 +37,16 @@ pub mod build;
 #[cfg(feature = "native")]
 pub mod compact;
 #[cfg(feature = "native")]
+pub mod embed;
+#[cfg(feature = "native")]
 pub mod extract;
 #[cfg(feature = "native")]
 pub mod file;
 #[cfg(feature = "native")]
 pub mod history;
+
+#[cfg(feature = "native")]
+pub use self::embed::embeddable_data_map;
 
 use ant_protocol::compute_address;
 use self_encryption::DataMap;
@@ -78,6 +83,11 @@ pub const MAX_MANIFEST_ENTRIES: usize = 100_000;
 pub const MANIFEST_LINK_RECOMMENDED_MAX_BYTES: usize = 1_500;
 /// Length of a content address in bytes.
 pub const ADDRESS_LEN: usize = 32;
+/// Largest encoded root DataMap a writer embeds in place of the shrunk map
+/// a large upload produces. A root map lets a reader start fetching data
+/// chunks with no wrapper-record fetches; at roughly 105 bytes per chunk
+/// this covers files up to about 2.5 GB.
+pub const MAX_EMBEDDED_ROOT_MAP_BYTES: usize = 64 * 1024;
 /// Deepest msgpack nesting the decoder tolerates. A manifest nests four
 /// levels; this leaves headroom for future optional fields.
 const MAX_DECODE_DEPTH: usize = 16;

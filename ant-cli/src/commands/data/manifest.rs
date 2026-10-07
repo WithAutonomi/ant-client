@@ -14,12 +14,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ant_core::data::{
-    apply_compaction, default_history_dir, extract_manifest, format_timestamp, is_link,
-    list_uploads, load_upload, manifest_filename_for, manifest_link, parse_link, plan_compaction,
-    publish_data_maps, read_manifest_file, record_upload, write_manifest_file, BuildEvent,
-    BuildOptions, Client, ContentRef, DownloadEvent, EntryStatus, ExtractEvent, ExtractOptions,
-    Link, Manifest, ManifestBuilder, PaymentMode, ReferenceMode, UploadEvent, UploadRecord,
-    Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+    apply_compaction, default_history_dir, embeddable_data_map, extract_manifest, format_timestamp,
+    is_link, list_uploads, load_upload, manifest_filename_for, manifest_link, parse_link,
+    plan_compaction, publish_data_maps, read_manifest_file, record_upload, write_manifest_file,
+    BuildEvent, BuildOptions, Client, ContentRef, DownloadEvent, EntryStatus, ExtractEvent,
+    ExtractOptions, Link, Manifest, ManifestBuilder, PaymentMode, ReferenceMode, UploadEvent,
+    UploadRecord, Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
 };
 use clap::Subcommand;
 use serde_json::json;
@@ -497,6 +497,9 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         let data_map = client.data_map_fetch(&address).await.map_err(|e| {
             anyhow::anyhow!("Failed to fetch DataMap {}: {e}", hex::encode(address))
         })?;
+        // Embed the root map when it is small enough: recipients then start
+        // on data chunks with no wrapper-record fetches.
+        let data_map = embeddable_data_map(client, &data_map).await?;
         builder.add_embedded(data_map, path, None)?;
     }
     if builder.pending_count() == 0 && args.public_files.is_empty() && args.embed_public.is_empty()
