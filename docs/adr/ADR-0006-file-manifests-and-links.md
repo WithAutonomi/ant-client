@@ -106,7 +106,10 @@ pub struct ManifestEntry {
 
 pub enum ContentRef {
     /// The DataMap itself. Saves the DataMap fetch a `Public` entry needs.
-    Embedded { data_map: DataMap },
+    /// `address` is the published DataMap address when the writer knows it
+    /// and embedded a different form (the root map); it keeps the entry's
+    /// identity equal to the file's public address.
+    Embedded { data_map: DataMap, address: Option<[u8; 32]> },
     /// Address of the file's public DataMap chunk, encoded as msgpack bin.
     Public { address: [u8; 32] },
 }
@@ -119,9 +122,9 @@ field existed. A manifest that is only a list of
 content references is valid.
 
 Each entry has a **content address**: for `Public` the address itself; for
-`Embedded` the hash of the DataMap's canonical bytes, which are exactly the
-bytes a public DataMap chunk contains (its versioned positional msgpack
-form).
+`Embedded` the recorded published address when there is one, otherwise the
+hash of the embedded DataMap's canonical bytes, which are exactly the bytes a
+public DataMap chunk contains (its versioned positional msgpack form).
 
 An embedded DataMap may be either form a DataMap takes: the **root** map that
 lists the file's data chunks, or the **shrunk** child map a large upload
@@ -129,10 +132,13 @@ publishes, which points at wrapper records holding the root. Readers accept
 both, as they do for any DataMap. Writers embed the root whenever its
 encoding is at most `MAX_EMBEDDED_ROOT_MAP_BYTES` (64 KiB, roughly 2.5 GB
 of file), because a reader holding the root starts fetching data chunks with
-no wrapper-record fetches at all; above that the shrunk map is embedded. For
-an entry whose shrunk map was published, the content address is that of the
-published map, so compaction and the `Public` form keep working whichever
-form was embedded. Each entry has an **effective name**: its `path` when present,
+no wrapper-record fetches at all; above that the shrunk map is embedded. When a
+writer embeds the root in place of a published shrunk map it records the
+published address beside it, so the entry's content address stays the file's
+public address and compaction and the `Public` form keep working whichever
+form was embedded. A private upload has no published address; its embedded
+root hashes to the address the root would have if published, which is what
+compaction then publishes. Each entry has an **effective name**: its `path` when present,
 otherwise the 64-character lowercase hex of its content address.
 
 ### Encoding

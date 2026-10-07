@@ -196,6 +196,7 @@ impl<'a> ManifestBuilder<'a> {
     pub fn add_embedded(
         &mut self,
         data_map: self_encryption::DataMap,
+        published_address: Option<[u8; ADDRESS_LEN]>,
         path: Option<String>,
         size: Option<u64>,
     ) -> Result<(), ManifestError> {
@@ -208,7 +209,10 @@ impl<'a> ManifestBuilder<'a> {
         self.entries.push(ManifestEntry {
             path,
             size,
-            source: ContentRef::Embedded { data_map },
+            source: ContentRef::Embedded {
+                data_map,
+                address: published_address,
+            },
         });
         Ok(())
     }
@@ -380,24 +384,28 @@ impl<'a> ManifestBuilder<'a> {
         public_address: Option<[u8; ADDRESS_LEN]>,
     ) -> Result<ContentRef, ManifestError> {
         if self.options.reference_mode != ReferenceMode::Compact {
+            // A public upload's identity is its published address; record it
+            // so embedding the root map does not change the entry's address.
             return Ok(ContentRef::Embedded {
                 data_map: embeddable_data_map(self.client, data_map).await?,
+                address: public_address,
             });
         }
         if let Some(address) = public_address {
             return Ok(ContentRef::Public { address });
         }
-        // The address is that of the published (shrunk) map, so it is
-        // computed from the map as uploaded, never from the root.
-        let embedded = ContentRef::Embedded {
+        // The address is that of the map as uploaded, never of the root.
+        let uploaded = ContentRef::Embedded {
             data_map: data_map.clone(),
+            address: None,
         };
-        let address = embedded.content_address()?;
+        let address = uploaded.content_address()?;
         if self.client.chunk_exists(&address).await? {
             return Ok(ContentRef::Public { address });
         }
         Ok(ContentRef::Embedded {
             data_map: embeddable_data_map(self.client, data_map).await?,
+            address: None,
         })
     }
 

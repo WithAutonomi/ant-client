@@ -1128,7 +1128,7 @@ impl BrowserManifestView {
         let mut entries = Vec::with_capacity(manifest.entries.len());
         for entry in &manifest.entries {
             let data_map = match &entry.source {
-                crate::data::manifest::ContentRef::Embedded { data_map } => Some(
+                crate::data::manifest::ContentRef::Embedded { data_map, .. } => Some(
                     rmp_serde::to_vec(data_map)
                         .map_err(|e| crate::data::manifest::ManifestError::Encode(e.to_string()))?,
                 ),

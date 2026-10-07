@@ -511,7 +511,7 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         // Embed the root map when it is small enough: recipients then start
         // on data chunks with no wrapper-record fetches.
         let data_map = embeddable_data_map(client, &data_map).await?;
-        builder.add_embedded(data_map, path, None)?;
+        builder.add_embedded(data_map, Some(address), path, None)?;
     }
     if builder.pending_count() == 0 && args.public_files.is_empty() && args.embed_public.is_empty()
     {

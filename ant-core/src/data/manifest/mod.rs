@@ -198,8 +198,16 @@ pub struct ManifestEntry {
 pub enum ContentRef {
     /// The DataMap itself. Saves the DataMap fetch a `Public` entry needs.
     Embedded {
-        /// The file's DataMap.
+        /// The file's DataMap: its root map when the writer could embed it,
+        /// otherwise the shrunk map a large upload publishes.
         data_map: DataMap,
+        /// Address of the file's DataMap chunk as published, when the
+        /// writer knows it and it differs from the hash of `data_map`;
+        /// that is, when a root map was embedded in place of the published
+        /// shrunk map. Keeps the entry's identity equal to the file's known
+        /// public address.
+        #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+        address: Option<[u8; ADDRESS_LEN]>,
     },
     /// Address of the file's public DataMap chunk.
     Public {
@@ -278,12 +286,17 @@ impl ContentRef {
     /// The address that identifies this entry's content.
     ///
     /// For `Public` it is the address itself. For `Embedded` it is the
-    /// address the DataMap would have as a public chunk: the hash of its
-    /// canonical positional msgpack bytes.
+    /// published DataMap address when the writer recorded one, otherwise the
+    /// address the embedded DataMap would have as a public chunk: the hash
+    /// of its canonical positional msgpack bytes.
     pub fn content_address(&self) -> Result<[u8; ADDRESS_LEN], ManifestError> {
         match self {
             Self::Public { address } => Ok(*address),
-            Self::Embedded { data_map } => {
+            Self::Embedded {
+                address: Some(address),
+                ..
+            } => Ok(*address),
+            Self::Embedded { data_map, .. } => {
                 let bytes = rmp_serde::to_vec(data_map).map_err(|e| {
                     ManifestError::Encode(format!("embedded DataMap did not serialize: {e}"))
                 })?;
@@ -456,6 +469,7 @@ mod tests {
                     size: Some(10),
                     source: ContentRef::Embedded {
                         data_map: data_map(1),
+                        address: None,
                     },
                 },
                 ManifestEntry {
@@ -463,6 +477,7 @@ mod tests {
                     size: None,
                     source: ContentRef::Embedded {
                         data_map: data_map(9),
+                        address: None,
                     },
                 },
             ],
@@ -699,8 +714,15 @@ mod tests {
         let dm = data_map(4);
         let entry = ContentRef::Embedded {
             data_map: dm.clone(),
+            address: None,
         };
         assert_eq!(entry.content_address().unwrap(), data_map_address(&dm));
+        // A recorded published address wins over the embedded map's hash.
+        let published = ContentRef::Embedded {
+            data_map: dm,
+            address: Some([7; 32]),
+        };
+        assert_eq!(published.content_address().unwrap(), [7; 32]);
     }
 
     #[test]

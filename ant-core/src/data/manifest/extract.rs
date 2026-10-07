@@ -308,7 +308,7 @@ async fn download_entry(
 
 async fn resolve_data_map(client: &Client, source: &ContentRef) -> Result<DataMap, ManifestError> {
     match source {
-        ContentRef::Embedded { data_map } => Ok(data_map.clone()),
+        ContentRef::Embedded { data_map, .. } => Ok(data_map.clone()),
         ContentRef::Public { address } => Ok(client.data_map_fetch(address).await?),
     }
 }

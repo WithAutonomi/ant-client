@@ -106,6 +106,7 @@ async fn manifest_round_trips_through_file_and_link() {
         &client,
         BuildOptions {
             name: Some("tree".into()),
+            torrent: None,
             reference_mode: ReferenceMode::Embedded,
             visibility: Visibility::Private,
             payment_mode: PaymentMode::Auto,
@@ -234,6 +235,7 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
         &client,
         BuildOptions {
             name: None,
+            torrent: None,
             reference_mode: ReferenceMode::Compact,
             visibility: Visibility::Private,
             payment_mode: PaymentMode::Auto,
@@ -262,6 +264,7 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
         &client,
         BuildOptions {
             name: None,
+            torrent: None,
             reference_mode: ReferenceMode::Embedded,
             visibility: Visibility::Public,
             payment_mode: PaymentMode::Auto,

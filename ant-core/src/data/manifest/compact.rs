@@ -120,7 +120,7 @@ pub async fn publish_data_maps(
         let entry = manifest.entries.get(embedded.index).ok_or_else(|| {
             ManifestError::Build(format!("entry {} is out of range", embedded.index))
         })?;
-        let ContentRef::Embedded { data_map } = &entry.source else {
+        let ContentRef::Embedded { data_map, .. } = &entry.source else {
             return Err(ManifestError::Build(format!(
                 "entry {} is not embedded",
                 embedded.name
@@ -182,6 +182,7 @@ mod tests {
                     size: None,
                     source: ContentRef::Embedded {
                         data_map: data_map(1),
+                        address: None,
                     },
                 },
                 ManifestEntry {
@@ -189,6 +190,7 @@ mod tests {
                     size: None,
                     source: ContentRef::Embedded {
                         data_map: data_map(2),
+                        address: None,
                     },
                 },
                 ManifestEntry {
