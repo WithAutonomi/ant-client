@@ -22,6 +22,16 @@ use ant_protocol::evm::{QuoteHash, TxHash};
 /// Length of an owner key seed.
 const OWNER_SEED_LEN: usize = 32;
 
+/// How long a paid state waits on the page's `onPaid` callback before it is
+/// stored anyway. The payment is spent either way, so a callback that never
+/// settles must not keep the state from being stored.
+#[cfg(not(feature = "test-utils"))]
+const ON_PAID_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Short enough that a test can wait out a callback that never settles.
+#[cfg(feature = "test-utils")]
+const ON_PAID_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// A pointer as JavaScript sees it.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -298,8 +308,11 @@ impl BrowserNetworkClient {
             .map_err(|error| error.to_string())?;
         if let Some(on_paid) = on_paid {
             // The payment is spent whatever the page does with this, so a
-            // callback that fails does not stop the state being stored.
-            let _ = hand_over_paid(on_paid, record, &proof).await;
+            // callback that fails, or never settles, does not stop the state
+            // being stored.
+            let _ =
+                crate::runtime::timeout(ON_PAID_TIMEOUT, hand_over_paid(on_paid, record, &proof))
+                    .await;
         }
         client
             .pointer_put_paid(record, proof)

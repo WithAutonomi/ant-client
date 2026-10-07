@@ -67,6 +67,10 @@ const POINTER_PROTOCOL_CAPABILITY: &str = "pointer_protocol";
 // (180 seconds each), plus connection/authentication setup. Admission has its
 // own ceiling and never spends the caller's response allowance.
 const RPC_ADMISSION_TIMEOUT: Duration = Duration::from_secs(400);
+/// How long asking a node, before paying, whether it takes pointer writes may
+/// take. A node that cannot say by then counts as unknown, not as refusing:
+/// the write, which has its own deadlines, finds out.
+const POINTER_WRITE_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECTION_SETUP_TIMEOUT_MS: u32 = 30_000;
 /// Longest one connection holds the page's ICE gathering turn. Gathering host
 /// candidates, the only kind without ICE servers, takes about a tenth of a second.

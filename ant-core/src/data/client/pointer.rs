@@ -48,10 +48,12 @@ use crate::runtime::sleep;
 
 /// How many of `peers` must answer a read.
 ///
-/// Derived from the group actually returned, not from a fixed constant: the
-/// close-group width is configurable, and a fixed four against a width of
-/// twenty would let a write land on four peers and a *disjoint* four answer the
-/// read. Quorums only intersect if both are taken from the same set.
+/// `peers` is the width from [`quorum_width`]: the configured close group, or
+/// more peers than that if a lookup returned more, never fewer. It is not a
+/// fixed constant, because the close-group width is configurable, and a fixed
+/// four against a width of twenty would let a write land on four peers and a
+/// *disjoint* four answer the read. Quorums only intersect if both are taken
+/// from the same set.
 fn read_quorum(peers: usize) -> usize {
     (peers / 2) + 1
 }
@@ -83,6 +85,18 @@ fn corroboration(peers: usize) -> usize {
     peers.min(2)
 }
 
+/// How many members the quorums of an operation on `found` peers are counted
+/// over: the configured close group, however few a lookup returned.
+///
+/// A lookup can come back short, while a node's view is thin or the network
+/// churns. Counting quorums over what it returned would shrink them with it:
+/// one returned peer would make a write of one copy complete, and a read that
+/// one peer answers would need no second peer to agree. Counted over the whole
+/// group, a short lookup is a shortfall instead.
+fn quorum_width(found: usize, close_group_size: usize) -> usize {
+    found.max(close_group_size)
+}
+
 /// The outcome of asking a close group.
 struct Answered {
     /// How many peers gave a usable answer.
@@ -93,6 +107,8 @@ struct Answered {
     /// The first failure that was a refusal rather than a missing answer: a
     /// peer that answered and said no. Asking again would get the same.
     refusal: Option<Error>,
+    /// How many peers refused.
+    refusals: usize,
 }
 
 impl Answered {
@@ -121,6 +137,7 @@ async fn ask_the_group<T>(
         count: 0,
         last_error: None,
         refusal: None,
+        refusals: 0,
     };
     while let Some(result) = in_flight.next().await {
         match result {
@@ -131,8 +148,13 @@ async fn ask_the_group<T>(
                     break;
                 }
             }
-            Err(e) if answered.refusal.is_none() && !worth_retrying(&e) => {
-                answered.refusal = Some(e);
+            Err(e) if !worth_retrying(&e) => {
+                answered.refusals += 1;
+                if answered.refusal.is_none() {
+                    answered.refusal = Some(e);
+                } else {
+                    answered.last_error = Some(e);
+                }
             }
             Err(e) => answered.last_error = Some(e),
         }
@@ -186,10 +208,113 @@ impl Replies {
     fn any(&self) -> bool {
         !self.seen.is_empty()
     }
+
+    /// Whether what has been heard settles the read.
+    ///
+    /// Answers alone settle a read that found nothing. A state is settled only
+    /// once enough peers have named it: until then the read keeps asking,
+    /// because the peers that would confirm it may simply not have answered yet.
+    ///
+    /// Nor is it settled while a state that would replace it has been named
+    /// by too few. The write and read quorums overlap in two peers, not two
+    /// honest ones: after a write that reached a bare write quorum, the peers
+    /// it missed hold the older state, and one more peer replaying that state
+    /// corroborates it before a second holder of the newer state has
+    /// answered. So the read waits for the rest of the group before letting
+    /// the older state stand. The newer state still has to be corroborated to
+    /// be returned, so no single peer decides the answer; one that names a
+    /// state nobody else holds only makes the read ask everyone.
+    fn settled(&self, needed: usize) -> bool {
+        match self.corroborated(needed) {
+            None => !self.any(),
+            Some(best) => !self
+                .seen
+                .iter()
+                .any(|(record, count)| *count < needed && record.replaces(best)),
+        }
+    }
+}
+
+/// Ask a close group of `peers` for a pointer, tallying the states they name.
+///
+/// Ends once a read quorum has answered and the tally is settled (see
+/// [`Replies::settled`]), or when the group is exhausted.
+async fn collect_read(
+    in_flight: FuturesUnordered<impl Future<Output = Result<Option<Pointer>>>>,
+    peers: usize,
+) -> (Answered, Replies) {
+    let needed = corroboration(peers);
+    let mut replies = Replies::default();
+    let answered = ask_the_group(in_flight, read_quorum(peers), |found| {
+        replies.add(found);
+        replies.settled(needed)
+    })
+    .await;
+    (answered, replies)
+}
+
+/// What one peer's acknowledgement of a pointer PUT says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PutAck {
+    /// It holds the state that was sent.
+    Stored,
+    /// It holds a state it says beats the one sent. That is one peer's word,
+    /// not a verified record, so a write stops for it only once a read
+    /// confirms the pointer has moved on.
+    Stale,
+}
+
+/// Whether one round of a pointer write stored it, from what came back.
+///
+/// `stored` peers hold the record, `wanted` is the write quorum, and `moved`
+/// says a read confirmed the network holds a state that replaces it.
+///
+/// A refusal ends the write only when no peer stored the record and a second
+/// peer refused as well. Once any peer has taken the same proof, one peer
+/// refusing it is that peer's problem; and while the rest of the group is
+/// silent, one refusal is that peer's word alone. Either way the round is a
+/// shortfall to retry with the proof already paid for, rather than a final
+/// answer one peer gave that throws the payment away.
+fn judge_write(
+    address: &XorName,
+    stored: usize,
+    wanted: usize,
+    moved: bool,
+    answered: Answered,
+) -> Result<()> {
+    if stored >= wanted {
+        return Ok(());
+    }
+    if moved {
+        return Err(Error::InvalidData(format!(
+            "the pointer {} moved while this update was in flight; the network now \
+             holds a newer state",
+            hex::encode(address)
+        )));
+    }
+    if stored == 0 && answered.refusals >= corroboration(wanted) {
+        if let Some(refusal) = answered.refusal {
+            return Err(refusal);
+        }
+    }
+    if answered.count > 0 || answered.refusals > 0 {
+        return Err(Error::CloseGroupShortfall(format!(
+            "pointer {} stored on {stored} of {wanted} close-group peers",
+            hex::encode(address)
+        )));
+    }
+    Err(answered
+        .last_error
+        .unwrap_or_else(|| Error::Protocol("no close-group peer accepted the pointer".to_string())))
 }
 
 /// Whether a pointer write that failed this way may succeed if tried again
-/// with the same proof: a shortfall or an unreachable group, not a refusal.
+/// with the same proof: a shortfall, an unreachable group, or a node that
+/// could not store it just then, not a refusal of the record itself.
+///
+/// A node answering with an error reports its own condition, such as a full
+/// disk or too many checks running, not a verdict on a record this client
+/// signed and paid for, so other peers may still take the same proof.
 fn worth_retrying(error: &Error) -> bool {
     matches!(
         error,
@@ -197,6 +322,7 @@ fn worth_retrying(error: &Error) -> bool {
             | Error::Network(_)
             | Error::Timeout(_)
             | Error::InsufficientPeers(_)
+            | Error::RemotePut { .. }
     )
 }
 
@@ -213,7 +339,7 @@ fn read_put_reply(
     body: ChunkMessageBody,
     expected_address: XorName,
     expected_state: XorName,
-) -> Option<Result<()>> {
+) -> Option<Result<PutAck>> {
     let ChunkMessageBody::PointerPutResponse(response) = body else {
         return None;
     };
@@ -223,7 +349,7 @@ fn read_put_reply(
         PointerPutResponse::Success { address, state_id }
         | PointerPutResponse::Unchanged { address, state_id } => {
             if address == expected_address && state_id == expected_state {
-                Ok(())
+                Ok(PutAck::Stored)
             } else {
                 Err(Error::InvalidData(format!(
                     "peer acknowledged a pointer this client did not send: address {} state {}",
@@ -235,22 +361,22 @@ fn read_put_reply(
         // Every reply names the address it is about, and every one of them is
         // checked against the address that was sent. A refusal is not exempt:
         // one about some other pointer says nothing about this write.
-        PointerPutResponse::Stale { address, state_id } => {
-            Err(Error::InvalidData(if address == expected_address {
-                format!(
-                    "the pointer moved while this update was in flight; the network \
-                     now holds state {}",
-                    hex::encode(state_id)
-                )
-            } else {
-                format!(
-                    "peer refused a pointer this client did not send: address {}",
-                    hex::encode(address)
-                )
-            }))
+        // A claim, about this pointer, that it has moved on. Whether it has
+        // is for a read to confirm (see [`judge_write`]).
+        PointerPutResponse::Stale { address, .. } if address == expected_address => {
+            Ok(PutAck::Stale)
         }
+        PointerPutResponse::Stale { address, .. } => Err(Error::InvalidData(format!(
+            "peer refused a pointer this client did not send: address {}",
+            hex::encode(address)
+        ))),
         PointerPutResponse::PaymentRequired { message } => Err(Error::Payment(message)),
-        PointerPutResponse::Error(e) => Err(Error::Protocol(format!("pointer PUT refused: {e}"))),
+        // The node's own reason, kept as it gave it: a node that could not
+        // store the record is a shortfall to retry, not a refusal of it.
+        PointerPutResponse::Error(e) => Err(Error::RemotePut {
+            address: hex::encode(expected_address),
+            source: e,
+        }),
     })
 }
 
@@ -301,8 +427,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns an error if signing fails, payment fails, or no storer accepts
-    /// the record.
+    /// Returns an error if signing fails, payment fails, or fewer peers than
+    /// the write quorum store the record.
     pub async fn pointer_create(
         &self,
         secret_key: &MlDsaSecretKey,
@@ -352,7 +478,8 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if the current record cannot be read, the counter is
-    /// exhausted, signing fails, payment fails, or no storer accepts it.
+    /// exhausted, signing fails, payment fails, or fewer peers than the write
+    /// quorum store it.
     pub async fn pointer_update(
         &self,
         secret_key: &MlDsaSecretKey,
@@ -398,16 +525,17 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if no peer is responsible for the address, if payment
-    /// fails, or if no storer accepts the record.
+    /// fails, or if fewer peers than the write quorum store the record.
     pub async fn pointer_put(&self, record: &Pointer) -> Result<XorName> {
         let address = record.address();
         let state_id = record.state_id();
 
-        // Refuse before paying if nobody is responsible for this address.
-        // There is no sense buying storage with nowhere to put it, and a
-        // quorum of nothing would otherwise be satisfied by nothing — a paid
-        // write reported as stored on zero peers.
-        self.pointer_group(&address).await?;
+        // Refuse before paying if nobody is responsible for this address, or
+        // too few of those who are can take the write. There is no sense
+        // buying storage with nowhere to put it, and a quorum of nothing would
+        // otherwise be satisfied by nothing — a paid write reported as stored
+        // on zero peers.
+        self.pointer_write_group(&address).await?;
 
         // The quote names the state; the peers that may issue it are the close
         // group around the address. One payment, one state.
@@ -435,7 +563,7 @@ impl Client {
     pub async fn prepare_pointer_payment(&self, record: &Pointer) -> Result<ChunkPaymentPlan> {
         let address = record.address();
         // As for a wallet payment: nothing is quoted with nowhere to store it.
-        self.pointer_group(&address).await?;
+        self.pointer_write_group(&address).await?;
         self.prepare_payment_plan_split(
             &address,
             &record.state_id(),
@@ -460,8 +588,11 @@ impl Client {
         // A write that fell short is retried with the same proof, as a chunk
         // store is: peers that took it the first time answer `Unchanged`, which
         // counts, so each round only has to reach the ones that did not. A
-        // refusal that says something definite — a newer state won, the
-        // payment was refused, a peer acknowledged something else — is final.
+        // refusal that says something definite, such as the payment was
+        // refused or a peer acknowledged something else, is final only once a
+        // second peer repeats it and nobody stored the record; a newer state
+        // winning is final once a read confirms it (see [`judge_write`]). One
+        // peer's refusal alone is retried like any shortfall.
         let mut attempt = 0;
         loop {
             match self.pointer_put_once(record, &proof).await {
@@ -491,7 +622,14 @@ impl Client {
         // never asked. The lookup above answered whether there was anywhere to
         // store this — this one answers where.
         let targets = self.pointer_group(&address).await?;
-        let wanted = write_quorum(targets.len());
+        let wanted = write_quorum(quorum_width(targets.len(), self.config().close_group_size));
+        if targets.len() < wanted {
+            return Err(Error::CloseGroupShortfall(format!(
+                "found {} close-group peers for pointer {}, and a write needs {wanted}",
+                targets.len(),
+                hex::encode(address)
+            )));
+        }
 
         let request =
             PointerPutRequest::with_payment(Bytes::from(record.to_bytes()), proof.to_vec());
@@ -507,26 +645,28 @@ impl Client {
             ));
         }
 
-        let answered = ask_the_group(in_flight, wanted, |()| true).await;
-        if answered.count >= wanted {
-            return Ok(address);
-        }
-        // A peer that refused — a newer state won, the payment was refused, an
-        // acknowledgement named another record — is the answer, and is not
-        // retried. Only a group that did not answer is a shortfall.
-        if let Some(refusal) = answered.refusal {
-            return Err(refusal);
-        }
-        if answered.count > 0 {
-            return Err(Error::CloseGroupShortfall(format!(
-                "pointer {} stored on {} of {wanted} close-group peers",
-                hex::encode(address),
-                answered.count
-            )));
-        }
-        Err(answered.failure().unwrap_or_else(|| {
-            Error::Protocol("no close-group peer accepted the pointer".to_string())
-        }))
+        let (mut stored, mut stale) = (0usize, 0usize);
+        let answered = ask_the_group(in_flight, wanted, |ack| {
+            match ack {
+                PutAck::Stored => stored += 1,
+                PutAck::Stale => stale += 1,
+            }
+            stored >= wanted
+        })
+        .await;
+        // Only a peer's word says the pointer moved on, so a read decides it
+        // before the write is abandoned.
+        let moved = stored < wanted && stale > 0 && self.moved_past(record).await;
+        judge_write(&address, stored, wanted, moved, answered).map(|()| address)
+    }
+
+    /// Whether the network has moved past `record`: a read returns a state
+    /// that replaces it. A read that fails says nothing, and counts as no.
+    async fn moved_past(&self, record: &Pointer) -> bool {
+        matches!(
+            self.pointer_get(&record.address()).await,
+            Ok(Some(current)) if current.replaces(record)
+        )
     }
 
     /// The peers a pointer write must land on and a read must ask.
@@ -558,6 +698,62 @@ impl Client {
         Ok(peers)
     }
 
+    /// The close group a write of `address` goes to, refused before anything
+    /// is quoted or paid if too few of it would take the write.
+    ///
+    /// While nodes are being upgraded some of a close group may not store
+    /// pointers yet. A browser can tell which from what each node advertises,
+    /// and a write that fewer than a write quorum would take is otherwise paid
+    /// for and then falls short. Only a node that says it would refuse counts
+    /// against the write: one that cannot be asked in time might still take
+    /// it, and the write finds out, as it did before. A native client cannot
+    /// tell at all, and its write finds out as before.
+    async fn pointer_write_group(
+        &self,
+        address: &XorName,
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
+        let group = self.pointer_group(address).await?;
+        let wanted = write_quorum(quorum_width(group.len(), self.config().close_group_size));
+        // Too few found to reach a write quorum is a shortfall, whatever they
+        // would say: no need to ask them.
+        if group.len() < wanted {
+            return Err(Error::CloseGroupShortfall(format!(
+                "found {} close-group peers for pointer {}, and a write needs {wanted}; \
+                 nothing was paid",
+                group.len(),
+                hex::encode(address)
+            )));
+        }
+        let mut asked: FuturesUnordered<_> = group
+            .iter()
+            .map(|(peer, addrs)| self.network().accepts_pointer_writes(peer, addrs))
+            .collect();
+        let (mut taking, mut refusing) = (0usize, 0usize);
+        while let Some(answer) = asked.next().await {
+            match answer {
+                Some(true) => taking += 1,
+                Some(false) => refusing += 1,
+                None => {}
+            }
+            if taking >= wanted {
+                break;
+            }
+            if group.len().saturating_sub(refusing) < wanted {
+                return Err(Error::InsufficientPeers(format!(
+                    "{refusing} of the {} close-group peers for pointer {} do not accept \
+                     pointer writes, so a write cannot reach the {wanted} it needs; nothing \
+                     was paid",
+                    group.len(),
+                    hex::encode(address)
+                )));
+            }
+        }
+        // Enough would take it, or too few could be asked to be sure it
+        // cannot land. Probes still out are dropped, which cancels them.
+        drop(asked);
+        Ok(group)
+    }
+
     /// Read the pointer at `address`, verifying it before returning it.
     ///
     /// The record is checked against the address it was asked for, so a storer
@@ -580,24 +776,20 @@ impl Client {
         // What it must not be able to do is decide the answer alone: any peer
         // may legitimately hold a stale record, so taking the first reply would
         // let one pin a reader to it. Asking concurrently also means one slow
-        // peer cannot stall the read behind the store timeout.
+        // peer cannot stall a read whose answer is settled. One that is not,
+        // because a newer state has been named but not yet confirmed, waits
+        // for the rest of the group, each request within its own deadline:
+        // that is what an update in flight costs a reader, and all a peer
+        // naming a state nobody else holds can cost it.
         let in_flight = FuturesUnordered::new();
         for (peer_id, addrs) in &peers {
             in_flight.push(self.send_pointer_get(*address, *peer_id, addrs.clone()));
         }
 
-        let wanted = read_quorum(peers.len());
-        let needed = corroboration(peers.len());
-        let mut replies = Replies::default();
-        let answered = ask_the_group(in_flight, wanted, |found| {
-            replies.add(found);
-            // Answers alone settle a read that found nothing. A state is
-            // settled only once enough peers have named it — until then the
-            // read keeps asking, because the peers that would confirm it may
-            // simply not have answered yet.
-            !replies.any() || replies.corroborated(needed).is_some()
-        })
-        .await;
+        let width = quorum_width(peers.len(), self.config().close_group_size);
+        let wanted = read_quorum(width);
+        let needed = corroboration(width);
+        let (answered, replies) = collect_read(in_flight, width).await;
         let corroborated = replies.corroborated(needed).cloned();
 
         if answered.count == 0 {
@@ -689,7 +881,7 @@ impl Client {
         peer_addrs: Vec<MultiAddr>,
         expected_address: XorName,
         expected_state: XorName,
-    ) -> Result<()> {
+    ) -> Result<PutAck> {
         let request_id = self.next_request_id();
         let message = ChunkMessage {
             request_id,
@@ -933,7 +1125,7 @@ mod tests {
                 state_id: sent.state_id(),
             },
         ] {
-            assert!(judged(honest).is_ok());
+            assert!(matches!(judged(honest), Ok(PutAck::Stored)));
         }
 
         for lie in [
@@ -965,8 +1157,98 @@ mod tests {
                 message: "pay up".to_string(),
             },
         ] {
-            assert!(judged(lie).is_err(), "this must not count as stored");
+            assert!(
+                !matches!(judged(lie), Ok(PutAck::Stored)),
+                "this must not count as stored"
+            );
         }
+    }
+
+    /// A lookup that comes back short does not shrink the quorums: they are
+    /// counted over the configured group, so one returned peer can neither
+    /// complete a write nor decide a read.
+    #[test]
+    fn a_short_lookup_is_a_shortfall_not_a_smaller_quorum() {
+        let width = quorum_width(1, 7);
+        assert_eq!(write_quorum(width), 5, "a write still needs five copies");
+        assert_eq!(read_quorum(width), 4, "a read still needs four answers");
+        assert_eq!(corroboration(width), 2, "and two peers naming its state");
+        assert_eq!(quorum_width(9, 7), 9, "a wider lookup is counted as it is");
+    }
+
+    fn answered(count: usize, refusal: Option<Error>) -> Answered {
+        let refusals = usize::from(refusal.is_some());
+        Answered {
+            count,
+            last_error: None,
+            refusal,
+            refusals,
+        }
+    }
+
+    /// One peer's word cannot throw a paid write away. Four peers stored it and
+    /// one claims the pointer moved on: unless a read confirms that, the round
+    /// is a shortfall, retried with the proof already paid for.
+    #[test]
+    fn one_peer_cannot_end_a_paid_write_that_others_stored() {
+        let address = [7u8; 32];
+        let refused = || Some(Error::Payment("pay up".to_string()));
+
+        let unconfirmed = judge_write(&address, 4, 5, false, answered(5, None));
+        assert!(
+            matches!(&unconfirmed, Err(e) if worth_retrying(e)),
+            "a claim nobody confirmed is a shortfall, got {unconfirmed:?}"
+        );
+        let refused_after_stores = judge_write(&address, 2, 5, false, answered(3, refused()));
+        assert!(
+            matches!(&refused_after_stores, Err(e) if worth_retrying(e)),
+            "a refusal after others took the proof is retried, got {refused_after_stores:?}"
+        );
+
+        let confirmed = judge_write(&address, 4, 5, true, answered(5, None));
+        assert!(
+            matches!(&confirmed, Err(e) if !worth_retrying(e)),
+            "a move a read confirmed is final, got {confirmed:?}"
+        );
+        assert!(
+            matches!(
+                judge_write(
+                    &address,
+                    0,
+                    5,
+                    false,
+                    Answered {
+                        refusals: 2,
+                        ..answered(0, refused())
+                    }
+                ),
+                Err(Error::Payment(_))
+            ),
+            "a refusal a second peer repeats, with nobody storing, is the answer"
+        );
+        assert!(judge_write(&address, 5, 5, false, answered(5, None)).is_ok());
+    }
+
+    /// Nor can one peer end it while the rest of the group is silent. Six
+    /// peers time out and one refuses: that refusal is one peer's word, so
+    /// the round is retried with the proof already paid for.
+    #[test]
+    fn one_refusal_among_silent_peers_is_retried() {
+        let address = [7u8; 32];
+        let alone = judge_write(
+            &address,
+            0,
+            5,
+            false,
+            Answered {
+                last_error: Some(Error::Timeout("no answer".to_string())),
+                ..answered(0, Some(Error::Payment("pay up".to_string())))
+            },
+        );
+        assert!(
+            matches!(&alone, Err(e) if worth_retrying(e)),
+            "one refusal among silent peers is a shortfall, got {alone:?}"
+        );
     }
 
     /// Tally some replies and ask what the group's answer is.
@@ -1060,6 +1342,88 @@ mod tests {
         );
     }
 
+    /// Replies that arrive in the order given, one every ten milliseconds.
+    fn arriving(
+        replies: Vec<Result<Option<Pointer>>>,
+    ) -> FuturesUnordered<BoxFuture<'static, Result<Option<Pointer>>>> {
+        let in_flight: FuturesUnordered<BoxFuture<'static, Result<Option<Pointer>>>> =
+            FuturesUnordered::new();
+        for (at, reply) in (1u64..).zip(replies) {
+            in_flight.push(Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10 * at)).await;
+                reply
+            }));
+        }
+        in_flight
+    }
+
+    /// A write that reached five of seven peers must read back, even when one
+    /// peer replays the older record it replaced.
+    ///
+    /// The two peers the write missed still hold the older state, honestly,
+    /// and the replaying peer makes three. If those three answer first, the
+    /// older state is corroborated after four answers while the newer one has
+    /// been named once. Stopping there hands back the state the write replaced
+    /// while four peers hold the new one, so the read keeps asking until the
+    /// newer state is corroborated or the group is exhausted. A newer state
+    /// nobody corroborates still never wins.
+    #[tokio::test(start_paused = true)]
+    async fn a_replayed_older_state_cannot_end_a_read_before_the_newer_one_is_heard() {
+        let (pk, sk) = keypair(13);
+        let old = Pointer::create(&sk, &pk, chunk_target(1)).expect("create");
+        let new = old.update(&sk, chunk_target(2)).expect("update");
+        let old_reply = || Ok(Some(old.clone()));
+        let new_reply = || Ok(Some(new.clone()));
+
+        let (answered, replies) = collect_read(
+            arriving(vec![
+                old_reply(),
+                old_reply(),
+                old_reply(),
+                new_reply(),
+                new_reply(),
+                new_reply(),
+                new_reply(),
+            ]),
+            7,
+        )
+        .await;
+        assert_eq!(
+            replies
+                .corroborated(corroboration(7))
+                .expect("an answer")
+                .state_id(),
+            new.state_id(),
+            "the state the write stored is the answer ({} answered)",
+            answered.count
+        );
+
+        // When nobody else confirms the newer state, it is still one peer's
+        // word, and the group's answer stands, only later.
+        let (answered, replies) = collect_read(
+            arriving(vec![
+                old_reply(),
+                old_reply(),
+                old_reply(),
+                new_reply(),
+                Err(Error::Timeout("gone".to_string())),
+                Err(Error::Timeout("gone".to_string())),
+                Err(Error::Timeout("gone".to_string())),
+            ]),
+            7,
+        )
+        .await;
+        assert_eq!(answered.count, 4);
+        assert_eq!(
+            replies
+                .corroborated(corroboration(7))
+                .expect("an answer")
+                .state_id(),
+            old.state_id(),
+            "a newer state one peer names never wins"
+        );
+    }
+
     /// The fan-out both a write and a read use, driven with synthetic replies.
     ///
     /// A majority ends the operation. The peers that have not answered are
@@ -1121,7 +1485,7 @@ mod tests {
     }
 
     /// A refusal is kept apart from a missing answer, so a write that fell
-    /// short because a peer said no reports that, and is not retried.
+    /// short because peers said no can report that rather than a timeout.
     #[tokio::test]
     async fn a_refusal_is_kept_apart_from_a_missing_answer() {
         let in_flight: FuturesUnordered<BoxFuture<'static, Result<()>>> = FuturesUnordered::new();
@@ -1136,11 +1500,80 @@ mod tests {
 
         let answered = ask_the_group(in_flight, write_quorum(7), |()| true).await;
         assert_eq!(answered.count, 1);
+        assert_eq!(answered.refusals, 1);
         assert!(
             matches!(&answered.refusal, Some(Error::InvalidData(message)) if message.contains("moved")),
             "the refusal is what the write reports"
         );
         assert!(matches!(answered.last_error, Some(Error::Timeout(_))));
+    }
+
+    /// Refusals are counted as they arrive through the group, not only the
+    /// first kept. One refusal among six silent peers is retried with the
+    /// proof already paid for; a second makes it the answer.
+    #[tokio::test]
+    async fn refusals_are_counted_through_the_group_and_judged_by_how_many() {
+        let group = |refusals: usize| {
+            let in_flight: FuturesUnordered<BoxFuture<'static, Result<PutAck>>> =
+                FuturesUnordered::new();
+            for peer in 0..7 {
+                in_flight.push(Box::pin(async move {
+                    if peer < refusals {
+                        Err(Error::Payment("pay up".to_string()))
+                    } else {
+                        Err(Error::Timeout("slow".to_string()))
+                    }
+                }));
+            }
+            in_flight
+        };
+        let address = [7u8; 32];
+        let wanted = write_quorum(7);
+
+        let one = ask_the_group(group(1), wanted, |_| true).await;
+        assert_eq!(one.refusals, 1);
+        let judged = judge_write(&address, 0, wanted, false, one);
+        assert!(
+            matches!(&judged, Err(e) if worth_retrying(e)),
+            "one refusal among silent peers is retried, got {judged:?}"
+        );
+
+        let two = ask_the_group(group(2), wanted, |_| true).await;
+        assert_eq!(two.refusals, 2);
+        let judged = judge_write(&address, 0, wanted, false, two);
+        assert!(
+            matches!(&judged, Err(Error::Payment(_))),
+            "two refusals with nobody storing are the answer, got {judged:?}"
+        );
+    }
+
+    /// A node that cannot store a record just then, such as one whose disk is
+    /// full, says nothing about the record. Two of them among five silent
+    /// peers leave a round to retry with the same proof.
+    #[tokio::test]
+    async fn a_node_that_cannot_store_is_a_shortfall_not_a_refusal() {
+        let in_flight: FuturesUnordered<BoxFuture<'static, Result<PutAck>>> =
+            FuturesUnordered::new();
+        for peer in 0..7 {
+            in_flight.push(Box::pin(async move {
+                if peer < 2 {
+                    Err(Error::RemotePut {
+                        address: String::new(),
+                        source: ant_protocol::ProtocolError::StorageFailed("disk full".to_string()),
+                    })
+                } else {
+                    Err(Error::Timeout("slow".to_string()))
+                }
+            }));
+        }
+        let wanted = write_quorum(7);
+        let answered = ask_the_group(in_flight, wanted, |_| true).await;
+        assert_eq!(answered.refusals, 0, "a full disk is not a refusal");
+        let judged = judge_write(&[7u8; 32], 0, wanted, false, answered);
+        assert!(
+            matches!(&judged, Err(e) if worth_retrying(e)),
+            "got {judged:?}"
+        );
     }
 
     /// A write quorum and a read quorum must intersect at every group width.
