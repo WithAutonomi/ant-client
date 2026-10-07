@@ -91,6 +91,10 @@ pub const MAX_EMBEDDED_ROOT_MAP_BYTES: usize = 64 * 1024;
 /// Deepest msgpack nesting the decoder tolerates. A manifest nests four
 /// levels; this leaves headroom for future optional fields.
 const MAX_DECODE_DEPTH: usize = 16;
+/// Length of a BitTorrent v1 info hash (SHA-1, BEP 3).
+pub const TORRENT_INFO_HASH_V1_LEN: usize = 20;
+/// Length of a BitTorrent v2 info hash (SHA-256, BEP 52).
+pub const TORRENT_INFO_HASH_V2_LEN: usize = 32;
 
 /// A set of files and how to fetch each one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,9 +103,79 @@ pub struct Manifest {
     /// portable path rules.
     #[serde(default)]
     pub name: Option<String>,
+    /// The BitTorrent identity of the same set of files, when the creator
+    /// has one. Carried so a manifest can be matched to a torrent; what a
+    /// client does with it is a later decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torrent: Option<TorrentReference>,
     /// Sorted by effective name once encoded. Effective names are unique.
     #[serde(default)]
     pub entries: Vec<ManifestEntry>,
+}
+
+/// A BitTorrent info hash identifying the same files (BEP 3 and BEP 52).
+/// At least one of the two hashes must be present.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TorrentReference {
+    /// SHA-1 info hash of a v1 torrent.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub info_hash_v1: Option<[u8; TORRENT_INFO_HASH_V1_LEN]>,
+    /// SHA-256 info hash of a v2 or hybrid torrent.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub info_hash_v2: Option<[u8; TORRENT_INFO_HASH_V2_LEN]>,
+}
+
+impl TorrentReference {
+    /// Whether at least one hash is present.
+    pub fn is_empty(&self) -> bool {
+        self.info_hash_v1.is_none() && self.info_hash_v2.is_none()
+    }
+
+    /// Parse a hex info hash: 40 characters select v1, 64 select v2.
+    pub fn parse_hex(hex_str: &str) -> Result<Self, ManifestError> {
+        let bytes = hex::decode(hex_str.trim())
+            .map_err(|e| ManifestError::InvalidTorrentHash(format!("not hex: {e}")))?;
+        let mut reference = Self::default();
+        match bytes.len() {
+            TORRENT_INFO_HASH_V1_LEN => {
+                let mut hash = [0u8; TORRENT_INFO_HASH_V1_LEN];
+                hash.copy_from_slice(&bytes);
+                reference.info_hash_v1 = Some(hash);
+            }
+            TORRENT_INFO_HASH_V2_LEN => {
+                let mut hash = [0u8; TORRENT_INFO_HASH_V2_LEN];
+                hash.copy_from_slice(&bytes);
+                reference.info_hash_v2 = Some(hash);
+            }
+            other => {
+                return Err(ManifestError::InvalidTorrentHash(format!(
+                    "expected {TORRENT_INFO_HASH_V1_LEN} (v1) or {TORRENT_INFO_HASH_V2_LEN} (v2) bytes, got {other}"
+                )))
+            }
+        }
+        Ok(reference)
+    }
+
+    /// Combine two references, each contributing the hashes it has. A hash
+    /// present in both must agree.
+    pub fn merge(self, other: Self) -> Result<Self, ManifestError> {
+        fn pick<const N: usize>(
+            a: Option<[u8; N]>,
+            b: Option<[u8; N]>,
+        ) -> Result<Option<[u8; N]>, ManifestError> {
+            match (a, b) {
+                (Some(x), Some(y)) if x != y => Err(ManifestError::InvalidTorrentHash(
+                    "two different hashes given for the same torrent version".to_string(),
+                )),
+                (Some(x), _) => Ok(Some(x)),
+                (None, y) => Ok(y),
+            }
+        }
+        Ok(Self {
+            info_hash_v1: pick(self.info_hash_v1, other.info_hash_v1)?,
+            info_hash_v2: pick(self.info_hash_v2, other.info_hash_v2)?,
+        })
+    }
 }
 
 /// One file in a manifest.
@@ -189,6 +263,9 @@ pub enum ManifestError {
     /// The caller cancelled the operation.
     #[error("operation cancelled")]
     Cancelled,
+    /// A torrent reference is malformed or empty.
+    #[error("invalid torrent info hash: {0}")]
+    InvalidTorrentHash(String),
     /// A filesystem error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -240,6 +317,7 @@ impl Manifest {
     pub fn new(name: Option<String>) -> Self {
         Self {
             name,
+            torrent: None,
             entries: Vec::new(),
         }
     }
@@ -261,6 +339,15 @@ impl Manifest {
         }
         if let Some(name) = &self.name {
             path::validate_component(name).map_err(ManifestError::InvalidName)?;
+        }
+        if self
+            .torrent
+            .as_ref()
+            .is_some_and(TorrentReference::is_empty)
+        {
+            return Err(ManifestError::InvalidTorrentHash(
+                "a torrent reference needs a v1 or v2 info hash".to_string(),
+            ));
         }
         let mut names = Vec::with_capacity(self.entries.len());
         for entry in &self.entries {
@@ -357,6 +444,7 @@ mod tests {
     fn sample() -> Manifest {
         Manifest {
             name: Some("album".into()),
+            torrent: None,
             entries: vec![
                 ManifestEntry {
                     path: Some("photos/b.jpg".into()),
@@ -549,6 +637,61 @@ mod tests {
             source: ContentRef::Public { address: [2; 32] },
         });
         assert!(matches!(m.validate(), Err(ManifestError::Conflict(_))));
+    }
+
+    #[test]
+    fn torrent_reference_round_trips_and_is_absent_from_bytes_when_unset() {
+        let without = sample().encode().unwrap();
+        let mut with_torrent = sample();
+        with_torrent.torrent = Some(TorrentReference {
+            info_hash_v1: Some([0xaa; TORRENT_INFO_HASH_V1_LEN]),
+            info_hash_v2: None,
+        });
+        let bytes = with_torrent.encode().unwrap();
+        assert!(bytes.len() > without.len());
+        assert_eq!(Manifest::decode(&bytes).unwrap(), {
+            let mut expected = with_torrent.clone();
+            expected.canonicalize().unwrap();
+            expected
+        });
+        // Old readers of this version see one more optional field; the bytes
+        // of a manifest without a torrent reference are unchanged.
+        assert_eq!(without, {
+            let mut plain = with_torrent.clone();
+            plain.torrent = None;
+            plain.encode().unwrap()
+        });
+    }
+
+    #[test]
+    fn torrent_reference_parsing_merging_and_validation() {
+        let v1 = TorrentReference::parse_hex(&"ab".repeat(TORRENT_INFO_HASH_V1_LEN)).unwrap();
+        assert_eq!(v1.info_hash_v1, Some([0xab; TORRENT_INFO_HASH_V1_LEN]));
+        assert_eq!(v1.info_hash_v2, None);
+        let v2 = TorrentReference::parse_hex(&"CD".repeat(TORRENT_INFO_HASH_V2_LEN)).unwrap();
+        assert_eq!(v2.info_hash_v2, Some([0xcd; TORRENT_INFO_HASH_V2_LEN]));
+        let both = v1.clone().merge(v2.clone()).unwrap();
+        assert!(both.info_hash_v1.is_some() && both.info_hash_v2.is_some());
+        let other_v1 = TorrentReference::parse_hex(&"ef".repeat(TORRENT_INFO_HASH_V1_LEN)).unwrap();
+        assert!(matches!(
+            v1.merge(other_v1),
+            Err(ManifestError::InvalidTorrentHash(_))
+        ));
+        assert!(matches!(
+            TorrentReference::parse_hex("abc"),
+            Err(ManifestError::InvalidTorrentHash(_))
+        ));
+        assert!(matches!(
+            TorrentReference::parse_hex(&"zz".repeat(TORRENT_INFO_HASH_V1_LEN)),
+            Err(ManifestError::InvalidTorrentHash(_))
+        ));
+
+        let mut empty = Manifest::new(None);
+        empty.torrent = Some(TorrentReference::default());
+        assert!(matches!(
+            empty.validate(),
+            Err(ManifestError::InvalidTorrentHash(_))
+        ));
     }
 
     #[test]

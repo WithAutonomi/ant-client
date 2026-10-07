@@ -1083,8 +1083,23 @@ pub enum BrowserLinkView {
 pub struct BrowserManifestView {
     /// Suggested root directory name.
     pub name: Option<String>,
+    /// BitTorrent identity of the same files, hex encoded, when recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub torrent: Option<BrowserTorrentView>,
     /// Entries in manifest order.
     pub entries: Vec<BrowserManifestEntryView>,
+}
+
+/// A manifest's torrent reference shaped for JavaScript.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTorrentView {
+    /// Hex SHA-1 info hash of a v1 torrent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub info_hash_v1: Option<String>,
+    /// Hex SHA-256 info hash of a v2 or hybrid torrent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub info_hash_v2: Option<String>,
 }
 
 /// One manifest entry shaped for JavaScript.
@@ -1130,6 +1145,10 @@ impl BrowserManifestView {
         }
         Ok(Self {
             name: manifest.name.clone(),
+            torrent: manifest.torrent.as_ref().map(|t| BrowserTorrentView {
+                info_hash_v1: t.info_hash_v1.map(hex::encode),
+                info_hash_v2: t.info_hash_v2.map(hex::encode),
+            }),
             entries,
         })
     }

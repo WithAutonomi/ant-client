@@ -327,6 +327,7 @@ async fn handle_file_upload(
     };
     let record = Manifest {
         name: None,
+        torrent: None,
         entries: vec![ManifestEntry {
             path: portable_component(&original_name),
             size: Some(file_size),

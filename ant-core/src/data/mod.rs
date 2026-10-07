@@ -74,7 +74,7 @@ pub use manifest::{
 };
 pub use manifest::{
     file_link, is_link, manifest_link, parse_link, ContentRef, Link, Manifest, ManifestEntry,
-    ManifestError, MANIFEST_EXTENSION, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+    ManifestError, TorrentReference, MANIFEST_EXTENSION, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
     MAX_EMBEDDED_ROOT_MAP_BYTES,
 };
 

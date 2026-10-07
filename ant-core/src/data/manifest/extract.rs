@@ -423,6 +423,7 @@ mod tests {
     fn selection_matches_exact_and_prefix() {
         let manifest = Manifest {
             name: None,
+            torrent: None,
             entries: vec![entry("a/b"), entry("a/c"), entry("ab"), entry("d")],
         };
         let all = select_entries(&manifest, &[]).unwrap();

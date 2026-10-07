@@ -19,7 +19,7 @@ use crate::data::Client;
 
 use super::embed::embeddable_data_map;
 use super::path::{check_collisions, validate_component, validate_path, PATH_SEPARATOR};
-use super::{ContentRef, Manifest, ManifestEntry, ManifestError, ADDRESS_LEN};
+use super::{ContentRef, Manifest, ManifestEntry, ManifestError, TorrentReference, ADDRESS_LEN};
 
 /// Capacity of the per-file upload progress channel.
 const UPLOAD_PROGRESS_CAPACITY: usize = 64;
@@ -42,6 +42,8 @@ pub enum ReferenceMode {
 pub struct BuildOptions {
     /// Suggested root directory name.
     pub name: Option<String>,
+    /// BitTorrent identity of the same files, when known.
+    pub torrent: Option<TorrentReference>,
     /// How uploaded files are referenced.
     pub reference_mode: ReferenceMode,
     /// Visibility of the file uploads themselves. `Public` stores each
@@ -351,6 +353,7 @@ impl<'a> ManifestBuilder<'a> {
 
         let mut manifest = Manifest {
             name: self.options.name.clone(),
+            torrent: self.options.torrent.clone(),
             entries: std::mem::take(&mut self.entries),
         };
         manifest.canonicalize()?;

@@ -64,6 +64,7 @@ mod tests {
     fn sample() -> Manifest {
         Manifest {
             name: Some("pack".into()),
+            torrent: None,
             entries: vec![ManifestEntry {
                 path: Some("a".into()),
                 size: None,

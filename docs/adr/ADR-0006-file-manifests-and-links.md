@@ -79,8 +79,18 @@ pub struct Manifest {
     /// Suggested root directory name. One path component, subject to the
     /// portable path rules.
     pub name: Option<String>,
+    /// The BitTorrent identity of the same files, when the creator has
+    /// one. Carried now; acted on later (see Deferred).
+    pub torrent: Option<TorrentReference>,
     /// Sorted by effective name. Effective names are unique.
     pub entries: Vec<ManifestEntry>,
+}
+
+/// A BitTorrent info hash (BEP 3 v1 SHA-1, BEP 52 v2 SHA-256). At least
+/// one must be present when the reference is.
+pub struct TorrentReference {
+    pub info_hash_v1: Option<[u8; 20]>,
+    pub info_hash_v2: Option<[u8; 32]>,
 }
 
 pub struct ManifestEntry {
@@ -102,8 +112,10 @@ pub enum ContentRef {
 }
 ```
 
-`name`, `path` and `size` are optional metadata. `source` and the payload of
-whichever variant it holds are required. A manifest that is only a list of
+`name`, `torrent`, `path` and `size` are optional metadata. `source` and the
+payload of whichever variant it holds are required. `torrent` is omitted from
+the bytes when absent, so a manifest without it encodes exactly as before the
+field existed. A manifest that is only a list of
 content references is valid.
 
 Each entry has a **content address**: for `Public` the address itself; for
@@ -429,6 +441,12 @@ is added.
   file's plaintext. The enum admits it later without a format break.
 - **Manifest-wide Merkle payment.** One batch for every file of a manifest.
   Orthogonal to the format.
+- **BitTorrent interoperability.** The format already carries the torrent
+  info hash of the same files, so a manifest and a torrent describing one
+  release can be matched. What a client does with it, such as cross-seeding,
+  verifying a torrent's pieces against Autonomi chunks, or importing a
+  torrent's file list into a manifest, is a later ADR. Until then the hash
+  is recorded by the creator and displayed, nothing more.
 
 ## Open questions for review
 

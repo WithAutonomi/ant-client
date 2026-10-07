@@ -327,6 +327,7 @@ mod tests {
     fn manifest(name: Option<&str>, seed: u8) -> Manifest {
         Manifest {
             name: name.map(str::to_owned),
+            torrent: None,
             entries: vec![ManifestEntry {
                 path: Some("a.bin".into()),
                 size: Some(1),

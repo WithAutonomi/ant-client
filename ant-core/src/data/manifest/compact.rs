@@ -175,6 +175,7 @@ mod tests {
     fn apply_compaction_replaces_only_the_requested_embedded_entries() {
         let manifest = Manifest {
             name: None,
+            torrent: None,
             entries: vec![
                 ManifestEntry {
                     path: Some("a".into()),

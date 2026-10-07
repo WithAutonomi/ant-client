@@ -18,8 +18,8 @@ use ant_core::data::{
     is_link, list_uploads, load_upload, manifest_filename_for, manifest_link, parse_link,
     plan_compaction, publish_data_maps, read_manifest_file, record_upload, write_manifest_file,
     BuildEvent, BuildOptions, Client, ContentRef, DownloadEvent, EntryStatus, ExtractEvent,
-    ExtractOptions, Link, Manifest, ManifestBuilder, PaymentMode, ReferenceMode, UploadEvent,
-    UploadRecord, Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+    ExtractOptions, Link, Manifest, ManifestBuilder, PaymentMode, ReferenceMode, TorrentReference,
+    UploadEvent, UploadRecord, Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
 };
 use clap::Subcommand;
 use serde_json::json;
@@ -77,6 +77,10 @@ pub enum ManifestAction {
         /// no wallet.
         #[arg(long = "embed-public", value_name = "ADDRESS[=PATH]")]
         embed_public: Vec<String>,
+        /// Record the BitTorrent info hash of the same files: 40 hex
+        /// characters for v1, 64 for v2. Repeat to give both.
+        #[arg(long = "torrent-hash", value_name = "HEX")]
+        torrent_hashes: Vec<String>,
         /// Force merkle batch payment regardless of chunk count.
         #[arg(long, conflicts_with = "no_merkle")]
         merkle: bool,
@@ -187,12 +191,14 @@ impl ManifestAction {
                 name,
                 public_files,
                 embed_public,
+                torrent_hashes,
                 overwrite,
                 link,
                 ..
             } if paths.is_empty() && embed_public.is_empty() => {
                 // Nothing to upload: a manifest over already-public files.
                 let mut manifest = Manifest::new(name);
+                manifest.torrent = parse_torrent_hashes(&torrent_hashes)?;
                 for spec in &public_files {
                     let (address, path) = parse_public_file(spec)?;
                     manifest.entries.push(ant_core::data::ManifestEntry {
@@ -242,6 +248,7 @@ impl ManifestAction {
                 follow_symlinks,
                 public_files,
                 embed_public,
+                torrent_hashes,
                 merkle,
                 no_merkle,
                 overwrite,
@@ -265,6 +272,7 @@ impl ManifestAction {
                         follow_symlinks,
                         public_files,
                         embed_public,
+                        torrent: parse_torrent_hashes(&torrent_hashes)?,
                         payment_mode,
                         overwrite,
                         link,
@@ -407,6 +415,7 @@ fn report_exported(
             serde_json::to_string_pretty(&json!({
                 "manifest_file": out.display().to_string(),
                 "name": manifest.name,
+                "torrent": torrent_json(manifest),
                 "entries": entries_json(manifest)?,
                 "embedded_entries": embedded,
                 "public_entries": manifest.entries.len() - embedded,
@@ -441,6 +450,7 @@ struct CreateArgs {
     follow_symlinks: bool,
     public_files: Vec<String>,
     embed_public: Vec<String>,
+    torrent: Option<TorrentReference>,
     payment_mode: PaymentMode,
     overwrite: bool,
     link: bool,
@@ -461,6 +471,7 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
 
     let options = BuildOptions {
         name,
+        torrent: args.torrent,
         reference_mode: if args.compact {
             ReferenceMode::Compact
         } else {
@@ -629,6 +640,7 @@ fn report_created(
         let mut value = json!({
             "manifest_file": out.display().to_string(),
             "name": manifest.name,
+                "torrent": torrent_json(manifest),
             "entries": entries_json(manifest)?,
             "total_size": manifest.total_size(),
             "link": link_text,
@@ -742,6 +754,7 @@ fn show(manifest: &Manifest, json: bool) -> anyhow::Result<()> {
             "{}",
             serde_json::to_string_pretty(&json!({
                 "name": manifest.name,
+                "torrent": torrent_json(manifest),
                 "total_size": manifest.total_size(),
                 "entries": entries_json(manifest)?,
             }))?
@@ -749,6 +762,14 @@ fn show(manifest: &Manifest, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     println!("Name:    {}", manifest.name.as_deref().unwrap_or("(none)"));
+    if let Some(torrent) = &manifest.torrent {
+        if let Some(v1) = torrent.info_hash_v1 {
+            println!("Torrent: v1 {}", hex::encode(v1));
+        }
+        if let Some(v2) = torrent.info_hash_v2 {
+            println!("Torrent: v2 {}", hex::encode(v2));
+        }
+    }
     println!("Entries: {}", manifest.entries.len());
     if let Some(total) = manifest.total_size() {
         println!("Size:    {total} bytes");
@@ -902,6 +923,30 @@ fn load_manifest(source: &str) -> anyhow::Result<Manifest> {
     }
 }
 
+/// Parse the `--torrent-hash` values into one reference, or `None` if none.
+fn parse_torrent_hashes(hashes: &[String]) -> anyhow::Result<Option<TorrentReference>> {
+    let mut merged: Option<TorrentReference> = None;
+    for hash in hashes {
+        let parsed = TorrentReference::parse_hex(hash)?;
+        merged = Some(match merged {
+            Some(existing) => existing.merge(parsed)?,
+            None => parsed,
+        });
+    }
+    Ok(merged)
+}
+
+/// Hex form of a torrent reference for JSON output.
+fn torrent_json(manifest: &Manifest) -> serde_json::Value {
+    match &manifest.torrent {
+        Some(t) => json!({
+            "info_hash_v1": t.info_hash_v1.map(hex::encode),
+            "info_hash_v2": t.info_hash_v2.map(hex::encode),
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// Parse `ADDRESS[=PATH]` for `--public-file`.
 fn parse_public_file(spec: &str) -> anyhow::Result<([u8; 32], Option<String>)> {
     let (address_text, path) = match spec.split_once(PUBLIC_FILE_SEPARATOR) {
@@ -1034,6 +1079,7 @@ mod tests {
             follow_symlinks: false,
             public_files: vec!["ab".repeat(32)],
             embed_public: vec![],
+            torrent_hashes: vec![],
             merkle: false,
             no_merkle: false,
             overwrite: false,
