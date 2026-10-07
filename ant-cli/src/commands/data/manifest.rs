@@ -17,9 +17,10 @@ use ant_core::data::{
     apply_compaction, default_history_dir, embeddable_data_map, extract_manifest, format_timestamp,
     is_link, list_uploads, load_upload, manifest_filename_for, manifest_link, parse_link,
     plan_compaction, publish_data_maps, read_manifest_file, record_upload, write_manifest_file,
-    BuildEvent, BuildOptions, Client, ContentRef, DownloadEvent, EntryStatus, ExtractEvent,
-    ExtractOptions, Link, Manifest, ManifestBuilder, PaymentMode, ReferenceMode, TorrentReference,
-    UploadEvent, UploadRecord, Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+    BuildEvent, BuildOptions, BuildResult, Client, ContentRef, DownloadEvent, EntryStatus,
+    ExtractEvent, ExtractOptions, Link, Manifest, ManifestBuilder, ManifestError, PaymentMode,
+    ReferenceMode, TorrentReference, UploadEvent, UploadRecord, Visibility,
+    MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
 };
 use clap::Subcommand;
 use serde_json::json;
@@ -211,7 +212,7 @@ impl ManifestAction {
                     anyhow::bail!("nothing to add: pass files, directories or --public-file");
                 }
                 manifest.canonicalize()?;
-                let out = resolve_output(manifest.name.as_deref(), output);
+                let out = resolve_output(manifest.name.as_deref(), output)?;
                 check_output_writable(&out, overwrite)?;
                 write_manifest(&manifest, &out, overwrite)?;
                 let history_id = record_upload_manifest(&manifest, None);
@@ -226,7 +227,7 @@ impl ManifestAction {
                 ..
             } => {
                 let manifest = load_manifest(&source)?;
-                let out = resolve_output(manifest.name.as_deref(), output);
+                let out = resolve_output(manifest.name.as_deref(), output)?;
                 write_manifest(&manifest, &out, overwrite)?;
                 report_exported(&manifest, &out, 0, link, json)
             }
@@ -329,7 +330,7 @@ async fn export_compact(
     json: bool,
 ) -> anyhow::Result<()> {
     // Nothing is published until the output is known to be writable.
-    let out = resolve_output(manifest.name.as_deref(), output);
+    let out = resolve_output(manifest.name.as_deref(), output)?;
     check_output_writable(&out, overwrite)?;
     let cancel = CancellationToken::new();
     spawn_ctrl_c(cancel.clone());
@@ -487,7 +488,7 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         cancel: CancellationToken::new(),
     };
     // Fail before any paid upload if the manifest could not be written.
-    let out = resolve_output(options.name.as_deref(), args.output.clone());
+    let out = resolve_output(options.name.as_deref(), args.output.clone())?;
     check_output_writable(&out, args.overwrite)?;
     spawn_ctrl_c(options.cancel.clone());
     let mut builder = ManifestBuilder::new(client, options);
@@ -520,34 +521,18 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
 
     info!("Building manifest from {} file(s)", builder.pending_count());
     let start = Instant::now();
-    let result = if json {
-        builder.finish(None).await?
+    let built = if json {
+        builder.finish(None).await
     } else {
         let (tx, rx) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         let ui = tokio::spawn(drive_build_progress(rx));
         let result = builder.finish(Some(tx)).await;
         let _ = ui.await;
-        result?
+        result
     };
 
-    // Record first: the history is the safety net for paid uploads, so it
-    // must exist even if writing the output file fails.
-    let history_id = record_upload_manifest(&result.manifest, None);
-    if result.cancelled {
-        let recorded = history_id
-            .map(|id| format!("; the partial manifest is recorded as {id}"))
-            .unwrap_or_default();
-        anyhow::bail!(
-            "cancelled after {} of {} file(s){recorded}",
-            result.files_uploaded,
-            result.files_uploaded
-                + result
-                    .manifest
-                    .entries
-                    .len()
-                    .saturating_sub(result.files_uploaded)
-        );
-    }
+    let (result, history_id) =
+        record_build_result(built, |manifest| record_upload_manifest(manifest, None))?;
     write_manifest(&result.manifest, &out, args.overwrite)?;
     if !json {
         eprintln!(
@@ -570,9 +555,72 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
     )
 }
 
+/// Persist completed uploads before reporting cancellation or failure.
+fn record_build_result(
+    built: Result<BuildResult, ManifestError>,
+    record: impl FnOnce(&Manifest) -> Option<String>,
+) -> anyhow::Result<(BuildResult, Option<String>)> {
+    let result = match built {
+        Ok(result) => result,
+        Err(ManifestError::BuildFailed {
+            path,
+            cause,
+            partial,
+        }) => {
+            let history_id = record(&partial.manifest);
+            anyhow::bail!(
+                "manifest build failed at {path:?} after {} of {} file(s): {cause}{}",
+                partial.files_uploaded,
+                partial.total_to_upload,
+                partial_record_message(history_id.as_deref()),
+            );
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let history_id = record(&result.manifest);
+    if result.cancelled {
+        return Err(cancelled_build_error(&result, history_id.as_deref()));
+    }
+    Ok((result, history_id))
+}
+
 /// The output path: the one given, or `<name>.ant` in the current directory.
-fn resolve_output(name: Option<&str>, output: Option<PathBuf>) -> PathBuf {
-    output.unwrap_or_else(|| PathBuf::from(manifest_filename_for(name)))
+fn resolve_output(name: Option<&str>, output: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(name) = name {
+        ant_core::data::manifest::path::validate_component(name)
+            .map_err(ManifestError::InvalidName)?;
+    }
+    Ok(output.unwrap_or_else(|| PathBuf::from(manifest_filename_for(name))))
+}
+
+fn resolve_download_root(manifest: &Manifest, output: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    manifest.validate()?;
+    Ok(output.unwrap_or_else(|| {
+        manifest
+            .name
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }))
+}
+
+fn partial_record_message(history_id: Option<&str>) -> String {
+    history_id
+        .map(|id| format!("; the partial manifest is recorded as {id}"))
+        .unwrap_or_default()
+}
+
+fn cancelled_build_error(
+    result: &ant_core::data::BuildResult,
+    history_id: Option<&str>,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cancelled after {} of {} file(s){}",
+        result.files_uploaded,
+        result.total_to_upload,
+        partial_record_message(history_id),
+    )
 }
 
 /// Refuse up front when the output exists and may not be replaced, so no
@@ -830,13 +878,7 @@ async fn download(
     concurrency: NonZeroUsize,
     json: bool,
 ) -> anyhow::Result<()> {
-    let output_root = output.unwrap_or_else(|| {
-        manifest
-            .name
-            .clone()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
-    });
+    let output_root = resolve_download_root(manifest, output)?;
     let options = ExtractOptions {
         output_root: output_root.clone(),
         selection,
@@ -1055,6 +1097,149 @@ async fn drive_extract_progress(mut rx: mpsc::Receiver<ExtractEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostile_names_are_rejected_before_export_or_download_root_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        for name in [
+            "../outside",
+            "/tmp/outside",
+            "a/b",
+            outside.to_str().unwrap(),
+        ] {
+            let manifest = Manifest {
+                name: Some(name.into()),
+                torrent: None,
+                entries: vec![ant_core::data::ManifestEntry {
+                    path: Some("valid.bin".into()),
+                    size: None,
+                    source: ContentRef::Public { address: [1; 32] },
+                }],
+            };
+            let mut bytes = ant_core::data::manifest::MANIFEST_MAGIC.to_vec();
+            bytes.push(ant_core::data::manifest::MANIFEST_FORMAT_VERSION);
+            bytes.extend(rmp_serde::to_vec_named(&manifest).unwrap());
+            let source = dir.path().join("incoming.ant");
+            std::fs::write(&source, bytes).unwrap();
+            let action = ManifestAction::Export {
+                source: source.to_string_lossy().into_owned(),
+                // Keep any regression's writes inside the fixture; the
+                // contained absolute-name case exercises default export.
+                output: if name == outside.to_str().unwrap() {
+                    None
+                } else {
+                    Some(dir.path().join("export.ant"))
+                },
+                compact: false,
+                yes: false,
+                overwrite: false,
+                link: false,
+            };
+            assert!(action.execute_offline(false).is_err());
+            assert!(resolve_output(Some(name), None).is_err());
+            assert!(resolve_download_root(&manifest, None).is_err());
+        }
+        assert!(!outside.with_extension("ant").exists());
+
+        let valid = Manifest::new(Some("pack".into()));
+        assert_eq!(
+            resolve_output(Some("pack"), None).unwrap(),
+            PathBuf::from("pack.ant")
+        );
+        assert_eq!(
+            resolve_download_root(&valid, None).unwrap(),
+            PathBuf::from("pack")
+        );
+        let explicit = dir.path().join("chosen/destination");
+        assert_eq!(
+            resolve_output(Some("pack"), Some(explicit.clone())).unwrap(),
+            explicit
+        );
+        assert_eq!(
+            resolve_download_root(&valid, Some(explicit.clone())).unwrap(),
+            explicit
+        );
+        assert_eq!(
+            resolve_download_root(&Manifest::new(None), None).unwrap(),
+            PathBuf::from(".")
+        );
+    }
+
+    #[test]
+    fn cancellation_reports_original_upload_total_regardless_of_reference_entries() {
+        let mut result = ant_core::data::BuildResult {
+            manifest: Manifest::new(None),
+            cancelled: true,
+            skipped_symlinks: vec![],
+            files_uploaded: 1,
+            total_to_upload: 10,
+            chunks_stored: 3,
+            storage_cost_atto: 0,
+            gas_cost_wei: 0,
+        };
+        for index in 0..3 {
+            result.manifest.entries.push(ant_core::data::ManifestEntry {
+                path: Some(format!("file-{index}")),
+                size: None,
+                source: ContentRef::Public {
+                    address: [index; 32],
+                },
+            });
+            assert_eq!(
+                cancelled_build_error(&result, Some("record-id")).to_string(),
+                "cancelled after 1 of 10 file(s); the partial manifest is recorded as record-id"
+            );
+        }
+    }
+
+    #[test]
+    fn build_failure_and_cancellation_are_recorded_before_returning_an_error() {
+        let manifest = Manifest {
+            name: Some("partial".into()),
+            torrent: None,
+            entries: vec![ant_core::data::ManifestEntry {
+                path: Some("completed.bin".into()),
+                size: Some(10),
+                source: ContentRef::Public { address: [1; 32] },
+            }],
+        };
+        for cancelled in [false, true] {
+            let partial = BuildResult {
+                manifest: manifest.clone(),
+                cancelled,
+                skipped_symlinks: vec![],
+                files_uploaded: 1,
+                total_to_upload: 2,
+                chunks_stored: 3,
+                storage_cost_atto: 12,
+                gas_cost_wei: 34,
+            };
+            let built = if cancelled {
+                Ok(partial)
+            } else {
+                Err(ManifestError::BuildFailed {
+                    path: "later.bin".into(),
+                    cause: Box::new(ManifestError::Build("forced failure".into())),
+                    partial: Box::new(partial),
+                })
+            };
+            let history = tempfile::tempdir().unwrap();
+            let error = record_build_result(built, |manifest| {
+                Some(record_upload(history.path(), manifest, None).unwrap().id)
+            })
+            .unwrap_err();
+            let listing = list_uploads(history.path()).unwrap();
+            assert_eq!(listing.records.len(), 1);
+            assert_eq!(listing.records[0].manifest, manifest);
+            assert!(error.to_string().contains(&listing.records[0].id));
+            assert!(error.to_string().contains("1 of 2 file(s)"));
+            if !cancelled {
+                assert!(error.to_string().contains("later.bin"));
+                assert!(error.to_string().contains("forced failure"));
+            }
+        }
+    }
 
     #[test]
     fn public_file_spec_parses_with_and_without_path() {

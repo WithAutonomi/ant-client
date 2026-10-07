@@ -268,6 +268,19 @@ pub enum ManifestError {
     /// Building or extracting hit a filesystem or layout problem.
     #[error("{0}")]
     Build(String),
+    /// A file failed after preflight. Completed uploads remain recoverable
+    /// from `partial`, including a file whose reference resolution failed.
+    #[cfg(feature = "native")]
+    #[error("manifest build failed at {path:?}: {cause}")]
+    BuildFailed {
+        /// Manifest path being processed when the failure occurred.
+        path: String,
+        /// The underlying failure.
+        #[source]
+        cause: Box<ManifestError>,
+        /// Completed uploads and pre-existing entries.
+        partial: Box<build::BuildResult>,
+    },
     /// The caller cancelled the operation.
     #[error("operation cancelled")]
     Cancelled,
@@ -502,6 +515,32 @@ mod tests {
         );
         assert_eq!(decoded.name.as_deref(), Some("album"));
         assert_eq!(decoded.total_size(), None);
+    }
+
+    #[test]
+    fn decode_rejects_manifest_names_with_separators() {
+        for name in ["../outside", "/tmp/outside", "a/b", "a\\b"] {
+            let mut manifest = sample();
+            manifest.name = Some(name.into());
+            assert!(matches!(
+                manifest.encode(),
+                Err(ManifestError::InvalidName(_))
+            ));
+            // Bypass the writer's validation to represent hostile input,
+            // keeping every entry path valid to isolate the name defect.
+            let mut bytes = MANIFEST_MAGIC.to_vec();
+            bytes.push(MANIFEST_FORMAT_VERSION);
+            bytes.extend(rmp_serde::to_vec_named(&manifest).unwrap());
+            assert!(matches!(
+                Manifest::decode(&bytes),
+                Err(ManifestError::InvalidName(_))
+            ));
+        }
+        let bytes = sample().encode().unwrap();
+        assert_eq!(
+            Manifest::decode(&bytes).unwrap().name.as_deref(),
+            Some("album")
+        );
     }
 
     fn data_map_address(dm: &DataMap) -> [u8; 32] {

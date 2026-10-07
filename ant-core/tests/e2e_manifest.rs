@@ -13,14 +13,16 @@ use std::sync::Arc;
 
 use ant_core::data::{
     apply_compaction, embeddable_data_map, extract_manifest, manifest_link, parse_link,
-    plan_compaction, publish_data_maps, read_manifest_file, write_manifest_file, BuildOptions,
-    Client, ContentRef, EntryStatus, ExtractOptions, Link, ManifestBuilder, PaymentMode,
-    ReferenceMode, Visibility, MAX_EMBEDDED_ROOT_MAP_BYTES,
+    plan_compaction, publish_data_maps, read_manifest_file, record_upload, write_manifest_file,
+    BuildEvent, BuildOptions, Client, ContentRef, EntryStatus, ExtractOptions, Link,
+    ManifestBuilder, ManifestError, PaymentMode, ReferenceMode, Visibility,
+    MAX_EMBEDDED_ROOT_MAP_BYTES,
 };
 use self_encryption::{shrink_data_map, ChunkInfo, DataMap};
 use serial_test::serial;
 use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 use tempfile::TempDir;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use xor_name::XorName;
 
@@ -124,6 +126,7 @@ async fn manifest_round_trips_through_file_and_link() {
         .unwrap();
     let built = builder.finish(None).await.expect("build manifest");
     assert_eq!(built.files_uploaded, 3);
+    assert_eq!(built.total_to_upload, 3);
     assert_eq!(built.manifest.entries.len(), 4);
     assert!(built
         .manifest
@@ -210,6 +213,113 @@ async fn manifest_round_trips_through_file_and_link() {
         .await
         .expect("overwrite extract");
     assert_eq!(report.written(), 1);
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
+    let (client, testnet) = setup().await;
+    let source = TempDir::new().unwrap();
+
+    for remove in [false, true] {
+        let first = source.path().join("first.bin");
+        let later = source.path().join("later.bin");
+        let expected = vec![if remove { 0x92 } else { 0x91 }; FILE_BYTES];
+        fs::write(&first, &expected).unwrap();
+        fs::write(&later, vec![0x93; FILE_BYTES]).unwrap();
+
+        let mut builder = ManifestBuilder::new(&client, BuildOptions::default());
+        builder.add_file(&first, "first.bin".into()).unwrap();
+        builder.add_file(&later, "later.bin".into()).unwrap();
+        builder
+            .add_public([9; 32], Some("existing.bin".into()), None)
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let sabotage = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if matches!(event, BuildEvent::FileStarted { index: 0, .. }) {
+                    // Preflight has passed. The first file still needs real
+                    // network/payment work before the next file is read.
+                    if remove {
+                        fs::remove_file(&later).unwrap();
+                    } else {
+                        fs::write(&later, [0x01]).unwrap();
+                    }
+                }
+            }
+        });
+        let error = builder.finish(Some(tx)).await.unwrap_err();
+        sabotage.await.unwrap();
+        let ManifestError::BuildFailed {
+            path,
+            cause,
+            partial,
+        } = error
+        else {
+            panic!("expected a recoverable build failure");
+        };
+        assert_eq!(path, "later.bin");
+        if remove {
+            assert!(matches!(*cause, ManifestError::Io(_)));
+        } else {
+            assert!(matches!(*cause, ManifestError::Data(_)));
+        }
+        assert_eq!(partial.files_uploaded, 1);
+        assert_eq!(partial.total_to_upload, 2);
+        assert!(!partial.cancelled);
+        assert_eq!(partial.manifest.entries.len(), 2);
+        assert!(partial
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.path.as_deref() == Some("first.bin")));
+        assert!(!partial
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.path.as_deref() == Some("later.bin")));
+
+        let history = TempDir::new().unwrap();
+        let record = record_upload(history.path(), &partial.manifest, None).unwrap();
+        let recovered = read_manifest_file(&record.path).unwrap();
+        let out = TempDir::new().unwrap();
+        let report = extract_manifest(
+            &client,
+            &recovered,
+            &extract_options(out.path(), vec!["first.bin".into()]),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.written(), 1);
+        assert_eq!(fs::read(out.path().join("first.bin")).unwrap(), expected);
+    }
+
+    // References do not count toward the original upload total, including
+    // when cancellation happens before the first upload starts.
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let mut builder = ManifestBuilder::new(
+        &client,
+        BuildOptions {
+            cancel,
+            ..Default::default()
+        },
+    );
+    let first = source.path().join("first.bin");
+    builder.add_file(&first, "first.bin".into()).unwrap();
+    builder.add_file(&first, "second.bin".into()).unwrap();
+    builder
+        .add_public([9; 32], Some("existing.bin".into()), None)
+        .unwrap();
+    let cancelled = builder.finish(None).await.unwrap();
+    assert!(cancelled.cancelled);
+    assert_eq!(cancelled.files_uploaded, 0);
+    assert_eq!(cancelled.total_to_upload, 2);
+    assert_eq!(cancelled.manifest.entries.len(), 1);
 
     drop(client);
     testnet.teardown().await;

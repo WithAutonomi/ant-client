@@ -172,6 +172,8 @@ Decoding untrusted bytes is bounded before allocation: at most
 `MAX_MANIFEST_BYTES` (64 MiB) input, at most `MAX_MANIFEST_ENTRIES`
 (100,000) entries, and a fixed msgpack nesting depth. Exceeding any limit is
 a decode error.
+Manifest-link payload lengths are checked before base64 decoding, and the
+decode buffer uses the exact unpadded decoded length within the same limit.
 
 Encoding is deterministic: entries sorted by effective name, fields in
 declaration order, nothing time-dependent. The same tree manifested with the
@@ -207,7 +209,8 @@ A path is valid when all of the following hold:
   two are equal, and none is a directory prefix of another: `a` and `a/b`
   cannot both be entries, and neither can `A` and `a/b`.
 
-`name` obeys the single-component rules. Unnamed entries always pass.
+`name` obeys the single-component rules and cannot contain either `/` or
+`\`. Unnamed entries always pass.
 
 These rules reject some trees that are legal where they were created. That is
 the intended trade: a manifest that passes is extractable everywhere the
@@ -285,6 +288,12 @@ the name and path collisions, is checked before the first paid upload, and
 the output location is checked before it too. Cancellation stops between
 files or abandons the upload in flight and returns the partial manifest,
 which the client records in the upload history so paid uploads are not lost.
+Ordinary file failures also preserve the partial result in
+`ManifestError::BuildFailed`; the CLI records it before reporting failure.
+Each successful upload's DataMap is retained before reference optimisation,
+so a root-map resolution failure cannot discard that upload. Partial results
+carry the original number of local files to upload, excluding entries added
+by address or an existing DataMap, for accurate cancellation/error counts.
 
 Directory walks sort by path, use paths relative to the root, and record
 `size` for every uploaded file. Symlinks are skipped and reported, whether

@@ -14,7 +14,7 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
-use super::{Manifest, ManifestError, ADDRESS_LEN};
+use super::{Manifest, ManifestError, ADDRESS_LEN, MAX_MANIFEST_BYTES};
 
 #[cfg(test)]
 use super::{ContentRef, ManifestEntry};
@@ -62,9 +62,7 @@ pub fn parse_link(input: &str) -> Result<Link, ManifestError> {
         let payload = remainder.strip_prefix('/').ok_or_else(|| {
             ManifestError::Link("manifest link is missing its payload".to_string())
         })?;
-        let bytes = URL_SAFE_NO_PAD
-            .decode(payload)
-            .map_err(|e| ManifestError::Link(format!("manifest payload is not base64url: {e}")))?;
+        let bytes = decode_manifest_payload(payload, MAX_MANIFEST_BYTES)?;
         return Manifest::decode(&bytes).map(Link::Manifest);
     }
 
@@ -75,6 +73,36 @@ pub fn parse_link(input: &str) -> Result<Link, ManifestError> {
         ));
     }
     parse_address(authority).map(Link::File)
+}
+
+/// Exact decoded length for unpadded base64, checked before allocating.
+fn manifest_payload_len(encoded_len: usize, max: usize) -> Result<usize, ManifestError> {
+    let remainder = encoded_len % 4;
+    if remainder == 1 {
+        return Err(ManifestError::Link(
+            "manifest payload is not base64url: invalid unpadded length".into(),
+        ));
+    }
+    let len = (encoded_len / 4)
+        .checked_mul(3)
+        .and_then(|n| n.checked_add(remainder * 3 / 4))
+        .ok_or_else(|| ManifestError::Link("manifest payload length overflow".into()))?;
+    if len > max {
+        return Err(ManifestError::TooLarge { len, max });
+    }
+    Ok(len)
+}
+
+fn decode_manifest_payload(payload: &str, max: usize) -> Result<Vec<u8>, ManifestError> {
+    let len = manifest_payload_len(payload.len(), max)?;
+    // Engine::decode rounds its allocation up to a complete base64 group,
+    // which could exceed the limit by two bytes even for an accepted input.
+    let mut bytes = vec![0; len];
+    let written = URL_SAFE_NO_PAD
+        .decode_slice(payload, &mut bytes)
+        .map_err(|e| ManifestError::Link(format!("manifest payload is not base64url: {e}")))?;
+    bytes.truncate(written);
+    Ok(bytes)
 }
 
 /// Format a file link.
@@ -162,6 +190,50 @@ mod tests {
         match parse_link(&link).unwrap() {
             Link::Manifest(m) => assert_eq!(m, sample()),
             Link::File(_) => panic!("expected manifest"),
+        }
+    }
+
+    #[test]
+    fn payload_bound_accepts_exact_limits_and_rejects_the_next_byte() {
+        for max in 1..=6 {
+            for len in [max - 1, max, max + 1] {
+                let input = vec![0xab; len];
+                let encoded = URL_SAFE_NO_PAD.encode(&input);
+                match decode_manifest_payload(&encoded, max) {
+                    Ok(decoded) => {
+                        assert!(len <= max);
+                        assert_eq!(decoded, input);
+                    }
+                    Err(ManifestError::TooLarge {
+                        len: actual,
+                        max: limit,
+                    }) => {
+                        assert_eq!(actual, len);
+                        assert_eq!(limit, max);
+                        assert!(len > max);
+                    }
+                    result => panic!("unexpected result: {result:?}"),
+                }
+            }
+        }
+        let encoded_limit = base64::encoded_len(MAX_MANIFEST_BYTES, false).unwrap();
+        assert_eq!(
+            manifest_payload_len(encoded_limit, MAX_MANIFEST_BYTES).unwrap(),
+            MAX_MANIFEST_BYTES
+        );
+        assert!(matches!(
+            manifest_payload_len(encoded_limit + 1, MAX_MANIFEST_BYTES),
+            Err(ManifestError::TooLarge { len, .. }) if len == MAX_MANIFEST_BYTES + 1
+        ));
+        assert!(matches!(
+            manifest_payload_len(usize::MAX, MAX_MANIFEST_BYTES),
+            Err(ManifestError::TooLarge { .. })
+        ));
+        for payload in ["A", "AAAAA", "!!!", "AB", "AA="] {
+            assert!(matches!(
+                decode_manifest_payload(payload, MAX_MANIFEST_BYTES),
+                Err(ManifestError::Link(_))
+            ));
         }
     }
 

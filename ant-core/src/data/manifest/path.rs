@@ -16,7 +16,7 @@ pub const MAX_PATH_COMPONENT_BYTES: usize = 255;
 /// Longest whole path in bytes.
 pub const MAX_PATH_BYTES: usize = 1024;
 /// Characters no component may contain, over and above control characters.
-const FORBIDDEN_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*', '\\'];
+const FORBIDDEN_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*', '\\', '/'];
 /// Windows reserved device names, compared without regard to case and
 /// with any extension removed.
 const RESERVED_DEVICE_NAMES: &[&str] = &[
@@ -216,6 +216,19 @@ mod tests {
         ] {
             assert_eq!(validate_path(p), Ok(()), "{p}");
         }
+    }
+
+    #[test]
+    fn components_reject_separators_but_paths_allow_directories() {
+        for name in ["../outside", "/tmp/outside", "a/b", "a\\b"] {
+            assert!(matches!(
+                validate_component(name),
+                Err(PathError::ForbiddenChar { .. })
+            ));
+        }
+        assert_eq!(validate_component("pack"), Ok(()));
+        assert_eq!(validate_path("a/b"), Ok(()));
+        assert_eq!(portable_component("a/b").as_deref(), Some("a_b"));
     }
 
     #[test]

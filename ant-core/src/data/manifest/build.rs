@@ -19,7 +19,10 @@ use crate::data::Client;
 
 use super::embed::embeddable_data_map;
 use super::path::{check_collisions, validate_component, validate_path, PATH_SEPARATOR};
-use super::{ContentRef, Manifest, ManifestEntry, ManifestError, TorrentReference, ADDRESS_LEN};
+use super::{
+    ContentRef, Manifest, ManifestEntry, ManifestError, TorrentReference, ADDRESS_LEN,
+    MAX_MANIFEST_ENTRIES,
+};
 
 /// Capacity of the per-file upload progress channel.
 const UPLOAD_PROGRESS_CAPACITY: usize = 64;
@@ -92,8 +95,8 @@ pub enum BuildEvent {
 /// What [`ManifestBuilder::finish`] produced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildResult {
-    /// The canonical manifest. Partial when `cancelled` is set: it holds
-    /// only the files uploaded before cancellation, plus address entries.
+    /// The canonical manifest. Partial after cancellation or a file
+    /// failure: completed uploads plus entries added without uploading.
     pub manifest: Manifest,
     /// Whether the build was cancelled before every file was uploaded.
     pub cancelled: bool,
@@ -101,6 +104,10 @@ pub struct BuildResult {
     pub skipped_symlinks: Vec<PathBuf>,
     /// Files uploaded.
     pub files_uploaded: usize,
+    /// Local files originally queued for upload, excluding entries added
+    /// by address or by an existing DataMap.
+    #[serde(default)]
+    pub total_to_upload: usize,
     /// Chunks newly stored across all uploads.
     pub chunks_stored: usize,
     /// Storage paid across all uploads, in atto tokens.
@@ -242,8 +249,25 @@ impl<'a> ManifestBuilder<'a> {
     /// before the first paid upload: file sizes, the name, and collisions
     /// among all queued paths and address entries.
     fn preflight(&self) -> Result<(), ManifestError> {
+        let count = self.pending.len().saturating_add(self.entries.len());
+        if count > MAX_MANIFEST_ENTRIES {
+            return Err(ManifestError::TooManyEntries {
+                count,
+                max: MAX_MANIFEST_ENTRIES,
+            });
+        }
         if let Some(name) = &self.options.name {
             validate_component(name).map_err(ManifestError::InvalidName)?;
+        }
+        if self
+            .options
+            .torrent
+            .as_ref()
+            .is_some_and(TorrentReference::is_empty)
+        {
+            return Err(ManifestError::InvalidTorrentHash(
+                "a torrent reference needs a v1 or v2 info hash".into(),
+            ));
         }
         let mut names = Vec::with_capacity(self.pending.len() + self.entries.len());
         for file in &self.pending {
@@ -267,7 +291,9 @@ impl<'a> ManifestBuilder<'a> {
     /// Validation runs first so no upload is paid for a manifest that
     /// could not be finished. Cancellation stops before the next file, or
     /// abandons the upload in flight, and returns the partial result with
-    /// `cancelled` set so already-paid uploads are not lost.
+    /// `cancelled` set so already-paid uploads are not lost. A file failure
+    /// returns [`ManifestError::BuildFailed`] with the same partial result;
+    /// callers should persist it before reporting the error.
     pub async fn finish(
         mut self,
         progress: Option<mpsc::Sender<BuildEvent>>,
@@ -279,6 +305,7 @@ impl<'a> ManifestBuilder<'a> {
         let mut storage_cost_atto: u128 = 0;
         let mut gas_cost_wei: u128 = 0;
         let mut cancelled = false;
+        let mut failure = None;
 
         let pending = std::mem::take(&mut self.pending);
         for (index, file) in pending.into_iter().enumerate() {
@@ -286,7 +313,13 @@ impl<'a> ManifestBuilder<'a> {
                 cancelled = true;
                 break;
             }
-            let size = fs::metadata(&file.local)?.len();
+            let size = match fs::metadata(&file.local) {
+                Ok(metadata) => metadata.len(),
+                Err(error) => {
+                    failure = Some((file.path, ManifestError::Io(error)));
+                    break;
+                }
+            };
             if let Some(tx) = &progress {
                 let _ = tx
                     .send(BuildEvent::FileStarted {
@@ -325,24 +358,52 @@ impl<'a> ManifestBuilder<'a> {
                     cancelled = true;
                     break;
                 }
-                result = upload => result?,
+                result = upload => match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        failure = Some((file.path, ManifestError::Data(error)));
+                        break;
+                    }
+                },
             };
 
-            files_uploaded += 1;
-            chunks_stored += result.chunks_stored;
-            storage_cost_atto =
-                storage_cost_atto.saturating_add(parse_atto(&result.storage_cost_atto)?);
-            gas_cost_wei = gas_cost_wei.saturating_add(result.gas_cost_wei);
-
-            let source = self
-                .reference_for(&result.data_map, result.data_map_address)
-                .await?;
-            let reference = source.kind();
+            // Keep the upload's usable DataMap before any fallible cost
+            // parsing or reference optimisation. A later error must not
+            // discard the file that has just been paid for and uploaded.
             self.entries.push(ManifestEntry {
                 path: Some(file.path.clone()),
                 size: Some(size),
-                source,
+                source: ContentRef::Embedded {
+                    data_map: result.data_map.clone(),
+                    address: result.data_map_address,
+                },
             });
+            files_uploaded += 1;
+            chunks_stored += result.chunks_stored;
+            gas_cost_wei = gas_cost_wei.saturating_add(result.gas_cost_wei);
+            match parse_atto(&result.storage_cost_atto) {
+                Ok(cost) => storage_cost_atto = storage_cost_atto.saturating_add(cost),
+                Err(error) => {
+                    failure = Some((file.path, error));
+                    break;
+                }
+            }
+
+            let source = match self
+                .reference_for(&result.data_map, result.data_map_address)
+                .await
+            {
+                Ok(source) => source,
+                Err(error) => {
+                    failure = Some((file.path, error));
+                    break;
+                }
+            };
+            let reference = source.kind();
+            // The entry just appended is always present at this point.
+            if let Some(entry) = self.entries.last_mut() {
+                entry.source = source;
+            }
 
             if let Some(tx) = &progress {
                 let _ = tx
@@ -362,15 +423,24 @@ impl<'a> ManifestBuilder<'a> {
         };
         manifest.canonicalize()?;
 
-        Ok(BuildResult {
+        let result = BuildResult {
             manifest,
             cancelled,
             skipped_symlinks: self.skipped_symlinks,
             files_uploaded,
+            total_to_upload: total,
             chunks_stored,
             storage_cost_atto,
             gas_cost_wei,
-        })
+        };
+        match failure {
+            Some((path, cause)) => Err(ManifestError::BuildFailed {
+                path,
+                cause: Box::new(cause),
+                partial: Box::new(result),
+            }),
+            None => Ok(result),
+        }
     }
 
     /// Embedded mode always embeds a DataMap, even when the upload was
