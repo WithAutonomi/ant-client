@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.3.9"
+version = "0.3.10-rc.1"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.11.0"
+version = "0.12.0-rc.1"
 dependencies = [
  "alloy",
  "ant-node",
@@ -910,9 +910,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8afebae6037bc8d219f3089305cad8803bde439484aa9d00979486c5ea554271"
+version = "0.22.0-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.10.1#6211f1752cb2c99a8eb3a33ba82779b006b7fcab"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -946,6 +945,7 @@ dependencies = [
  "self_encryption",
  "semver 1.0.28",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2",
  "tar",
@@ -963,9 +963,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb1f2e060c4283457a718c094d5fd594efd1d4eeec7cc6ca3ea113df17cce382"
+version = "4.0.0-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.10.1#daca05b065fc065903e292828466663d9a4cfcac"
 dependencies = [
  "blake3",
  "bytes",
@@ -5529,9 +5528,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84923dc4955c42dfad8e06cfc34ef75b8e89d4d2fed048b18b81dc9ebadf790b"
+version = "0.29.0-rc.1"
+source = "git+https://github.com/WithAutonomi/saorsa-core?branch=rc-2026.10.1#b01ca5e19f5b14102961e2ed4821714c870a8d0e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5598,9 +5596,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.37.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "261ed20ee1ed8555594fef412b428fa20c21d2cbeebfe3f11868c7df9489a410"
+version = "0.38.0-rc.1"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?branch=rc-2026.10.1#f39e45968c976ec81d0234d6f0f133eb75413b26"
 dependencies = [
  "anyhow",
  "async-trait",
