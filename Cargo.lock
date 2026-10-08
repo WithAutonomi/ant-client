@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "alloy",
  "ant-node",
@@ -912,9 +912,9 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8afebae6037bc8d219f3089305cad8803bde439484aa9d00979486c5ea554271"
+checksum = "da674a180ffd70852738bb96d3bc494135e87ad632e0ad71b8a3945be094225d"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -948,6 +948,7 @@ dependencies = [
  "self_encryption",
  "semver 1.0.28",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2",
  "tar",
@@ -965,9 +966,9 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "3.1.0"
+version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb1f2e060c4283457a718c094d5fd594efd1d4eeec7cc6ca3ea113df17cce382"
+checksum = "c269f3a7c2e117cf444b97a8326d3583a8b016b3ce688c39ec5310bdebc367c5"
 dependencies = [
  "blake3",
  "bytes",
@@ -5531,9 +5532,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.28.0"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84923dc4955c42dfad8e06cfc34ef75b8e89d4d2fed048b18b81dc9ebadf790b"
+checksum = "efd8c6152246053fa3497fa5e5d1ddc49ec1882fe24cf1ef3e529b03562c3c6a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5600,9 +5601,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.37.0"
+version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "261ed20ee1ed8555594fef412b428fa20c21d2cbeebfe3f11868c7df9489a410"
+checksum = "f201fce78c610eda6da22ee8d9ad7a84c4a7ffe8e91b5603b6c025f53742ce73"
 dependencies = [
  "anyhow",
  "async-trait",
