@@ -13,11 +13,13 @@
 //! unless a read waits for their record, and the read budget admits speculative
 //! GETs, cancelled ones included, only within a share of its cap. Only fetches a
 //! read waited for inform the reads' adaptive concurrency, and read-ahead keeps
-//! its records out of the shared chunk cache.
+//! its records out of the shared chunk cache. Readers reading ahead the same
+//! record at the same time share one fetch.
 use super::{BrowserNetworkCore, SharedNetworkAdapter};
 use crate::client_engine::files::RecordLayout;
 use crate::client_engine::read_ahead::releasable;
 use crate::client_engine::read_budget::ReadBudget;
+use crate::client_engine::single_flight::{Flown, SingleFlight};
 use crate::data::{ChunkCache, Client, ClientConfig, Error, Network};
 use bytes::Bytes;
 use futures::future::{AbortHandle, Abortable, FutureExt, LocalBoxFuture, Shared};
@@ -121,6 +123,10 @@ pub(super) struct ReadAheadPool {
     /// Fetches records ahead of reads. Its GETs are speculative unless a read
     /// waits for their record.
     client: Client,
+    /// Fetches in flight, by record. Readers reading ahead the same record
+    /// share one fetch, so the fetch that sent the GET reports it to the reads'
+    /// adaptive limiter once.
+    fetches: SingleFlight<[u8; 32], crate::data::Result<Option<crate::data::DataChunk>>>,
     /// The client reads fetch through. Read-ahead takes records from its cache
     /// and reports the fetches a read waited for to its adaptive limiter.
     reads: Rc<Client>,
@@ -140,6 +146,7 @@ impl ReadAheadPool {
         .with_chunk_cache(ChunkCache::new(READ_AHEAD_CACHE_RECORDS));
         Rc::new(Self {
             client,
+            fetches: SingleFlight::default(),
             reads: Rc::clone(reads),
             awaited,
             budget: Arc::clone(&core.pool.read_budget),
@@ -155,14 +162,36 @@ impl ReadAheadPool {
                 return Ok(Some(content));
             }
         }
-        let epoch = self.reads.controller().fetch.observation_epoch();
-        let started = Instant::now();
-        let result = self.client.chunk_get(&address).await;
-        self.client.chunk_cache().remove(&address);
-        if self.awaited.contains(&address) {
-            self.reads
-                .observe_chunk_get(&result, started.elapsed(), epoch);
-        }
+        let mut started = None;
+        let flown = self
+            .fetches
+            .run(
+                address,
+                false,
+                || {
+                    started = Some((
+                        self.reads.controller().fetch.observation_epoch(),
+                        Instant::now(),
+                    ));
+                    self.client.chunk_get(&address)
+                },
+                |result| match result {
+                    Ok(chunk) => Ok(chunk.clone()),
+                    Err(error) => Err(error.duplicate()),
+                },
+            )
+            .await;
+        let result = match flown {
+            Flown::Led { value, .. } => {
+                self.client.chunk_cache().remove(&address);
+                if let (true, Some((epoch, started))) = (self.awaited.contains(&address), started) {
+                    self.reads
+                        .observe_chunk_get(&value, started.elapsed(), epoch);
+                }
+                value
+            }
+            Flown::Joined(value) => value,
+        };
         result.map(|chunk| chunk.map(|chunk| chunk.content))
     }
 

@@ -471,7 +471,8 @@ test("read-ahead of a misdeclared DataMap stays within its record bounds and sto
 
 test("the readers of one client share its read-ahead budget", async () => {
   // Three streaming readers each want their window and the last record, eleven
-  // records, but together hold or fetch at most 24.
+  // records, but together hold or fetch at most 24. Each reader holds its own
+  // records, while those they read ahead at the same time are fetched once.
   const { map, rtc } = misdeclaredMap();
   const client = new BrowserNetworkClient(rtc.endpoints);
   const readers = [];
@@ -484,7 +485,8 @@ test("the readers of one client share its read-ahead budget", async () => {
     const reads = readers.map(reader => assert.rejects(reader.readRange(0, 1)));
     const fetched = await watch(rtc, readers, peak) - opened;
     assert(peak.total <= maxHeld, `${peak.total} records held or in flight`);
-    assert(fetched > 11, `only ${fetched} records were read ahead`);
+    assert(peak.total > 11, `only ${peak.total} records were held or in flight`);
+    assert(fetched <= 11, `${fetched} GETs for the eleven records the readers share`);
     await Promise.all(reads);
   } finally {
     for (const reader of readers) reader.close();
