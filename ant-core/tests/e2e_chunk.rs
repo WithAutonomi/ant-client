@@ -9,7 +9,6 @@ use bytes::Bytes;
 use futures::future::join_all;
 use serial_test::serial;
 use std::sync::Arc;
-use std::time::Duration;
 use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 
 async fn setup() -> (Client, MiniTestnet) {
@@ -78,8 +77,7 @@ async fn test_concurrent_chunk_gets_share_one_fetch() {
         assert_eq!(chunk.content.as_ref(), content.as_ref());
     }
 
-    // Let any GET still on the wire, such as an unanswered hedge, arrive.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    testnet.flush_chunk_gets(client.network().node()).await;
     let sent: Vec<usize> = testnet
         .chunk_gets_received(&address)
         .iter()

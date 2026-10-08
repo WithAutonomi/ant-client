@@ -29,7 +29,7 @@ use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitme
 use ant_node::storage::{AntProtocol, ChunkStore, ChunkStoreConfig, MigrationConfig};
 // Wire / transport / EVM types: route through ant-protocol so the test
 // harness exercises the same surface the client does.
-use ant_protocol::chunk::{ChunkMessage, ChunkMessageBody};
+use ant_protocol::chunk::{ChunkGetRequest, ChunkMessage, ChunkMessageBody};
 use ant_protocol::evm::{testnet::Testnet, Network as EvmNetwork, RewardsAddress, Wallet};
 use ant_protocol::pqc::ops::{MlDsaOperations, MlDsaSecretKey};
 use ant_protocol::transport::{
@@ -587,6 +587,58 @@ impl MiniTestnet {
             .iter()
             .map(|node| node.chunk_gets.get(address))
             .collect()
+    }
+
+    /// Waits until every other running node has counted a sentinel GET sent
+    /// from `sender` after the caller's GETs. Call it before
+    /// [`Self::chunk_gets_received`] so a GET still in transit, such as an
+    /// unanswered hedge, is counted too.
+    ///
+    /// A GET's send returns once the node's QUIC stack has acknowledged the
+    /// stream, so every GET `sender` sent before this call has reached the
+    /// node before its sentinel is sent, and a node accepts one peer's
+    /// streams in the order they were opened.
+    pub async fn flush_chunk_gets(&self, sender: &P2PNode) {
+        const SENTINEL: [u8; 32] = [0xA5; 32];
+        let message = ChunkMessage {
+            request_id: u64::MAX,
+            body: ChunkMessageBody::GetRequest(ChunkGetRequest::new(SENTINEL)),
+        }
+        .encode()
+        .expect("encode sentinel GET");
+
+        let mut pending = Vec::new();
+        for node in &self.nodes {
+            let Some(p2p_node) = &node.p2p_node else {
+                continue;
+            };
+            if p2p_node.peer_id() == sender.peer_id() {
+                continue;
+            }
+            let expected = node.chunk_gets.get(&SENTINEL) + 1;
+            sender
+                .send_message(
+                    p2p_node.peer_id(),
+                    ant_protocol::CHUNK_PROTOCOL_ID,
+                    message.clone(),
+                    &p2p_node.listen_addrs().await,
+                )
+                .await
+                .expect("send sentinel GET");
+            pending.push((node, expected));
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while pending
+            .iter()
+            .any(|(node, expected)| node.chunk_gets.get(&SENTINEL) < *expected)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "nodes did not count the sentinel GET within 10s"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Count how many nodes are still running (have a P2P node).
