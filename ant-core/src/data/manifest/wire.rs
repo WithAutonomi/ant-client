@@ -135,14 +135,15 @@ pub fn serialize<S: Serializer>(data_map: &DataMap, serializer: S) -> Result<S::
 /// Deserialise a DataMap from the manifest layout.
 pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<DataMap, D::Error> {
     let DataMapIn { chunks, child } = DataMapIn::deserialize(deserializer)?;
-    if chunks.is_empty() || chunks.len() % CHUNK_RECORD_LEN != 0 {
+    let (records, remainder) = chunks.as_chunks::<CHUNK_RECORD_LEN>();
+    if records.is_empty() || !remainder.is_empty() {
         return Err(D::Error::custom(format!(
             "embedded DataMap chunks must be a non-empty multiple of {CHUNK_RECORD_LEN} bytes, got {}",
             chunks.len()
         )));
     }
-    let infos = chunks
-        .chunks_exact(CHUNK_RECORD_LEN)
+    let infos = records
+        .iter()
         .enumerate()
         .map(|(index, record)| {
             let (dst, rest) = record.split_at(HASH_LEN);
