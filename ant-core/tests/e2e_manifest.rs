@@ -1,0 +1,581 @@
+//! ADR-0006 end-to-end: build a manifest from a directory, share it as a
+//! `.ant` file and as a manifest link, and extract it against a real
+//! in-process testnet with Anvil payments.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod support;
+
+use std::fs;
+use std::num::NonZeroUsize;
+use std::path::Path;
+use std::sync::Arc;
+
+use ant_core::data::{
+    apply_compaction, data_map_address, embeddable_data_map, embedded_len, extract_manifest,
+    manifest_link, parse_link, plan_compaction, publish_data_maps, read_manifest_file,
+    record_upload, write_manifest_file, BuildEvent, BuildOptions, Client, ContentRef, EntryStatus,
+    ExtractOptions, Link, Manifest, ManifestBuilder, ManifestEntry, ManifestError, PaymentMode,
+    ReferenceMode, Visibility, MAX_EMBEDDED_ROOT_MAP_BYTES,
+};
+use self_encryption::{shrink_data_map, ChunkInfo, DataMap};
+use serial_test::serial;
+use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
+use tempfile::TempDir;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use xor_name::XorName;
+
+/// Payload size for each test file; comfortably above the self-encryption
+/// minimum and below one chunk so uploads stay quick.
+const FILE_BYTES: usize = 2048;
+/// Chunk infos in a synthetic root map small enough to embed.
+const SMALL_ROOT_CHUNKS: usize = 8;
+/// Chunk infos in a synthetic root map whose encoding exceeds the cap.
+const LARGE_ROOT_CHUNKS: usize = 2_000;
+/// A file large enough that self-encryption splits it into more than three
+/// chunks, so its upload publishes a shrunk DataMap.
+const SHRUNK_FILE_BYTES: usize = 13 * 1024 * 1024;
+
+/// A root DataMap with `chunks` synthetic infos; the hashes need not exist
+/// on the network because only the map's own encoding and shrinking matter.
+fn synthetic_root(chunks: usize, seed: u8) -> DataMap {
+    DataMap::new(
+        (0..chunks)
+            .map(|index| ChunkInfo {
+                index,
+                dst_hash: XorName([seed.wrapping_add(index as u8); 32]),
+                src_hash: XorName([seed.wrapping_mul(3).wrapping_add(index as u8); 32]),
+                src_size: FILE_BYTES,
+            })
+            .collect(),
+    )
+}
+
+/// Shrink `root` as an upload would and store its wrapper records.
+async fn shrink_and_store(client: &Client, root: DataMap) -> DataMap {
+    let (child, wrapper_chunks) = shrink_data_map(root, |_, _| Ok(())).expect("shrink");
+    assert!(child.is_child());
+    for chunk in wrapper_chunks {
+        client
+            .chunk_put(chunk.content)
+            .await
+            .expect("store wrapper record");
+    }
+    child
+}
+
+async fn setup() -> (Client, MiniTestnet) {
+    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
+    let node = testnet.node(3).expect("Node 3 should exist");
+    let client = Client::from_node(Arc::clone(&node), test_client_config())
+        .with_wallet(testnet.wallet().clone());
+    (client, testnet)
+}
+
+fn write_tree(root: &Path) {
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(root.join("a.bin"), vec![0x11u8; FILE_BYTES]).unwrap();
+    fs::write(root.join("docs/b.bin"), vec![0x22u8; FILE_BYTES]).unwrap();
+    fs::write(root.join("docs/c.bin"), vec![0x33u8; FILE_BYTES]).unwrap();
+}
+
+fn extract_options(output: &Path, selection: Vec<String>) -> ExtractOptions {
+    ExtractOptions {
+        output_root: output.to_path_buf(),
+        selection,
+        overwrite: false,
+        concurrency: NonZeroUsize::new(2).unwrap(),
+        cancel: CancellationToken::new(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn manifest_round_trips_through_file_and_link() {
+    let (client, testnet) = setup().await;
+
+    let source = TempDir::new().unwrap();
+    write_tree(source.path());
+
+    // A public file added by address, uploaded separately.
+    let extra = source.path().join("..").join("extra.bin");
+    fs::write(&extra, vec![0x44u8; FILE_BYTES]).unwrap();
+    let extra_upload = client
+        .file_upload_public_with_mode(&extra, PaymentMode::Auto)
+        .await
+        .expect("public upload");
+    let extra_address = extra_upload.data_map_address.expect("public address");
+
+    let mut builder = ManifestBuilder::new(
+        &client,
+        BuildOptions {
+            name: Some("tree".into()),
+            torrent: None,
+            reference_mode: ReferenceMode::Embedded,
+            visibility: Visibility::Private,
+            payment_mode: PaymentMode::Auto,
+            follow_symlinks: false,
+            cancel: CancellationToken::new(),
+        },
+    );
+    builder.add_directory(source.path(), None).unwrap();
+    builder
+        .add_public(
+            extra_address,
+            Some("extra/extra.bin".into()),
+            Some(FILE_BYTES as u64),
+        )
+        .unwrap();
+    let built = builder.finish(None).await.expect("build manifest");
+    assert_eq!(built.files_uploaded, 3);
+    assert_eq!(built.total_to_upload, 3);
+    assert_eq!(built.manifest.entries.len(), 4);
+    assert!(built
+        .manifest
+        .entries
+        .iter()
+        .filter(|e| e.path.as_deref() != Some("extra/extra.bin"))
+        .all(|e| matches!(e.source, ContentRef::Embedded { .. })));
+
+    // .ant file round trip.
+    let ant_path = source.path().join("..").join("tree.ant");
+    write_manifest_file(&ant_path, &built.manifest, true).unwrap();
+    let from_file = read_manifest_file(&ant_path).unwrap();
+    assert_eq!(from_file, built.manifest);
+
+    // Manifest link round trip.
+    let link = manifest_link(&built.manifest).unwrap();
+    let from_link = match parse_link(&link).unwrap() {
+        Link::Manifest(m) => m,
+        Link::File(_) => panic!("expected manifest link"),
+    };
+    assert_eq!(from_link, built.manifest);
+
+    // Full extraction.
+    let out = TempDir::new().unwrap();
+    let report = extract_manifest(
+        &client,
+        &from_link,
+        &extract_options(out.path(), vec![]),
+        None,
+    )
+    .await
+    .expect("extract");
+    assert_eq!(report.written(), 4, "{:?}", report.entries);
+    assert_eq!(report.failed(), 0);
+    assert_eq!(
+        fs::read(out.path().join("a.bin")).unwrap(),
+        vec![0x11u8; FILE_BYTES]
+    );
+    assert_eq!(
+        fs::read(out.path().join("docs/b.bin")).unwrap(),
+        vec![0x22u8; FILE_BYTES]
+    );
+    assert_eq!(
+        fs::read(out.path().join("docs/c.bin")).unwrap(),
+        vec![0x33u8; FILE_BYTES]
+    );
+    assert_eq!(
+        fs::read(out.path().join("extra/extra.bin")).unwrap(),
+        vec![0x44u8; FILE_BYTES]
+    );
+
+    // Selective extraction by directory prefix into a fresh root.
+    let partial = TempDir::new().unwrap();
+    let report = extract_manifest(
+        &client,
+        &from_file,
+        &extract_options(partial.path(), vec!["docs".into()]),
+        None,
+    )
+    .await
+    .expect("partial extract");
+    assert_eq!(report.written(), 2);
+    assert!(!partial.path().join("a.bin").exists());
+    assert!(partial.path().join("docs/b.bin").exists());
+
+    // Existing targets fail per entry without overwrite and nothing else is
+    // touched; with overwrite they are replaced.
+    let report = extract_manifest(
+        &client,
+        &from_file,
+        &extract_options(out.path(), vec![]),
+        None,
+    )
+    .await
+    .expect("second extract runs");
+    assert_eq!(report.failed(), 4);
+    assert!(report
+        .entries
+        .iter()
+        .all(|e| matches!(&e.status, EntryStatus::Failed { error } if error.contains("exists"))));
+    let mut overwrite = extract_options(out.path(), vec!["a.bin".into()]);
+    overwrite.overwrite = true;
+    let report = extract_manifest(&client, &from_file, &overwrite, None)
+        .await
+        .expect("overwrite extract");
+    assert_eq!(report.written(), 1);
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
+    let (client, testnet) = setup().await;
+    let source = TempDir::new().unwrap();
+
+    for remove in [false, true] {
+        let first = source.path().join("first.bin");
+        let later = source.path().join("later.bin");
+        let expected = vec![if remove { 0x92 } else { 0x91 }; FILE_BYTES];
+        fs::write(&first, &expected).unwrap();
+        fs::write(&later, vec![0x93; FILE_BYTES]).unwrap();
+
+        let mut builder = ManifestBuilder::new(&client, BuildOptions::default());
+        builder.add_file(&first, "first.bin".into()).unwrap();
+        builder.add_file(&later, "later.bin".into()).unwrap();
+        builder
+            .add_public([9; 32], Some("existing.bin".into()), None)
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let sabotage = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if matches!(event, BuildEvent::FileStarted { index: 0, .. }) {
+                    // Preflight has passed. The first file still needs real
+                    // network/payment work before the next file is read.
+                    if remove {
+                        fs::remove_file(&later).unwrap();
+                    } else {
+                        fs::write(&later, [0x01]).unwrap();
+                    }
+                }
+            }
+        });
+        let error = builder.finish(Some(tx)).await.unwrap_err();
+        sabotage.await.unwrap();
+        let ManifestError::BuildFailed {
+            path,
+            cause,
+            partial,
+        } = error
+        else {
+            panic!("expected a recoverable build failure");
+        };
+        assert_eq!(path, "later.bin");
+        if remove {
+            assert!(matches!(*cause, ManifestError::Io(_)));
+        } else {
+            assert!(matches!(*cause, ManifestError::Data(_)));
+        }
+        assert_eq!(partial.files_uploaded, 1);
+        assert_eq!(partial.total_to_upload, 2);
+        assert!(!partial.cancelled);
+        assert_eq!(partial.manifest.entries.len(), 2);
+        assert!(partial
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.path.as_deref() == Some("first.bin")));
+        assert!(!partial
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.path.as_deref() == Some("later.bin")));
+
+        let history = TempDir::new().unwrap();
+        let record = record_upload(history.path(), &partial.manifest, None).unwrap();
+        let recovered = read_manifest_file(&record.path).unwrap();
+        let out = TempDir::new().unwrap();
+        let report = extract_manifest(
+            &client,
+            &recovered,
+            &extract_options(out.path(), vec!["first.bin".into()]),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.written(), 1);
+        assert_eq!(fs::read(out.path().join("first.bin")).unwrap(), expected);
+    }
+
+    // References do not count toward the original upload total, including
+    // when cancellation happens before the first upload starts.
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let mut builder = ManifestBuilder::new(
+        &client,
+        BuildOptions {
+            cancel,
+            ..Default::default()
+        },
+    );
+    let first = source.path().join("first.bin");
+    builder.add_file(&first, "first.bin".into()).unwrap();
+    builder.add_file(&first, "second.bin".into()).unwrap();
+    builder
+        .add_public([9; 32], Some("existing.bin".into()), None)
+        .unwrap();
+    let cancelled = builder.finish(None).await.unwrap();
+    assert!(cancelled.cancelled);
+    assert_eq!(cancelled.files_uploaded, 0);
+    assert_eq!(cancelled.total_to_upload, 2);
+    assert_eq!(cancelled.manifest.entries.len(), 1);
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_network() {
+    let (client, testnet) = setup().await;
+
+    let source = TempDir::new().unwrap();
+    fs::write(source.path().join("private.bin"), vec![0x55u8; FILE_BYTES]).unwrap();
+    fs::write(source.path().join("public.bin"), vec![0x66u8; FILE_BYTES]).unwrap();
+
+    // Make public.bin's DataMap public ahead of time; private.bin stays
+    // private, so compact mode must embed it rather than publish it.
+    client
+        .file_upload_public_with_mode(&source.path().join("public.bin"), PaymentMode::Auto)
+        .await
+        .expect("pre-publish");
+
+    let mut builder = ManifestBuilder::new(
+        &client,
+        BuildOptions {
+            name: None,
+            torrent: None,
+            reference_mode: ReferenceMode::Compact,
+            visibility: Visibility::Private,
+            payment_mode: PaymentMode::Auto,
+            follow_symlinks: false,
+            cancel: CancellationToken::new(),
+        },
+    );
+    builder.add_directory(source.path(), None).unwrap();
+    let built = builder.finish(None).await.expect("build");
+
+    let kind_of = |name: &str| {
+        built
+            .manifest
+            .entries
+            .iter()
+            .find(|e| e.path.as_deref() == Some(name))
+            .map(|e| e.source.kind())
+            .unwrap()
+    };
+    assert_eq!(kind_of("public.bin"), "public");
+    assert_eq!(kind_of("private.bin"), "embedded");
+
+    // The default mode embeds every DataMap, even when the files are
+    // uploaded as public in the same run.
+    let mut embedded_builder = ManifestBuilder::new(
+        &client,
+        BuildOptions {
+            name: None,
+            torrent: None,
+            reference_mode: ReferenceMode::Embedded,
+            visibility: Visibility::Public,
+            payment_mode: PaymentMode::Auto,
+            follow_symlinks: false,
+            cancel: CancellationToken::new(),
+        },
+    );
+    embedded_builder.add_directory(source.path(), None).unwrap();
+    let embedded = embedded_builder.finish(None).await.expect("build embedded");
+    assert!(embedded
+        .manifest
+        .entries
+        .iter()
+        .all(|e| e.source.kind() == "embedded"));
+
+    let out = TempDir::new().unwrap();
+    let report = extract_manifest(
+        &client,
+        &built.manifest,
+        &extract_options(out.path(), vec![]),
+        None,
+    )
+    .await
+    .expect("extract");
+    assert_eq!(report.written(), 2, "{:?}", report.entries);
+    assert_eq!(
+        fs::read(out.path().join("public.bin")).unwrap(),
+        vec![0x66u8; FILE_BYTES]
+    );
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn compact_export_publishes_private_data_maps_then_replaces_them() {
+    let (client, testnet) = setup().await;
+
+    let source = TempDir::new().unwrap();
+    fs::write(source.path().join("x.bin"), vec![0x77u8; FILE_BYTES]).unwrap();
+    fs::write(source.path().join("y.bin"), vec![0x88u8; FILE_BYTES]).unwrap();
+
+    let mut builder = ManifestBuilder::new(&client, BuildOptions::default());
+    builder.add_directory(source.path(), None).unwrap();
+    let built = builder.finish(None).await.expect("build");
+    assert!(built
+        .manifest
+        .entries
+        .iter()
+        .all(|e| e.source.kind() == "embedded"));
+
+    // Nothing is public yet, so every entry needs publishing.
+    let plan = plan_compaction(&client, &built.manifest, &CancellationToken::new())
+        .await
+        .expect("plan");
+    assert!(plan.already_public.is_empty());
+    assert_eq!(plan.needs_publish.len(), 2);
+    assert!(!plan.is_free());
+
+    let stored = publish_data_maps(
+        &client,
+        &built.manifest,
+        &plan.needs_publish,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("publish");
+    assert_eq!(stored.len(), 2);
+
+    // A second plan sees them as public, and compaction is free.
+    let plan = plan_compaction(&client, &built.manifest, &CancellationToken::new())
+        .await
+        .expect("replan");
+    assert!(plan.is_free());
+    assert_eq!(plan.already_public.len(), 2);
+
+    let compacted = apply_compaction(&built.manifest, &plan.all_indices()).unwrap();
+    assert!(compacted
+        .entries
+        .iter()
+        .all(|e| e.source.kind() == "public"));
+    assert!(compacted.encode().unwrap().len() < built.manifest.encode().unwrap().len());
+
+    let out = TempDir::new().unwrap();
+    let report = extract_manifest(
+        &client,
+        &compacted,
+        &extract_options(out.path(), vec![]),
+        None,
+    )
+    .await
+    .expect("extract compacted");
+    assert_eq!(report.written(), 2, "{:?}", report.entries);
+    assert_eq!(
+        fs::read(out.path().join("y.bin")).unwrap(),
+        vec![0x88u8; FILE_BYTES]
+    );
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn embedding_uses_the_root_map_only_when_it_is_small_enough() {
+    let (client, testnet) = setup().await;
+
+    // A small file's shrunk map resolves back to its root for embedding, so a
+    // reader starts on data chunks with no wrapper-record fetches.
+    let small_root = synthetic_root(SMALL_ROOT_CHUNKS, 0x10);
+    assert!(embedded_len(&small_root).unwrap() <= MAX_EMBEDDED_ROOT_MAP_BYTES);
+    let small_child = shrink_and_store(&client, small_root.clone()).await;
+    let embedded = embeddable_data_map(&client, &small_child)
+        .await
+        .expect("resolve small");
+    assert!(!embedded.is_child());
+    assert_eq!(embedded, small_root);
+    // Embedding the root does not change the entry's identity.
+    assert_eq!(
+        data_map_address(&embedded).unwrap(),
+        data_map_address(&small_child).unwrap()
+    );
+
+    // A huge file's root exceeds the cap, so the shrunk map is embedded.
+    let large_root = synthetic_root(LARGE_ROOT_CHUNKS, 0x40);
+    assert!(embedded_len(&large_root).unwrap() > MAX_EMBEDDED_ROOT_MAP_BYTES);
+    let large_child = shrink_and_store(&client, large_root).await;
+    let embedded = embeddable_data_map(&client, &large_child)
+        .await
+        .expect("resolve large");
+    assert!(embedded.is_child());
+    assert_eq!(embedded, large_child);
+
+    // A map that is already a root is returned without any fetch.
+    let root = synthetic_root(SMALL_ROOT_CHUNKS, 0x70);
+    assert_eq!(embeddable_data_map(&client, &root).await.unwrap(), root);
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn embedded_root_identity_is_the_published_address() {
+    let (client, testnet) = setup().await;
+
+    let source = TempDir::new().unwrap();
+    let file = source.path().join("big.bin");
+    let bytes: Vec<u8> = (0..SHRUNK_FILE_BYTES).map(|i| (i % 251) as u8).collect();
+    fs::write(&file, &bytes).unwrap();
+
+    let result = client
+        .file_upload_with_visibility_and_progress(
+            &file,
+            PaymentMode::Auto,
+            Visibility::Public,
+            None,
+        )
+        .await
+        .expect("public upload");
+    let published = result.data_map_address.expect("public address");
+    assert!(result.data_map.is_child(), "the upload must shrink its map");
+
+    // The address derived locally from the root, by re-shrinking it, is the
+    // address the upload published.
+    let root = embeddable_data_map(&client, &result.data_map)
+        .await
+        .expect("resolve root");
+    assert!(!root.is_child());
+    assert_eq!(data_map_address(&root).unwrap(), published);
+    assert_eq!(data_map_address(&result.data_map).unwrap(), published);
+
+    // An entry embedding that root, as a private upload of the same bytes
+    // records it, is found already public by compaction.
+    let manifest = Manifest {
+        name: None,
+        torrent: None,
+        entries: vec![ManifestEntry {
+            path: Some("big.bin".into()),
+            size: None,
+            source: ContentRef::Embedded { data_map: root },
+        }],
+    };
+    let plan = plan_compaction(&client, &manifest, &CancellationToken::new())
+        .await
+        .expect("plan");
+    assert!(plan.is_free(), "{plan:?}");
+    assert_eq!(plan.already_public.len(), 1);
+    assert_eq!(plan.already_public[0].address, published);
+
+    // The link form carries the shrunk map and keeps the identity.
+    let link = manifest.link_form().unwrap();
+    let ContentRef::Embedded { data_map } = &link.entries[0].source else {
+        panic!("link form keeps the entry embedded");
+    };
+    assert_eq!(data_map, &result.data_map);
+
+    drop(client);
+    testnet.teardown().await;
+}

@@ -28,6 +28,8 @@ self_encryption = "0.36"
 # Portable WebRTC Direct profile shared with ant-node.
 saorsa-transport = { version = "0.37.0", default-features = false, features = ["webrtc"] }
 thiserror = "2"
+# NFC normalisation for the portable manifest path rules (ADR-0006).
+unicode-normalization = "0.1"
 url = "2"
 web-time = "1.1"
 

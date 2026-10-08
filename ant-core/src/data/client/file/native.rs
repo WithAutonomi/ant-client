@@ -2825,7 +2825,7 @@ impl Client {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn file_upload_with_visibility_and_progress(
+    pub async fn file_upload_with_visibility_and_progress(
         &self,
         path: &Path,
         mode: PaymentMode,

@@ -277,7 +277,8 @@ mod wasm {
     };
     use super::{
         chunk_infos, content_address, decrypt_public_file, encrypt_public_file, verify_record,
-        BrowserRecord, BrowserRecordInfo, BrowserStagedFile, MAX_BROWSER_FILE_BYTES,
+        BrowserLinkView, BrowserManifestView, BrowserRecord, BrowserRecordInfo, BrowserStagedFile,
+        MAX_BROWSER_FILE_BYTES,
     };
     use ant_protocol::transport::{
         run_iterative_lookup, IterativeLookup, LookupConfig, LookupKey, LookupNode, LookupQuery,
@@ -631,6 +632,36 @@ mod wasm {
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         serde_wasm_bindgen::to_value(&defaults)
             .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Decode an `ant://manifest/...` link, an `ant://<address>` file link
+    /// or a bare address (ADR-0006). A manifest comes back with its entries,
+    /// embedded DataMaps included as bytes ready for `downloadPrivateFile`;
+    /// a file link comes back as `{ kind: "file", address }`.
+    #[wasm_bindgen(js_name = parseManifestLink)]
+    pub fn parse_manifest_link_wasm(link: &str) -> Result<JsValue, JsValue> {
+        let parsed = crate::data::manifest::parse_link(link)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let view = match parsed {
+            crate::data::manifest::Link::File(address) => BrowserLinkView::File {
+                address: hex::encode(address),
+            },
+            crate::data::manifest::Link::Manifest(manifest) => BrowserLinkView::Manifest {
+                manifest: BrowserManifestView::from_manifest(&manifest)
+                    .map_err(|error| JsValue::from_str(&error.to_string()))?,
+            },
+        };
+        serde_wasm_bindgen::to_value(&view).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Decode the bytes of a `.ant` manifest file (ADR-0006).
+    #[wasm_bindgen(js_name = decodeManifest)]
+    pub fn decode_manifest_wasm(bytes: &[u8]) -> Result<JsValue, JsValue> {
+        let manifest = crate::data::manifest::Manifest::decode(bytes)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let view = BrowserManifestView::from_manifest(&manifest)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        serde_wasm_bindgen::to_value(&view).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
     /// Validate and normalize browser bootstrap and public-file metadata.
@@ -1025,5 +1056,103 @@ mod tests {
             decrypt_public_file(data_map, &records).expect("decrypt nested fixture"),
             content
         );
+    }
+}
+
+/// What a parsed `ant://` link points at, shaped for JavaScript.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum BrowserLinkView {
+    /// A public file by DataMap address (hex).
+    File {
+        /// Hex address.
+        address: String,
+    },
+    /// A manifest carried by the link.
+    Manifest {
+        /// The decoded manifest.
+        manifest: BrowserManifestView,
+    },
+}
+
+/// A manifest shaped for JavaScript: every entry carries its effective
+/// name, kind and address, and embedded entries carry the DataMap bytes a
+/// private download takes.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserManifestView {
+    /// Suggested root directory name.
+    pub name: Option<String>,
+    /// BitTorrent identity of the same files, hex encoded, when recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub torrent: Option<BrowserTorrentView>,
+    /// Entries in manifest order.
+    pub entries: Vec<BrowserManifestEntryView>,
+}
+
+/// A manifest's torrent reference shaped for JavaScript.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTorrentView {
+    /// Hex SHA-1 info hash of a v1 torrent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub info_hash_v1: Option<String>,
+    /// Hex SHA-256 info hash of a v2 or hybrid torrent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub info_hash_v2: Option<String>,
+}
+
+/// One manifest entry shaped for JavaScript.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserManifestEntryView {
+    /// Effective name: the path, or the hex content address.
+    pub name: String,
+    /// Relative path when the entry has one.
+    pub path: Option<String>,
+    /// Size hint recorded by the manifest's creator; unverified.
+    pub size: Option<u64>,
+    /// Exact plaintext size, known when the entry embeds a root DataMap.
+    pub known_size: Option<u64>,
+    /// `embedded` or `public`.
+    pub kind: &'static str,
+    /// Hex content address.
+    pub address: String,
+    /// Canonical DataMap bytes for an embedded entry.
+    #[serde(skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub data_map: Option<Vec<u8>>,
+}
+
+impl BrowserManifestView {
+    pub fn from_manifest(
+        manifest: &crate::data::manifest::Manifest,
+    ) -> Result<Self, crate::data::manifest::ManifestError> {
+        let mut entries = Vec::with_capacity(manifest.entries.len());
+        for entry in &manifest.entries {
+            let data_map = match &entry.source {
+                crate::data::manifest::ContentRef::Embedded { data_map } => Some(
+                    rmp_serde::to_vec(data_map)
+                        .map_err(|e| crate::data::manifest::ManifestError::Encode(e.to_string()))?,
+                ),
+                crate::data::manifest::ContentRef::Public { .. } => None,
+            };
+            entries.push(BrowserManifestEntryView {
+                name: entry.effective_name()?,
+                path: entry.path.clone(),
+                size: entry.size,
+                known_size: entry.known_size(),
+                kind: entry.source.kind(),
+                address: hex::encode(entry.source.content_address()?),
+                data_map,
+            });
+        }
+        Ok(Self {
+            name: manifest.name.clone(),
+            torrent: manifest.torrent.as_ref().map(|t| BrowserTorrentView {
+                info_hash_v1: t.info_hash_v1.map(hex::encode),
+                info_hash_v2: t.info_hash_v2.map(hex::encode),
+            }),
+            entries,
+        })
     }
 }

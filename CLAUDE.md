@@ -75,6 +75,17 @@ ant-core/src/
 │       ├── merkle.rs         # Merkle batch payment (PaymentMode enum)
 │       ├── pointer.rs        # pointer_create/update/get/resolve (ADR-0016)
 │       └── cache.rs          # In-memory LRU chunk cache
+│   └── manifest/             # File manifests and ant:// links (ADR-0006)
+│       ├── mod.rs            # Manifest, ManifestEntry, ContentRef, encode/decode, limits
+│       ├── path.rs           # Portable path rules (cross-platform, enforced everywhere)
+│       ├── link.rs           # ant://<address> and ant://manifest/<base64url> links
+│       ├── file.rs           # .ant file read/write
+│       ├── history.rs        # Upload history: one .ant per upload under <data dir>/uploads
+│       ├── wire.rs           # Manifest-owned DataMap layout; pre-decode structure check
+│       ├── build.rs          # ManifestBuilder (uploads files, embedded or compact refs)
+│       ├── embed.rs          # Root-vs-shrunk DataMap choice for embedding
+│       ├── compact.rs        # Plan/publish/apply compaction (embedded DataMaps -> addresses)
+│       └── extract.rs        # Containment-safe extraction with per-entry results
 └── node/                     # Node management
     ├── mod.rs                # add_nodes, remove_node, reset
     ├── types.rs              # DaemonConfig, DaemonStatus, NodeConfig, NodeInfo, AddNodeOpts, etc.
@@ -110,6 +121,7 @@ ant-cli/src/
     │   ├── file.rs           # ant file upload/download
     │   ├── chunk.rs          # ant chunk put/get
     │   ├── pointer.rs        # ant pointer keygen/address/create/update/get/resolve
+    │   ├── manifest.rs       # ant manifest create/list/show/link/export/download
     │   └── wallet.rs         # ant wallet address/balance
     └── node/
         ├── mod.rs
@@ -145,6 +157,13 @@ cargo run --bin ant -- --help  # Run the CLI
 - **Registry file locking**: Use `NodeRegistry::load_locked()` for read-modify-write operations to prevent concurrent CLI invocations from corrupting the registry. The returned `File` handle holds the lock until dropped.
 - **Dual-path CLI commands**: Commands that modify the registry (like `ant node add`) check if the daemon is running. If so, they route through the REST API; otherwise, they operate directly on the registry file.
 - **Binary source resolution**: Node binary sources are represented by the `BinarySource` enum (Latest, Version, Url, LocalPath). Download variants are stubbed until release infrastructure is available.
+- **Manifests never touch the network**: a manifest (`.ant` file or `ant://manifest/...` link)
+  is shared off-network; only the files it references live on Autonomi. `ant://<hex>` is always
+  a plain file link. Every upload (`ant file upload`, `ant manifest create`) is also recorded as
+  a manifest under `<data dir>/uploads/`; `ant manifest list` shows them and `show`/`link`/`export`/`download`
+  accept a record id. Entry paths obey the portable rules in `data/manifest/path.rs` at build,
+  decode and extract time, and extraction never follows symlinks inside the output directory.
+  See `docs/adr/ADR-0006-file-manifests-and-links.md`.
 - **Log forwarding is opt-in and node-logging-dependent**: `ant node logs forward enable` is the
   consent act. It only forwards nodes whose `NodeConfig.log_dir` is `Some` — node file logging is
   off unless the node was added with `--log-dir-path` — and reports the nodes it is skipping.
