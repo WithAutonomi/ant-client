@@ -117,6 +117,8 @@ thread_local! {
 }
 
 mod bootstrap;
+mod download;
+pub use download::BrowserFileReader;
 mod failed_payment;
 mod inbox;
 mod multiplex;
@@ -2024,14 +2026,18 @@ fn parse_lookup_key(value: &str, label: &str) -> Result<LookupKey, String> {
     })
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BrowserDownloadResult {
-    #[serde(with = "serde_bytes")]
-    content: Vec<u8>,
+    #[serde(with = "serde_wasm_bindgen::preserve")]
+    content: Uint8Array,
     hash: String,
     file: PublicFileDescriptor,
     /// Node that served a public DataMap; absent for a caller-held private DataMap.
-    #[serde(rename = "dataMapNode", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "dataMapNode",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     data_map_node: Option<BrowserNode>,
 }
 
@@ -2105,11 +2111,7 @@ struct BrowserFileReaderOptions {
 
 impl BrowserFileReaderOptions {
     fn from_js(options: Option<JsValue>) -> Result<Self, JsValue> {
-        options
-            .map(serde_wasm_bindgen::from_value)
-            .transpose()
-            .map(Option::unwrap_or_default)
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+        download::options_from_js(options).map_err(|error| JsValue::from_str(&error))
     }
 }
 
@@ -2122,10 +2124,10 @@ enum BrowserFileSource {
 }
 
 struct ResolvedBrowserFile {
+    /// Descriptor without a chunk list; `index` holds the chunk metadata.
     file: PublicFileDescriptor,
-    expected_hash: Option<String>,
     data_map_node: Option<BrowserNode>,
-    root_data_map: self_encryption::DataMap,
+    index: crate::client_engine::files::FileIndex,
 }
 
 struct UploadRecord {
@@ -2238,88 +2240,6 @@ impl RecordPlacement {
         self.file_total
             .unwrap_or_default()
             .max(self.offset + batch_total)
-    }
-}
-
-/// Random-access public-file reader for media playback and bounded downloads.
-#[wasm_bindgen(js_name = BrowserFileReader)]
-pub struct BrowserFileReader {
-    shared: Rc<crate::data::Client>,
-    file: PublicFileDescriptor,
-    root_data_map: self_encryption::DataMap,
-    read_ahead: Rc<read_ahead::ReadAhead>,
-    closed: Cell<bool>,
-}
-
-#[wasm_bindgen(js_class = BrowserFileReader)]
-impl BrowserFileReader {
-    /// Plaintext file size in bytes.
-    #[wasm_bindgen(getter)]
-    pub fn size(&self) -> usize {
-        self.file.size
-    }
-
-    /// Browser MIME type advertised by the file descriptor.
-    #[wasm_bindgen(getter, js_name = contentType)]
-    pub fn content_type(&self) -> String {
-        self.file.content_type.clone()
-    }
-
-    /// Display filename advertised by the file descriptor.
-    #[wasm_bindgen(getter)]
-    pub fn name(&self) -> String {
-        self.file.name.clone()
-    }
-
-    /// Fetch and decrypt one plaintext byte range without reconstructing the file.
-    #[wasm_bindgen(js_name = readRange)]
-    pub async fn read_range(&self, start: usize, length: usize) -> Result<Uint8Array, JsValue> {
-        let content = self
-            .read_range_inner(start, length)
-            .await
-            .map_err(|error| JsValue::from_str(&error))?;
-        Ok(Uint8Array::from(content.as_slice()))
-    }
-
-    /// Release cached encrypted records held for playback read-ahead and seeks.
-    pub fn close(&self) {
-        self.closed.set(true);
-        self.read_ahead.close();
-        self.shared.chunk_cache().clear();
-    }
-}
-
-impl Drop for BrowserFileReader {
-    fn drop(&mut self) {
-        self.read_ahead.close();
-    }
-}
-
-impl BrowserFileReader {
-    async fn read_range_inner(&self, start: usize, length: usize) -> Result<Vec<u8>, String> {
-        if self.closed.get() {
-            return Err("browser file reader is closed".to_string());
-        }
-        if length > MAX_BROWSER_RANGE_BYTES {
-            return Err(format!(
-                "browser range reads are limited to {MAX_BROWSER_RANGE_BYTES} bytes"
-            ));
-        }
-        let lease = self.read_ahead.begin_read(start, length);
-        let bytes = self
-            .shared
-            .data_download_range_with(&self.root_data_map, start, length, |address| {
-                lease.record(address)
-            })
-            .await;
-        if matches!(bytes, Err(crate::data::Error::Encryption(_))) {
-            // The records do not decrypt as the DataMap declares, so reading
-            // further ahead would only spend bandwidth and memory.
-            self.read_ahead.close();
-        }
-        bytes
-            .map(|bytes| bytes.to_vec())
-            .map_err(|error| error.to_string())
     }
 }
 
@@ -2483,32 +2403,49 @@ impl BrowserNetworkClient {
         serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
-    /// Download and reconstruct a complete public Autonomi file.
+    /// Download a public file into one JavaScript Uint8Array, using bounded
+    /// WASM buffers. `options` is `{ maxMemoryBytes?, signal? }`: the largest
+    /// output buffer to allocate, and an AbortSignal that cancels the download.
+    /// For disk-backed downloads use openPublicFile and reader.pipeTo(writable).
     #[wasm_bindgen(js_name = downloadPublicFile)]
     pub async fn download_public_file(
         &self,
         file: JsValue,
         concurrency: Option<usize>,
         on_progress: Option<js_sys::Function>,
+        options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
         let file: BrowserPublicFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        self.download_file(BrowserFileSource::Public(file), concurrency, on_progress)
-            .await
+        self.download_file(
+            BrowserFileSource::Public(file),
+            concurrency,
+            on_progress,
+            options,
+        )
+        .await
     }
 
-    /// Download and reconstruct a private file from the DataMap its uploader kept.
+    /// Download a private file into one JavaScript Uint8Array. Takes the same
+    /// arguments as downloadPublicFile; openPrivateFile and pipeTo support
+    /// files that cannot fit in one JavaScript buffer.
     #[wasm_bindgen(js_name = downloadPrivateFile)]
     pub async fn download_private_file(
         &self,
         file: JsValue,
         concurrency: Option<usize>,
         on_progress: Option<js_sys::Function>,
+        options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
         let file: BrowserPrivateFileInput = serde_wasm_bindgen::from_value(file)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        self.download_file(BrowserFileSource::Private(file), concurrency, on_progress)
-            .await
+        self.download_file(
+            BrowserFileSource::Private(file),
+            concurrency,
+            on_progress,
+            options,
+        )
+        .await
     }
 
     /// Resolve and validate a public file for random-access range reads.
@@ -2729,12 +2666,11 @@ impl BrowserNetworkClient {
         source: BrowserFileSource,
         concurrency: Option<usize>,
         on_progress: Option<js_sys::Function>,
+        options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
-        let progress = ProgressReporter::from_js(on_progress);
-        let result = self
-            .download_file_inner(source, concurrency.unwrap_or(usize::MAX), &progress)
-            .await
+        let settings = download::DownloadSettings::new(concurrency, on_progress, options)
             .map_err(|error| JsValue::from_str(&error))?;
+        let result = self.download_file_inner(source, settings).await?;
         serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
@@ -2745,69 +2681,45 @@ impl BrowserNetworkClient {
         options: BrowserFileReaderOptions,
     ) -> Result<BrowserFileReader, String> {
         let resolved = self.resolve_file(source, &progress).await?;
-        let file = resolved.file;
         progress.report(&format!(
             "Ready to stream {} ({} bytes, {} chunks)",
-            file.name,
-            file.size,
-            file.chunks.len()
+            resolved.file.name,
+            resolved.file.size,
+            resolved.index.chunk_count()
         ));
-        let read_ahead = read_ahead::ReadAhead::new(
+        Ok(BrowserFileReader::new(
+            Rc::clone(&self.shared),
+            resolved,
             &self.read_ahead,
-            &resolved.root_data_map,
             options.streaming,
-        );
-        Ok(BrowserFileReader {
-            shared: Rc::clone(&self.shared),
-            file,
-            root_data_map: resolved.root_data_map,
-            read_ahead,
-            closed: Cell::new(false),
-        })
+        ))
     }
 
+    /// Errors are JavaScript values so an AbortSignal's reason reaches the caller.
     async fn download_file_inner(
         &self,
         source: BrowserFileSource,
-        concurrency: usize,
-        progress: &ProgressReporter,
-    ) -> Result<BrowserDownloadResult, String> {
-        if concurrency == 0 {
-            return Err("download concurrency must be a positive integer".to_string());
-        }
-        let mut resolved = self.resolve_file(source, progress).await?;
-        let content = self
-            .shared
-            .data_download_with_progress(
-                &resolved.root_data_map,
-                concurrency,
-                &|completed, total| {
-                    progress.report(&format!("Downloaded chunk {completed}/{total}"));
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?
-            .to_vec();
-        if content.len() != resolved.file.size {
-            return Err(format!(
-                "reconstructed file has {} bytes, expected {}",
-                content.len(),
-                resolved.file.size
-            ));
-        }
-        let hash = hex::encode(blake3::hash(&content).as_bytes());
-        if let Some(expected_hash) = resolved.expected_hash.as_ref() {
-            super::verify_record(expected_hash, &content).map_err(|error| error.to_string())?;
-        }
-        resolved.file.blake3 = hash.clone();
-        progress.report(&format!(
-            "Verified complete {} as {hash}",
-            resolved.file.name
-        ));
+        settings: download::DownloadSettings,
+    ) -> Result<BrowserDownloadResult, JsValue> {
+        // Validates the signal before any network work, and covers resolution.
+        let mut cancel = download::Cancellation::new(settings.signal.clone())?;
+        let resolved = cancel
+            .run(async {
+                self.resolve_file(source, &settings.progress)
+                    .await
+                    .map_err(|error| JsValue::from_str(&error))
+            })
+            .await?;
+        let (content, hash) =
+            download::collect(&self.shared, &resolved.index, &settings, &mut cancel).await?;
+        let file = download::completed_descriptor(resolved.file, &resolved.index, hash.clone());
+        settings
+            .progress
+            .report(&format!("Verified complete {} as {hash}", file.name));
         Ok(BrowserDownloadResult {
             content,
             hash,
-            file: resolved.file,
+            file,
             data_map_node: resolved.data_map_node,
         })
     }
@@ -2910,32 +2822,20 @@ impl BrowserNetworkClient {
         .await
         .map_err(|error| error.to_string())?;
 
-        let mut actual_chunks = super::chunk_infos(&root_data_map);
-        actual_chunks.sort_by_key(|chunk| chunk.index);
-        if actual_chunks.len() < 3 {
-            return Err("ant-core returned an invalid public DataMap".to_string());
-        }
-        let resolved_size = actual_chunks.iter().try_fold(0usize, |total, chunk| {
-            total
-                .checked_add(chunk.src_size)
-                .ok_or_else(|| "resolved public file size overflow".to_string())
-        })?;
-        if !(self_encryption::MIN_ENCRYPTABLE_BYTES..=super::MAX_BROWSER_FILE_BYTES)
-            .contains(&resolved_size)
-        {
-            return Err(format!("invalid public file size {resolved_size}"));
+        let index = crate::client_engine::files::FileIndex::new(&root_data_map)?;
+        if index.size() > super::manifest::MAX_SAFE_JS_INTEGER {
+            return Err("file size exceeds JavaScript's exact integer range".into());
         }
 
-        file.size = resolved_size;
-        file.chunks = actual_chunks;
+        file.size = index.size();
+        file.chunks = Vec::new(); // Listed from the index once the file is read.
         file.data_map_size = encoded_data_map.len();
         file.blake3.clear(); // Computed when plaintext is read; not a second content identity.
         file.content_type = normalized_content_type(&file.content_type);
         Ok(ResolvedBrowserFile {
             file,
-            expected_hash: None,
             data_map_node: None,
-            root_data_map,
+            index,
         })
     }
 
@@ -2977,7 +2877,7 @@ impl BrowserNetworkClient {
         let descriptor = PublicFileDescriptor {
             name: name.to_string(),
             address: encrypted.address,
-            size: content.len(),
+            size: content.len() as u64,
             content_type: normalized_content_type(content_type),
             blake3: encrypted.blake3,
             data_map_size: encrypted.data_map_size,
@@ -3076,7 +2976,7 @@ impl BrowserNetworkClient {
         let descriptor = PublicFileDescriptor {
             name: staged.name,
             address: staged.address,
-            size: staged.size,
+            size: staged.size as u64,
             content_type: staged.content_type,
             blake3: staged.blake3,
             data_map_size: staged.data_map_size,

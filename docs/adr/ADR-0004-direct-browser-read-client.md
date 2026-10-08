@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-09-25
+- **Last amended:** 2026-10-01
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -655,3 +655,83 @@ in flight through the shared chunk cache. The bounded read-ahead described under
 streaming reads keeps at most five, so repeat the playback comparison of six and
 ten on it. The method, raw results and scripts are in
 `docs/investigations/2026-09-29-browser-lookup-alpha`.
+
+## Large-file download destinations (2026-10-01)
+
+Related: [V2-1398](https://linear.app/autonominetwork/issue/V2-1398).
+
+The browser download limit is independent of upload limits. Root-map file sizes,
+seek-index offsets, and shared range arithmetic use `u64`; only chunk indices and
+individual buffer lengths use `usize`. The JavaScript facade accepts nonnegative
+safe-integer numbers, rejecting fractional, overflowing and imprecise positions.
+Manifest validation no longer rejects files over 1 GB; it caps a file's chunk
+list at 262,144 entries (about 1 TiB at the native chunk size) to bound the
+sorting and normalisation of an untrusted entry.
+
+A reader retains a validated root-map index and uses binary searches to identify
+overlapping chunks. Decryption delegates to `self_encryption::decrypt_chunk`
+with the original indices and neighbouring source hashes. This avoids the
+dependency's pointer-sized whole-file range arithmetic without changing its KDF,
+DataMap representation or stored ciphertext. Encrypted records and reconstructed
+plaintext chunks are verified against their respective hashes and sizes. The
+reader validates its index when it opens, so a DataMap whose range reads reject,
+such as one with non-contiguous indices, fails to open rather than opening with
+read-ahead off as described under streaming reads. Read-ahead plans its windows
+over the same 64-bit index, so it follows reads past 4 GiB on wasm32.
+
+Complete downloads and `BrowserFileReader.pipeTo` share one transfer: chunks are
+fetched concurrently within the client's adaptive fetch cap (and a complete
+download's `concurrency` argument), each retried on the deferred schedule on its
+own, and handed on in file order. Fetching continues while the consumer works,
+holding at most 32 MiB of plaintext; a record waiting to retry keeps its place
+under the cap. A complete download copies each chunk into one JavaScript
+`Uint8Array` allocated up front, hashes it in order and keeps the
+`Downloaded chunk n/total` progress. Its optional `maxMemoryBytes` limits that
+allocation; allocation failure rejects before file-content transfer and directs
+the caller to streaming. Automatic free-memory detection and implicit disk spill
+are not portable browser capabilities; applications own the memory budget and
+the choice of a storage destination.
+
+`pipeTo(writable, { start?, end?, signal?, onProgress? })` writes the whole file
+or a half-open range to a caller-owned `WritableStream`, at most 4 MiB per write,
+awaiting each write. Like `ReadableStream.pipeTo`, it rejects invalid calls
+without touching the destination, closes the destination on success, aborts it
+on failure without waiting for a stalled write, and releases the writer lock.
+An abort while the destination is closing still rejects, but per the Streams
+specification the close completes, so the destination may already be committed.
+An `AbortSignal` cancels a `pipeTo` or a complete download, including resolution
+and retry waits. Closing a reader releases its read-ahead records and makes
+later calls fail; it no longer clears the client's shared, bounded chunk cache,
+which other readers may be using. The core does not open file pickers, own
+browser filesystem policy, or change the companion SDK.
+
+Removing only the 1 GB check was rejected because wasm32 offsets would still
+truncate around 4 GiB. Whole-file WASM buffering was rejected because it couples
+supported file size to linear-memory capacity. Disk-only output was rejected
+because small files and consumers needing bytes can use JavaScript memory.
+Bounding decompression of crafted records was left to a bounded
+`decrypt_chunk` in self_encryption: the risk predates this change and also
+affects native downloads.
+
+This changes the public Rust browser descriptor's `size` from `usize` to `u64`
+and Rust signatures of affected WASM exports. `readRange` now rejects fractional,
+negative, missing and imprecise arguments that wasm-bindgen previously coerced.
+The download options object and `pipeTo` are additive. Native
+`data_download_range` keeps its signature. Wire, storage, payment and node
+behavior are unchanged. Upload size limits are unchanged.
+
+Content-buffer memory is bounded, but root-map/index memory still grows with the
+number of chunks. Streaming also depends on destination capacity; in-memory
+output depends on the engine's typed-array limits. The JavaScript facade supports
+positions through `Number.MAX_SAFE_INTEGER`, just under 8 PiB, rather than
+claiming literally unlimited file sizes.
+
+Validation includes a complete 4,303,347,835-byte native-encrypted fixture streamed
+through generated WASM with a matching BLAKE3; public/private seeks beyond 4 GiB;
+disk output; fetching bounded behind a blocked write; `AbortSignal` cancellation
+during retries, stalled writes and the destination's close; invalid calls that
+leave the destination untouched; writer, allocation and output errors; memory
+budgets; manifest validation; and native index, range and retry tests. The
+generated WASM tests use mocked WebRTC hosts with real Rust protocol and crypto
+processing. They do not establish real-browser or live-network compatibility by
+themselves.

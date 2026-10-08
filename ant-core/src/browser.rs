@@ -27,14 +27,16 @@ pub use protocol::{
 mod wasm_transport;
 
 use bytes::Bytes;
-use self_encryption::{DataMap, EncryptedChunk};
+use self_encryption::{ChunkInfo, DataMap, EncryptedChunk};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-/// Maximum file size accepted by the browser API (1 GB decimal).
+/// Maximum file size accepted by the browser upload API (1 GB decimal).
 ///
-/// The page upload path streams through a worker and browser storage. Complete
-/// downloads and the legacy whole-buffer encryption binding remain memory-bound.
+/// The page upload path streams through a worker and browser storage; the
+/// legacy encryption binding remains memory-bound. Downloads are not limited by
+/// this constant: a complete download needs one buffer of the file's size,
+/// while `pipeTo` and range reads hold a bounded amount of plaintext.
 pub const MAX_BROWSER_FILE_BYTES: usize = 1_000_000_000;
 
 /// One native self-encryption chunk descriptor exposed to the browser.
@@ -255,16 +257,16 @@ pub fn decrypt_public_file(
 }
 
 fn chunk_infos(data_map: &DataMap) -> Vec<BrowserChunkInfo> {
-    data_map
-        .infos()
-        .iter()
-        .map(|info| BrowserChunkInfo {
-            index: info.index,
-            dst_hash: hex::encode(info.dst_hash.0),
-            src_hash: hex::encode(info.src_hash.0),
-            src_size: info.src_size,
-        })
-        .collect()
+    data_map.infos().iter().map(browser_chunk_info).collect()
+}
+
+fn browser_chunk_info(info: &ChunkInfo) -> BrowserChunkInfo {
+    BrowserChunkInfo {
+        index: info.index,
+        dst_hash: hex::encode(info.dst_hash.0),
+        src_hash: hex::encode(info.src_hash.0),
+        src_size: info.src_size,
+    }
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "browser-wasm"))]

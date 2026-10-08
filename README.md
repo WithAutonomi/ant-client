@@ -35,6 +35,50 @@ transports use `record.rs` for BLAKE3 verification. Native
 `Client::data_download_range` and the browser media reader call the same range
 implementation.
 
+Browser downloads and range reads have no 1 GB file cap. File sizes and offsets
+use 64-bit arithmetic internally; the JavaScript API accepts exact, nonnegative
+`number` positions through `Number.MAX_SAFE_INTEGER` (just under 8 PiB). The
+resolved DataMap and seek index still occupy memory proportional to the number
+of chunks; content buffers stay bounded, including for seeks past 4 GiB.
+Uploads retain their existing size limits.
+
+`downloadPublicFile(file, concurrency?, onProgress?, { maxMemoryBytes?, signal? })`
+and its private-file counterpart allocate the output as one JavaScript
+`Uint8Array` and copy each decrypted chunk into it, holding at most 32 MiB of
+plaintext in WASM. Progress is reported as `Downloaded chunk n/total`, and an
+`AbortSignal` cancels the download. `maxMemoryBytes` limits the output buffer,
+not total process memory; without it, allocation is attempted up to the
+JavaScript engine's buffer limit. Allocation errors reject with guidance to use
+streaming, since browsers do not expose a reliable amount of free memory.
+
+For large downloads, pass a `WritableStream` to `BrowserFileReader.pipeTo`.
+For example, after the application obtains a file handle from a user gesture:
+
+```js
+const reader = await client.openPublicFile(address);
+try {
+  const writable = await fileHandle.createWritable();
+  const { bytesWritten, hash } = await reader.pipeTo(writable);
+} finally {
+  reader.close();
+}
+```
+
+The same API works with `openPrivateFile({ data_map })`. `pipeTo(writable,
+{ start?, end?, signal?, onProgress? })` optionally streams a half-open byte
+range and reports `(bytesWritten, totalBytes)` after each write. Chunks are
+fetched concurrently and written in order, at most 4 MiB per write; fetching
+continues during writes until 32 MiB of plaintext is held. Invalid calls reject
+without touching the destination; otherwise the destination is closed on
+success, aborted on failure (an abort during its close may come too late to
+undo the commit), and its writer lock released. The result contains
+the byte count and BLAKE3 of the written range, and an `AbortSignal` cancels
+the call. `reader.close()` releases the records read-ahead holds and makes later
+calls fail. `readRange(start, length)` remains available for media and custom
+sinks, with a 4 MiB per-call limit. The application chooses a memory budget and
+supplies its disk destination; the core does not open file pickers or silently
+select a path.
+
 The adapters supply QUIC or WebRTC discovery/GET requests, runtime timers,
 caches, progress callbacks, and output handling. Browser descriptors and wallet
 callbacks remain browser API concerns. Native filesystem streaming still uses
