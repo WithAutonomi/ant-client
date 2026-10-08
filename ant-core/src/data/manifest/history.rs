@@ -5,6 +5,9 @@
 //! example `20261006T140311Z-holiday-photos.ant`. The filename stem is the
 //! record's id. The timestamp is UTC in a compact form that is safe on every
 //! filesystem, and the label is the upload's name reduced to safe characters.
+//! When an id is already taken, which happens when uploads with the same label
+//! finish within one second, `-2`, `-3` and so on are appended. Records list
+//! newest first, and within one second by that suffix compared as a number.
 //! Nothing else is stored, so the history directory is just a folder of
 //! manifests that any manifest tool can read.
 
@@ -36,6 +39,9 @@ const ID_SEPARATOR: char = '-';
 const TIMESTAMP_LEN: usize = 16;
 /// Attempts to find a free id when several uploads share a second.
 const MAX_ID_ATTEMPTS: u32 = 1000;
+/// Sequence number of an id without a collision suffix; the first suffix
+/// written is `-2`.
+const FIRST_ID_SEQUENCE: u32 = 1;
 const SECS_PER_MINUTE: u64 = 60;
 const SECS_PER_HOUR: u64 = 60 * SECS_PER_MINUTE;
 const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
@@ -162,9 +168,23 @@ pub fn list_uploads(dir: &Path) -> Result<UploadListing, ManifestError> {
     listing.records.sort_by(|a, b| {
         b.recorded_at
             .cmp(&a.recorded_at)
-            .then_with(|| b.id.cmp(&a.id))
+            .then_with(|| id_sort_key(&b.id).cmp(&id_sort_key(&a.id)))
     });
     Ok(listing)
+}
+
+/// An id split into its base and collision suffix, so `-10` sorts after
+/// `-2`. An id without a numeric suffix is the first of its base.
+fn id_sort_key(id: &str) -> (&str, u32) {
+    id.rsplit_once(ID_SEPARATOR)
+        .and_then(|(base, suffix)| {
+            let all_digits = !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit());
+            all_digits
+                .then(|| suffix.parse().ok())
+                .flatten()
+                .map(|n| (base, n))
+        })
+        .unwrap_or((id, FIRST_ID_SEQUENCE))
 }
 
 /// Load the record with `id` from `dir`, or `None` when there is none.
@@ -370,6 +390,27 @@ mod tests {
     }
 
     #[test]
+    fn collision_suffixes_sort_numerically() {
+        let base = "20261006T140311Z-photo";
+        let mut ids = vec![
+            base.to_string(),
+            format!("{base}-2"),
+            format!("{base}-10"),
+            format!("{base}-3"),
+        ];
+        ids.sort_by(|a, b| id_sort_key(b).cmp(&id_sort_key(a)));
+        assert_eq!(
+            ids,
+            vec![
+                format!("{base}-10"),
+                format!("{base}-3"),
+                format!("{base}-2"),
+                base.to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn record_list_and_load() {
         let dir = tempfile::tempdir().unwrap();
         let history = dir.path().join("uploads");
@@ -386,6 +427,12 @@ mod tests {
         let listing = list_uploads(&history).unwrap();
         assert_eq!(listing.records.len(), 3);
         assert!(listing.unreadable.is_empty());
+        if second.recorded_at == third.recorded_at {
+            let ids: Vec<_> = listing.records.iter().map(|r| r.id.as_str()).collect();
+            let second_pos = ids.iter().position(|id| *id == second.id).unwrap();
+            let third_pos = ids.iter().position(|id| *id == third.id).unwrap();
+            assert!(third_pos < second_pos, "newer collision suffix lists first");
+        }
         assert!(listing
             .records
             .windows(2)

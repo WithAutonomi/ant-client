@@ -18,6 +18,10 @@ use super::{Manifest, ManifestError, ADDRESS_LEN, MAX_MANIFEST_BYTES};
 
 #[cfg(test)]
 use super::{ContentRef, ManifestEntry};
+#[cfg(test)]
+use self_encryption::{ChunkInfo, DataMap};
+#[cfg(test)]
+use xor_name::XorName;
 
 /// Scheme prefix of every link.
 pub const LINK_SCHEME: &str = "ant://";
@@ -110,12 +114,19 @@ pub fn file_link(address: &[u8; ADDRESS_LEN]) -> String {
     format!("{LINK_SCHEME}{}", hex::encode(address))
 }
 
-/// Format a manifest link, encoding the manifest.
+/// Format a manifest link, encoding the manifest's link form.
 pub fn manifest_link(manifest: &Manifest) -> Result<String, ManifestError> {
-    Ok(manifest_link_from_bytes(&manifest.encode()?))
+    Ok(manifest_link_from_bytes(&manifest_link_bytes(manifest)?))
 }
 
-/// Format a manifest link from already-encoded `.ant` bytes.
+/// The `.ant` bytes a manifest link carries: the encoding of
+/// [`Manifest::link_form`], with every embedded DataMap in its published
+/// (shrunk) form.
+pub fn manifest_link_bytes(manifest: &Manifest) -> Result<Vec<u8>, ManifestError> {
+    manifest.link_form()?.encode()
+}
+
+/// Format a manifest link from already-encoded `.ant` bytes, as given.
 pub fn manifest_link_from_bytes(bytes: &[u8]) -> String {
     format!("{MANIFEST_LINK_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
 }
@@ -181,6 +192,38 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn manifest_link_carries_the_link_form() {
+        let root = DataMap::new(
+            (0..8u8)
+                .map(|i| ChunkInfo {
+                    index: usize::from(i),
+                    dst_hash: XorName([i; 32]),
+                    src_hash: XorName([i.wrapping_add(50); 32]),
+                    src_size: 1_000,
+                })
+                .collect(),
+        );
+        let mut manifest = sample();
+        manifest.entries.push(ManifestEntry {
+            path: Some("big".into()),
+            size: None,
+            source: ContentRef::Embedded { data_map: root },
+        });
+        let link = manifest_link(&manifest).unwrap();
+        let Link::Manifest(decoded) = parse_link(&link).unwrap() else {
+            panic!("expected manifest");
+        };
+        let mut expected = manifest.link_form().unwrap();
+        expected.canonicalize().unwrap();
+        assert_eq!(decoded, expected);
+        assert_ne!(decoded, {
+            let mut full = manifest.clone();
+            full.canonicalize().unwrap();
+            full
+        });
     }
 
     #[test]

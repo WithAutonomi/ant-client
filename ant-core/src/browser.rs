@@ -1110,8 +1110,10 @@ pub struct BrowserManifestEntryView {
     pub name: String,
     /// Relative path when the entry has one.
     pub path: Option<String>,
-    /// Recorded size hint.
+    /// Size hint recorded by the manifest's creator; unverified.
     pub size: Option<u64>,
+    /// Exact plaintext size, known when the entry embeds a root DataMap.
+    pub known_size: Option<u64>,
     /// `embedded` or `public`.
     pub kind: &'static str,
     /// Hex content address.
@@ -1128,7 +1130,7 @@ impl BrowserManifestView {
         let mut entries = Vec::with_capacity(manifest.entries.len());
         for entry in &manifest.entries {
             let data_map = match &entry.source {
-                crate::data::manifest::ContentRef::Embedded { data_map, .. } => Some(
+                crate::data::manifest::ContentRef::Embedded { data_map } => Some(
                     rmp_serde::to_vec(data_map)
                         .map_err(|e| crate::data::manifest::ManifestError::Encode(e.to_string()))?,
                 ),
@@ -1138,6 +1140,7 @@ impl BrowserManifestView {
                 name: entry.effective_name()?,
                 path: entry.path.clone(),
                 size: entry.size,
+                known_size: entry.known_size(),
                 kind: entry.source.kind(),
                 address: hex::encode(entry.source.content_address()?),
                 data_map,

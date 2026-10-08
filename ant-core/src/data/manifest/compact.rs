@@ -4,6 +4,12 @@
 //! network. Planning finds out which entries already are and which would
 //! have to be published first. Publishing is a separate, paid step the
 //! caller must opt into, because it makes those files public.
+//!
+//! Every address here is derived from the embedded DataMap itself
+//! ([`ContentRef::content_address`]); nothing a manifest's author wrote can
+//! point compaction at other content. Publishing stores the DataMap's
+//! published (shrunk) form, the same chunk a public upload of the file
+//! stores, so a file has one public identity however it was uploaded.
 
 use std::collections::BTreeSet;
 
@@ -13,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::data::Client;
 
-use super::{ContentRef, Manifest, ManifestError, ADDRESS_LEN};
+use super::{published_data_map, ContentRef, Manifest, ManifestError, ADDRESS_LEN};
 
 #[cfg(test)]
 use super::ManifestEntry;
@@ -103,16 +109,22 @@ pub async fn plan_compaction(
     Ok(plan)
 }
 
-/// Store the DataMap chunk of each entry in `entries`. Paid; makes those
-/// files public. Returns the addresses stored, in the same order.
-/// Cancellation is honoured between stores, never in the middle of one.
+/// Store the published DataMap chunk of each entry in `entries`. Paid;
+/// makes those files public. Returns the addresses stored, in the same
+/// order.
+///
+/// Before anything is paid for, every entry is checked: it must be embedded,
+/// its published map must hash to the planned address, and when that map
+/// is shrunk, the wrapper records it points at must be on the network, or
+/// the published chunk would not resolve. Cancellation is honoured between
+/// stores, never in the middle of one.
 pub async fn publish_data_maps(
     client: &Client,
     manifest: &Manifest,
     entries: &[EmbeddedEntry],
     cancel: &CancellationToken,
 ) -> Result<Vec<[u8; ADDRESS_LEN]>, ManifestError> {
-    let mut stored = Vec::with_capacity(entries.len());
+    let mut to_store = Vec::with_capacity(entries.len());
     for embedded in entries {
         if cancel.is_cancelled() {
             return Err(ManifestError::Cancelled);
@@ -120,13 +132,39 @@ pub async fn publish_data_maps(
         let entry = manifest.entries.get(embedded.index).ok_or_else(|| {
             ManifestError::Build(format!("entry {} is out of range", embedded.index))
         })?;
-        let ContentRef::Embedded { data_map, .. } = &entry.source else {
+        if entry.source.content_address()? != embedded.address {
+            return Err(ManifestError::Build(format!(
+                "entry {} does not match the compaction plan",
+                embedded.name
+            )));
+        }
+        let ContentRef::Embedded { data_map } = &entry.source else {
             return Err(ManifestError::Build(format!(
                 "entry {} is not embedded",
                 embedded.name
             )));
         };
-        let address = client.data_map_store(data_map).await?;
+        let published = published_data_map(data_map)?;
+        if published.is_child() {
+            for info in published.infos() {
+                if !client.chunk_exists(&info.dst_hash.0).await? {
+                    return Err(ManifestError::Build(format!(
+                        "entry {} cannot be published: its wrapper record {} is not on the network",
+                        embedded.name,
+                        hex::encode(info.dst_hash.0)
+                    )));
+                }
+            }
+        }
+        to_store.push((embedded, published));
+    }
+
+    let mut stored = Vec::with_capacity(to_store.len());
+    for (embedded, published) in to_store {
+        if cancel.is_cancelled() {
+            return Err(ManifestError::Cancelled);
+        }
+        let address = client.data_map_store(&published).await?;
         if address != embedded.address {
             return Err(ManifestError::Build(format!(
                 "entry {} stored at an unexpected address",
@@ -150,6 +188,7 @@ pub fn apply_compaction(
             continue;
         }
         if let ContentRef::Embedded { .. } = entry.source {
+            // Derived from the DataMap, so the entry keeps its content.
             let address = entry.source.content_address()?;
             entry.source = ContentRef::Public { address };
         }
@@ -182,7 +221,6 @@ mod tests {
                     size: None,
                     source: ContentRef::Embedded {
                         data_map: data_map(1),
-                        address: None,
                     },
                 },
                 ManifestEntry {
@@ -190,7 +228,6 @@ mod tests {
                     size: None,
                     source: ContentRef::Embedded {
                         data_map: data_map(2),
-                        address: None,
                     },
                 },
                 ManifestEntry {

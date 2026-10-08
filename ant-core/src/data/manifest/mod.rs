@@ -24,13 +24,15 @@
 //! # Forward compatibility
 //!
 //! Structs are encoded as msgpack maps with field names, every optional
-//! field has a default, unknown fields are ignored, and only optional fields
-//! or new [`ContentRef`] variants may be added within a format version. An
-//! unknown variant or an unknown header version is a hard error so a reader
-//! never silently skips a file it cannot resolve.
+//! field has a default and is omitted when absent, unknown fields are
+//! ignored, and only optional fields or new [`ContentRef`] variants may be
+//! added within a format version. An unknown variant or an unknown header
+//! version is a hard error so a reader never silently skips a file it cannot
+//! resolve. The normative schema is in ADR-0006.
 
 pub mod link;
 pub mod path;
+mod wire;
 
 #[cfg(feature = "native")]
 pub mod build;
@@ -49,7 +51,7 @@ pub mod history;
 pub use self::embed::embeddable_data_map;
 
 use ant_protocol::compute_address;
-use self_encryption::DataMap;
+use self_encryption::{shrink_data_map, DataMap};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -64,7 +66,11 @@ use serde::ser::{SerializeMap, Serializer};
 #[cfg(test)]
 use xor_name::XorName;
 
-pub use self::link::{file_link, is_link, manifest_link, parse_link, Link};
+pub use self::link::{
+    file_link, is_link, manifest_link, manifest_link_bytes, manifest_link_from_bytes, parse_link,
+    Link,
+};
+pub use self::wire::CHUNK_RECORD_LEN;
 
 /// The four magic bytes that open every manifest.
 pub const MANIFEST_MAGIC: [u8; 4] = [0xC1, b'A', b'N', b'T'];
@@ -83,12 +89,14 @@ pub const MAX_MANIFEST_ENTRIES: usize = 100_000;
 pub const MANIFEST_LINK_RECOMMENDED_MAX_BYTES: usize = 1_500;
 /// Length of a content address in bytes.
 pub const ADDRESS_LEN: usize = 32;
-/// Largest encoded root DataMap a writer embeds in place of the shrunk map
-/// a large upload produces. A root map lets a reader start fetching data
-/// chunks with no wrapper-record fetches; at roughly 105 bytes per chunk
-/// this covers files up to about 2.5 GB.
+/// Largest root DataMap, as written in a manifest, that a `.ant` file embeds
+/// in place of the shrunk map a large upload produces. A root map lets a
+/// reader start fetching data chunks with no wrapper-record fetches; at
+/// [`CHUNK_RECORD_LEN`] bytes per chunk of up to about 4 MiB this covers
+/// files up to about 4 GB. Links carry the published (shrunk) form instead
+/// (see [`Manifest::link_form`]).
 pub const MAX_EMBEDDED_ROOT_MAP_BYTES: usize = 64 * 1024;
-/// Deepest msgpack nesting the decoder tolerates. A manifest nests four
+/// Deepest msgpack nesting the decoder tolerates. A manifest nests five
 /// levels; this leaves headroom for future optional fields.
 const MAX_DECODE_DEPTH: usize = 16;
 /// Length of a BitTorrent v1 info hash (SHA-1, BEP 3).
@@ -101,7 +109,7 @@ pub const TORRENT_INFO_HASH_V2_LEN: usize = 32;
 pub struct Manifest {
     /// Suggested root directory name. One path component, subject to the
     /// portable path rules.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// The BitTorrent identity of the same set of files, when the creator
     /// has one. Carried so a manifest can be matched to a torrent; what a
@@ -183,11 +191,12 @@ impl TorrentReference {
 pub struct ManifestEntry {
     /// Relative path, subject to the portable path rules. When absent the
     /// entry is extracted under its content address.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// Plaintext length in bytes as recorded by the creator. A hint for
-    /// display only; nothing is decided by it.
-    #[serde(default)]
+    /// Plaintext length in bytes as recorded by the creator. Unverified: a
+    /// hint for display only. Use [`ManifestEntry::known_size`] for a
+    /// figure that can be relied on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
     /// Where the bytes come from.
     pub source: ContentRef,
@@ -199,15 +208,10 @@ pub enum ContentRef {
     /// The DataMap itself. Saves the DataMap fetch a `Public` entry needs.
     Embedded {
         /// The file's DataMap: its root map when the writer could embed it,
-        /// otherwise the shrunk map a large upload publishes.
+        /// otherwise the shrunk map a large upload publishes. Either form
+        /// has the same content address.
+        #[serde(with = "wire")]
         data_map: DataMap,
-        /// Address of the file's DataMap chunk as published, when the
-        /// writer knows it and it differs from the hash of `data_map`;
-        /// that is, when a root map was embedded in place of the published
-        /// shrunk map. Keeps the entry's identity equal to the file's known
-        /// public address.
-        #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
-        address: Option<[u8; ADDRESS_LEN]>,
     },
     /// Address of the file's public DataMap chunk.
     Public {
@@ -295,26 +299,49 @@ pub enum ManifestError {
     Data(#[from] crate::data::error::Error),
 }
 
+/// The form of `data_map` a public upload stores as its DataMap chunk: the
+/// map shrunk until it lists at most three chunks, exactly as an upload
+/// shrinks it. A map that is already that small is returned unchanged.
+/// Computed locally; self-encryption is deterministic, so a root map and the
+/// shrunk map it came from give the same result.
+pub fn published_data_map(data_map: &DataMap) -> Result<DataMap, ManifestError> {
+    shrink_data_map(data_map.clone(), |_, _| Ok(()))
+        .map(|(shrunk, _)| shrunk)
+        .map_err(|e| ManifestError::Encode(format!("DataMap could not be shrunk: {e}")))
+}
+
+/// The address `data_map` has, or would have, as a public file: the hash of
+/// its published form's DataMap chunk bytes (self_encryption's versioned
+/// msgpack, as the network stores them).
+pub fn data_map_address(data_map: &DataMap) -> Result<[u8; ADDRESS_LEN], ManifestError> {
+    let bytes = rmp_serde::to_vec(&published_data_map(data_map)?)
+        .map_err(|e| ManifestError::Encode(format!("DataMap did not serialize: {e}")))?;
+    Ok(compute_address(&bytes))
+}
+
+/// Bytes `data_map` occupies in an encoded manifest, as written.
+pub fn embedded_len(data_map: &DataMap) -> Result<usize, ManifestError> {
+    let mut bytes = Vec::new();
+    wire::serialize(
+        data_map,
+        &mut rmp_serde::Serializer::new(&mut bytes).with_struct_map(),
+    )
+    .map_err(|e| ManifestError::Encode(e.to_string()))?;
+    Ok(bytes.len())
+}
+
 impl ContentRef {
     /// The address that identifies this entry's content.
     ///
-    /// For `Public` it is the address itself. For `Embedded` it is the
-    /// published DataMap address when the writer recorded one, otherwise the
-    /// address the embedded DataMap would have as a public chunk: the hash
-    /// of its canonical positional msgpack bytes.
+    /// For `Public` it is the address itself. For `Embedded` it is derived
+    /// from the embedded DataMap by [`data_map_address`], so it is the
+    /// file's public address whether the root or the shrunk map was
+    /// embedded, and whether or not the file was ever made public. Nothing
+    /// in the bytes can make it disagree with the DataMap.
     pub fn content_address(&self) -> Result<[u8; ADDRESS_LEN], ManifestError> {
         match self {
             Self::Public { address } => Ok(*address),
-            Self::Embedded {
-                address: Some(address),
-                ..
-            } => Ok(*address),
-            Self::Embedded { data_map, .. } => {
-                let bytes = rmp_serde::to_vec(data_map).map_err(|e| {
-                    ManifestError::Encode(format!("embedded DataMap did not serialize: {e}"))
-                })?;
-                Ok(compute_address(&bytes))
-            }
+            Self::Embedded { data_map } => data_map_address(data_map),
         }
     }
 
@@ -328,6 +355,18 @@ impl ContentRef {
 }
 
 impl ManifestEntry {
+    /// The plaintext size the file is known to have: from an embedded root
+    /// DataMap, which lists every chunk. `None` for a `Public` entry or a
+    /// shrunk map, whose size is not known until it is resolved.
+    pub fn known_size(&self) -> Option<u64> {
+        match &self.source {
+            ContentRef::Embedded { data_map } if !data_map.is_child() => {
+                u64::try_from(data_map.original_file_size()).ok()
+            }
+            _ => None,
+        }
+    }
+
     /// The name this entry extracts under: its `path`, or the lowercase hex
     /// of its content address when it has none.
     pub fn effective_name(&self) -> Result<String, ManifestError> {
@@ -402,6 +441,21 @@ impl Manifest {
         Ok(())
     }
 
+    /// The manifest as a link carries it: every embedded DataMap replaced by
+    /// its published (shrunk) form, at most three chunks. Lossless: each
+    /// entry keeps its content address, and a reader resolves the root
+    /// from the wrapper records the upload stored. Keeps links short; a
+    /// `.ant` file keeps the root maps.
+    pub fn link_form(&self) -> Result<Self, ManifestError> {
+        let mut link = self.clone();
+        for entry in &mut link.entries {
+            if let ContentRef::Embedded { data_map } = &mut entry.source {
+                *data_map = published_data_map(data_map)?;
+            }
+        }
+        Ok(link)
+    }
+
     /// Encode to the byte form, validating and sorting first.
     pub fn encode(&self) -> Result<Vec<u8>, ManifestError> {
         let mut canonical = self.clone();
@@ -422,7 +476,8 @@ impl Manifest {
     }
 
     /// Decode from the byte form, enforcing the size, depth and entry
-    /// limits and the portable path rules.
+    /// limits and the portable path rules. The structure, including the
+    /// entry count, is checked before any entry is decoded.
     pub fn decode(bytes: &[u8]) -> Result<Self, ManifestError> {
         if bytes.len() > MAX_MANIFEST_BYTES {
             return Err(ManifestError::TooLarge {
@@ -438,6 +493,7 @@ impl Manifest {
             return Err(ManifestError::UnsupportedVersion(version));
         }
         let body = &bytes[MANIFEST_HEADER_LEN..];
+        wire::check_structure(body)?;
         let mut deserializer = rmp_serde::Deserializer::from_read_ref(body);
         deserializer.set_max_depth(MAX_DECODE_DEPTH);
         let manifest = Manifest::deserialize(&mut deserializer)
@@ -457,6 +513,21 @@ impl Manifest {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Header; `{"name": "r", "entries": [`; the unnamed embedded entry,
+    /// sorted first by its hex effective name, whose DataMap is one 68-byte
+    /// chunk record (dst hash, src hash, big-endian u32 size) in a `bin`;
+    /// then the `Public` entry `a` with its address as a 32-byte `bin`.
+    const GOLDEN_V1_HEX: &str = concat!(
+        "c1414e5401",
+        "82a46e616d65a172a7656e747269657392",
+        "81a6736f7572636581a8456d62656464656481a8646174615f6d617081a66368756e6b73c444",
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "3333333333333333333333333333333333333333333333333333333333333333",
+        "00000102",
+        "83a470617468a161a473697a6505a6736f7572636581a65075626c696381a761646472657373c420",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+    );
 
     fn data_map(seed: u8) -> DataMap {
         DataMap::new(vec![ChunkInfo {
@@ -482,7 +553,6 @@ mod tests {
                     size: Some(10),
                     source: ContentRef::Embedded {
                         data_map: data_map(1),
-                        address: None,
                     },
                 },
                 ManifestEntry {
@@ -490,7 +560,6 @@ mod tests {
                     size: None,
                     source: ContentRef::Embedded {
                         data_map: data_map(9),
-                        address: None,
                     },
                 },
             ],
@@ -508,7 +577,7 @@ mod tests {
             .iter()
             .map(|e| e.effective_name().unwrap())
             .collect();
-        let hex_name = hex::encode(data_map_address(&data_map(9)));
+        let hex_name = hex::encode(data_map_address(&data_map(9)).unwrap());
         assert_eq!(
             names,
             vec!["a.txt".to_string(), hex_name, "photos/b.jpg".into()]
@@ -543,8 +612,18 @@ mod tests {
         );
     }
 
-    fn data_map_address(dm: &DataMap) -> [u8; 32] {
-        compute_address(&rmp_serde::to_vec(dm).unwrap())
+    /// A root map with more chunks than a published map may hold.
+    fn large_root() -> DataMap {
+        DataMap::new(
+            (0..8u8)
+                .map(|i| ChunkInfo {
+                    index: usize::from(i),
+                    dst_hash: XorName([i; 32]),
+                    src_hash: XorName([i.wrapping_add(100); 32]),
+                    src_size: 4_000_000,
+                })
+                .collect(),
+        )
     }
 
     #[test]
@@ -668,6 +747,13 @@ mod tests {
             too_many.validate(),
             Err(ManifestError::TooManyEntries { .. })
         ));
+        let mut bytes = MANIFEST_MAGIC.to_vec();
+        bytes.push(MANIFEST_FORMAT_VERSION);
+        bytes.extend(rmp_serde::to_vec_named(&too_many).unwrap());
+        assert!(matches!(
+            Manifest::decode(&bytes),
+            Err(ManifestError::TooManyEntries { .. })
+        ));
     }
 
     #[test]
@@ -708,8 +794,7 @@ mod tests {
             expected.canonicalize().unwrap();
             expected
         });
-        // Old readers of this version see one more optional field; the bytes
-        // of a manifest without a torrent reference are unchanged.
+        // An absent reference is omitted from the bytes entirely.
         assert_eq!(without, {
             let mut plain = with_torrent.clone();
             plain.torrent = None;
@@ -749,19 +834,144 @@ mod tests {
     }
 
     #[test]
-    fn embedded_content_address_matches_public_record_address() {
+    fn embedded_content_address_is_the_published_record_address() {
+        // A small map is its own published form.
         let dm = data_map(4);
         let entry = ContentRef::Embedded {
             data_map: dm.clone(),
-            address: None,
         };
-        assert_eq!(entry.content_address().unwrap(), data_map_address(&dm));
-        // A recorded published address wins over the embedded map's hash.
-        let published = ContentRef::Embedded {
-            data_map: dm,
-            address: Some([7; 32]),
+        assert_eq!(
+            entry.content_address().unwrap(),
+            compute_address(&rmp_serde::to_vec(&dm).unwrap())
+        );
+
+        // A root map and its shrunk map share one identity: the address of
+        // the shrunk map's chunk, which is what a public upload stores.
+        let root = large_root();
+        let shrunk = published_data_map(&root).unwrap();
+        assert!(shrunk.is_child());
+        assert!(shrunk.len() < root.len());
+        let expected = compute_address(&rmp_serde::to_vec(&shrunk).unwrap());
+        assert_eq!(data_map_address(&root).unwrap(), expected);
+        assert_eq!(data_map_address(&shrunk).unwrap(), expected);
+        assert_eq!(published_data_map(&shrunk).unwrap(), shrunk);
+    }
+
+    #[test]
+    fn link_form_carries_published_maps_and_keeps_identity() {
+        let mut manifest = sample();
+        manifest.entries.push(ManifestEntry {
+            path: Some("big.bin".into()),
+            size: None,
+            source: ContentRef::Embedded {
+                data_map: large_root(),
+            },
+        });
+        let link = manifest.link_form().unwrap();
+        assert!(link.encode().unwrap().len() < manifest.encode().unwrap().len());
+        for (full, linked) in manifest.entries.iter().zip(&link.entries) {
+            assert_eq!(
+                full.source.content_address().unwrap(),
+                linked.source.content_address().unwrap()
+            );
+            if let ContentRef::Embedded { data_map } = &linked.source {
+                assert!(data_map.len() <= 3);
+            }
+        }
+    }
+
+    #[test]
+    fn known_size_comes_from_a_root_map_only() {
+        let root = large_root();
+        let entry = |source| ManifestEntry {
+            path: None,
+            size: Some(1),
+            source,
         };
-        assert_eq!(published.content_address().unwrap(), [7; 32]);
+        assert_eq!(
+            entry(ContentRef::Embedded {
+                data_map: root.clone()
+            })
+            .known_size(),
+            Some(root.original_file_size() as u64)
+        );
+        assert_eq!(
+            entry(ContentRef::Embedded {
+                data_map: published_data_map(&root).unwrap()
+            })
+            .known_size(),
+            None
+        );
+        assert_eq!(
+            entry(ContentRef::Public { address: [1; 32] }).known_size(),
+            None
+        );
+    }
+
+    /// Golden bytes: the v1 encoding of a fixed manifest. Any change to these
+    /// bytes is a format change and needs a new version or an ADR amendment.
+    #[test]
+    fn encoding_matches_the_committed_fixture() {
+        let manifest = Manifest {
+            name: Some("r".into()),
+            torrent: None,
+            entries: vec![
+                ManifestEntry {
+                    path: Some("a".into()),
+                    size: Some(5),
+                    source: ContentRef::Public {
+                        address: [0x11; 32],
+                    },
+                },
+                ManifestEntry {
+                    path: None,
+                    size: None,
+                    source: ContentRef::Embedded {
+                        data_map: DataMap::new(vec![ChunkInfo {
+                            index: 0,
+                            dst_hash: XorName([0x22; 32]),
+                            src_hash: XorName([0x33; 32]),
+                            src_size: 0x0102,
+                        }]),
+                    },
+                },
+            ],
+        };
+        assert_eq!(hex::encode(manifest.encode().unwrap()), GOLDEN_V1_HEX);
+        assert_eq!(
+            Manifest::decode(&hex::decode(GOLDEN_V1_HEX).unwrap()).unwrap(),
+            {
+                let mut expected = manifest.clone();
+                expected.canonicalize().unwrap();
+                expected
+            }
+        );
+    }
+
+    #[test]
+    fn decode_rejects_positional_encoding() {
+        let mut bytes = MANIFEST_MAGIC.to_vec();
+        bytes.push(MANIFEST_FORMAT_VERSION);
+        bytes.extend(rmp_serde::to_vec(&sample()).unwrap());
+        assert!(matches!(
+            Manifest::decode(&bytes),
+            Err(ManifestError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn absent_optionals_are_omitted_not_nil() {
+        let manifest = Manifest {
+            name: None,
+            torrent: None,
+            entries: vec![ManifestEntry {
+                path: None,
+                size: None,
+                source: ContentRef::Public { address: [1; 32] },
+            }],
+        };
+        let bytes = manifest.encode().unwrap();
+        assert!(!bytes[MANIFEST_HEADER_LEN..].contains(&0xc0));
     }
 
     #[test]

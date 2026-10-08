@@ -14,13 +14,13 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ant_core::data::{
-    apply_compaction, default_history_dir, embeddable_data_map, extract_manifest, format_timestamp,
-    is_link, list_uploads, load_upload, manifest_filename_for, manifest_link, parse_link,
-    plan_compaction, publish_data_maps, read_manifest_file, record_upload, write_manifest_file,
-    BuildEvent, BuildOptions, BuildResult, Client, ContentRef, DownloadEvent, EntryStatus,
-    ExtractEvent, ExtractOptions, Link, Manifest, ManifestBuilder, ManifestError, PaymentMode,
-    ReferenceMode, TorrentReference, UploadEvent, UploadRecord, Visibility,
-    MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+    apply_compaction, data_map_address, default_history_dir, embeddable_data_map, extract_manifest,
+    format_timestamp, is_link, list_uploads, load_upload, manifest_filename_for,
+    manifest_link_bytes, manifest_link_from_bytes, parse_link, plan_compaction, publish_data_maps,
+    read_manifest_file, record_upload, write_manifest_file, BuildEvent, BuildOptions, BuildResult,
+    Client, ContentRef, DownloadEvent, EntryStatus, ExtractEvent, ExtractOptions, Link, Manifest,
+    ManifestBuilder, ManifestError, PaymentMode, ReferenceMode, TorrentReference, UploadEvent,
+    UploadRecord, Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
 };
 use clap::Subcommand;
 use serde_json::json;
@@ -40,6 +40,8 @@ const PUBLIC_FILE_SEPARATOR: char = '=';
 const YES_ANSWERS: &[&str] = &["y", "yes"];
 /// Exit code for a second Ctrl-C, matching the shell convention for SIGINT.
 const FORCE_QUIT_EXIT_CODE: i32 = 130;
+/// Marks a size in `manifest show` that only the manifest's creator vouches for.
+const CLAIMED_SIZE_MARK: char = '*';
 
 /// Manifest subcommands.
 #[derive(Subcommand, Debug)]
@@ -103,10 +105,12 @@ pub enum ManifestAction {
         /// from `ant manifest list`.
         source: String,
     },
-    /// Print a manifest file as an `ant://manifest/...` link.
+    /// Print a manifest as an `ant://manifest/...` link. The link carries
+    /// each embedded DataMap in its short published form.
     Link {
-        /// The `.ant` file.
-        file: PathBuf,
+        /// A `.ant` file, an `ant://manifest/...` link, or an upload id
+        /// from `ant manifest list`.
+        source: String,
     },
     /// Write a manifest out as a `.ant` file, optionally compacted.
     ///
@@ -185,7 +189,7 @@ impl ManifestAction {
         match self {
             Self::List => list_history(json),
             Self::Show { source } => show(&load_manifest(&source)?, json),
-            Self::Link { file } => link(&read_manifest_file(&file)?, json),
+            Self::Link { source } => link(&load_manifest(&source)?, json),
             Self::Create {
                 paths,
                 output,
@@ -401,7 +405,7 @@ fn report_exported(
     json: bool,
 ) -> anyhow::Result<()> {
     let link_text = if with_link {
-        Some(manifest_link(manifest)?)
+        Some(make_link(manifest)?)
     } else {
         None
     };
@@ -421,7 +425,7 @@ fn report_exported(
                 "embedded_entries": embedded,
                 "public_entries": manifest.entries.len() - embedded,
                 "data_maps_published": published,
-                "link": link_text,
+                "link": link_text.as_ref().map(|(link, _)| link),
             }))?
         );
         return Ok(());
@@ -435,8 +439,8 @@ fn report_exported(
     if published > 0 {
         println!("Published {published} DataMap chunk(s)");
     }
-    if let Some(link) = link_text {
-        warn_if_long_link(manifest)?;
+    if let Some((link, len)) = link_text {
+        warn_if_long_link(len);
         println!("{link}");
     }
     Ok(())
@@ -512,7 +516,18 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         // Embed the root map when it is small enough: recipients then start
         // on data chunks with no wrapper-record fetches.
         let data_map = embeddable_data_map(client, &data_map).await?;
-        builder.add_embedded(data_map, Some(address), path, None)?;
+        // An entry's identity is derived from its DataMap. A map stored in
+        // some other form than an upload publishes would derive a different
+        // address, so such a file is referenced by its address instead.
+        if data_map_address(&data_map)? == address {
+            builder.add_embedded(data_map, path, None)?;
+        } else {
+            eprintln!(
+                "warning: the DataMap at {} is not in published form; adding it by address",
+                hex::encode(address)
+            );
+            builder.add_public(address, path, None)?;
+        }
     }
     if builder.pending_count() == 0 && args.public_files.is_empty() && args.embed_public.is_empty()
     {
@@ -680,7 +695,7 @@ fn report_created(
     json: bool,
 ) -> anyhow::Result<()> {
     let link_text = if with_link {
-        Some(manifest_link(manifest)?)
+        Some(make_link(manifest)?)
     } else {
         None
     };
@@ -691,7 +706,7 @@ fn report_created(
                 "torrent": torrent_json(manifest),
             "entries": entries_json(manifest)?,
             "total_size": manifest.total_size(),
-            "link": link_text,
+            "link": link_text.as_ref().map(|(link, _)| link),
             "history_id": history_id,
         });
         if let Some(r) = result {
@@ -721,8 +736,8 @@ fn report_created(
     if let Some(id) = history_id {
         println!("Recorded as {id} (ant manifest download {id})");
     }
-    if let Some(link) = link_text {
-        warn_if_long_link(manifest)?;
+    if let Some((link, len)) = link_text {
+        warn_if_long_link(len);
         println!("{link}");
     }
     Ok(())
@@ -823,11 +838,18 @@ fn show(manifest: &Manifest, json: bool) -> anyhow::Result<()> {
         println!("Size:    {total} bytes");
     }
     println!();
+    let mut any_claimed = false;
     for entry in &manifest.entries {
-        let size = entry
-            .size
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "?".to_string());
+        // A size read from an embedded root DataMap is exact; the recorded
+        // `size` is only the creator's claim and is marked as such.
+        let size = match (entry.known_size(), entry.size) {
+            (Some(known), _) => known.to_string(),
+            (None, Some(claimed)) => {
+                any_claimed = true;
+                format!("{claimed}{CLAIMED_SIZE_MARK}")
+            }
+            (None, None) => "?".to_string(),
+        };
         println!(
             "{:>12}  {:<9} {}",
             size,
@@ -835,30 +857,39 @@ fn show(manifest: &Manifest, json: bool) -> anyhow::Result<()> {
             entry.effective_name()?
         );
     }
+    if any_claimed {
+        println!();
+        println!("{CLAIMED_SIZE_MARK} size as recorded by the manifest's creator, not verified");
+    }
     Ok(())
 }
 
 fn link(manifest: &Manifest, json: bool) -> anyhow::Result<()> {
-    let bytes = manifest.encode()?;
-    let link = manifest_link(manifest)?;
+    let (link, len) = make_link(manifest)?;
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "link": link,
-                "manifest_bytes": bytes.len(),
+                "manifest_bytes": len,
                 "recommended_max_bytes": MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
             }))?
         );
         return Ok(());
     }
-    warn_if_long_link(manifest)?;
+    warn_if_long_link(len);
     println!("{link}");
     Ok(())
 }
 
-fn warn_if_long_link(manifest: &Manifest) -> anyhow::Result<()> {
-    let len = manifest.encode()?.len();
+/// A manifest link and the length of the `.ant` bytes it carries, encoded
+/// once.
+fn make_link(manifest: &Manifest) -> anyhow::Result<(String, usize)> {
+    let bytes = manifest_link_bytes(manifest)?;
+    Ok((manifest_link_from_bytes(&bytes), bytes.len()))
+}
+
+fn warn_if_long_link(len: usize) {
     if len > MANIFEST_LINK_RECOMMENDED_MAX_BYTES {
         eprintln!(
             "warning: this manifest is {len} bytes; links above \
@@ -866,7 +897,6 @@ fn warn_if_long_link(manifest: &Manifest) -> anyhow::Result<()> {
              Consider sharing the .ant file instead."
         );
     }
-    Ok(())
 }
 
 async fn download(
@@ -1010,6 +1040,7 @@ fn entries_json(manifest: &Manifest) -> anyhow::Result<Vec<serde_json::Value>> {
                 "name": entry.effective_name()?,
                 "path": entry.path,
                 "size": entry.size,
+                "known_size": entry.known_size(),
                 "kind": entry.source.kind(),
                 "address": hex::encode(entry.source.content_address()?),
             }))

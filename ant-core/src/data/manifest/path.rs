@@ -17,11 +17,40 @@ pub const MAX_PATH_COMPONENT_BYTES: usize = 255;
 pub const MAX_PATH_BYTES: usize = 1024;
 /// Characters no component may contain, over and above control characters.
 const FORBIDDEN_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*', '\\', '/'];
-/// Windows reserved device names, compared without regard to case and
-/// with any extension removed.
+/// Windows reserved device names, compared without regard to case, with
+/// any extension and the spaces before it removed. Windows also treats the
+/// superscript digits ¹ ² ³ as COM and LPT port numbers.
 const RESERVED_DEVICE_NAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "CONIN$",
+    "CONOUT$",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
 ];
 /// Lowest non-control character.
 const FIRST_PRINTABLE: char = '\u{20}';
@@ -121,7 +150,13 @@ pub fn validate_component(component: &str) -> Result<(), PathError> {
     if component.ends_with(' ') || component.ends_with('.') {
         return Err(PathError::TrailingSpaceOrDot(component.to_string()));
     }
-    let stem = component.split('.').next().unwrap_or(component);
+    // Windows ignores spaces between a device name and its extension, so
+    // `CON .txt` is the console too.
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .trim_end_matches(' ');
     if RESERVED_DEVICE_NAMES
         .iter()
         .any(|reserved| stem.eq_ignore_ascii_case(reserved))
@@ -160,12 +195,21 @@ pub fn portable_component(name: &str) -> Option<String> {
     validate_component(&candidate).ok().map(|()| candidate)
 }
 
-/// The key two paths are compared under: NFC normalised and lowercased.
+/// The key two paths are compared under: NFC normalised, case folded by
+/// uppercasing then lowercasing, and normalised again.
 ///
-/// Lowercasing approximates Unicode case folding closely enough to reject
-/// anything a case-insensitive filesystem would merge.
+/// Lowercasing alone leaves pairs a case-insensitive filesystem merges,
+/// because their uppercase forms are equal: `ſ` and `s`, `ς` and `σ`, `ı`
+/// and `i`. Mapping through uppercase first joins them; the final NFC pass
+/// recomposes anything case mapping decomposed. The result rejects at
+/// least everything APFS and NTFS would merge, and possibly a little more.
 pub fn fold(path: &str) -> String {
-    path.nfc().collect::<String>().to_lowercase()
+    path.nfc()
+        .collect::<String>()
+        .to_uppercase()
+        .to_lowercase()
+        .nfc()
+        .collect()
 }
 
 /// Reject duplicate effective names and file-versus-directory conflicts
@@ -273,6 +317,27 @@ mod tests {
             validate_path("dir/CON.txt"),
             Err(PathError::ReservedName("CON.txt".into()))
         );
+        for reserved in [
+            "CON .txt",
+            "con  .tar.gz",
+            "CONIN$",
+            "conout$.log",
+            "COM\u{b9}",
+            "lpt\u{b3}.txt",
+        ] {
+            assert_eq!(
+                validate_component(reserved),
+                Err(PathError::ReservedName(reserved.into())),
+                "{reserved}"
+            );
+        }
+        for ordinary in ["CONSOLE", "COM10", "LPT0", "COM\u{b4}", "CON_.txt"] {
+            assert_eq!(validate_component(ordinary), Ok(()), "{ordinary}");
+        }
+        assert_eq!(
+            validate_component("CON"),
+            Err(PathError::ReservedName("CON".into()))
+        );
         assert_eq!(
             validate_path("lpt9"),
             Err(PathError::ReservedName("lpt9".into()))
@@ -322,7 +387,20 @@ mod tests {
         assert_eq!(
             check_collisions(["caf\u{e9}", "cafe\u{301}"]),
             Err(PathError::Duplicate("cafe\u{301}".into()))
-        );
+        ); // Pairs that lowercase apart but share an uppercase form.
+        for (a, b) in [
+            ("\u{17f}", "s"),
+            ("\u{3c2}", "\u{3c3}"),
+            ("\u{131}", "i"),
+            ("stra\u{df}e", "STRASSE"),
+        ] {
+            assert_eq!(
+                check_collisions([a, b]),
+                Err(PathError::Duplicate(b.into())),
+                "{a} vs {b}"
+            );
+        }
+        assert!(check_collisions(["\u{17f}/x", "S"]).is_err());
     }
 
     #[test]

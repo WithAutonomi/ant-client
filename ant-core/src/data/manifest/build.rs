@@ -20,8 +20,8 @@ use crate::data::Client;
 use super::embed::embeddable_data_map;
 use super::path::{check_collisions, validate_component, validate_path, PATH_SEPARATOR};
 use super::{
-    ContentRef, Manifest, ManifestEntry, ManifestError, TorrentReference, ADDRESS_LEN,
-    MAX_MANIFEST_ENTRIES,
+    data_map_address, ContentRef, Manifest, ManifestEntry, ManifestError, TorrentReference,
+    ADDRESS_LEN, MAX_MANIFEST_ENTRIES,
 };
 
 /// Capacity of the per-file upload progress channel.
@@ -199,11 +199,11 @@ impl<'a> ManifestBuilder<'a> {
 
     /// Add a file by a DataMap already in hand, embedded. Nothing is
     /// uploaded. This is how a public file is brought into a manifest with
-    /// its DataMap embedded, so recipients skip the DataMap fetch.
+    /// its DataMap embedded, so recipients skip the DataMap fetch. The
+    /// entry's content address is derived from `data_map`.
     pub fn add_embedded(
         &mut self,
         data_map: self_encryption::DataMap,
-        published_address: Option<[u8; ADDRESS_LEN]>,
         path: Option<String>,
         size: Option<u64>,
     ) -> Result<(), ManifestError> {
@@ -216,10 +216,7 @@ impl<'a> ManifestBuilder<'a> {
         self.entries.push(ManifestEntry {
             path,
             size,
-            source: ContentRef::Embedded {
-                data_map,
-                address: published_address,
-            },
+            source: ContentRef::Embedded { data_map },
         });
         Ok(())
     }
@@ -375,7 +372,6 @@ impl<'a> ManifestBuilder<'a> {
                 size: Some(size),
                 source: ContentRef::Embedded {
                     data_map: result.data_map.clone(),
-                    address: result.data_map_address,
                 },
             });
             files_uploaded += 1;
@@ -454,28 +450,21 @@ impl<'a> ManifestBuilder<'a> {
         public_address: Option<[u8; ADDRESS_LEN]>,
     ) -> Result<ContentRef, ManifestError> {
         if self.options.reference_mode != ReferenceMode::Compact {
-            // A public upload's identity is its published address; record it
-            // so embedding the root map does not change the entry's address.
+            // The root and the shrunk map share one content address, so
+            // embedding the root does not change the entry's identity.
             return Ok(ContentRef::Embedded {
                 data_map: embeddable_data_map(self.client, data_map).await?,
-                address: public_address,
             });
         }
         if let Some(address) = public_address {
             return Ok(ContentRef::Public { address });
         }
-        // The address is that of the map as uploaded, never of the root.
-        let uploaded = ContentRef::Embedded {
-            data_map: data_map.clone(),
-            address: None,
-        };
-        let address = uploaded.content_address()?;
+        let address = data_map_address(data_map)?;
         if self.client.chunk_exists(&address).await? {
             return Ok(ContentRef::Public { address });
         }
         Ok(ContentRef::Embedded {
             data_map: embeddable_data_map(self.client, data_map).await?,
-            address: None,
         })
     }
 

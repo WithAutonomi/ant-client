@@ -12,11 +12,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ant_core::data::{
-    apply_compaction, embeddable_data_map, extract_manifest, manifest_link, parse_link,
-    plan_compaction, publish_data_maps, read_manifest_file, record_upload, write_manifest_file,
-    BuildEvent, BuildOptions, Client, ContentRef, EntryStatus, ExtractOptions, Link,
-    ManifestBuilder, ManifestError, PaymentMode, ReferenceMode, Visibility,
-    MAX_EMBEDDED_ROOT_MAP_BYTES,
+    apply_compaction, data_map_address, embeddable_data_map, embedded_len, extract_manifest,
+    manifest_link, parse_link, plan_compaction, publish_data_maps, read_manifest_file,
+    record_upload, write_manifest_file, BuildEvent, BuildOptions, Client, ContentRef, EntryStatus,
+    ExtractOptions, Link, Manifest, ManifestBuilder, ManifestEntry, ManifestError, PaymentMode,
+    ReferenceMode, Visibility, MAX_EMBEDDED_ROOT_MAP_BYTES,
 };
 use self_encryption::{shrink_data_map, ChunkInfo, DataMap};
 use serial_test::serial;
@@ -32,7 +32,10 @@ const FILE_BYTES: usize = 2048;
 /// Chunk infos in a synthetic root map small enough to embed.
 const SMALL_ROOT_CHUNKS: usize = 8;
 /// Chunk infos in a synthetic root map whose encoding exceeds the cap.
-const LARGE_ROOT_CHUNKS: usize = 1_000;
+const LARGE_ROOT_CHUNKS: usize = 2_000;
+/// A file large enough that self-encryption splits it into more than three
+/// chunks, so its upload publishes a shrunk DataMap.
+const SHRUNK_FILE_BYTES: usize = 13 * 1024 * 1024;
 
 /// A root DataMap with `chunks` synthetic infos; the hashes need not exist
 /// on the network because only the map's own encoding and shrinking matter.
@@ -486,17 +489,22 @@ async fn embedding_uses_the_root_map_only_when_it_is_small_enough() {
     // A small file's shrunk map resolves back to its root for embedding, so a
     // reader starts on data chunks with no wrapper-record fetches.
     let small_root = synthetic_root(SMALL_ROOT_CHUNKS, 0x10);
-    assert!(rmp_serde::to_vec(&small_root).unwrap().len() <= MAX_EMBEDDED_ROOT_MAP_BYTES);
+    assert!(embedded_len(&small_root).unwrap() <= MAX_EMBEDDED_ROOT_MAP_BYTES);
     let small_child = shrink_and_store(&client, small_root.clone()).await;
     let embedded = embeddable_data_map(&client, &small_child)
         .await
         .expect("resolve small");
     assert!(!embedded.is_child());
     assert_eq!(embedded, small_root);
+    // Embedding the root does not change the entry's identity.
+    assert_eq!(
+        data_map_address(&embedded).unwrap(),
+        data_map_address(&small_child).unwrap()
+    );
 
     // A huge file's root exceeds the cap, so the shrunk map is embedded.
     let large_root = synthetic_root(LARGE_ROOT_CHUNKS, 0x40);
-    assert!(rmp_serde::to_vec(&large_root).unwrap().len() > MAX_EMBEDDED_ROOT_MAP_BYTES);
+    assert!(embedded_len(&large_root).unwrap() > MAX_EMBEDDED_ROOT_MAP_BYTES);
     let large_child = shrink_and_store(&client, large_root).await;
     let embedded = embeddable_data_map(&client, &large_child)
         .await
@@ -507,6 +515,66 @@ async fn embedding_uses_the_root_map_only_when_it_is_small_enough() {
     // A map that is already a root is returned without any fetch.
     let root = synthetic_root(SMALL_ROOT_CHUNKS, 0x70);
     assert_eq!(embeddable_data_map(&client, &root).await.unwrap(), root);
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn embedded_root_identity_is_the_published_address() {
+    let (client, testnet) = setup().await;
+
+    let source = TempDir::new().unwrap();
+    let file = source.path().join("big.bin");
+    let bytes: Vec<u8> = (0..SHRUNK_FILE_BYTES).map(|i| (i % 251) as u8).collect();
+    fs::write(&file, &bytes).unwrap();
+
+    let result = client
+        .file_upload_with_visibility_and_progress(
+            &file,
+            PaymentMode::Auto,
+            Visibility::Public,
+            None,
+        )
+        .await
+        .expect("public upload");
+    let published = result.data_map_address.expect("public address");
+    assert!(result.data_map.is_child(), "the upload must shrink its map");
+
+    // The address derived locally from the root, by re-shrinking it, is the
+    // address the upload published.
+    let root = embeddable_data_map(&client, &result.data_map)
+        .await
+        .expect("resolve root");
+    assert!(!root.is_child());
+    assert_eq!(data_map_address(&root).unwrap(), published);
+    assert_eq!(data_map_address(&result.data_map).unwrap(), published);
+
+    // An entry embedding that root, as a private upload of the same bytes
+    // records it, is found already public by compaction.
+    let manifest = Manifest {
+        name: None,
+        torrent: None,
+        entries: vec![ManifestEntry {
+            path: Some("big.bin".into()),
+            size: None,
+            source: ContentRef::Embedded { data_map: root },
+        }],
+    };
+    let plan = plan_compaction(&client, &manifest, &CancellationToken::new())
+        .await
+        .expect("plan");
+    assert!(plan.is_free(), "{plan:?}");
+    assert_eq!(plan.already_public.len(), 1);
+    assert_eq!(plan.already_public[0].address, published);
+
+    // The link form carries the shrunk map and keeps the identity.
+    let link = manifest.link_form().unwrap();
+    let ContentRef::Embedded { data_map } = &link.entries[0].source else {
+        panic!("link form keeps the entry embedded");
+    };
+    assert_eq!(data_map, &result.data_map);
 
     drop(client);
     testnet.teardown().await;

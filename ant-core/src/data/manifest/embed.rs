@@ -3,14 +3,15 @@
 //! A large upload yields a shrunk (child) DataMap that points at wrapper
 //! records; a reader must fetch those before it can fetch data. Embedding the
 //! root map instead removes that step, at the price of manifest bytes. The
-//! policy here embeds the root when its encoding stays under
-//! [`MAX_EMBEDDED_ROOT_MAP_BYTES`] and the child map otherwise.
+//! policy here embeds the root when its encoding, as a manifest writes it,
+//! stays under [`MAX_EMBEDDED_ROOT_MAP_BYTES`] and the child map otherwise.
+//! Either form has the same content address.
 
 use self_encryption::DataMap;
 
 use crate::data::Client;
 
-use super::{ManifestError, MAX_EMBEDDED_ROOT_MAP_BYTES};
+use super::{embedded_len, ManifestError, MAX_EMBEDDED_ROOT_MAP_BYTES};
 
 /// The DataMap to embed for a file: its root map when that is small enough,
 /// otherwise the shrunk map given. A map that is already a root is returned
@@ -23,10 +24,7 @@ pub async fn embeddable_data_map(
         return Ok(data_map.clone());
     }
     let root = client.data_map_resolve_root(data_map).await?;
-    let encoded_len = rmp_serde::to_vec(&root)
-        .map_err(|e| ManifestError::Encode(format!("root DataMap did not serialize: {e}")))?
-        .len();
-    if encoded_len <= MAX_EMBEDDED_ROOT_MAP_BYTES {
+    if embedded_len(&root)? <= MAX_EMBEDDED_ROOT_MAP_BYTES {
         Ok(root)
     } else {
         Ok(data_map.clone())

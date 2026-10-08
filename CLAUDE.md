@@ -81,7 +81,9 @@ ant-core/src/
 │       ├── link.rs           # ant://<address> and ant://manifest/<base64url> links
 │       ├── file.rs           # .ant file read/write
 │       ├── history.rs        # Upload history: one .ant per upload under <data dir>/uploads
+│       ├── wire.rs           # Manifest-owned DataMap layout; pre-decode structure check
 │       ├── build.rs          # ManifestBuilder (uploads files, embedded or compact refs)
+│       ├── embed.rs          # Root-vs-shrunk DataMap choice for embedding
 │       ├── compact.rs        # Plan/publish/apply compaction (embedded DataMaps -> addresses)
 │       └── extract.rs        # Containment-safe extraction with per-entry results
 └── node/                     # Node management
@@ -158,7 +160,7 @@ cargo run --bin ant -- --help  # Run the CLI
 - **Manifests never touch the network**: a manifest (`.ant` file or `ant://manifest/...` link)
   is shared off-network; only the files it references live on Autonomi. `ant://<hex>` is always
   a plain file link. Every upload (`ant file upload`, `ant manifest create`) is also recorded as
-  a manifest under `<data dir>/uploads/`; `ant manifest list` shows them and `show`/`download`
+  a manifest under `<data dir>/uploads/`; `ant manifest list` shows them and `show`/`link`/`export`/`download`
   accept a record id. Entry paths obey the portable rules in `data/manifest/path.rs` at build,
   decode and extract time, and extraction never follows symlinks inside the output directory.
   See `docs/adr/ADR-0006-file-manifests-and-links.md`.

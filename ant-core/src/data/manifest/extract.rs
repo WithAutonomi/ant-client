@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::data::client::file::DownloadEvent;
+use crate::data::error::Error;
 use crate::data::Client;
 
 use super::path::PATH_SEPARATOR;
@@ -265,7 +266,13 @@ async fn download_entry(
         .parent()
         .ok_or_else(|| ManifestError::Build(format!("{} has no parent", target.display())))?;
 
-    let data_map = resolve_data_map(client, &entry.source).await?;
+    // The root map lists every chunk, so its size is the file's real size,
+    // unlike the creator's unverified `size` hint. The download would
+    // resolve the root anyway.
+    let data_map = client
+        .data_map_resolve_root(&resolve_data_map(client, &entry.source).await?)
+        .await?;
+    ensure_space(parent, data_map.original_file_size())?;
 
     let temp = TempBuilder::new()
         .prefix(TEMP_PREFIX)
@@ -306,9 +313,26 @@ async fn download_entry(
     Ok(bytes)
 }
 
+/// Fail the entry before downloading when `dir`'s filesystem cannot hold
+/// `needed` bytes. When free space cannot be determined the download goes
+/// ahead and any shortage surfaces as a write error.
+fn ensure_space(dir: &Path, needed: usize) -> Result<(), ManifestError> {
+    let Ok(available) = fs2::available_space(dir) else {
+        return Ok(());
+    };
+    let needed = u64::try_from(needed).unwrap_or(u64::MAX);
+    if available < needed {
+        return Err(ManifestError::Data(Error::InsufficientDiskSpace(format!(
+            "the file needs {needed} bytes but only {available} are free in {}",
+            dir.display()
+        ))));
+    }
+    Ok(())
+}
+
 async fn resolve_data_map(client: &Client, source: &ContentRef) -> Result<DataMap, ManifestError> {
     match source {
-        ContentRef::Embedded { data_map, .. } => Ok(data_map.clone()),
+        ContentRef::Embedded { data_map } => Ok(data_map.clone()),
         ContentRef::Public { address } => Ok(client.data_map_fetch(address).await?),
     }
 }
@@ -417,6 +441,16 @@ mod tests {
             size: None,
             source: ContentRef::Public { address: [1; 32] },
         }
+    }
+
+    #[test]
+    fn ensure_space_refuses_what_cannot_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_space(dir.path(), 0).unwrap();
+        assert!(matches!(
+            ensure_space(dir.path(), usize::MAX),
+            Err(ManifestError::Data(Error::InsufficientDiskSpace(_)))
+        ));
     }
 
     #[test]

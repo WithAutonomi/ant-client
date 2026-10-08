@@ -333,8 +333,6 @@ async fn handle_file_upload(
             size: Some(file_size),
             source: ContentRef::Embedded {
                 data_map: recorded_map,
-                // A public upload keeps its published address as identity.
-                address: result.data_map_address.filter(|_| public),
             },
         }],
     };
