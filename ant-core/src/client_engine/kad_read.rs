@@ -43,15 +43,14 @@ const ROUND_GRACE: Duration = Duration::from_secs(ITERATION_GRACE_TIMEOUT_SECS);
 const LOOKUP_DEADLINE: Duration = Duration::from_secs(LOOKUP_TIMEOUT_SECS as u64);
 
 /// How long a likely holder may take to send the chunk before the next
-/// likely holder is asked too. Long enough for a 4 MiB transfer on a healthy
-/// path; short enough that an unreachable holder costs one hedge, not a
-/// request timeout.
+/// likely holder is asked too. A slow or unreachable holder then costs one
+/// hedge, not a request timeout.
 ///
-/// Measured on a 60-node testnet (50 MiB files): at the default fetch
-/// concurrency of 4, 1 s cut bytes received by a third at no latency cost;
-/// at 16, it cost about 12% latency, where 500 ms cost about 3% for a fifth
-/// fewer bytes.
-const HOLDER_HEDGE_DELAY: Duration = Duration::from_secs(1);
+/// Measured on a 60-node testnet with 50 MiB files, against asking every
+/// likely holder at once: 500 ms changed download time by -2% to +9% and cut
+/// bytes received by 14-24%. A 1 s delay cut more bytes, 16-36%, but cost up
+/// to 18%.
+const HOLDER_HEDGE_DELAY: Duration = Duration::from_millis(500);
 
 /// Peers a lookup must know of before it can tell likely holders apart. With
 /// fewer, as on a cold start, every known peer looks close and all are asked
