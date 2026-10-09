@@ -6,7 +6,14 @@ use std::{collections::HashSet, future::Future, time::Duration};
 
 pub(crate) const MAX_GET_FALLBACK_PEERS: usize = 20;
 pub(crate) const CLOSE_GROUP_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// A stalled early GET may race one other candidate after this delay, sized to
+/// a healthy peer's transfer of a 4 MiB record. That takes about a second over
+/// QUIC, but 1-3 s over a browser's WebRTC DataChannel, where a 1 s delay raced
+/// nearly every read and fetched a second copy.
+#[cfg(not(target_arch = "wasm32"))]
 const EARLY_READ_HEDGE_DELAY: Duration = Duration::from_secs(1);
+#[cfg(target_arch = "wasm32")]
+const EARLY_READ_HEDGE_DELAY: Duration = Duration::from_secs(3);
 /// Speculative GETs per round are bounded by this multiple of the early
 /// allowance, including hints that may hold the record after stale hints used it.
 const MAX_EARLY_READS_PER_ALLOWANCE: usize = 2;
