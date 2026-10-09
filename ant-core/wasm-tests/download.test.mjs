@@ -231,6 +231,28 @@ let largeFile;
 // Larger than the read-ahead window plus the last record.
 const large = () => (largeFile ??= recordFile(12));
 
+test("a download keeps as many GETs in flight as the read budget admits", async () => {
+  // Every node holds every record and multiplexes, so neither one session nor
+  // one holder bounds the download; the read budget, of 8 GETs, does.
+  const { original, encrypted } = large();
+  let active = 0, peak = 0;
+  const rtc = mockWebRtc(Array.from({ length: 4 }, () => ({
+    multiplex: true,
+    respond(_channel, method) { if (method === "get_chunk") peak = Math.max(peak, ++active); },
+    delay: method => method === "get_chunk" ? 200 : 0,
+    delivered(_channel, method) { if (method === "get_chunk") active--; },
+  })));
+  for (const store of rtc.stores) {
+    for (const record of encrypted.records) store.set(record.address, record.content);
+  }
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const result = await client.downloadPublicFile(encrypted.address, undefined);
+    assert.deepEqual(result.content, original);
+    assert(peak > 4 && peak <= 8, `${peak} GETs in flight`);
+  } finally { client.close(); }
+});
+
 test("a streaming reader reads ahead from any read; an ordinary one only fetches the next record", async () => {
   const { original, encrypted, starts } = recordFile(5);
   for (const streaming of [true, false]) {

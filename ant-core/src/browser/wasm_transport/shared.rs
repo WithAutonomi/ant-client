@@ -11,6 +11,11 @@ use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, WitnessedCloseGroup};
 use ant_protocol::{ChunkMessage, ChunkMessageBody};
 use futures::future::LocalBoxFuture;
 
+/// Speculative GETs, such as read-ahead, are admitted as if the read cap were at
+/// most this. They hold half of it, so a node's multiplexed session always has a
+/// slot left for a GET a read waits for, such as a seek's.
+const SPECULATIVE_READ_LIMIT: usize = multiplex::MAX_REQUESTS;
+
 pub(super) struct SharedNetworkAdapter {
     pub(super) inner: Rc<BrowserNetworkCore>,
     local_peer: PeerId,
@@ -61,7 +66,14 @@ impl SharedNetworkAdapter {
         crate::runtime::timeout(
             admission.remaining(),
             self.inner.pool.read_budget.acquire(
-                || self.inner.pool.read_limit(),
+                || {
+                    let limit = self.inner.pool.read_limit();
+                    if self.is_speculative(request) {
+                        limit.min(SPECULATIVE_READ_LIMIT)
+                    } else {
+                        limit
+                    }
+                },
                 || self.is_speculative(request),
             ),
         )
