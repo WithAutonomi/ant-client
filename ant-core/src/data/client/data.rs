@@ -423,6 +423,24 @@ impl Client {
             .await
     }
 
+    /// Resolve a shrunk (child) `DataMap` to the root map that lists the
+    /// file's data chunks, fetching the wrapper records it points at. A map
+    /// that is already a root is returned unchanged without any fetch.
+    ///
+    /// # Errors
+    /// Returns the underlying fetch error, or an encryption error when a
+    /// wrapper record does not decode to a DataMap.
+    pub async fn data_map_resolve_root(&self, data_map: &DataMap) -> Result<DataMap> {
+        if !data_map.is_child() {
+            return Ok(data_map.clone());
+        }
+        let fetch = |address| async move { self.fetch_data_record(address).await };
+        let cap = || self.controller().fetch.current();
+        crate::client_engine::files::resolve(data_map, &fetch, &cap)
+            .await
+            .map_err(map_read_error)
+    }
+
     /// As [`Client::data_download_range`], taking records from `held` and
     /// fetching those it resolves to `None`. A record that `held` resolves to
     /// an error counts as a failed fetch attempt, which the read retries by

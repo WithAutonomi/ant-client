@@ -8,14 +8,17 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use ant_core::data::manifest::path::portable_component;
 use ant_core::data::{
-    spawn_download_diagnostics_writer, Client, CollisionPolicy, CostEstimateConfidence,
-    DownloadEvent, Error as DataError, FileChunkPeerReport, FileChunkPeerReportPeer,
-    FileChunkPeerStatus, FileChunkPeerSweepReport, PaymentMode, UploadEvent,
+    embeddable_data_map, parse_link, spawn_download_diagnostics_writer, Client, CollisionPolicy,
+    ContentRef, CostEstimateConfidence, DownloadEvent, Error as DataError, FileChunkPeerReport,
+    FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport, Link, Manifest,
+    ManifestEntry, PaymentMode, UploadEvent,
 };
 use ant_core::datamap_file::{original_name_from_datamap, read_datamap, write_datamap};
 
-use super::chunk::{parse_address, xor_distance_decimal};
+use super::chunk::xor_distance_decimal;
+use super::manifest::record_upload_manifest;
 use crate::progress;
 
 /// File subcommands.
@@ -55,20 +58,21 @@ pub enum FileAction {
     /// Download a file from the network.
     ///
     /// Public:  `ant file download ADDRESS -o output.pdf`
+    /// Public (link): `ant file download ant://ADDRESS`
     /// Private: `ant file download --datamap photo.jpg.datamap`
     /// Private (custom output): `ant file download --datamap photo.jpg.datamap -o keep.jpg`
     Download {
-        /// Hex-encoded address (public data map address).
-        /// Required unless --datamap is provided.
+        /// Public data map address: 64 hex characters or an `ant://ADDRESS`
+        /// link. Required unless --datamap is provided.
         #[arg(required_unless_present = "datamap")]
         address: Option<String>,
         /// Path to a local data map file (for private downloads).
         #[arg(long)]
         datamap: Option<PathBuf>,
-        /// Output file path. Required for `--address` downloads. Optional for
-        /// `--datamap` downloads — defaults to the original filename derived
-        /// from the datamap basename (e.g. `photo.jpg.datamap` → `photo.jpg`,
-        /// written to the current directory).
+        /// Output file path. Defaults to the hex address for address
+        /// downloads, and for `--datamap` downloads to the original filename
+        /// derived from the datamap basename (e.g. `photo.jpg.datamap` →
+        /// `photo.jpg`), written to the current directory.
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Number of closest peers to try for each chunk fetch.
@@ -112,21 +116,34 @@ impl FileAction {
     }
 }
 
+/// Parse a public file address: bare hex or an `ant://ADDRESS` link.
+fn parse_file_address(input: &str) -> anyhow::Result<[u8; 32]> {
+    match parse_link(input)? {
+        Link::File(address) => Ok(address),
+        Link::Manifest(_) => anyhow::bail!(
+            "this is a manifest link, not a file address; use `ant manifest download`"
+        ),
+    }
+}
+
 /// Resolve the on-disk output path for `file download`.
 ///
-/// `--address` downloads have nothing to derive from, so `-o/--output` is
-/// mandatory. `--datamap` downloads default to the original filename baked
-/// into the datamap basename (`photo.jpg.datamap` → `photo.jpg`), written
-/// to the current working directory.
+/// Address downloads default to the hex address as the filename (ADR-0006:
+/// a file link downloads with no further input). `--datamap` downloads
+/// default to the original filename baked into the datamap basename
+/// (`photo.jpg.datamap` → `photo.jpg`), written to the current directory.
 fn resolve_download_output(
     output: Option<PathBuf>,
     datamap: Option<&Path>,
+    address: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
     if let Some(p) = output {
         return Ok(p);
     }
-    let dm = datamap
-        .ok_or_else(|| anyhow::anyhow!("-o/--output is required when downloading by --address"))?;
+    if let Some(addr) = address {
+        return Ok(PathBuf::from(hex::encode(parse_file_address(addr)?)));
+    }
+    let dm = datamap.ok_or_else(|| anyhow::anyhow!("an address or --datamap is required"))?;
     let basename = original_name_from_datamap(dm).ok_or_else(|| {
         anyhow::anyhow!(
             "Cannot derive output filename from {}; pass -o/--output explicitly",
@@ -170,7 +187,8 @@ impl FileAction {
                 all_peers,
                 download_diagnostics,
             } => {
-                let resolved_output = resolve_download_output(output, datamap.as_deref())?;
+                let resolved_output =
+                    resolve_download_output(output, datamap.as_deref(), address.as_deref())?;
                 handle_file_download(
                     client,
                     address.as_deref(),
@@ -285,6 +303,41 @@ async fn handle_file_upload(
 
     let elapsed = start.elapsed();
 
+    let original_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Cannot determine source filename from {}", path.display())
+        })?;
+
+    // Every upload is remembered as a one-entry manifest in the upload
+    // history (ADR-0006), so it can be listed and downloaded again. The
+    // DataMap is embedded whether or not the upload was public, as the root
+    // map when that is small enough so a later download starts on data
+    // chunks at once; if resolving the root fails the shrunk map is kept.
+    // A file name that breaks the portable path rules is repaired, or
+    // dropped so the entry extracts under its content address, rather than
+    // losing the record.
+    let recorded_map = match embeddable_data_map(client, &result.data_map).await {
+        Ok(map) => map,
+        Err(e) => {
+            eprintln!("warning: could not resolve the root DataMap for the upload record: {e}");
+            result.data_map.clone()
+        }
+    };
+    let record = Manifest {
+        name: None,
+        torrent: None,
+        entries: vec![ManifestEntry {
+            path: portable_component(&original_name),
+            size: Some(file_size),
+            source: ContentRef::Embedded {
+                data_map: recorded_map,
+            },
+        }],
+    };
+    let manifest_id = record_upload_manifest(&record, Some(&original_name));
+
     if public {
         let dm_address = result
             .data_map_address
@@ -310,6 +363,7 @@ async fn handle_file_upload(
                 chunk_attempts_total: result.chunk_attempts_total,
                 store_durations_ms: result.store_durations_ms.clone(),
                 retries_histogram: result.retries_histogram,
+                manifest_id: manifest_id.clone(),
             };
             println!("{}", serde_json::to_string(&out)?);
         } else {
@@ -323,6 +377,7 @@ async fn handle_file_upload(
             println!();
             println!("Anyone can download this file with:");
             println!("  ant file download {hex_addr} -o <FILE>");
+            print_recorded(manifest_id.as_deref());
         }
 
         info!(
@@ -334,12 +389,6 @@ async fn handle_file_upload(
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let original_name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Cannot determine source filename from {}", path.display())
-            })?;
         let datamap_path =
             write_datamap(parent, &original_name, &result.data_map, collision_policy)
                 .map_err(|e| anyhow::anyhow!("Failed to persist datamap: {e}"))?;
@@ -362,6 +411,7 @@ async fn handle_file_upload(
                 chunk_attempts_total: result.chunk_attempts_total,
                 store_durations_ms: result.store_durations_ms.clone(),
                 retries_histogram: result.retries_histogram,
+                manifest_id: manifest_id.clone(),
             };
             println!("{}", serde_json::to_string(&out)?);
         } else {
@@ -375,6 +425,7 @@ async fn handle_file_upload(
             println!();
             println!("Download this file with:");
             println!("  ant file download --datamap {}", datamap_path.display());
+            print_recorded(manifest_id.as_deref());
         }
 
         info!(
@@ -470,7 +521,7 @@ async fn handle_file_download(
     let download_result: anyhow::Result<Option<FilePeerCheckJson>> = async {
         let data_map = if let Some(addr_hex) = address {
             info!("Downloading public file from address {addr_hex}");
-            let address = parse_address(addr_hex)?;
+            let address = parse_file_address(addr_hex)?;
             if !json_output {
                 let spinner = progress::new_spinner("Fetching data map...");
                 let result = if let Some(peer_count) = peer_count {
@@ -735,6 +786,16 @@ struct UploadJsonResult {
     store_durations_ms: Vec<u64>,
     /// Stored-chunk count by retry round (index 0 = first attempt).
     retries_histogram: [usize; 4],
+    /// Id of the upload-history record, when it could be written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_id: Option<String>,
+}
+
+/// Tell the user where the upload was recorded.
+fn print_recorded(manifest_id: Option<&str>) {
+    if let Some(id) = manifest_id {
+        println!("Recorded as {id} (ant manifest download {id})");
+    }
 }
 
 #[derive(Serialize)]
@@ -1110,38 +1171,49 @@ mod tests {
         let explicit = PathBuf::from("custom/path.bin");
         let datamap = PathBuf::from("photo.jpg.datamap");
         let resolved =
-            resolve_download_output(Some(explicit.clone()), Some(datamap.as_path())).unwrap();
+            resolve_download_output(Some(explicit.clone()), Some(datamap.as_path()), None).unwrap();
         assert_eq!(resolved, explicit);
     }
 
     #[test]
     fn resolve_download_output_explicit_wins_even_without_datamap() {
         let explicit = PathBuf::from("out.bin");
-        let resolved = resolve_download_output(Some(explicit.clone()), None).unwrap();
+        let resolved = resolve_download_output(Some(explicit.clone()), None, None).unwrap();
         assert_eq!(resolved, explicit);
     }
 
     #[test]
     fn resolve_download_output_derives_from_datamap_basename() {
         let datamap = PathBuf::from("photo.jpg.datamap");
-        let resolved = resolve_download_output(None, Some(datamap.as_path())).unwrap();
+        let resolved = resolve_download_output(None, Some(datamap.as_path()), None).unwrap();
         assert_eq!(resolved, PathBuf::from("photo.jpg"));
     }
 
     #[test]
     fn resolve_download_output_derives_from_full_datamap_path() {
         let datamap = PathBuf::from("/tmp/sub/archive.tar.gz.datamap");
-        let resolved = resolve_download_output(None, Some(datamap.as_path())).unwrap();
+        let resolved = resolve_download_output(None, Some(datamap.as_path()), None).unwrap();
         assert_eq!(resolved, PathBuf::from("archive.tar.gz"));
     }
 
     #[test]
-    fn resolve_download_output_errors_on_address_download_without_output() {
-        let err = resolve_download_output(None, None).unwrap_err();
+    fn resolve_download_output_errors_without_address_or_datamap() {
+        let err = resolve_download_output(None, None, None).unwrap_err();
         assert!(
-            err.to_string().contains("--output"),
-            "expected --output guidance, got: {err}"
+            err.to_string().contains("--datamap"),
+            "expected guidance, got: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_download_output_defaults_to_hex_for_address_and_link() {
+        let hex64 = "ab".repeat(32);
+        let resolved = resolve_download_output(None, None, Some(&hex64)).unwrap();
+        assert_eq!(resolved, PathBuf::from(&hex64));
+        let link = format!("ant://{hex64}");
+        let resolved = resolve_download_output(None, None, Some(&link)).unwrap();
+        assert_eq!(resolved, PathBuf::from(&hex64));
+        assert!(resolve_download_output(None, None, Some("ant://manifest/AAAA")).is_err());
     }
 
     #[test]
@@ -1149,7 +1221,7 @@ mod tests {
         // `.datamap` strips to an empty stem; we refuse to default-save
         // to "" and instead instruct the user to pass -o.
         let datamap = PathBuf::from(".datamap");
-        let err = resolve_download_output(None, Some(datamap.as_path())).unwrap_err();
+        let err = resolve_download_output(None, Some(datamap.as_path()), None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Cannot derive"), "got: {msg}");
         assert!(msg.contains("-o/--output"), "got: {msg}");
@@ -1158,7 +1230,7 @@ mod tests {
     #[test]
     fn resolve_download_output_errors_on_non_datamap_extension() {
         let datamap = PathBuf::from("photo.jpg");
-        let err = resolve_download_output(None, Some(datamap.as_path())).unwrap_err();
+        let err = resolve_download_output(None, Some(datamap.as_path()), None).unwrap_err();
         assert!(err.to_string().contains("Cannot derive"));
     }
 

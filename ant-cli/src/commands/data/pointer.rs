@@ -178,8 +178,12 @@ impl PointerAction {
                 let (kind, target) = describe_target(&target);
                 if json {
                     println!("{}", json!({ "kind": kind, "target": target }));
-                } else {
+                } else if kind == "chunk" {
                     println!("{target}");
+                } else {
+                    // A chain can end at a kind this build does not know. Say so,
+                    // rather than print it where a chunk address would be.
+                    println!("{kind} {target}");
                 }
             }
         }
