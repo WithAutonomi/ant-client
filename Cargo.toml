@@ -3,13 +3,12 @@ members = ["ant-core", "ant-cli"]
 resolver = "2"
 
 
-# V2-1358 / ant-node ADR-0020 stack, built against sibling checkouts until the
-# saorsa-core, ant-protocol and ant-node branches are released: saorsa-core's
-# lookup steps, ant-protocol's get-or-closer request, and ant-node answering
-# it (for the in-process test nodes). saorsa-core pins saorsa-transport by
-# git rev, so the direct dependency takes the same rev.
+# ant-node ADR-0020 (V2-1358): saorsa-core's lookup steps, ant-protocol's
+# get-or-closer request, and ant-node answering it (for the in-process test
+# nodes). saorsa-core pins saorsa-transport by git rev, so the direct
+# dependency takes the same rev. Drop these once releases include them.
 [patch.crates-io]
-saorsa-core = { path = "../saorsa-core-v2-1358-kad" }
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "b3a36bedeb9af318142262871820833259da839f" }
 saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320" }
-ant-protocol = { path = "../ant-protocol-v2-1358-kad" }
-ant-node = { path = "../ant-node-v2-1358-kad" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "b2f0e18be3ac7ed58d3acecde13373be82b3c01d" }
+ant-node = { git = "https://github.com/WithAutonomi/ant-node", rev = "f5b82587fa1de4948c4e354c5537a9c72b2926af" }
