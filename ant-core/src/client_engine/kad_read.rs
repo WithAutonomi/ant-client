@@ -177,13 +177,15 @@ async fn serve_step<N: KadNetwork>(
     }
 
     // A peer that predates get-or-closer: FIND_NODE answers the lookup, and a
-    // GET sent with it may still be transferring after that.
+    // GET sent with it may still be transferring after that. FIND_NODE is
+    // polled first, so both requests always go out in the same step.
     let find = network.find_node(&peer);
     let get = network.get(&peer);
     tokio::pin!(find, get);
     let mut reply = Some(reply);
     let fetched = loop {
         tokio::select! {
+            biased;
             nodes = &mut find, if reply.is_some() => {
                 if let Some(reply) = reply.take() {
                     let _ = reply.send(closer_reply(nodes));
