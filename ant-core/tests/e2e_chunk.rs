@@ -121,6 +121,44 @@ async fn test_chunk_put_duplicate_is_idempotent() {
     testnet.teardown().await;
 }
 
+/// ADR-0020: every test node announces get-or-closer, so a kad read must ask
+/// each peer for the chunk and for closer peers in one request, never a plain
+/// GET, and find a stored chunk without the ordinary read path behind it.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_chunk_get_or_closer_reads_from_upgraded_nodes() {
+    let (client, testnet) = setup().await;
+    let content = Bytes::from("ant-core get-or-closer e2e payload");
+    let address = client
+        .chunk_put(content.clone())
+        .await
+        .expect("chunk_put should succeed with payment");
+    let gets_before = testnet.reads.gets();
+
+    let chunk = client
+        .chunk_get_kad_only(&address)
+        .await
+        .expect("kad read should succeed")
+        .expect("a stored chunk should be found");
+    assert_eq!(chunk.content.as_ref(), content.as_ref());
+    assert!(testnet.reads.get_or_closers() > 0);
+    assert_eq!(
+        testnet.reads.gets(),
+        gets_before,
+        "no plain GET should go to a node that answers get-or-closer"
+    );
+
+    let missing = client
+        .chunk_get_kad_only(&[0xDE; 32])
+        .await
+        .expect("kad read should succeed");
+    assert!(missing.is_none(), "a missing chunk should not be found");
+
+    drop(client);
+    testnet.teardown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_chunk_get_nonexistent_returns_none() {
