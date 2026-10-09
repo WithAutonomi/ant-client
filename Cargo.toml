@@ -5,10 +5,9 @@ resolver = "2"
 
 # ant-node ADR-0020 (V2-1358): saorsa-core's lookup steps, ant-protocol's
 # get-or-closer request, and ant-node answering it (for the in-process test
-# nodes). saorsa-core pins saorsa-transport by git rev, so the direct
-# dependency takes the same rev. Drop these once releases include them.
+# nodes), each on the rc-2026.10.1 release baseline. Drop these once
+# releases include them.
 [patch.crates-io]
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "b3a36bedeb9af318142262871820833259da839f" }
-saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320" }
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "b2f0e18be3ac7ed58d3acecde13373be82b3c01d" }
-ant-node = { git = "https://github.com/WithAutonomi/ant-node", rev = "f5b82587fa1de4948c4e354c5537a9c72b2926af" }
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "4deab7562ea48ee9c2152ea8b69d5d644fa92721" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "69a031bacd106100376f1914718bfbd44bb1e955" }
+ant-node = { git = "https://github.com/WithAutonomi/ant-node", rev = "79385bfddc04a26b5c0747b3355364c12b9a127b" }
