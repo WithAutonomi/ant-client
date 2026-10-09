@@ -100,6 +100,11 @@ const DEFAULT_BROWSER_QUOTE_CONCURRENCY: usize = 4;
 const MAX_READ_RESPONSE_MEMORY: usize = 128 * 1024 * 1024;
 const READ_RESPONSE_RESERVATION: usize =
     3 * (MAX_BROWSER_RESPONSE_BYTES + PQ_ENCRYPTED_OVERHEAD_BYTES);
+/// Chunk fetches a browser client starts with: as many GETs as the read budget
+/// admits at once. A WebRTC DataChannel carries a record more slowly than QUIC,
+/// so the native cold start of 4 left half the budget idle. The adaptive
+/// controller still backs off from here.
+const BROWSER_FETCH_START: usize = MAX_READ_RESPONSE_MEMORY / READ_RESPONSE_RESERVATION;
 const MAX_BROWSER_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_UPLOAD_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
@@ -2443,7 +2448,12 @@ impl BrowserNetworkClient {
                     MAX_RANGE_CACHE_BYTES / MAX_BROWSER_RECORD_BYTES,
                 )),
         );
-        *inner.pool.fetch_limiter.borrow_mut() = Some(shared.controller().fetch.clone());
+        let controller = shared.controller();
+        controller.warm_start(crate::data::client::adaptive::ChannelStart {
+            fetch: BROWSER_FETCH_START,
+            ..controller.snapshot()
+        });
+        *inner.pool.fetch_limiter.borrow_mut() = Some(controller.fetch.clone());
         let read_ahead = read_ahead::ReadAheadPool::new(&inner, &shared);
         Ok(Self {
             inner,
