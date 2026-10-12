@@ -25,6 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   This is what makes an npm install usable out of the box: npm 12 blocks package install scripts
   by default, so the step that copies that file into the config directory frequently does not
   run.
+- `data::Error::InsufficientFunds { have, need }` (amounts in atto): a wallet whose payment-token
+  balance is below the payment total now fails with this instead of a generic
+  `Error::Payment(String)`, so consumers such as the mobile SDK can offer "top up your wallet"
+  without matching on message text (#152). It covers every wallet-backed payment path: the
+  journaled native path that file and data uploads use, the wave-batch and Merkle batch paths, and
+  single-chunk payment. Nothing has been paid when it is returned, because the wallet checks its
+  balance before sending. A shortfall after earlier batches of the same upload were paid still
+  surfaces as `PartialUpload`, with this error as its reason, so the spend is still reported. The
+  CLI's message changes from `payment error: Insufficient tokens to pay for quotes. Have: …` to
+  `insufficient funds: wallet has … atto, payment needs … atto`. A shortfall of gas (ETH) is not
+  detected up front and is unchanged.
 
 ### Changed
 - `ant update` no longer replaces the binary when `ant` was installed by a package manager. It

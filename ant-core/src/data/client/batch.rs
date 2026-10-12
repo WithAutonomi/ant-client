@@ -97,7 +97,7 @@ impl SingleNodeQuotePayment {
                 .pay_for_quotes(quote_payments)
                 .await
                 .map_err(|PayForQuotesError(err, _)| {
-                    Error::Payment(format!("Failed to pay for quotes: {err}"))
+                    Error::from_payment_failure(format!("Failed to pay for quotes: {err}"))
                 })?;
 
         let mut result_hashes = Vec::new();
@@ -544,7 +544,7 @@ impl Client {
                 .pay_for_quotes(all_payments)
                 .await
                 .map_err(|PayForQuotesError(err, _)| {
-                    Error::Payment(format!("Batch payment failed: {err}"))
+                    Error::from_payment_failure(format!("Batch payment failed: {err}"))
                 })?;
 
         info!(

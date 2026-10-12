@@ -293,7 +293,7 @@ mod settlement_refusal_tests {
 ///   network stress these are how transport failures surface)
 /// - `PartialUpload` -> `NetworkError` (literal capacity signal: some
 ///   chunks could not be stored)
-/// - `AlreadyStored`, `Encryption`, `Crypto`, `Payment`,
+/// - `AlreadyStored`, `Encryption`, `Crypto`, `Payment`, `InsufficientFunds`,
 ///   `Serialization`, `InvalidData`, `NotFound`, `SignatureVerification`,
 ///   `Config`, `InsufficientDiskSpace`, `CostEstimationInconclusive`,
 ///   `Cancelled` -> `ApplicationError` (would happen on a perfectly
@@ -324,6 +324,7 @@ pub(crate) fn classify_error(err: &Error) -> Outcome {
         | Error::Encryption(_)
         | Error::Crypto(_)
         | Error::Payment(_)
+        | Error::InsufficientFunds { .. }
         | Error::Serialization(_)
         | Error::InvalidData(_)
         // A definitively absent record, reported over a working link —
@@ -1076,6 +1077,13 @@ mod tests {
             ),
             (Error::Storage("s".to_string()), Outcome::NetworkError),
             (Error::Payment("p".to_string()), Outcome::ApplicationError),
+            (
+                Error::InsufficientFunds {
+                    have: ant_protocol::evm::Amount::ZERO,
+                    need: ant_protocol::evm::Amount::from(1),
+                },
+                Outcome::ApplicationError,
+            ),
             (Error::Protocol("p".to_string()), Outcome::NetworkError),
             (
                 Error::InvalidData("d".to_string()),
@@ -1231,6 +1239,7 @@ mod tests {
             | Error::InsufficientPeers(_)
             | Error::Storage(_)
             | Error::Payment(_)
+            | Error::InsufficientFunds { .. }
             | Error::Protocol(_)
             | Error::InvalidData(_)
             | Error::NotFound(_)
