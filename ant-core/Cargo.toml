@@ -101,6 +101,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "RtcDataChannelInit",
     "RtcDataChannelState",
     "RtcDataChannelType",
+    "RtcIceConnectionState",
     "RtcIceGatheringState",
     "RtcPeerConnection",
     "RtcPeerConnectionState",

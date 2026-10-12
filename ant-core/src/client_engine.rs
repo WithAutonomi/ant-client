@@ -241,13 +241,17 @@ where
 
     fn record(&mut self, peer: K, endpoint: String, cooldown: Duration) {
         if !self.entries.contains_key(&peer) && self.entries.len() >= self.max_entries {
-            let oldest = self
+            // Evict whichever record expires first, so a short refusal never
+            // outlives a long failure.
+            let soonest = self
                 .entries
                 .iter()
-                .max_by_key(|(_, record)| record.failed_at.elapsed())
+                .min_by_key(|(_, record)| {
+                    record.cooldown.saturating_sub(record.failed_at.elapsed())
+                })
                 .map(|(peer, _)| peer.clone());
-            if let Some(oldest) = oldest {
-                self.entries.remove(&oldest);
+            if let Some(soonest) = soonest {
+                self.entries.remove(&soonest);
             }
         }
         self.entries.insert(
@@ -283,13 +287,25 @@ mod tests {
     #[test]
     fn refusal_expires_after_its_shorter_cooldown() {
         let mut cache =
-            EndpointFailureCache::new(Duration::from_secs(60), Duration::from_millis(20), 8);
+            EndpointFailureCache::new(Duration::from_secs(60), Duration::from_millis(500), 8);
         cache.record_refusal(7_u8, "endpoint".to_string());
         cache.record_failure(8_u8, "endpoint".to_string());
         assert!(cache.is_suppressed(&7, "endpoint"));
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(600));
         assert!(!cache.is_suppressed(&7, "endpoint"));
         assert!(cache.is_suppressed(&8, "endpoint"));
+    }
+
+    #[test]
+    fn eviction_drops_a_refusal_before_a_longer_failure() {
+        let mut cache =
+            EndpointFailureCache::new(Duration::from_secs(60), Duration::from_secs(15), 2);
+        cache.record_failure(7_u8, "failed".to_string());
+        cache.record_refusal(8_u8, "refused".to_string());
+        cache.record_failure(9_u8, "new".to_string());
+        assert!(cache.is_suppressed(&7, "failed"));
+        assert!(!cache.is_suppressed(&8, "refused"));
+        assert!(cache.is_suppressed(&9, "new"));
     }
 
     #[test]

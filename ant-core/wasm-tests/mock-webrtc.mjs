@@ -121,6 +121,7 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
 
   globalThis.RTCPeerConnection = class {
     connectionState = "new";
+    iceConnectionState = "new";
     iceGatheringState = "new";
     constructor() {
       connections.push(this);
@@ -167,6 +168,17 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
       // the browser fails the association without connecting (ant-node ADR-0023).
       if (this.dial <= (nodes[this.remoteSeed - 1].refuseDials ?? 0)) {
         setTimeout(() => {
+          this.iceConnectionState = "failed";
+          this.connectionState = "failed";
+          this.onconnectionstatechange?.(new Event("connectionstatechange"));
+        }, REFUSAL_MS);
+        return;
+      }
+      // A different node at the endpoint answers ICE, but fails the DTLS
+      // certificate check, so the association fails after ICE connected.
+      if (this.dial <= (nodes[this.remoteSeed - 1].failDtlsDials ?? 0)) {
+        setTimeout(() => {
+          this.iceConnectionState = "connected";
           this.connectionState = "failed";
           this.onconnectionstatechange?.(new Event("connectionstatechange"));
         }, REFUSAL_MS);
@@ -204,6 +216,7 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
       }
       if (channel.options.connectDelay) await new Promise(resolve => setTimeout(resolve, channel.options.connectDelay));
       if (this.connectionState === "new") this.connectionState = "connected";
+      this.iceConnectionState = "connected";
       setTimeout(() => channel.onopen?.({}), 0);
     }
     close() {

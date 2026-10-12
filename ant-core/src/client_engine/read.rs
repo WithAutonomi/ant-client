@@ -83,30 +83,30 @@ fn spread_close_group<P>(peers: &mut [P], choose: &mut impl FnMut(usize) -> usiz
     }
 }
 
-/// The next hint to read before discovery completes. Unattempted hints in the
-/// close group as currently known (the nearest `CLOSE_GROUP_SIZE` hints) are
-/// chosen between with `choose`; once all of those have been tried, the
-/// nearest remaining hint is next.
+/// The next hint to read before discovery completes. Unattempted, `eligible`
+/// hints in the close group as currently known (the nearest `CLOSE_GROUP_SIZE`
+/// hints) are chosen between with `choose`; once none of those remain, the
+/// nearest remaining eligible hint is next.
 fn next_early_peer<'a, P>(
     hints: &'a [P],
     attempted: &HashSet<[u8; 32]>,
     target: &[u8; 32],
     key: impl Fn(&P) -> [u8; 32],
+    eligible: impl Fn(&P) -> bool,
     choose: &mut impl FnMut(usize) -> usize,
 ) -> Option<&'a P> {
     let mut ranked = hints.iter().collect::<Vec<_>>();
     ranked.sort_by_key(|peer| ant_protocol::transport::xor_distance(&key(peer), target));
     ranked.dedup_by_key(|peer| key(peer));
+    let readable = |peer: &P| !attempted.contains(&key(peer)) && eligible(peer);
     let close_group = ranked
         .iter()
         .take(CLOSE_GROUP_SIZE)
-        .filter(|peer| !attempted.contains(&key(peer)))
+        .filter(|peer| readable(peer))
         .copied()
         .collect::<Vec<_>>();
     let Some(last) = close_group.len().checked_sub(1) else {
-        return ranked
-            .into_iter()
-            .find(|peer| !attempted.contains(&key(peer)));
+        return ranked.into_iter().find(|peer| readable(peer));
     };
     close_group
         .get(choose(close_group.len()).min(last))
@@ -186,11 +186,15 @@ where
                 let within_allowance = attempted.len() < allowance;
                 let next = {
                     let hints = updates.borrow_and_update();
-                    next_early_peer(&hints, &attempted, &target, &key, &mut choose)
-                        .filter(|peer| {
-                            within_allowance || may_hold(&attempted, &key(peer), &target)
-                        })
-                        .cloned()
+                    next_early_peer(
+                        &hints,
+                        &attempted,
+                        &target,
+                        &key,
+                        |peer| within_allowance || may_hold(&attempted, &key(peer), &target),
+                        &mut choose,
+                    )
+                    .cloned()
                 };
                 if let Some(peer) = next {
                     let id = key(&peer);
@@ -894,11 +898,25 @@ mod tests {
             len - 1
         };
         let attempted = HashSet::new();
-        let next = next_early_peer(&hints, &attempted, &peer(0), |p| *p, &mut farthest);
+        let next = next_early_peer(
+            &hints,
+            &attempted,
+            &peer(0),
+            |p| *p,
+            |_| true,
+            &mut farthest,
+        );
         assert_eq!(next, Some(&peer(7)));
 
         let attempted = [1, 2].map(peer).into_iter().collect::<HashSet<_>>();
-        let next = next_early_peer(&hints, &attempted, &peer(0), |p| *p, &mut farthest);
+        let next = next_early_peer(
+            &hints,
+            &attempted,
+            &peer(0),
+            |p| *p,
+            |_| true,
+            &mut farthest,
+        );
         assert_eq!(next, Some(&peer(7)));
         assert_eq!(
             *offered.borrow(),
@@ -908,9 +926,31 @@ mod tests {
         // Once the known close group has been tried, the nearest hint is next
         // without consulting the chooser.
         let attempted = (1..=7).map(peer).collect::<HashSet<_>>();
-        let next = next_early_peer(&hints, &attempted, &peer(0), |p| *p, &mut farthest);
+        let next = next_early_peer(
+            &hints,
+            &attempted,
+            &peer(0),
+            |p| *p,
+            |_| true,
+            &mut farthest,
+        );
         assert_eq!(next, Some(&peer(8)));
         assert_eq!(offered.borrow().len(), 2);
+    }
+
+    #[test]
+    fn an_ineligible_hint_is_never_chosen_over_an_eligible_one() {
+        let hints = (1..10).map(peer).collect::<Vec<_>>();
+        let attempted = HashSet::new();
+        let next = next_early_peer(
+            &hints,
+            &attempted,
+            &peer(0),
+            |p| *p,
+            |p| *p == peer(1),
+            &mut |len: usize| len - 1,
+        );
+        assert_eq!(next, Some(&peer(1)));
     }
 
     #[test]

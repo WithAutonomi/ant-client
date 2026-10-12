@@ -53,13 +53,15 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelState,
-    RtcDataChannelType, RtcIceGatheringState, RtcPeerConnection, RtcPeerConnectionState,
-    RtcSdpType, RtcSessionDescriptionInit,
+    RtcDataChannelType, RtcIceConnectionState, RtcIceGatheringState, RtcPeerConnection,
+    RtcPeerConnectionState, RtcSdpType, RtcSessionDescriptionInit,
 };
 
 const REQUEST_TIMEOUT_MS: u32 = 10_000;
 /// Lane failure reported when the browser declares the peer connection dead.
 const PEER_CONNECTION_FAILED: &str = "WebRTC peer connection failed";
+/// Lane failure recorded when the node closes a DataChannel.
+const DATA_CHANNEL_CLOSED: &str = "WebRTC DataChannel closed";
 /// Advertised by a node whose `chunk_protocol` admits pointer reads and paid
 /// pointer writes (ADR-0016).
 const POINTER_PROTOCOL_CAPABILITY: &str = "pointer_protocol";
@@ -98,8 +100,8 @@ const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 /// ADR-0023).
 const ENDPOINT_REFUSAL_COOLDOWN: Duration = Duration::from_secs(15);
 /// A fresh association that the browser declares failed this soon after its
-/// ICE checks began, without ever connecting, was answered with a STUN error:
-/// the node's transport refused it for capacity. A refusal arrives within a
+/// ICE checks began, before ICE ever connected, was answered with a STUN
+/// error: the node's transport refused it for capacity. A refusal arrives within a
 /// few round trips (66 ms in Chromium, 100 ms in WebKit on loopback), while
 /// both kept checking an unanswering node until the 10 s channel-open timeout.
 const REFUSAL_DETECTION_WINDOW: Duration = Duration::from_secs(3);
@@ -888,7 +890,7 @@ impl Connection {
         let close_inbox = Rc::clone(&inbox);
         let close_open = Rc::clone(&open_tx);
         let on_close = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
-            close_inbox.fail("WebRTC DataChannel closed".to_string());
+            close_inbox.fail(DATA_CHANNEL_CLOSED.to_string());
             if let Some(sender) = close_open.borrow_mut().take() {
                 let _ = sender.send(Err("WebRTC DataChannel closed before opening".into()));
             }
@@ -1014,23 +1016,29 @@ impl Connection {
     }
 
     /// Mark a failed fresh dial `Refused` when the node answered it and
-    /// turned it away (ant-node ADR-0023): its transport refused the ICE check, or it
-    /// hung up after ICE and DTLS completed. A connected node whose channel
-    /// is still open failed for another reason, such as authentication, and
-    /// keeps the full failure cooldown.
+    /// turned it away (ant-node ADR-0023): its transport refused the ICE
+    /// check, or it hung up after ICE and DTLS completed. Anything else keeps
+    /// the full failure cooldown: DTLS failing after ICE connected (a
+    /// different node answered), an authentication failure, or a lane this
+    /// client closed itself.
     fn note_refusal(&self, checks_started: Option<web_time::Instant>, outcome: &Cell<DialOutcome>) {
         let Some(checks_started) = checks_started else {
             return;
         };
         let association = &self.peer_connection;
         let refused = if association.connected.get() {
-            association.is_dead()
-                || matches!(
-                    self.data_channel.ready_state(),
-                    RtcDataChannelState::Closing | RtcDataChannelState::Closed
-                )
+            association.is_dead() || self.inbox.failed_with(DATA_CHANNEL_CLOSED)
         } else {
-            association.is_dead() && checks_started.elapsed() < REFUSAL_DETECTION_WINDOW
+            // Chromium declares the association failed while its legacy ICE
+            // state still reads "checking", so test that ICE never connected
+            // rather than that it reads "failed".
+            let ice_connected = matches!(
+                association.ice_connection_state(),
+                RtcIceConnectionState::Connected | RtcIceConnectionState::Completed
+            );
+            association.is_dead()
+                && !ice_connected
+                && checks_started.elapsed() < REFUSAL_DETECTION_WINDOW
         };
         if refused {
             outcome.set(DialOutcome::Refused);

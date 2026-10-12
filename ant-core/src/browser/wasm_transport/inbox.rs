@@ -201,6 +201,11 @@ impl ResponseInbox {
         self.failure.borrow().is_some()
     }
 
+    /// The first failure this inbox recorded was `reason`.
+    pub(super) fn failed_with(&self, reason: &str) -> bool {
+        self.failure.borrow().as_deref() == Some(reason)
+    }
+
     pub(super) fn check_failure(&self) -> Result<(), String> {
         let failure = self.failure.borrow().clone();
         match failure {
