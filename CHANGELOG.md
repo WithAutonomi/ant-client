@@ -65,8 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changed. `--no-modify-path` or `ANT_NO_MODIFY_PATH=1` (also honoured by `install.ps1`) restores
   the old print-the-line behaviour. The macOS default install directory moves from
   `/usr/local/bin`, which is root-owned without Homebrew so the install failed without `sudo`, to
-  `~/.local/bin`, matching Linux. If another `ant` is already on `PATH` — such as an earlier
-  macOS install in `/usr/local/bin` — the installer says so, since it may shadow the new one.
+  `~/.local/bin`, matching Linux. If another `ant` is already on `PATH` — an earlier macOS
+  install in `/usr/local/bin`, or an unrelated program such as Apache Ant — the installer says
+  so, since it may shadow the new one.
 
 ## [0.3.6] - 2026-09-01
 

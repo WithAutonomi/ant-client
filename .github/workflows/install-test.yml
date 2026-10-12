@@ -83,20 +83,25 @@ jobs:
           cat "$config_file"
 
       # As on Linux (#194), from a fresh-machine PATH. /bin/bash is the 3.2 that `curl | bash` runs
-      # on a stock Mac, and zsh is the default login shell; `zsh -lc` also runs /etc/zprofile's
-      # path_helper, which reorders PATH.
+      # on a stock Mac, and zsh is the default login shell. zsh login shells run /etc/zprofile's
+      # path_helper and Homebrew's shellenv after ~/.zshenv, which put ~/.local/bin behind
+      # /opt/homebrew/bin, where this runner image has Apache Ant (also `ant`). So login shells are
+      # checked for ~/.local/bin on PATH rather than for which `ant` wins.
       - name: verify a default install is on PATH in new shells
         env:
           ANT_VERSION: ${{ inputs.version }}
         run: |
           fresh() { env -i HOME="$HOME" SHELL=/bin/zsh PATH=/usr/bin:/bin "$@"; }
           fresh ANT_VERSION="$ANT_VERSION" /bin/bash install.sh
-          for shell in "zsh -c" "zsh -lc" "zsh -ic" "/bin/bash -lc"; do
-            found="$(fresh $shell 'command -v ant' 2> /dev/null)"
-            echo "$shell: ${found:-<not found>}"
-            [ "$found" = "$HOME/.local/bin/ant" ] || exit 1
+          found="$(fresh zsh -c 'command -v ant')"
+          echo "zsh -c: ${found:-<not found>}"
+          [ "$found" = "$HOME/.local/bin/ant" ]
+          for shell in "zsh -lc" "zsh -ic" "/bin/bash -lc"; do
+            p="$(fresh $shell 'echo $PATH' 2> /dev/null)"
+            echo "$shell: $p"
+            case ":$p:" in *":$HOME/.local/bin:"*) ;; *) exit 1 ;; esac
           done
-          fresh zsh -lc 'ant --version'
+          fresh zsh -c 'ant --version'
 
   test-install-script-windows:
     name: test install.ps1 (Windows)

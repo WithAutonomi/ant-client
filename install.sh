@@ -358,12 +358,15 @@ case ":$PATH:" in
     ;;
 esac
 
-# An older install elsewhere (macOS used to default to /usr/local/bin) can shadow this one.
+# Another `ant` can shadow this one: an older install (macOS used to default to /usr/local/bin), or
+# an unrelated program such as Apache Ant. macOS login shells put /usr/local/bin and Homebrew's bin
+# ahead of ~/.local/bin, so either wins there.
 OTHER_ANT="$(command -v "$BINARY_NAME" 2> /dev/null || true)"
 if [ -n "$OTHER_ANT" ] && [ "$OTHER_ANT" != "${INSTALL_DIR}/${BINARY_NAME}" ]; then
   say ""
-  say "NOTE: another ${BINARY_NAME} is on your PATH at ${OTHER_ANT}, and may run instead of this one."
-  say "Remove whichever copy you no longer use."
+  say "NOTE: ${OTHER_ANT} is also on your PATH and may run instead of this ant."
+  say "If it is an older install of this ant, remove it. If it is another program (Apache Ant is"
+  say "also called ant), put ${INSTALL_DIR} first on your PATH or run ${INSTALL_DIR}/${BINARY_NAME}."
 fi
 
 say ""
