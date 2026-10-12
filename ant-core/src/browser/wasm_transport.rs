@@ -102,7 +102,7 @@ const ENDPOINT_REFUSAL_COOLDOWN: Duration = Duration::from_secs(15);
 /// A fresh association that the browser declares failed this soon after its
 /// ICE checks began, before ICE ever connected, was answered with a STUN
 /// error: the node's transport refused it for capacity. A refusal arrives within a
-/// few round trips (66 ms in Chromium, 100 ms in WebKit on loopback), while
+/// few round trips (67 ms in Chromium, 54 ms in WebKit on loopback), while
 /// both kept checking an unanswering node until the 10 s channel-open timeout.
 const REFUSAL_DETECTION_WINDOW: Duration = Duration::from_secs(3);
 const MAX_BROWSER_ROUTING_ENTRIES: usize = 256;
