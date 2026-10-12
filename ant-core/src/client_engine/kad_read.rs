@@ -125,9 +125,9 @@ enum StepReply {
 ///
 /// # Errors
 ///
-/// Returns the first error `retryable` rejects, such as content that does not
-/// match its address. Every other failure only removes that peer from the
-/// lookup.
+/// Returns the first error `retryable` rejects. Every other failure, bad
+/// content included if `retryable` accepts it, only removes that peer from
+/// the lookup.
 pub(crate) async fn kad_read<N: KadNetwork>(
     network: &N,
     target: LookupKey,
@@ -570,11 +570,21 @@ mod tests {
         }
     }
 
-    fn retryable(error: &MockError) -> bool {
-        *error == MockError::Unreachable
+    /// As the native adapter does: every failure a peer causes, bad content
+    /// included, only takes that peer out of the read.
+    fn retryable(_error: &MockError) -> bool {
+        true
     }
 
     async fn read(network: &MockNetwork, seeds: &[u8]) -> Result<Option<&'static str>, MockError> {
+        read_with(network, seeds, retryable).await
+    }
+
+    async fn read_with(
+        network: &MockNetwork,
+        seeds: &[u8],
+        retryable: impl Fn(&MockError) -> bool,
+    ) -> Result<Option<&'static str>, MockError> {
         let outcome = kad_read(
             network,
             [0; 32],
@@ -692,14 +702,46 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn corrupt_content_ends_the_read_with_an_error() {
+    async fn corrupt_content_from_one_peer_leaves_the_read_to_the_others() {
+        let corrupt = MockPeer {
+            corrupt: true,
+            ..holder()
+        };
+        // The honest holder is slower, so the corrupt answer arrives first.
+        let network = MockNetwork::with([
+            (9, router(&[2, 3])),
+            (2, corrupt),
+            (3, holder_after(QUICK_TRANSFER)),
+        ]);
+
+        assert_eq!(read(&network, &[9]).await, Ok(Some("chunk")));
+        assert!(network.requests().contains(&(2, "get_or_closer")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn corrupt_content_from_the_only_holder_is_not_found() {
         let corrupt = MockPeer {
             corrupt: true,
             ..holder()
         };
         let network = MockNetwork::with([(9, router(&[2])), (2, corrupt)]);
 
-        assert_eq!(read(&network, &[9]).await, Err(MockError::Corrupt));
+        assert_eq!(read(&network, &[9]).await, Ok(None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_error_the_adapter_rejects_ends_the_read() {
+        let corrupt = MockPeer {
+            corrupt: true,
+            ..holder()
+        };
+        let network = MockNetwork::with([(9, router(&[2])), (2, corrupt)]);
+        let only_unreachable = |error: &MockError| *error == MockError::Unreachable;
+
+        assert_eq!(
+            read_with(&network, &[9], only_unreachable).await,
+            Err(MockError::Corrupt)
+        );
     }
 
     #[tokio::test(start_paused = true)]
