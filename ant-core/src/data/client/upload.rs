@@ -1021,7 +1021,9 @@ impl UploadAdapter for MemoryUploadAdapter<'_> {
             })
             .collect::<Vec<_>>();
         let (transactions, gas) = wallet.pay_for_quotes(payments).await.map_err(
-            |ant_protocol::evm::PayForQuotesError(error, _)| Error::Payment(error.to_string()),
+            |ant_protocol::evm::PayForQuotesError(error, _)| {
+                Error::from_payment_failure(error.to_string())
+            },
         )?;
         let amount = plans.iter().try_fold(Amount::ZERO, |sum, plan| {
             sum.checked_add(plan.payment.total_amount())
@@ -1046,7 +1048,7 @@ impl UploadAdapter for MemoryUploadAdapter<'_> {
                 batch.merkle_payment_timestamp,
             )
             .await
-            .map_err(|e| Error::Payment(e.to_string()))?;
+            .map_err(|e| Error::from_payment_failure(e.to_string()))?;
         Ok(MerkleUploadPayment {
             winner_pool,
             amount,
