@@ -12,8 +12,9 @@ use ant_protocol::{ChunkMessage, ChunkMessageBody};
 use futures::future::LocalBoxFuture;
 
 /// Speculative GETs, such as read-ahead, are admitted as if the read cap were at
-/// most this. They hold half of it, so a node's multiplexed session always has a
-/// slot left for a GET a read waits for, such as a seek's.
+/// most this. They then hold at most half of it, so they alone never fill a
+/// node's multiplexed session. A GET a read waits for, such as a seek's, still
+/// queues there if other awaited GETs hold every slot.
 const SPECULATIVE_READ_LIMIT: usize = multiplex::MAX_REQUESTS;
 
 pub(super) struct SharedNetworkAdapter {
