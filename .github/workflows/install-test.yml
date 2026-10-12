@@ -19,6 +19,7 @@ jobs:
         env:
           ANT_VERSION: ${{ inputs.version }}
           INSTALL_DIR: ${{ runner.temp }}/bin
+          ANT_NO_MODIFY_PATH: "1"
         run: bash install.sh
 
       - name: verify binary
@@ -37,6 +38,21 @@ jobs:
           echo "Bootstrap config installed at $config_file"
           cat "$config_file"
 
+      # A default install must leave `ant` on PATH in new shells with no manual edit (#194). env -i
+      # starts each shell from a PATH without ~/.local/bin, as on a fresh machine.
+      - name: verify a default install is on PATH in new shells
+        env:
+          ANT_VERSION: ${{ inputs.version }}
+        run: |
+          fresh() { env -i HOME="$HOME" SHELL=/bin/bash PATH=/usr/bin:/bin "$@"; }
+          fresh ANT_VERSION="$ANT_VERSION" bash install.sh
+          for shell in "bash -lc" "bash -ic"; do
+            found="$(fresh $shell 'command -v ant' 2> /dev/null)"
+            echo "$shell: ${found:-<not found>}"
+            [ "$found" = "$HOME/.local/bin/ant" ] || exit 1
+          done
+          fresh bash -lc 'ant --version'
+
   test-install-script-macos:
     name: test install.sh (macOS)
     runs-on: macos-latest
@@ -47,6 +63,7 @@ jobs:
         env:
           ANT_VERSION: ${{ inputs.version }}
           INSTALL_DIR: ${{ runner.temp }}/bin
+          ANT_NO_MODIFY_PATH: "1"
         run: bash install.sh
 
       - name: verify binary
@@ -64,6 +81,22 @@ jobs:
           fi
           echo "Bootstrap config installed at $config_file"
           cat "$config_file"
+
+      # As on Linux (#194), from a fresh-machine PATH. /bin/bash is the 3.2 that `curl | bash` runs
+      # on a stock Mac, and zsh is the default login shell; `zsh -lc` also runs /etc/zprofile's
+      # path_helper, which reorders PATH.
+      - name: verify a default install is on PATH in new shells
+        env:
+          ANT_VERSION: ${{ inputs.version }}
+        run: |
+          fresh() { env -i HOME="$HOME" SHELL=/bin/zsh PATH=/usr/bin:/bin "$@"; }
+          fresh ANT_VERSION="$ANT_VERSION" /bin/bash install.sh
+          for shell in "zsh -c" "zsh -lc" "zsh -ic" "/bin/bash -lc"; do
+            found="$(fresh $shell 'command -v ant' 2> /dev/null)"
+            echo "$shell: ${found:-<not found>}"
+            [ "$found" = "$HOME/.local/bin/ant" ] || exit 1
+          done
+          fresh zsh -lc 'ant --version'
 
   test-install-script-windows:
     name: test install.ps1 (Windows)

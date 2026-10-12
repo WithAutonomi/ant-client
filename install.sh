@@ -5,14 +5,23 @@
 #   curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh | bash
 #
 # Environment variables:
-#   ANT_CHANNEL   — release channel to install from: "stable" (default) or "beta".
-#   ANT_VERSION   — install a specific version (e.g. "0.1.1"). Overrides ANT_CHANNEL.
-#   INSTALL_DIR   — override install directory (default: ~/.local/bin on Linux, /usr/local/bin on macOS).
+#   ANT_CHANNEL        — release channel to install from: "stable" (default) or "beta".
+#   ANT_VERSION        — install a specific version (e.g. "0.1.1"). Overrides ANT_CHANNEL.
+#   INSTALL_DIR        — override install directory (default: ~/.local/bin).
+#   ANT_NO_MODIFY_PATH — set to 1 to leave your shell startup files alone (same as --no-modify-path).
+#
+# Options:
+#   --no-modify-path   — do not add INSTALL_DIR to PATH; print the line to add instead.
+#
+# When INSTALL_DIR is not already on PATH, the installer adds it to your shell startup files
+# (~/.profile, your existing bash files, ~/.zshenv, fish's conf.d) so that `ant` works in every new
+# terminal, and prints each file it changed. install.ps1 does the same with the Windows user PATH.
 #
 # Examples:
-#   curl -fsSL <this-script> | bash                     # newest stable
-#   curl -fsSL <this-script> | ANT_CHANNEL=beta bash    # newest beta-eligible
-#   curl -fsSL <this-script> | ANT_VERSION=0.3.3 bash   # a specific version
+#   curl -fsSL <this-script> | bash                           # newest stable
+#   curl -fsSL <this-script> | ANT_CHANNEL=beta bash          # newest beta-eligible
+#   curl -fsSL <this-script> | ANT_VERSION=0.3.3 bash         # a specific version
+#   curl -fsSL <this-script> | bash -s -- --no-modify-path    # leave PATH to me
 
 set -euo pipefail
 
@@ -66,14 +75,111 @@ config_dir() {
   esac
 }
 
+# User-writable on both platforms, so the install never needs sudo. macOS used to default to
+# /usr/local/bin, which is root-owned on a machine without Homebrew.
 default_install_dir() {
-  local os
-  os="$(uname -s)"
-  case "$os" in
-    Linux)  echo "$HOME/.local/bin" ;;
-    Darwin) echo "/usr/local/bin" ;;
-    *)      err "unsupported OS: $os" ;;
+  echo "$HOME/.local/bin"
+}
+
+# $1 with a leading $HOME spelled as a literal `$HOME`, for lines written into startup files.
+home_relative() {
+  case "$1" in
+    "$HOME"/*) printf '%s\n' "\$HOME${1#"$HOME"}" ;;
+    *)         printf '%s\n' "$1" ;;
   esac
+}
+
+# Shell startup files that should put INSTALL_DIR on PATH, one per line. Mirrors rustup:
+#   ~/.profile          — every POSIX login shell; always written.
+#   ~/.bash_profile,
+#   ~/.bash_login       — bash login shells skip ~/.profile when either exists; written if present.
+#   ~/.bashrc           — interactive non-login bash (a new Linux terminal); written if present, or
+#                         created when bash is the login shell.
+#   ~/.zshenv           — read by every zsh, interactive or not; written whenever zsh is installed,
+#                         which includes every Mac.
+# fish is handled separately, as its syntax differs.
+posix_startup_files() {
+  local shell_name="${SHELL##*/}" rc
+
+  printf '%s\n' "$HOME/.profile"
+  for rc in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.bashrc"; do
+    if [ -f "$rc" ]; then
+      printf '%s\n' "$rc"
+    elif [ "$rc" = "$HOME/.bashrc" ] && [ "$shell_name" = "bash" ]; then
+      printf '%s\n' "$rc"
+    fi
+  done
+  if [ "$shell_name" = "zsh" ] || command -v zsh > /dev/null 2>&1; then
+    printf '%s\n' "${ZDOTDIR:-$HOME}/.zshenv"
+  fi
+}
+
+# Append line $2 to startup file $1, under a comment saying where it came from.
+# Returns 0 when the file was changed, 1 when the line was already there, 2 when the write failed.
+append_startup_line() {
+  local rc="$1" line="$2" gap=""
+
+  if [ -f "$rc" ] && grep -qxF "$line" "$rc"; then
+    return 1
+  fi
+  if [ -s "$rc" ]; then
+    gap=$'\n'
+  fi
+  {
+    mkdir -p "$(dirname "$rc")" \
+      && printf '%s# Added by the ant installer (https://github.com/%s)\n%s\n' "$gap" "$REPO" "$line" >> "$rc"
+  } 2> /dev/null || return 2
+}
+
+# Put INSTALL_DIR on PATH for future shells, and tell the user what changed.
+add_install_dir_to_path() {
+  local dir posix_line fish_line rc i status
+  local entries=() changed=() present=() failed=()
+
+  dir="$(home_relative "$INSTALL_DIR")"
+  # Guarded, so a shell that reads several of these files (Ubuntu's ~/.profile sources ~/.bashrc)
+  # still ends up with one entry.
+  # shellcheck disable=SC2016 # $PATH is meant to reach the startup file unexpanded.
+  posix_line="$(printf 'case ":${PATH}:" in *":%s:"*) ;; *) export PATH="%s:$PATH" ;; esac' "$dir" "$dir")"
+  # shellcheck disable=SC2016
+  fish_line="$(printf 'contains "%s" $PATH; or set -gx PATH "%s" $PATH' "$dir" "$dir")"
+
+  # Pairs of (startup file, line to add to it).
+  while IFS= read -r rc; do
+    entries+=("$rc" "$posix_line")
+  done < <(posix_startup_files)
+  if command -v fish > /dev/null 2>&1; then
+    entries+=("${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/ant.fish" "$fish_line")
+  fi
+
+  for ((i = 0; i < ${#entries[@]}; i += 2)); do
+    rc="${entries[i]}"
+    status=0
+    append_startup_line "$rc" "${entries[i + 1]}" || status=$?
+    case "$status" in
+      0) changed+=("$rc") ;;
+      1) present+=("$rc") ;;
+      *) failed+=("$rc") ;;
+    esac
+  done
+
+  say ""
+  if [ "${#changed[@]}" -gt 0 ]; then
+    say "Added ${INSTALL_DIR} to your PATH in:"
+    for rc in "${changed[@]}"; do say "  $rc"; done
+  elif [ "${#present[@]}" -gt 0 ]; then
+    say "Your shell startup files already add ${INSTALL_DIR} to your PATH."
+  fi
+  if [ "${#failed[@]}" -gt 0 ]; then
+    say "Could not write to:"
+    for rc in "${failed[@]}"; do say "  $rc"; done
+  fi
+  if [ "${#changed[@]}" -eq 0 ] && [ "${#present[@]}" -eq 0 ]; then
+    say "Add it to your PATH with:"
+  else
+    say "Open a new terminal to use ant, or run this to use it in the current one:"
+  fi
+  say "  export PATH=\"${INSTALL_DIR}:\$PATH\""
 }
 
 # Whether a version is eligible for a release channel.
@@ -184,6 +290,18 @@ resolve_version() {
 need curl
 need tar
 
+MODIFY_PATH=1
+case "${ANT_NO_MODIFY_PATH:-}" in
+  ""|0) ;;
+  *) MODIFY_PATH=0 ;;
+esac
+for arg in "$@"; do
+  case "$arg" in
+    --no-modify-path) MODIFY_PATH=0 ;;
+    *) err "unknown option '$arg' (the only option is --no-modify-path)" ;;
+  esac
+done
+
 TARGET="$(detect_target)"
 CHANNEL="${ANT_CHANNEL:-stable}"
 VERSION="${ANT_VERSION:-$(resolve_version "$CHANNEL")}"
@@ -209,6 +327,8 @@ tar xzf "${TMPDIR}/${ARCHIVE}" -C "$TMPDIR"
 
 # Install binary
 mkdir -p "$INSTALL_DIR"
+# Absolute, so the PATH entry written below does not depend on where the installer was run from.
+INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)"
 cp "${TMPDIR}/${BINARY_NAME}-${VERSION}-${TARGET}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
 say "Installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
@@ -227,12 +347,24 @@ fi
 case ":$PATH:" in
   *":${INSTALL_DIR}:"*) ;;
   *)
-    say ""
-    say "WARNING: ${INSTALL_DIR} is not in your PATH."
-    say "Add it with:"
-    say "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+    if [ "$MODIFY_PATH" = 1 ]; then
+      add_install_dir_to_path
+    else
+      say ""
+      say "WARNING: ${INSTALL_DIR} is not in your PATH."
+      say "Add it with:"
+      say "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+    fi
     ;;
 esac
+
+# An older install elsewhere (macOS used to default to /usr/local/bin) can shadow this one.
+OTHER_ANT="$(command -v "$BINARY_NAME" 2> /dev/null || true)"
+if [ -n "$OTHER_ANT" ] && [ "$OTHER_ANT" != "${INSTALL_DIR}/${BINARY_NAME}" ]; then
+  say ""
+  say "NOTE: another ${BINARY_NAME} is on your PATH at ${OTHER_ANT}, and may run instead of this one."
+  say "Remove whichever copy you no longer use."
+fi
 
 say ""
 say "Done! Run 'ant --help' to get started."
