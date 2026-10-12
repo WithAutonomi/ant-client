@@ -864,6 +864,7 @@ impl Client {
             // speculation on stale hints before a live holder is discovered.
             // The final close-group size and absence rules still use peer_count.
             crate::client_engine::read::MAX_GET_FALLBACK_PEERS,
+            crate::client_engine::read::uniform_choice,
             |sender| {
                 #[cfg(feature = "native")]
                 let observation = &observation;

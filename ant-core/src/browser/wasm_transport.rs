@@ -91,6 +91,18 @@ const MAX_LOOKUP_PRECONNECTS: usize = 8;
 const BROWSER_LOOKUP_ALPHA: usize = 6;
 const MAX_BOOTSTRAP_CONNECTIONS: usize = 4;
 const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+/// A node that answers a dial and declines it is up, but full. Skip it only
+/// briefly: long enough not to redial it for every chunk of a stream (a 4 MiB
+/// chunk plays for several seconds at video bit rates), short enough that it
+/// rejoins lookups and reads soon after its sessions free up (ant-node
+/// ADR-0023).
+const ENDPOINT_REFUSAL_COOLDOWN: Duration = Duration::from_secs(15);
+/// A fresh association that the browser declares failed this soon after its
+/// ICE checks began, without ever connecting, was answered with a STUN error:
+/// the node's transport refused it for capacity. A refusal arrives within a
+/// few round trips (66 ms in Chromium, 100 ms in WebKit on loopback), while
+/// both kept checking an unanswering node until the 10 s channel-open timeout.
+const REFUSAL_DETECTION_WINDOW: Duration = Duration::from_secs(3);
 const MAX_BROWSER_ROUTING_ENTRIES: usize = 256;
 const MAX_BROWSER_ENDPOINT_FAILURES: usize = 256;
 const DEFAULT_BROWSER_QUOTE_CONCURRENCY: usize = 4;
@@ -325,6 +337,7 @@ impl BrowserClientPool {
             dial_failures: Rc::new(RefCell::new(
                 crate::client_engine::EndpointFailureCache::new(
                     ENDPOINT_FAILURE_COOLDOWN,
+                    ENDPOINT_REFUSAL_COOLDOWN,
                     MAX_BROWSER_ENDPOINT_FAILURES,
                 ),
             )),
@@ -628,7 +641,24 @@ impl BrowserClientPool {
 struct PeerAssociation {
     connection: RtcPeerConnection,
     channels: RefCell<Vec<AssociationChannel>>,
+    /// ICE and DTLS completed at least once: the node answered as the holder
+    /// of the advertised certificate.
+    connected: Cell<bool>,
+    /// Ticks on every connection state change.
+    state_changes: watch::Sender<()>,
     _on_state_change: Closure<dyn FnMut(Event)>,
+}
+
+/// What a failed setup learned about its endpoint, which decides how long the
+/// endpoint stays out of lookups and reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialOutcome {
+    /// Setup reused a live association, so the endpoint was not dialled.
+    NotDialled,
+    /// The endpoint never answered, or answered as the wrong node.
+    Failed,
+    /// The node answered and declined: up, but full right now.
+    Refused,
 }
 
 /// One lane's channel, with the inbox that records when this client stopped
@@ -666,16 +696,34 @@ impl PeerAssociation {
             let association = association.clone();
             let on_state_change = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
                 if let Some(association) = association.upgrade() {
+                    if association.connection.connection_state()
+                        == RtcPeerConnectionState::Connected
+                    {
+                        association.connected.set(true);
+                    }
                     association.fail_lanes_if_dead();
+                    association.state_changes.send_replace(());
                 }
             });
             connection.set_onconnectionstatechange(Some(on_state_change.as_ref().unchecked_ref()));
             Self {
                 connection,
                 channels: RefCell::new(Vec::new()),
+                connected: Cell::new(false),
+                state_changes: watch::channel(()).0,
                 _on_state_change: on_state_change,
             }
         })
+    }
+
+    /// Resolve once the browser reports the association dead.
+    async fn ended(&self) {
+        let mut changes = self.state_changes.subscribe();
+        while !self.is_dead() {
+            if changes.changed().await.is_err() {
+                futures::future::pending::<()>().await;
+            }
+        }
     }
 
     /// The browser reports that the association can carry nothing more.
@@ -739,7 +787,7 @@ impl Connection {
     async fn open(
         endpoint: &WebRtcDirectEndpoint,
         source: &SharedAssociation,
-        attempted_dial: &Cell<bool>,
+        outcome: &Cell<DialOutcome>,
         dial_failures: Option<&DialFailures>,
     ) -> Result<Self, String> {
         // Serialize only setup. Each lane has its own RPC lock, inbox, request
@@ -769,7 +817,11 @@ impl Connection {
         }
         #[cfg(feature = "test-utils")]
         trace.event("dial", if fresh { "fresh" } else { "reused" });
-        attempted_dial.set(fresh);
+        outcome.set(if fresh {
+            DialOutcome::Failed
+        } else {
+            DialOutcome::NotDialled
+        });
         let peer_connection = if let Some(existing) = existing {
             existing
         } else {
@@ -866,6 +918,7 @@ impl Connection {
             _on_open: on_open,
         };
 
+        let mut checks_started = None;
         if fresh {
             let offer = JsFuture::from(connection.peer_connection.create_offer())
                 .await
@@ -903,22 +956,45 @@ impl Connection {
             JsFuture::from(connection.peer_connection.set_remote_description(&remote))
                 .await
                 .map_err(js_error_message)?;
+            checks_started = Some(web_time::Instant::now());
         }
 
-        timeout(
+        let opened = async move {
+            open_rx
+                .await
+                .map_err(|_| "WebRTC DataChannel closed before opening".to_string())?
+        };
+        let ended = async {
+            connection.peer_connection.ended().await;
+            Err(PEER_CONNECTION_FAILED.to_string())
+        };
+        let open = timeout(
             async move {
-                open_rx
-                    .await
-                    .map_err(|_| "WebRTC DataChannel closed before opening".to_string())?
+                match select(Box::pin(opened), Box::pin(ended)).await {
+                    Either::Left((result, _)) | Either::Right((result, _)) => result,
+                }
             },
             "WebRTC DataChannel opening timed out",
         )
-        .await?;
+        .await;
+        if let Err(error) = open {
+            connection.note_refusal(checks_started, outcome);
+            return Err(error);
+        }
+        // An open channel proves ICE and DTLS completed, including in browsers
+        // that do not report `connectionState`.
+        connection.peer_connection.connected.set(true);
         connection.data_channel.set_onopen(None);
         #[cfg(feature = "test-utils")]
         trace.event("channel-open", "");
 
-        let session = establish_pq_session(&connection, endpoint).await?;
+        let session = match establish_pq_session(&connection, endpoint).await {
+            Ok(session) => session,
+            Err(error) => {
+                connection.note_refusal(checks_started, outcome);
+                return Err(error);
+            }
+        };
         connection.pq_session.replace(Some(session));
         connection.rpc.replace(Some(multiplex::RpcSession::new(
             connection.data_channel.clone(),
@@ -935,6 +1011,30 @@ impl Connection {
 
     fn rpc(&self) -> Option<Rc<multiplex::RpcSession>> {
         self.rpc.borrow().clone()
+    }
+
+    /// Mark a failed fresh dial `Refused` when the node answered it and
+    /// turned it away (ant-node ADR-0023): its transport refused the ICE check, or it
+    /// hung up after ICE and DTLS completed. A connected node whose channel
+    /// is still open failed for another reason, such as authentication, and
+    /// keeps the full failure cooldown.
+    fn note_refusal(&self, checks_started: Option<web_time::Instant>, outcome: &Cell<DialOutcome>) {
+        let Some(checks_started) = checks_started else {
+            return;
+        };
+        let association = &self.peer_connection;
+        let refused = if association.connected.get() {
+            association.is_dead()
+                || matches!(
+                    self.data_channel.ready_state(),
+                    RtcDataChannelState::Closing | RtcDataChannelState::Closed
+                )
+        } else {
+            association.is_dead() && checks_started.elapsed() < REFUSAL_DETECTION_WINDOW
+        };
+        if refused {
+            outcome.set(DialOutcome::Refused);
+        }
     }
 
     /// Usable for a new RPC. Every local close (a failed exchange, malformed
@@ -1046,12 +1146,12 @@ impl BrowserNodeClientCore {
             }
         }
         let generation = self.generation.get();
-        let attempted_dial = Cell::new(false);
+        let outcome = Cell::new(DialOutcome::NotDialled);
         let connection = match timeout_with_ms(
             Connection::open(
                 &self.endpoint,
                 &self.association,
-                &attempted_dial,
+                &outcome,
                 self.dial_failures.as_ref(),
             ),
             "WebRTC connection/authentication setup timed out",
@@ -1063,11 +1163,14 @@ impl BrowserNodeClientCore {
             Err(error) => {
                 #[cfg(feature = "test-utils")]
                 trace.finish(&error);
-                if let Some(cache) = self.dial_failures.as_ref().filter(|_| attempted_dial.get()) {
-                    cache.borrow_mut().record_failure(
-                        self.endpoint.peer_id.clone(),
-                        self.endpoint.multiaddr.clone(),
-                    );
+                if let Some(cache) = &self.dial_failures {
+                    let peer = self.endpoint.peer_id.clone();
+                    let endpoint = self.endpoint.multiaddr.clone();
+                    match outcome.get() {
+                        DialOutcome::NotDialled => {}
+                        DialOutcome::Failed => cache.borrow_mut().record_failure(peer, endpoint),
+                        DialOutcome::Refused => cache.borrow_mut().record_refusal(peer, endpoint),
+                    }
                 }
                 return Err(error);
             }
