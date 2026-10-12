@@ -814,9 +814,10 @@ impl Client {
         }
 
         // ADR-0020: ask every peer the lookup queries for the chunk as well as
-        // for closer peers, and stop at the first verified chunk. A lookup that
-        // finds no holder says nothing about absence, so the ordinary read
-        // below runs then, with its own discovery and absence rule.
+        // for closer peers, and stop at the first verified chunk. A peer whose
+        // content fails verification only drops out. A lookup that finds no
+        // holder says nothing about absence, so the ordinary read below runs
+        // then, with its own discovery, absence rule and bad-content rule.
         #[cfg(feature = "native")]
         if let Some(chunk) = self.chunk_get_kad(address, peer_count).await? {
             if let Some(diag) = diag {

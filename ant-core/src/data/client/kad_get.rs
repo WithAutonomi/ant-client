@@ -13,6 +13,7 @@ use ant_protocol::{
     ChunkGetOrCloserResponse, ChunkMessage, ChunkMessageBody, DataChunk, XorName,
 };
 use std::time::Duration;
+use tracing::warn;
 
 /// One chunk read's view of the native network.
 struct NativeKadNetwork<'a> {
@@ -100,9 +101,9 @@ impl KadNetwork for NativeKadNetwork<'_> {
         )
         .await?;
         match response.result? {
-            ChunkGetOrCloserResponse::Found { address, content } => {
-                Ok(StepAnswer::Found(self.verified(address, content)?))
-            }
+            ChunkGetOrCloserResponse::Found { address, content } => Ok(StepAnswer::Found(
+                note_bad_content(peer, self.verified(address, content))?,
+            )),
             ChunkGetOrCloserResponse::Closer { address, peers } if address == self.address => {
                 let nodes = self
                     .node()
@@ -138,19 +139,36 @@ impl KadNetwork for NativeKadNetwork<'_> {
     }
 
     async fn get(&self, peer: &DHTNode) -> Result<Option<DataChunk>> {
-        self.client
+        let fetched = self
+            .client
             .chunk_get_from_peer(&self.address, &peer.peer_id, &peer.addresses_by_priority())
-            .await
+            .await;
+        note_bad_content(peer, fetched)
     }
 }
 
-/// Failures that only take one peer out of a read; anything else, such as
-/// content that does not match its address, ends it.
+/// Failures that only take one peer out of a read. That includes content that
+/// does not match its address: every peer the lookup queries is asked for the
+/// chunk, so one dishonest peer on the path must not end the read. If no other
+/// peer sends the chunk, the ordinary read path runs, and its own rule still
+/// ends on bad content.
 fn is_retryable(error: &Error) -> bool {
     matches!(
         error,
-        Error::Timeout(_) | Error::Network(_) | Error::Protocol(_)
+        Error::Timeout(_) | Error::Network(_) | Error::Protocol(_) | Error::InvalidData(_)
     )
+}
+
+/// Log a peer whose content failed verification; [`is_retryable`] then only
+/// drops it from the read.
+fn note_bad_content<T>(peer: &DHTNode, result: Result<T>) -> Result<T> {
+    if let Err(Error::InvalidData(reason)) = &result {
+        warn!(
+            "Peer {} sent content that failed verification: {reason}",
+            peer.peer_id
+        );
+    }
+    result
 }
 
 impl Client {
@@ -197,5 +215,16 @@ impl Client {
     pub async fn chunk_get_kad_only(&self, address: &XorName) -> Result<Option<DataChunk>> {
         self.chunk_get_kad(address, self.config().close_group_size)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bad_content_only_drops_the_peer_that_sent_it() {
+        assert!(is_retryable(&Error::InvalidData("hash mismatch".into())));
+        assert!(!is_retryable(&Error::Config("local failure".into())));
     }
 }
