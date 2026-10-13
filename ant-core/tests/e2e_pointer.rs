@@ -18,7 +18,7 @@
 //!
 //! To make a read or a write reach only part of the group through the client's
 //! own path, a test tells every node except the ones meant to answer to ignore
-//! pointer GETs or PUTs while staying in the network (`support::PointerSilence`).
+//! pointer GETs or PUTs while staying in the network (`support::Silence`).
 //! The client then waits out its timeout on them, exactly as it would on
 //! unreachable peers. Silencing the whole network rather than chosen group
 //! members keeps these tests independent of which seven peers the client's own
@@ -54,7 +54,7 @@ use serial_test::serial;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use support::{test_client_config, MiniTestnet, PointerSilence, DEFAULT_NODE_COUNT};
+use support::{test_client_config, MiniTestnet, Silence, DEFAULT_NODE_COUNT};
 
 /// The node the client is built on. Its own lookups leave it out, so it is
 /// never one of the close group a test addresses.
@@ -102,7 +102,7 @@ struct Member {
     peer_id: PeerId,
     addrs: Vec<MultiAddr>,
     protocol: Arc<AntProtocol>,
-    silence: Arc<PointerSilence>,
+    silence: Arc<Silence>,
 }
 
 /// The close group the client writes `address` to, found by the lookup the
@@ -125,7 +125,7 @@ async fn close_group(client: &Client, testnet: &MiniTestnet, address: &XorName) 
                     peer_id,
                     addrs: addrs.clone(),
                     protocol: Arc::clone(node.protocol.as_ref()?),
-                    silence: Arc::clone(&node.pointer_silence),
+                    silence: Arc::clone(&node.silence),
                 })
             })
         })
@@ -323,10 +323,10 @@ fn only_these_answer(testnet: &MiniTestnet, answering: &[Member], kind: Request)
     for node in &testnet.nodes {
         let silent = !answering
             .iter()
-            .any(|member| Arc::ptr_eq(&member.silence, &node.pointer_silence));
+            .any(|member| Arc::ptr_eq(&member.silence, &node.silence));
         let switch = match kind {
-            Request::Get => &node.pointer_silence.gets,
-            Request::Put => &node.pointer_silence.puts,
+            Request::Get => &node.silence.pointer_gets,
+            Request::Put => &node.silence.pointer_puts,
         };
         switch.store(silent, Ordering::Relaxed);
     }
@@ -335,8 +335,8 @@ fn only_these_answer(testnet: &MiniTestnet, answering: &[Member], kind: Request)
 /// Let every node handle every pointer request again.
 fn everyone_answers(testnet: &MiniTestnet) {
     for node in &testnet.nodes {
-        node.pointer_silence.gets.store(false, Ordering::Relaxed);
-        node.pointer_silence.puts.store(false, Ordering::Relaxed);
+        node.silence.pointer_gets.store(false, Ordering::Relaxed);
+        node.silence.pointer_puts.store(false, Ordering::Relaxed);
     }
 }
 
