@@ -127,6 +127,13 @@ and opens channels created on it later. A request in flight must fail when the
 connection fails rather than at its response deadline, and the pool must redial
 rather than open a lane on the failed association.
 
+`capacity-refusal.test.mjs` and `refused-holder.test.mjs` cover full nodes
+(ant-node ADR-0023). A node that declines a dial, at its transport or its
+application, fails the dial at once and is dialled again after the 15 s refusal
+cooldown, while a DTLS failure keeps the 30-minute cooldown. A read whose only
+holder declines waits out the cooldown instead of reporting the record not
+found, and a read whose holder keeps declining reports it busy after three waits.
+
 `ice-gathering.test.mjs` checks that concurrent dials gather ICE candidates one
 connection at a time, and that a gathering which never completes hands the turn
 on after its timeout. WebKit opens many more UDP sockets for connections whose

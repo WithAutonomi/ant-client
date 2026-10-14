@@ -4,10 +4,19 @@ use ant_protocol::CLOSE_GROUP_SIZE;
 use futures::future::{select, Either};
 use futures::{stream::FuturesUnordered, StreamExt};
 use rand::Rng as _;
-use std::{collections::HashSet, future::Future, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    time::Duration,
+};
 
 pub(crate) const MAX_GET_FALLBACK_PEERS: usize = 20;
 pub(crate) const CLOSE_GROUP_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Rounds a read waits for a refusing holder before reporting its holders
+/// busy. Each wait lasts until the first refusal that may hide a holder ends,
+/// so with the browser's 15 s refusal cooldown (ant-node ADR-0023) the waits
+/// add at most 45 s and three lookups to a read on a network that is full.
+const MAX_REFUSAL_WAITS: usize = 3;
 const EARLY_READ_HEDGE_DELAY: Duration = Duration::from_secs(1);
 /// Speculative GETs per round are bounded by this multiple of the early
 /// allowance, including hints that may hold the record after stale hints used it.
@@ -143,6 +152,12 @@ pub(crate) fn read_targets<P>(
 /// a delay, on both native and WASM. At most two GETs run, including after discovery.
 /// A peer is queried at most once per round, and only the completed final candidate
 /// set can establish absence.
+///
+/// `refused` lists peers the adapter skips for now because they declined a
+/// session while full, each with the time until it is tried again. While one
+/// of them may hold the record, a round that finds nothing proves nothing:
+/// the read waits for the first of them to return, up to `MAX_REFUSAL_WAITS`
+/// times, and then fails with `busy()` rather than report the record absent.
 #[allow(clippy::too_many_arguments)] // Adapters supply each hook; the engine owns how they combine.
 pub(crate) async fn retrieve_progressive<P, T, E, D, DF, G, GF, S, SF>(
     target: [u8; 32],
@@ -152,6 +167,8 @@ pub(crate) async fn retrieve_progressive<P, T, E, D, DF, G, GF, S, SF>(
     key: impl Fn(&P) -> [u8; 32],
     get: G,
     retryable: impl Fn(&E) -> bool,
+    refused: impl Fn() -> Vec<([u8; 32], Duration)>,
+    busy: impl FnOnce() -> E,
     sleep: S,
 ) -> Result<Option<T>, E>
 where
@@ -165,10 +182,14 @@ where
 {
     let allowance = early_limit.min(MAX_GET_FALLBACK_PEERS);
     let max_early_reads = allowance * MAX_EARLY_READS_PER_ALLOWANCE;
-    for attempt in 0..2 {
-        if attempt > 0 {
-            sleep(CLOSE_GROUP_RETRY_DELAY).await;
+    let mut delay = None;
+    let mut retried = false;
+    let mut refusal_waits = 0;
+    loop {
+        if let Some(delay) = delay {
+            sleep(delay).await;
         }
+        let refused_at_start = refused();
         let (sender, mut updates) = tokio::sync::watch::channel(Vec::new());
         let mut discovery = Box::pin(discover(sender));
         let mut attempted = HashSet::new();
@@ -323,12 +344,39 @@ where
         if let Some(value) = race_cached_read(pending_early, ordinary, &retryable).await? {
             return Ok(Some(value));
         }
-        let misses = not_found.lock().unwrap_or_else(|e| e.into_inner());
-        if is_authoritative_not_found(final_ids.intersection(&misses).count(), final_ids.len()) {
-            break;
-        }
+        let refused_now = refused().into_iter().collect::<HashMap<_, _>>();
+        let (absent, refusal) = {
+            let misses = not_found.lock().unwrap_or_else(|e| e.into_inner());
+            let absent = is_authoritative_not_found(
+                final_ids.intersection(&misses).count(),
+                final_ids.len(),
+            );
+            // A refused peer stays out of discovery and reads, so this round
+            // may never have asked it. It cannot hold the record once it, or a
+            // close group of nearer peers, answered NotFound. A refusal that
+            // ended during the round is ready now.
+            let refusal = refused_at_start
+                .iter()
+                .map(|(peer, _)| peer)
+                .chain(refused_now.keys())
+                .filter(|peer| !misses.contains(*peer) && may_hold(&misses, peer, &target))
+                .map(|peer| refused_now.get(peer).copied().unwrap_or_default())
+                .min();
+            (absent, refusal)
+        };
+        delay = Some(match refusal {
+            Some(_) if refusal_waits == MAX_REFUSAL_WAITS => return Err(busy()),
+            Some(remaining) => {
+                refusal_waits += 1;
+                remaining.max(CLOSE_GROUP_RETRY_DELAY)
+            }
+            None if absent || retried => return Ok(None),
+            None => {
+                retried = true;
+                CLOSE_GROUP_RETRY_DELAY
+            }
+        });
     }
-    Ok(None)
 }
 
 /// Nearest-first holder choice, for tests that pin the read order.
@@ -362,6 +410,8 @@ where
         key,
         |peer, _| get(peer),
         retryable,
+        Vec::new,
+        || unreachable!("no peer is refused"),
         sleep,
     )
     .await
@@ -379,6 +429,119 @@ mod tests {
     enum ReadError {
         Transport,
         Integrity,
+        Busy,
+    }
+
+    /// The browser's refusal cooldown, as these tests model it.
+    const REFUSAL_COOLDOWN: Duration = Duration::from_secs(15);
+
+    /// Read `peer(0)` while `refusal` gives the time left on `holder`'s
+    /// refusal at each instant. Discovery that starts while it is refused
+    /// skips it and finds the next seven peers, which answer NotFound. Each
+    /// discovery takes `round`.
+    async fn read_past_refused_holder(
+        holder: [u8; 32],
+        refusal: impl Fn(tokio::time::Instant) -> Option<Duration>,
+        round: Duration,
+    ) -> (Result<Option<u8>, ReadError>, usize) {
+        let rounds = Cell::new(0);
+        let refusal = &refusal;
+        let result = retrieve_progressive(
+            peer(0),
+            0,
+            nearest,
+            |_| {
+                rounds.set(rounds.get() + 1);
+                let closest = if refusal(tokio::time::Instant::now()).is_some() {
+                    (2..=8).map(peer).collect()
+                } else {
+                    (1..=7).map(peer).collect()
+                };
+                async move {
+                    tokio::time::sleep(round).await;
+                    ReadCandidates {
+                        closest,
+                        known: vec![],
+                    }
+                }
+            },
+            |p| *p,
+            |p, _| async move { Ok(if p == holder { Some(42) } else { None }) },
+            |_| true,
+            || {
+                refusal(tokio::time::Instant::now())
+                    .map(|remaining| (holder, remaining))
+                    .into_iter()
+                    .collect()
+            },
+            || ReadError::Busy,
+            tokio::time::sleep,
+        )
+        .await;
+        (result, rounds.get())
+    }
+
+    /// A single refusal that ends at `until`.
+    fn refused_until(
+        until: tokio::time::Instant,
+    ) -> impl Fn(tokio::time::Instant) -> Option<Duration> {
+        move |now| {
+            until
+                .checked_duration_since(now)
+                .filter(|remaining| !remaining.is_zero())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_holder_is_read_after_its_cooldown_rather_than_reported_absent() {
+        let start = tokio::time::Instant::now();
+        let (result, rounds) = read_past_refused_holder(
+            peer(1),
+            refused_until(start + REFUSAL_COOLDOWN),
+            Duration::ZERO,
+        )
+        .await;
+        // Seven NotFound answers would otherwise prove the record absent.
+        assert_eq!(result, Ok(Some(42)));
+        assert_eq!(rounds, 2);
+        assert_eq!(start.elapsed(), REFUSAL_COOLDOWN);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_that_ends_during_a_round_is_retried_after_the_usual_delay() {
+        const ROUND: Duration = Duration::from_secs(2);
+        let start = tokio::time::Instant::now();
+        let (result, rounds) = read_past_refused_holder(
+            peer(1),
+            refused_until(start + Duration::from_secs(1)),
+            ROUND,
+        )
+        .await;
+        assert_eq!(result, Ok(Some(42)));
+        assert_eq!(rounds, 2);
+        assert_eq!(start.elapsed(), ROUND + CLOSE_GROUP_RETRY_DELAY + ROUND);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn holders_that_keep_refusing_are_reported_busy_rather_than_absent() {
+        let start = tokio::time::Instant::now();
+        // Refused again on every attempt, so always a full cooldown away.
+        let (result, rounds) =
+            read_past_refused_holder(peer(1), |_| Some(REFUSAL_COOLDOWN), Duration::ZERO).await;
+        assert_eq!(result, Err(ReadError::Busy));
+        assert_eq!(rounds, MAX_REFUSAL_WAITS + 1);
+        let waits = u32::try_from(MAX_REFUSAL_WAITS).unwrap();
+        assert_eq!(start.elapsed(), REFUSAL_COOLDOWN * waits);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_peer_beyond_the_close_group_does_not_delay_absence() {
+        let start = tokio::time::Instant::now();
+        let (result, rounds) =
+            read_past_refused_holder(peer(200), |_| Some(REFUSAL_COOLDOWN), Duration::ZERO).await;
+        assert_eq!(result, Ok(None));
+        assert_eq!(rounds, 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
     #[tokio::test(start_paused = true)]
@@ -407,6 +570,8 @@ mod tests {
                 }
             },
             |_| true,
+            Vec::new,
+            || unreachable!("no peer is refused"),
             tokio::time::sleep,
         );
         let result = tokio::time::timeout(Duration::from_secs(2), read)
@@ -463,6 +628,8 @@ mod tests {
                 }
             },
             |_| true,
+            Vec::new,
+            || unreachable!("no peer is refused"),
             tokio::time::sleep,
         );
         futures::pin_mut!(future);
@@ -503,6 +670,8 @@ mod tests {
                 async move { Ok::<_, ReadError>((p == peer(1)).then_some(42)) }
             },
             |_| true,
+            Vec::new,
+            || unreachable!("no peer is refused"),
             tokio::time::sleep,
         );
         let result = tokio::time::timeout(Duration::from_secs(20), read)
@@ -538,6 +707,8 @@ mod tests {
                 async move { Ok::<_, ReadError>((p == peer(100)).then_some(42)) }
             },
             |_| true,
+            Vec::new,
+            || unreachable!("no peer is refused"),
             tokio::time::sleep,
         );
         assert_eq!(read.await, Ok(Some(42)));
@@ -569,6 +740,8 @@ mod tests {
                 async move { Ok::<_, ReadError>((p == peer(3)).then_some(42)) }
             },
             |_| true,
+            Vec::new,
+            || unreachable!("no peer is refused"),
             tokio::time::sleep,
         );
         assert_eq!(read.await, Ok(Some(42)));
@@ -602,6 +775,8 @@ mod tests {
                 }
             },
             |error| *error == ReadError::Transport,
+            Vec::new,
+            || unreachable!("no peer is refused"),
             tokio::time::sleep,
         );
         let result = tokio::time::timeout(Duration::from_secs(2), read)
@@ -626,6 +801,8 @@ mod tests {
                 Ok::<_, ReadError>(Some(42))
             },
             |_| true,
+            Vec::new,
+            || unreachable!("no peer is refused"),
             |_| async {},
         ));
         assert_eq!(result, Ok(Some(42)));
@@ -650,6 +827,8 @@ mod tests {
                 async { Ok::<Option<()>, ReadError>(None) }
             },
             |_| true,
+            Vec::new,
+            || unreachable!("no peer is refused"),
             |_| async {},
         )
         .now_or_never();
@@ -692,6 +871,8 @@ mod tests {
                 }
             },
             |_| true,
+            Vec::new,
+            || unreachable!("no peer is refused"),
             |_| async {},
         ));
         assert_eq!(result, Ok(Some(42)));
@@ -728,6 +909,8 @@ mod tests {
                 async { Ok::<Option<()>, ReadError>(None) }
             },
             |_| true,
+            Vec::new,
+            || unreachable!("no peer is refused"),
             |_| async {},
         ));
         assert_eq!(result, Ok(None));
@@ -750,6 +933,8 @@ mod tests {
             |p| *p,
             |_, _| async { Err::<Option<()>, _>(ReadError::Integrity) },
             |error| *error == ReadError::Transport,
+            Vec::new,
+            || unreachable!("no peer is refused"),
             |_| async {},
         ));
         assert_eq!(result, Err(ReadError::Integrity));

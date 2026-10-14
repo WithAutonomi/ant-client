@@ -990,6 +990,19 @@ impl Client {
                     Error::Timeout(_) | Error::Network(_) | Error::Protocol(_)
                 )
             },
+            || {
+                self.network()
+                    .refused_peers()
+                    .into_iter()
+                    .map(|(peer, remaining)| (*peer.as_bytes(), remaining))
+                    .collect()
+            },
+            || {
+                Error::Network(format!(
+                    "the nodes that may hold chunk {} are busy; try again shortly",
+                    hex::encode(address)
+                ))
+            },
             crate::runtime::sleep,
         )
         .await?;

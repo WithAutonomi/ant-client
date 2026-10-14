@@ -186,7 +186,8 @@ where
 struct FailureRecord {
     endpoint: String,
     failed_at: Instant,
-    cooldown: Duration,
+    /// The endpoint answered and declined, rather than failing.
+    refused: bool,
 }
 
 /// Runtime-neutral negative cache for transport endpoints.
@@ -224,31 +225,48 @@ where
         let Some(record) = self.entries.get(peer) else {
             return false;
         };
-        if record.endpoint != endpoint || record.failed_at.elapsed() >= record.cooldown {
+        if record.endpoint != endpoint || self.remaining(record).is_zero() {
             self.entries.remove(peer);
             return false;
         }
         true
     }
 
+    /// Peers suppressed because their endpoint declined a dial, each with the
+    /// time until it is dialled again.
+    pub(crate) fn refusals(&self) -> impl Iterator<Item = (&K, Duration)> + '_ {
+        self.entries
+            .iter()
+            .filter(|(_, record)| record.refused)
+            .map(|(peer, record)| (peer, self.remaining(record)))
+            .filter(|(_, remaining)| !remaining.is_zero())
+    }
+
     pub(crate) fn record_failure(&mut self, peer: K, endpoint: String) {
-        self.record(peer, endpoint, self.cooldown);
+        self.record(peer, endpoint, false);
     }
 
     pub(crate) fn record_refusal(&mut self, peer: K, endpoint: String) {
-        self.record(peer, endpoint, self.refusal_cooldown);
+        self.record(peer, endpoint, true);
     }
 
-    fn record(&mut self, peer: K, endpoint: String, cooldown: Duration) {
+    fn remaining(&self, record: &FailureRecord) -> Duration {
+        let cooldown = if record.refused {
+            self.refusal_cooldown
+        } else {
+            self.cooldown
+        };
+        cooldown.saturating_sub(record.failed_at.elapsed())
+    }
+
+    fn record(&mut self, peer: K, endpoint: String, refused: bool) {
         if !self.entries.contains_key(&peer) && self.entries.len() >= self.max_entries {
             // Evict whichever record expires first, so a short refusal never
             // outlives a long failure.
             let soonest = self
                 .entries
                 .iter()
-                .min_by_key(|(_, record)| {
-                    record.cooldown.saturating_sub(record.failed_at.elapsed())
-                })
+                .min_by_key(|(_, record)| self.remaining(record))
                 .map(|(peer, _)| peer.clone());
             if let Some(soonest) = soonest {
                 self.entries.remove(&soonest);
@@ -259,7 +277,7 @@ where
             FailureRecord {
                 endpoint,
                 failed_at: Instant::now(),
-                cooldown,
+                refused,
             },
         );
     }
@@ -291,7 +309,12 @@ mod tests {
         cache.record_refusal(7_u8, "endpoint".to_string());
         cache.record_failure(8_u8, "endpoint".to_string());
         assert!(cache.is_suppressed(&7, "endpoint"));
+        let refusals = cache.refusals().collect::<Vec<_>>();
+        assert_eq!(refusals.len(), 1);
+        assert_eq!(refusals[0].0, &7);
+        assert!(refusals[0].1 <= Duration::from_millis(500));
         std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(cache.refusals().count(), 0);
         assert!(!cache.is_suppressed(&7, "endpoint"));
         assert!(cache.is_suppressed(&8, "endpoint"));
     }
