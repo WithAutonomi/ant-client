@@ -6,6 +6,7 @@
 //! host adapter. Higher-level browser integration is owned by the companion
 //! `ant-client-browser-sdk` project.
 
+pub mod file_manifest;
 pub mod manifest;
 pub mod payment;
 #[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
@@ -664,6 +665,28 @@ mod wasm {
         let view = BrowserManifestView::from_manifest(&manifest)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         serde_wasm_bindgen::to_value(&view).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Build canonical `.ant` bytes and a compact share link without network I/O.
+    #[wasm_bindgen(js_name = createManifest)]
+    pub fn create_manifest_wasm(input: JsValue) -> Result<JsValue, JsValue> {
+        let input: super::file_manifest::ManifestInput = serde_wasm_bindgen::from_value(input)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let result = input.create().map_err(|error| JsValue::from_str(&error))?;
+        serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Format a public file link using the shared link grammar.
+    #[wasm_bindgen(js_name = createFileLink)]
+    pub fn create_file_link_wasm(address: &str) -> Result<String, JsValue> {
+        match crate::data::manifest::parse_link(address)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?
+        {
+            crate::data::manifest::Link::File(address) => {
+                Ok(crate::data::manifest::file_link(&address))
+            }
+            _ => Err(JsValue::from_str("expected a public file address")),
+        }
     }
 
     /// Validate and normalize browser bootstrap and public-file metadata.
