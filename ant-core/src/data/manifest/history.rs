@@ -351,6 +351,7 @@ mod tests {
             entries: vec![ManifestEntry {
                 path: Some("a.bin".into()),
                 size: Some(1),
+                sha256: None,
                 source: ContentRef::Public {
                     address: [seed; 32],
                 },

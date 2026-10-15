@@ -20,6 +20,7 @@ use ant_core::data::{
 };
 use self_encryption::{shrink_data_map, ChunkInfo, DataMap};
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 use support::{test_client_config, MiniTestnet, DEFAULT_NODE_COUNT};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -218,6 +219,79 @@ async fn manifest_round_trips_through_file_and_link() {
     assert_eq!(report.written(), 1);
 
     drop(client);
+    testnet.teardown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn uploads_record_sha256_and_extraction_checks_it() {
+    let (client, testnet) = setup().await;
+
+    let source = TempDir::new().unwrap();
+    write_tree(source.path());
+    let mut builder = ManifestBuilder::new(
+        &client,
+        BuildOptions {
+            name: Some("hashed".into()),
+            torrent: None,
+            reference_mode: ReferenceMode::Embedded,
+            visibility: Visibility::Private,
+            payment_mode: PaymentMode::Auto,
+            follow_symlinks: false,
+            cancel: CancellationToken::new(),
+        },
+    );
+    builder.add_directory(source.path(), None).unwrap();
+    let built = builder.finish(None).await.expect("build manifest");
+    assert_eq!(built.manifest.entries.len(), 3);
+
+    // Every uploaded entry records the SHA-256 of the file it came from.
+    for entry in &built.manifest.entries {
+        let path = entry.path.as_deref().expect("uploaded entries have paths");
+        let bytes = fs::read(source.path().join(path)).unwrap();
+        let expected: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(entry.sha256, Some(expected), "{path}");
+    }
+
+    // It survives the `.ant` encoding, and a matching download extracts.
+    let reread = Manifest::decode(&built.manifest.encode().unwrap()).unwrap();
+    assert_eq!(reread, built.manifest);
+    let out = TempDir::new().unwrap();
+    let report = extract_manifest(&client, &reread, &extract_options(out.path(), vec![]), None)
+        .await
+        .unwrap();
+    assert_eq!(report.written(), 3, "{:?}", report.entries);
+
+    // A wrong hash fails only that entry, and leaves nothing at its target.
+    let mut tampered = built.manifest.clone();
+    let victim = tampered
+        .entries
+        .iter_mut()
+        .find(|e| e.path.as_deref() == Some("docs/b.bin"))
+        .unwrap();
+    victim.sha256 = Some([0u8; 32]);
+    let out = TempDir::new().unwrap();
+    let report = extract_manifest(
+        &client,
+        &tampered,
+        &extract_options(out.path(), vec![]),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.written(), 2, "{:?}", report.entries);
+    assert_eq!(report.failed(), 1, "{:?}", report.entries);
+    assert!(report.entries.iter().any(|e| e.name == "docs/b.bin"
+        && matches!(&e.status, EntryStatus::Failed { error } if error.contains("SHA-256 mismatch"))));
+    assert!(!out.path().join("docs/b.bin").exists());
+    // No temporary file is left beside it either.
+    let leftovers: Vec<_> = fs::read_dir(out.path().join("docs"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "c.bin")
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
     testnet.teardown().await;
 }
 
@@ -559,6 +633,7 @@ async fn embedded_root_identity_is_the_published_address() {
         entries: vec![ManifestEntry {
             path: Some("big.bin".into()),
             size: None,
+            sha256: None,
             source: ContentRef::Embedded { data_map: root },
         }],
     };

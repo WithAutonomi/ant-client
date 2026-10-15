@@ -209,6 +209,7 @@ impl ManifestAction {
                     manifest.entries.push(ant_core::data::ManifestEntry {
                         path,
                         size: None,
+                        sha256: None,
                         source: ContentRef::Public { address },
                     });
                 }
@@ -856,6 +857,10 @@ fn show(manifest: &Manifest, json: bool) -> anyhow::Result<()> {
             entry.source.kind(),
             entry.effective_name()?
         );
+        // Recorded by the creator; extraction checks downloads against it.
+        if let Some(sha256) = entry.sha256 {
+            println!("{:>12}  {:<9} sha256 {}", "", "", hex::encode(sha256));
+        }
     }
     if any_claimed {
         println!();
@@ -1041,6 +1046,7 @@ fn entries_json(manifest: &Manifest) -> anyhow::Result<Vec<serde_json::Value>> {
                 "path": entry.path,
                 "size": entry.size,
                 "known_size": entry.known_size(),
+                "sha256": entry.sha256.map(hex::encode),
                 "kind": entry.source.kind(),
                 "address": hex::encode(entry.source.content_address()?),
             }))
@@ -1145,6 +1151,7 @@ mod tests {
                 entries: vec![ant_core::data::ManifestEntry {
                     path: Some("valid.bin".into()),
                     size: None,
+                    sha256: None,
                     source: ContentRef::Public { address: [1; 32] },
                 }],
             };
@@ -1213,6 +1220,7 @@ mod tests {
             result.manifest.entries.push(ant_core::data::ManifestEntry {
                 path: Some(format!("file-{index}")),
                 size: None,
+                sha256: None,
                 source: ContentRef::Public {
                     address: [index; 32],
                 },
@@ -1232,6 +1240,7 @@ mod tests {
             entries: vec![ant_core::data::ManifestEntry {
                 path: Some("completed.bin".into()),
                 size: Some(10),
+                sha256: None,
                 source: ContentRef::Public { address: [1; 32] },
             }],
         };

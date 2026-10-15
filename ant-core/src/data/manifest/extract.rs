@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use futures::stream::{self, StreamExt};
 use self_encryption::DataMap;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::Builder as TempBuilder;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -27,11 +28,13 @@ use crate::data::error::Error;
 use crate::data::Client;
 
 use super::path::PATH_SEPARATOR;
-use super::{ContentRef, Manifest, ManifestEntry, ManifestError};
+use super::{ContentRef, Manifest, ManifestEntry, ManifestError, SHA256_LEN};
 
 #[cfg(all(test, unix))]
 use std::os::unix::fs::symlink;
 
+/// Read buffer for checking a downloaded file's SHA-256.
+const SHA256_READ_BUFFER: usize = 1024 * 1024;
 /// Prefix of the temporary file an entry is downloaded into.
 const TEMP_PREFIX: &str = ".ant-extract-";
 /// Capacity of the per-entry download progress channel.
@@ -300,6 +303,22 @@ async fn download_entry(
         .file_download_with_progress(&data_map, &temp, download_progress)
         .await?;
 
+    // Check the creator's recorded SHA-256 before the file takes its name.
+    // On a mismatch the temporary file is dropped, so nothing unverified is
+    // left behind.
+    if let Some(expected) = entry.sha256 {
+        let path = temp.to_path_buf();
+        let actual = tokio::task::spawn_blocking(move || file_sha256(&path))
+            .await
+            .map_err(|e| ManifestError::Build(format!("hashing task failed: {e}")))??;
+        if actual != expected {
+            return Err(ManifestError::Sha256Mismatch {
+                expected: hex::encode(expected),
+                actual: hex::encode(actual),
+            });
+        }
+    }
+
     // Re-check the parent chain and the target immediately before the
     // rename; either may have changed while the download ran.
     verify_parent_chain(&options.output_root, name)?;
@@ -311,6 +330,21 @@ async fn download_entry(
     };
     persisted.map_err(|e| ManifestError::Io(e.error))?;
     Ok(bytes)
+}
+
+/// SHA-256 of the file at `path`, read in one streaming pass.
+fn file_sha256(path: &Path) -> io::Result<[u8; SHA256_LEN]> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; SHA256_READ_BUFFER];
+    loop {
+        let n = io::Read::read(&mut file, &mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 /// Fail the entry before downloading when `dir`'s filesystem cannot hold
@@ -435,10 +469,24 @@ fn check_target(target: &Path, overwrite: bool) -> Result<(), ManifestError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn file_sha256_matches_a_one_shot_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        // Spans several read buffers, with a ragged tail.
+        let data: Vec<u8> = (0..(2 * SHA256_READ_BUFFER + 4321))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let path = dir.path().join("f.bin");
+        fs::write(&path, &data).unwrap();
+        let expected: [u8; SHA256_LEN] = Sha256::digest(&data).into();
+        assert_eq!(file_sha256(&path).unwrap(), expected);
+    }
+
     fn entry(path: &str) -> ManifestEntry {
         ManifestEntry {
             path: Some(path.into()),
             size: None,
+            sha256: None,
             source: ContentRef::Public { address: [1; 32] },
         }
     }

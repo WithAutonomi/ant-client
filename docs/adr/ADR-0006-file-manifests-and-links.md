@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-09-23
-- **Last amended:** 2026-10-08
+- **Last amended:** 2026-10-15
 - **Decision owners:** Mick
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -116,6 +116,9 @@ pub struct ManifestEntry {
     /// Plaintext length in bytes as recorded by the creator. A hint for
     /// display only; nothing is decided by it.
     pub size: Option<u64>,
+    /// SHA-256 of the plaintext as recorded by the creator. Checked against
+    /// every download that extracts the entry.
+    pub sha256: Option<[u8; 32]>,
     /// Where the bytes come from.
     pub source: ContentRef,
 }
@@ -129,11 +132,23 @@ pub enum ContentRef {
 }
 ```
 
-`name`, `torrent`, `path` and `size` are optional metadata. `source` and the
-payload of whichever variant it holds are required. A manifest that is only
-a list of content references is valid. `size` is the creator's claim and is
-never verified; where an exact size is needed it comes from a root DataMap,
-which lists every chunk's plaintext length.
+`name`, `torrent`, `path`, `size` and `sha256` are optional metadata.
+`source` and the payload of whichever variant it holds are required. A
+manifest that is only a list of content references is valid. `size` is the
+creator's claim and is never verified; where an exact size is needed it
+comes from a root DataMap, which lists every chunk's plaintext length.
+
+`sha256` is a standard whole-file hash of the plaintext, for tools and
+processes outside Autonomi: fixity checks, receipts, comparison with a copy
+held elsewhere. It adds nothing to integrity within Autonomi, which the
+content address already gives, and it is not part of an entry's identity.
+Like `size` it is the creator's claim, but unlike `size` it is checked:
+extraction hashes every downloaded file that has one and fails the entry on
+a mismatch (see Download and extraction). Uploads record it, computed in the
+same read that feeds the encryptor, so it costs no extra pass over the file.
+(Added 2026-10-15, V2-1564: an optional field within format version 1 under
+the forward-compatibility rules below, so readers that predate it ignore it,
+and entries without it encode exactly as before.)
 
 An embedded DataMap may be either form a DataMap takes: the **root** map that
 lists the file's data chunks, or the **shrunk** child map a large upload
@@ -201,6 +216,7 @@ Torrent       map {
 Entry         map {
                 "path":   str             optional
                 "size":   uint            optional
+                "sha256": bin 32          optional
                 "source": ContentRef      required
               }
 ContentRef    map with exactly one key, the variant name:
@@ -357,6 +373,10 @@ optional path and size, and nothing is uploaded. A public file can also be
 added with its DataMap fetched from the network and embedded, which costs
 nothing and lets recipients skip the DataMap fetch.
 
+Every file the builder uploads is recorded with its `sha256`. Entries added
+by address, or with a DataMap fetched from the network, have none: the
+creator never read their bytes.
+
 Two reference modes for uploaded files:
 
 - **Embedded (default).** The DataMap goes into the manifest, whether or not
@@ -409,7 +429,8 @@ stored, so the history is a plain folder of manifests. The client lists
 records newest first, ordering ids within one second by their suffix as a
 number, and accepts a record id wherever it accepts a manifest file or link:
 `show`, `link`, `export` and `download`. Every record embeds the full
-DataMap, whether or not the upload was public. A file name that breaks the
+DataMap, whether or not the upload was public, and records the upload's
+`sha256`. A file name that breaks the
 portable path rules is repaired for the record, or dropped so the entry
 extracts under its content address, rather than losing the record. Recording never fails an
 upload that has already succeeded; an unusable history directory is reported
@@ -464,10 +485,13 @@ Per entry: resolve the DataMap (`Public` needs one fetch), resolve it to its
 root (a shrunk map needs its wrapper records), and check that the target's
 filesystem has room for the root's exact plaintext size before downloading;
 too little space is a per-entry failure. Then download through the ordinary
-file download and write as above. The recorded `size` decides nothing; tools
-show it marked as the creator's claim, and show the exact size instead
-wherever an embedded root map provides one. Extracted files get the
-platform's default permissions.
+file download and write as above. When the entry records a `sha256`, the
+downloaded temporary file is hashed before it takes its name; a mismatch is
+a per-entry failure and the temporary file is removed, so nothing unverified
+is left at the target. The recorded `size` decides nothing; tools show it
+marked as the creator's claim, and show the exact size instead wherever an
+embedded root map provides one. Extracted files get the platform's default
+permissions.
 
 A bounded number of entries are in flight at once, one by default. Results
 are per entry: written, failed with its error, or cancelled. One failure does
@@ -482,12 +506,14 @@ and extract. Encode, decode, validate and link handling are portable and
 build for the browser. The browser bindings export two functions:
 `parseManifestLink`, for a manifest link, a file link or a bare address,
 and `decodeManifest`, for `.ant` bytes. Each returns entries with their
-effective name, content address, claimed and exact size, and an embedded
-entry's DataMap bytes, which feed the existing private-file download
-directly. Creating manifests in the browser is not exported. Build and
+effective name, content address, claimed and exact size, recorded
+`sha256` when present, and an embedded entry's DataMap bytes, which feed the
+existing private-file download directly. Creating manifests in the browser is not exported. Build and
 extract need a filesystem. The CLI exposes create, list, show, link, export
 and download for manifests, and its ordinary file download accepts a file
-link or a bare address. No daemon API is added.
+link or a bare address; `show` prints each recorded `sha256`, and
+`ant file upload` prints the uploaded file's. No daemon API is part of the
+initial release.
 
 ## Consequences
 
@@ -507,6 +533,8 @@ link or a bare address. No daemon API is added.
 - Integrity, deduplication and payment are inherited from DataMaps and
   chunks. No node change.
 - Deterministic encoding gives identical manifests identical links.
+- Uploaded entries carry a standard SHA-256 that tools outside Autonomi can
+  check, recorded at no extra read cost, and every extraction verifies it.
 
 ### Negative / Trade-offs
 
@@ -555,6 +583,10 @@ link or a bare address. No daemon API is added.
   rejected; a positional (array) body, entry or variant is rejected; the
   DataMap layout round-trips root and shrunk maps and rejects truncated,
   empty and gapped chunk lists.
+- `sha256`: a golden fixture pins it as a 32-byte `bin` between `size` and
+  `source`; entries without it encode exactly as before; a hash of the wrong
+  length is rejected; the upload read loop's hash equals a one-shot digest of
+  the file; extraction's file hash matches a one-shot digest.
 - Identity: a root map and its shrunk map derive the same content address;
   on a local network, a real multi-chunk public upload's published address
   equals the address derived from its root, and compaction finds an
