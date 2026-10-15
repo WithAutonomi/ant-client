@@ -247,6 +247,7 @@ impl BrowserNetworkClient {
     /// page is lost, [`Self::store_paid_pointer`] stores the same state without
     /// paying again. `on_prepared` is awaited with an opaque record/plan checkpoint
     /// before any payment; persist it durably to recover a later receipt.
+    #[allow(clippy::too_many_arguments)] // Preserve the existing positional browser ABI.
     #[wasm_bindgen(js_name = createPointer)]
     pub async fn create_pointer(
         &self,
@@ -278,6 +279,7 @@ impl BrowserNetworkClient {
     /// Point the pointer `owner_seed` controls at `target`, one past the
     /// counter the network serves (or create it), and pay for the new state.
     /// `on_paid` is as for [`Self::create_pointer`].
+    #[allow(clippy::too_many_arguments)] // Preserve the existing positional browser ABI.
     #[wasm_bindgen(js_name = updatePointer)]
     pub async fn update_pointer(
         &self,
