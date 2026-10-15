@@ -6,6 +6,7 @@
 //! host adapter. Higher-level browser integration is owned by the companion
 //! `ant-client-browser-sdk` project.
 
+pub mod file_manifest;
 pub mod manifest;
 pub mod payment;
 #[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
@@ -666,6 +667,28 @@ mod wasm {
         serde_wasm_bindgen::to_value(&view).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
+    /// Build canonical `.ant` bytes and a compact share link without network I/O.
+    #[wasm_bindgen(js_name = createManifest)]
+    pub fn create_manifest_wasm(input: JsValue) -> Result<JsValue, JsValue> {
+        let input: super::file_manifest::ManifestInput = serde_wasm_bindgen::from_value(input)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let result = input.create().map_err(|error| JsValue::from_str(&error))?;
+        serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Format a public file link using the shared link grammar.
+    #[wasm_bindgen(js_name = createFileLink)]
+    pub fn create_file_link_wasm(address: &str) -> Result<String, JsValue> {
+        match crate::data::manifest::parse_link(address)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?
+        {
+            crate::data::manifest::Link::File(address) => {
+                Ok(crate::data::manifest::file_link(&address))
+            }
+            _ => Err(JsValue::from_str("expected a public file address")),
+        }
+    }
+
     /// Validate and normalize browser bootstrap and public-file metadata.
     #[wasm_bindgen(js_name = parseBrowserManifest)]
     pub fn parse_browser_manifest_wasm(value: JsValue) -> Result<JsValue, JsValue> {
@@ -1080,7 +1103,7 @@ pub enum BrowserLinkView {
 /// A manifest shaped for JavaScript: every entry carries its effective
 /// name, kind and address, and embedded entries carry the DataMap bytes a
 /// private download takes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserManifestView {
     /// Suggested root directory name.
@@ -1093,7 +1116,7 @@ pub struct BrowserManifestView {
 }
 
 /// A manifest's torrent reference shaped for JavaScript.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserTorrentView {
     /// Hex SHA-1 info hash of a v1 torrent.
@@ -1105,7 +1128,7 @@ pub struct BrowserTorrentView {
 }
 
 /// One manifest entry shaped for JavaScript.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserManifestEntryView {
     /// Effective name: the path, or the hex content address.
@@ -1117,11 +1140,11 @@ pub struct BrowserManifestEntryView {
     /// Exact plaintext size, known when the entry embeds a root DataMap.
     pub known_size: Option<u64>,
     /// `embedded` or `public`.
-    pub kind: &'static str,
+    pub kind: String,
     /// Hex content address.
     pub address: String,
     /// Canonical DataMap bytes for an embedded entry.
-    #[serde(skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
     pub data_map: Option<Vec<u8>>,
 }
 
@@ -1138,13 +1161,16 @@ impl BrowserManifestView {
                 ),
                 crate::data::manifest::ContentRef::Public { .. } => None,
             };
+            // An embedded entry's address comes from self-encrypting its
+            // DataMap; derive it once and name a path-less entry by it.
+            let address = hex::encode(entry.source.content_address()?);
             entries.push(BrowserManifestEntryView {
-                name: entry.effective_name()?,
+                name: entry.path.clone().unwrap_or_else(|| address.clone()),
                 path: entry.path.clone(),
                 size: entry.size,
                 known_size: entry.known_size(),
-                kind: entry.source.kind(),
-                address: hex::encode(entry.source.content_address()?),
+                kind: entry.source.kind().to_owned(),
+                address,
                 data_map,
             });
         }
