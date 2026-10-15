@@ -217,7 +217,9 @@ use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
 use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use crate::data::network::send_and_await_chunk_response;
+use crate::data::network::{
+    send_and_await_chunk_response, send_and_await_chunk_response_notifying_sent, RequestSent,
+};
 use ant_protocol::evm::{QuoteHash, TxHash};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{
@@ -864,6 +866,7 @@ impl Client {
             // speculation on stale hints before a live holder is discovered.
             // The final close-group size and absence rules still use peer_count.
             crate::client_engine::read::MAX_GET_FALLBACK_PEERS,
+            self.network().read_hedge_delay(),
             |sender| {
                 #[cfg(feature = "native")]
                 let observation = &observation;
@@ -947,7 +950,7 @@ impl Client {
                 }
             },
             |(peer, _)| *peer.as_bytes(),
-            |(peer, addrs), early| {
+            |(peer, addrs), early, sent| {
                 #[cfg(feature = "native")]
                 let observation = &observation;
                 async move {
@@ -963,6 +966,8 @@ impl Client {
                                 ),
                                 ..ReadObservation::default()
                             });
+                            // A native GET leaves at once.
+                            sent.notify();
                             return self
                                 .chunk_get_diagnostic_attempt(
                                     address,
@@ -976,11 +981,12 @@ impl Client {
                     }
                     #[cfg(feature = "native")]
                     if let (Some(diag), Some(observation)) = (diag, observation) {
+                        sent.notify();
                         return self
                             .chunk_get_diagnostic_attempt(address, &peer, &addrs, diag, observation)
                             .await;
                     }
-                    self.chunk_get_from_peer(address, &peer, &addrs).await
+                    self.chunk_get_from_peer(address, &peer, &addrs, sent).await
                 }
             },
             |error| {
@@ -1055,7 +1061,12 @@ impl Client {
         let mut get_results = stream::iter(targets.iter().cloned())
             .map(|target| async move {
                 let chunk_result = self
-                    .chunk_get_from_peer(address, &target.peer_id, &target.peer_addrs)
+                    .chunk_get_from_peer(
+                        address,
+                        &target.peer_id,
+                        &target.peer_addrs,
+                        RequestSent::unobserved(),
+                    )
                     .await;
 
                 if let Ok(Some(chunk)) = &chunk_result {
@@ -1100,12 +1111,14 @@ impl Client {
         Ok(results)
     }
 
-    /// Fetch a chunk from a specific peer.
+    /// Fetch a chunk from a specific peer, notifying `sent` once the GET leaves
+    /// for it.
     async fn chunk_get_from_peer(
         &self,
         address: &XorName,
         peer: &PeerId,
         peer_addrs: &[MultiAddr],
+        sent: RequestSent,
     ) -> Result<Option<DataChunk>> {
         let node = self.network();
         let request_id = self.next_request_id();
@@ -1122,7 +1135,7 @@ impl Client {
         let addr_hex = hex::encode(address);
         let timeout_secs = self.config().chunk_get_timeout_secs;
 
-        let result = send_and_await_chunk_response(
+        let result = send_and_await_chunk_response_notifying_sent(
             node,
             peer,
             message_bytes,
@@ -1164,6 +1177,7 @@ impl Client {
                     "Timeout waiting for chunk {addr_hex} from {peer} after {timeout_secs}s"
                 ))
             },
+            sent,
         )
         .await;
 
