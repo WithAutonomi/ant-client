@@ -100,11 +100,11 @@ const DEFAULT_BROWSER_QUOTE_CONCURRENCY: usize = 4;
 const MAX_READ_RESPONSE_MEMORY: usize = 128 * 1024 * 1024;
 const READ_RESPONSE_RESERVATION: usize =
     3 * (MAX_BROWSER_RESPONSE_BYTES + PQ_ENCRYPTED_OVERHEAD_BYTES);
-/// Chunk fetches a browser client starts with: as many GETs as the read budget
-/// admits at once. A WebRTC DataChannel carries a record more slowly than QUIC,
-/// so the native cold start of 4 left half the budget idle. The adaptive
-/// controller still backs off from here.
-const BROWSER_FETCH_START: usize = MAX_READ_RESPONSE_MEMORY / READ_RESPONSE_RESERVATION;
+/// How long a read's first GET waits for its response, once sent, before the
+/// read also asks another holder. A healthy peer takes 1-3 s to carry a 4 MiB
+/// record over a WebRTC DataChannel, so the native 1 s raced nearly every read
+/// and fetched a second copy.
+const BROWSER_READ_HEDGE_DELAY: Duration = Duration::from_secs(3);
 const MAX_BROWSER_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_UPLOAD_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
@@ -241,7 +241,19 @@ impl Deref for BrowserClientLease {
 
 impl BrowserClientLease {
     async fn authenticated(&self) -> Result<LockedBrowserClient<'_>, RpcError> {
-        self.client.authenticated_before(&self.admission).await
+        self.client
+            .authenticated_before(&self.admission, None)
+            .await
+    }
+
+    /// Authenticate for a GET, whose session slot follows its read priority.
+    async fn authenticated_read(
+        &self,
+        read: &multiplex::ReadPriority<'_>,
+    ) -> Result<LockedBrowserClient<'_>, RpcError> {
+        self.client
+            .authenticated_before(&self.admission, Some(read))
+            .await
     }
 
     async fn hello(&self) -> Result<BrowserHello, String> {
@@ -284,7 +296,7 @@ impl BrowserClientLease {
                     client.authenticate().await?;
                     drop(client);
                     let client = match select(
-                        Box::pin(self.client.authenticated_before(&self.admission)),
+                        Box::pin(self.client.authenticated_before(&self.admission, None)),
                         Box::pin(sender.cancellation()),
                     )
                     .await
@@ -608,11 +620,14 @@ impl BrowserClientPool {
         }
     }
 
+    /// Physical GETs admitted at once: the adaptive fetch cap within the read
+    /// budget, or the budget's capacity before a client installs its limiter.
     fn read_limit(&self) -> usize {
-        let desired = self.fetch_limiter.borrow().as_ref().map_or_else(
-            || crate::data::client::adaptive::ChannelStart::default().fetch,
-            |limiter| limiter.current(),
-        );
+        let desired = self
+            .fetch_limiter
+            .borrow()
+            .as_ref()
+            .map_or_else(|| self.read_budget.capacity(), |limiter| limiter.current());
         self.read_budget.limit(desired)
     }
 
@@ -1140,6 +1155,7 @@ impl BrowserNodeClientCore {
     async fn authenticated_before(
         &self,
         admission: &TransferDeadline,
+        read: Option<&multiplex::ReadPriority<'_>>,
     ) -> Result<LockedBrowserClient<'_>, RpcError> {
         loop {
             let mut client = self.lock_before(admission).await?;
@@ -1149,7 +1165,11 @@ impl BrowserNodeClientCore {
                 .current_rpc()
                 .ok_or_else(|| "WebRTC session unavailable".to_string())?;
             let generation = self.generation.get();
-            match rpc.admit(admission.remaining()).await {
+            let admitted = match read {
+                Some(read) => rpc.admit_read(admission.remaining(), read).await,
+                None => rpc.admit(admission.remaining()).await,
+            };
+            match admitted {
                 Ok(_) if generation != self.generation.get() => continue,
                 Ok(slot) if !rpc.is_closed() => {
                     client.slot.replace(Some(slot));
@@ -1176,7 +1196,7 @@ impl BrowserNodeClientCore {
 
     #[cfg(feature = "test-utils")]
     async fn authenticated(&self) -> Result<LockedBrowserClient<'_>, RpcError> {
-        self.authenticated_before(&TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
+        self.authenticated_before(&TransferDeadline::new(RPC_ADMISSION_TIMEOUT), None)
             .await
     }
 
@@ -1217,7 +1237,7 @@ impl Drop for BrowserNodeClientCore {
 struct LockedBrowserClient<'a> {
     client: &'a BrowserNodeClientCore,
     _guard: Option<MutexGuard<'a, ()>>,
-    slot: RefCell<Option<tokio::sync::OwnedSemaphorePermit>>,
+    slot: RefCell<Option<multiplex::SessionSlot>>,
     authenticated_generation: Option<u64>,
 }
 
@@ -2442,18 +2462,24 @@ impl BrowserNetworkClient {
         let inner = Rc::new(inner);
         let adapter = Rc::new(SharedNetworkAdapter::new(Rc::clone(&inner)));
         let network = crate::data::Network::from_browser(adapter.clone());
+        // Fetches beyond the GETs the read budget admits at once would only
+        // queue, so the fetch channel starts there and never probes past it. A
+        // WebRTC DataChannel carries a record more slowly than QUIC, so the
+        // native cold start would leave much of the budget idle. The adaptive
+        // controller still backs off from here.
+        let read_capacity = inner.pool.read_budget.capacity();
+        let mut config = crate::data::ClientConfig::default();
+        config.adaptive.max.fetch = read_capacity;
+        let start = crate::data::client::adaptive::ChannelStart {
+            fetch: read_capacity,
+            ..Default::default()
+        };
         let shared = Rc::new(
-            crate::data::Client::from_network(network, crate::data::ClientConfig::default())
-                .with_chunk_cache(crate::data::ChunkCache::new(
-                    MAX_RANGE_CACHE_BYTES / MAX_BROWSER_RECORD_BYTES,
-                )),
+            crate::data::Client::from_network_with_start(network, config, start).with_chunk_cache(
+                crate::data::ChunkCache::new(MAX_RANGE_CACHE_BYTES / MAX_BROWSER_RECORD_BYTES),
+            ),
         );
-        let controller = shared.controller();
-        controller.warm_start(crate::data::client::adaptive::ChannelStart {
-            fetch: BROWSER_FETCH_START,
-            ..controller.snapshot()
-        });
-        *inner.pool.fetch_limiter.borrow_mut() = Some(controller.fetch.clone());
+        *inner.pool.fetch_limiter.borrow_mut() = Some(shared.controller().fetch.clone());
         let read_ahead = read_ahead::ReadAheadPool::new(&inner, &shared);
         Ok(Self {
             inner,

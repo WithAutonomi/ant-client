@@ -58,9 +58,21 @@ impl ReadBudget {
         })
     }
 
+    /// Physical reads the byte budget admits at once.
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub(crate) fn limit(&self, desired: usize) -> usize {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         desired.max(1).min(self.capacity).min(state.processing_cap)
+    }
+
+    /// Changes whenever a read's admission may have changed: a permit is
+    /// released, the processing allowance moves, or [`ReadBudget::notify`]
+    /// asks queued reads whether they are still speculative.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<()> {
+        self.changed.subscribe()
     }
 
     /// Only admitted physical reads consume reservations. Cancellation drops
@@ -208,6 +220,7 @@ mod tests {
     #[test]
     fn admissions_obey_both_the_adaptive_and_byte_limits() {
         let budget = ReadBudget::new(100, 20);
+        assert_eq!(budget.capacity(), 5);
         assert_eq!(budget.limit(256), 5);
         let a = block_on(budget.acquire(|| 2, || false)).unwrap();
         let b = block_on(budget.acquire(|| 2, || false)).unwrap();
@@ -312,6 +325,19 @@ mod tests {
         let permit = block_on(wait).unwrap();
         assert!(!permit.speculative);
         assert_eq!(budget.state.lock().unwrap().speculative, 1);
+    }
+
+    #[test]
+    fn subscribers_learn_of_released_permits_and_notifications() {
+        let budget = ReadBudget::new(100, 10);
+        let mut changed = budget.subscribe();
+        let permit = block_on(budget.acquire(|| 2, || false)).unwrap();
+        assert!(!changed.has_changed().unwrap());
+        drop(permit);
+        assert!(changed.has_changed().unwrap());
+        changed.borrow_and_update();
+        budget.notify();
+        assert!(changed.has_changed().unwrap());
     }
 
     #[test]

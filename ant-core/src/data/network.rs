@@ -3,6 +3,7 @@
 //! Provides peer discovery, message sending, and DHT operations
 //! for the client library.
 
+pub use crate::client_engine::read::RequestSent;
 #[cfg(feature = "native")]
 use crate::data::error::Error;
 use crate::data::error::Result;
@@ -197,6 +198,25 @@ pub trait BrowserNetwork {
         request: ant_protocol::ChunkMessage,
         timeout: std::time::Duration,
     ) -> futures::future::LocalBoxFuture<'a, Result<ant_protocol::ChunkMessage>>;
+    /// Execute one authenticated request as [`BrowserNetwork::request`] does, and
+    /// notify `sent` once it has passed this adapter's own admission and leaves
+    /// for the peer. Adapters that admit every request at once keep this default.
+    fn request_notifying_sent<'a>(
+        &'a self,
+        peer: &'a PeerId,
+        addrs: &'a [MultiAddr],
+        request: ant_protocol::ChunkMessage,
+        timeout: std::time::Duration,
+        sent: RequestSent,
+    ) -> futures::future::LocalBoxFuture<'a, Result<ant_protocol::ChunkMessage>> {
+        sent.notify();
+        self.request(peer, addrs, request, timeout)
+    }
+    /// How long a read's first GET waits for its response, once sent, before the
+    /// read also asks another holder: a healthy peer's transfer of a full record.
+    fn read_hedge_delay(&self) -> std::time::Duration {
+        crate::client_engine::read::DEFAULT_EARLY_READ_HEDGE_DELAY
+    }
 }
 
 impl Network {
@@ -534,6 +554,19 @@ impl Network {
         );
     }
 
+    /// How long a read's first GET waits for its response, once sent, before the
+    /// read also asks another holder.
+    pub(crate) fn read_hedge_delay(&self) -> std::time::Duration {
+        #[cfg(feature = "native")]
+        {
+            crate::client_engine::read::DEFAULT_EARLY_READ_HEDGE_DELAY
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.backend.read_hedge_delay()
+        }
+    }
+
     /// Whether `peer` would take a paid pointer write from this client, as
     /// far as can be told before one is sent: `None` if it cannot be told.
     ///
@@ -580,8 +613,44 @@ pub(crate) async fn send_and_await_chunk_response<T, E: From<crate::data::error:
     send_error: impl FnOnce(String) -> E,
     timeout_error: impl FnOnce() -> E,
 ) -> std::result::Result<T, E> {
+    send_and_await_chunk_response_notifying_sent(
+        network,
+        target_peer,
+        message_bytes,
+        request_id,
+        timeout,
+        peer_addrs,
+        response_handler,
+        send_error,
+        timeout_error,
+        RequestSent::unobserved(),
+    )
+    .await
+}
+
+/// Execute a request as [`send_and_await_chunk_response`] does, notifying `sent`
+/// once the request has passed the client's own admission and leaves for the peer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_and_await_chunk_response_notifying_sent<
+    T,
+    E: From<crate::data::error::Error>,
+>(
+    network: &Network,
+    target_peer: &PeerId,
+    message_bytes: Vec<u8>,
+    request_id: u64,
+    timeout: std::time::Duration,
+    peer_addrs: &[MultiAddr],
+    response_handler: impl Fn(ant_protocol::ChunkMessageBody) -> Option<std::result::Result<T, E>>,
+    send_error: impl FnOnce(String) -> E,
+    timeout_error: impl FnOnce() -> E,
+    sent: RequestSent,
+) -> std::result::Result<T, E> {
     #[cfg(feature = "native")]
     {
+        // A native client has no request admission of its own: the request
+        // leaves at once.
+        sent.notify();
         ant_protocol::send_and_await_chunk_response(
             network.node(),
             target_peer,
@@ -601,7 +670,7 @@ pub(crate) async fn send_and_await_chunk_response<T, E: From<crate::data::error:
             Ok(request) => {
                 network
                     .backend
-                    .request(target_peer, peer_addrs, request, timeout)
+                    .request_notifying_sent(target_peer, peer_addrs, request, timeout, sent)
                     .await
             }
             Err(error) => Err(crate::data::error::Error::Protocol(error.to_string())),

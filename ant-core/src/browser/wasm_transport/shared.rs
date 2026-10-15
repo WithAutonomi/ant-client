@@ -6,16 +6,10 @@
 use super::*;
 use crate::client_engine::read_budget::ReadPermit;
 use crate::data::error::{Error as DataError, Result as DataResult};
-use crate::data::network::BrowserNetwork;
+use crate::data::network::{BrowserNetwork, RequestSent};
 use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, WitnessedCloseGroup};
 use ant_protocol::{ChunkMessage, ChunkMessageBody};
 use futures::future::LocalBoxFuture;
-
-/// Speculative GETs, such as read-ahead, are admitted as if the read cap were at
-/// most this. They then hold at most half of it, so they alone never fill a
-/// node's multiplexed session. A GET a read waits for, such as a seek's, still
-/// queues there if other awaited GETs hold every slot.
-const SPECULATIVE_READ_LIMIT: usize = multiplex::MAX_REQUESTS;
 
 pub(super) struct SharedNetworkAdapter {
     pub(super) inner: Rc<BrowserNetworkCore>,
@@ -40,7 +34,8 @@ impl SharedNetworkAdapter {
     }
 
     /// An adapter for read-ahead, whose GETs for records no read awaits hold at
-    /// most the read budget's speculative share.
+    /// most the read budget's speculative share, and of each peer session's
+    /// slots.
     pub(super) fn read_ahead(
         inner: Rc<BrowserNetworkCore>,
         awaited: Rc<read_ahead::AwaitedRecords>,
@@ -67,14 +62,7 @@ impl SharedNetworkAdapter {
         crate::runtime::timeout(
             admission.remaining(),
             self.inner.pool.read_budget.acquire(
-                || {
-                    let limit = self.inner.pool.read_limit();
-                    if self.is_speculative(request) {
-                        limit.min(SPECULATIVE_READ_LIMIT)
-                    } else {
-                        limit
-                    }
-                },
+                || self.inner.pool.read_limit(),
                 || self.is_speculative(request),
             ),
         )
@@ -298,6 +286,21 @@ impl BrowserNetwork for SharedNetworkAdapter {
         request: ChunkMessage,
         timeout: Duration,
     ) -> LocalBoxFuture<'a, DataResult<ChunkMessage>> {
+        self.request_notifying_sent(peer, addrs, request, timeout, RequestSent::unobserved())
+    }
+
+    fn read_hedge_delay(&self) -> Duration {
+        BROWSER_READ_HEDGE_DELAY
+    }
+
+    fn request_notifying_sent<'a>(
+        &'a self,
+        peer: &'a PeerId,
+        addrs: &'a [MultiAddr],
+        request: ChunkMessage,
+        timeout: Duration,
+        sent: RequestSent,
+    ) -> LocalBoxFuture<'a, DataResult<ChunkMessage>> {
         Box::pin(async move {
             #[cfg(feature = "test-utils")]
             let mut trace = diagnostics::Trace::new(
@@ -337,7 +340,19 @@ impl BrowserNetwork for SharedNetworkAdapter {
                 self.inner.pool.client_before(&endpoint, admission).await
             }
             .map_err(rpc_data_error)?;
-            let client = client.authenticated().await.map_err(rpc_data_error)?;
+            // A GET competes for the peer's session slots by whether a read
+            // waits for its record.
+            let client = if is_read {
+                let speculative = || self.is_speculative(&request);
+                let read = multiplex::ReadPriority {
+                    speculative: &speculative,
+                    changed: self.inner.pool.read_budget.subscribe(),
+                };
+                client.authenticated_read(&read).await
+            } else {
+                client.authenticated().await
+            }
+            .map_err(rpc_data_error)?;
             #[cfg(feature = "test-utils")]
             trace.event("authenticated", "");
             let hello = client
@@ -364,6 +379,8 @@ impl BrowserNetwork for SharedNetworkAdapter {
             let bytes = request
                 .encode()
                 .map_err(|e| DataError::Protocol(e.to_string()))?;
+            // Admission is done: the request leaves with the session's next frame.
+            sent.notify();
             let (response, _read_permit) = client
                 .request_reserved(
                     BrowserRequestBody::ChunkProtocol,

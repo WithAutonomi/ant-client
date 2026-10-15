@@ -60,10 +60,14 @@ test("a connected known holder can finish a verified read while discovery is sti
 
 test("an early read is hedged only after a DataChannel transfer's time", async () => {
   // Both nodes hold the DataMap and discovery never completes, so only the
-  // early read's hedge can send a second GET. On WASM it waits 3 s: a first
-  // reply within that time is the only GET, and a slower one is raced.
-  for (const [firstReply, expectedGets] of [[2_000, 1], [6_000, 2]]) {
-    let asked = 0;
+  // early read's hedge can send a second GET. A browser races a GET 3 s after
+  // sending it: a first reply within that time is the only GET, and a slower
+  // one is raced a full 3 s after it was sent.
+  const hedge = 3_000;
+  // Timers may fire this much early.
+  const timerSlack = 50;
+  for (const [firstReply, expectedGets] of [[hedge / 2, 1], [hedge * 2, 2]]) {
+    let asked = 0, delivered = 0;
     const options = [{ chunk: datamap.content }, { chunk: datamap.content }];
     const rtc = mockWebRtc(options);
     const client = new BrowserNetworkClient(rtc.endpoints);
@@ -73,14 +77,18 @@ test("an early read is hedged only after a DataChannel transfer's time", async (
       for (const node of options) {
         node.respond = (_channel, method) => method === "find_node" ? false : undefined;
         node.delay = method => method === "get_chunk" && asked++ === 0 ? firstReply : 0;
+        node.delivered = (_channel, method) => { if (method === "get_chunk") delivered++; };
       }
-      const began = Date.now();
       reader = await client.openPublicFile(datamap.address);
-      const elapsed = Date.now() - began;
       assert.equal(reader.size, content.length);
       const gets = rtc.requests.filter(r => r.method === "get_chunk" && r.address === datamap.address);
       assert.equal(gets.length, expectedGets, `first reply after ${firstReply} ms`);
-      assert(elapsed < Math.min(firstReply, 3_000) + 1_500, `the read took ${elapsed} ms`);
+      if (expectedGets > 1) {
+        const raced = gets[1].at - gets[0].at;
+        assert(raced >= hedge - timerSlack && raced < firstReply, `raced after ${raced} ms`);
+      }
+      // Drain the slow reply before the client closes.
+      await until(() => delivered === expectedGets, "every GET's reply");
     } finally { reader?.close(); client.close(); }
   }
 });
@@ -342,6 +350,24 @@ test("a zero-length read is not a read that a later one continues", async () => 
     // The header read starts no window: its record and the next only.
     assert.deepEqual(await reader.readRange(0, 10), original.slice(0, 10));
     assert.equal(await settled(rtc, 500) - opened, 2);
+  } finally { reader?.close(); client.close(); }
+});
+
+test("read-ahead holds at most half of a node's request slots", async () => {
+  // No read waits for the window's slow records, so only two of its four
+  // fetches go out to the one node. Its other two slots stay free for reads.
+  const slow = 1_000;
+  const { original, encrypted } = large();
+  const rtc = serve(encrypted, new Set(), new Map([1, 2, 3, 4].map(index => [index, slow])));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let reader;
+  try {
+    reader = await client.openPublicFile(encrypted.address, undefined, { streaming: true });
+    assert.deepEqual(await reader.readRange(0, 10), original.slice(0, 10));
+    await settled(rtc, slow / 5);
+    const sent = [1, 2, 3, 4].filter(index => getsOf(rtc, encrypted.chunks[index].dst_hash) > 0);
+    assert.equal(sent.length, 2, `read-ahead sent GETs for records ${sent}`);
+    await settled(rtc, slow);
   } finally { reader?.close(); client.close(); }
 });
 

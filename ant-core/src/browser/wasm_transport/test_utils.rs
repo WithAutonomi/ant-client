@@ -1206,8 +1206,10 @@ pub async fn test_admission_deadlines(endpoints: JsValue) {
     let waiter = async {
         TimeoutFuture::new(1).await;
         let deadline = TransferDeadline::new(Duration::from_millis(20));
-        assert!(matches!(lease.client.authenticated_before(&deadline).await,
-            Err(RpcError::Timeout(message)) if message.contains("admission")));
+        assert!(
+            matches!(lease.client.authenticated_before(&deadline, None).await,
+            Err(RpcError::Timeout(message)) if message.contains("admission"))
+        );
     };
     let (result, ()) = futures::future::join(active, waiter).await;
     result.unwrap();

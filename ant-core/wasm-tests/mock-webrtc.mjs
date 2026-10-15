@@ -65,7 +65,7 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
       }
       const put = method === "put_chunk" || method === "put_pointer";
       const address = method === "get_chunk" ? this.server.last_get_address() : undefined;
-      requests.push({ node: this.index, method, ...(put ? {
+      requests.push({ node: this.index, method, at: performance.now(), ...(put ? {
         address: this.server.last_put_address(),
         quoteHash: this.server.last_put_quote_hash(),
       } : {}), ...(address ? { address } : {}) });
