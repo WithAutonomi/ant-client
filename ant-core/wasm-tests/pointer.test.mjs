@@ -4,7 +4,7 @@
 import { BrowserNetworkClient } from "./client-fixture.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { pointerAddress } from "./pkg/ant_core.js";
+import { pointerAddress, recoverPointerPayment } from "./pkg/ant_core.js";
 import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 
 const seed = new Uint8Array(32).fill(7);
@@ -474,6 +474,129 @@ test("an open pointer reports its counter, and a transfer nowhere is refused bef
       /to itself/,
     );
     assert.equal(signer.calls.length, 1, "only the create was paid for");
+  } finally {
+    client.close();
+  }
+});
+
+const transaction = `0x${"ab".repeat(32)}`;
+/** The receipt recovery takes: the transaction keyed by the quote it paid. */
+const receiptFor = (quote) => ({ transactionHashes: { [quote.quoteHash]: transaction } });
+
+test("onPrepared is awaited before the wallet, and one that fails pays nothing", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  const order = [];
+  const pay = (...args) => { order.push("wallet"); return signer.pay(...args); };
+  try {
+    await client.createPointer(seed, target(1), "chunk", paymentNetwork, pay, {
+      onPrepared: async checkpoint => {
+        assert.equal(JSON.parse(checkpoint).version, 1);
+        order.push("prepared");
+        await new Promise(resolve => setTimeout(resolve, 20));
+        order.push("kept");
+      },
+    });
+    assert.deepEqual(order, ["prepared", "kept", "wallet"], "the wallet waits for the checkpoint");
+
+    const before = puts(rtc).length;
+    await assert.rejects(
+      client.updatePointer(seed, target(2), "chunk", paymentNetwork, pay, {
+        onPrepared: async () => { throw new Error("disk full"); },
+      }),
+      /disk full/,
+    );
+    assert.equal(signer.calls.length, 1, "a checkpoint that was not kept is not paid for");
+    assert.equal(puts(rtc).length, before, "and nothing is sent");
+  } finally {
+    client.close();
+  }
+});
+
+test("pointer write options are checked before anything is paid", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    for (const [options, error] of [
+      [{ onPrepare: () => {} }, /unknown pointer write option "onPrepare"/],
+      [{ onPaid: 5 }, /onPaid must be a function/],
+      [7, /must be an object/],
+    ]) {
+      await assert.rejects(
+        client.createPointer(seed, target(1), "chunk", paymentNetwork, signer.pay, options),
+        error,
+      );
+    }
+    assert.equal(signer.calls.length, 0);
+  } finally {
+    client.close();
+  }
+});
+
+test("a settlement refusal learned while onPrepared runs stops the payment", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  try {
+    await assert.rejects(
+      client.createPointer(seed, target(1), "chunk", paymentNetwork, signer.pay, {
+        onPrepared: () => client.test_refuse_settlement(),
+      }),
+      /test settlement refusal/,
+    );
+    assert.equal(signer.calls.length, 0, "a write this build cannot settle is not paid for");
+  } finally {
+    client.close();
+  }
+});
+
+test("recoverPointerPayment rebuilds the paid state from its checkpoint and receipt", async () => {
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const signer = wallet();
+  const checkpoints = [];
+  let paid;
+  const options = { onPrepared: value => { checkpoints.push(value); }, onPaid: value => { paid = value; } };
+  try {
+    const written = await client.createPointer(seed, target(1), "chunk", paymentNetwork, signer.pay, options);
+    const [checkpoint] = checkpoints;
+    const quote = signer.calls[0].quotes[0];
+
+    // Other receipt fields, such as totalAmount, are neither needed nor read.
+    const recovered = recoverPointerPayment(checkpoint, { ...receiptFor(quote), walletAddress: "0x01" });
+    assert.deepEqual(recovered.record, paid.record);
+    assert.deepEqual(recovered.proof, paid.proof, "the same proof the write paid for");
+    assert.deepEqual(
+      await client.storePaidPointer(recovered.record, recovered.proof, paymentNetwork),
+      written.pointer,
+    );
+    assert.equal(signer.calls.length, 1, "recovering pays nothing");
+
+    await assert.rejects(
+      async () => recoverPointerPayment(checkpoint, { transactionHash: transaction, totalAmount: quote.amount }),
+      /transactionHashes/,
+      "a receipt that does not say which quote it paid is refused",
+    );
+    await assert.rejects(
+      async () => recoverPointerPayment(checkpoint, { transactionHashes: { ["cd".repeat(32)]: transaction } }),
+      /does not pay this checkpoint's quote/,
+    );
+
+    const saved = JSON.parse(checkpoint);
+    await assert.rejects(
+      async () => recoverPointerPayment(JSON.stringify({ ...saved, version: 2, added: true }), receiptFor(quote)),
+      /unsupported pointer checkpoint version 2/,
+      "a newer checkpoint is reported as such, not as malformed",
+    );
+
+    await client.updatePointer(seed, target(2), "chunk", paymentNetwork, signer.pay, options);
+    const other = JSON.parse(checkpoints[1]);
+    await assert.rejects(
+      async () => recoverPointerPayment(JSON.stringify({ ...saved, record: other.record }), receiptFor(quote)),
+      /pointer record differs from its payment plan/,
+    );
   } finally {
     client.close();
   }
