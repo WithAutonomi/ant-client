@@ -415,6 +415,24 @@ impl Manifest {
 
     /// Check the entry count, the name, every path and every collision rule.
     pub fn validate(&self) -> Result<(), ManifestError> {
+        self.validated_names()?;
+        Ok(())
+    }
+
+    /// Validate, then sort entries by effective name so encoding is
+    /// deterministic.
+    pub fn canonicalize(&mut self) -> Result<(), ManifestError> {
+        let names = self.validated_names()?;
+        let mut keyed: Vec<_> = names.into_iter().zip(self.entries.drain(..)).collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        self.entries = keyed.into_iter().map(|(_, entry)| entry).collect();
+        Ok(())
+    }
+
+    /// [`Self::validate`], returning each entry's effective name in entry
+    /// order. A path-less embedded entry's name comes from self-encrypting
+    /// its DataMap, so callers that need the names reuse these.
+    fn validated_names(&self) -> Result<Vec<String>, ManifestError> {
         if self.entries.len() > MAX_MANIFEST_ENTRIES {
             return Err(ManifestError::TooManyEntries {
                 count: self.entries.len(),
@@ -443,21 +461,9 @@ impl Manifest {
             }
             names.push(entry.effective_name()?);
         }
-        path::check_collisions(names.iter().map(String::as_str)).map_err(ManifestError::Conflict)
-    }
-
-    /// Validate, then sort entries by effective name so encoding is
-    /// deterministic.
-    pub fn canonicalize(&mut self) -> Result<(), ManifestError> {
-        self.validate()?;
-        let mut keyed = self
-            .entries
-            .drain(..)
-            .map(|entry| entry.effective_name().map(|name| (name, entry)))
-            .collect::<Result<Vec<_>, _>>()?;
-        keyed.sort_by(|a, b| a.0.cmp(&b.0));
-        self.entries = keyed.into_iter().map(|(_, entry)| entry).collect();
-        Ok(())
+        path::check_collisions(names.iter().map(String::as_str))
+            .map_err(ManifestError::Conflict)?;
+        Ok(names)
     }
 
     /// The manifest as a link carries it: every embedded DataMap replaced by

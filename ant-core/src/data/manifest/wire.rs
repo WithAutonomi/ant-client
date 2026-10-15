@@ -109,6 +109,13 @@ struct DataMapIn {
 /// Serialise a DataMap in the manifest layout. Used through
 /// `#[serde(with = "wire")]`.
 pub fn serialize<S: Serializer>(data_map: &DataMap, serializer: S) -> Result<S::Ok, S::Error> {
+    // `deserialize` refuses a map without chunks, so writing one would
+    // produce a manifest nobody can read.
+    if data_map.infos().is_empty() {
+        return Err(S::Error::custom(
+            "an embedded DataMap must list at least one chunk",
+        ));
+    }
     let mut chunks = Vec::with_capacity(data_map.len() * CHUNK_RECORD_LEN);
     for (position, info) in data_map.infos().iter().enumerate() {
         if info.index != position {
@@ -418,6 +425,13 @@ mod tests {
         }))
         .unwrap();
         assert!(rmp_serde::from_slice::<Holder>(&empty).is_err());
+        let unreadable = Holder {
+            data_map: DataMap::new(Vec::new()),
+        };
+        assert!(
+            rmp_serde::to_vec_named(&unreadable).is_err(),
+            "what the decoder refuses is never written"
+        );
 
         let gapped = Holder {
             data_map: DataMap::new(vec![chunk(0, 1), chunk(2, 2)]),

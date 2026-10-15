@@ -26,7 +26,9 @@ Browser applications need shared-core manifest exports and pointer operations wi
 
 ## Decision
 
-Export manifest construction through the existing shared format encoder. Extend pointer writes with an awaited pre-payment checkpoint containing the signed record and verified plan. The browser durably journals that checkpoint, submission evidence and receipts before proceeding. Export a recovery function that builds the paid proof from the original plan and receipt, without signing, quoting or submitting another transaction. Existing pointer write arguments remain compatible. A failed pre-payment checkpoint prevents payment; a failed paid checkpoint must not prevent storing an already paid state.
+Export manifest construction through the existing shared format encoder, which refuses anything its decoder would refuse. Browser input is held to native writer policy: a root DataMap is embedded only up to the native size limit, and a size hint must match a root DataMap's exact size.
+
+Pointer writes take a trailing options object, `{ onPrepared, onPaid }`; a bare function is still accepted as `onPaid`, and unknown options are refused. `onPrepared` is awaited with a versioned checkpoint containing the signed record and verified plan before the wallet is invoked. The settlement-refusal check is repeated after it, immediately before the wallet is invoked. The application durably keeps that checkpoint, and its wallet keeps each broadcast's transaction hash: only the wallet observes the broadcast, and the core's `onSubmission` records nothing for a pointer write. Export a recovery function that builds the paid proof from the original plan and a receipt naming the transaction by quote hash (`transactionHashes`). It checks that the receipt pays the checkpoint's quote, without signing, quoting or submitting another transaction. A failed pre-payment checkpoint prevents payment; a failed paid checkpoint must not prevent storing an already paid state.
 
 ## Consequences
 
