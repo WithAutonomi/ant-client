@@ -58,6 +58,33 @@ test("a connected known holder can finish a verified read while discovery is sti
 });
 
 
+test("an early read is hedged only after a DataChannel transfer's time", async () => {
+  // Both nodes hold the DataMap and discovery never completes, so only the
+  // early read's hedge can send a second GET. On WASM it waits 3 s: a first
+  // reply within that time is the only GET, and a slower one is raced.
+  for (const [firstReply, expectedGets] of [[2_000, 1], [6_000, 2]]) {
+    let asked = 0;
+    const options = [{ chunk: datamap.content }, { chunk: datamap.content }];
+    const rtc = mockWebRtc(options);
+    const client = new BrowserNetworkClient(rtc.endpoints);
+    let reader;
+    try {
+      await client.findClosest(datamap.address);
+      for (const node of options) {
+        node.respond = (_channel, method) => method === "find_node" ? false : undefined;
+        node.delay = method => method === "get_chunk" && asked++ === 0 ? firstReply : 0;
+      }
+      const began = Date.now();
+      reader = await client.openPublicFile(datamap.address);
+      const elapsed = Date.now() - began;
+      assert.equal(reader.size, content.length);
+      const gets = rtc.requests.filter(r => r.method === "get_chunk" && r.address === datamap.address);
+      assert.equal(gets.length, expectedGets, `first reply after ${firstReply} ms`);
+      assert(elapsed < Math.min(firstReply, 3_000) + 1_500, `the read took ${elapsed} ms`);
+    } finally { reader?.close(); client.close(); }
+  }
+});
+
 test("a newly discovered holder is readable before a slow lookup round finishes", async () => {
   const nodes = [{ view: [1, 2] }, {}, {}];
   const rtc = mockWebRtc(nodes);
@@ -230,6 +257,28 @@ function serve(encrypted, missing = new Set(), delays = new Map()) {
 let largeFile;
 // Larger than the read-ahead window plus the last record.
 const large = () => (largeFile ??= recordFile(12));
+
+test("a download keeps as many GETs in flight as the read budget admits", async () => {
+  // Every node holds every record and multiplexes, so neither one session nor
+  // one holder bounds the download; the read budget, of 8 GETs, does.
+  const { original, encrypted } = large();
+  let active = 0, peak = 0;
+  const rtc = mockWebRtc(Array.from({ length: 4 }, () => ({
+    multiplex: true,
+    respond(_channel, method) { if (method === "get_chunk") peak = Math.max(peak, ++active); },
+    delay: method => method === "get_chunk" ? 200 : 0,
+    delivered(_channel, method) { if (method === "get_chunk") active--; },
+  })));
+  for (const store of rtc.stores) {
+    for (const record of encrypted.records) store.set(record.address, record.content);
+  }
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const result = await client.downloadPublicFile(encrypted.address, undefined);
+    assert.deepEqual(result.content, original);
+    assert(peak > 4 && peak <= 8, `${peak} GETs in flight`);
+  } finally { client.close(); }
+});
 
 test("a streaming reader reads ahead from any read; an ordinary one only fetches the next record", async () => {
   const { original, encrypted, starts } = recordFile(5);

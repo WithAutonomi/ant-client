@@ -8,7 +8,8 @@ use crate::client_engine::read_budget::ReadPermit;
 use tokio::sync::Semaphore;
 
 pub(super) const CAPABILITY: &str = "rpc-multiplex-4";
-const MAX_REQUESTS: usize = 4;
+/// Requests one multiplexed session carries at once.
+pub(super) const MAX_REQUESTS: usize = 4;
 type Reply = Result<(BrowserResponseFrame, Duration), RpcError>;
 
 pub(super) struct RpcSession {
