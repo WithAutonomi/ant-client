@@ -331,6 +331,7 @@ async fn handle_file_upload(
         entries: vec![ManifestEntry {
             path: portable_component(&original_name),
             size: Some(file_size),
+            sha256: Some(result.sha256),
             source: ContentRef::Embedded {
                 data_map: recorded_map,
             },
@@ -357,6 +358,7 @@ async fn handle_file_upload(
                 chunks_stored: result.chunks_stored,
                 chunks_failed: result.chunks_failed,
                 size: file_size,
+                sha256: hex::encode(result.sha256),
                 storage_cost_atto: result.storage_cost_atto.clone(),
                 gas_cost_wei: result.gas_cost_wei.to_string(),
                 elapsed_secs: elapsed.as_secs_f64(),
@@ -372,6 +374,7 @@ async fn handle_file_upload(
             println!("  Address: {hex_addr}");
             println!("  Chunks:  {total_chunks} ({} + 1 data map)", data_chunks);
             println!("  Size:    {}", format_size(file_size));
+            println!("  SHA-256: {}", hex::encode(result.sha256));
             println!("  Cost:    {cost_display}");
             println!("  Time:    {:.1}s", elapsed.as_secs_f64());
             println!();
@@ -405,6 +408,7 @@ async fn handle_file_upload(
                 chunks_stored: result.chunks_stored,
                 chunks_failed: result.chunks_failed,
                 size: file_size,
+                sha256: hex::encode(result.sha256),
                 storage_cost_atto: result.storage_cost_atto.clone(),
                 gas_cost_wei: result.gas_cost_wei.to_string(),
                 elapsed_secs: elapsed.as_secs_f64(),
@@ -420,6 +424,7 @@ async fn handle_file_upload(
             println!("  Datamap: {}", datamap_path.display());
             println!("  Chunks:  {}", result.chunks_stored);
             println!("  Size:    {}", format_size(file_size));
+            println!("  SHA-256: {}", hex::encode(result.sha256));
             println!("  Cost:    {cost_display}");
             println!("  Time:    {:.1}s", elapsed.as_secs_f64());
             println!();
@@ -775,6 +780,8 @@ struct UploadJsonResult {
     chunks_stored: usize,
     chunks_failed: usize,
     size: u64,
+    /// SHA-256 of the uploaded file, hex.
+    sha256: String,
     storage_cost_atto: String,
     gas_cost_wei: String,
     elapsed_secs: f64,

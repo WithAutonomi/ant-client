@@ -103,6 +103,8 @@ const MAX_DECODE_DEPTH: usize = 16;
 pub const TORRENT_INFO_HASH_V1_LEN: usize = 20;
 /// Length of a BitTorrent v2 info hash (SHA-256, BEP 52).
 pub const TORRENT_INFO_HASH_V2_LEN: usize = 32;
+/// Length of an entry's `sha256`.
+pub const SHA256_LEN: usize = 32;
 
 /// A set of files and how to fetch each one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +200,13 @@ pub struct ManifestEntry {
     /// figure that can be relied on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// SHA-256 of the plaintext as recorded by the creator: a standard
+    /// whole-file hash that tools outside Autonomi can check. Integrity
+    /// within Autonomi already comes from the content address; this is the
+    /// creator's claim until a download is checked against it, which
+    /// extraction does whenever it is present.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub sha256: Option<[u8; SHA256_LEN]>,
     /// Where the bytes come from.
     pub source: ContentRef,
 }
@@ -284,6 +293,16 @@ pub enum ManifestError {
         cause: Box<ManifestError>,
         /// Completed uploads and pre-existing entries.
         partial: Box<build::BuildResult>,
+    },
+    /// A downloaded file's SHA-256 differs from the one its entry records.
+    #[error(
+        "SHA-256 mismatch: the manifest records {expected}, the downloaded file hashes to {actual}"
+    )]
+    Sha256Mismatch {
+        /// The recorded hash, hex.
+        expected: String,
+        /// The downloaded file's hash, hex.
+        actual: String,
     },
     /// The caller cancelled the operation.
     #[error("operation cancelled")]
@@ -546,11 +565,13 @@ mod tests {
                 ManifestEntry {
                     path: Some("photos/b.jpg".into()),
                     size: Some(20),
+                    sha256: None,
                     source: ContentRef::Public { address: [7; 32] },
                 },
                 ManifestEntry {
                     path: Some("a.txt".into()),
                     size: Some(10),
+                    sha256: None,
                     source: ContentRef::Embedded {
                         data_map: data_map(1),
                     },
@@ -558,12 +579,70 @@ mod tests {
                 ManifestEntry {
                     path: None,
                     size: None,
+                    sha256: None,
                     source: ContentRef::Embedded {
                         data_map: data_map(9),
                     },
                 },
             ],
         }
+    }
+
+    /// Header; `{"entries": [`; one `Public` entry `a` with `size` 5 and
+    /// `sha256` written as a 32-byte `bin` between `size` and `source`.
+    const GOLDEN_V1_SHA256_HEX: &str = concat!(
+        "c1414e5401",
+        "81a7656e747269657391",
+        "84a470617468a161a473697a6505",
+        "a6736861323536c420",
+        "abababababababababababababababababababababababababababababababab",
+        "a6736f7572636581a65075626c696381a761646472657373c420",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+    );
+
+    #[test]
+    fn sha256_encodes_between_size_and_source_and_round_trips() {
+        let manifest = Manifest {
+            name: None,
+            torrent: None,
+            entries: vec![ManifestEntry {
+                path: Some("a".into()),
+                size: Some(5),
+                sha256: Some([0xab; SHA256_LEN]),
+                source: ContentRef::Public {
+                    address: [0x11; 32],
+                },
+            }],
+        };
+        let bytes = manifest.encode().unwrap();
+        assert_eq!(hex::encode(&bytes), GOLDEN_V1_SHA256_HEX);
+        assert_eq!(Manifest::decode(&bytes).unwrap(), manifest);
+    }
+
+    #[test]
+    fn absent_sha256_leaves_the_encoding_unchanged() {
+        // Entries without a hash encode exactly as before the field existed,
+        // so existing manifests and links keep their bytes.
+        let mut manifest = sample();
+        for entry in &mut manifest.entries {
+            assert!(entry.sha256.is_none());
+        }
+        let bytes = manifest.encode().unwrap();
+        assert!(!bytes.windows(b"sha256".len()).any(|w| w == b"sha256"));
+        manifest.entries[0].sha256 = Some([1; SHA256_LEN]);
+        let with = manifest.encode().unwrap();
+        assert!(with.windows(b"sha256".len()).any(|w| w == b"sha256"));
+    }
+
+    #[test]
+    fn decode_rejects_a_sha256_of_the_wrong_length() {
+        let golden = hex::decode(GOLDEN_V1_SHA256_HEX).unwrap();
+        // Shorten the bin: header 0xc4 0x20 -> 0xc4 0x1f, dropping one byte.
+        let pos = golden.windows(2).position(|w| w == [0xc4, 0x20]).unwrap();
+        let mut short = golden[..pos].to_vec();
+        short.extend_from_slice(&[0xc4, 0x1f]);
+        short.extend_from_slice(&golden[pos + 2 + 1..]);
+        assert!(Manifest::decode(&short).is_err());
     }
 
     #[test]
@@ -740,6 +819,7 @@ mod tests {
             .map(|i| ManifestEntry {
                 path: Some(format!("f{i}")),
                 size: None,
+                sha256: None,
                 source: ContentRef::Public { address: [1; 32] },
             })
             .collect();
@@ -764,6 +844,7 @@ mod tests {
         m.entries.push(ManifestEntry {
             path: Some("../x".into()),
             size: None,
+            sha256: None,
             source: ContentRef::Public { address: [1; 32] },
         });
         assert!(matches!(
@@ -774,6 +855,7 @@ mod tests {
         m.entries.push(ManifestEntry {
             path: Some("a/b".into()),
             size: None,
+            sha256: None,
             source: ContentRef::Public { address: [2; 32] },
         });
         assert!(matches!(m.validate(), Err(ManifestError::Conflict(_))));
@@ -863,6 +945,7 @@ mod tests {
         manifest.entries.push(ManifestEntry {
             path: Some("big.bin".into()),
             size: None,
+            sha256: None,
             source: ContentRef::Embedded {
                 data_map: large_root(),
             },
@@ -886,6 +969,7 @@ mod tests {
         let entry = |source| ManifestEntry {
             path: None,
             size: Some(1),
+            sha256: None,
             source,
         };
         assert_eq!(
@@ -919,6 +1003,7 @@ mod tests {
                 ManifestEntry {
                     path: Some("a".into()),
                     size: Some(5),
+                    sha256: None,
                     source: ContentRef::Public {
                         address: [0x11; 32],
                     },
@@ -926,6 +1011,7 @@ mod tests {
                 ManifestEntry {
                     path: None,
                     size: None,
+                    sha256: None,
                     source: ContentRef::Embedded {
                         data_map: DataMap::new(vec![ChunkInfo {
                             index: 0,
@@ -967,6 +1053,7 @@ mod tests {
             entries: vec![ManifestEntry {
                 path: None,
                 size: None,
+                sha256: None,
                 source: ContentRef::Public { address: [1; 32] },
             }],
         };

@@ -25,6 +25,8 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
 self_encryption = "0.36.2"
+# Whole-file SHA-256 of uploaded plaintext, and its manifest check (V2-1564).
+sha2 = "0.10"
 # Portable WebRTC Direct profile shared with ant-node.
 saorsa-transport = { version = "0.37.0", default-features = false, features = ["webrtc"] }
 thiserror = "2"

@@ -186,6 +186,10 @@ pub struct UploadCostEstimate {
 pub struct FileUploadResult {
     /// The data map containing chunk metadata for reconstruction.
     pub data_map: DataMap,
+    /// SHA-256 of the uploaded plaintext, computed while it was read for
+    /// encryption (no second pass). A standard whole-file hash that tools
+    /// outside Autonomi can check; the DataMap's own hashes are per chunk.
+    pub sha256: [u8; 32],
     /// Number of chunks stored on the network.
     pub chunks_stored: usize,
     /// Number of chunks that failed to store. Always 0 for a successful

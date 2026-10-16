@@ -1116,6 +1116,9 @@ pub struct BrowserManifestEntryView {
     pub size: Option<u64>,
     /// Exact plaintext size, known when the entry embeds a root DataMap.
     pub known_size: Option<u64>,
+    /// Hex SHA-256 of the plaintext recorded by the manifest's creator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     /// `embedded` or `public`.
     pub kind: &'static str,
     /// Hex content address.
@@ -1143,6 +1146,7 @@ impl BrowserManifestView {
                 path: entry.path.clone(),
                 size: entry.size,
                 known_size: entry.known_size(),
+                sha256: entry.sha256.map(hex::encode),
                 kind: entry.source.kind(),
                 address: hex::encode(entry.source.content_address()?),
                 data_map,

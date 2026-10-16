@@ -219,6 +219,7 @@ mod tests {
                 ManifestEntry {
                     path: Some("a".into()),
                     size: None,
+                    sha256: None,
                     source: ContentRef::Embedded {
                         data_map: data_map(1),
                     },
@@ -226,6 +227,7 @@ mod tests {
                 ManifestEntry {
                     path: Some("b".into()),
                     size: None,
+                    sha256: None,
                     source: ContentRef::Embedded {
                         data_map: data_map(2),
                     },
@@ -233,6 +235,7 @@ mod tests {
                 ManifestEntry {
                     path: Some("c".into()),
                     size: None,
+                    sha256: None,
                     source: ContentRef::Public { address: [9; 32] },
                 },
             ],

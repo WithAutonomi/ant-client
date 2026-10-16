@@ -38,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   This is what makes an npm install usable out of the box: npm 12 blocks package install scripts
   by default, so the step that copies that file into the config directory frequently does not
   run.
+- Uploads report the file's SHA-256 (V2-1564). `ant file upload` prints it (and `--json` adds
+  `sha256`); it is computed in the same read that feeds the encryptor, so it costs no extra pass.
+  Manifest entries (ADR-0006) gain an optional `sha256`: uploads record it in the upload history
+  and in `ant manifest create` manifests, `ant manifest show` prints it, and
+  `ant manifest download` checks every downloaded file against it, failing the entry (and leaving
+  nothing at the target) on a mismatch. Entries without it encode exactly as before, and older
+  readers ignore it. In `ant-core`: `FileUploadResult::sha256`, `PreparedUpload::sha256`,
+  `DataUploadResult::sha256`, `ManifestEntry::sha256` and `ManifestError::Sha256Mismatch`.
 
 ### Changed
 - A pointer read that meets a final state returns the final state a majority of the close group

@@ -68,6 +68,7 @@ mod tests {
             entries: vec![ManifestEntry {
                 path: Some("a".into()),
                 size: None,
+                sha256: None,
                 source: ContentRef::Public { address: [1; 32] },
             }],
         }

@@ -22,6 +22,7 @@ use bytes::Bytes;
 #[cfg(feature = "native")]
 use futures::stream::StreamExt;
 use self_encryption::{encrypt, DataMap};
+use sha2::{Digest, Sha256};
 use std::num::NonZeroUsize;
 use tracing::{debug, info};
 
@@ -30,6 +31,10 @@ use tracing::{debug, info};
 pub struct DataUploadResult {
     /// The data map containing chunk metadata for reconstruction.
     pub data_map: DataMap,
+    /// SHA-256 of the uploaded plaintext, computed while it was read for
+    /// encryption (no second pass). A standard whole-file hash that tools
+    /// outside Autonomi can check; the DataMap's own hashes are per chunk.
+    pub sha256: [u8; 32],
     /// Number of chunks stored on the network.
     pub chunks_stored: usize,
     /// Which payment mode was actually used (not just requested).
@@ -50,6 +55,7 @@ impl Client {
         let content_len = content.len();
         debug!("Encrypting data ({content_len} bytes)");
 
+        let sha256: [u8; 32] = Sha256::digest(&content).into();
         let (data_map, encrypted_chunks) = encrypt(content)
             .map_err(|e| Error::Encryption(format!("Failed to encrypt data: {e}")))?;
 
@@ -68,6 +74,7 @@ impl Client {
 
         Ok(DataUploadResult {
             data_map,
+            sha256,
             chunks_stored,
             payment_mode_used: PaymentMode::Single,
         })
@@ -87,6 +94,7 @@ impl Client {
         content: Bytes,
         mode: PaymentMode,
     ) -> Result<DataUploadResult> {
+        let sha256: [u8; 32] = Sha256::digest(&content).into();
         let (data_map, encrypted) =
             encrypt(content).map_err(|e| Error::Encryption(e.to_string()))?;
         let chunks = encrypted
@@ -115,6 +123,7 @@ impl Client {
             .await?;
         Ok(DataUploadResult {
             data_map,
+            sha256,
             chunks_stored: outcome.addresses.len(),
             payment_mode_used: outcome.mode,
         })
@@ -165,6 +174,7 @@ impl Client {
         let content_len = content.len();
         debug!("Preparing data upload for external signing (visibility={visibility:?}, {content_len} bytes)");
 
+        let sha256: [u8; 32] = Sha256::digest(&content).into();
         let (data_map, encrypted_chunks) = encrypt(content)
             .map_err(|e| Error::Encryption(format!("Failed to encrypt data: {e}")))?;
 
@@ -256,6 +266,7 @@ impl Client {
 
         Ok(PreparedUpload {
             data_map,
+            sha256,
             payment_info: ExternalPaymentInfo::WaveBatch {
                 prepared_chunks,
                 payment_intent,
