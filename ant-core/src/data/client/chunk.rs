@@ -864,6 +864,7 @@ impl Client {
             // speculation on stale hints before a live holder is discovered.
             // The final close-group size and absence rules still use peer_count.
             crate::client_engine::read::MAX_GET_FALLBACK_PEERS,
+            crate::client_engine::read::uniform_choice,
             |sender| {
                 #[cfg(feature = "native")]
                 let observation = &observation;
@@ -988,6 +989,19 @@ impl Client {
                     error,
                     Error::Timeout(_) | Error::Network(_) | Error::Protocol(_)
                 )
+            },
+            || {
+                self.network()
+                    .refused_peers()
+                    .into_iter()
+                    .map(|(peer, remaining)| (*peer.as_bytes(), remaining))
+                    .collect()
+            },
+            || {
+                Error::Network(format!(
+                    "the nodes that may hold chunk {} are busy; try again shortly",
+                    hex::encode(address)
+                ))
             },
             crate::runtime::sleep,
         )
