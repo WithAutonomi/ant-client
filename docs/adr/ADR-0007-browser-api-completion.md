@@ -48,7 +48,7 @@ Export a recovery function that builds the paid proof from the original plan and
 ### Negative / Trade-offs
 
 - Applications must supply durable persistence and an observation-only recovery provider for unresolved payments. A crash before submission may require explicit verification that nothing was broadcast.
-- Checkpoints contain signed records and transaction evidence and must be treated as sensitive application data.
+- Checkpoints contain signed records and quoted payment plans, and kept submissions and receipts contain transaction evidence; all must be treated as sensitive application data.
 
 ### Neutral / Operational
 
