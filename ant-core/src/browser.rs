@@ -272,7 +272,7 @@ fn browser_chunk_info(info: &ChunkInfo) -> BrowserChunkInfo {
 
 #[cfg(all(target_arch = "wasm32", feature = "browser-wasm"))]
 mod wasm {
-    use super::file_manifest::{MANIFEST_INPUT_FIELDS, TORRENT_FIELD, TORRENT_INPUT_FIELDS};
+    use super::file_manifest::{struct_fields, ManifestInput, TorrentInput, TORRENT_FIELD};
     use super::manifest::parse_browser_manifest;
     use super::payment::{payment_quote_hash, verify_storage_quote, BrowserQuoteArtifact};
     use super::protocol::{
@@ -672,13 +672,14 @@ mod wasm {
     /// Build canonical `.ant` bytes and a compact share link without network I/O.
     #[wasm_bindgen(js_name = createManifest)]
     pub fn create_manifest_wasm(input: JsValue) -> Result<JsValue, JsValue> {
-        reject_unknown_keys(&input, &MANIFEST_INPUT_FIELDS).map_err(|e| JsValue::from_str(&e))?;
+        reject_unknown_keys(&input, struct_fields::<ManifestInput>())
+            .map_err(|e| JsValue::from_str(&e))?;
         if input.is_object() {
             let torrent = js_sys::Reflect::get(&input, &JsValue::from_str(TORRENT_FIELD))?;
-            reject_unknown_keys(&torrent, &TORRENT_INPUT_FIELDS)
+            reject_unknown_keys(&torrent, struct_fields::<TorrentInput>())
                 .map_err(|e| JsValue::from_str(&e))?;
         }
-        let input: super::file_manifest::ManifestInput = serde_wasm_bindgen::from_value(input)
+        let input: ManifestInput = serde_wasm_bindgen::from_value(input)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
         let result = input
             .create()
@@ -1165,8 +1166,34 @@ impl BrowserManifestView {
     pub fn from_manifest(
         manifest: &crate::data::manifest::Manifest,
     ) -> Result<Self, crate::data::manifest::ManifestError> {
+        Self::addressed_from(manifest, manifest)
+    }
+
+    /// [`Self::from_manifest`] for a caller holding the manifest's
+    /// [`link_form`](crate::data::manifest::Manifest::link_form) too. Its
+    /// DataMaps are already shrunk, so addresses come from it without
+    /// self-encrypting any embedded DataMap again.
+    pub(crate) fn from_manifest_and_link(
+        manifest: &crate::data::manifest::Manifest,
+        link: &crate::data::manifest::Manifest,
+    ) -> Result<Self, crate::data::manifest::ManifestError> {
+        if link.entries.len() != manifest.entries.len() {
+            return Err(crate::data::manifest::ManifestError::Encode(
+                "link form does not match its manifest".into(),
+            ));
+        }
+        Self::addressed_from(manifest, link)
+    }
+
+    /// The view of `manifest`, taking each entry's address from the entry
+    /// at the same position in `addresses`, a manifest with the same
+    /// content addresses in the same order.
+    fn addressed_from(
+        manifest: &crate::data::manifest::Manifest,
+        addresses: &crate::data::manifest::Manifest,
+    ) -> Result<Self, crate::data::manifest::ManifestError> {
         let mut entries = Vec::with_capacity(manifest.entries.len());
-        for entry in &manifest.entries {
+        for (entry, addressed) in manifest.entries.iter().zip(&addresses.entries) {
             let data_map = match &entry.source {
                 crate::data::manifest::ContentRef::Embedded { data_map } => Some(
                     rmp_serde::to_vec(data_map)
@@ -1176,7 +1203,7 @@ impl BrowserManifestView {
             };
             // An embedded entry's address comes from self-encrypting its
             // DataMap; derive it once for both the name and the address.
-            let address = entry.source.content_address()?;
+            let address = addressed.source.content_address()?;
             entries.push(BrowserManifestEntryView {
                 name: entry.effective_name_with(&address),
                 path: entry.path.clone(),

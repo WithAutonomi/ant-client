@@ -6,12 +6,13 @@
 use super::manifest::MAX_SAFE_JS_INTEGER;
 use super::BrowserManifestView;
 use crate::data::manifest::{
-    self, embedded_len, ContentRef, Link, Manifest, ManifestEntry, ManifestError, TorrentReference,
-    MANIFEST_LINK_RECOMMENDED_MAX_BYTES, MAX_EMBEDDED_ROOT_MAP_BYTES, MAX_MANIFEST_BYTES,
-    MAX_MANIFEST_ENTRIES,
+    self, embedded_len, is_embeddable, ContentRef, Link, Manifest, ManifestEntry, ManifestError,
+    TorrentReference, MANIFEST_LINK_RECOMMENDED_MAX_BYTES, MAX_EMBEDDED_ROOT_MAP_BYTES,
+    MAX_MANIFEST_BYTES, MAX_MANIFEST_ENTRIES, MAX_PUBLISHED_MAP_CHUNKS,
 };
 use self_encryption::DataMap;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -22,14 +23,6 @@ use xor_name::XorName;
 /// The [`ManifestInput`] field holding a [`TorrentInput`], as JavaScript
 /// names it.
 pub const TORRENT_FIELD: &str = "torrent";
-
-/// Every [`ManifestInput`] field as JavaScript names it. A JavaScript caller
-/// checks keys against this: `serde_wasm_bindgen` reads only declared fields,
-/// so `deny_unknown_fields` cannot refuse the others there.
-pub const MANIFEST_INPUT_FIELDS: [&str; 3] = ["name", TORRENT_FIELD, "entries"];
-
-/// Every [`TorrentInput`] field as JavaScript names it.
-pub const TORRENT_INPUT_FIELDS: [&str; 2] = ["infoHashV1", "infoHashV2"];
 
 /// Why [`ManifestInput::create`] refused its input.
 #[derive(Debug, Error)]
@@ -63,6 +56,18 @@ pub enum ManifestInputError {
         /// The limit.
         max: usize,
     },
+    /// A shrunk DataMap that is not the published form an upload returns,
+    /// such as an intermediate shrink level.
+    #[error(
+        "a shrunk DataMap of {chunks} chunks is not the published form an upload returns, \
+         which lists at most {max}"
+    )]
+    UnpublishedDataMap {
+        /// Chunks the map lists.
+        chunks: usize,
+        /// The most a published map lists.
+        max: usize,
+    },
     /// A size hint JavaScript cannot represent exactly.
     #[error("size {0} exceeds JavaScript's safe integer range")]
     UnsafeSize(u64),
@@ -80,6 +85,44 @@ pub enum ManifestInputError {
         /// The input field.
         field: &'static str,
     },
+}
+
+/// The field names a struct deserializes from, exactly as its serde derive
+/// declares them, after any `rename_all`. A JavaScript caller checks keys
+/// against these: `serde_wasm_bindgen` reads only the declared fields, so
+/// `deny_unknown_fields` cannot refuse the others there.
+pub fn struct_fields<'de, T: Deserialize<'de>>() -> &'static [&'static str] {
+    let mut recorder = FieldRecorder(&[]);
+    // Fails by design: the recorder only notes the names it is handed.
+    let _ = T::deserialize(&mut recorder);
+    recorder.0
+}
+
+/// A deserializer that records the field names a struct asks for.
+struct FieldRecorder(&'static [&'static str]);
+
+impl<'de> Deserializer<'de> for &mut FieldRecorder {
+    type Error = de::value::Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+        Err(de::Error::custom("not a struct"))
+    }
+
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _: &'static str,
+        fields: &'static [&'static str],
+        _: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.0 = fields;
+        Err(de::Error::custom("field names recorded"))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+        byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+        identifier ignored_any
+    }
 }
 
 /// What `createManifest` takes: metadata the creator supplies. The address of
@@ -181,9 +224,10 @@ impl ManifestInput {
         // canonical too.
         manifest.canonicalize()?;
         let bytes = manifest.encode_canonical()?;
-        let link_bytes = manifest.link_form()?.encode_canonical()?;
+        let link = manifest.link_form()?;
+        let link_bytes = link.encode_canonical()?;
         Ok(CreatedManifest {
-            manifest: BrowserManifestView::from_manifest(&manifest)?,
+            manifest: BrowserManifestView::from_manifest_and_link(&manifest, &link)?,
             bytes,
             link: manifest::manifest_link_from_bytes(&link_bytes),
             link_recommended: link_bytes.len() <= MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
@@ -269,7 +313,8 @@ fn torrent_hash<T>(
 }
 
 /// Decode a canonical DataMap and hold it to what a native writer embeds: a
-/// root map only while it is small, otherwise the shrunk map an upload returns.
+/// root map only while it is small, otherwise the published map an upload
+/// returns.
 fn embeddable_data_map(bytes: &[u8]) -> Result<DataMap, ManifestInputError> {
     let data_map: DataMap = rmp_serde::from_slice(bytes)
         .map_err(|e| ManifestInputError::InvalidDataMap(e.to_string()))?;
@@ -278,14 +323,20 @@ fn embeddable_data_map(bytes: &[u8]) -> Result<DataMap, ManifestInputError> {
     if canonical != bytes {
         return Err(ManifestInputError::NonCanonicalDataMap);
     }
-    let len = embedded_len(&data_map)?;
-    if !data_map.is_child() && len > MAX_EMBEDDED_ROOT_MAP_BYTES {
-        return Err(ManifestInputError::RootDataMapTooLarge {
-            len,
-            max: MAX_EMBEDDED_ROOT_MAP_BYTES,
-        });
+    if is_embeddable(&data_map)? {
+        return Ok(data_map);
     }
-    Ok(data_map)
+    Err(if data_map.is_child() {
+        ManifestInputError::UnpublishedDataMap {
+            chunks: data_map.len(),
+            max: MAX_PUBLISHED_MAP_CHUNKS,
+        }
+    } else {
+        ManifestInputError::RootDataMapTooLarge {
+            len: embedded_len(&data_map)?,
+            max: MAX_EMBEDDED_ROOT_MAP_BYTES,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -373,24 +424,35 @@ mod tests {
     }
 
     #[test]
-    fn the_field_lists_name_every_input_field() {
-        // `deny_unknown_fields` holds through serde_json, so input naming
-        // exactly the listed fields parses only if the lists are complete.
-        let torrent: serde_json::Map<_, _> = TORRENT_INPUT_FIELDS
-            .iter()
-            .map(|field| (field.to_string(), serde_json::Value::Null))
-            .collect();
-        let input = serde_json::json!({
-            "name": null,
-            TORRENT_FIELD: torrent,
-            "entries": [],
-        });
-        let keys: Vec<_> = input.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys.len(), MANIFEST_INPUT_FIELDS.len());
-        assert!(keys
-            .iter()
-            .all(|key| MANIFEST_INPUT_FIELDS.contains(&key.as_str())));
-        serde_json::from_value::<ManifestInput>(input).expect("every listed field is known");
+    fn struct_fields_are_the_names_javascript_uses() {
+        assert_eq!(
+            struct_fields::<ManifestInput>(),
+            ["name", TORRENT_FIELD, "entries"]
+        );
+        assert_eq!(
+            struct_fields::<TorrentInput>(),
+            ["infoHashV1", "infoHashV2"]
+        );
+    }
+
+    #[test]
+    fn an_embedded_entry_is_addressed_as_its_link_form_is() {
+        // Enough chunks that the link form shrinks the map.
+        let input = ManifestInput {
+            name: None,
+            torrent: None,
+            entries: vec![EntryInput::Embedded {
+                path: None,
+                size: None,
+                data_map: data_map_bytes(MAX_PUBLISHED_MAP_CHUNKS * 4, None),
+            }],
+        };
+        let created = input.create().expect("manifest");
+        let decoded = Manifest::decode(&created.bytes).expect("native decode");
+        let address = hex::encode(decoded.entries[0].source.content_address().unwrap());
+        let entry = &created.manifest.entries[0];
+        assert_eq!(entry.address, address);
+        assert_eq!(entry.name, address, "a path-less entry is named by it");
     }
 
     #[test]
@@ -451,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_small_root_data_map_is_embedded() {
+    fn only_a_small_root_or_published_data_map_is_embedded() {
         let error = embedded(None, data_map_bytes(OVERSIZED_CHUNKS, None))
             .create()
             .unwrap_err();
@@ -460,12 +522,21 @@ mod tests {
             "{error}"
         );
 
-        // A shrunk map carries no exact size, so any hint is kept as given.
-        let created = embedded(Some(1), data_map_bytes(OVERSIZED_CHUNKS, Some(1)))
+        // A published map carries no exact size, so any hint is kept as given.
+        let created = embedded(Some(1), data_map_bytes(MAX_PUBLISHED_MAP_CHUNKS, Some(1)))
             .create()
-            .expect("a shrunk map of any size is embedded");
+            .expect("the published map an upload returns is embedded");
         assert_eq!(created.manifest.entries[0].known_size, None);
         Manifest::decode(&created.bytes).expect("native decode");
+
+        // A larger shrunk map is an intermediate level no writer embeds.
+        let error = embedded(None, data_map_bytes(MAX_PUBLISHED_MAP_CHUNKS + 1, Some(1)))
+            .create()
+            .unwrap_err();
+        assert!(
+            matches!(error, ManifestInputError::UnpublishedDataMap { .. }),
+            "{error}"
+        );
     }
 
     #[test]

@@ -885,7 +885,9 @@ fn prune_locally_expired_proofs(
     proofs: HashMap<[u8; 32], Vec<u8>>,
 ) -> HashMap<XorName, Vec<u8>> {
     let now = std::time::SystemTime::now();
-    let max_safe_age = max_safe_proof_age();
+    let max_safe_age = Duration::from_secs(
+        CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS),
+    );
     let mut kept: HashMap<XorName, Vec<u8>> = HashMap::with_capacity(proofs.len());
     // Pair each expired address with the EXACT bytes we observed at
     // load time. The cache-side drop only removes the entry if those
@@ -920,19 +922,16 @@ fn prune_locally_expired_proofs(
     kept
 }
 
-/// The quote age past which a proof is too close to the storer's limit to
-/// trust.
-fn max_safe_proof_age() -> Duration {
-    Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS))
-}
-
-/// Whether serialized proof bytes are still young enough for storers to
-/// accept, judged as a cached proof is. `None` if the bytes are not a
-/// single-node proof.
-#[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
-pub(crate) fn paid_proof_is_safely_fresh(proof: &[u8], now: std::time::SystemTime) -> Option<bool> {
+/// Whether serialized proof bytes hold a quote older at `now` than storers
+/// accept (`QUOTE_MAX_AGE_SECS`, with no safety margin), so storing them can
+/// no longer succeed. `None` if the bytes are not a single-node proof.
+pub fn paid_proof_has_expired(proof: &[u8], now: std::time::SystemTime) -> Option<bool> {
     let (proof, _) = deserialize_proof(proof).ok()?;
-    Some(proof_is_safely_fresh(&proof, now, max_safe_proof_age()))
+    Some(!proof_is_safely_fresh(
+        &proof,
+        now,
+        Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS),
+    ))
 }
 
 /// True iff every quote in the proof has a timestamp not older than
@@ -1227,9 +1226,12 @@ mod tests {
     }
 
     #[test]
-    fn paid_proof_bytes_are_judged_by_their_oldest_quote() {
+    fn a_paid_proof_expires_with_its_oldest_quote() {
         let now = std::time::SystemTime::now();
-        let stale = now - Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS);
+        // Inside the safety margin a cached proof is dropped, but storers
+        // still accept it, so it has not expired.
+        let close = now - Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS);
+        let stale = now - Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS + 1);
         let bytes = |timestamps: &[std::time::SystemTime]| {
             serialize_single_node_proof(&PaymentProof {
                 proof_of_payment: make_proof_with_timestamps(timestamps),
@@ -1238,12 +1240,15 @@ mod tests {
             })
             .unwrap()
         };
-        assert_eq!(paid_proof_is_safely_fresh(&bytes(&[now]), now), Some(true));
         assert_eq!(
-            paid_proof_is_safely_fresh(&bytes(&[now, stale]), now),
+            paid_proof_has_expired(&bytes(&[now, close]), now),
             Some(false)
         );
-        assert_eq!(paid_proof_is_safely_fresh(b"not a proof", now), None);
+        assert_eq!(
+            paid_proof_has_expired(&bytes(&[now, stale]), now),
+            Some(true)
+        );
+        assert_eq!(paid_proof_has_expired(b"not a proof", now), None);
     }
 
     #[test]

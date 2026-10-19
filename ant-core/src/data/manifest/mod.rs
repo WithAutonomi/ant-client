@@ -96,6 +96,9 @@ pub const ADDRESS_LEN: usize = 32;
 /// files up to about 4 GB. Links carry the published (shrunk) form instead
 /// (see [`Manifest::link_form`]).
 pub const MAX_EMBEDDED_ROOT_MAP_BYTES: usize = 64 * 1024;
+/// Most chunks a published (shrunk) DataMap lists: an upload shrinks a map
+/// until it lists no more than this, as [`published_data_map`] does.
+pub const MAX_PUBLISHED_MAP_CHUNKS: usize = 3;
 /// Deepest msgpack nesting the decoder tolerates. A manifest nests five
 /// levels; this leaves headroom for future optional fields.
 const MAX_DECODE_DEPTH: usize = 16;
@@ -336,6 +339,19 @@ pub fn data_map_address(data_map: &DataMap) -> Result<[u8; ADDRESS_LEN], Manifes
     let bytes = rmp_serde::to_vec(&published_data_map(data_map)?)
         .map_err(|e| ManifestError::Encode(format!("DataMap did not serialize: {e}")))?;
     Ok(compute_address(&bytes))
+}
+
+/// Whether a writer embeds `data_map` as it is: a root map of at most
+/// [`MAX_EMBEDDED_ROOT_MAP_BYTES`], or a shrunk map in the published form an
+/// upload returns, at most [`MAX_PUBLISHED_MAP_CHUNKS`] chunks. A larger
+/// root is embedded by its published map instead, and an intermediate
+/// shrink level never is.
+pub fn is_embeddable(data_map: &DataMap) -> Result<bool, ManifestError> {
+    if data_map.is_child() {
+        Ok(data_map.len() <= MAX_PUBLISHED_MAP_CHUNKS)
+    } else {
+        Ok(embedded_len(data_map)? <= MAX_EMBEDDED_ROOT_MAP_BYTES)
+    }
 }
 
 /// Bytes `data_map` occupies in an encoded manifest, as written.
