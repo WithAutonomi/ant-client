@@ -10,7 +10,7 @@ use crate::data::client::file::UploadEvent;
 use crate::data::client::quote::settlement_refusal_error;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use crate::data::network::send_and_await_chunk_response;
+use crate::data::network::{send_and_await_chunk_response, ChunkRequest, RequestDispatched};
 use ant_protocol::evm::{
     Amount, MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
     MidpointProof, PoolCommitment, CANDIDATES_PER_POOL, MAX_LEAVES,
@@ -1405,11 +1405,14 @@ impl Client {
 
                 let result = send_and_await_chunk_response(
                     &node_clone,
-                    &peer_id_clone,
-                    message_bytes,
-                    request_id,
-                    attempt_timeout,
-                    &addrs_clone,
+                    ChunkRequest {
+                        target_peer: &peer_id_clone,
+                        peer_addrs: &addrs_clone,
+                        message_bytes,
+                        request_id,
+                        timeout: attempt_timeout,
+                        dispatched: RequestDispatched::unobserved(),
+                    },
                     |body| map_merkle_candidate_response(peer_id_clone, body),
                     |e| {
                         Error::Network(format!(
@@ -1466,11 +1469,14 @@ impl Client {
                         );
                         send_and_await_chunk_response(
                             &node_clone,
-                            &peer_id_clone,
-                            legacy_message_bytes,
-                            legacy_request_id,
-                            timeout,
-                            &addrs_clone,
+                            ChunkRequest {
+                                target_peer: &peer_id_clone,
+                                peer_addrs: &addrs_clone,
+                                message_bytes: legacy_message_bytes,
+                                request_id: legacy_request_id,
+                                timeout,
+                                dispatched: RequestDispatched::unobserved(),
+                            },
                             |body| map_merkle_candidate_response(peer_id_clone, body),
                             |e| {
                                 Error::Network(format!(

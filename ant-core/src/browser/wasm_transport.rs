@@ -100,10 +100,12 @@ const DEFAULT_BROWSER_QUOTE_CONCURRENCY: usize = 4;
 const MAX_READ_RESPONSE_MEMORY: usize = 128 * 1024 * 1024;
 const READ_RESPONSE_RESERVATION: usize =
     3 * (MAX_BROWSER_RESPONSE_BYTES + PQ_ENCRYPTED_OVERHEAD_BYTES);
-/// How long a read's first GET waits for its response, once sent, before the
-/// read also asks another holder. A healthy peer takes 1-3 s to carry a 4 MiB
-/// record over a WebRTC DataChannel, so the native 1 s raced nearly every read
-/// and fetched a second copy.
+/// How long a read's first GET waits for its response, once dispatched to its
+/// peer, before the read also asks another holder. A healthy peer takes 1-3 s to
+/// carry a 4 MiB record over a WebRTC DataChannel, so the native 1 s raced nearly
+/// every read and fetched a second copy. The delay also covers the GET's wait for
+/// its peer: a session slot, and replies its session carries ahead of it. A peer
+/// busy with several of this client's GETs may therefore be raced.
 const BROWSER_READ_HEDGE_DELAY: Duration = Duration::from_secs(3);
 const MAX_BROWSER_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
@@ -2386,7 +2388,9 @@ impl BrowserNetworkClient {
         // queue, so the fetch channel starts there and never probes past it. A
         // WebRTC DataChannel carries a record more slowly than QUIC, so the
         // native cold start would leave much of the budget idle. The adaptive
-        // controller still backs off from here.
+        // controller still backs off from here. A hedge or a GET after
+        // discovery may then wait for a permit another fetch's GET frees, and
+        // holds nothing of its peer's meanwhile.
         let read_capacity = inner.pool.read_budget.capacity();
         let mut config = crate::data::ClientConfig::default();
         config.adaptive.max.fetch = read_capacity;

@@ -61,8 +61,8 @@ test("a connected known holder can finish a verified read while discovery is sti
 test("an early read is hedged only after a DataChannel transfer's time", async () => {
   // Both nodes hold the DataMap and discovery never completes, so only the
   // early read's hedge can send a second GET. A browser races a GET 3 s after
-  // sending it: a first reply within that time is the only GET, and a slower
-  // one is raced a full 3 s after it was sent.
+  // dispatching it to its peer: a first reply within that time is the only GET,
+  // and a slower one is raced a full 3 s later, as the GETs' arrivals show.
   const hedge = 3_000;
   // Timers may fire this much early.
   const timerSlack = 50;

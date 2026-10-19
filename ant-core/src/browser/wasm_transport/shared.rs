@@ -6,7 +6,7 @@
 use super::*;
 use crate::client_engine::read_budget::ReadPermit;
 use crate::data::error::{Error as DataError, Result as DataResult};
-use crate::data::network::{BrowserNetwork, RequestSent};
+use crate::data::network::{BrowserNetwork, RequestDispatched};
 use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, WitnessedCloseGroup};
 use ant_protocol::{ChunkMessage, ChunkMessageBody};
 use futures::future::LocalBoxFuture;
@@ -286,20 +286,26 @@ impl BrowserNetwork for SharedNetworkAdapter {
         request: ChunkMessage,
         timeout: Duration,
     ) -> LocalBoxFuture<'a, DataResult<ChunkMessage>> {
-        self.request_notifying_sent(peer, addrs, request, timeout, RequestSent::unobserved())
+        self.request_notifying_dispatched(
+            peer,
+            addrs,
+            request,
+            timeout,
+            RequestDispatched::unobserved(),
+        )
     }
 
     fn read_hedge_delay(&self) -> Duration {
         BROWSER_READ_HEDGE_DELAY
     }
 
-    fn request_notifying_sent<'a>(
+    fn request_notifying_dispatched<'a>(
         &'a self,
         peer: &'a PeerId,
         addrs: &'a [MultiAddr],
         request: ChunkMessage,
         timeout: Duration,
-        sent: RequestSent,
+        dispatched: RequestDispatched,
     ) -> LocalBoxFuture<'a, DataResult<ChunkMessage>> {
         Box::pin(async move {
             #[cfg(feature = "test-utils")]
@@ -314,15 +320,19 @@ impl BrowserNetwork for SharedNetworkAdapter {
             let endpoint = webrtc_endpoint(peer, addrs)?;
             let admission = TransferDeadline::new(RPC_ADMISSION_TIMEOUT);
             let is_read = matches!(&request.body, ChunkMessageBody::GetRequest(_));
-            // Read-ahead reserves before peer admission, so a GET queued as
-            // speculative holds no peer session slot that a read waits for.
-            // Other reads reserve after it, so they hold no read budget while
-            // waiting for a busy peer.
-            let mut read_permit = if is_read && self.awaited.is_some() {
+            // A GET reserves the read budget before anything of its peer's, so
+            // it holds no peer session slot while it waits for the budget. The
+            // budget is the client's own, and a GET raced against this one would
+            // wait for it too. From here the GET waits only on its peer, for a
+            // connection, a session slot, the send and the reply, and a read
+            // counts its hedge delay from here: a busy or silent peer looks
+            // stalled, a full budget does not.
+            let read_permit = if is_read {
                 Some(self.reserve_read(&request, &admission).await?)
             } else {
                 None
             };
+            dispatched.notify();
             // Bulk records cannot hold the discovery/quote lane's RPC lock.
             // The node already accepts two independently authenticated channels
             // on one association; application request/witness semantics stay intact.
@@ -365,11 +375,6 @@ impl BrowserNetwork for SharedNetworkAdapter {
                 Admission::of(&request.body),
                 self.payment_network.as_ref(),
             )?;
-            // The transport owns the read permit across cancellation, then
-            // returns it through response decoding.
-            if is_read && read_permit.is_none() {
-                read_permit = Some(self.reserve_read(&request, &admission).await?);
-            }
             let exclusive = matches!(
                 &request.body,
                 ChunkMessageBody::PutRequest(_) | ChunkMessageBody::PointerPutRequest(_)
@@ -379,8 +384,8 @@ impl BrowserNetwork for SharedNetworkAdapter {
             let bytes = request
                 .encode()
                 .map_err(|e| DataError::Protocol(e.to_string()))?;
-            // Admission is done: the request leaves with the session's next frame.
-            sent.notify();
+            // The transport owns the read permit across cancellation, then
+            // returns it through response decoding.
             let (response, _read_permit) = client
                 .request_reserved(
                     BrowserRequestBody::ChunkProtocol,

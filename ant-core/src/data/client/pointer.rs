@@ -54,7 +54,7 @@ use crate::data::client::batch::ChunkPaymentPlan;
 use crate::data::client::chunk::STORE_RESPONSE_TIMEOUT;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use crate::data::network::send_and_await_chunk_response;
+use crate::data::network::{send_and_await_chunk_response, ChunkRequest, RequestDispatched};
 use crate::runtime::sleep;
 
 /// How many of `peers` must answer a read.
@@ -1574,15 +1574,18 @@ impl Client {
 
         send_and_await_chunk_response(
             self.network(),
-            &target_peer,
-            bytes,
-            request_id,
-            // A pointer PUT carries a single-node proof — merkle proofs are
-            // refused for pointers — so it does not make the storer do the
-            // network closeness lookup the merkle timeout exists to cover.
-            // Same budget as a non-merkle chunk PUT.
-            STORE_RESPONSE_TIMEOUT,
-            &peer_addrs,
+            ChunkRequest {
+                target_peer: &target_peer,
+                peer_addrs: &peer_addrs,
+                message_bytes: bytes,
+                request_id,
+                // A pointer PUT carries a single-node proof — merkle proofs are
+                // refused for pointers — so it does not make the storer do the
+                // network closeness lookup the merkle timeout exists to cover.
+                // Same budget as a non-merkle chunk PUT.
+                timeout: STORE_RESPONSE_TIMEOUT,
+                dispatched: RequestDispatched::unobserved(),
+            },
             move |body| read_put_reply(body, expected_address, expected_state),
             |e| Error::Network(format!("pointer PUT send failed: {e}")),
             || Error::Timeout("pointer PUT timed out".to_string()),
@@ -1608,11 +1611,14 @@ impl Client {
 
         send_and_await_chunk_response(
             self.network(),
-            &target_peer,
-            bytes,
-            request_id,
-            Duration::from_secs(self.config().chunk_get_timeout_secs),
-            &peer_addrs,
+            ChunkRequest {
+                target_peer: &target_peer,
+                peer_addrs: &peer_addrs,
+                message_bytes: bytes,
+                request_id,
+                timeout: Duration::from_secs(self.config().chunk_get_timeout_secs),
+                dispatched: RequestDispatched::unobserved(),
+            },
             move |body| read_get_reply(body, address),
             |e| Error::Network(format!("pointer GET send failed: {e}")),
             || Error::Timeout("pointer GET timed out".to_string()),
