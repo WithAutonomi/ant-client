@@ -4,22 +4,22 @@
 //! reservation remain owned until the authenticated reply is drained or the
 //! ordinary transport deadline closes the session.
 //!
-//! A speculative GET, one no read waits for yet such as read-ahead, holds at most
-//! a share of a session's slots and never takes a slot another request is queued
-//! for. In a multiplexed session, a GET a read waits for, such as a seek's,
-//! therefore waits for a slot only while requests that are not speculative hold
-//! the rest.
+//! A speculative GET, one no read waits for yet such as read-ahead, is admitted
+//! only while speculative GETs hold less than a share of a session's slots, and
+//! never takes a slot another request is queued for. A GET a read waits for, such
+//! as a seek's, therefore never waits behind read-ahead that comes after it.
+//!
+//! Like the read budget's permits, a GET is classed once: when it queues as a
+//! read's, or when it is admitted. A GET whose read stops waiting for it, such as
+//! one cancelled by a seek, keeps its slot as a read's until its exchange
+//! completes, so read-ahead may hold more than the share for that long.
 use super::*;
-use crate::client_engine::read_budget::ReadPermit;
+use crate::client_engine::read_budget::{ReadPermit, SPECULATIVE_SHARE_DIVISOR};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 pub(super) const CAPABILITY: &str = "rpc-multiplex-4";
 /// Requests one multiplexed session carries at once.
 const MAX_REQUESTS: usize = 4;
-/// Speculative GETs hold at most this fraction (one in N) of a session's slots,
-/// and at least one. A session without multiplexing has one slot, which
-/// read-ahead may then hold.
-const SPECULATIVE_SHARE_DIVISOR: usize = 2;
 type Reply = Result<(BrowserResponseFrame, Duration), RpcError>;
 
 /// How a GET competes for a session's slots. It is speculative while no read
@@ -195,6 +195,8 @@ impl RpcSession {
                         .map(|permit| self.slot(permit, false))
                         .map_err(|_| "WebRTC session closed".to_string().into());
                 }
+                // At least one slot: a session without multiplexing has one,
+                // which read-ahead may then hold.
                 let share = (self.capacity() / SPECULATIVE_SHARE_DIVISOR).max(1);
                 if self.speculative.get() < share {
                     match self.slots.clone().try_acquire_owned() {

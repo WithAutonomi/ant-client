@@ -16,8 +16,9 @@ const PROCESSING_WINDOW_SAMPLES: usize = 8;
 /// Speculative reads, such as read-ahead, hold at most this fraction (one in N)
 /// of the read cap, so reads a caller waits for always have the rest. This
 /// includes speculative reads whose caller was cancelled: the transport keeps
-/// their permits until their responses are drained.
-const SPECULATIVE_SHARE_DIVISOR: usize = 2;
+/// their permits until their responses are drained. Each peer session admits
+/// speculative GETs within the same share of its slots.
+pub(crate) const SPECULATIVE_SHARE_DIVISOR: usize = 2;
 
 struct State {
     active: usize,
