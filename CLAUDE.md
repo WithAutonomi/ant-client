@@ -81,6 +81,7 @@ ant-core/src/
 │       ├── link.rs           # ant://<address> and ant://manifest/<base64url> links
 │       ├── file.rs           # .ant file read/write
 │       ├── history.rs        # Upload history: one .ant per upload under <data dir>/uploads
+│       ├── journal.rs        # Crash-safe journal of a running build (<id>.ant.partial)
 │       ├── wire.rs           # Manifest-owned DataMap layout; pre-decode structure check
 │       ├── build.rs          # ManifestBuilder (uploads files, embedded or compact refs)
 │       ├── embed.rs          # Root-vs-shrunk DataMap choice for embedding
@@ -163,7 +164,10 @@ cargo run --bin ant -- --help  # Run the CLI
   a plain file link. Every upload (`ant file upload`, `ant manifest create`) is also recorded as
   a manifest under `<data dir>/uploads/`; `ant manifest list` shows them and `show`/`link`/`export`/`download`
   accept a record id. Entry paths obey the portable rules in `data/manifest/path.rs` at build,
-  decode and extract time, and extraction never follows symlinks inside the output directory.
+  decode and extract time, and extraction never follows symlinks inside the output directory
+  and resolves every name from directories it holds open (`data/manifest/output/`). A manifest
+  build journals each completed upload to `<id>.ant.partial` before paying for the next, so a
+  crash loses no paid upload; leftover journals list as interrupted records.
   See `docs/adr/ADR-0006-file-manifests-and-links.md`.
 - **Log forwarding is opt-in and node-logging-dependent**: `ant node logs forward enable` is the
   consent act. It only forwards nodes whose `NodeConfig.log_dir` is `Some` — node file logging is

@@ -423,9 +423,11 @@ reference such as an embedded root map is used only when the manifest still
 fits with it; the shrunk map is kept otherwise. Every partial or complete
 result can therefore be encoded and recorded. Cancellation stops between
 files or abandons the upload in flight and returns the partial manifest,
-which the client records in the upload history so paid uploads are not lost.
-Ordinary file failures also preserve the partial result in
-`ManifestError::BuildFailed`; the CLI records it before reporting failure.
+which the builder records in the upload history so paid uploads are not
+lost. Ordinary file failures also preserve the partial result in
+`ManifestError::BuildFailed`, recorded the same way before it is returned.
+A crash or a forced quit loses no paid upload either: the build journals
+every completed upload as it goes (see Upload history).
 Each successful upload's DataMap is retained before reference optimisation,
 so a root-map resolution failure cannot discard that upload. Partial results
 carry the original number of local files to upload, excluding entries added
@@ -448,8 +450,9 @@ A single-file upload becomes a one-entry manifest; a manifest build is
 recorded as itself. Records live under `<data dir>/uploads/` as ordinary
 `.ant` files named `<UTC timestamp>-<label>.ant`, where the filename stem is
 the record id. When that id is taken, as when uploads with the same label
-finish within one second, `-2`, `-3` and so on are appended. Nothing else is
-stored, so the history is a plain folder of manifests. The client lists
+finish within one second, `-2`, `-3` and so on are appended. Apart from the
+journals of builds that have not finished, nothing else is stored, so the
+history is a plain folder of manifests. The client lists
 records newest first, ordering ids within one second by their suffix as a
 number, and accepts a record id wherever it accepts a manifest file or link:
 `show`, `link`, `export` and `download`. Every record embeds the full
@@ -459,6 +462,34 @@ portable path rules is repaired for the record, or dropped so the entry
 extracts under its content address, rather than losing the record. Recording never fails an
 upload that has already succeeded; an unusable history directory is reported
 and the upload result still shown.
+
+A manifest build pays for its uploads one at a time, so it also keeps a
+journal in the history while it runs, `<id>.ant.partial`, and a crash, a
+kill, a power cut or a forced quit cannot lose an upload that was paid for:
+
+- The journal is created, and its name made durable, before the first paid
+  upload. A build that cannot create it stops before paying for anything.
+  Entries added without uploading are recorded first.
+- Each completed upload's entry is flushed to disk before the next upload is
+  paid for. When the entry's reference is then finalised, for example by
+  embedding the root map, it is recorded again; the later record of a name
+  wins.
+- When the build ends, complete, cancelled or failed, its manifest becomes
+  the ordinary record under the same id and the journal is removed. A build
+  that stops before anything was uploaded paid for nothing and leaves no
+  record. If the record cannot be written, the journal stays.
+- A journal left behind is listed as an **interrupted** upload holding every
+  entry that reached the disk, and its id is accepted wherever a record id
+  is. While its build runs the journal is locked, and it is listed as **in
+  progress**. A journal beside a record of the same id, left by a build that
+  stopped between the two steps above, is ignored.
+
+The journal is the magic `0xC1 'A' 'N' 'J'`, a version byte (1), and frames:
+a little-endian `u32` payload length, the payload's CRC-32, and the payload.
+The first payload is the manifest's `name` and `torrent`; every other
+payload is one entry in the manifest's own msgpack form. Reading stops at
+the first frame that is incomplete or fails its checksum, which is where a
+write was cut short; every frame before it is kept.
 
 ### Export and compaction
 
@@ -649,6 +680,19 @@ initial release.
   link); an abandoned temporary file is removed. The Windows implementation
   is type-checked and linted for `x86_64-pc-windows-msvc`, but CI has no
   Windows test runner. Junction tests are to be added with one.
+- Upload journal tests: a journal left behind lists as an interrupted record
+  of exactly the entries written, with a later record of a name replacing an
+  earlier one; while locked it lists as in progress; a write cut short, or a
+  damaged last frame, keeps every entry before it; finishing writes the
+  record and removes the journal; journals and records never share an id;
+  a journal beside its record is not listed. On a local network, a build
+  that fails after its first upload shows that upload in its in-progress
+  journal before going on, records its partial result itself, and a build
+  cancelled before any upload leaves no record.
+- Size budget tests: the largest entry an upload can become bounds a real
+  shrunk map; the fixed part counts everything but the entries; an upload is
+  admitted only when its largest entry fits; a larger reference is taken
+  only when it fits.
 - End-to-end on a local network: build a manifest with an embedded entry, a
   compact entry and an entry added by address; extract it from a `.ant` file
   and from a manifest link; extract a selection; verify bytes and per-entry

@@ -20,6 +20,8 @@ blake3 = "1"
 base64 = "0.22"
 bytes = "1"
 hex = "0.4"
+# Checksums for the frames of an upload journal (ADR-0006).
+crc32fast = "1.5"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"

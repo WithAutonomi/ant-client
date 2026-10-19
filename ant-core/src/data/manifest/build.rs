@@ -22,6 +22,7 @@ use crate::data::client::merkle::PaymentMode;
 use crate::data::Client;
 
 use super::embed::embeddable_data_map;
+use super::journal::UploadJournal;
 use super::path::{check_collisions, validate_component, validate_path, PATH_SEPARATOR};
 use super::{
     data_map_address, ContentRef, Manifest, ManifestEntry, ManifestError, TorrentReference,
@@ -70,6 +71,13 @@ pub struct BuildOptions {
     /// Cancels the build between files, or during an upload. Files already
     /// uploaded are kept in the partial result.
     pub cancel: CancellationToken,
+    /// Upload history directory to record the build in. A journal is
+    /// created there before the first paid upload and each completed upload
+    /// is flushed to it before the next is paid for, so a crash or a forced
+    /// quit loses none of them. When the build ends, complete or not, its
+    /// manifest becomes the record. A build that cannot create the journal
+    /// stops before paying for anything.
+    pub history: Option<PathBuf>,
 }
 
 /// Progress during [`ManifestBuilder::finish`].
@@ -124,6 +132,15 @@ pub struct BuildResult {
     pub storage_cost_atto: u128,
     /// Gas paid across all uploads, in wei.
     pub gas_cost_wei: u128,
+    /// The upload history record of this build, when it was recorded. A
+    /// build that uploaded nothing before it stopped is not recorded.
+    #[serde(default)]
+    pub history_id: Option<String>,
+    /// Why the record could not be written, when it could not. The
+    /// journal then stays in the history, listed as interrupted, with every
+    /// entry the build completed.
+    #[serde(default)]
+    pub history_error: Option<String>,
 }
 
 struct PendingFile {
@@ -315,6 +332,7 @@ impl<'a> ManifestBuilder<'a> {
         progress: Option<mpsc::Sender<BuildEvent>>,
     ) -> Result<BuildResult, ManifestError> {
         let mut budget = self.preflight()?;
+        let mut journal = self.start_journal()?;
         let total = self.pending.len();
         let mut files_uploaded = 0;
         let mut chunks_stored = 0;
@@ -400,10 +418,20 @@ impl<'a> ManifestBuilder<'a> {
                 },
             };
             let counted = budget.uploaded(index, &uploaded);
+            // On disk before anything else can fail or be paid for. If it
+            // cannot be, the build stops rather than pay for uploads a crash
+            // would lose.
+            let journaled = journal
+                .as_mut()
+                .map_or(Ok(()), |journal| journal.append(&uploaded));
             self.entries.push(uploaded);
             files_uploaded += 1;
             chunks_stored += result.chunks_stored;
             gas_cost_wei = gas_cost_wei.saturating_add(result.gas_cost_wei);
+            if let Err(error) = journaled {
+                failure = Some((file.path, error));
+                break;
+            }
             let counted = match counted {
                 Ok(counted) => counted,
                 Err(error) => {
@@ -435,9 +463,20 @@ impl<'a> ManifestBuilder<'a> {
             let Some(entry) = self.entries.last_mut() else {
                 break;
             };
-            if let Err(error) = budget.offer_source(entry, counted, source) {
-                failure = Some((file.path, error));
-                break;
+            let changed = match budget.offer_source(entry, counted, source) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    failure = Some((file.path, error));
+                    break;
+                }
+            };
+            // Record the final reference too; the uploaded form is already
+            // safe, so a failure here only stops the build.
+            if let (true, Some(journal)) = (changed, journal.as_mut()) {
+                if let Err(error) = journal.append(entry) {
+                    failure = Some((file.path, error));
+                    break;
+                }
             }
             let reference = entry.source.kind();
 
@@ -457,7 +496,25 @@ impl<'a> ManifestBuilder<'a> {
             torrent: self.options.torrent.clone(),
             entries: std::mem::take(&mut self.entries),
         };
+        // On an error here the journal stays, with every completed upload.
         manifest.canonicalize()?;
+
+        let stopped_early = cancelled || failure.is_some();
+        let (history_id, history_error) = match journal {
+            None => (None, None),
+            // Nothing was paid for, so there is nothing to keep.
+            Some(journal) if stopped_early && files_uploaded == 0 => {
+                let _ = journal.discard();
+                (None, None)
+            }
+            Some(journal) => {
+                let id = journal.id().to_string();
+                match journal.finish(&manifest) {
+                    Ok(record) => (Some(record.id), None),
+                    Err(error) => (Some(id), Some(error.to_string())),
+                }
+            }
+        };
 
         let result = BuildResult {
             manifest,
@@ -468,6 +525,8 @@ impl<'a> ManifestBuilder<'a> {
             chunks_stored,
             storage_cost_atto,
             gas_cost_wei,
+            history_id,
+            history_error,
         };
         match failure {
             Some((path, cause)) => Err(ManifestError::BuildFailed {
@@ -477,6 +536,26 @@ impl<'a> ManifestBuilder<'a> {
             }),
             None => Ok(result),
         }
+    }
+
+    /// Create the build's journal, when it is recorded, holding the entries
+    /// added without uploading. Runs before the first paid upload.
+    fn start_journal(&self) -> Result<Option<UploadJournal>, ManifestError> {
+        let Some(dir) = &self.options.history else {
+            return Ok(None);
+        };
+        let mut journal = UploadJournal::create(
+            dir,
+            self.options.name.as_deref(),
+            self.options.torrent.as_ref(),
+        )?;
+        for entry in &self.entries {
+            if let Err(error) = journal.append(entry) {
+                let _ = journal.discard();
+                return Err(error);
+            }
+        }
+        Ok(Some(journal))
     }
 
     /// Embedded mode always embeds a DataMap, even when the upload was
@@ -628,12 +707,13 @@ impl SizeBudget {
 
     /// Give `entry`, counted at `current` bytes, the reference `source` when
     /// the manifest still fits with it; otherwise it keeps the one it has.
+    /// Returns whether the reference changed.
     fn offer_source(
         &mut self,
         entry: &mut ManifestEntry,
         current: usize,
         source: ContentRef,
-    ) -> Result<(), ManifestError> {
+    ) -> Result<bool, ManifestError> {
         let previous = std::mem::replace(&mut entry.source, source);
         let offered = match encoded_len(entry) {
             Ok(len) => len,
@@ -645,10 +725,11 @@ impl SizeBudget {
         let projected = self.swapped(current, offered);
         if projected <= MAX_MANIFEST_BYTES {
             self.reserved = projected;
+            Ok(entry.source != previous)
         } else {
             entry.source = previous;
+            Ok(false)
         }
-        Ok(())
     }
 
     fn smallest_of(&self, index: usize) -> usize {
@@ -800,9 +881,9 @@ mod tests {
         let counted = budget.uploaded(0, &entry).unwrap();
 
         // With room, a large root map replaces the uploaded map.
-        budget
+        assert!(budget
             .offer_source(&mut entry, counted, embedded(root_of(100)))
-            .unwrap();
+            .unwrap());
         assert!(
             matches!(&entry.source, ContentRef::Embedded { data_map } if data_map.len() == 100)
         );
@@ -811,9 +892,9 @@ mod tests {
         // Full to the limit: a still larger map is refused and the entry
         // keeps the one it has; a smaller reference is always taken.
         budget.reserved = MAX_MANIFEST_BYTES;
-        budget
+        assert!(!budget
             .offer_source(&mut entry, with_root, embedded(root_of(200)))
-            .unwrap();
+            .unwrap());
         assert!(
             matches!(&entry.source, ContentRef::Embedded { data_map } if data_map.len() == 100)
         );
@@ -821,9 +902,16 @@ mod tests {
         let public = ContentRef::Public {
             address: [7; ADDRESS_LEN],
         };
-        budget
+        assert!(budget
             .offer_source(&mut entry, with_root, public.clone())
-            .unwrap();
+            .unwrap());
+        // Offering the same reference again changes nothing.
+        let now = budget.reserved;
+        let current = encoded_len(&entry).unwrap();
+        assert!(!budget
+            .offer_source(&mut entry, current, public.clone())
+            .unwrap());
+        assert_eq!(budget.reserved, now);
         assert_eq!(entry.source, public);
         assert!(budget.reserved < MAX_MANIFEST_BYTES);
     }

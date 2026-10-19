@@ -19,8 +19,8 @@ use ant_core::data::{
     manifest_link_bytes, manifest_link_from_bytes, parse_link, plan_compaction, publish_data_maps,
     read_manifest_file, record_upload, write_manifest_file, BuildEvent, BuildOptions, BuildResult,
     Client, ContentRef, DownloadEvent, EntryStatus, ExtractEvent, ExtractOptions, Link, Manifest,
-    ManifestBuilder, ManifestError, PaymentMode, ReferenceMode, TorrentReference, UploadEvent,
-    UploadRecord, Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+    ManifestBuilder, ManifestError, PaymentMode, RecordState, ReferenceMode, TorrentReference,
+    UploadEvent, UploadRecord, Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
 };
 use clap::Subcommand;
 use serde_json::json;
@@ -491,6 +491,9 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         payment_mode: args.payment_mode,
         follow_symlinks: args.follow_symlinks,
         cancel: CancellationToken::new(),
+        // Each completed upload is journaled here before the next is paid
+        // for; a build that cannot record itself stops before paying.
+        history: Some(default_history_dir()?),
     };
     // Fail before any paid upload if the manifest could not be written.
     let out = resolve_output(options.name.as_deref(), args.output.clone())?;
@@ -547,8 +550,7 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         result
     };
 
-    let (result, history_id) =
-        record_build_result(built, |manifest| record_upload_manifest(manifest, None))?;
+    let (result, history_id) = build_outcome(built)?;
     write_manifest(&result.manifest, &out, args.overwrite)?;
     if !json {
         eprintln!(
@@ -571,10 +573,11 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
     )
 }
 
-/// Persist completed uploads before reporting cancellation or failure.
-fn record_build_result(
+/// Turn a build's outcome into its result and record id, or an error that
+/// says where the completed uploads are recorded. The builder has already
+/// recorded them in the history, complete or partial.
+fn build_outcome(
     built: Result<BuildResult, ManifestError>,
-    record: impl FnOnce(&Manifest) -> Option<String>,
 ) -> anyhow::Result<(BuildResult, Option<String>)> {
     let result = match built {
         Ok(result) => result,
@@ -583,22 +586,33 @@ fn record_build_result(
             cause,
             partial,
         }) => {
-            let history_id = record(&partial.manifest);
+            warn_unfinished_record(&partial);
             anyhow::bail!(
                 "manifest build failed at {path:?} after {} of {} file(s): {cause}{}",
                 partial.files_uploaded,
                 partial.total_to_upload,
-                partial_record_message(history_id.as_deref()),
+                partial_record_message(partial.history_id.as_deref()),
             );
         }
         Err(error) => return Err(error.into()),
     };
-
-    let history_id = record(&result.manifest);
+    warn_unfinished_record(&result);
+    let history_id = result.history_id.clone();
     if result.cancelled {
         return Err(cancelled_build_error(&result, history_id.as_deref()));
     }
     Ok((result, history_id))
+}
+
+/// Say when a build's record could not be written. Its journal stays in the
+/// history with every completed upload, listed as interrupted.
+fn warn_unfinished_record(result: &BuildResult) {
+    if let (Some(id), Some(error)) = (&result.history_id, &result.history_error) {
+        eprintln!(
+            "warning: the record of upload {id} could not be written ({error}); \
+             it stays in the history as interrupted, with every completed file"
+        );
+    }
 }
 
 /// The output path: the one given, or `<name>.ant` in the current directory.
@@ -759,6 +773,7 @@ fn list_history(json: bool) -> anyhow::Result<()> {
                     "name": r.manifest.name,
                     "entries": r.manifest.entries.len(),
                     "total_size": r.manifest.total_size(),
+                    "state": r.state,
                     "file": r.path.display().to_string(),
                 })
             })
@@ -803,8 +818,13 @@ fn print_history_row(record: &UploadRecord) {
     // Drop the trailing " UTC"; the header already says so.
     let stamp = format_timestamp(record.recorded_at);
     let stamp = stamp.strip_suffix(" UTC").unwrap_or(&stamp);
+    let state = match record.state {
+        RecordState::Complete => "",
+        RecordState::InProgress => "  (in progress)",
+        RecordState::Interrupted => "  (interrupted: the files listed were uploaded)",
+    };
     println!(
-        "{:<23}  {:>7}  {:>12}  {}",
+        "{:<23}  {:>7}  {:>12}  {}{state}",
         stamp,
         record.manifest.entries.len(),
         size,
@@ -1215,6 +1235,8 @@ mod tests {
             chunks_stored: 3,
             storage_cost_atto: 0,
             gas_cost_wei: 0,
+            history_id: Some("record-id".into()),
+            history_error: None,
         };
         for index in 0..3 {
             result.manifest.entries.push(ant_core::data::ManifestEntry {
@@ -1233,7 +1255,7 @@ mod tests {
     }
 
     #[test]
-    fn build_failure_and_cancellation_are_recorded_before_returning_an_error() {
+    fn build_failure_and_cancellation_report_where_the_build_was_recorded() {
         let manifest = Manifest {
             name: Some("partial".into()),
             torrent: None,
@@ -1254,6 +1276,8 @@ mod tests {
                 chunks_stored: 3,
                 storage_cost_atto: 12,
                 gas_cost_wei: 34,
+                history_id: Some("20261019T120000Z-partial".into()),
+                history_error: None,
             };
             let built = if cancelled {
                 Ok(partial)
@@ -1264,15 +1288,10 @@ mod tests {
                     partial: Box::new(partial),
                 })
             };
-            let history = tempfile::tempdir().unwrap();
-            let error = record_build_result(built, |manifest| {
-                Some(record_upload(history.path(), manifest, None).unwrap().id)
-            })
-            .unwrap_err();
-            let listing = list_uploads(history.path()).unwrap();
-            assert_eq!(listing.records.len(), 1);
-            assert_eq!(listing.records[0].manifest, manifest);
-            assert!(error.to_string().contains(&listing.records[0].id));
+            let error = build_outcome(built).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("the partial manifest is recorded as 20261019T120000Z-partial"));
             assert!(error.to_string().contains("1 of 2 file(s)"));
             if !cancelled {
                 assert!(error.to_string().contains("later.bin"));

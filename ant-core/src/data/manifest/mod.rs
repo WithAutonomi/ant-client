@@ -47,6 +47,8 @@ pub mod file;
 #[cfg(feature = "native")]
 pub mod history;
 #[cfg(feature = "native")]
+mod journal;
+#[cfg(feature = "native")]
 mod output;
 
 #[cfg(feature = "native")]
