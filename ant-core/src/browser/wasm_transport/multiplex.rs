@@ -3,19 +3,68 @@
 //! Cancellation drops the caller, not an admitted exchange. Its slot and read
 //! reservation remain owned until the authenticated reply is drained or the
 //! ordinary transport deadline closes the session.
+//!
+//! A speculative GET, one no read waits for yet such as read-ahead, is admitted
+//! only while speculative GETs hold less than a share of a session's slots, and
+//! never takes a slot another request is queued for. A GET a read waits for, such
+//! as a seek's, therefore never waits behind read-ahead that comes after it.
+//!
+//! Like the read budget's permits, a GET is classed once: when it queues as a
+//! read's, or when it is admitted. A GET whose read stops waiting for it, such as
+//! one cancelled by a seek, keeps its slot as a read's until its exchange
+//! completes, so read-ahead may hold more than the share for that long.
 use super::*;
-use crate::client_engine::read_budget::ReadPermit;
-use tokio::sync::Semaphore;
+use crate::client_engine::read_budget::{ReadPermit, SPECULATIVE_SHARE_DIVISOR};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 pub(super) const CAPABILITY: &str = "rpc-multiplex-4";
+/// Requests one multiplexed session carries at once.
 const MAX_REQUESTS: usize = 4;
 type Reply = Result<(BrowserResponseFrame, Duration), RpcError>;
+
+/// How a GET competes for a session's slots. It is speculative while no read
+/// waits for its record, and is asked again whenever `changed` changes.
+pub(super) struct ReadPriority<'a> {
+    pub(super) speculative: &'a dyn Fn() -> bool,
+    pub(super) changed: watch::Receiver<()>,
+}
+
+/// A session slot an admitted request holds until its exchange completes.
+pub(super) struct SessionSlot {
+    permit: Option<OwnedSemaphorePermit>,
+    session: Rc<RpcSession>,
+    speculative: bool,
+}
+
+impl Drop for SessionSlot {
+    fn drop(&mut self) {
+        // Release the slot before waking those waiting for one.
+        drop(self.permit.take());
+        if self.speculative {
+            self.session
+                .speculative
+                .set(self.session.speculative.get() - 1);
+        }
+        self.session.released.send_replace(());
+    }
+}
+
+/// Resolves on the next change. A closed channel never changes again.
+async fn next_change(receiver: &mut watch::Receiver<()>) {
+    if receiver.changed().await.is_err() {
+        futures::future::pending::<()>().await;
+    }
+}
 
 pub(super) struct RpcSession {
     channel: RtcDataChannel,
     inbox: Rc<ResponseInbox>,
     pq: Rc<RefCell<Option<PqSession>>>,
     slots: std::sync::Arc<Semaphore>,
+    /// Slots held by speculative GETs.
+    speculative: Cell<usize>,
+    /// Changes when a slot is released or added, or the session closes.
+    released: watch::Sender<()>,
     send: Mutex<()>,
     pending: RefCell<HashMap<u64, oneshot::Sender<Reply>>>,
     changed: watch::Sender<()>,
@@ -31,11 +80,14 @@ impl RpcSession {
         pq: Rc<RefCell<Option<PqSession>>>,
     ) -> Rc<Self> {
         let (changed, _) = watch::channel(());
+        let (released, _) = watch::channel(());
         let session = Rc::new(Self {
             channel,
             inbox,
             pq,
             slots: std::sync::Arc::new(Semaphore::new(1)),
+            speculative: Cell::new(0),
+            released,
             send: Mutex::new(()),
             pending: RefCell::new(HashMap::new()),
             changed,
@@ -70,6 +122,7 @@ impl RpcSession {
         if !self.multiplex.replace(true) {
             self.inbox.enable_multiplex();
             self.slots.add_permits(MAX_REQUESTS - 1);
+            self.released.send_replace(());
         }
     }
 
@@ -78,6 +131,7 @@ impl RpcSession {
             return;
         }
         self.slots.close();
+        self.released.send_replace(());
         self.inbox.fail(error.clone());
         self.channel.close();
         for (_, sender) in self.pending.take() {
@@ -91,14 +145,78 @@ impl RpcSession {
         self.closed.get()
     }
 
-    pub(super) async fn admit(
-        &self,
-        timeout: Duration,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, RpcError> {
+    /// Requests the session carries at once.
+    fn capacity(&self) -> usize {
+        if self.multiplex.get() {
+            MAX_REQUESTS
+        } else {
+            1
+        }
+    }
+
+    fn slot(self: &Rc<Self>, permit: OwnedSemaphorePermit, speculative: bool) -> SessionSlot {
+        self.speculative
+            .set(self.speculative.get() + usize::from(speculative));
+        SessionSlot {
+            permit: Some(permit),
+            session: Rc::clone(self),
+            speculative,
+        }
+    }
+
+    pub(super) async fn admit(self: &Rc<Self>, timeout: Duration) -> Result<SessionSlot, RpcError> {
         crate::runtime::timeout(timeout, self.slots.clone().acquire_owned())
             .await
             .map_err(|_| RpcError::Timeout("WebRTC admission timed out waiting for peer".into()))?
+            .map(|permit| self.slot(permit, false))
             .map_err(|_| "WebRTC session closed".to_string().into())
+    }
+
+    /// Admit a GET. One a read waits for queues for a slot like any request.
+    /// A speculative one takes a free slot only within the session's
+    /// speculative share and only while no request is queued for it, and is
+    /// asked again whenever a slot is released or `read.changed` changes, so
+    /// a GET a read comes to wait for is admitted as one.
+    pub(super) async fn admit_read(
+        self: &Rc<Self>,
+        timeout: Duration,
+        read: &ReadPriority<'_>,
+    ) -> Result<SessionSlot, RpcError> {
+        let mut released = self.released.subscribe();
+        let mut changed = read.changed.clone();
+        let admission = async {
+            loop {
+                if !(read.speculative)() {
+                    return self
+                        .slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map(|permit| self.slot(permit, false))
+                        .map_err(|_| "WebRTC session closed".to_string().into());
+                }
+                // At least one slot: a session without multiplexing has one,
+                // which read-ahead may then hold.
+                let share = (self.capacity() / SPECULATIVE_SHARE_DIVISOR).max(1);
+                if self.speculative.get() < share {
+                    match self.slots.clone().try_acquire_owned() {
+                        Ok(permit) => return Ok(self.slot(permit, true)),
+                        Err(TryAcquireError::Closed) => {
+                            return Err("WebRTC session closed".to_string().into())
+                        }
+                        Err(TryAcquireError::NoPermits) => {}
+                    }
+                }
+                select(
+                    Box::pin(next_change(&mut released)),
+                    Box::pin(next_change(&mut changed)),
+                )
+                .await;
+            }
+        };
+        crate::runtime::timeout(timeout, admission)
+            .await
+            .map_err(|_| RpcError::Timeout("WebRTC admission timed out waiting for peer".into()))?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -108,7 +226,7 @@ impl RpcSession {
         plaintext: Vec<u8>,
         timeout: Duration,
         read_permit: Option<ReadPermit>,
-        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        permit: Option<SessionSlot>,
         exclusive: bool,
     ) -> Result<(BrowserResponseFrame, Duration, Option<ReadPermit>), RpcError> {
         // Preserve per-lane PUT serialization: several complete incoming PUTs
@@ -117,18 +235,15 @@ impl RpcSession {
         // deadlocking when several callers already hold one slot each.
         let permit = if exclusive {
             drop(permit);
-            let count = if self.multiplex.get() {
-                MAX_REQUESTS as u32
-            } else {
-                1
-            };
-            crate::runtime::timeout(
+            let count = self.capacity() as u32;
+            let permit = crate::runtime::timeout(
                 RPC_ADMISSION_TIMEOUT,
                 self.slots.clone().acquire_many_owned(count),
             )
             .await
             .map_err(|_| RpcError::Timeout("WebRTC write admission timed out".into()))?
-            .map_err(|_| "WebRTC session closed".to_string())?
+            .map_err(|_| "WebRTC session closed".to_string())?;
+            self.slot(permit, false)
         } else {
             match permit {
                 Some(permit) => permit,

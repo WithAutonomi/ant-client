@@ -3,6 +3,7 @@
 //! Provides peer discovery, message sending, and DHT operations
 //! for the client library.
 
+pub use crate::client_engine::read::RequestDispatched;
 #[cfg(feature = "native")]
 use crate::data::error::Error;
 use crate::data::error::Result;
@@ -197,6 +198,27 @@ pub trait BrowserNetwork {
         request: ant_protocol::ChunkMessage,
         timeout: std::time::Duration,
     ) -> futures::future::LocalBoxFuture<'a, Result<ant_protocol::ChunkMessage>>;
+    /// Execute one authenticated request as [`BrowserNetwork::request`] does, and
+    /// notify `dispatched` once it has passed this adapter's own limits, which
+    /// another request would wait for too, and waits only on its peer. Adapters
+    /// without limits of their own keep this default, which notifies at once.
+    fn request_notifying_dispatched<'a>(
+        &'a self,
+        peer: &'a PeerId,
+        addrs: &'a [MultiAddr],
+        request: ant_protocol::ChunkMessage,
+        timeout: std::time::Duration,
+        dispatched: RequestDispatched,
+    ) -> futures::future::LocalBoxFuture<'a, Result<ant_protocol::ChunkMessage>> {
+        dispatched.notify();
+        self.request(peer, addrs, request, timeout)
+    }
+    /// How long a read's first GET waits for its response, once dispatched,
+    /// before the read also asks another holder: a healthy peer's transfer of a
+    /// full record.
+    fn read_hedge_delay(&self) -> std::time::Duration {
+        crate::client_engine::read::DEFAULT_EARLY_READ_HEDGE_DELAY
+    }
 }
 
 impl Network {
@@ -534,6 +556,19 @@ impl Network {
         );
     }
 
+    /// How long a read's first GET waits for its response, once dispatched,
+    /// before the read also asks another holder.
+    pub(crate) fn read_hedge_delay(&self) -> std::time::Duration {
+        #[cfg(feature = "native")]
+        {
+            crate::client_engine::read::DEFAULT_EARLY_READ_HEDGE_DELAY
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.backend.read_hedge_delay()
+        }
+    }
+
     /// Whether `peer` would take a paid pointer write from this client, as
     /// far as can be told before one is sent: `None` if it cannot be told.
     ///
@@ -567,21 +602,40 @@ impl Network {
     }
 }
 
+/// One request to a peer, as [`send_and_await_chunk_response`] sends it.
+pub(crate) struct ChunkRequest<'a> {
+    pub(crate) target_peer: &'a PeerId,
+    pub(crate) peer_addrs: &'a [MultiAddr],
+    /// The encoded `ChunkMessage`.
+    pub(crate) message_bytes: Vec<u8>,
+    pub(crate) request_id: u64,
+    pub(crate) timeout: std::time::Duration,
+    /// Notified once the request has passed this client's own limits and waits
+    /// only on its peer.
+    pub(crate) dispatched: RequestDispatched,
+}
+
 /// Execute a request through the platform adapter and apply the shared response handler.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_and_await_chunk_response<T, E: From<crate::data::error::Error>>(
     network: &Network,
-    target_peer: &PeerId,
-    message_bytes: Vec<u8>,
-    request_id: u64,
-    timeout: std::time::Duration,
-    peer_addrs: &[MultiAddr],
+    request: ChunkRequest<'_>,
     response_handler: impl Fn(ant_protocol::ChunkMessageBody) -> Option<std::result::Result<T, E>>,
     send_error: impl FnOnce(String) -> E,
     timeout_error: impl FnOnce() -> E,
 ) -> std::result::Result<T, E> {
+    let ChunkRequest {
+        target_peer,
+        peer_addrs,
+        message_bytes,
+        request_id,
+        timeout,
+        dispatched,
+    } = request;
     #[cfg(feature = "native")]
     {
+        // A native client has no limits of its own on requests: each is
+        // dispatched at once.
+        dispatched.notify();
         ant_protocol::send_and_await_chunk_response(
             network.node(),
             target_peer,
@@ -601,7 +655,13 @@ pub(crate) async fn send_and_await_chunk_response<T, E: From<crate::data::error:
             Ok(request) => {
                 network
                     .backend
-                    .request(target_peer, peer_addrs, request, timeout)
+                    .request_notifying_dispatched(
+                        target_peer,
+                        peer_addrs,
+                        request,
+                        timeout,
+                        dispatched,
+                    )
                     .await
             }
             Err(error) => Err(crate::data::error::Error::Protocol(error.to_string())),

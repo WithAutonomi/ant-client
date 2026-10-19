@@ -217,7 +217,7 @@ use crate::data::client::batch::{finalize_batch_payment, PreparedChunk};
 use crate::data::client::peer_xor_distance;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
-use crate::data::network::send_and_await_chunk_response;
+use crate::data::network::{send_and_await_chunk_response, ChunkRequest, RequestDispatched};
 use ant_protocol::evm::{QuoteHash, TxHash};
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::{
@@ -739,11 +739,14 @@ impl Client {
 
         let result = send_and_await_chunk_response(
             node,
-            target_peer,
-            message_bytes,
-            request_id,
-            timeout,
-            peer_addrs,
+            ChunkRequest {
+                target_peer,
+                peer_addrs,
+                message_bytes,
+                request_id,
+                timeout,
+                dispatched: RequestDispatched::unobserved(),
+            },
             |body| match body {
                 ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address: addr }) => {
                     debug!("Chunk stored at {}", hex::encode(addr));
@@ -863,7 +866,10 @@ impl Client {
             // flight. Stopping after just the close-group count can exhaust
             // speculation on stale hints before a live holder is discovered.
             // The final close-group size and absence rules still use peer_count.
-            crate::client_engine::read::MAX_GET_FALLBACK_PEERS,
+            crate::client_engine::read::EarlyReads {
+                limit: crate::client_engine::read::MAX_GET_FALLBACK_PEERS,
+                hedge_delay: self.network().read_hedge_delay(),
+            },
             |sender| {
                 #[cfg(feature = "native")]
                 let observation = &observation;
@@ -947,7 +953,7 @@ impl Client {
                 }
             },
             |(peer, _)| *peer.as_bytes(),
-            |(peer, addrs), early| {
+            |(peer, addrs), early, dispatched| {
                 #[cfg(feature = "native")]
                 let observation = &observation;
                 async move {
@@ -963,6 +969,8 @@ impl Client {
                                 ),
                                 ..ReadObservation::default()
                             });
+                            // A native GET is dispatched at once.
+                            dispatched.notify();
                             return self
                                 .chunk_get_diagnostic_attempt(
                                     address,
@@ -976,11 +984,13 @@ impl Client {
                     }
                     #[cfg(feature = "native")]
                     if let (Some(diag), Some(observation)) = (diag, observation) {
+                        dispatched.notify();
                         return self
                             .chunk_get_diagnostic_attempt(address, &peer, &addrs, diag, observation)
                             .await;
                     }
-                    self.chunk_get_from_peer(address, &peer, &addrs).await
+                    self.chunk_get_from_peer(address, &peer, &addrs, dispatched)
+                        .await
                 }
             },
             |error| {
@@ -1055,7 +1065,12 @@ impl Client {
         let mut get_results = stream::iter(targets.iter().cloned())
             .map(|target| async move {
                 let chunk_result = self
-                    .chunk_get_from_peer(address, &target.peer_id, &target.peer_addrs)
+                    .chunk_get_from_peer(
+                        address,
+                        &target.peer_id,
+                        &target.peer_addrs,
+                        RequestDispatched::unobserved(),
+                    )
                     .await;
 
                 if let Ok(Some(chunk)) = &chunk_result {
@@ -1100,12 +1115,14 @@ impl Client {
         Ok(results)
     }
 
-    /// Fetch a chunk from a specific peer.
+    /// Fetch a chunk from a specific peer, notifying `dispatched` once the GET
+    /// waits only on that peer.
     async fn chunk_get_from_peer(
         &self,
         address: &XorName,
         peer: &PeerId,
         peer_addrs: &[MultiAddr],
+        dispatched: RequestDispatched,
     ) -> Result<Option<DataChunk>> {
         let node = self.network();
         let request_id = self.next_request_id();
@@ -1124,11 +1141,14 @@ impl Client {
 
         let result = send_and_await_chunk_response(
             node,
-            peer,
-            message_bytes,
-            request_id,
-            timeout,
-            peer_addrs,
+            ChunkRequest {
+                target_peer: peer,
+                peer_addrs,
+                message_bytes,
+                request_id,
+                timeout,
+                dispatched,
+            },
             |body| match body {
                 ChunkMessageBody::GetResponse(ChunkGetResponse::Success {
                     address: addr,
