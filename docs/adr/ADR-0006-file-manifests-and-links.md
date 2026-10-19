@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-09-23
-- **Last amended:** 2026-10-15
+- **Last amended:** 2026-10-19
 - **Decision owners:** Mick
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -283,8 +283,14 @@ A path is valid when all of the following hold:
 - Valid UTF-8, with `/` as the only separator. `\` is a forbidden character,
   never a separator.
 - No leading `/`, no empty component, no component equal to `.` or `..`.
-- No component contains NUL, a control character (below `0x20`, or `0x7F`),
-  or any of `< > : " | ? * \`.
+- No component contains a Unicode control character (`U+0000`–`U+001F`,
+  `U+007F`–`U+009F`; some terminals act on the C1 range, and entry names are
+  printed), a bidirectional embedding, override or isolate control
+  (`U+202A`–`U+202E`, `U+2066`–`U+2069`), or any of `< > : " | ? * \`.
+  Bidirectional controls make a name display as something it is not:
+  `invoice<U+202E>fdp.exe` shows as `invoiceexe.pdf`. Joiners and directional
+  marks stay allowed because real names in Persian, emoji and right-to-left
+  scripts use them.
 - No component ends with a space or a `.`.
 - No component, with any extension and the spaces before it removed,
   equals a Windows reserved device name ignoring case: `CON`, `PRN`, `AUX`,
@@ -292,13 +298,19 @@ A path is valid when all of the following hold:
   and `LPT¹`–`LPT³`. So `CON .txt` is rejected as well as `CON.txt`.
 - Each component is at most `MAX_PATH_COMPONENT_BYTES` (255) bytes; the whole
   path is at most `MAX_PATH_BYTES` (1024) bytes.
-- Effective names are compared under a folded key: NFC normalisation, then
-  uppercasing followed by lowercasing, then NFC again. Lowercasing alone
-  misses pairs that APFS and NTFS merge because their uppercase forms are
-  equal (`ſ` and `s`, `ς` and `σ`, `ı` and `i`); going through uppercase
-  joins them, and the final normalisation recomposes anything case mapping
-  decomposed. The key may reject a few pairs a given filesystem would keep
-  apart (`ß` and `ss`), which is the safe direction. Under that comparison
+- Effective names are compared under a folded key: the code points HFS+
+  ignores in names are dropped (zero-width joiners, directional marks and
+  formatting controls, and `U+FEFF`), then NFC normalisation, uppercasing,
+  full Unicode case folding, and NFC again. Each step covers merges the
+  others miss. NTFS compares uppercase forms (`ſ` and `s`, `ς` and `σ` on
+  older volumes). APFS applies full case folding (`ß`, `ẞ` and `ss`; `µ` and
+  `μ`), which lowercasing the uppercase form would miss for `ẞ`. HFS+ treats
+  `ab` and `a<U+200C>b` as one name. The final normalisation recomposes
+  anything case mapping decomposed. The key is checked against every BMP
+  character in the Windows XP and Windows 7 NTFS upcase tables and against
+  every cased character on a live case-insensitive APFS volume; it misses
+  no merge either makes. It rejects a few pairs those filesystems keep
+  apart (`ı` and `i`), which is the safe direction. Under that comparison
   no two effective names are equal, and none is a directory prefix of
   another: `a` and `a/b` cannot both be entries, and neither can `A` and
   `a/b`.

@@ -30,6 +30,8 @@ sha2 = "0.10"
 # Portable WebRTC Direct profile shared with ant-node.
 saorsa-transport = { version = "0.38.1", default-features = false, features = ["webrtc"] }
 thiserror = "2"
+# Full Unicode case folding for the portable manifest path rules (ADR-0006).
+unicase = "2.9"
 # NFC normalisation for the portable manifest path rules (ADR-0006).
 unicode-normalization = "0.1"
 url = "2"
