@@ -409,7 +409,19 @@ Two reference modes for uploaded files:
 
 Everything that could make the finished manifest invalid, such as file sizes,
 the name and path collisions, is checked before the first paid upload, and
-the output location is checked before it too. Cancellation stops between
+the output location is checked before it too.
+
+The finished manifest must also fit `MAX_MANIFEST_BYTES`, which a few
+thousand embedded root maps can exceed. Before the first upload every queued
+file is counted at the smallest entry it can become (a public address with
+its path, size and hash), and a build that cannot fit even so is refused. A
+file is uploaded only when the largest entry it can become, its own shrunk
+DataMap of at most three chunk records, would still fit; otherwise the build
+stops before paying for it, as a file failure that keeps the partial result.
+After an upload the entry is counted at its real size, and a larger
+reference such as an embedded root map is used only when the manifest still
+fits with it; the shrunk map is kept otherwise. Every partial or complete
+result can therefore be encoded and recorded. Cancellation stops between
 files or abandons the upload in flight and returns the partial manifest,
 which the client records in the upload history so paid uploads are not lost.
 Ordinary file failures also preserve the partial result in
