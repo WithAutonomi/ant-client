@@ -85,7 +85,8 @@ ant-core/src/
 │       ├── build.rs          # ManifestBuilder (uploads files, embedded or compact refs)
 │       ├── embed.rs          # Root-vs-shrunk DataMap choice for embedding
 │       ├── compact.rs        # Plan/publish/apply compaction (embedded DataMaps -> addresses)
-│       └── extract.rs        # Containment-safe extraction with per-entry results
+│       ├── extract.rs        # Containment-safe extraction with per-entry results
+│       └── output/           # Handle-relative output directories (fds on Unix, held handles on Windows)
 └── node/                     # Node management
     ├── mod.rs                # add_nodes, remove_node, reset
     ├── types.rs              # DaemonConfig, DaemonStatus, NodeConfig, NodeInfo, AddNodeOpts, etc.

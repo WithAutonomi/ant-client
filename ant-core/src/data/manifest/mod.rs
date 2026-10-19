@@ -46,6 +46,8 @@ pub mod extract;
 pub mod file;
 #[cfg(feature = "native")]
 pub mod history;
+#[cfg(feature = "native")]
+mod output;
 
 #[cfg(feature = "native")]
 pub use self::embed::embeddable_data_map;

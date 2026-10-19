@@ -481,26 +481,45 @@ portable path rules. Any violation rejects the manifest.
 Containment is a filesystem contract, not a string check. Within the output
 root the extractor never follows a symlink or a junction, that is, anything
 the platform's no-follow metadata reports as a link (on Windows, the
-name-surrogate reparse points): each
-intermediate directory is created, or confirmed to be a real directory, by a
-non-following metadata check immediately before use, and the file is
-downloaded into a reserved temporary name in its parent directory and renamed
-into place with no-clobber semantics. The target is checked again, without
-following links, immediately before the rename. An entry whose path would
-traverse a link, or whose target already exists, is a per-entry failure
-unless overwrite was requested, in which case only a regular file at the
-exact target is replaced, never a link. Handle-relative (resolve-beneath)
-opening would close the remaining check-to-use window against a concurrent
-local attacker and is a later hardening step, not part of this decision.
+name-surrogate reparse points). It resolves every name from directories it
+holds open, never again from a path string once checked, so nothing that
+changes while an entry downloads can redirect where the entry is written,
+even a concurrent local process that can write inside the output root:
+
+- On Unix each directory is held as a file descriptor opened without
+  following links, and every create, rename and check is relative to it.
+  Renaming a directory or replacing any path to it with a symlink does not
+  change the directory a descriptor refers to.
+- On Windows each directory from the root down is held open without delete
+  sharing, which stops it from being renamed, deleted or replaced by a link
+  while the entry is written. Directories beneath the root are opened as the
+  reparse point itself, so a link is seen rather than followed.
+
+The output root itself may be a link, since it is the caller's choice; links
+in its own path are resolved once when it is opened. Each intermediate
+directory is created, or confirmed to be a real directory, as it is opened.
+The file is downloaded into a temporary name in its parent and renamed into
+place without replacing anything (an atomic no-replace rename where the
+filesystem has one, otherwise a hard link, otherwise a check just before the
+rename). An entry whose path would traverse a link, or whose target already
+exists, is a per-entry failure unless overwrite was requested. Even then only
+a regular file is replaced, never a link, and never a file this extraction
+already wrote: two entries that a filesystem treats as one name, such as a
+long name and its Windows 8.3 alias, end with the second failing rather than
+silently replacing the first. Files are told apart by device and inode on
+Unix and by volume and file id on Windows. Commits within one extraction are
+serialised, so that check, the rename and recording the written file are
+one step.
 
 Per entry: resolve the DataMap (`Public` needs one fetch), resolve it to its
 root (a shrunk map needs its wrapper records), and check that the target's
 filesystem has room for the root's exact plaintext size before downloading;
 too little space is a per-entry failure. Then download through the ordinary
 file download and write as above. When the entry records a `sha256`, the
-downloaded temporary file is hashed before it takes its name; a mismatch is
-a per-entry failure and the temporary file is removed, so nothing unverified
-is left at the target. The recorded `size` decides nothing; tools show it
+download is hashed as it is written, in the same pass, and checked before
+the file takes its name; a mismatch is a per-entry failure and the temporary
+file is removed, so nothing unverified is left at the target. The file is
+flushed to disk before the rename. The recorded `size` decides nothing; tools show it
 marked as the creator's claim, and show the exact size instead wherever an
 embedded root map provides one. Extracted files get the platform's default
 permissions.
@@ -611,9 +630,13 @@ initial release.
   every depth inside the output root causes a per-entry failure and nothing
   is written outside the root; an existing target fails without overwrite
   and is replaced only when it is a regular file; a link at the target is
-  never followed even with overwrite. Windows uses the same no-follow
-  metadata checks, but CI has no Windows unit-test runner. Junction tests
-  are to be added with one.
+  never followed even with overwrite; a directory swapped for a symlink to
+  elsewhere while an entry downloads cannot redirect the file; a name that
+  appears during the download is not replaced; overwrite never replaces a
+  file the same extraction wrote under another name (simulated with a hard
+  link); an abandoned temporary file is removed. The Windows implementation
+  is type-checked and linted for `x86_64-pc-windows-msvc`, but CI has no
+  Windows test runner. Junction tests are to be added with one.
 - End-to-end on a local network: build a manifest with an embedded entry, a
   compact entry and an entry added by address; extract it from a `.ant` file
   and from a manifest link; extract a selection; verify bytes and per-entry
