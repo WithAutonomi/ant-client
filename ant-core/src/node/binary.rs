@@ -720,6 +720,76 @@ mod tests {
         );
     }
 
+    /// Build an in-memory zip archive from `(entry name, contents)` pairs.
+    fn zip_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, data) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut writer, data).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn extract_zip_finds_binary_in_subdirectory() {
+        // Windows release archives carry `<binary>.exe`, possibly under a folder.
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = format!("{BINARY_NAME}.exe");
+        let data = b"fake binary";
+        let zip_data = zip_archive(&[(&format!("release/{exe}"), data)]);
+
+        let result = extract_zip(&zip_data, tmp.path(), BINARY_NAME).unwrap();
+        assert_eq!(result.binary_path, tmp.path().join(&exe));
+        assert_eq!(std::fs::read(&result.binary_path).unwrap(), data);
+        assert!(result.bootstrap_peers_path.is_none());
+    }
+
+    #[test]
+    fn extract_zip_finds_bootstrap_peers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bp_data = b"[peers]\naddrs = [\"1.2.3.4:5000\"]\n";
+        let zip_data = zip_archive(&[
+            (BINARY_NAME, b"fake binary"),
+            (BOOTSTRAP_PEERS_FILE, bp_data),
+        ]);
+
+        let result = extract_zip(&zip_data, tmp.path(), BINARY_NAME).unwrap();
+        assert!(result.binary_path.exists());
+        let bp_path = result.bootstrap_peers_path.unwrap();
+        assert_eq!(bp_path, tmp.path().join(BOOTSTRAP_PEERS_FILE));
+        assert_eq!(std::fs::read(&bp_path).unwrap(), bp_data);
+    }
+
+    #[test]
+    fn extract_zip_missing_binary_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_data = zip_archive(&[("README.md", b"no binary here")]);
+
+        let result = extract_zip(&zip_data, tmp.path(), BINARY_NAME);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_zip_skips_path_traversal_entry() {
+        // An entry that escapes the archive root has no enclosed name, so it
+        // is skipped rather than matched by its final path component.
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path().join("install");
+        std::fs::create_dir(&install_dir).unwrap();
+        let zip_data = zip_archive(&[(&format!("../{BINARY_NAME}"), b"malicious content")]);
+
+        let result = extract_zip(&zip_data, &install_dir, BINARY_NAME);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found"),
+            "expected not-found error, got: {err}"
+        );
+        assert!(!tmp.path().join(BINARY_NAME).exists());
+        assert!(!install_dir.join(BINARY_NAME).exists());
+    }
+
     #[tokio::test]
     async fn resolve_version_uses_cache() {
         let tmp = tempfile::tempdir().unwrap();
