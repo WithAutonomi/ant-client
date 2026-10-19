@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { decodeManifest, parseManifestLink } from "./pkg/ant_core.js";
+import {
+  createFileLink,
+  createManifest,
+  decodeManifest,
+  parseManifestLink,
+} from "./pkg/ant_core.js";
 
 // A manifest built by `ant manifest create --embed-public ADDRESS=file.bin`
 // against mainnet: one embedded entry whose DataMap is a shrunk child map,
@@ -47,4 +52,53 @@ test("decodeManifest requires the full header", () => {
   const wrongVersion = Uint8Array.from(bytes);
   wrongVersion[4] = 2;
   assert.throws(() => decodeManifest(wrongVersion), /version/);
+});
+
+test("createManifest takes JavaScript input and writes what the decoders read", () => {
+  const embedded = parseManifestLink(LINK).manifest.entries[0];
+  const created = createManifest({
+    name: "files",
+    torrent: { infoHashV1: "ab".repeat(20) },
+    entries: [
+      { kind: "public", path: "z.txt", size: 20, address: `ant://${"cd".repeat(32)}` },
+      { kind: "embedded", path: "a.bin", dataMap: embedded.dataMap },
+    ],
+  });
+  assert.ok(created.bytes instanceof Uint8Array);
+  assert.deepEqual([...created.bytes.subarray(0, 4)], MAGIC);
+  assert.equal(created.linkRecommended, true);
+  assert.deepEqual(
+    created.manifest.entries.map(({ name, kind }) => [name, kind]),
+    [["a.bin", "embedded"], ["z.txt", "public"]],
+    "entries are listed in the order the bytes hold them",
+  );
+  assert.equal(created.manifest.entries[0].address, ADDRESS);
+  assert.equal(created.manifest.entries[1].size, 20);
+  assert.equal(created.manifest.torrent.infoHashV1, "ab".repeat(20));
+
+  assert.deepEqual(decodeManifest(created.bytes), created.manifest);
+  assert.deepEqual(parseManifestLink(created.link), { kind: "manifest", manifest: created.manifest });
+});
+
+test("createManifest refuses input it does not know", () => {
+  const address = "cd".repeat(32);
+  for (const [input, error] of [
+    [{ entries: [], extra: true }, /unknown field `extra`/],
+    [{ entries: [{ kind: "public", address, extra: true }] }, /unknown field `extra`/],
+    [{ entries: [{ kind: "Public", address }] }, /unknown variant `Public`/],
+    [{ entries: [{ kind: "embedded", dataMap: [1, 2, 3] }] }, /invalid DataMap/],
+    [{ entries: [{ kind: "public", address: LINK }] }, /public entry requires a file address/],
+    [{ torrent: { infoHashV1: "ab".repeat(20), infoHashV3: "" }, entries: [] }, /unknown field `infoHashV3`/],
+    [{ entries: [{ kind: "public", address, size: 2 ** 53 }] }, /expected u64/],
+    [{ entries: [{ kind: "public", address, size: 2n ** 53n }] }, /safe integer/],
+  ]) {
+    assert.throws(() => createManifest(input), error);
+  }
+});
+
+test("createFileLink formats a public address in the shared link grammar", () => {
+  assert.equal(createFileLink(ADDRESS), `ant://${ADDRESS}`);
+  assert.equal(createFileLink(`ant://${ADDRESS.toUpperCase()}`), `ant://${ADDRESS}`);
+  assert.throws(() => createFileLink(LINK), /expected a public file address/);
+  assert.throws(() => createFileLink("not an address"));
 });

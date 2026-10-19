@@ -6,16 +6,81 @@
 use super::manifest::MAX_SAFE_JS_INTEGER;
 use super::BrowserManifestView;
 use crate::data::manifest::{
-    self, embedded_len, ContentRef, Link, Manifest, ManifestEntry, TorrentReference,
+    self, embedded_len, ContentRef, Link, Manifest, ManifestEntry, ManifestError, TorrentReference,
     MANIFEST_LINK_RECOMMENDED_MAX_BYTES, MAX_EMBEDDED_ROOT_MAP_BYTES, MAX_MANIFEST_BYTES,
+    MAX_MANIFEST_ENTRIES,
 };
 use self_encryption::DataMap;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 #[cfg(test)]
 use self_encryption::ChunkInfo;
 #[cfg(test)]
 use xor_name::XorName;
+
+/// The [`ManifestInput`] field holding a [`TorrentInput`], as JavaScript
+/// names it.
+pub const TORRENT_FIELD: &str = "torrent";
+
+/// Every [`ManifestInput`] field as JavaScript names it. A JavaScript caller
+/// checks keys against this: `serde_wasm_bindgen` reads only declared fields,
+/// so `deny_unknown_fields` cannot refuse the others there.
+pub const MANIFEST_INPUT_FIELDS: [&str; 3] = ["name", TORRENT_FIELD, "entries"];
+
+/// Every [`TorrentInput`] field as JavaScript names it.
+pub const TORRENT_INPUT_FIELDS: [&str; 2] = ["infoHashV1", "infoHashV2"];
+
+/// Why [`ManifestInput::create`] refused its input.
+#[derive(Debug, Error)]
+pub enum ManifestInputError {
+    /// The shared encoder refused the manifest.
+    #[error(transparent)]
+    Manifest(#[from] ManifestError),
+    /// A public entry named something other than a file.
+    #[error("public entry requires a file address")]
+    NotAFileAddress,
+    /// The embedded DataMaps alone exceed what one manifest can hold.
+    #[error("embedded DataMaps exceed the {max}-byte manifest size limit")]
+    EmbeddedTooLarge {
+        /// The limit.
+        max: usize,
+    },
+    /// An embedded DataMap did not decode.
+    #[error("invalid DataMap: {0}")]
+    InvalidDataMap(String),
+    /// An embedded DataMap decoded, but not from its canonical encoding.
+    #[error("DataMap must use canonical MessagePack encoding")]
+    NonCanonicalDataMap,
+    /// A root DataMap too large to embed, as a native writer would refuse.
+    #[error(
+        "a root DataMap of {len} bytes exceeds the {max}-byte embedding limit; \
+         embed the shrunk DataMap its upload returned"
+    )]
+    RootDataMapTooLarge {
+        /// Embedded length of the map.
+        len: usize,
+        /// The limit.
+        max: usize,
+    },
+    /// A size hint JavaScript cannot represent exactly.
+    #[error("size {0} exceeds JavaScript's safe integer range")]
+    UnsafeSize(u64),
+    /// A size hint that contradicts the size a root DataMap fixes.
+    #[error("size {hint} does not match the embedded DataMap's {known} bytes")]
+    SizeMismatch {
+        /// The size given.
+        hint: u64,
+        /// The size the DataMap lists.
+        known: u64,
+    },
+    /// A torrent hash given under the other version's field.
+    #[error("{field} has the length of the other torrent version")]
+    TorrentHashVersion {
+        /// The input field.
+        field: &'static str,
+    },
+}
 
 /// What `createManifest` takes: metadata the creator supplies. The address of
 /// an embedded entry is derived from its DataMap, never taken on trust.
@@ -55,6 +120,11 @@ pub enum EntryInput {
     },
     /// A file by its DataMap, in self_encryption's canonical MessagePack as
     /// the browser client hands it out. Grants access to a private file.
+    ///
+    /// The `.ant` bytes carry the map as given; the link carries its shrunk
+    /// form, which a reader resolves through the wrapper records an upload
+    /// stores. So a root map must be one an upload shrank, as every upload
+    /// does, never one encrypted without being uploaded.
     Embedded {
         /// Relative path, subject to the portable path rules.
         path: Option<String>,
@@ -85,7 +155,15 @@ pub struct CreatedManifest {
 impl ManifestInput {
     /// Validate the input and encode it with the shared encoder, so the bytes
     /// and link are exactly those a native writer produces.
-    pub fn create(self) -> Result<CreatedManifest, String> {
+    pub fn create(self) -> Result<CreatedManifest, ManifestInputError> {
+        // Counted before any entry is parsed or any DataMap decoded.
+        if self.entries.len() > MAX_MANIFEST_ENTRIES {
+            return Err(ManifestError::TooManyEntries {
+                count: self.entries.len(),
+                max: MAX_MANIFEST_ENTRIES,
+            }
+            .into());
+        }
         let torrent = self.torrent.map(TorrentInput::into_reference).transpose()?;
         let mut embedded_bytes = 0;
         let entries = self
@@ -98,12 +176,14 @@ impl ManifestInput {
             torrent,
             entries,
         };
-        // Sorted here too so the view lists entries in the order the bytes do.
-        manifest.canonicalize().map_err(|e| e.to_string())?;
-        let bytes = manifest.encode().map_err(|e| e.to_string())?;
-        let link_bytes = manifest::manifest_link_bytes(&manifest).map_err(|e| e.to_string())?;
+        // Validated and sorted once: the view lists entries in the order the
+        // bytes do, and the link form keeps every entry's name, so it stays
+        // canonical too.
+        manifest.canonicalize()?;
+        let bytes = manifest.encode_canonical()?;
+        let link_bytes = manifest.link_form()?.encode_canonical()?;
         Ok(CreatedManifest {
-            manifest: BrowserManifestView::from_manifest(&manifest).map_err(|e| e.to_string())?,
+            manifest: BrowserManifestView::from_manifest(&manifest)?,
             bytes,
             link: manifest::manifest_link_from_bytes(&link_bytes),
             link_recommended: link_bytes.len() <= MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
@@ -112,7 +192,7 @@ impl ManifestInput {
 }
 
 impl TorrentInput {
-    fn into_reference(self) -> Result<TorrentReference, String> {
+    fn into_reference(self) -> Result<TorrentReference, ManifestInputError> {
         Ok(TorrentReference {
             info_hash_v1: torrent_hash(self.info_hash_v1, "infoHashV1", |t| t.info_hash_v1)?,
             info_hash_v2: torrent_hash(self.info_hash_v2, "infoHashV2", |t| t.info_hash_v2)?,
@@ -123,17 +203,15 @@ impl TorrentInput {
 impl EntryInput {
     /// The manifest entry. `embedded_bytes` totals the DataMap input so far,
     /// so a page cannot make this decode more than a manifest can hold.
-    fn into_entry(self, embedded_bytes: &mut usize) -> Result<ManifestEntry, String> {
+    fn into_entry(self, embedded_bytes: &mut usize) -> Result<ManifestEntry, ManifestInputError> {
         let entry = match self {
             Self::Public {
                 path,
                 size,
                 address,
             } => {
-                let Link::File(address) =
-                    manifest::parse_link(&address).map_err(|e| e.to_string())?
-                else {
-                    return Err("public entry requires a file address".into());
+                let Link::File(address) = manifest::parse_link(&address)? else {
+                    return Err(ManifestInputError::NotAFileAddress);
                 };
                 ManifestEntry {
                     path,
@@ -150,7 +228,9 @@ impl EntryInput {
                 *embedded_bytes = embedded_bytes
                     .checked_add(data_map.len())
                     .filter(|total| *total <= MAX_MANIFEST_BYTES)
-                    .ok_or("embedded DataMaps exceed the manifest size limit")?;
+                    .ok_or(ManifestInputError::EmbeddedTooLarge {
+                        max: MAX_MANIFEST_BYTES,
+                    })?;
                 ManifestEntry {
                     path,
                     size,
@@ -161,16 +241,14 @@ impl EntryInput {
                 }
             }
         };
-        if entry.size.is_some_and(|size| size > MAX_SAFE_JS_INTEGER) {
-            return Err("size exceeds JavaScript's safe integer range".into());
+        if let Some(size) = entry.size.filter(|size| *size > MAX_SAFE_JS_INTEGER) {
+            return Err(ManifestInputError::UnsafeSize(size));
         }
         // A root DataMap lists every chunk, so its size is exact.
-        if entry
-            .known_size()
-            .zip(entry.size)
-            .is_some_and(|(known, hint)| known != hint)
-        {
-            return Err("size does not match the embedded DataMap".into());
+        if let Some((known, hint)) = entry.known_size().zip(entry.size) {
+            if known != hint {
+                return Err(ManifestInputError::SizeMismatch { hint, known });
+            }
         }
         Ok(entry)
     }
@@ -180,30 +258,32 @@ impl EntryInput {
 /// selects: a hash of the other version's length is refused.
 fn torrent_hash<T>(
     hex: Option<String>,
-    field: &str,
+    field: &'static str,
     pick: impl FnOnce(TorrentReference) -> Option<T>,
-) -> Result<Option<T>, String> {
+) -> Result<Option<T>, ManifestInputError> {
     hex.map(|hex| {
-        let parsed = TorrentReference::parse_hex(&hex).map_err(|e| e.to_string())?;
-        pick(parsed).ok_or_else(|| format!("{field} has the length of the other torrent version"))
+        let parsed = TorrentReference::parse_hex(&hex)?;
+        pick(parsed).ok_or(ManifestInputError::TorrentHashVersion { field })
     })
     .transpose()
 }
 
 /// Decode a canonical DataMap and hold it to what a native writer embeds: a
 /// root map only while it is small, otherwise the shrunk map an upload returns.
-fn embeddable_data_map(bytes: &[u8]) -> Result<DataMap, String> {
-    let data_map: DataMap =
-        rmp_serde::from_slice(bytes).map_err(|e| format!("invalid DataMap: {e}"))?;
-    if rmp_serde::to_vec(&data_map).map_err(|e| e.to_string())? != bytes {
-        return Err("DataMap must use canonical MessagePack encoding".into());
+fn embeddable_data_map(bytes: &[u8]) -> Result<DataMap, ManifestInputError> {
+    let data_map: DataMap = rmp_serde::from_slice(bytes)
+        .map_err(|e| ManifestInputError::InvalidDataMap(e.to_string()))?;
+    let canonical = rmp_serde::to_vec(&data_map)
+        .map_err(|e| ManifestInputError::InvalidDataMap(e.to_string()))?;
+    if canonical != bytes {
+        return Err(ManifestInputError::NonCanonicalDataMap);
     }
-    let len = embedded_len(&data_map).map_err(|e| e.to_string())?;
+    let len = embedded_len(&data_map)?;
     if !data_map.is_child() && len > MAX_EMBEDDED_ROOT_MAP_BYTES {
-        return Err(format!(
-            "a root DataMap of {len} bytes exceeds the {MAX_EMBEDDED_ROOT_MAP_BYTES}-byte \
-             embedding limit; embed the shrunk DataMap its upload returned"
-        ));
+        return Err(ManifestInputError::RootDataMapTooLarge {
+            len,
+            max: MAX_EMBEDDED_ROOT_MAP_BYTES,
+        });
     }
     Ok(data_map)
 }
@@ -293,10 +373,58 @@ mod tests {
     }
 
     #[test]
+    fn the_field_lists_name_every_input_field() {
+        // `deny_unknown_fields` holds through serde_json, so input naming
+        // exactly the listed fields parses only if the lists are complete.
+        let torrent: serde_json::Map<_, _> = TORRENT_INPUT_FIELDS
+            .iter()
+            .map(|field| (field.to_string(), serde_json::Value::Null))
+            .collect();
+        let input = serde_json::json!({
+            "name": null,
+            TORRENT_FIELD: torrent,
+            "entries": [],
+        });
+        let keys: Vec<_> = input.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys.len(), MANIFEST_INPUT_FIELDS.len());
+        assert!(keys
+            .iter()
+            .all(|key| MANIFEST_INPUT_FIELDS.contains(&key.as_str())));
+        serde_json::from_value::<ManifestInput>(input).expect("every listed field is known");
+    }
+
+    #[test]
+    fn the_entry_count_is_checked_before_any_entry_is_parsed() {
+        // Unparseable addresses: only the count can refuse these first.
+        let entries = (0..=MAX_MANIFEST_ENTRIES)
+            .map(|_| EntryInput::Public {
+                path: None,
+                size: None,
+                address: String::new(),
+            })
+            .collect();
+        let error = ManifestInput {
+            name: None,
+            torrent: None,
+            entries,
+        }
+        .create()
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ManifestInputError::Manifest(ManifestError::TooManyEntries { .. })
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn an_empty_data_map_is_refused_rather_than_written_unreadable() {
         let error = embedded(None, data_map_bytes(0, None))
             .create()
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("at least one chunk"), "{error}");
     }
 
@@ -307,7 +435,10 @@ mod tests {
         let error = embedded(Some(exact - 1), data_map_bytes(chunks, None))
             .create()
             .unwrap_err();
-        assert!(error.contains("does not match"), "{error}");
+        assert!(
+            matches!(error, ManifestInputError::SizeMismatch { hint, known } if hint == exact - 1 && known == exact),
+            "{error}"
+        );
 
         for size in [None, Some(exact)] {
             let created = embedded(size, data_map_bytes(chunks, None))
@@ -324,7 +455,10 @@ mod tests {
         let error = embedded(None, data_map_bytes(OVERSIZED_CHUNKS, None))
             .create()
             .unwrap_err();
-        assert!(error.contains("embedding limit"), "{error}");
+        assert!(
+            matches!(error, ManifestInputError::RootDataMapTooLarge { .. }),
+            "{error}"
+        );
 
         // A shrunk map carries no exact size, so any hint is kept as given.
         let created = embedded(Some(1), data_map_bytes(OVERSIZED_CHUNKS, Some(1)))

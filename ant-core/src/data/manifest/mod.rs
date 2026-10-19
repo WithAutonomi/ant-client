@@ -377,10 +377,15 @@ impl ManifestEntry {
     /// The plaintext size the file is known to have: from an embedded root
     /// DataMap, which lists every chunk. `None` for a `Public` entry or a
     /// shrunk map, whose size is not known until it is resolved.
+    ///
+    /// Summed as `u64`: `DataMap::original_file_size` sums `usize`, which
+    /// overflows past 4 GiB on 32-bit targets such as `wasm32`.
     pub fn known_size(&self) -> Option<u64> {
         match &self.source {
             ContentRef::Embedded { data_map } if !data_map.is_child() => {
-                u64::try_from(data_map.original_file_size()).ok()
+                data_map.infos().iter().try_fold(0u64, |total, info| {
+                    total.checked_add(u64::try_from(info.src_size).ok()?)
+                })
             }
             _ => None,
         }
@@ -391,8 +396,15 @@ impl ManifestEntry {
     pub fn effective_name(&self) -> Result<String, ManifestError> {
         match &self.path {
             Some(path) => Ok(path.clone()),
-            None => Ok(hex::encode(self.source.content_address()?)),
+            None => Ok(self.effective_name_with(&self.source.content_address()?)),
         }
+    }
+
+    /// [`Self::effective_name`] for a caller that has already derived the
+    /// entry's content address, which for an embedded entry means
+    /// self-encrypting its DataMap.
+    pub fn effective_name_with(&self, address: &[u8; ADDRESS_LEN]) -> String {
+        self.path.clone().unwrap_or_else(|| hex::encode(address))
     }
 }
 
@@ -485,8 +497,14 @@ impl Manifest {
     pub fn encode(&self) -> Result<Vec<u8>, ManifestError> {
         let mut canonical = self.clone();
         canonical.canonicalize()?;
-        let body = rmp_serde::to_vec_named(&canonical)
-            .map_err(|e| ManifestError::Encode(e.to_string()))?;
+        canonical.encode_canonical()
+    }
+
+    /// Encode a manifest [`Self::canonicalize`] has already validated and
+    /// sorted, without doing either again. Only the size limit is checked.
+    pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, ManifestError> {
+        let body =
+            rmp_serde::to_vec_named(self).map_err(|e| ManifestError::Encode(e.to_string()))?;
         let mut bytes = Vec::with_capacity(MANIFEST_HEADER_LEN + body.len());
         bytes.extend_from_slice(&MANIFEST_MAGIC);
         bytes.push(MANIFEST_FORMAT_VERSION);
@@ -967,6 +985,25 @@ mod tests {
                 assert!(data_map.len() <= 3);
             }
         }
+    }
+
+    #[test]
+    fn known_size_is_unknown_rather_than_wrapped_when_sizes_overflow() {
+        let chunk = |index| ChunkInfo {
+            index,
+            dst_hash: XorName::from_content(&[0]),
+            src_hash: XorName::from_content(&[1]),
+            src_size: usize::MAX,
+        };
+        let entry = ManifestEntry {
+            path: None,
+            size: None,
+            sha256: None,
+            source: ContentRef::Embedded {
+                data_map: DataMap::new(vec![chunk(0), chunk(1)]),
+            },
+        };
+        assert_eq!(entry.known_size(), None);
     }
 
     #[test]

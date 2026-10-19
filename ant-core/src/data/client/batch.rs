@@ -17,7 +17,6 @@ use ant_protocol::evm::{
     Amount, EncodedPeerId, PayForQuotesError, PaymentQuote, ProofOfPayment, QuoteHash,
     RewardsAddress, TxHash, Wallet,
 };
-#[cfg(any(feature = "native", test))]
 use ant_protocol::payment::deserialize_proof;
 use ant_protocol::payment::{serialize_single_node_proof, PaymentProof, QuotePaymentInfo};
 use ant_protocol::transport::{MultiAddr, PeerId};
@@ -886,9 +885,7 @@ fn prune_locally_expired_proofs(
     proofs: HashMap<[u8; 32], Vec<u8>>,
 ) -> HashMap<XorName, Vec<u8>> {
     let now = std::time::SystemTime::now();
-    let max_safe_age = Duration::from_secs(
-        CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS),
-    );
+    let max_safe_age = max_safe_proof_age();
     let mut kept: HashMap<XorName, Vec<u8>> = HashMap::with_capacity(proofs.len());
     // Pair each expired address with the EXACT bytes we observed at
     // load time. The cache-side drop only removes the entry if those
@@ -921,6 +918,21 @@ fn prune_locally_expired_proofs(
         crate::data::client::cached_single::try_drop_proofs_for_file(resume_key, &expired);
     }
     kept
+}
+
+/// The quote age past which a proof is too close to the storer's limit to
+/// trust.
+fn max_safe_proof_age() -> Duration {
+    Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS.saturating_sub(CACHED_PROOF_SAFETY_MARGIN_SECS))
+}
+
+/// Whether serialized proof bytes are still young enough for storers to
+/// accept, judged as a cached proof is. `None` if the bytes are not a
+/// single-node proof.
+#[cfg(any(all(target_arch = "wasm32", feature = "browser-wasm"), test))]
+pub(crate) fn paid_proof_is_safely_fresh(proof: &[u8], now: std::time::SystemTime) -> Option<bool> {
+    let (proof, _) = deserialize_proof(proof).ok()?;
+    Some(proof_is_safely_fresh(&proof, now, max_safe_proof_age()))
 }
 
 /// True iff every quote in the proof has a timestamp not older than
@@ -1212,6 +1224,26 @@ mod tests {
             })
             .collect();
         ProofOfPayment { peer_quotes }
+    }
+
+    #[test]
+    fn paid_proof_bytes_are_judged_by_their_oldest_quote() {
+        let now = std::time::SystemTime::now();
+        let stale = now - Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS);
+        let bytes = |timestamps: &[std::time::SystemTime]| {
+            serialize_single_node_proof(&PaymentProof {
+                proof_of_payment: make_proof_with_timestamps(timestamps),
+                tx_hashes: Vec::new(),
+                commitment_sidecars: Vec::new(),
+            })
+            .unwrap()
+        };
+        assert_eq!(paid_proof_is_safely_fresh(&bytes(&[now]), now), Some(true));
+        assert_eq!(
+            paid_proof_is_safely_fresh(&bytes(&[now, stale]), now),
+            Some(false)
+        );
+        assert_eq!(paid_proof_is_safely_fresh(b"not a proof", now), None);
     }
 
     #[test]

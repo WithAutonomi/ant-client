@@ -13,13 +13,14 @@
 
 use super::upload_adapter::{paid_transactions, quote_transactions, wallet_quotes};
 use super::*;
-use crate::data::client::batch::ChunkPaymentPlan;
+use crate::data::client::batch::{paid_proof_is_safely_fresh, ChunkPaymentPlan};
 use crate::data::{
     ml_dsa_65, pointer_address, FinalState, FinalityStatus, MlDsaPublicKey, MlDsaSecretKey,
     Pointer, PointerFinality, PointerTarget, PointerTargetKind,
 };
 use ant_protocol::evm::{QuoteHash, TxHash};
-use std::borrow::Cow;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 
 /// Length of an owner key seed.
 const OWNER_SEED_LEN: usize = 32;
@@ -33,21 +34,29 @@ const POINTER_CHECKPOINT_VERSION: u64 = 1;
 /// whose checkpoint would not fit is refused before anything is paid.
 const MAX_POINTER_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
 
-/// The pointer write option awaited with the checkpoint before paying.
-const ON_PREPARED_OPTION: &str = "onPrepared";
-
-/// The pointer write option handed the paid state before storing it.
-const ON_PAID_OPTION: &str = "onPaid";
-
-/// How long a paid state waits on the page's `onPaid` callback before it is
-/// stored anyway. The payment is spent either way, so a callback that never
-/// settles must not keep the state from being stored.
+/// How long a write waits on a page callback. An `onPrepared` that does not
+/// settle in time fails the write before anything is paid; a paid state is
+/// stored anyway once `onPaid` has had this long, since the payment is spent
+/// either way.
 #[cfg(not(feature = "test-utils"))]
-const ON_PAID_TIMEOUT: Duration = Duration::from_secs(30);
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Short enough that a test can wait out a callback that never settles.
 #[cfg(feature = "test-utils")]
-const ON_PAID_TIMEOUT: Duration = Duration::from_secs(1);
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Ends every error a write returns before its wallet is invoked: nothing
+/// was paid, and retrying cannot pay twice.
+const NOT_SUBMITTED: &str = "payment was not submitted";
+
+/// The pointer write option awaited with the checkpoint before paying.
+const ON_PREPARED_OPTION: &str = "onPrepared";
+
+/// The pointer write option handed each transaction the wallet broadcasts.
+const ON_SUBMISSION_OPTION: &str = "onSubmission";
+
+/// The pointer write option handed the paid state before storing it.
+const ON_PAID_OPTION: &str = "onPaid";
 
 /// A pointer as JavaScript sees it.
 #[derive(Debug, Serialize)]
@@ -258,22 +267,27 @@ impl BrowserNetworkClient {
     /// `kind` is `"chunk"` or `"pointer"`. Refused before anything is paid if
     /// the pointer already exists.
     ///
-    /// `options` is `{ onPrepared, onPaid }`, each optional; a bare function
-    /// is taken as `onPaid`, as earlier releases took it.
+    /// `options` is `{ onPrepared, onSubmission, onPaid }`, each optional.
+    /// An unknown option is refused before anything is paid.
     ///
-    /// - `onPrepared` is awaited with an opaque checkpoint, the signed record
-    ///   and its payment plan (never the owner seed), before the wallet is
-    ///   asked to pay. If it fails, nothing is paid. With the receipt of the
-    ///   payment that follows, [`recover_pointer_payment`] rebuilds the paid
-    ///   state, so persist it durably before it settles.
+    /// - `onPrepared` is awaited with an opaque checkpoint string, the signed
+    ///   record and its payment plan (never the owner seed), before the
+    ///   wallet is asked to pay. Persist it durably before it settles; if it
+    ///   fails, or does not settle within 30 seconds, nothing is paid.
+    /// - `onSubmission` is handed what the wallet reports for each
+    ///   transaction it broadcasts, `{ transactionHash }` or
+    ///   `{ transactionHashes }`, and the wallet waits on its promise. Keep
+    ///   it: with the checkpoint, [`recover_pointer_payment`] rebuilds the
+    ///   paid state once the transaction is confirmed, so a page lost before
+    ///   the receipt never pays twice.
     /// - `onPaid` is called with `{ record, proof }` once the state is paid
     ///   for and before it is stored. Keep both: if storing fails, or the page
     ///   is lost, [`Self::store_paid_pointer`] stores the same state without
     ///   paying again.
     ///
-    /// The `onSubmission` the wallet is handed records nothing for a pointer
-    /// write, unlike an upload's: the wallet must keep the transaction hash
-    /// it broadcasts, or a page lost before the receipt pays again on retry.
+    /// Nothing is paid unless `pay_for_quotes` is called. A write that fails
+    /// before calling it says "payment was not submitted"; any later failure
+    /// may have paid, and is recovered from what the callbacks were handed.
     #[wasm_bindgen(js_name = createPointer)]
     pub async fn create_pointer(
         &self,
@@ -282,7 +296,7 @@ impl BrowserNetworkClient {
         kind: &str,
         payment_network: JsValue,
         pay_for_quotes: js_sys::Function,
-        options: JsValue,
+        options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
         let payment_network = parse_payment_network(payment_network)?;
         let written = self
@@ -293,7 +307,7 @@ impl BrowserNetworkClient {
                 kind,
                 &payment_network,
                 &pay_for_quotes,
-                &options,
+                options,
             )
             .await
             .map_err(|error| JsValue::from_str(&error))?;
@@ -311,7 +325,7 @@ impl BrowserNetworkClient {
         kind: &str,
         payment_network: JsValue,
         pay_for_quotes: js_sys::Function,
-        options: JsValue,
+        options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
         let payment_network = parse_payment_network(payment_network)?;
         let written = self
@@ -322,7 +336,7 @@ impl BrowserNetworkClient {
                 kind,
                 &payment_network,
                 &pay_for_quotes,
-                &options,
+                options,
             )
             .await
             .map_err(|error| JsValue::from_str(&error))?;
@@ -345,7 +359,7 @@ impl BrowserNetworkClient {
         recipient: &str,
         payment_network: JsValue,
         pay_for_quotes: js_sys::Function,
-        options: JsValue,
+        options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
         let payment_network = parse_payment_network(payment_network)?;
         let written = self
@@ -356,7 +370,7 @@ impl BrowserNetworkClient {
                 "pointer",
                 &payment_network,
                 &pay_for_quotes,
-                &options,
+                options,
             )
             .await
             .map_err(|error| JsValue::from_str(&error))?;
@@ -378,7 +392,11 @@ impl BrowserNetworkClient {
     }
 
     /// Store a pointer state already paid for, from the `record` and `proof`
-    /// an earlier write handed to its `on_paid` callback. Pays nothing.
+    /// an earlier write handed to its `onPaid` callback or
+    /// [`recover_pointer_payment`] rebuilt. Pays nothing.
+    ///
+    /// Storers accept a proof only while its quotes are under a day old; a
+    /// refusal of an older proof says it expired.
     #[wasm_bindgen(js_name = storePaidPointer)]
     pub async fn store_paid_pointer(
         &self,
@@ -390,16 +408,17 @@ impl BrowserNetworkClient {
         let record = Pointer::from_bytes(record)
             .map_err(|error| JsValue::from_str(&format!("invalid pointer record: {error}")))?;
         let client = self.paying_client(&payment_network);
+        let refused = |error: crate::data::Error| JsValue::from_str(&explain_refusal(proof, error));
         if let Err(error) = client.pointer_put_paid(&record, proof.to_vec()).await {
             // As for a transfer written the first time: a final state whose
             // acknowledgements were all lost may have landed anyway.
             if !record.is_terminal() {
-                return Err(JsValue::from_str(&error.to_string()));
+                return Err(refused(error));
             }
             client
                 .recover_final_write(&record, error)
                 .await
-                .map_err(|error| JsValue::from_str(&error.to_string()))?;
+                .map_err(refused)?;
         }
         to_js(&BrowserPointer::from(&record))
     }
@@ -421,46 +440,39 @@ enum PointerWrite {
 struct PointerWriteOptions {
     /// Awaited with the recovery checkpoint before the wallet is asked to pay.
     on_prepared: Option<js_sys::Function>,
+    /// Handed each transaction the wallet reports broadcasting.
+    on_submission: Option<js_sys::Function>,
     /// Handed `{ record, proof }` once the state is paid for.
     on_paid: Option<js_sys::Function>,
 }
 
 impl PointerWriteOptions {
-    /// Read `{ onPrepared, onPaid }`, or a bare `onPaid` function as earlier
-    /// releases took it. An unknown option is refused rather than ignored: a
-    /// misspelt `onPrepared` would otherwise pay with no checkpoint kept.
-    fn parse(value: &JsValue) -> Result<Self, String> {
-        if value.is_undefined() || value.is_null() {
+    /// Read `{ onPrepared, onSubmission, onPaid }`. An unknown option is
+    /// refused rather than ignored: a misspelt `onPrepared` would otherwise
+    /// pay with no checkpoint kept.
+    fn parse(value: Option<JsValue>) -> Result<Self, String> {
+        let Some(value) = value.filter(|value| !value.is_undefined() && !value.is_null()) else {
             return Ok(Self::default());
-        }
-        if let Some(on_paid) = value.dyn_ref::<js_sys::Function>() {
-            return Ok(Self {
-                on_paid: Some(on_paid.clone()),
-                ..Self::default()
-            });
-        }
+        };
+        // A function is not an object here: earlier releases took a bare
+        // `onPaid`, which must not now be read as an empty options object.
         if !value.is_object() {
             return Err("pointer write options must be an object".into());
         }
-        let options: &js_sys::Object = value.unchecked_ref();
-        for key in js_sys::Object::keys(options).iter() {
-            let key = key.as_string().unwrap_or_default();
-            if key != ON_PREPARED_OPTION && key != ON_PAID_OPTION {
-                return Err(format!("unknown pointer write option {key:?}"));
-            }
-        }
+        reject_unknown_keys(
+            &value,
+            &[ON_PREPARED_OPTION, ON_SUBMISSION_OPTION, ON_PAID_OPTION],
+        )?;
         Ok(Self {
-            on_prepared: option_function(options, ON_PREPARED_OPTION)?,
-            on_paid: option_function(options, ON_PAID_OPTION)?,
+            on_prepared: option_function(&value, ON_PREPARED_OPTION)?,
+            on_submission: option_function(&value, ON_SUBMISSION_OPTION)?,
+            on_paid: option_function(&value, ON_PAID_OPTION)?,
         })
     }
 }
 
 /// The function `options` holds at `name`, if any.
-fn option_function(
-    options: &js_sys::Object,
-    name: &str,
-) -> Result<Option<js_sys::Function>, String> {
+fn option_function(options: &JsValue, name: &str) -> Result<Option<js_sys::Function>, String> {
     let value =
         js_sys::Reflect::get(options, &JsValue::from_str(name)).map_err(js_error_message)?;
     if value.is_undefined() || value.is_null() {
@@ -482,7 +494,7 @@ impl BrowserNetworkClient {
         kind: &str,
         payment_network: &BrowserPaymentNetwork,
         pay_for_quotes: &js_sys::Function,
-        options: &JsValue,
+        options: Option<JsValue>,
     ) -> Result<BrowserPointerWrite, String> {
         let options = PointerWriteOptions::parse(options)?;
         let (owner, secret) = owner_keys(owner_seed)?;
@@ -528,28 +540,34 @@ impl BrowserNetworkClient {
             .await
             .map_err(|error| error.to_string())?;
         if let Some(on_prepared) = &options.on_prepared {
-            let checkpoint = serde_json::to_string(&PointerPaymentCheckpoint {
-                version: POINTER_CHECKPOINT_VERSION,
-                record: Cow::Owned(record.to_bytes()),
-                plan: Cow::Borrowed(&plan),
-            })
-            .map_err(|e| e.to_string())?;
-            if checkpoint.len() > MAX_POINTER_CHECKPOINT_BYTES {
-                return Err(format!(
-                    "pointer checkpoint exceeds the {MAX_POINTER_CHECKPOINT_BYTES} bytes recovery \
-                     reads; payment was not submitted"
-                ));
-            }
+            let checkpoint = PointerPaymentCheckpoint::encode(record, &plan)?;
             // Nothing is paid until the page has kept the checkpoint.
-            let returned = on_prepared
-                .call1(&JsValue::NULL, &JsValue::from_str(&checkpoint))
-                .map_err(js_error_message)?;
-            JsFuture::from(Promise::resolve(&returned))
-                .await
-                .map_err(js_error_message)?;
+            crate::runtime::timeout(
+                CALLBACK_TIMEOUT,
+                call_and_wait(on_prepared, &JsValue::from_str(&checkpoint)),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "onPrepared did not settle within {}s; {NOT_SUBMITTED}",
+                    CALLBACK_TIMEOUT.as_secs()
+                )
+            })?
+            .map_err(|error| {
+                format!(
+                    "onPrepared failed: {}; {NOT_SUBMITTED}",
+                    js_error_message(error)
+                )
+            })?;
         }
         let (transactions, submission) = self
-            .pay_plan(client, &plan, payment_network, pay_for_quotes)
+            .pay_plan(
+                client,
+                &plan,
+                payment_network,
+                pay_for_quotes,
+                options.on_submission.as_ref(),
+            )
             .await?;
         let proof = plan
             .proof(&transactions)
@@ -558,9 +576,11 @@ impl BrowserNetworkClient {
             // The payment is spent whatever the page does with this, so a
             // callback that fails, or never settles, does not stop the state
             // being stored.
-            let _ =
-                crate::runtime::timeout(ON_PAID_TIMEOUT, hand_over_paid(on_paid, record, &proof))
-                    .await;
+            let hand_over = async {
+                let paid = paid_state(&record.to_bytes(), &proof)?;
+                call_and_wait(on_paid, &paid).await
+            };
+            let _ = crate::runtime::timeout(CALLBACK_TIMEOUT, hand_over).await;
         }
         if let Err(error) = client.pointer_put_paid(record, proof).await {
             // A final state cannot be taken back, and a write whose
@@ -585,34 +605,47 @@ impl BrowserNetworkClient {
     ///
     /// The upload path journals each broadcast so that an interrupted payment
     /// is recovered rather than repeated. A pointer write keeps no journal of
-    /// its own, and the `onSubmission` it hands the wallet records nothing.
-    /// The page keeps the `onPrepared` checkpoint and the transaction its
-    /// wallet broadcasts, from which [`recover_pointer_payment`] rebuilds the
-    /// paid state; once paid, `onPaid` hands it the record and proof, and
-    /// from then on nothing is paid twice. A page that keeps neither and is
-    /// lost between the broadcast and its receipt pays again on retry.
+    /// its own: the page keeps the `onPrepared` checkpoint and each broadcast
+    /// the wallet reports, forwarded to `on_submission`, from which
+    /// [`recover_pointer_payment`] rebuilds the paid state. Once paid,
+    /// `onPaid` hands it the record and proof, and from then on nothing is
+    /// paid twice.
     async fn pay_plan(
         &self,
         client: &crate::data::Client,
         plan: &ChunkPaymentPlan,
         payment_network: &BrowserPaymentNetwork,
         wallet: &js_sys::Function,
+        on_submission: Option<&js_sys::Function>,
     ) -> Result<(HashMap<QuoteHash, TxHash>, BrowserPaymentSubmission), String> {
         let verified = wallet_quotes(std::slice::from_ref(plan)).map_err(|e| e.to_string())?;
         let network = serde_wasm_bindgen::to_value(payment_network).map_err(|e| e.to_string())?;
         let quotes = serde_wasm_bindgen::to_value(&verified).map_err(|e| e.to_string())?;
-        let on_submission = Closure::<dyn FnMut(JsValue) -> Promise>::new(|_: JsValue| {
-            Promise::resolve(&JsValue::UNDEFINED)
-        })
-        .into_js_value();
+        let on_submission = on_submission.cloned();
+        // The wallet waits on the promise this returns, so the page has kept
+        // the transaction before the wallet goes on.
+        let on_submission =
+            Closure::<dyn FnMut(JsValue) -> Promise>::new(
+                move |sent: JsValue| match &on_submission {
+                    Some(callback) => match callback.call1(&JsValue::NULL, &sent) {
+                        Ok(returned) => Promise::resolve(&returned),
+                        Err(error) => Promise::reject(&error),
+                    },
+                    None => Promise::resolve(&JsValue::UNDEFINED),
+                },
+            )
+            .into_js_value();
         // Checked again here, not only when quoting: `onPrepared` may have
         // taken long enough for another write to learn that this build
         // cannot settle.
         if let Some(refusal) = client.corroborated_settlement_refusal() {
-            return Err(crate::data::Error::ClientUpdateRequired(refusal).to_string());
+            return Err(format!(
+                "{}; {NOT_SUBMITTED}",
+                crate::data::Error::ClientUpdateRequired(refusal)
+            ));
         }
         if self.inner.pool.availability.closed.get() {
-            return Err("browser client is closed; payment was not submitted".to_string());
+            return Err(format!("browser client is closed; {NOT_SUBMITTED}"));
         }
         let returned = wallet
             .call4(
@@ -633,14 +666,10 @@ impl BrowserNetworkClient {
     }
 }
 
-/// Hand a paid state to the page as `{ record, proof }`, waiting for it if
-/// the callback returns a promise.
-async fn hand_over_paid(
-    on_paid: &js_sys::Function,
-    record: &Pointer,
-    proof: &[u8],
-) -> Result<(), JsValue> {
-    let returned = on_paid.call1(&JsValue::NULL, &paid_state(&record.to_bytes(), proof)?)?;
+/// Call a page callback with `argument`, waiting for it if it returns a
+/// promise.
+async fn call_and_wait(callback: &js_sys::Function, argument: &JsValue) -> Result<(), JsValue> {
+    let returned = callback.call1(&JsValue::NULL, argument)?;
     JsFuture::from(Promise::resolve(&returned)).await?;
     Ok(())
 }
@@ -658,14 +687,72 @@ fn paid_state(record: &[u8], proof: &[u8]) -> Result<JsValue, JsValue> {
     Ok(paid.into())
 }
 
+/// A storer's refusal of a paid state, saying so when the proof has expired:
+/// that refusal is final, unlike a network failure worth retrying.
+fn explain_refusal(proof: &[u8], error: crate::data::Error) -> String {
+    match paid_proof_is_safely_fresh(proof, crate::runtime::system_time()) {
+        Some(false) => format!(
+            "paid proof expired: its quotes are older than storers accept, so this state \
+             cannot be stored without paying again ({error})"
+        ),
+        _ => error.to_string(),
+    }
+}
+
 /// What `onPrepared` is handed, as JSON: the signed record and the plan its
-/// payment follows. Holds no owner seed or secret key.
+/// payment follows, each base64 so that their bytes are not spelt out as
+/// JSON numbers, the plan in MessagePack. Holds no owner seed or secret key.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PointerPaymentCheckpoint<'a> {
+struct PointerPaymentCheckpoint {
     version: u64,
-    record: Cow<'a, [u8]>,
-    plan: Cow<'a, ChunkPaymentPlan>,
+    record: String,
+    plan: String,
+}
+
+impl PointerPaymentCheckpoint {
+    /// The checkpoint string, refused if recovery could not read it back.
+    fn encode(record: &Pointer, plan: &ChunkPaymentPlan) -> Result<String, String> {
+        let plan = rmp_serde::to_vec_named(plan).map_err(|e| e.to_string())?;
+        let checkpoint = serde_json::to_string(&Self {
+            version: POINTER_CHECKPOINT_VERSION,
+            record: URL_SAFE_NO_PAD.encode(record.to_bytes()),
+            plan: URL_SAFE_NO_PAD.encode(plan),
+        })
+        .map_err(|e| e.to_string())?;
+        if checkpoint.len() > MAX_POINTER_CHECKPOINT_BYTES {
+            return Err(format!(
+                "pointer checkpoint exceeds the {MAX_POINTER_CHECKPOINT_BYTES} bytes recovery \
+                 reads; {NOT_SUBMITTED}"
+            ));
+        }
+        Ok(checkpoint)
+    }
+
+    /// The record bytes and plan a checkpoint string holds.
+    fn decode(checkpoint: &str) -> Result<(Vec<u8>, ChunkPaymentPlan), String> {
+        let invalid =
+            |error: &dyn std::fmt::Display| format!("invalid pointer checkpoint: {error}");
+        if checkpoint.len() > MAX_POINTER_CHECKPOINT_BYTES {
+            return Err(format!(
+                "pointer checkpoint exceeds {MAX_POINTER_CHECKPOINT_BYTES} bytes"
+            ));
+        }
+        let CheckpointVersion { version } =
+            serde_json::from_str(checkpoint).map_err(|e| invalid(&e))?;
+        if version != POINTER_CHECKPOINT_VERSION {
+            return Err(format!("unsupported pointer checkpoint version {version}"));
+        }
+        let saved: Self = serde_json::from_str(checkpoint).map_err(|e| invalid(&e))?;
+        let record = URL_SAFE_NO_PAD
+            .decode(saved.record)
+            .map_err(|e| invalid(&e))?;
+        let plan = URL_SAFE_NO_PAD
+            .decode(saved.plan)
+            .map_err(|e| invalid(&e))?;
+        let plan = rmp_serde::from_slice(&plan).map_err(|e| invalid(&e))?;
+        Ok((record, plan))
+    }
 }
 
 /// A checkpoint's version alone, read first so that a checkpoint from a
@@ -675,25 +762,28 @@ struct CheckpointVersion {
     version: u64,
 }
 
-/// What recovery reads of a receipt: the transaction paying each quote,
-/// keyed by quote hash, so a receipt is matched to the quote it paid rather
-/// than taken for whichever checkpoint it comes with. Other fields, such as
-/// `totalAmount`, are ignored.
+/// What recovery reads of a receipt, or of a submission the wallet reported:
+/// `transactionHashes`, keyed by the quote each paid, or `transactionHash`,
+/// one transaction paying the checkpoint's one quote, as the write itself
+/// accepts. Other fields, such as `totalAmount`, are ignored.
 #[derive(Deserialize)]
 struct PointerPaymentReceipt {
-    #[serde(rename = "transactionHashes")]
+    #[serde(default, rename = "transactionHashes")]
     transaction_hashes: HashMap<String, String>,
+    #[serde(default, rename = "transactionHash")]
+    transaction_hash: Option<String>,
 }
 
 /// Rebuild an already-paid state, `{ record, proof }` for
 /// [`BrowserNetworkClient::store_paid_pointer`], from the checkpoint a write
-/// handed `onPrepared` and the receipt of the payment that followed it, as
+/// handed `onPrepared` and the receipt of the payment that followed it, or
+/// the submission `onSubmission` was handed: `{ transactionHash }` or
 /// `{ transactionHashes: { <quote hash>: <transaction hash> } }`.
 ///
-/// Does not quote, sign, submit payment, or contact the network, and checks
-/// only that the receipt names this checkpoint's quote: confirm the
-/// transaction on chain first. Only use an application's own persisted
-/// checkpoint; this never authorizes fresh payment.
+/// Does not quote, sign, submit payment, or contact the network. A keyed
+/// receipt must name this checkpoint's quote; beyond that the transaction is
+/// not checked, so confirm it on chain first. Only use an application's own
+/// persisted checkpoint; this never authorizes fresh payment.
 #[wasm_bindgen(js_name = recoverPointerPayment)]
 pub fn recover_pointer_payment(checkpoint: &str, receipt: JsValue) -> Result<JsValue, JsValue> {
     let receipt: PointerPaymentReceipt = serde_wasm_bindgen::from_value(receipt)
@@ -708,26 +798,18 @@ fn recover_paid_state(
     checkpoint: &str,
     receipt: &PointerPaymentReceipt,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    if checkpoint.len() > MAX_POINTER_CHECKPOINT_BYTES {
-        return Err(format!(
-            "pointer checkpoint exceeds {MAX_POINTER_CHECKPOINT_BYTES} bytes"
-        ));
-    }
-    let CheckpointVersion { version } =
-        serde_json::from_str(checkpoint).map_err(|e| format!("invalid pointer checkpoint: {e}"))?;
-    if version != POINTER_CHECKPOINT_VERSION {
-        return Err(format!("unsupported pointer checkpoint version {version}"));
-    }
-    let saved: PointerPaymentCheckpoint =
-        serde_json::from_str(checkpoint).map_err(|e| format!("invalid pointer checkpoint: {e}"))?;
-    let record = Pointer::from_bytes(&saved.record).map_err(|e| e.to_string())?;
-    if saved.plan.address != record.state_id() || saved.plan.data_size != saved.record.len() as u64
-    {
+    let (record_bytes, plan) = PointerPaymentCheckpoint::decode(checkpoint)?;
+    let record = Pointer::from_bytes(&record_bytes).map_err(|e| e.to_string())?;
+    if plan.address != record.state_id() || plan.data_size != record_bytes.len() as u64 {
         return Err("pointer record differs from its payment plan".into());
     }
-    let verified = wallet_quotes(std::slice::from_ref(&saved.plan)).map_err(|e| e.to_string())?;
-    let transactions = quote_transactions(&verified, &receipt.transaction_hashes, None)
-        .map_err(|e| format!("receipt does not pay this checkpoint's quote: {e}"))?;
-    let proof = saved.plan.proof(&transactions).map_err(|e| e.to_string())?;
-    Ok((saved.record.into_owned(), proof))
+    let verified = wallet_quotes(std::slice::from_ref(&plan)).map_err(|e| e.to_string())?;
+    let transactions = quote_transactions(
+        &verified,
+        &receipt.transaction_hashes,
+        receipt.transaction_hash.as_deref(),
+    )
+    .map_err(|e| format!("receipt does not pay this checkpoint's quote: {e}"))?;
+    let proof = plan.proof(&transactions).map_err(|e| e.to_string())?;
+    Ok((record_bytes, proof))
 }

@@ -272,12 +272,14 @@ fn browser_chunk_info(info: &ChunkInfo) -> BrowserChunkInfo {
 
 #[cfg(all(target_arch = "wasm32", feature = "browser-wasm"))]
 mod wasm {
+    use super::file_manifest::{MANIFEST_INPUT_FIELDS, TORRENT_FIELD, TORRENT_INPUT_FIELDS};
     use super::manifest::parse_browser_manifest;
     use super::payment::{payment_quote_hash, verify_storage_quote, BrowserQuoteArtifact};
     use super::protocol::{
         ice_password_from_sdp, parse_response_frame, parse_webrtc_direct_multiaddr,
         server_answer_sdp, v2_server_ice_credential, BrowserEndpointInput,
     };
+    use super::wasm_transport::reject_unknown_keys;
     use super::{
         chunk_infos, content_address, decrypt_public_file, encrypt_public_file, verify_record,
         BrowserLinkView, BrowserManifestView, BrowserRecord, BrowserRecordInfo, BrowserStagedFile,
@@ -670,9 +672,17 @@ mod wasm {
     /// Build canonical `.ant` bytes and a compact share link without network I/O.
     #[wasm_bindgen(js_name = createManifest)]
     pub fn create_manifest_wasm(input: JsValue) -> Result<JsValue, JsValue> {
+        reject_unknown_keys(&input, &MANIFEST_INPUT_FIELDS).map_err(|e| JsValue::from_str(&e))?;
+        if input.is_object() {
+            let torrent = js_sys::Reflect::get(&input, &JsValue::from_str(TORRENT_FIELD))?;
+            reject_unknown_keys(&torrent, &TORRENT_INPUT_FIELDS)
+                .map_err(|e| JsValue::from_str(&e))?;
+        }
         let input: super::file_manifest::ManifestInput = serde_wasm_bindgen::from_value(input)
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let result = input.create().map_err(|error| JsValue::from_str(&error))?;
+        let result = input
+            .create()
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
         serde_wasm_bindgen::to_value(&result).map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
@@ -680,7 +690,7 @@ mod wasm {
     #[wasm_bindgen(js_name = createFileLink)]
     pub fn create_file_link_wasm(address: &str) -> Result<String, JsValue> {
         match crate::data::manifest::parse_link(address)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?
+            .map_err(|error| JsValue::from_str(&error.to_string()))?
         {
             crate::data::manifest::Link::File(address) => {
                 Ok(crate::data::manifest::file_link(&address))
@@ -1165,16 +1175,16 @@ impl BrowserManifestView {
                 crate::data::manifest::ContentRef::Public { .. } => None,
             };
             // An embedded entry's address comes from self-encrypting its
-            // DataMap; derive it once and name a path-less entry by it.
-            let address = hex::encode(entry.source.content_address()?);
+            // DataMap; derive it once for both the name and the address.
+            let address = entry.source.content_address()?;
             entries.push(BrowserManifestEntryView {
-                name: entry.path.clone().unwrap_or_else(|| address.clone()),
+                name: entry.effective_name_with(&address),
                 path: entry.path.clone(),
                 size: entry.size,
                 known_size: entry.known_size(),
                 sha256: entry.sha256.map(hex::encode),
                 kind: entry.source.kind().to_owned(),
-                address,
+                address: hex::encode(address),
                 data_map,
             });
         }
