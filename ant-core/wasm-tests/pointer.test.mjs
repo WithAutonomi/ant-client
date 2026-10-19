@@ -4,6 +4,7 @@
 import { BrowserNetworkClient } from "./client-fixture.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
+import vm from "node:vm";
 import { pointerAddress, recoverPointerPayment } from "./pkg/ant_core.js";
 import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 
@@ -523,6 +524,9 @@ test("pointer write options are checked before anything is paid", async () => {
   try {
     for (const [options, error] of [
       [{ onPrepare: () => {} }, /unknown field `onPrepare`/],
+      // Checked whatever the object's prototype or realm.
+      [Object.assign(Object.create(null), { onPrepare: () => {} }), /unknown field `onPrepare`/],
+      [vm.runInNewContext("({ onPrepare: () => {} })"), /unknown field `onPrepare`/],
       [{ onPaid: 5 }, /onPaid must be a function/],
       [{ onSubmission: "x" }, /onSubmission must be a function/],
       [7, /must be an object/],

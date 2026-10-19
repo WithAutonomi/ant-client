@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import vm from "node:vm";
 import {
   createFileLink,
   createManifest,
@@ -96,6 +97,14 @@ test("createManifest refuses input it does not know", () => {
     [{ entries: [{ kind: "public", address, size: 2n ** 53n }] }, /safe integer/],
   ]) {
     assert.throws(() => createManifest(input), error);
+  }
+  // Whatever the object's prototype or realm.
+  for (const input of [
+    Object.assign(Object.create(null), { entries: [], extra: true }),
+    { entries: [], torrent: Object.assign(Object.create(null), { infoHashV1: "ab".repeat(20), extra: true }) },
+    vm.runInNewContext("({ entries: [], extra: true })"),
+  ]) {
+    assert.throws(() => createManifest(input), /unknown field `extra`/);
   }
 });
 
