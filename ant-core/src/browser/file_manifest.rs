@@ -8,7 +8,7 @@ use super::BrowserManifestView;
 use crate::data::manifest::{
     self, embedded_len, is_embeddable, ContentRef, Link, Manifest, ManifestEntry, ManifestError,
     TorrentReference, MANIFEST_LINK_RECOMMENDED_MAX_BYTES, MAX_EMBEDDED_ROOT_MAP_BYTES,
-    MAX_MANIFEST_BYTES, MAX_MANIFEST_ENTRIES, MAX_PUBLISHED_MAP_CHUNKS,
+    MAX_MANIFEST_BYTES, MAX_MANIFEST_ENTRIES, MAX_PUBLISHED_MAP_CHUNKS, SHA256_LEN,
 };
 use self_encryption::DataMap;
 use serde::de::{self, Visitor};
@@ -71,6 +71,9 @@ pub enum ManifestInputError {
     /// A size hint JavaScript cannot represent exactly.
     #[error("size {0} exceeds JavaScript's safe integer range")]
     UnsafeSize(u64),
+    /// A SHA-256 that is not hex of the right length.
+    #[error("sha256 must be {} bytes of hex", SHA256_LEN)]
+    InvalidSha256,
     /// A size hint that contradicts the size a root DataMap fixes.
     #[error("size {hint} does not match the embedded DataMap's {known} bytes")]
     SizeMismatch {
@@ -158,6 +161,8 @@ pub enum EntryInput {
         path: Option<String>,
         /// Plaintext size hint.
         size: Option<u64>,
+        /// Hex SHA-256 of the plaintext, recorded as the creator's claim.
+        sha256: Option<String>,
         /// The file's public address.
         address: String,
     },
@@ -173,6 +178,8 @@ pub enum EntryInput {
         path: Option<String>,
         /// Plaintext size; must match a root DataMap's exact size.
         size: Option<u64>,
+        /// Hex SHA-256 of the plaintext, recorded as the creator's claim.
+        sha256: Option<String>,
         /// The serialized DataMap.
         #[serde(rename = "dataMap", with = "serde_bytes")]
         data_map: Vec<u8>,
@@ -252,6 +259,7 @@ impl EntryInput {
             Self::Public {
                 path,
                 size,
+                sha256,
                 address,
             } => {
                 let Link::File(address) = manifest::parse_link(&address)? else {
@@ -260,13 +268,14 @@ impl EntryInput {
                 ManifestEntry {
                     path,
                     size,
-                    sha256: None,
+                    sha256: sha256.as_deref().map(parse_sha256).transpose()?,
                     source: ContentRef::Public { address },
                 }
             }
             Self::Embedded {
                 path,
                 size,
+                sha256,
                 data_map,
             } => {
                 *embedded_bytes = embedded_bytes
@@ -278,7 +287,7 @@ impl EntryInput {
                 ManifestEntry {
                     path,
                     size,
-                    sha256: None,
+                    sha256: sha256.as_deref().map(parse_sha256).transpose()?,
                     source: ContentRef::Embedded {
                         data_map: embeddable_data_map(&data_map)?,
                     },
@@ -310,6 +319,14 @@ fn torrent_hash<T>(
         pick(parsed).ok_or(ManifestInputError::TorrentHashVersion { field })
     })
     .transpose()
+}
+
+/// Parse a hex SHA-256.
+fn parse_sha256(hex: &str) -> Result<[u8; SHA256_LEN], ManifestInputError> {
+    hex::decode(hex)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(ManifestInputError::InvalidSha256)
 }
 
 /// Decode a canonical DataMap and hold it to what a native writer embeds: a
@@ -372,6 +389,7 @@ mod tests {
             entries: vec![EntryInput::Embedded {
                 path: Some("file".into()),
                 size,
+                sha256: None,
                 data_map,
             }],
         }
@@ -386,11 +404,13 @@ mod tests {
                 EntryInput::Public {
                     path: Some("z.txt".into()),
                     size: Some(20),
+                    sha256: Some("ef".repeat(SHA256_LEN)),
                     address: "ab".repeat(32),
                 },
                 EntryInput::Public {
                     path: Some("a.txt".into()),
                     size: None,
+                    sha256: None,
                     address: "cd".repeat(32),
                 },
             ],
@@ -399,6 +419,11 @@ mod tests {
         .expect("manifest");
         let decoded = Manifest::decode(&created.bytes).expect("native decode");
         assert_eq!(decoded.entries[0].path.as_deref(), Some("a.txt"));
+        assert_eq!(decoded.entries[1].sha256, Some([0xef; SHA256_LEN]));
+        assert_eq!(
+            created.manifest.entries[1].sha256.as_deref(),
+            Some("ef".repeat(SHA256_LEN).as_str())
+        );
         assert_eq!(
             manifest::parse_link(&created.link).expect("link"),
             manifest::Link::Manifest(decoded)
@@ -415,11 +440,34 @@ mod tests {
                 entries: vec![EntryInput::Public {
                     path: Some(path.into()),
                     size: Some(size),
+                    sha256: None,
                     address: "ab".repeat(32),
                 }]
             }
             .create()
             .is_err());
+        }
+    }
+
+    #[test]
+    fn a_sha256_must_be_hex_of_its_length() {
+        for sha256 in ["zz".repeat(SHA256_LEN), "ab".repeat(SHA256_LEN - 1)] {
+            let error = ManifestInput {
+                name: None,
+                torrent: None,
+                entries: vec![EntryInput::Public {
+                    path: None,
+                    size: None,
+                    sha256: Some(sha256),
+                    address: "ab".repeat(32),
+                }],
+            }
+            .create()
+            .unwrap_err();
+            assert!(
+                matches!(error, ManifestInputError::InvalidSha256),
+                "{error}"
+            );
         }
     }
 
@@ -444,6 +492,7 @@ mod tests {
             entries: vec![EntryInput::Embedded {
                 path: None,
                 size: None,
+                sha256: None,
                 data_map: data_map_bytes(MAX_PUBLISHED_MAP_CHUNKS * 4, None),
             }],
         };
@@ -462,6 +511,7 @@ mod tests {
             .map(|_| EntryInput::Public {
                 path: None,
                 size: None,
+                sha256: None,
                 address: String::new(),
             })
             .collect();

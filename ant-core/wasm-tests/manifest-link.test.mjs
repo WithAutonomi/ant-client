@@ -60,7 +60,7 @@ test("createManifest takes JavaScript input and writes what the decoders read", 
     name: "files",
     torrent: { infoHashV1: "ab".repeat(20) },
     entries: [
-      { kind: "public", path: "z.txt", size: 20, address: `ant://${"cd".repeat(32)}` },
+      { kind: "public", path: "z.txt", size: 20, sha256: "ef".repeat(32), address: `ant://${"cd".repeat(32)}` },
       { kind: "embedded", path: "a.bin", dataMap: embedded.dataMap },
     ],
   });
@@ -74,6 +74,8 @@ test("createManifest takes JavaScript input and writes what the decoders read", 
   );
   assert.equal(created.manifest.entries[0].address, ADDRESS);
   assert.equal(created.manifest.entries[1].size, 20);
+  assert.equal(created.manifest.entries[1].sha256, "ef".repeat(32));
+  assert.equal(created.manifest.entries[0].sha256, undefined);
   assert.equal(created.manifest.torrent.infoHashV1, "ab".repeat(20));
 
   assert.deepEqual(decodeManifest(created.bytes), created.manifest);
@@ -88,6 +90,7 @@ test("createManifest refuses input it does not know", () => {
     [{ entries: [{ kind: "Public", address }] }, /unknown variant `Public`/],
     [{ entries: [{ kind: "embedded", dataMap: [1, 2, 3] }] }, /invalid DataMap/],
     [{ entries: [{ kind: "public", address: LINK }] }, /public entry requires a file address/],
+    [{ entries: [{ kind: "public", address, sha256: "ab" }] }, /sha256 must be 32 bytes of hex/],
     [{ torrent: { infoHashV1: "ab".repeat(20), infoHashV3: "" }, entries: [] }, /unknown field `infoHashV3`/],
     [{ entries: [{ kind: "public", address, size: 2 ** 53 }] }, /expected u64/],
     [{ entries: [{ kind: "public", address, size: 2n ** 53n }] }, /safe integer/],
