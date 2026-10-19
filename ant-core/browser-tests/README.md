@@ -73,6 +73,14 @@ injects a post-payment byte-loader failure, resumes on a new client without
 another payment, and downloads using only the public DataMap address. No RTC
 or node RPC mocks are installed. It also checks that a closed network client
 rejects reconnection. Temporary node data is removed on shutdown.
+
+The pointer recovery test pays once on the local chain, then loses the page
+after the payment confirms and before the write stores the state. It rebuilds
+the paid state from the `onPrepared` checkpoint and the transaction
+`onSubmission` kept, stores it without paying again, and checks that a write
+refused before the wallet says "payment was not submitted". It also builds a
+manifest in the page and writes the `.ant` file and link to its test output
+directory, for decoding with `ant manifest show`.
 The suite uses local funds only and verifies that the RPC belongs to the local
 Anvil devnet before invoking the wallet.
 
