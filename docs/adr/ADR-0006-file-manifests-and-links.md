@@ -413,10 +413,14 @@ the output location is checked before it too.
 
 The finished manifest must also fit `MAX_MANIFEST_BYTES`, which a few
 thousand embedded root maps can exceed. Before the first upload every queued
-file is counted at the smallest entry it can become (a public address with
-its path, size and hash), and a build that cannot fit even so is refused. A
-file is uploaded only when the largest entry it can become, its own shrunk
-DataMap of at most three chunk records, would still fit; otherwise the build
+file is counted at the smallest entry it can be expected to become, with its
+path, size and hash: its public address in compact mode with public uploads,
+and otherwise its own DataMap of three chunk records, since every other
+upload is embedded. A build that cannot fit even so is refused. (A private
+file in compact mode that turns out to be public already ends up smaller, so
+the check can refuse a build that would just have fitted, never the
+reverse.) A file is uploaded only when the largest entry it can become, its
+own three-record DataMap at the deepest child level, would still fit; otherwise the build
 stops before paying for it, as a file failure that keeps the partial result.
 After an upload the entry is counted at its real size, and a larger
 reference such as an embedded root map is used only when the manifest still
@@ -459,7 +463,12 @@ number, and accepts a record id wherever it accepts a manifest file or link:
 DataMap, whether or not the upload was public, and records the upload's
 `sha256`. A file name that breaks the
 portable path rules is repaired for the record, or dropped so the entry
-extracts under its content address, rather than losing the record. Recording never fails an
+extracts under its content address, rather than losing the record. A record
+written under earlier, looser path rules is repaired the same way when it is
+loaded, and of two entries whose names now collide the later extracts under
+its content address, so a client update never makes a recorded upload
+unreachable. Records loaded from anywhere else, such as a shared `.ant` file
+or a link, are still refused when they break the rules. Recording never fails an
 upload that has already succeeded; an unusable history directory is reported
 and the upload result still shown.
 
@@ -475,14 +484,23 @@ kill, a power cut or a forced quit cannot lose an upload that was paid for:
   embedding the root map, it is recorded again; the later record of a name
   wins.
 - When the build ends, complete, cancelled or failed, its manifest becomes
-  the ordinary record under the same id and the journal is removed. A build
+  the ordinary record under the same id. The history directory is synced
+  before the journal is removed, so a power cut cannot lose both. A build
   that stops before anything was uploaded paid for nothing and leaves no
   record. If the record cannot be written, the journal stays.
+- Holding an id's journal is what claims the id: every record, a
+  single-file upload's included, is written by the holder of its journal,
+  which is created exclusively before the record is looked for. Two writers
+  therefore never take one id, and a record never takes the id of a running
+  build.
 - A journal left behind is listed as an **interrupted** upload holding every
   entry that reached the disk, and its id is accepted wherever a record id
-  is. While its build runs the journal is locked, and it is listed as **in
-  progress**. A journal beside a record of the same id, left by a build that
-  stopped between the two steps above, is ignored.
+  is, with a reminder that it is partial. While its build runs the journal
+  is locked, and it is listed as **in progress**; its id is refused until the
+  build ends, since it is still growing and on Windows cannot be read at
+  all. A journal beside a record of the same id, left by a build that
+  stopped between the steps above, is ignored, and so is one that stopped
+  before holding any entry.
 
 The journal is the magic `0xC1 'A' 'N' 'J'`, a version byte (1), and frames:
 a little-endian `u32` payload length, the payload's CRC-32, and the payload.
@@ -685,14 +703,18 @@ initial release.
   earlier one; while locked it lists as in progress; a write cut short, or a
   damaged last frame, keeps every entry before it; finishing writes the
   record and removes the journal; journals and records never share an id;
-  a journal beside its record is not listed. On a local network, a build
+  a journal beside its record is not listed, nor is one cut short before its
+  opening; recording a single upload leaves no journal; a record written
+  under looser rules loads repaired, with nothing lost. On a local network, a build
   that fails after its first upload shows that upload in its in-progress
   journal before going on, records its partial result itself, and a build
   cancelled before any upload leaves no record.
 - Size budget tests: the largest entry an upload can become bounds a real
-  shrunk map; the fixed part counts everything but the entries; an upload is
-  admitted only when its largest entry fits; a larger reference is taken
-  only when it fits.
+  shrunk map, and every real upload map is at least the counted smallest;
+  a build of long paths that would fit as addresses but not embedded is
+  refused before paying; the fixed part counts everything but the entries;
+  an upload is admitted only when its largest entry fits; a larger reference
+  is taken only when it fits.
 - End-to-end on a local network: build a manifest with an embedded entry, a
   compact entry and an entry added by address; extract it from a `.ant` file
   and from a manifest link; extract a selection; verify bytes and per-entry

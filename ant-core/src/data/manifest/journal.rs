@@ -30,7 +30,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::file::write_manifest_file;
-use super::history::{new_ids, no_free_id, record_path, record_upload, RecordState, UploadRecord};
+use super::history::{
+    new_ids, no_free_id, record_path, record_upload, repair_names, RecordState, UploadRecord,
+};
 use super::{Manifest, ManifestEntry, ManifestError, TorrentReference, MAX_MANIFEST_BYTES};
 
 #[cfg(test)]
@@ -74,25 +76,36 @@ pub(super) struct UploadJournal {
 
 impl UploadJournal {
     /// Start a journal in the history directory `dir` for a manifest with
-    /// this name and torrent reference.
+    /// this name and torrent reference, under an id made from `label`, or
+    /// from `name` when there is no label.
+    ///
+    /// Holding an id's journal is what claims the id: a record is only ever
+    /// written by the holder of its journal. So a record found once the
+    /// journal is created was written before, the id is skipped, and no two
+    /// writers can take one id.
     pub(super) fn create(
         dir: &Path,
+        label: Option<&str>,
         name: Option<&str>,
         torrent: Option<&TorrentReference>,
     ) -> Result<Self, ManifestError> {
         fs::create_dir_all(dir)?;
-        let mut ids = new_ids(name);
+        let mut ids = new_ids(label.or(name));
         while let Some(id) = ids.next() {
-            if record_path(dir, &id).exists() {
-                continue;
-            }
             let path = journal_path(dir, &id);
             let file = match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e.into()),
             };
-            let mut journal = Self {
+            // A listing holds a shared lock only for an instant, so wait for
+            // it rather than fail.
+            if let Err(error) = file.lock() {
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(error.into());
+            }
+            let journal = Self {
                 dir: dir.to_path_buf(),
                 id,
                 path,
@@ -100,6 +113,11 @@ impl UploadJournal {
                 label: ids.label.clone(),
                 file,
             };
+            if record_path(dir, &journal.id).exists() {
+                let _ = journal.discard();
+                continue;
+            }
+            let mut journal = journal;
             let header = JournalHeader {
                 name: name.map(str::to_owned),
                 torrent: torrent.cloned(),
@@ -122,7 +140,16 @@ impl UploadJournal {
 
     /// Record `entry` and flush it to disk before returning.
     pub(super) fn append(&mut self, entry: &ManifestEntry) -> Result<(), ManifestError> {
-        self.append_frame(entry)
+        self.write_frame(entry)?;
+        self.file.sync_data().map_err(Into::into)
+    }
+
+    /// Record every entry, flushing them to disk once at the end.
+    pub(super) fn append_all(&mut self, entries: &[ManifestEntry]) -> Result<(), ManifestError> {
+        for entry in entries {
+            self.write_frame(entry)?;
+        }
+        self.file.sync_data().map_err(Into::into)
     }
 
     /// Write `manifest` as the build's record and remove the journal.
@@ -137,15 +164,19 @@ impl UploadJournal {
                 manifest: manifest.clone(),
                 state: RecordState::Complete,
             },
-            // Another writer took the id after this journal did.
+            // A client that writes records without claiming them first took
+            // the id after this journal did.
             Err(ManifestError::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists => {
                 record_upload(&self.dir, manifest, Some(&self.label))?
             }
             Err(e) => return Err(e),
         };
-        // The record is written; a journal left beside a record of the same
-        // id is ignored by listings.
-        let _ = self.discard();
+        // Remove the journal only once the record's name is on disk, or a
+        // power cut could lose both. A journal left beside its record is
+        // ignored by listings.
+        if sync_directory(&self.dir).is_ok() {
+            let _ = self.discard();
+        }
         Ok(record)
     }
 
@@ -157,24 +188,17 @@ impl UploadJournal {
         fs::remove_file(path).map_err(Into::into)
     }
 
-    /// Lock the new file, write the opening and the header frame, and make
-    /// the journal's name durable in its directory.
+    /// Write the opening and the header frame, and make the journal and its
+    /// name durable.
     fn start(&mut self, header: &JournalHeader) -> Result<(), ManifestError> {
-        self.file.try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => {
-                ManifestError::Build(format!("{} is locked", self.path.display()))
-            }
-            TryLockError::Error(error) => error.into(),
-        })?;
-        let mut opening = Vec::with_capacity(JOURNAL_HEADER_LEN);
-        opening.extend_from_slice(&JOURNAL_MAGIC);
-        opening.push(JOURNAL_FORMAT_VERSION);
-        self.file.write_all(&opening)?;
-        self.append_frame(header)?;
+        self.file.write_all(&opening())?;
+        self.write_frame(header)?;
+        self.file.sync_data()?;
         sync_directory(&self.dir)
     }
 
-    fn append_frame<T: Serialize>(&mut self, value: &T) -> Result<(), ManifestError> {
+    /// Write one frame, not yet flushed to disk.
+    fn write_frame<T: Serialize>(&mut self, value: &T) -> Result<(), ManifestError> {
         let payload =
             rmp_serde::to_vec_named(value).map_err(|e| ManifestError::Encode(e.to_string()))?;
         let len = u32::try_from(payload.len())
@@ -183,10 +207,15 @@ impl UploadJournal {
         frame.extend_from_slice(&len.to_le_bytes());
         frame.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
         frame.extend_from_slice(&payload);
-        self.file.write_all(&frame)?;
-        self.file.sync_data()?;
-        Ok(())
+        self.file.write_all(&frame).map_err(Into::into)
     }
+}
+
+/// The bytes a journal opens with: the magic and the version.
+fn opening() -> [u8; JOURNAL_HEADER_LEN] {
+    let mut opening = [JOURNAL_FORMAT_VERSION; JOURNAL_HEADER_LEN];
+    opening[..JOURNAL_MAGIC.len()].copy_from_slice(&JOURNAL_MAGIC);
+    opening
 }
 
 /// Where the journal of the record `id` lives in `dir`.
@@ -225,11 +254,17 @@ pub(super) fn read_journal(path: &Path) -> Result<(Manifest, bool), ManifestErro
 /// The manifest in a journal's bytes, up to the first frame that is cut
 /// short or damaged.
 fn parse_journal(bytes: &[u8]) -> Result<Manifest, ManifestError> {
-    let (opening, frames) = bytes
-        .split_at_checked(JOURNAL_HEADER_LEN)
-        .ok_or_else(|| ManifestError::Decode("not an upload journal".to_string()))?;
+    let not_a_journal = || ManifestError::Decode("not an upload journal".to_string());
+    let Some((opening, frames)) = bytes.split_at_checked(JOURNAL_HEADER_LEN) else {
+        // Cut short before its opening was whole: it holds nothing yet.
+        return if self::opening().starts_with(bytes) {
+            Ok(Manifest::default())
+        } else {
+            Err(not_a_journal())
+        };
+    };
     if opening[..JOURNAL_MAGIC.len()] != JOURNAL_MAGIC {
-        return Err(ManifestError::Decode("not an upload journal".to_string()));
+        return Err(not_a_journal());
     }
     let version = opening[JOURNAL_MAGIC.len()];
     if version != JOURNAL_FORMAT_VERSION {
@@ -262,13 +297,12 @@ fn parse_journal(bytes: &[u8]) -> Result<Manifest, ManifestError> {
             }
         }
     }
-    let manifest = Manifest {
+    // Repaired, not refused, if a later client tightened the rules.
+    repair_names(Manifest {
         name: header.name,
         torrent: header.torrent,
         entries,
-    };
-    manifest.validate()?;
-    Ok(manifest)
+    })
 }
 
 /// The payloads of whole, checked frames, ending at the first that is not.
@@ -331,7 +365,7 @@ mod tests {
     #[test]
     fn a_journal_left_behind_is_an_interrupted_record_of_what_reached_the_disk() {
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = UploadJournal::create(dir.path(), Some("photos"), None).unwrap();
+        let mut journal = UploadJournal::create(dir.path(), None, Some("photos"), None).unwrap();
         let id = journal.id().to_string();
         journal.append(&entry("a.bin", 1)).unwrap();
         journal.append(&entry("b.bin", 2)).unwrap();
@@ -359,7 +393,7 @@ mod tests {
     #[test]
     fn a_write_cut_short_keeps_every_entry_before_it() {
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = UploadJournal::create(dir.path(), None, None).unwrap();
+        let mut journal = UploadJournal::create(dir.path(), None, None, None).unwrap();
         let id = journal.id().to_string();
         journal.append(&entry("a.bin", 1)).unwrap();
         journal.append(&entry("b.bin", 2)).unwrap();
@@ -394,7 +428,7 @@ mod tests {
     #[test]
     fn finishing_writes_the_record_and_removes_the_journal() {
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = UploadJournal::create(dir.path(), Some("set"), None).unwrap();
+        let mut journal = UploadJournal::create(dir.path(), None, Some("set"), None).unwrap();
         let id = journal.id().to_string();
         journal.append(&entry("a.bin", 1)).unwrap();
         let manifest = Manifest {
@@ -414,7 +448,7 @@ mod tests {
     #[test]
     fn journals_and_records_never_share_an_id() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = UploadJournal::create(dir.path(), Some("same"), None).unwrap();
+        let journal = UploadJournal::create(dir.path(), None, Some("same"), None).unwrap();
         let manifest = Manifest {
             name: Some("same".into()),
             torrent: None,
@@ -424,15 +458,40 @@ mod tests {
         // id the running build holds.
         let record = record_upload(dir.path(), &manifest, None).unwrap();
         assert_ne!(record.id, journal.id());
-        let other = UploadJournal::create(dir.path(), Some("same"), None).unwrap();
+        let other = UploadJournal::create(dir.path(), None, Some("same"), None).unwrap();
         assert_ne!(other.id(), journal.id());
         assert_ne!(other.id(), record.id);
     }
 
     #[test]
+    fn an_empty_journal_is_not_listed_and_a_record_leaves_no_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        // Journals cut short at creation, before their opening was whole:
+        // nothing was paid for, so there is nothing to list.
+        fs::write(journal_path(dir.path(), "20261001T000000Z-empty"), b"").unwrap();
+        fs::write(
+            journal_path(dir.path(), "20261001T000001Z-opening"),
+            &opening()[..JOURNAL_MAGIC.len()],
+        )
+        .unwrap();
+        let listing = list_uploads(dir.path()).unwrap();
+        assert!(listing.records.is_empty(), "{:?}", listing.records);
+        assert!(listing.unreadable.is_empty(), "{:?}", listing.unreadable);
+
+        let manifest = Manifest {
+            name: None,
+            torrent: None,
+            entries: vec![entry("a.bin", 1)],
+        };
+        let record = record_upload(dir.path(), &manifest, Some("single")).unwrap();
+        assert!(!journal_path(dir.path(), &record.id).exists());
+        assert_eq!(list_uploads(dir.path()).unwrap().records.len(), 1);
+    }
+
+    #[test]
     fn a_leftover_journal_beside_its_record_is_not_listed() {
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = UploadJournal::create(dir.path(), None, None).unwrap();
+        let mut journal = UploadJournal::create(dir.path(), None, None, None).unwrap();
         let id = journal.id().to_string();
         journal.append(&entry("a.bin", 1)).unwrap();
         drop(journal);

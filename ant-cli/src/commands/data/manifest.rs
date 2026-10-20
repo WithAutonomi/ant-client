@@ -587,8 +587,13 @@ fn build_outcome(
             partial,
         }) => {
             warn_unfinished_record(&partial);
+            let at = if path.is_empty() {
+                String::new()
+            } else {
+                format!(" at {path:?}")
+            };
             anyhow::bail!(
-                "manifest build failed at {path:?} after {} of {} file(s): {cause}{}",
+                "manifest build failed{at} after {} of {} file(s): {cause}{}",
                 partial.files_uploaded,
                 partial.total_to_upload,
                 partial_record_message(partial.history_id.as_deref()),
@@ -1012,12 +1017,31 @@ fn load_manifest(source: &str) -> anyhow::Result<Manifest> {
     }
     let dir = default_history_dir()?;
     match load_upload(&dir, source)? {
-        Some(record) => Ok(record.manifest),
+        Some(record) => record_manifest(record),
         None => anyhow::bail!(
             "{source} is not a manifest file, a manifest link, or a recorded upload id \
              (see `ant manifest list`)"
         ),
     }
+}
+
+/// A recorded upload's manifest. One still in progress is refused: it is
+/// still growing, and while it runs it may not be readable at all. One that
+/// was interrupted is used, with a reminder of what it holds.
+fn record_manifest(record: UploadRecord) -> anyhow::Result<Manifest> {
+    match record.state {
+        RecordState::Complete => {}
+        RecordState::InProgress => anyhow::bail!(
+            "upload {} is still in progress; use it once it has finished",
+            record.id
+        ),
+        RecordState::Interrupted => eprintln!(
+            "warning: upload {} was interrupted; it holds the {} file(s) uploaded before it stopped",
+            record.id,
+            record.manifest.entries.len()
+        ),
+    }
+    Ok(record.manifest)
 }
 
 /// Parse the `--torrent-hash` values into one reference, or `None` if none.
@@ -1298,6 +1322,22 @@ mod tests {
                 assert!(error.to_string().contains("forced failure"));
             }
         }
+    }
+
+    #[test]
+    fn records_in_progress_are_refused_and_interrupted_ones_used() {
+        let record = |state| UploadRecord {
+            id: "20261019T120000Z-set".into(),
+            path: PathBuf::from("20261019T120000Z-set.ant.partial"),
+            recorded_at: 0,
+            label: "set".into(),
+            manifest: Manifest::new(Some("set".into())),
+            state,
+        };
+        assert!(record_manifest(record(RecordState::Complete)).is_ok());
+        assert!(record_manifest(record(RecordState::Interrupted)).is_ok());
+        let error = record_manifest(record(RecordState::InProgress)).unwrap_err();
+        assert!(error.to_string().contains("still in progress"), "{error}");
     }
 
     #[test]

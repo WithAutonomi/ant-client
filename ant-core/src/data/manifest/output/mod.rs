@@ -253,12 +253,17 @@ impl Staged<'_> {
                     _ => error.into(),
                 })?;
         }
+        // The file is in place, so nothing from here on fails the entry. A
+        // rename done as a hard link may have left the temporary name too.
+        let _ = dir.remove_file(&temp_name);
         self.temp_name = None;
         // Read the identity back from the final name: on some filesystems,
-        // such as FAT, a rename changes it.
-        if let Some(identity) = dir
-            .entry(&target.file_name)?
-            .and_then(|entry| entry.identity)
+        // such as FAT, a rename changes it. A file whose identity cannot be
+        // read is only left unguarded against a later alias.
+        if let Ok(Some(Entry {
+            identity: Some(identity),
+            ..
+        })) = dir.entry(&target.file_name)
         {
             written.insert(identity);
         }

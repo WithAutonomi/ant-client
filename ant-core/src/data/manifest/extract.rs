@@ -310,7 +310,8 @@ impl Extraction<'_> {
                 });
             }
         }
-        staged.commit(overwrite)?;
+        // The commit syncs the file to disk; keep that off the async workers.
+        tokio::task::block_in_place(|| staged.commit(overwrite))?;
         Ok(bytes)
     }
 }
