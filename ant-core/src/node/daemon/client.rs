@@ -106,8 +106,7 @@ pub async fn stop(config: &DaemonConfig) -> Result<DaemonStopResult> {
 /// If the daemon is already running, returns a result with `already_running: true`.
 /// Otherwise, spawns the daemon and polls for the port file to confirm startup.
 pub async fn start(config: &DaemonConfig) -> Result<DaemonStartResult> {
-    // Check if daemon is already running
-    if let Some(pid) = check_running(&config.pid_file_path) {
+    if let Some(pid) = running_daemon_or_clear_stale(config) {
         let port = read_port_file(&config.port_file_path);
         return Ok(DaemonStartResult {
             already_running: true,
@@ -421,19 +420,15 @@ pub async fn stop_all_nodes(config: &DaemonConfig) -> Result<StopNodeResult> {
 
 /// Get daemon connection info for programmatic use.
 ///
-/// Reads PID and port files and checks if the process is alive.
+/// Reads the PID and port files. `running` is true only if the recorded PID is a live daemon
+/// process (see [`recorded_daemon`]); `pid` and `port` are reported as recorded either way.
 pub fn info(config: &DaemonConfig) -> DaemonInfo {
-    let pid = std::fs::read_to_string(&config.pid_file_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok());
-
+    let recorded = recorded_daemon(&config.pid_file_path);
     let port = read_port_file(&config.port_file_path);
 
-    let running = pid.is_some_and(is_process_alive);
-
     DaemonInfo {
-        running,
-        pid,
+        running: matches!(recorded, RecordedDaemon::Live(_)),
+        pid: recorded.pid(),
         port,
         api_base: port.map(|p| format!("http://127.0.0.1:{p}/api/v1")),
     }
@@ -466,7 +461,7 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
 
 /// Validate that a PID belongs to an ant daemon process by checking its
 /// command line. This guards against PID reuse after a daemon crash.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn validate_daemon_process(pid: u32) -> bool {
     let cmdline_path = format!("/proc/{pid}/cmdline");
     match std::fs::read(&cmdline_path) {
@@ -489,12 +484,35 @@ fn validate_daemon_process(pid: u32) -> bool {
             exe_matches && has_daemon_arg
         }
         Err(_) => {
-            // On non-Linux Unix (macOS), /proc doesn't exist. Fall back to
-            // trusting the PID file since there's no cheap way to inspect
-            // the command line without shelling out.
+            // Without /proc there's no cheap way to inspect the command line
+            // without shelling out, so fall back to trusting the PID file.
             true
         }
     }
+}
+
+/// Validate that a PID belongs to an ant daemon process by checking its
+/// executable name. macOS has no /proc, and reading another process's
+/// arguments needs `sysctl(KERN_PROCARGS2)` parsing, so this checks the
+/// basename only, as the Windows version does.
+#[cfg(target_os = "macos")]
+fn validate_daemon_process(pid: u32) -> bool {
+    let Some(pid) = pid_to_i32(pid) else {
+        return false;
+    };
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let Ok(len) = usize::try_from(len) else {
+        return false;
+    };
+    if len == 0 {
+        return false;
+    }
+    let path = String::from_utf8_lossy(&buf[..len]);
+    std::path::Path::new(path.as_ref())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "ant")
 }
 
 #[cfg(windows)]
@@ -565,13 +583,56 @@ fn read_pid_file(path: &Path) -> Result<u32> {
         .map_err(|_| Error::DaemonNotRunning)
 }
 
-/// Check if a daemon is running. Returns the PID if so.
-fn check_running(pid_file: &Path) -> Option<u32> {
-    let pid = read_pid_file(pid_file).ok()?;
-    if is_process_alive(pid) {
-        Some(pid)
+/// What the PID file says about the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedDaemon {
+    /// No readable PID file.
+    Absent,
+    /// The recorded PID is a live daemon process.
+    Live(u32),
+    /// The daemon exited without removing its files (a reboot, an OOM kill, SIGKILL). The
+    /// recorded PID is now dead, or belongs to an unrelated process.
+    Stale(u32),
+}
+
+impl RecordedDaemon {
+    fn pid(self) -> Option<u32> {
+        match self {
+            RecordedDaemon::Absent => None,
+            RecordedDaemon::Live(pid) | RecordedDaemon::Stale(pid) => Some(pid),
+        }
+    }
+}
+
+/// Classify the daemon recorded in `pid_file`.
+///
+/// A live PID is not enough on its own: the files outlive an unclean exit, and after a reboot the
+/// PID is often reused by an unrelated process. The process must also be identifiable as the
+/// daemon, the same test `stop` applies before signalling it.
+fn recorded_daemon(pid_file: &Path) -> RecordedDaemon {
+    let Ok(pid) = read_pid_file(pid_file) else {
+        return RecordedDaemon::Absent;
+    };
+    if is_process_alive(pid) && validate_daemon_process(pid) {
+        RecordedDaemon::Live(pid)
     } else {
-        None
+        RecordedDaemon::Stale(pid)
+    }
+}
+
+/// The PID of the running daemon, if there is one.
+///
+/// Otherwise removes any PID and port files a previous daemon left behind, so the next daemon
+/// starts clean: the port poll in [`start`] would otherwise read the dead daemon's port straight
+/// back.
+fn running_daemon_or_clear_stale(config: &DaemonConfig) -> Option<u32> {
+    match recorded_daemon(&config.pid_file_path) {
+        RecordedDaemon::Live(pid) => Some(pid),
+        RecordedDaemon::Absent | RecordedDaemon::Stale(_) => {
+            let _ = std::fs::remove_file(&config.pid_file_path);
+            let _ = std::fs::remove_file(&config.port_file_path);
+            None
+        }
     }
 }
 
@@ -733,5 +794,77 @@ mod tests {
         };
         let args = daemon_run_args(&config);
         assert_eq!(args, vec!["node", "daemon", "run", "--port", "0"]);
+    }
+
+    fn config_in(dir: &Path) -> DaemonConfig {
+        DaemonConfig {
+            pid_file_path: dir.join("daemon.pid"),
+            port_file_path: dir.join("daemon.port"),
+            ..DaemonConfig::default()
+        }
+    }
+
+    /// The files a daemon leaves behind when it dies without cleaning up, after its PID has been
+    /// reused: the test process stands in for the unrelated process now holding it.
+    fn write_files_with_reused_pid(config: &DaemonConfig) {
+        std::fs::write(&config.pid_file_path, std::process::id().to_string()).unwrap();
+        std::fs::write(&config.port_file_path, "39007").unwrap();
+    }
+
+    #[test]
+    fn info_without_a_pid_file_is_not_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = info(&config_in(tmp.path()));
+        assert!(!info.running);
+        assert_eq!(info.pid, None);
+    }
+
+    // The fallback for other Unixes trusts any live PID, so these hold only where the process can
+    // be identified.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn validate_rejects_a_live_process_that_is_not_the_daemon() {
+        assert!(!validate_daemon_process(std::process::id()));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn info_with_a_reused_pid_is_not_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_in(tmp.path());
+        write_files_with_reused_pid(&config);
+
+        let info = info(&config);
+        assert!(
+            !info.running,
+            "a reused PID must not be reported as the daemon"
+        );
+        assert_eq!(info.pid, Some(std::process::id()));
+        assert_eq!(info.port, Some(39007));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn start_clears_files_left_by_a_dead_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_in(tmp.path());
+        write_files_with_reused_pid(&config);
+
+        assert_eq!(running_daemon_or_clear_stale(&config), None);
+        assert!(!config.pid_file_path.exists());
+        assert!(
+            !config.port_file_path.exists(),
+            "a stale port file would be read back as the new daemon's port"
+        );
+    }
+
+    #[test]
+    fn start_clears_a_port_file_without_a_pid_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_in(tmp.path());
+        std::fs::write(&config.port_file_path, "39007").unwrap();
+
+        assert_eq!(running_daemon_or_clear_stale(&config), None);
+        assert!(!config.port_file_path.exists());
     }
 }

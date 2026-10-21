@@ -59,6 +59,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata describing a file that was no longer there, so the next `npm update` silently rolled
   the user back.
 
+### Fixed
+- `ant node daemon info` and `ant node daemon start` no longer mistake a stale PID file for a
+  running daemon (V2-1655). A daemon that dies without cleaning up (a reboot, an OOM kill)
+  leaves its PID and port files behind, and once the PID is reused by an unrelated process,
+  `info` reported the dead daemon as running while `status` said it was not, and `start`
+  refused to start a new one. Both now require the process to be identifiable as the daemon,
+  the check `stop` already applied, and `start` removes the stale files before starting a new
+  daemon. On macOS the check now reads the executable's name, where it previously trusted any
+  live PID. The `info` help text and README no longer claim its output is always JSON: it is
+  human-readable unless `--json` is passed, like every other command.
+
 ## [0.3.6] - 2026-09-01
 
 ### Fixed
