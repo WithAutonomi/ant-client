@@ -420,8 +420,9 @@ pub async fn stop_all_nodes(config: &DaemonConfig) -> Result<StopNodeResult> {
 
 /// Get daemon connection info for programmatic use.
 ///
-/// Reads the PID and port files. `running` is true only if the recorded PID is a live daemon
-/// process (see [`recorded_daemon`]); `pid` and `port` are reported as recorded either way.
+/// Reads the PID and port files. `running` is true only if the recorded PID is a live process
+/// identifiable as the daemon, since a PID left behind by a daemon that died may have been
+/// reused; `pid` and `port` are reported as recorded either way.
 pub fn info(config: &DaemonConfig) -> DaemonInfo {
     let recorded = recorded_daemon(&config.pid_file_path);
     let port = read_port_file(&config.port_file_path);
