@@ -96,6 +96,9 @@ pub const ADDRESS_LEN: usize = 32;
 /// files up to about 4 GB. Links carry the published (shrunk) form instead
 /// (see [`Manifest::link_form`]).
 pub const MAX_EMBEDDED_ROOT_MAP_BYTES: usize = 64 * 1024;
+/// Most chunks a published (shrunk) DataMap lists: an upload shrinks a map
+/// until it lists no more than this, as [`published_data_map`] does.
+pub const MAX_PUBLISHED_MAP_CHUNKS: usize = 3;
 /// Deepest msgpack nesting the decoder tolerates. A manifest nests five
 /// levels; this leaves headroom for future optional fields.
 const MAX_DECODE_DEPTH: usize = 16;
@@ -338,6 +341,19 @@ pub fn data_map_address(data_map: &DataMap) -> Result<[u8; ADDRESS_LEN], Manifes
     Ok(compute_address(&bytes))
 }
 
+/// Whether a writer embeds `data_map` as it is: a root map of at most
+/// [`MAX_EMBEDDED_ROOT_MAP_BYTES`], or a shrunk map in the published form an
+/// upload returns, at most [`MAX_PUBLISHED_MAP_CHUNKS`] chunks. A larger
+/// root is embedded by its published map instead, and an intermediate
+/// shrink level never is.
+pub fn is_embeddable(data_map: &DataMap) -> Result<bool, ManifestError> {
+    if data_map.is_child() {
+        Ok(data_map.len() <= MAX_PUBLISHED_MAP_CHUNKS)
+    } else {
+        Ok(embedded_len(data_map)? <= MAX_EMBEDDED_ROOT_MAP_BYTES)
+    }
+}
+
 /// Bytes `data_map` occupies in an encoded manifest, as written.
 pub fn embedded_len(data_map: &DataMap) -> Result<usize, ManifestError> {
     let mut bytes = Vec::new();
@@ -377,10 +393,15 @@ impl ManifestEntry {
     /// The plaintext size the file is known to have: from an embedded root
     /// DataMap, which lists every chunk. `None` for a `Public` entry or a
     /// shrunk map, whose size is not known until it is resolved.
+    ///
+    /// Summed as `u64`: `DataMap::original_file_size` sums `usize`, which
+    /// overflows past 4 GiB on 32-bit targets such as `wasm32`.
     pub fn known_size(&self) -> Option<u64> {
         match &self.source {
             ContentRef::Embedded { data_map } if !data_map.is_child() => {
-                u64::try_from(data_map.original_file_size()).ok()
+                data_map.infos().iter().try_fold(0u64, |total, info| {
+                    total.checked_add(u64::try_from(info.src_size).ok()?)
+                })
             }
             _ => None,
         }
@@ -391,8 +412,15 @@ impl ManifestEntry {
     pub fn effective_name(&self) -> Result<String, ManifestError> {
         match &self.path {
             Some(path) => Ok(path.clone()),
-            None => Ok(hex::encode(self.source.content_address()?)),
+            None => Ok(self.effective_name_with(&self.source.content_address()?)),
         }
+    }
+
+    /// [`Self::effective_name`] for a caller that has already derived the
+    /// entry's content address, which for an embedded entry means
+    /// self-encrypting its DataMap.
+    pub fn effective_name_with(&self, address: &[u8; ADDRESS_LEN]) -> String {
+        self.path.clone().unwrap_or_else(|| hex::encode(address))
     }
 }
 
@@ -415,6 +443,24 @@ impl Manifest {
 
     /// Check the entry count, the name, every path and every collision rule.
     pub fn validate(&self) -> Result<(), ManifestError> {
+        self.validated_names()?;
+        Ok(())
+    }
+
+    /// Validate, then sort entries by effective name so encoding is
+    /// deterministic.
+    pub fn canonicalize(&mut self) -> Result<(), ManifestError> {
+        let names = self.validated_names()?;
+        let mut keyed: Vec<_> = names.into_iter().zip(self.entries.drain(..)).collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        self.entries = keyed.into_iter().map(|(_, entry)| entry).collect();
+        Ok(())
+    }
+
+    /// [`Self::validate`], returning each entry's effective name in entry
+    /// order. A path-less embedded entry's name comes from self-encrypting
+    /// its DataMap, so callers that need the names reuse these.
+    fn validated_names(&self) -> Result<Vec<String>, ManifestError> {
         if self.entries.len() > MAX_MANIFEST_ENTRIES {
             return Err(ManifestError::TooManyEntries {
                 count: self.entries.len(),
@@ -443,21 +489,9 @@ impl Manifest {
             }
             names.push(entry.effective_name()?);
         }
-        path::check_collisions(names.iter().map(String::as_str)).map_err(ManifestError::Conflict)
-    }
-
-    /// Validate, then sort entries by effective name so encoding is
-    /// deterministic.
-    pub fn canonicalize(&mut self) -> Result<(), ManifestError> {
-        self.validate()?;
-        let mut keyed = self
-            .entries
-            .drain(..)
-            .map(|entry| entry.effective_name().map(|name| (name, entry)))
-            .collect::<Result<Vec<_>, _>>()?;
-        keyed.sort_by(|a, b| a.0.cmp(&b.0));
-        self.entries = keyed.into_iter().map(|(_, entry)| entry).collect();
-        Ok(())
+        path::check_collisions(names.iter().map(String::as_str))
+            .map_err(ManifestError::Conflict)?;
+        Ok(names)
     }
 
     /// The manifest as a link carries it: every embedded DataMap replaced by
@@ -479,8 +513,14 @@ impl Manifest {
     pub fn encode(&self) -> Result<Vec<u8>, ManifestError> {
         let mut canonical = self.clone();
         canonical.canonicalize()?;
-        let body = rmp_serde::to_vec_named(&canonical)
-            .map_err(|e| ManifestError::Encode(e.to_string()))?;
+        canonical.encode_canonical()
+    }
+
+    /// Encode a manifest [`Self::canonicalize`] has already validated and
+    /// sorted, without doing either again. Only the size limit is checked.
+    pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, ManifestError> {
+        let body =
+            rmp_serde::to_vec_named(self).map_err(|e| ManifestError::Encode(e.to_string()))?;
         let mut bytes = Vec::with_capacity(MANIFEST_HEADER_LEN + body.len());
         bytes.extend_from_slice(&MANIFEST_MAGIC);
         bytes.push(MANIFEST_FORMAT_VERSION);
@@ -961,6 +1001,25 @@ mod tests {
                 assert!(data_map.len() <= 3);
             }
         }
+    }
+
+    #[test]
+    fn known_size_is_unknown_rather_than_wrapped_when_sizes_overflow() {
+        let chunk = |index| ChunkInfo {
+            index,
+            dst_hash: XorName::from_content(&[0]),
+            src_hash: XorName::from_content(&[1]),
+            src_size: usize::MAX,
+        };
+        let entry = ManifestEntry {
+            path: None,
+            size: None,
+            sha256: None,
+            source: ContentRef::Embedded {
+                data_map: DataMap::new(vec![chunk(0), chunk(1)]),
+            },
+        };
+        assert_eq!(entry.known_size(), None);
     }
 
     #[test]

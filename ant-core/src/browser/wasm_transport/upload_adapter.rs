@@ -58,19 +58,30 @@ pub(super) fn paid_transactions(
     verified: &[VerifiedStorageQuote],
     payment: &BrowserPaymentSubmission,
 ) -> DataResult<HashMap<QuoteHash, TxHash>> {
+    quote_transactions(
+        verified,
+        &payment.transaction_hashes,
+        payment.transaction_hash.as_deref(),
+    )
+}
+
+/// The transaction paying each quote: from `by_quote`, keyed by quote hash
+/// with or without `0x`, or, when that names none, `single`, one transaction
+/// paying them all.
+pub(super) fn quote_transactions(
+    verified: &[VerifiedStorageQuote],
+    by_quote: &HashMap<String, String>,
+    single: Option<&str>,
+) -> DataResult<HashMap<QuoteHash, TxHash>> {
     let mut transactions = HashMap::new();
     for quote in verified {
-        let hash = if payment.transaction_hashes.is_empty() {
-            payment.transaction_hash.as_ref()
+        let hash = if by_quote.is_empty() {
+            single
         } else {
-            payment
-                .transaction_hashes
+            by_quote
                 .get(&quote.quote_hash)
-                .or_else(|| {
-                    payment
-                        .transaction_hashes
-                        .get(&format!("0x{}", quote.quote_hash))
-                })
+                .or_else(|| by_quote.get(&format!("0x{}", quote.quote_hash)))
+                .map(String::as_str)
         }
         .ok_or_else(|| Error::Payment("wallet returned no transaction for a paid quote".into()))?;
         transactions.insert(

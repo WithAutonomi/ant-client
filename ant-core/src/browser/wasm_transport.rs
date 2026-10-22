@@ -3565,6 +3565,26 @@ fn pass_ice_gathering_turn(connection: RtcPeerConnection, turn: Option<OwnedSema
     });
 }
 
+/// Refuse an input object holding a key outside `known`. `serde_wasm_bindgen`
+/// reads only the fields a struct declares, so `#[serde(deny_unknown_fields)]`
+/// never sees the others; a value that is not an object is left to serde.
+///
+/// Any object is checked, whatever its prototype or realm: `dyn_ref` would
+/// test `instanceof Object`, which `Object.create(null)` and an object from
+/// another frame both fail.
+pub(crate) fn reject_unknown_keys(value: &JsValue, known: &[&str]) -> Result<(), String> {
+    if !value.is_object() {
+        return Ok(());
+    }
+    for key in js_sys::Object::keys(value.unchecked_ref::<js_sys::Object>()).iter() {
+        let key = key.as_string().unwrap_or_default();
+        if !known.contains(&key.as_str()) {
+            return Err(format!("unknown field `{key}`, expected one of {known:?}"));
+        }
+    }
+    Ok(())
+}
+
 fn js_error_message(value: JsValue) -> String {
     value
         .as_string()

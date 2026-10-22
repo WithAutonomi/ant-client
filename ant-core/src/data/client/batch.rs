@@ -17,7 +17,6 @@ use ant_protocol::evm::{
     Amount, EncodedPeerId, PayForQuotesError, PaymentQuote, ProofOfPayment, QuoteHash,
     RewardsAddress, TxHash, Wallet,
 };
-#[cfg(any(feature = "native", test))]
 use ant_protocol::payment::deserialize_proof;
 use ant_protocol::payment::{serialize_single_node_proof, PaymentProof, QuotePaymentInfo};
 use ant_protocol::transport::{MultiAddr, PeerId};
@@ -923,6 +922,18 @@ fn prune_locally_expired_proofs(
     kept
 }
 
+/// Whether serialized proof bytes hold a quote older at `now` than storers
+/// accept (`QUOTE_MAX_AGE_SECS`, with no safety margin), so storing them can
+/// no longer succeed. `None` if the bytes are not a single-node proof.
+pub fn paid_proof_has_expired(proof: &[u8], now: std::time::SystemTime) -> Option<bool> {
+    let (proof, _) = deserialize_proof(proof).ok()?;
+    Some(!proof_is_safely_fresh(
+        &proof,
+        now,
+        Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS),
+    ))
+}
+
 /// True iff every quote in the proof has a timestamp not older than
 /// `now - max_safe_age`.
 ///
@@ -1212,6 +1223,32 @@ mod tests {
             })
             .collect();
         ProofOfPayment { peer_quotes }
+    }
+
+    #[test]
+    fn a_paid_proof_expires_with_its_oldest_quote() {
+        let now = std::time::SystemTime::now();
+        // Inside the safety margin a cached proof is dropped, but storers
+        // still accept it, so it has not expired.
+        let close = now - Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS);
+        let stale = now - Duration::from_secs(CACHED_PROOF_MAX_AGE_SECS + 1);
+        let bytes = |timestamps: &[std::time::SystemTime]| {
+            serialize_single_node_proof(&PaymentProof {
+                proof_of_payment: make_proof_with_timestamps(timestamps),
+                tx_hashes: Vec::new(),
+                commitment_sidecars: Vec::new(),
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            paid_proof_has_expired(&bytes(&[now, close]), now),
+            Some(false)
+        );
+        assert_eq!(
+            paid_proof_has_expired(&bytes(&[now, stale]), now),
+            Some(true)
+        );
+        assert_eq!(paid_proof_has_expired(b"not a proof", now), None);
     }
 
     #[test]

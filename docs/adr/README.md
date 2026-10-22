@@ -26,3 +26,4 @@ See [`TOOLING.md`](./TOOLING.md) for `adrs`, `adr-kit`, and AI harness setup.
 - [ADR-0004: Direct browser read client](./ADR-0004-direct-browser-read-client.md)
 - [ADR-0005: Bootstrap multiaddresses and portable network defaults](./ADR-0005-bootstrap-multiaddresses.md)
 - [ADR-0006: File manifests and manifest links](./ADR-0006-file-manifests-and-links.md)
+- [ADR-0007: Browser manifest creation and pointer payment recovery](./ADR-0007-browser-api-completion.md) (Proposed)
