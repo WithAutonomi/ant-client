@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "ant-cli"
-version = "0.3.11"
+version = "0.3.12-rc.1"
 dependencies = [
  "ant-core",
  "anyhow",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "ant-core"
-version = "0.13.0"
+version = "0.14.0-rc.1"
 dependencies = [
  "alloy",
  "ant-node",
@@ -910,7 +910,7 @@ dependencies = [
  "web-time",
  "windows-sys 0.61.2",
  "xor_name",
- "zip",
+ "zip 2.4.2",
 ]
 
 [[package]]
@@ -924,8 +924,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.23.0"
-source = "git+https://github.com/WithAutonomi/ant-node?rev=611f204b4cedc78ae0118a8ce7b7c17c735c4658#611f204b4cedc78ae0118a8ce7b7c17c735c4658"
+version = "0.23.1-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-node?branch=rc-2026.10.3#91bde9f4cfbc8c49d15cd2c18e4f4a89a9eec4b0"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -972,14 +972,13 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "xor_name",
- "zip",
+ "zip 9.0.5",
 ]
 
 [[package]]
 name = "ant-protocol"
-version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4ad739acc497fb0f9bb49691e5874ecd68584569e730cc32f8a26d70f4b6725"
+version = "5.0.1-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.10.3#4dd56833cbe565c8a43c37953c2921d39529adff"
 dependencies = [
  "blake3",
  "bytes",
@@ -5580,9 +5579,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.29.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96eb0b46528062e949d16000877f27e37a535d2c431c49e102e73268f503a104"
+version = "0.29.2-rc.1"
+source = "git+https://github.com/WithAutonomi/saorsa-core?branch=rc-2026.10.3#d75fa893baf3dc7a3ee89f06ee5c611225037428"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5649,8 +5647,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.38.1"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=520dd3ef7540b1743e644ecdd8a74f2b58ec43a9#520dd3ef7540b1743e644ecdd8a74f2b58ec43a9"
+version = "0.38.2-rc.1"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?branch=rc-2026.10.3#e03aabc7598d7106854a2de9fee4b013618b7581"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6940,6 +6938,12 @@ dependencies = [
  "tokio-util",
  "webrtc-util 0.12.0",
 ]
+
+[[package]]
+name = "typed-path"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54ec2755506471f54baf5e4bb5499d8e510cc1caf271270e778a736bd2d7336c"
 
 [[package]]
 name = "typenum"
@@ -8261,6 +8265,20 @@ dependencies = [
  "zeroize",
  "zopfli",
  "zstd",
+]
+
+[[package]]
+name = "zip"
+version = "9.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap 2.14.0",
+ "memchr",
+ "nix 0.31.3",
+ "typed-path",
 ]
 
 [[package]]
