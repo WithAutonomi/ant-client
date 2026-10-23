@@ -8,8 +8,11 @@
 //! When an id is already taken, which happens when uploads with the same label
 //! finish within one second, `-2`, `-3` and so on are appended. Records list
 //! newest first, and within one second by that suffix compared as a number.
-//! Nothing else is stored, so the history directory is just a folder of
-//! manifests that any manifest tool can read.
+//! Apart from the journal of a manifest build that has not finished
+//! (`<id>.ant.partial`, see the `journal` module), nothing else is stored, so
+//! the history directory is just a folder of manifests that any manifest
+//! tool can read. An unfinished build's journal is listed as a record in
+//! progress or interrupted.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,11 +20,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::file::{read_manifest_file, write_manifest_file};
-use super::{Manifest, ManifestError, MANIFEST_EXTENSION};
+use super::file::read_manifest_bytes;
+use super::journal::{journal_path, read_journal, UploadJournal, JOURNAL_SUFFIX};
+use super::path::{
+    check_collisions, portable_component, validate_component, validate_path, PathError,
+    PATH_SEPARATOR,
+};
+use super::{Manifest, ManifestEntry, ManifestError, MANIFEST_EXTENSION};
 
 #[cfg(test)]
-use super::{ContentRef, ManifestEntry};
+use super::{ContentRef, MANIFEST_FORMAT_VERSION, MANIFEST_MAGIC};
 
 /// Directory under the data directory that holds upload records.
 pub const UPLOAD_HISTORY_DIR: &str = "uploads";
@@ -78,14 +86,34 @@ const FEBRUARY: u32 = 2;
 pub struct UploadRecord {
     /// Filename stem: `<timestamp>-<label>`.
     pub id: String,
-    /// Where the manifest lives.
+    /// Where the manifest lives: the `.ant` record, or the journal of an
+    /// upload that has not finished.
     pub path: PathBuf,
-    /// When it was recorded, seconds since the Unix epoch.
+    /// When it was recorded, seconds since the Unix epoch. For a manifest
+    /// build, when the build started.
     pub recorded_at: u64,
     /// The label part of the id.
     pub label: String,
-    /// The manifest itself.
+    /// The manifest itself. For an upload that has not finished, every
+    /// entry that reached the disk.
     pub manifest: Manifest,
+    /// Whether the upload finished.
+    #[serde(default)]
+    pub state: RecordState,
+}
+
+/// Whether a recorded upload finished.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordState {
+    /// The upload ended and its record was written, complete or partial.
+    #[default]
+    Complete,
+    /// A manifest build is still running and adding entries.
+    InProgress,
+    /// A manifest build stopped without finishing, as on a crash or a
+    /// forced quit. Its entries are every upload completed before then.
+    Interrupted,
 }
 
 /// Result of listing a history directory.
@@ -104,46 +132,85 @@ pub fn default_history_dir() -> Result<PathBuf, ManifestError> {
 }
 
 /// Write `manifest` into `dir` as a new record and return it.
+///
+/// The id is claimed through a journal, as a build claims its own, so a
+/// record never takes the id of a build that is still running. If the
+/// record itself cannot be written, the journal stays and the upload is
+/// listed as interrupted.
 pub fn record_upload(
     dir: &Path,
     manifest: &Manifest,
     label: Option<&str>,
 ) -> Result<UploadRecord, ManifestError> {
-    fs::create_dir_all(dir)?;
+    manifest.validate()?;
+    let mut journal = UploadJournal::create(
+        dir,
+        label,
+        manifest.name.as_deref(),
+        manifest.torrent.as_ref(),
+    )?;
+    journal.append_all(&manifest.entries)?;
+    journal.finish(manifest)
+}
+
+/// The ids to try, in order, for a record made now with `label`.
+pub(super) struct NewIds {
+    /// When the record is made, seconds since the Unix epoch.
+    pub(super) recorded_at: u64,
+    /// The sanitised label.
+    pub(super) label: String,
+    base: String,
+    attempt: u32,
+}
+
+impl Iterator for NewIds {
+    type Item = String;
+
+    fn next(&mut self) -> Option<String> {
+        if self.attempt >= MAX_ID_ATTEMPTS {
+            return None;
+        }
+        let id = if self.attempt == 0 {
+            self.base.clone()
+        } else {
+            format!("{}{ID_SEPARATOR}{}", self.base, self.attempt + 1)
+        };
+        self.attempt += 1;
+        Some(id)
+    }
+}
+
+/// The ids for a record made now: `<timestamp>-<label>`, then `-2`, `-3`
+/// and so on.
+pub(super) fn new_ids(label: Option<&str>) -> NewIds {
     let recorded_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    let label = sanitize_label(label.or(manifest.name.as_deref()));
+    let label = sanitize_label(label);
     let base = format!(
         "{}{ID_SEPARATOR}{label}",
         format_compact_timestamp(recorded_at)
     );
-    for attempt in 0..MAX_ID_ATTEMPTS {
-        let id = if attempt == 0 {
-            base.clone()
-        } else {
-            format!("{base}{ID_SEPARATOR}{}", attempt + 1)
-        };
-        let path = dir.join(format!("{id}.{MANIFEST_EXTENSION}"));
-        match write_manifest_file(&path, manifest, false) {
-            Ok(()) => {
-                return Ok(UploadRecord {
-                    id,
-                    path,
-                    recorded_at,
-                    label,
-                    manifest: manifest.clone(),
-                })
-            }
-            Err(ManifestError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
-        }
+    NewIds {
+        recorded_at,
+        label,
+        base,
+        attempt: 0,
     }
-    Err(ManifestError::Build(format!(
+}
+
+/// Where the finished record with `id` lives in `dir`.
+pub(super) fn record_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.{MANIFEST_EXTENSION}"))
+}
+
+/// The error when every candidate id is taken.
+pub(super) fn no_free_id(dir: &Path) -> ManifestError {
+    ManifestError::Build(format!(
         "could not find a free record id after {MAX_ID_ATTEMPTS} attempts in {}",
         dir.display()
-    )))
+    ))
 }
 
 /// List every record in `dir`, newest first. A missing directory is an
@@ -157,10 +224,30 @@ pub fn list_uploads(dir: &Path) -> Result<UploadListing, ManifestError> {
     };
     for entry in entries {
         let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some(MANIFEST_EXTENSION) {
-            continue;
-        }
-        match load_record(&path) {
+        let journal_id = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(JOURNAL_SUFFIX));
+        let loaded = match journal_id {
+            // A journal whose record exists is left over from a build that
+            // stopped between writing the record and removing the journal.
+            Some(id) if record_path(dir, id).is_file() => continue,
+            // One that stopped holding nothing paid for nothing.
+            Some(id) => match load_journal(&path, id) {
+                Ok(record)
+                    if record.state == RecordState::Interrupted
+                        && record.manifest.entries.is_empty() =>
+                {
+                    continue
+                }
+                loaded => loaded,
+            },
+            None if path.extension().and_then(|e| e.to_str()) == Some(MANIFEST_EXTENSION) => {
+                load_record(&path)
+            }
+            None => continue,
+        };
+        match loaded {
             Ok(record) => listing.records.push(record),
             Err(e) => listing.unreadable.push((path, e.to_string())),
         }
@@ -192,13 +279,57 @@ pub fn load_upload(dir: &Path, id: &str) -> Result<Option<UploadRecord>, Manifes
     if id.is_empty() || id.contains(['/', '\\']) {
         return Ok(None);
     }
-    let path = dir.join(format!("{id}.{MANIFEST_EXTENSION}"));
-    match fs::symlink_metadata(&path) {
-        Ok(meta) if meta.is_file() => load_record(&path).map(Some),
-        Ok(_) => Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    let path = record_path(dir, id);
+    if is_regular_file(&path)? {
+        return load_record(&path).map(Some);
+    }
+    let journal = journal_path(dir, id);
+    if is_regular_file(&journal)? {
+        return load_journal(&journal, id).map(Some);
+    }
+    Ok(None)
+}
+
+/// Whether `path` is a regular file, not following a link.
+fn is_regular_file(path: &Path) -> Result<bool, ManifestError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(meta.is_file()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e.into()),
     }
+}
+
+/// An unfinished build's journal as a record: in progress while its build
+/// holds the journal, interrupted otherwise.
+fn load_journal(path: &Path, id: &str) -> Result<UploadRecord, ManifestError> {
+    let (manifest, in_progress) = read_journal(path)?;
+    let (recorded_at, label) = match parse_id(id) {
+        Some(parsed) => parsed,
+        None => (modified_secs(path)?, id.to_string()),
+    };
+    Ok(UploadRecord {
+        id: id.to_string(),
+        path: path.to_path_buf(),
+        recorded_at,
+        label,
+        manifest,
+        state: if in_progress {
+            RecordState::InProgress
+        } else {
+            RecordState::Interrupted
+        },
+    })
+}
+
+/// When `path` was last modified, seconds since the Unix epoch, or zero if
+/// unknown.
+fn modified_secs(path: &Path) -> Result<u64, ManifestError> {
+    Ok(fs::metadata(path)?
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or_default())
 }
 
 /// `YYYY-MM-DD HH:MM:SS UTC` for display.
@@ -212,18 +343,10 @@ fn load_record(path: &Path) -> Result<UploadRecord, ManifestError> {
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| ManifestError::Build(format!("{} has no UTF-8 name", path.display())))?;
-    let manifest = read_manifest_file(path)?;
+    let manifest = read_record(path)?;
     let (recorded_at, label) = match parse_id(stem) {
         Some(parsed) => parsed,
-        None => (
-            fs::metadata(path)?
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or_default(),
-            stem.to_string(),
-        ),
+        None => (modified_secs(path)?, stem.to_string()),
     };
     Ok(UploadRecord {
         id: stem.to_string(),
@@ -231,7 +354,74 @@ fn load_record(path: &Path) -> Result<UploadRecord, ManifestError> {
         recorded_at,
         label,
         manifest,
+        state: RecordState::Complete,
     })
+}
+
+/// Read a record, repairing names that break the current portable path
+/// rules instead of refusing it.
+fn read_record(path: &Path) -> Result<Manifest, ManifestError> {
+    repair_names(Manifest::decode_unvalidated(&read_manifest_bytes(path)?)?)
+}
+
+/// Bring a record written under looser path rules in line with the current
+/// ones, the way a new record's names are repaired: an invalid name or path
+/// component is made portable, a path that cannot be is dropped so the entry
+/// extracts under its content address, and of two entries whose names now
+/// collide the later loses its path. A client update so never makes a
+/// recorded upload unreachable. A manifest that is already valid is
+/// returned unchanged.
+pub(super) fn repair_names(mut manifest: Manifest) -> Result<Manifest, ManifestError> {
+    if manifest.validate().is_ok() {
+        return Ok(manifest);
+    }
+    if let Some(name) = &manifest.name {
+        if validate_component(name).is_err() {
+            manifest.name = portable_component(name);
+        }
+    }
+    for entry in &mut manifest.entries {
+        if let Some(path) = &entry.path {
+            if validate_path(path).is_err() {
+                entry.path = portable_path(path);
+            }
+        }
+    }
+    // Each round drops a path or a duplicate entry, so this ends.
+    loop {
+        let names = manifest
+            .entries
+            .iter()
+            .map(ManifestEntry::effective_name)
+            .collect::<Result<Vec<_>, _>>()?;
+        let colliding = match check_collisions(names.iter().map(String::as_str)) {
+            Ok(()) => break,
+            Err(PathError::Duplicate(name)) | Err(PathError::PrefixConflict { file: name, .. }) => {
+                name
+            }
+            Err(other) => return Err(ManifestError::Conflict(other)),
+        };
+        let Some(index) = names.iter().rposition(|name| *name == colliding) else {
+            break;
+        };
+        if manifest.entries[index].path.take().is_none() {
+            // Already under its content address: the same content twice.
+            manifest.entries.remove(index);
+        }
+    }
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+/// `path` with every component made portable, or `None` when a component
+/// has nothing usable left or the result breaks the rules some other way.
+fn portable_path(path: &str) -> Option<String> {
+    let components = path
+        .split(PATH_SEPARATOR)
+        .map(portable_component)
+        .collect::<Option<Vec<_>>>()?;
+    let repaired = components.join(&PATH_SEPARATOR.to_string());
+    validate_path(&repaired).is_ok().then_some(repaired)
 }
 
 fn sanitize_label(label: Option<&str>) -> String {
@@ -357,6 +547,57 @@ mod tests {
                 },
             }],
         }
+    }
+
+    /// A record an older client wrote under looser rules still loads: its
+    /// names are repaired instead of the record being refused, and no entry
+    /// is lost.
+    #[test]
+    fn records_written_under_looser_rules_load_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = |path: &str, seed: u8| ManifestEntry {
+            path: Some(path.into()),
+            size: Some(1),
+            sha256: None,
+            source: ContentRef::Public {
+                address: [seed; 32],
+            },
+        };
+        let old = Manifest {
+            name: Some("old\u{85}set".into()),
+            torrent: None,
+            entries: vec![
+                entry("ab", 1),
+                entry("a\u{200C}b", 2),
+                entry("next\u{85}line.txt", 3),
+                entry("strasse", 4),
+                entry("stra\u{1e9e}e/x", 5),
+            ],
+        };
+        assert!(old.validate().is_err());
+        let mut bytes = MANIFEST_MAGIC.to_vec();
+        bytes.push(MANIFEST_FORMAT_VERSION);
+        bytes.extend(rmp_serde::to_vec_named(&old).unwrap());
+        let id = "20261001T000000Z-old";
+        fs::write(record_path(dir.path(), id), &bytes).unwrap();
+
+        let record = load_upload(dir.path(), id).unwrap().unwrap();
+        record.manifest.validate().unwrap();
+        assert_eq!(record.manifest.name.as_deref(), Some("old_set"));
+        assert_eq!(record.manifest.entries.len(), old.entries.len());
+        let paths: Vec<_> = record
+            .manifest
+            .entries
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
+        assert!(paths.contains(&Some("next_line.txt".into())));
+        assert!(paths.contains(&Some("ab".into())));
+        assert!(paths.contains(&Some("strasse".into())));
+        // The later of each colliding pair extracts under its address.
+        assert_eq!(paths.iter().filter(|p| p.is_none()).count(), 2);
+        let listing = list_uploads(dir.path()).unwrap();
+        assert_eq!(listing.records.len(), 1, "{:?}", listing.unreadable);
     }
 
     #[test]

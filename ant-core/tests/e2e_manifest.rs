@@ -13,10 +13,10 @@ use std::sync::Arc;
 
 use ant_core::data::{
     apply_compaction, data_map_address, embeddable_data_map, embedded_len, extract_manifest,
-    manifest_link, parse_link, plan_compaction, publish_data_maps, read_manifest_file,
-    record_upload, write_manifest_file, BuildEvent, BuildOptions, Client, ContentRef, EntryStatus,
-    ExtractOptions, Link, Manifest, ManifestBuilder, ManifestEntry, ManifestError, PaymentMode,
-    ReferenceMode, Visibility, MAX_EMBEDDED_ROOT_MAP_BYTES,
+    list_uploads, load_upload, manifest_link, parse_link, plan_compaction, publish_data_maps,
+    read_manifest_file, write_manifest_file, BuildEvent, BuildOptions, Client, ContentRef,
+    EntryStatus, ExtractOptions, Link, Manifest, ManifestBuilder, ManifestEntry, ManifestError,
+    PaymentMode, RecordState, ReferenceMode, Visibility, MAX_EMBEDDED_ROOT_MAP_BYTES,
 };
 use self_encryption::{shrink_data_map, ChunkInfo, DataMap};
 use serial_test::serial;
@@ -118,6 +118,7 @@ async fn manifest_round_trips_through_file_and_link() {
             payment_mode: PaymentMode::Auto,
             follow_symlinks: false,
             cancel: CancellationToken::new(),
+            history: None,
         },
     );
     builder.add_directory(source.path(), None).unwrap();
@@ -239,6 +240,7 @@ async fn uploads_record_sha256_and_extraction_checks_it() {
             payment_mode: PaymentMode::Auto,
             follow_symlinks: false,
             cancel: CancellationToken::new(),
+            history: None,
         },
     );
     builder.add_directory(source.path(), None).unwrap();
@@ -308,28 +310,56 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
         fs::write(&first, &expected).unwrap();
         fs::write(&later, vec![0x93; FILE_BYTES]).unwrap();
 
-        let mut builder = ManifestBuilder::new(&client, BuildOptions::default());
+        let history = TempDir::new().unwrap();
+        let mut builder = ManifestBuilder::new(
+            &client,
+            BuildOptions {
+                history: Some(history.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
         builder.add_file(&first, "first.bin".into()).unwrap();
         builder.add_file(&later, "later.bin".into()).unwrap();
         builder
             .add_public([9; 32], Some("existing.bin".into()), None)
             .unwrap();
         let (tx, mut rx) = mpsc::channel(1);
+        let history_dir = history.path().to_path_buf();
         let sabotage = tokio::spawn(async move {
+            let mut journaled = None;
             while let Some(event) = rx.recv().await {
-                if matches!(event, BuildEvent::FileStarted { index: 0, .. }) {
-                    // Preflight has passed. The first file still needs real
-                    // network/payment work before the next file is read.
-                    if remove {
-                        fs::remove_file(&later).unwrap();
-                    } else {
-                        fs::write(&later, [0x01]).unwrap();
+                match event {
+                    BuildEvent::FileStarted { index: 0, .. } => {
+                        // Preflight has passed. The first file still needs
+                        // real network/payment work before the next is read.
+                        if remove {
+                            fs::remove_file(&later).unwrap();
+                        } else {
+                            fs::write(&later, [0x01]).unwrap();
+                        }
                     }
+                    // The paid upload is on disk before the build goes on,
+                    // so a crash from here on cannot lose it.
+                    BuildEvent::FileFinished { path, .. } if path == "first.bin" => {
+                        journaled = Some(list_uploads(&history_dir).unwrap().records);
+                    }
+                    _ => {}
                 }
             }
+            journaled
         });
         let error = builder.finish(Some(tx)).await.unwrap_err();
-        sabotage.await.unwrap();
+        let journaled = sabotage.await.unwrap().unwrap();
+        assert_eq!(journaled.len(), 1);
+        assert_eq!(journaled[0].state, RecordState::InProgress);
+        let mut names: Vec<_> = journaled[0]
+            .manifest
+            .entries
+            .iter()
+            .filter_map(|entry| entry.path.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["existing.bin", "first.bin"]);
         let ManifestError::BuildFailed {
             path,
             cause,
@@ -359,9 +389,17 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
             .iter()
             .any(|entry| entry.path.as_deref() == Some("later.bin")));
 
-        let history = TempDir::new().unwrap();
-        let record = record_upload(history.path(), &partial.manifest, None).unwrap();
+        // The builder recorded the partial result itself.
+        let id = partial
+            .history_id
+            .clone()
+            .expect("the partial build is recorded");
+        assert!(partial.history_error.is_none());
+        let record = load_upload(history.path(), &id).unwrap().unwrap();
+        assert_eq!(record.state, RecordState::Complete);
+        assert_eq!(list_uploads(history.path()).unwrap().records.len(), 1);
         let recovered = read_manifest_file(&record.path).unwrap();
+        assert_eq!(recovered, partial.manifest);
         let out = TempDir::new().unwrap();
         let report = extract_manifest(
             &client,
@@ -379,10 +417,12 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
     // when cancellation happens before the first upload starts.
     let cancel = CancellationToken::new();
     cancel.cancel();
+    let history = TempDir::new().unwrap();
     let mut builder = ManifestBuilder::new(
         &client,
         BuildOptions {
             cancel,
+            history: Some(history.path().to_path_buf()),
             ..Default::default()
         },
     );
@@ -396,6 +436,9 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
     assert!(cancelled.cancelled);
     assert_eq!(cancelled.files_uploaded, 0);
     assert_eq!(cancelled.total_to_upload, 2);
+    // Nothing was paid for, so nothing is recorded.
+    assert!(cancelled.history_id.is_none());
+    assert!(fs::read_dir(history.path()).unwrap().next().is_none());
     assert_eq!(cancelled.manifest.entries.len(), 1);
 
     drop(client);
@@ -428,6 +471,7 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
             payment_mode: PaymentMode::Auto,
             follow_symlinks: false,
             cancel: CancellationToken::new(),
+            history: None,
         },
     );
     builder.add_directory(source.path(), None).unwrap();
@@ -457,6 +501,7 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
             payment_mode: PaymentMode::Auto,
             follow_symlinks: false,
             cancel: CancellationToken::new(),
+            history: None,
         },
     );
     embedded_builder.add_directory(source.path(), None).unwrap();

@@ -2,16 +2,15 @@
 //!
 //! Containment is a filesystem contract, not a string check. Inside the
 //! output root the extractor never follows a symlink, junction or reparse
-//! point: every intermediate directory is created, or confirmed to be a
-//! real directory, without following links, before the download, and the
-//! whole parent chain and the target are checked again, without following
-//! links, immediately before the final rename. The file is written through
-//! a reserved temporary name in its parent. An existing target is a
-//! per-entry failure unless overwrite was requested, and even then only a
-//! regular file is replaced.
+//! point, and every name is resolved from directories held open, so
+//! nothing that changes while an entry downloads can redirect where it is
+//! written (see the `output` module). The file is written through a
+//! temporary name in its parent and renamed into place without replacing
+//! anything. An existing target is a per-entry failure unless overwrite was
+//! requested, and even then only a regular file this extraction did not
+//! write is replaced.
 
-use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -19,7 +18,6 @@ use futures::stream::{self, StreamExt};
 use self_encryption::DataMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tempfile::Builder as TempBuilder;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -27,16 +25,10 @@ use crate::data::client::file::DownloadEvent;
 use crate::data::error::Error;
 use crate::data::Client;
 
+use super::output::OutputRoot;
 use super::path::PATH_SEPARATOR;
 use super::{ContentRef, Manifest, ManifestEntry, ManifestError, SHA256_LEN};
 
-#[cfg(all(test, unix))]
-use std::os::unix::fs::symlink;
-
-/// Read buffer for checking a downloaded file's SHA-256.
-const SHA256_READ_BUFFER: usize = 1024 * 1024;
-/// Prefix of the temporary file an entry is downloaded into.
-const TEMP_PREFIX: &str = ".ant-extract-";
 /// Capacity of the per-entry download progress channel.
 const DOWNLOAD_PROGRESS_CAPACITY: usize = 64;
 
@@ -187,23 +179,22 @@ pub async fn extract_manifest(
 ) -> Result<ExtractReport, ManifestError> {
     manifest.validate()?;
     let selected = select_entries(manifest, &options.selection)?;
-    fs::create_dir_all(&options.output_root)?;
-    let total = selected.len();
+    let root = OutputRoot::open(&options.output_root)?;
+    let extraction = Extraction {
+        client,
+        root: &root,
+        options,
+        total: selected.len(),
+    };
+    let extraction = &extraction;
 
     let outcomes: Vec<(usize, EntryOutcome)> = stream::iter(selected.into_iter().enumerate())
         .map(|(index, (name, entry))| {
             let progress = progress.clone();
             async move {
-                let status = extract_entry(
-                    client,
-                    entry,
-                    &name,
-                    index,
-                    total,
-                    options,
-                    progress.as_ref(),
-                )
-                .await;
+                let status = extraction
+                    .extract_entry(entry, &name, index, progress.as_ref())
+                    .await;
                 if let Some(tx) = &progress {
                     let _ = tx
                         .send(ExtractEvent::EntryFinished {
@@ -226,125 +217,138 @@ pub async fn extract_manifest(
     })
 }
 
-async fn extract_entry(
-    client: &Client,
-    entry: &ManifestEntry,
-    name: &str,
-    index: usize,
+/// What every entry of one extraction shares.
+struct Extraction<'a> {
+    client: &'a Client,
+    root: &'a OutputRoot,
+    options: &'a ExtractOptions,
+    /// Number of selected entries.
     total: usize,
-    options: &ExtractOptions,
-    progress: Option<&mpsc::Sender<ExtractEvent>>,
-) -> EntryStatus {
-    if options.cancel.is_cancelled() {
-        return EntryStatus::Cancelled;
-    }
-    if let Some(tx) = progress {
-        let _ = tx
-            .send(ExtractEvent::EntryStarted {
-                name: name.to_string(),
-                index,
-                total,
-            })
-            .await;
-    }
-    let work = download_entry(client, entry, name, options, progress);
-    tokio::select! {
-        _ = options.cancel.cancelled() => EntryStatus::Cancelled,
-        result = work => match result {
-            Ok(bytes) => EntryStatus::Written { bytes },
-            Err(e) => EntryStatus::Failed { error: e.to_string() },
-        },
-    }
 }
 
-async fn download_entry(
-    client: &Client,
-    entry: &ManifestEntry,
-    name: &str,
-    options: &ExtractOptions,
-    progress: Option<&mpsc::Sender<ExtractEvent>>,
-) -> Result<u64, ManifestError> {
-    let target = prepare_target(&options.output_root, name, options.overwrite)?;
-    let parent = target
-        .parent()
-        .ok_or_else(|| ManifestError::Build(format!("{} has no parent", target.display())))?;
+impl Extraction<'_> {
+    async fn extract_entry(
+        &self,
+        entry: &ManifestEntry,
+        name: &str,
+        index: usize,
+        progress: Option<&mpsc::Sender<ExtractEvent>>,
+    ) -> EntryStatus {
+        if self.options.cancel.is_cancelled() {
+            return EntryStatus::Cancelled;
+        }
+        if let Some(tx) = progress {
+            let _ = tx
+                .send(ExtractEvent::EntryStarted {
+                    name: name.to_string(),
+                    index,
+                    total: self.total,
+                })
+                .await;
+        }
+        let work = self.download_entry(entry, name, progress);
+        tokio::select! {
+            _ = self.options.cancel.cancelled() => EntryStatus::Cancelled,
+            result = work => match result {
+                Ok(bytes) => EntryStatus::Written { bytes },
+                Err(e) => EntryStatus::Failed { error: e.to_string() },
+            },
+        }
+    }
 
-    // The root map lists every chunk, so its size is the file's real size,
-    // unlike the creator's unverified `size` hint. The download would
-    // resolve the root anyway.
-    let data_map = client
-        .data_map_resolve_root(&resolve_data_map(client, &entry.source).await?)
-        .await?;
-    ensure_space(parent, data_map.original_file_size())?;
+    async fn download_entry(
+        &self,
+        entry: &ManifestEntry,
+        name: &str,
+        progress: Option<&mpsc::Sender<ExtractEvent>>,
+    ) -> Result<u64, ManifestError> {
+        let overwrite = self.options.overwrite;
+        let target = self.root.target(name)?;
+        target.check(overwrite)?;
 
-    let temp = TempBuilder::new()
-        .prefix(TEMP_PREFIX)
-        .tempfile_in(parent)?
-        .into_temp_path();
+        // The root map lists every chunk, so its size is the file's real
+        // size, unlike the creator's unverified `size` hint. The download
+        // would resolve the root anyway.
+        let client = self.client;
+        let data_map = client
+            .data_map_resolve_root(&resolve_data_map(client, &entry.source).await?)
+            .await?;
+        ensure_space(target.parent_path(), data_map.original_file_size())?;
 
-    let download_progress = progress.map(|tx| {
-        let (dl_tx, mut dl_rx) = mpsc::channel(DOWNLOAD_PROGRESS_CAPACITY);
-        let tx = tx.clone();
-        let name = name.to_string();
-        tokio::spawn(async move {
-            while let Some(event) = dl_rx.recv().await {
-                let _ = tx
-                    .send(ExtractEvent::Download {
-                        name: name.clone(),
-                        event,
-                    })
-                    .await;
-            }
-        });
-        dl_tx
-    });
-
-    let bytes = client
-        .file_download_with_progress(&data_map, &temp, download_progress)
-        .await?;
-
-    // Check the creator's recorded SHA-256 before the file takes its name.
-    // On a mismatch the temporary file is dropped, so nothing unverified is
-    // left behind.
-    if let Some(expected) = entry.sha256 {
-        let path = temp.to_path_buf();
-        let actual = tokio::task::spawn_blocking(move || file_sha256(&path))
-            .await
-            .map_err(|e| ManifestError::Build(format!("hashing task failed: {e}")))??;
-        if actual != expected {
-            return Err(ManifestError::Sha256Mismatch {
-                expected: hex::encode(expected),
-                actual: hex::encode(actual),
+        let download_progress = progress.map(|tx| {
+            let (dl_tx, mut dl_rx) = mpsc::channel(DOWNLOAD_PROGRESS_CAPACITY);
+            let tx = tx.clone();
+            let name = name.to_string();
+            tokio::spawn(async move {
+                while let Some(event) = dl_rx.recv().await {
+                    let _ = tx
+                        .send(ExtractEvent::Download {
+                            name: name.clone(),
+                            event,
+                        })
+                        .await;
+                }
             });
-        }
-    }
+            dl_tx
+        });
 
-    // Re-check the parent chain and the target immediately before the
-    // rename; either may have changed while the download ran.
-    verify_parent_chain(&options.output_root, name)?;
-    check_target(&target, options.overwrite)?;
-    let persisted = if options.overwrite {
-        temp.persist(&target)
-    } else {
-        temp.persist_noclobber(&target)
-    };
-    persisted.map_err(|e| ManifestError::Io(e.error))?;
-    Ok(bytes)
+        // Dropping the staged file on any early return, including a
+        // cancellation, removes it.
+        let mut staged = target.stage()?;
+        let mut writer = HashingWriter::new(staged.file()?, entry.sha256.is_some());
+        let bytes = client
+            .file_download_to_writer(&data_map, &mut writer, download_progress)
+            .await?;
+
+        // Check the creator's recorded SHA-256 before the file takes its
+        // name, so nothing unverified is left at the target.
+        if let (Some(expected), Some(actual)) = (entry.sha256, writer.finish()) {
+            if actual != expected {
+                return Err(ManifestError::Sha256Mismatch {
+                    expected: hex::encode(expected),
+                    actual: hex::encode(actual),
+                });
+            }
+        }
+        // The commit syncs the file to disk; keep that off the async workers.
+        tokio::task::block_in_place(|| staged.commit(overwrite))?;
+        Ok(bytes)
+    }
 }
 
-/// SHA-256 of the file at `path`, read in one streaming pass.
-fn file_sha256(path: &Path) -> io::Result<[u8; SHA256_LEN]> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; SHA256_READ_BUFFER];
-    loop {
-        let n = io::Read::read(&mut file, &mut buffer)?;
-        if n == 0 {
-            break;
+/// Writes through to a file, hashing what it writes when asked to, so a
+/// download is checked in the same pass that stores it.
+struct HashingWriter<'a, W> {
+    inner: &'a mut W,
+    hasher: Option<Sha256>,
+}
+
+impl<'a, W: Write> HashingWriter<'a, W> {
+    fn new(inner: &'a mut W, hash: bool) -> Self {
+        Self {
+            inner,
+            hasher: hash.then(Sha256::new),
         }
-        hasher.update(&buffer[..n]);
     }
-    Ok(hasher.finalize().into())
+
+    /// The SHA-256 of everything written, when hashing was asked for.
+    fn finish(self) -> Option<[u8; SHA256_LEN]> {
+        self.hasher.map(|hasher| hasher.finalize().into())
+    }
+}
+
+impl<W: Write> Write for HashingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        if let Some(hasher) = &mut self.hasher {
+            hasher.update(&buf[..written]);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Fail the entry before downloading when `dir`'s filesystem cannot hold
@@ -371,115 +375,27 @@ async fn resolve_data_map(client: &Client, source: &ContentRef) -> Result<DataMa
     }
 }
 
-/// Resolve `name` beneath `root`, creating intermediate directories, with
-/// the containment rules above. Returns the target path, which does not
-/// exist unless `overwrite` is set and it is a regular file.
-pub fn prepare_target(root: &Path, name: &str, overwrite: bool) -> Result<PathBuf, ManifestError> {
-    let mut components = name.split(PATH_SEPARATOR).peekable();
-    let mut current = root.to_path_buf();
-    while let Some(component) = components.next() {
-        current.push(component);
-        if components.peek().is_none() {
-            check_target(&current, overwrite)?;
-            return Ok(current);
-        }
-        ensure_real_directory(&current)?;
-    }
-    Err(ManifestError::Build("empty effective name".to_string()))
-}
-
-/// Confirm, without creating anything or following links, that every
-/// directory component of `name` beneath `root` is still a real directory.
-fn verify_parent_chain(root: &Path, name: &str) -> Result<(), ManifestError> {
-    let mut components = name.split(PATH_SEPARATOR).peekable();
-    let mut current = root.to_path_buf();
-    while let Some(component) = components.next() {
-        if components.peek().is_none() {
-            return Ok(());
-        }
-        current.push(component);
-        let meta = fs::symlink_metadata(&current)?;
-        verify_directory(&current, &meta)?;
-    }
-    Ok(())
-}
-
-fn ensure_real_directory(path: &Path) -> Result<(), ManifestError> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) => verify_directory(path, &meta),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            match fs::create_dir(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e.into()),
-            }
-            let meta = fs::symlink_metadata(path)?;
-            verify_directory(path, &meta)
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn verify_directory(path: &Path, meta: &fs::Metadata) -> Result<(), ManifestError> {
-    if meta.file_type().is_symlink() {
-        return Err(ManifestError::Build(format!(
-            "{} is a symlink; extraction does not follow links inside the output directory",
-            path.display()
-        )));
-    }
-    if !meta.is_dir() {
-        return Err(ManifestError::Build(format!(
-            "{} exists and is not a directory",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn check_target(target: &Path, overwrite: bool) -> Result<(), ManifestError> {
-    match fs::symlink_metadata(target) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(ManifestError::Build(format!(
-                    "{} is a symlink and will not be replaced",
-                    target.display()
-                )));
-            }
-            if !overwrite {
-                return Err(ManifestError::Build(format!(
-                    "{} already exists; pass overwrite to replace it",
-                    target.display()
-                )));
-            }
-            if !meta.is_file() {
-                return Err(ManifestError::Build(format!(
-                    "{} exists and is not a regular file",
-                    target.display()
-                )));
-            }
-            Ok(())
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
     #[test]
-    fn file_sha256_matches_a_one_shot_digest() {
-        let dir = tempfile::tempdir().unwrap();
-        // Spans several read buffers, with a ragged tail.
-        let data: Vec<u8> = (0..(2 * SHA256_READ_BUFFER + 4321))
-            .map(|i| (i % 251) as u8)
-            .collect();
-        let path = dir.path().join("f.bin");
-        fs::write(&path, &data).unwrap();
+    fn hashing_writer_matches_a_one_shot_digest_and_writes_everything() {
+        let data: Vec<u8> = (0..100_003u32).map(|i| (i % 251) as u8).collect();
+        let mut out = Vec::new();
+        let mut writer = HashingWriter::new(&mut out, true);
+        for piece in data.chunks(4096) {
+            writer.write_all(piece).unwrap();
+        }
         let expected: [u8; SHA256_LEN] = Sha256::digest(&data).into();
-        assert_eq!(file_sha256(&path).unwrap(), expected);
+        assert_eq!(writer.finish(), Some(expected));
+        assert_eq!(out, data);
+
+        let mut unhashed = Vec::new();
+        let mut writer = HashingWriter::new(&mut unhashed, false);
+        writer.write_all(&data).unwrap();
+        assert_eq!(writer.finish(), None);
     }
 
     fn entry(path: &str) -> ManifestEntry {
@@ -516,52 +432,5 @@ mod tests {
         let trailing = select_entries(&manifest, &["a/".into()]).unwrap();
         assert_eq!(trailing.len(), 2);
         assert!(select_entries(&manifest, &["zzz".into()]).is_err());
-    }
-
-    #[test]
-    fn prepare_target_creates_directories_and_refuses_existing_file() {
-        let root = tempfile::tempdir().unwrap();
-        let target = prepare_target(root.path(), "x/y/z.txt", false).unwrap();
-        assert_eq!(target, root.path().join("x").join("y").join("z.txt"));
-        assert!(root.path().join("x/y").is_dir());
-        fs::write(&target, b"old").unwrap();
-        assert!(prepare_target(root.path(), "x/y/z.txt", false).is_err());
-        assert!(prepare_target(root.path(), "x/y/z.txt", true).is_ok());
-        // A directory where a file should go is never replaced.
-        assert!(prepare_target(root.path(), "x/y", true).is_err());
-        // A file where a directory should go.
-        assert!(prepare_target(root.path(), "x/y/z.txt/deeper", false).is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn prepare_target_never_follows_symlinks_inside_root() {
-        let outside = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
-
-        // Pre-existing directory symlink at the first level.
-        symlink(outside.path(), root.path().join("safe")).unwrap();
-        let err = prepare_target(root.path(), "safe/file.txt", false).unwrap_err();
-        assert!(err.to_string().contains("symlink"), "{err}");
-        assert!(!outside.path().join("file.txt").exists());
-
-        // Deeper: a real directory containing a symlinked directory.
-        fs::create_dir(root.path().join("real")).unwrap();
-        symlink(outside.path(), root.path().join("real/link")).unwrap();
-        assert!(prepare_target(root.path(), "real/link/f", false).is_err());
-
-        // A symlink at the target itself, with and without overwrite.
-        symlink(outside.path().join("victim"), root.path().join("t.txt")).unwrap();
-        assert!(prepare_target(root.path(), "t.txt", false).is_err());
-        assert!(prepare_target(root.path(), "t.txt", true).is_err());
-        assert!(!outside.path().join("victim").exists());
-
-        // A directory swapped for a symlink after preparation is caught by
-        // the pre-rename check.
-        prepare_target(root.path(), "late/file", false).unwrap();
-        fs::remove_dir(root.path().join("late")).unwrap();
-        symlink(outside.path(), root.path().join("late")).unwrap();
-        assert!(verify_parent_chain(root.path(), "late/file").is_err());
-        assert!(verify_parent_chain(root.path(), "real/f").is_ok());
     }
 }

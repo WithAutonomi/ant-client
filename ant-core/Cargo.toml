@@ -20,6 +20,8 @@ blake3 = "1"
 base64 = "0.22"
 bytes = "1"
 hex = "0.4"
+# Checksums for the frames of an upload journal (ADR-0006).
+crc32fast = "1.5"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
@@ -30,6 +32,8 @@ sha2 = "0.10"
 # Portable WebRTC Direct profile shared with ant-node.
 saorsa-transport = { version = "0.38.2", default-features = false, features = ["webrtc"] }
 thiserror = "2"
+# Full Unicode case folding for the portable manifest path rules (ADR-0006).
+unicase = "2.9"
 # NFC normalisation for the portable manifest path rules (ADR-0006).
 unicode-normalization = "0.1"
 url = "2"
@@ -126,9 +130,12 @@ libc = "0.2"
 # Without this, the musl CI builds fail because the runners lack musl-compatible
 # OpenSSL dev libraries. Not needed on Windows (uses schannel via native-tls).
 openssl = { version = "0.10", features = ["vendored"] }
+# Directory-relative file operations for containment-safe manifest
+# extraction (ADR-0006). Already in the tree through tempfile.
+rustix = { version = "1.1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading"] }
 
 [features]
 # Preserve the existing native ant-core API for ordinary consumers. WASM

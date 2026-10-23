@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 
 use thiserror::Error;
+use unicase::UniCase;
 use unicode_normalization::UnicodeNormalization;
 
 /// The only separator a manifest path may use.
@@ -52,10 +53,19 @@ const RESERVED_DEVICE_NAMES: &[&str] = &[
     "LPT\u{b2}",
     "LPT\u{b3}",
 ];
-/// Lowest non-control character.
-const FIRST_PRINTABLE: char = '\u{20}';
-/// The DEL control character.
-const DELETE: char = '\u{7F}';
+/// Bidirectional embedding, override and isolate controls. They make a name
+/// display differently from what it is, so `invoice\u{202E}fdp.exe` shows as
+/// `invoiceexe.pdf`.
+const BIDI_CONTROLS: &[char] = &[
+    '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}',
+    '\u{2069}',
+];
+/// Code points HFS+ ignores when it compares names, so a name containing
+/// them is the same file as one without.
+const HFS_IGNORABLE_CHARS: &[char] = &[
+    '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+    '\u{202E}', '\u{206A}', '\u{206B}', '\u{206C}', '\u{206D}', '\u{206E}', '\u{206F}', '\u{FEFF}',
+];
 /// Replacement for a forbidden character when reducing a name to a
 /// portable component.
 const COMPONENT_REPLACEMENT: char = '_';
@@ -138,10 +148,7 @@ pub fn validate_component(component: &str) -> Result<(), PathError> {
     if component == "." || component == ".." {
         return Err(PathError::DotComponent(component.to_string()));
     }
-    if let Some(ch) = component
-        .chars()
-        .find(|c| *c < FIRST_PRINTABLE || *c == DELETE || FORBIDDEN_CHARS.contains(c))
-    {
+    if let Some(ch) = component.chars().find(|c| is_forbidden_char(*c)) {
         return Err(PathError::ForbiddenChar {
             component: component.to_string(),
             ch,
@@ -174,7 +181,7 @@ pub fn portable_component(name: &str) -> Option<String> {
     let mut replaced: String = name
         .chars()
         .map(|c| {
-            if c < FIRST_PRINTABLE || c == DELETE || FORBIDDEN_CHARS.contains(&c) {
+            if is_forbidden_char(c) {
                 COMPONENT_REPLACEMENT
             } else {
                 c
@@ -195,21 +202,32 @@ pub fn portable_component(name: &str) -> Option<String> {
     validate_component(&candidate).ok().map(|()| candidate)
 }
 
-/// The key two paths are compared under: NFC normalised, case folded by
-/// uppercasing then lowercasing, and normalised again.
+/// Whether a component may never contain `c`: any Unicode control
+/// character (C0, DEL and C1, which some terminals act on), a bidirectional
+/// control, or a character some platform reserves.
+fn is_forbidden_char(c: char) -> bool {
+    c.is_control() || FORBIDDEN_CHARS.contains(&c) || BIDI_CONTROLS.contains(&c)
+}
+
+/// The key two paths are compared under: without the code points HFS+
+/// ignores, NFC normalised, uppercased, fully case folded, and normalised
+/// again.
 ///
-/// Lowercasing alone leaves pairs a case-insensitive filesystem merges,
-/// because their uppercase forms are equal: `ſ` and `s`, `ς` and `σ`, `ı`
-/// and `i`. Mapping through uppercase first joins them; the final NFC pass
-/// recomposes anything case mapping decomposed. The result rejects at
-/// least everything APFS and NTFS would merge, and possibly a little more.
+/// Each step covers merges the others miss. NTFS compares uppercase forms,
+/// which joins pairs such as `ſ` and `s` or `ς` and `σ`. APFS applies full
+/// Unicode case folding, which joins `ß`, `ẞ` and `ss`; lowercasing the
+/// uppercase form would leave `ẞ` as `ß`. Dropping the ignorable code points
+/// first lets characters on either side of one compose, and the final NFC
+/// pass recomposes anything case mapping decomposed. The result rejects at
+/// least everything APFS, HFS+ and NTFS would merge, and possibly a little
+/// more, such as `ı` and `i`.
 pub fn fold(path: &str) -> String {
-    path.nfc()
-        .collect::<String>()
-        .to_uppercase()
-        .to_lowercase()
-        .nfc()
-        .collect()
+    let significant: String = path
+        .chars()
+        .filter(|c| !HFS_IGNORABLE_CHARS.contains(c))
+        .collect();
+    let upper = significant.nfc().collect::<String>().to_uppercase();
+    UniCase::new(upper).to_folded_case().nfc().collect()
 }
 
 /// Reject duplicate effective names and file-versus-directory conflicts
@@ -393,6 +411,9 @@ mod tests {
             ("\u{3c2}", "\u{3c3}"),
             ("\u{131}", "i"),
             ("stra\u{df}e", "STRASSE"),
+            // APFS folds capital sharp s to `ss` as well.
+            ("stra\u{1e9e}e", "strasse"),
+            ("\u{df}", "\u{1e9e}"),
         ] {
             assert_eq!(
                 check_collisions([a, b]),
@@ -418,5 +439,59 @@ mod tests {
             Err(PathError::PrefixConflict { .. })
         ));
         assert_eq!(check_collisions(["a", "a-b", "ab/c"]), Ok(()));
+    }
+
+    #[test]
+    fn components_reject_c1_and_bidi_controls_but_keep_joiners_and_marks() {
+        for (name, ch) in [
+            ("csi\u{9B}31m", '\u{9B}'),
+            ("next\u{85}line", '\u{85}'),
+            ("invoice\u{202E}fdp.exe", '\u{202E}'),
+            ("isolated\u{2066}name", '\u{2066}'),
+        ] {
+            assert!(
+                matches!(
+                    validate_component(name),
+                    Err(PathError::ForbiddenChar { ch: found, .. }) if found == ch
+                ),
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            portable_component("invoice\u{202E}fdp.exe").as_deref(),
+            Some("invoice_fdp.exe")
+        );
+        // Persian writes ZWNJ inside words, emoji sequences join with ZWJ,
+        // and right-to-left names may carry directional marks.
+        for name in [
+            "می\u{200C}خواهم",
+            "family-\u{1F468}\u{200D}\u{1F469}",
+            "\u{5E9}\u{200F}.txt",
+        ] {
+            assert_eq!(validate_component(name), Ok(()), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn collisions_ignore_the_code_points_hfs_plus_ignores() {
+        for (a, b) in [
+            ("ab", "a\u{200C}b"),
+            ("ab", "\u{FEFF}ab"),
+            ("ab", "a\u{200E}b"),
+            // Composition happens across the ignored code point.
+            ("caf\u{e9}", "cafe\u{200C}\u{301}"),
+        ] {
+            assert!(
+                matches!(check_collisions([a, b]), Err(PathError::Duplicate(_))),
+                "{a:?} / {b:?}"
+            );
+            assert!(
+                matches!(
+                    check_collisions([a, &format!("{b}/child")]),
+                    Err(PathError::PrefixConflict { .. })
+                ),
+                "{a:?} / {b:?}"
+            );
+        }
     }
 }
