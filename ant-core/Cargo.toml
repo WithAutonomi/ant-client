@@ -52,7 +52,9 @@ toml = { version = "0.8" }
 tokio = { version = "1", features = ["sync", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
-zip = { version = "2", optional = true }
+# Release .zip archives are Deflate-only. zip decodes them through flate2, on
+# the backend the `flate2` dependency above selects.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"], optional = true }
 tower-http = { version = "0.6.8", features = ["cors"], optional = true }
 
 # Data operations
