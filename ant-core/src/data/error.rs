@@ -1,5 +1,6 @@
 //! Error types for data operations.
 
+use ant_protocol::evm::Amount;
 use thiserror::Error;
 
 /// Result type alias using the data Error type.
@@ -19,6 +20,20 @@ pub enum Error {
     /// Payment operation failed.
     #[error("payment error: {0}")]
     Payment(String),
+
+    /// The wallet holds fewer payment tokens than the payment needs.
+    ///
+    /// Distinct from [`Error::Payment`] so callers can offer "top up your
+    /// wallet" instead of a generic payment failure. The wallet checks its
+    /// balance before sending anything, so nothing has been paid. A shortfall
+    /// of gas (ETH) is not detected up front and still surfaces as `Payment`.
+    #[error("insufficient funds: wallet has {have} atto, payment needs {need} atto")]
+    InsufficientFunds {
+        /// The wallet's payment-token balance, in atto.
+        have: Amount,
+        /// The payment total, in atto.
+        need: Amount,
+    },
 
     /// Protocol error.
     #[error("protocol error: {0}")]
@@ -252,6 +267,10 @@ impl Error {
             Self::Network(m) => Self::Network(m.clone()),
             Self::Storage(m) => Self::Storage(m.clone()),
             Self::Payment(m) => Self::Payment(m.clone()),
+            Self::InsufficientFunds { have, need } => Self::InsufficientFunds {
+                have: *have,
+                need: *need,
+            },
             Self::Protocol(m) => Self::Protocol(m.clone()),
             Self::RemotePut { address, source } => Self::RemotePut {
                 address: address.clone(),
@@ -326,6 +345,36 @@ pub struct PartialUploadSpend {
     pub gas_cost_wei: u128,
 }
 
+/// evmlib's wording for a wallet whose token balance is below the payment
+/// total (`evmlib::wallet::Error::InsufficientTokensForQuotes`).
+///
+/// This text is the only contract available: ant-protocol does not re-export
+/// that error type, and evmlib's journaled payment API returns it already
+/// rendered as a `String`. `tests/e2e_native_payment.rs` pins it against a real
+/// unfunded wallet, so a change of wording in evmlib fails a test rather than
+/// silently demoting the error back to [`Error::Payment`].
+const INSUFFICIENT_TOKENS: &str = "Insufficient tokens to pay for quotes. Have: ";
+
+impl Error {
+    /// A failed wallet payment: [`Error::InsufficientFunds`] when `message`
+    /// carries the wallet's balance-shortfall report, else [`Error::Payment`].
+    pub(crate) fn from_payment_failure(message: String) -> Self {
+        insufficient_funds(&message).unwrap_or(Self::Payment(message))
+    }
+}
+
+/// Parse evmlib's "Have: {have} atto, need: {need} atto" report out of `message`,
+/// wherever it sits in it (callers prefix their own context).
+fn insufficient_funds(message: &str) -> Option<Error> {
+    let start = message.find(INSUFFICIENT_TOKENS)? + INSUFFICIENT_TOKENS.len();
+    let (have, rest) = message[start..].split_once(" atto, need: ")?;
+    let (need, _) = rest.split_once(" atto")?;
+    Some(Error::InsufficientFunds {
+        have: have.parse().ok()?,
+        need: need.parse().ok()?,
+    })
+}
+
 // ant-node is only linked when the `devnet` feature is on, so the
 // blanket `From` impl follows that gate. LocalDevnet maps node errors
 // to `Error::Network` via this conversion; default builds never see it.
@@ -357,6 +406,56 @@ mod tests {
     fn test_display_payment() {
         let err = Error::Payment("insufficient funds".to_string());
         assert_eq!(err.to_string(), "payment error: insufficient funds");
+    }
+
+    #[test]
+    fn test_display_insufficient_funds() {
+        let err = Error::InsufficientFunds {
+            have: Amount::from(5),
+            need: Amount::from(300),
+        };
+        assert_eq!(
+            err.to_string(),
+            "insufficient funds: wallet has 5 atto, payment needs 300 atto"
+        );
+    }
+
+    #[test]
+    fn payment_failure_with_a_balance_shortfall_is_insufficient_funds() {
+        // As evmlib renders it, bare (the journaled native path) and under the
+        // context each caller adds (the batch, merkle and single-node paths).
+        // `have` exceeds u64 to prove the amounts round-trip as U256.
+        let report = "Insufficient tokens to pay for quotes. \
+                      Have: 18446744073709551616 atto, need: 18446744073709551617 atto";
+        for message in [
+            report.to_string(),
+            format!("Failed to pay for quotes: {report}"),
+            format!("Merkle batch payment failed: {report}"),
+        ] {
+            match Error::from_payment_failure(message.clone()) {
+                Error::InsufficientFunds { have, need } => {
+                    assert_eq!(have, Amount::from(u64::MAX) + Amount::from(1));
+                    assert_eq!(need, Amount::from(u64::MAX) + Amount::from(2));
+                }
+                other => panic!("{message:?} became {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn other_payment_failures_stay_payment_errors_verbatim() {
+        for message in [
+            "Batch payment failed: server returned an error response: nonce too low",
+            "insufficient funds for gas * price + value",
+            // Truncated or malformed reports must not be guessed at.
+            "Insufficient tokens to pay for quotes. Have: 5 atto",
+            "Insufficient tokens to pay for quotes. Have: lots atto, need: 300 atto",
+        ] {
+            match Error::from_payment_failure(message.to_string()) {
+                Error::Payment(m) => assert_eq!(m, message),
+                other => panic!("{message:?} became {other:?}"),
+            }
+        }
     }
 
     #[test]
