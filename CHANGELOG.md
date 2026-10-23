@@ -58,6 +58,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it (`npm update -g @withautonomi/ant`). Self-replacing an npm-managed binary left npm's
   metadata describing a file that was no longer there, so the next `npm update` silently rolled
   the user back.
+- `install.sh` puts `ant` on `PATH`, as `install.ps1` already did on Windows, so `ant --version`
+  works in a new terminal straight after installing (#194). When `INSTALL_DIR` is not already on
+  `PATH` it adds a guarded line to `~/.profile`, to the user's existing bash startup files, to
+  `~/.zshenv` when zsh is installed and to fish's `conf.d` when fish is, and lists each file it
+  changed. `--no-modify-path` or `ANT_NO_MODIFY_PATH=1` (also honoured by `install.ps1`) restores
+  the old print-the-line behaviour. The macOS default install directory moves from
+  `/usr/local/bin`, which is root-owned without Homebrew so the install failed without `sudo`, to
+  `~/.local/bin`, matching Linux. If another `ant` is already on `PATH` — an earlier macOS
+  install in `/usr/local/bin`, or an unrelated program such as Apache Ant — the installer says
+  so, since it may shadow the new one.
 
 ## [0.3.6] - 2026-09-01
 

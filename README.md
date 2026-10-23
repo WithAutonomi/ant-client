@@ -154,7 +154,15 @@ Both installers take the same environment variables:
 |----------|-------------|
 | `ANT_CHANNEL` | Release channel: `stable` (default) or `beta`. See [Beta Programme](#beta-programme). |
 | `ANT_VERSION` | Install one specific version, e.g. `0.3.3`. Overrides `ANT_CHANNEL`. |
-| `INSTALL_DIR` | Where to put the binary. Defaults to `~/.local/bin` on Linux, `/usr/local/bin` on macOS, `%LOCALAPPDATA%\ant\bin` on Windows. |
+| `INSTALL_DIR` | Where to put the binary. Defaults to `~/.local/bin` on Linux and macOS, `%LOCALAPPDATA%\ant\bin` on Windows. |
+| `ANT_NO_MODIFY_PATH` | Set to `1` to stop the installer adding `INSTALL_DIR` to your `PATH`. |
+
+If `INSTALL_DIR` is not already on your `PATH`, the installer adds it, so `ant` works in every new
+terminal. `install.ps1` adds it to your Windows user `PATH`. `install.sh` adds one guarded line to
+`~/.profile`, to whichever of `~/.bash_profile`, `~/.bash_login` and `~/.bashrc` you already have,
+to `~/.zshenv` when zsh is installed and to `conf.d/ant.fish` when fish is, and lists each file it
+changed. To leave your startup files alone, pass `--no-modify-path` (`curl ... | bash -s --
+--no-modify-path`) or set `ANT_NO_MODIFY_PATH=1`.
 
 ### npm
 
