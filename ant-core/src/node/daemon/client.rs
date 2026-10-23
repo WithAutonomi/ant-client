@@ -468,9 +468,10 @@ fn validate_daemon_process(pid: u32) -> bool {
     match std::fs::read(&cmdline_path) {
         Ok(raw) => {
             // /proc/PID/cmdline uses null bytes as separators.
-            // Check that the executable basename ends with "ant" and one
-            // of the arguments is "daemon". This avoids false positives
-            // from processes like "rant" or "phantom-daemon".
+            // Check that the executable basename is exactly "ant" and the
+            // arguments run the daemon. This avoids false positives from
+            // processes like "rant" or "phantom-daemon", and from other `ant`
+            // commands that reuse the PID.
             let args: Vec<String> = raw
                 .split(|&b| b == 0)
                 .filter(|s| !s.is_empty())
@@ -481,8 +482,7 @@ fn validate_daemon_process(pid: u32) -> bool {
                 .and_then(|exe| std::path::Path::new(exe).file_name())
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name == "ant" || name == "ant.exe");
-            let has_daemon_arg = args.iter().any(|a| a == "daemon");
-            exe_matches && has_daemon_arg
+            exe_matches && runs_the_daemon(&args)
         }
         Err(_) => {
             // Without /proc there's no cheap way to inspect the command line
@@ -492,12 +492,50 @@ fn validate_daemon_process(pid: u32) -> bool {
     }
 }
 
-/// Validate that a PID belongs to an ant daemon process by checking its
-/// executable name. macOS has no /proc, and reading another process's
-/// arguments needs `sysctl(KERN_PROCARGS2)` parsing, so this checks the
-/// basename only, as the Windows version does.
-#[cfg(target_os = "macos")]
+/// Whether a command line runs the daemon: `daemon run`, as [`daemon_run_args`] passes to the
+/// detached child (and as a foreground `ant node daemon run` has). Other `ant` commands, including
+/// `daemon start` and `daemon status`, do not match.
+fn runs_the_daemon<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0].as_ref() == "daemon" && pair[1].as_ref() == "run")
+}
+
+/// Validate that a PID belongs to an ant daemon process: its executable is `ant` and its arguments
+/// run the daemon.
+#[cfg(any(target_os = "macos", windows))]
 fn validate_daemon_process(pid: u32) -> bool {
+    executable_is_ant(pid) && arguments_allow_daemon(pid)
+}
+
+/// Whether the process's arguments are the daemon's. `sysinfo` reads them (`KERN_PROCARGS2` on
+/// macOS, the process environment block on Windows).
+///
+/// The arguments of a process owned by another user, or of an elevated process on Windows, can't
+/// be read, and `sysinfo` then reports none. Every real process has at least `argv[0]`, so an
+/// empty list means "unreadable", and the executable-name check alone decides. Calling a live
+/// daemon stale would make `start` launch a second one.
+#[cfg(any(target_os = "macos", windows))]
+fn arguments_allow_daemon(pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::new().with_cmd(UpdateKind::Always),
+    );
+    let Some(process) = system.process(pid) else {
+        return false;
+    };
+    let args = process.cmd();
+    args.is_empty() || runs_the_daemon(args)
+}
+
+/// Whether the process's executable is named `ant`. `proc_pidpath` works for any user's process,
+/// so this holds even where the arguments can't be read.
+#[cfg(target_os = "macos")]
+fn executable_is_ant(pid: u32) -> bool {
     let Some(pid) = pid_to_i32(pid) else {
         return false;
     };
@@ -516,8 +554,10 @@ fn validate_daemon_process(pid: u32) -> bool {
         .is_some_and(|name| name == "ant")
 }
 
+/// Whether the process's executable is named `ant`. `PROCESS_QUERY_LIMITED_INFORMATION` is granted
+/// even for elevated processes, so this holds even where the arguments can't be read.
 #[cfg(windows)]
-fn validate_daemon_process(pid: u32) -> bool {
+fn executable_is_ant(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -826,6 +866,131 @@ mod tests {
     #[test]
     fn validate_rejects_a_live_process_that_is_not_the_daemon() {
         assert!(!validate_daemon_process(std::process::id()));
+    }
+
+    #[test]
+    fn only_daemon_run_is_the_daemon_command() {
+        assert!(runs_the_daemon(&["/usr/bin/ant", "node", "daemon", "run"]));
+        assert!(runs_the_daemon(&[
+            "ant.exe", "node", "daemon", "run", "--port", "8765"
+        ]));
+        for args in [
+            &["ant", "node", "daemon", "start"][..],
+            &["ant", "node", "daemon", "status"],
+            &["ant", "file", "upload", "daemon"],
+            &["ant", "run", "daemon"],
+            &["ant"],
+            &[],
+        ] {
+            assert!(!runs_the_daemon(args), "{args:?} is not the daemon");
+        }
+    }
+
+    /// Test-name filter that selects [`sleep_as_an_ant_named_process`] in a copy of this binary.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    const SLEEPER: &str = "node::daemon::client::tests::sleep_as_an_ant_named_process";
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    const SLEEP_ENV: &str = "ANT_CORE_TEST_SLEEP_AS_ANT";
+
+    /// The body of [`AntNamedProcess`], not a test: ignored, and a no-op unless its environment
+    /// variable is set, so an `--ignored` run returns at once.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    #[ignore = "helper process for AntNamedProcess"]
+    fn sleep_as_an_ant_named_process() {
+        if std::env::var_os(SLEEP_ENV).is_some() {
+            std::thread::sleep(Duration::from_secs(120));
+        }
+    }
+
+    /// A live process whose executable is named `ant`, running `args`: a copy of this test binary
+    /// that sleeps until dropped. libtest reads `args` as more test-name filters, which with
+    /// `--exact` select no other test.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    struct AntNamedProcess {
+        child: std::process::Child,
+        _dir: tempfile::TempDir,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    impl AntNamedProcess {
+        fn spawn(args: &[&str]) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = dir
+                .path()
+                .join(if cfg!(windows) { "ant.exe" } else { "ant" });
+            std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+            let child = std::process::Command::new(&exe)
+                .args(args)
+                .args(["--exact", "--ignored", SLEEPER])
+                .env(SLEEP_ENV, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            Self { child, _dir: dir }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn assert_still_running(&mut self) {
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "the ant-named helper process exited early"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    impl Drop for AntNamedProcess {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn validate_accepts_an_ant_process_running_the_daemon() {
+        let mut process = AntNamedProcess::spawn(&["node", "daemon", "run"]);
+        let pid = process.pid();
+        // The child is visible once spawn returns; the retry only absorbs a slow process table.
+        let accepted = (0..50).any(|_| {
+            validate_daemon_process(pid) || {
+                std::thread::sleep(Duration::from_millis(100));
+                false
+            }
+        });
+        process.assert_still_running();
+        assert!(accepted, "an `ant node daemon run` process is the daemon");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn validate_rejects_another_ant_command_holding_the_pid() {
+        let mut process = AntNamedProcess::spawn(&["file", "upload", "photo.jpg"]);
+        assert!(!validate_daemon_process(process.pid()));
+        process.assert_still_running();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn info_with_a_pid_reused_by_another_ant_command_is_not_running() {
+        let mut process = AntNamedProcess::spawn(&["node", "daemon", "status"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_in(tmp.path());
+        std::fs::write(&config.pid_file_path, process.pid().to_string()).unwrap();
+
+        let info = info(&config);
+        process.assert_still_running();
+        assert!(
+            !info.running,
+            "another `ant` command holding a reused PID must not be reported as the daemon"
+        );
+        assert_eq!(info.pid, Some(process.pid()));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
