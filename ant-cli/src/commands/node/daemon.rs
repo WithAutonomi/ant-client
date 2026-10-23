@@ -48,7 +48,7 @@ pub enum DaemonCommand {
     Stop,
     /// Show whether the daemon is running and summary stats
     Status,
-    /// Output connection details for programmatic use (always JSON)
+    /// Show connection details: PID, port, console and API URLs (add --json for scripts)
     Info,
     /// Run the daemon in the foreground (used internally)
     #[command(hide = true)]

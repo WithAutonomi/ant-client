@@ -523,7 +523,7 @@ Daemon is running
 
 #### `ant node daemon info`
 
-Output connection details as JSON (always JSON, regardless of `--json` flag). AI agents use this to discover the daemon's REST API.
+Show connection details: PID, port, console URL and REST API base. AI agents use `ant node daemon info --json` to discover the daemon's REST API.
 
 ```json
 {
