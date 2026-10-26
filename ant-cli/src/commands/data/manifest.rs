@@ -42,6 +42,10 @@ const YES_ANSWERS: &[&str] = &["y", "yes"];
 const FORCE_QUIT_EXIT_CODE: i32 = 130;
 /// Marks a size in `manifest show` that only the manifest's creator vouches for.
 const CLAIMED_SIZE_MARK: char = '*';
+/// Where a download's default directory is made: the current directory.
+const DEFAULT_DOWNLOAD_PARENT: &str = ".";
+/// First character of a hidden name, which a download never defaults to.
+const HIDDEN_NAME_PREFIX: char = '.';
 
 /// Manifest subcommands.
 #[derive(Subcommand, Debug)]
@@ -143,8 +147,9 @@ pub enum ManifestAction {
         /// A `.ant` file, an `ant://manifest/...` link, or an upload id
         /// from `ant manifest list`.
         source: String,
-        /// Directory to extract into. Defaults to the manifest name, or
-        /// the current directory when it has none.
+        /// Directory to extract into, existing or not. Defaults to a new
+        /// directory named after the manifest, which must not exist yet. A
+        /// manifest without a name, or with a hidden one, needs --output.
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Only extract these entries or directories. Repeatable.
@@ -651,15 +656,39 @@ fn resolve_output(name: Option<&str>, output: Option<PathBuf>) -> anyhow::Result
     Ok(output.unwrap_or_else(|| PathBuf::from(manifest_filename_for(name))))
 }
 
-fn resolve_download_root(manifest: &Manifest, output: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+/// The directory a download extracts into. An `--output` given is used as
+/// it is, existing or not. Without one, a new directory named after the
+/// manifest is made in `parent`. The sender chooses that name, so it never
+/// picks a directory that already exists or a hidden one, such as `~/.ssh`
+/// or `~/.config`, and a manifest without a name needs `--output`. Making
+/// the directory is the check, so nothing can appear there in between.
+fn resolve_download_root(
+    manifest: &Manifest,
+    output: Option<PathBuf>,
+    parent: &Path,
+) -> anyhow::Result<PathBuf> {
     manifest.validate()?;
-    Ok(output.unwrap_or_else(|| {
-        manifest
-            .name
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
-    }))
+    if let Some(output) = output {
+        return Ok(output);
+    }
+    let Some(name) = manifest.name.as_deref() else {
+        anyhow::bail!("this manifest has no name; pass --output to choose where to extract it");
+    };
+    if name.starts_with(HIDDEN_NAME_PREFIX) {
+        anyhow::bail!(
+            "this manifest is named {name:?}, a hidden directory; \
+             pass --output to choose where to extract it"
+        );
+    }
+    let root = parent.join(name);
+    match std::fs::create_dir(&root) {
+        Ok(()) => Ok(root),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => anyhow::bail!(
+            "{} already exists; pass --output {name:?} to extract into it",
+            root.display()
+        ),
+        Err(e) => Err(anyhow::anyhow!("cannot create {}: {e}", root.display())),
+    }
 }
 
 /// `kept` says where the partial manifest is kept, as [`keep_partial`] does.
@@ -951,7 +980,7 @@ async fn download(
     concurrency: NonZeroUsize,
     json: bool,
 ) -> anyhow::Result<()> {
-    let output_root = resolve_download_root(manifest, output)?;
+    let output_root = resolve_download_root(manifest, output, Path::new(DEFAULT_DOWNLOAD_PARENT))?;
     let options = ExtractOptions {
         output_root: output_root.clone(),
         selection,
@@ -1227,32 +1256,57 @@ mod tests {
             };
             assert!(action.execute_offline(false).is_err());
             assert!(resolve_output(Some(name), None).is_err());
-            assert!(resolve_download_root(&manifest, None).is_err());
+            assert!(resolve_download_root(&manifest, None, dir.path()).is_err());
         }
         assert!(!outside.with_extension("ant").exists());
 
-        let valid = Manifest::new(Some("pack".into()));
         assert_eq!(
             resolve_output(Some("pack"), None).unwrap(),
             PathBuf::from("pack.ant")
-        );
-        assert_eq!(
-            resolve_download_root(&valid, None).unwrap(),
-            PathBuf::from("pack")
         );
         let explicit = dir.path().join("chosen/destination");
         assert_eq!(
             resolve_output(Some("pack"), Some(explicit.clone())).unwrap(),
             explicit
         );
+    }
+
+    /// The sender names the manifest, so without --output a download only
+    /// ever extracts into a new directory it has just made.
+    #[test]
+    fn a_download_defaults_only_to_a_new_directory_named_after_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = Manifest::new(Some("pack".into()));
         assert_eq!(
-            resolve_download_root(&valid, Some(explicit.clone())).unwrap(),
-            explicit
+            resolve_download_root(&valid, None, dir.path()).unwrap(),
+            dir.path().join("pack")
         );
-        assert_eq!(
-            resolve_download_root(&Manifest::new(None), None).unwrap(),
-            PathBuf::from(".")
-        );
+        assert!(dir.path().join("pack").is_dir());
+        let error = resolve_download_root(&valid, None, dir.path()).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+
+        // Hidden and unnamed manifests need --output, and nothing is made.
+        for manifest in [
+            Manifest::new(Some(".ssh".into())),
+            Manifest::new(Some(".config".into())),
+            Manifest::new(None),
+        ] {
+            let error = resolve_download_root(&manifest, None, dir.path()).unwrap_err();
+            assert!(error.to_string().contains("--output"), "{error}");
+        }
+        assert!(!dir.path().join(".ssh").exists());
+        assert!(!dir.path().join(".config").exists());
+
+        // An explicit --output is used as it is, existing or not.
+        for output in [dir.path().join("pack"), dir.path().join("chosen/new")] {
+            for manifest in [&valid, &Manifest::new(Some(".ssh".into()))] {
+                assert_eq!(
+                    resolve_download_root(manifest, Some(output.clone()), dir.path()).unwrap(),
+                    output
+                );
+            }
+        }
+        assert!(!dir.path().join("chosen").exists());
     }
 
     #[test]

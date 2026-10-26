@@ -543,6 +543,16 @@ manifest untouched. Entries already referenced by address are unaffected.
 Input: a manifest, an output root, and an optional selection by exact
 effective name or directory prefix. Empty selection means everything.
 
+The output root is the caller's choice. When the CLI is not given one, it
+extracts into a new directory named after the manifest, made in the current
+directory before anything is downloaded; making it is the check. The sender
+chooses that name, and a terminal usually starts in the home directory, so
+a default never lands in a directory that exists already or has a hidden
+name: a manifest named `.ssh` would otherwise plant `authorized_keys`, and
+one named `AppData` a login script on Windows. Such a manifest, and one
+without a name, needs an explicit output directory, which may be any
+directory, existing or not.
+
 Before any network access, every effective name is re-validated against the
 portable path rules. Any violation rejects the manifest.
 
@@ -699,6 +709,9 @@ initial release.
 - Portable path tests, run on Unix and macOS in CI: every rule above,
   positive and negative, including the extended reserved names and the
   case-folding pairs above.
+- Default output tests: without an explicit output, a download makes a new
+  directory named after the manifest and refuses one that exists, a hidden
+  name or no name, making nothing; an explicit output is used as given.
 - Containment tests, run on Unix and macOS in CI: a pre-existing symlink at
   every depth inside the output root causes a per-entry failure and nothing
   is written outside the root; an existing target fails without overwrite
