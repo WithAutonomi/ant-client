@@ -5,7 +5,7 @@
 //! it over saorsa-core's lookup steps and the chunk protocol.
 
 use crate::client_engine::kad_read::{kad_read, KadNetwork, KadReadOutcome, StepAnswer};
-use crate::client_engine::read::RequestDispatched;
+use crate::client_engine::read::{uniform_choice, RequestDispatched};
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::transport::{DHTNode, P2PNode};
@@ -200,7 +200,16 @@ impl Client {
             .find_closest_nodes_local(address, peer_count)
             .await;
         Ok(
-            match kad_read(&network, *address, peer_count, seeds, is_retryable).await? {
+            match kad_read(
+                &network,
+                *address,
+                peer_count,
+                seeds,
+                is_retryable,
+                uniform_choice,
+            )
+            .await?
+            {
                 KadReadOutcome::Found(chunk) => Some(chunk),
                 KadReadOutcome::NotFound => None,
             },
