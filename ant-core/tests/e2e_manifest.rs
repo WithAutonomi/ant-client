@@ -197,8 +197,11 @@ async fn manifest_round_trips_through_file_and_link() {
     assert!(!partial.path().join("a.bin").exists());
     assert!(partial.path().join("docs/b.bin").exists());
 
-    // Existing targets fail per entry without overwrite and nothing else is
-    // touched; with overwrite they are replaced.
+    // Running it again keeps every file that still has its recorded
+    // SHA-256, without downloading it, so a download that stopped can be
+    // continued. The entry added by address records no hash, so its file
+    // fails as existing, and so does a file that differs from its entry;
+    // with overwrite both are replaced.
     let report = extract_manifest(
         &client,
         &from_file,
@@ -207,17 +210,35 @@ async fn manifest_round_trips_through_file_and_link() {
     )
     .await
     .expect("second extract runs");
-    assert_eq!(report.failed(), 4);
-    assert!(report
-        .entries
-        .iter()
-        .all(|e| matches!(&e.status, EntryStatus::Failed { error } if error.contains("exists"))));
-    let mut overwrite = extract_options(out.path(), vec!["a.bin".into()]);
+    assert_eq!(report.present(), 3, "{:?}", report.entries);
+    assert_eq!(report.failed(), 1, "{:?}", report.entries);
+    assert!(report.entries.iter().any(|e| e.name == "extra/extra.bin"
+        && matches!(&e.status, EntryStatus::Failed { error } if error.contains("exists"))));
+    fs::write(out.path().join("a.bin"), b"changed locally").unwrap();
+    let both = vec!["a.bin".into(), "extra/extra.bin".into()];
+    let report = extract_manifest(
+        &client,
+        &from_file,
+        &extract_options(out.path(), both.clone()),
+        None,
+    )
+    .await
+    .expect("third extract runs");
+    assert_eq!(report.failed(), 2, "{:?}", report.entries);
+    assert_eq!(
+        fs::read(out.path().join("a.bin")).unwrap(),
+        b"changed locally"
+    );
+    let mut overwrite = extract_options(out.path(), both);
     overwrite.overwrite = true;
     let report = extract_manifest(&client, &from_file, &overwrite, None)
         .await
         .expect("overwrite extract");
-    assert_eq!(report.written(), 1);
+    assert_eq!(report.written(), 2, "{:?}", report.entries);
+    assert_eq!(
+        fs::read(out.path().join("a.bin")).unwrap(),
+        vec![0x11u8; FILE_BYTES]
+    );
 
     drop(client);
     testnet.teardown().await;

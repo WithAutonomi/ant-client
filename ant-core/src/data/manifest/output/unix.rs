@@ -112,6 +112,12 @@ impl Dir {
         Ok(File::from(openat(&self.fd, name, flags, new_file_mode())?))
     }
 
+    /// Open the file `name` for reading, failing if it is a link.
+    pub(super) fn open_file(&self, name: &str) -> io::Result<File> {
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        Ok(File::from(openat(&self.fd, name, flags, Mode::empty())?))
+    }
+
     /// Rename `from` to `to` in this directory, failing if `to` exists.
     pub(super) fn rename_noreplace(&self, from: &str, to: &str) -> io::Result<()> {
         #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]

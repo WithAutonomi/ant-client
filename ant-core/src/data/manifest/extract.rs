@@ -6,9 +6,11 @@
 //! nothing that changes while an entry downloads can redirect where it is
 //! written (see the `output` module). The file is written through a
 //! temporary name in its parent and renamed into place without replacing
-//! anything. An existing target is a per-entry failure unless overwrite was
-//! requested, and even then only a regular file this extraction did not
-//! write is replaced.
+//! anything. A regular file already at a target with the entry's recorded
+//! SHA-256 is kept as that entry, so an extraction that stopped part way can
+//! be run again. Any other existing target is a per-entry failure unless
+//! overwrite was requested, and even then only a regular file this
+//! extraction did not write is replaced.
 
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
@@ -84,6 +86,12 @@ pub enum EntryStatus {
         /// Bytes written.
         bytes: u64,
     },
+    /// Already at its target with the entry's recorded SHA-256, as an
+    /// earlier run left it. Nothing was downloaded or written.
+    Present {
+        /// Bytes of the file.
+        bytes: u64,
+    },
     /// Failed; nothing was left at the target.
     Failed {
         /// The error.
@@ -113,6 +121,11 @@ impl ExtractReport {
     /// Entries written.
     pub fn written(&self) -> usize {
         self.count(|s| matches!(s, EntryStatus::Written { .. }))
+    }
+
+    /// Entries already present.
+    pub fn present(&self) -> usize {
+        self.count(|s| matches!(s, EntryStatus::Present { .. }))
     }
 
     /// Entries that failed.
@@ -250,7 +263,7 @@ impl Extraction<'_> {
         tokio::select! {
             _ = self.options.cancel.cancelled() => EntryStatus::Cancelled,
             result = work => match result {
-                Ok(bytes) => EntryStatus::Written { bytes },
+                Ok(status) => status,
                 Err(e) => EntryStatus::Failed { error: e.to_string() },
             },
         }
@@ -261,9 +274,15 @@ impl Extraction<'_> {
         entry: &ManifestEntry,
         name: &str,
         progress: Option<&mpsc::Sender<ExtractEvent>>,
-    ) -> Result<u64, ManifestError> {
+    ) -> Result<EntryStatus, ManifestError> {
         let overwrite = self.options.overwrite;
         let target = self.root.target(name)?;
+        // Hashing a large file blocks, so keep it off the async workers.
+        if let Some(expected) = &entry.sha256 {
+            if let Some(bytes) = tokio::task::block_in_place(|| target.identical(expected))? {
+                return Ok(EntryStatus::Present { bytes });
+            }
+        }
         target.check(overwrite)?;
 
         // The root map lists every chunk, so its size is the file's real
@@ -312,7 +331,7 @@ impl Extraction<'_> {
         }
         // The commit syncs the file to disk; keep that off the async workers.
         tokio::task::block_in_place(|| staged.commit(overwrite))?;
-        Ok(bytes)
+        Ok(EntryStatus::Written { bytes })
     }
 }
 

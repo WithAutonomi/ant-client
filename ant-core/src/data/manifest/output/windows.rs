@@ -131,6 +131,14 @@ impl Dir {
             .open(self.path.join(name))
     }
 
+    /// Open the file `name` for reading, as the link itself if it is one.
+    pub(super) fn open_file(&self, name: &str) -> io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(self.path.join(name))
+    }
+
     /// Rename `from` to `to` in this directory, failing if `to` exists.
     pub(super) fn rename_noreplace(&self, from: &str, to: &str) -> io::Result<()> {
         TempPath::try_from_path(self.path.join(from))?

@@ -21,7 +21,10 @@
 //! overwrite was requested and it is a regular file this extraction did not
 //! write. The last rule means two entries that a filesystem treats as one
 //! name, such as a long name and its Windows 8.3 alias, never end as one
-//! file: the second fails instead of silently replacing the first.
+//! file: the second fails instead of silently replacing the first. A regular
+//! file already at a target with the entry's SHA-256 is that entry, as an
+//! earlier run left it, and is kept; the same rule keeps one file from
+//! counting for two entries.
 
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -29,8 +32,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
+use sha2::{Digest, Sha256};
+
 use super::path::PATH_SEPARATOR;
-use super::ManifestError;
+use super::{ManifestError, SHA256_LEN};
 
 #[cfg(test)]
 use std::io::Write;
@@ -144,6 +149,44 @@ impl Target<'_> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         self.existing(overwrite, &written).map(|_| ())
+    }
+
+    /// The length of the regular file already at the target when its
+    /// SHA-256 is `expected`: the entry is there already and needs no
+    /// download. A file this extraction already counted, under this name or
+    /// another the filesystem treats as the same, does not count again.
+    pub(super) fn identical(
+        &self,
+        expected: &[u8; SHA256_LEN],
+    ) -> Result<Option<u64>, ManifestError> {
+        let Some(Entry {
+            kind: EntryKind::File,
+            identity,
+        }) = self.dir().entry(&self.file_name)?
+        else {
+            return Ok(None);
+        };
+        let mut file = self.dir().open_file(&self.file_name)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        let mut hasher = Sha256::new();
+        io::copy(&mut file, &mut hasher)?;
+        if hasher.finalize().as_slice() != expected {
+            return Ok(None);
+        }
+        if let Some(identity) = identity {
+            let mut written = self
+                .root
+                .written
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !written.insert(identity) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(metadata.len()))
     }
 
     /// Create the temporary file the entry is downloaded into.
@@ -356,6 +399,31 @@ mod tests {
     }
 
     #[test]
+    fn a_file_with_the_entry_hash_is_kept_and_counts_once() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("kept.bin"), b"earlier run").unwrap();
+        let root = OutputRoot::open(dir.path()).unwrap();
+        let hash: [u8; SHA256_LEN] = Sha256::digest(b"earlier run").into();
+        let target = root.target("kept.bin").unwrap();
+        assert_eq!(target.identical(&[0; SHA256_LEN]).unwrap(), None);
+        assert_eq!(target.identical(&hash).unwrap(), Some(11));
+        // Counted once: a second entry for the same file is refused.
+        assert_eq!(target.identical(&hash).unwrap(), None);
+        assert!(target.check(true).is_err());
+        assert_eq!(
+            fs::read(dir.path().join("kept.bin")).unwrap(),
+            b"earlier run"
+        );
+        assert_eq!(
+            root.target("missing.bin")
+                .unwrap()
+                .identical(&hash)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn a_staged_file_that_is_not_committed_is_removed() {
         let dir = tempfile::tempdir().unwrap();
         let root = OutputRoot::open(dir.path()).unwrap();
@@ -413,6 +481,7 @@ mod tests {
         // A symlink at the target itself, with and without overwrite.
         symlink(outside.path().join("victim"), dir.path().join("t.txt")).unwrap();
         let target = root.target("t.txt").unwrap();
+        assert_eq!(target.identical(&[0; SHA256_LEN]).unwrap(), None);
         assert!(target.check(false).is_err());
         assert!(target.check(true).is_err());
         assert!(!outside.path().join("victim").exists());

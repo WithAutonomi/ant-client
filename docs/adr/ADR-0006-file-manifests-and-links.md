@@ -551,7 +551,11 @@ a default never lands in a directory that exists already or has a hidden
 name: a manifest named `.ssh` would otherwise plant `authorized_keys`, and
 one named `AppData` a login script on Windows. Such a manifest, and one
 without a name, needs an explicit output directory, which may be any
-directory, existing or not.
+directory, existing or not. A download that stops can be run again: the CLI
+records the directory it made under `<data dir>/downloads/`, keyed by a hash
+of the manifest and the directory's path, until every entry is in place, and
+a re-run of the same download continues into it. The sender cannot make that
+record, so it does not let a name pick an existing directory.
 
 Before any network access, every effective name is re-validated against the
 portable path rules. Any violation rejects the manifest.
@@ -584,7 +588,12 @@ directory is created, or confirmed to be a real directory, as it is opened.
 The file is downloaded into a temporary name in its parent and renamed into
 place without replacing anything (an atomic no-replace rename where the
 filesystem has one, otherwise a hard link, otherwise a check just before the
-rename). An entry whose path would traverse a link, or whose target already
+rename). A regular file already at the target with the entry's recorded
+`sha256` is that entry, as an earlier run left it: it is kept and reported
+as present, and nothing is downloaded, so an extraction that stopped can be
+run again. A file the same extraction has already counted, under that name
+or another the filesystem treats as the same, does not count twice. Any
+other entry whose path would traverse a link, or whose target already
 exists, is a per-entry failure unless overwrite was requested. Even then only
 a regular file is replaced, never a link, and never a file this extraction
 already wrote: two entries that a filesystem treats as one name, such as a
@@ -608,7 +617,7 @@ embedded root map provides one. Extracted files get the platform's default
 permissions.
 
 A bounded number of entries are in flight at once, one by default. Results
-are per entry: written, failed with its error, or cancelled. One failure does
+are per entry: written, already present, failed with its error, or cancelled. One failure does
 not abort the rest. The operation reports progress at manifest and file level
 and accepts a cancellation token; cancelling abandons the in-flight download
 and marks every unstarted entry cancelled.
@@ -666,8 +675,10 @@ initial release.
 - A link's embedded entries carry the shrunk map, so a recipient of a large
   file fetches its wrapper records before its data, which a `.ant` file
   with the root map avoids.
-- Existing files in the output directory are never reused; a re-download
-  fails per entry or overwrites on request.
+- An existing file in the output directory is reused only when it has its
+  entry's recorded `sha256`. An entry without one, such as an entry added by
+  address, fails per entry when its file exists, or is downloaded again with
+  overwrite.
 - A new format is a new compatibility surface; the version byte and the
   forward-compatibility rules bound it.
 
@@ -710,8 +721,10 @@ initial release.
   positive and negative, including the extended reserved names and the
   case-folding pairs above.
 - Default output tests: without an explicit output, a download makes a new
-  directory named after the manifest and refuses one that exists, a hidden
-  name or no name, making nothing; an explicit output is used as given.
+  directory named after the manifest and records it; the same download
+  continues into it, while another manifest of that name, or this one once
+  its record is gone, is refused; a hidden name or no name is refused,
+  making nothing; an explicit output is used as given.
 - Containment tests, run on Unix and macOS in CI: a pre-existing symlink at
   every depth inside the output root causes a per-entry failure and nothing
   is written outside the root; an existing target fails without overwrite
@@ -720,7 +733,9 @@ initial release.
   elsewhere while an entry downloads cannot redirect the file; a name that
   appears during the download is not replaced; overwrite never replaces a
   file the same extraction wrote under another name (simulated with a hard
-  link); an abandoned temporary file is removed. The Windows implementation
+  link); an abandoned temporary file is removed; a file with the entry's
+  hash is kept and counts once, and a link at the target never counts. The
+  Windows implementation
   is type-checked and linted for `x86_64-pc-windows-msvc`, but CI has no
   Windows test runner. Junction tests are to be added with one.
 - Upload journal tests: a journal left behind lists as an interrupted record
@@ -748,7 +763,10 @@ initial release.
 - End-to-end on a local network: build a manifest with an embedded entry, a
   compact entry and an entry added by address; extract it from a `.ant` file
   and from a manifest link; extract a selection; verify bytes and per-entry
-  results; download a file link through the ordinary file download.
+  results; run it again into the same directory, where every file with its
+  recorded hash is kept without a download, while a file without one, or
+  one that differs from its entry, fails until overwrite replaces it;
+  download a file link through the ordinary file download.
 - Review trigger: any new `ContentRef` variant, or any change to the header,
   path rules or containment contract, requires an amending or superseding
   ADR.
