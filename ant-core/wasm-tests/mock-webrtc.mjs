@@ -22,7 +22,8 @@ export async function closesSettled() {
 // Reset for each test. Only browser-owned RTC objects are mocked; all node
 // responses use the shared Rust wire contract and real session encryption.
 // ICE gathering completes `gatheringMs` after setLocalDescription; Infinity
-// never completes.
+// never completes. A node with `iceUnreachable` never answers ICE checks, so its
+// connection stays "checking" and its channels never open.
 export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
   const connections = [];
   const requests = [];
@@ -109,6 +110,7 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
 
   globalThis.RTCPeerConnection = class {
     connectionState = "new";
+    iceConnectionState = "new";
     iceGatheringState = "new";
     constructor() {
       connections.push(this);
@@ -150,6 +152,8 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
     }
     async setRemoteDescription(remote) {
       this.remoteSeed = Number(remote.sdp.match(/m=application (\d+)/)[1]) - 24_000;
+      this.iceConnectionState = "checking";
+      if (nodes[this.remoteSeed - 1].iceUnreachable) return;
       await this.prepareChannel(this.channel);
     }
     async prepareChannel(channel) {
@@ -157,6 +161,8 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
       channel.options = nodes[this.remoteSeed - 1];
       if (channel.options.connectErrorDelay) await new Promise(resolve => setTimeout(resolve, channel.options.connectErrorDelay));
       if (channel.options.connectError) throw new Error(channel.options.connectError);
+      // ICE finds a path before DTLS and SCTP, which `connectDelay` stands for.
+      if (this.iceConnectionState === "checking") this.iceConnectionState = "connected";
       channel.server = new BrowserTestNode(
         this.remoteSeed,
         channel.options.alreadyStored ?? false,
@@ -189,6 +195,7 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
       this.closed = true;
       // Browsers report closed at once, without a connectionstatechange event.
       this.connectionState = "closed";
+      this.iceConnectionState = "closed";
       for (const channel of this.channels) channel.close();
     }
   };

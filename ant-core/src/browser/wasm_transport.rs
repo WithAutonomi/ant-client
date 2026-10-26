@@ -29,7 +29,7 @@ use ant_protocol::transport::{
 };
 use futures_channel::oneshot;
 use futures_util::{
-    future::{join_all, select, Either},
+    future::{join_all, pending, select, Either},
     lock::{Mutex, MutexGuard},
     stream::FuturesUnordered,
 };
@@ -53,8 +53,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelState,
-    RtcDataChannelType, RtcIceGatheringState, RtcPeerConnection, RtcPeerConnectionState,
-    RtcSdpType, RtcSessionDescriptionInit,
+    RtcDataChannelType, RtcIceConnectionState, RtcIceGatheringState, RtcPeerConnection,
+    RtcPeerConnectionState, RtcSdpType, RtcSessionDescriptionInit,
 };
 
 const REQUEST_TIMEOUT_MS: u32 = 10_000;
@@ -77,6 +77,14 @@ const CONNECTION_SETUP_TIMEOUT_MS: u32 = 30_000;
 const ICE_GATHERING_TURN_TIMEOUT: Duration = Duration::from_secs(1);
 /// How often the holder of the gathering turn checks whether its gathering completed.
 const ICE_GATHERING_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How long a new connection waits for ICE to find a path to its endpoint. On
+/// mainnet a live node answers ICE checks in about a tenth of a second (p99
+/// 1.4 s, slowest 2.7 s of 788). About two in five endpoints that lookups dial
+/// never answer, and each used to hold a pool slot, and keep its lookup round
+/// waiting, for the whole channel-opening timeout.
+const ICE_CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(3);
+/// Dial failure of an endpoint that did not answer ICE checks in time.
+const ICE_UNREACHABLE: &str = "WebRTC endpoint did not answer ICE connectivity checks";
 const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 // Retain useful associations across concurrent close-group walks. Active leases
 // remain non-evictable, and the pool still imposes a hard resource bound.
@@ -722,6 +730,15 @@ impl PeerAssociation {
         }
     }
 
+    /// ICE has found no path to the peer yet. A browser without
+    /// `iceConnectionState` never reports that.
+    fn awaits_connectivity(&self) -> bool {
+        matches!(
+            self.connection.ice_connection_state(),
+            RtcIceConnectionState::New | RtcIceConnectionState::Checking
+        )
+    }
+
     /// Reuse the association only while another lane still uses it. A
     /// channel this client has retired may still read "open", and reusing its
     /// association could put a new channel on a dead SCTP association without
@@ -927,11 +944,28 @@ impl Connection {
                 .map_err(js_error_message)?;
         }
 
+        let opened = async move {
+            open_rx
+                .await
+                .map_err(|_| "WebRTC DataChannel closed before opening".to_string())?
+        };
+        // A live endpoint answers ICE checks well within the connectivity
+        // timeout, so a new dial to one that has not fails then, rather than
+        // at the opening timeout.
+        let unreachable = async {
+            if fresh {
+                crate::runtime::sleep(ICE_CONNECTIVITY_TIMEOUT).await;
+                if connection.peer_connection.awaits_connectivity() {
+                    return Err(ICE_UNREACHABLE.to_string());
+                }
+            }
+            pending().await
+        };
         timeout(
-            async move {
-                open_rx
-                    .await
-                    .map_err(|_| "WebRTC DataChannel closed before opening".to_string())?
+            async {
+                match select(Box::pin(opened), Box::pin(unreachable)).await {
+                    Either::Left((result, _)) | Either::Right((result, _)) => result,
+                }
             },
             "WebRTC DataChannel opening timed out",
         )
