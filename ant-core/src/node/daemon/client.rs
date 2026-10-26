@@ -67,14 +67,28 @@ pub async fn stop(config: &DaemonConfig) -> Result<DaemonStopResult> {
         return Ok(DaemonStopResult { pid });
     }
 
-    if !is_confirmed_daemon(config, pid) {
-        // PID is alive but isn't our daemon — clean up stale files without killing
-        let _ = std::fs::remove_file(&config.pid_file_path);
-        let _ = std::fs::remove_file(&config.port_file_path);
-        return Err(Error::DaemonStopFailed(format!(
-            "PID {pid} is alive but does not appear to be the ant daemon (possible PID reuse). \
-             Stale PID file removed."
-        )));
+    match confirm_daemon(config, pid) {
+        Confirmation::Daemon => {}
+        Confirmation::NotDaemon => {
+            // PID is alive but isn't our daemon — clean up stale files without killing
+            let _ = std::fs::remove_file(&config.pid_file_path);
+            let _ = std::fs::remove_file(&config.port_file_path);
+            return Err(Error::DaemonStopFailed(format!(
+                "PID {pid} is alive but does not appear to be the ant daemon (possible PID \
+                 reuse). Stale PID file removed."
+            )));
+        }
+        // Neither signal a process that may not be the daemon, nor delete the files of one that
+        // may be.
+        Confirmation::Inconclusive(reason) => {
+            return Err(Error::DaemonStopFailed(format!(
+                "cannot tell whether PID {pid} is the ant daemon: {reason}. Nothing was \
+                 signalled or removed. If it is the daemon, stop that process directly; if not, \
+                 delete {} and {}",
+                config.pid_file_path.display(),
+                config.port_file_path.display()
+            )));
+        }
     }
 
     send_terminate(pid);
@@ -442,7 +456,9 @@ pub async fn stop_all_nodes(config: &DaemonConfig) -> Result<StopNodeResult> {
 /// Reads the PID and port files. `running` is true only if the recorded PID is a live process
 /// confirmed as the daemon, since a PID left behind by a daemon that died may have been reused.
 /// The process confirms itself by running `ant node daemon run`; failing that, the daemon's API on
-/// the recorded port must report the PID. `pid` and `port` are reported as recorded either way.
+/// the recorded port must report the PID. A process that can't be confirmed either way is not
+/// reported as running, but nothing is changed. `pid` and `port` are reported as recorded either
+/// way.
 pub fn info(config: &DaemonConfig) -> DaemonInfo {
     let recorded = recorded_daemon(config);
     let port = read_port_file(&config.port_file_path);
@@ -490,7 +506,7 @@ enum ProcessIdentity {
     /// An `ant` executable whose arguments don't show that it is the daemon. They are another
     /// command line, such as another `ant` command or a foreground daemon started behind global
     /// options, or they can't be read: a process owned by another user, an elevated one on
-    /// Windows, or no `/proc`. [`is_confirmed_daemon`] asks the daemon's API instead.
+    /// Windows, or no `/proc`. [`confirm_daemon`] asks the daemon's API instead.
     Unconfirmed,
 }
 
@@ -538,12 +554,19 @@ fn process_identity(pid: u32) -> ProcessIdentity {
     identity_from(executable_is_ant, Some(args.as_slice()))
 }
 
-/// Whether an executable path names the `ant` binary. The basename must be exactly `ant` or
-/// `ant.exe`, which rules out processes like `rant`.
+/// Whether an executable path names the `ant` binary. The basename must be `ant` or `ant.exe`,
+/// which rules out processes like `rant`. Windows file names are case-insensitive, so there
+/// `ANT.EXE` and `Ant.exe` count too.
 fn is_ant_executable_name(exe: &Path) -> bool {
     exe.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "ant" || name == "ant.exe")
+        .is_some_and(|name| {
+            if cfg!(windows) {
+                name.eq_ignore_ascii_case("ant") || name.eq_ignore_ascii_case("ant.exe")
+            } else {
+                name == "ant" || name == "ant.exe"
+            }
+        })
 }
 
 /// Identify a process from its executable name and its arguments.
@@ -571,58 +594,121 @@ fn process_args(pid: u32) -> Option<Vec<std::ffi::OsString>> {
     (!args.is_empty()).then(|| args.to_vec())
 }
 
+/// What can be said about whether a live process is the daemon that `config`'s files record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Confirmation {
+    /// It is the daemon.
+    Daemon,
+    /// It is not: its executable isn't `ant`, or the daemon's API answers with another PID.
+    NotDaemon,
+    /// It can't be told either way: an `ant` process whose arguments don't show it is the daemon,
+    /// and no daemon API answered. The text says why. Nothing may be deleted or signalled on this
+    /// basis, since a live daemon whose API was briefly slow would lose its files.
+    Inconclusive(String),
+}
+
 /// Whether the live process `pid` is the daemon that `config`'s files record.
 ///
-/// The process's own details settle it when they can (see [`ProcessIdentity`]). An
-/// [`Unconfirmed`](ProcessIdentity::Unconfirmed) `ant` process counts only if the daemon's API, on
-/// the recorded port, reports that PID.
-fn is_confirmed_daemon(config: &DaemonConfig, pid: u32) -> bool {
+/// The process's own details settle it when they can (see [`ProcessIdentity`]). For an
+/// [`Unconfirmed`](ProcessIdentity::Unconfirmed) `ant` process, the daemon's API on the recorded
+/// port decides: our PID is the daemon, another PID is not, and no answer is inconclusive.
+fn confirm_daemon(config: &DaemonConfig, pid: u32) -> Confirmation {
     match process_identity(pid) {
-        ProcessIdentity::Daemon => true,
-        ProcessIdentity::Other => false,
-        ProcessIdentity::Unconfirmed => daemon_api_reports_pid(&config.port_file_path, pid),
+        ProcessIdentity::Daemon => Confirmation::Daemon,
+        ProcessIdentity::Other => Confirmation::NotDaemon,
+        ProcessIdentity::Unconfirmed => match daemon_api_pid(config) {
+            Ok(api_pid) if api_pid == pid => Confirmation::Daemon,
+            Ok(_) => Confirmation::NotDaemon,
+            Err(reason) => Confirmation::Inconclusive(format!(
+                "it is an `ant` process whose arguments don't show it is the daemon, and {reason}"
+            )),
+        },
     }
 }
 
-/// Whether the daemon API on the port recorded in `port_file` reports `pid` as its PID
-/// (`GET /api/v1/status`).
+/// The PID the daemon's API reports (`GET /api/v1/status`) on the port in `config`'s port file,
+/// or why no API answered.
 ///
-/// A dead daemon's port has nothing listening on it, or something that isn't the daemon. This is a
-/// blocking local request with one-second timeouts, made only for an unconfirmed process.
-fn daemon_api_reports_pid(port_file: &Path, pid: u32) -> bool {
-    use std::io::{Read, Write};
-
-    let Some(port) = read_port_file(port_file) else {
-        return false;
+/// Tries the address the daemon was configured to listen on, then both loopbacks, since the
+/// daemon may have been started with another `--listen-addr` than this call's config. These are
+/// blocking local requests with one-second timeouts, made only for an unconfirmed process.
+fn daemon_api_pid(config: &DaemonConfig) -> std::result::Result<u32, String> {
+    let Some(port) = read_port_file(&config.port_file_path) else {
+        return Err(format!(
+            "{} holds no port to ask its API on",
+            config.port_file_path.display()
+        ));
     };
-    let timeout = Duration::from_secs(1);
-    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
-    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
-        return false;
-    };
-    let request = format!(
-        "GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
-    let mut response = Vec::new();
-    stream.set_read_timeout(Some(timeout)).is_ok()
-        && stream.set_write_timeout(Some(timeout)).is_ok()
-        && stream.write_all(request.as_bytes()).is_ok()
-        && stream.take(64 * 1024).read_to_end(&mut response).is_ok()
-        && status_response_reports_pid(&response, pid)
+    let mut failures = Vec::new();
+    for ip in api_addresses(config.listen_addr) {
+        let addr = std::net::SocketAddr::new(ip, port);
+        match query_status_pid(addr) {
+            Ok(pid) => return Ok(pid),
+            Err(e) => failures.push(format!("{addr}: {e}")),
+        }
+    }
+    Err(format!("no daemon API answered ({})", failures.join("; ")))
 }
 
-/// Whether a raw HTTP response is a `200` whose [`DaemonStatus`] body reports `pid`.
-fn status_response_reports_pid(response: &[u8], pid: u32) -> bool {
-    let Some(end_of_head) = response.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return false;
+/// The addresses to look for the daemon's API on: the configured listen address, with an
+/// unspecified one (`0.0.0.0`, `::`) replaced by the loopback of its family, then both loopbacks.
+fn api_addresses(listen_addr: std::net::IpAddr) -> Vec<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let configured = match listen_addr {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
     };
+    let mut addresses = vec![configured];
+    for loopback in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        if !addresses.contains(&loopback) {
+            addresses.push(loopback);
+        }
+    }
+    addresses
+}
+
+/// Ask the daemon API at `addr` for its status and return the PID it reports.
+fn query_status_pid(addr: std::net::SocketAddr) -> std::result::Result<u32, String> {
+    use std::io::{Read, Write};
+
+    let timeout = Duration::from_secs(1);
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|e| format!("could not connect: {e}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .map_err(|e| e.to_string())?;
+    let request =
+        format!("GET /api/v1/status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("request failed: {e}"))?;
+    let mut response = Vec::new();
+    stream
+        .take(64 * 1024)
+        .read_to_end(&mut response)
+        .map_err(|e| format!("no response: {e}"))?;
+    status_response_pid(&response).ok_or_else(|| "the answer was not a daemon status".to_string())
+}
+
+/// The PID in a raw HTTP response that is a `200` carrying a [`DaemonStatus`].
+fn status_response_pid(response: &[u8]) -> Option<u32> {
+    let end_of_head = response.windows(4).position(|w| w == b"\r\n\r\n")?;
     let status_code = std::str::from_utf8(&response[..end_of_head])
         .ok()
         .and_then(|head| head.lines().next())
         .and_then(|status_line| status_line.split_whitespace().nth(1));
-    status_code == Some("200")
-        && serde_json::from_slice::<DaemonStatus>(&response[end_of_head + 4..])
-            .is_ok_and(|status| status.pid == Some(pid))
+    if status_code != Some("200") {
+        return None;
+    }
+    serde_json::from_slice::<DaemonStatus>(&response[end_of_head + 4..])
+        .ok()?
+        .pid
 }
 
 /// Whether the process's executable is named `ant`. `proc_pidpath` works for any user's process,
@@ -641,10 +727,7 @@ fn executable_is_ant(pid: u32) -> bool {
         return false;
     }
     let path = String::from_utf8_lossy(&buf[..len]);
-    std::path::Path::new(path.as_ref())
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "ant")
+    is_ant_executable_name(Path::new(path.as_ref()))
 }
 
 /// Whether the process's executable is named `ant`. `PROCESS_QUERY_LIMITED_INFORMATION` is granted
@@ -670,11 +753,7 @@ fn executable_is_ant(pid: u32) -> bool {
             return false;
         }
         let path = String::from_utf16_lossy(&buf[..size as usize]);
-        // Check the executable basename, not just substring
-        std::path::Path::new(&path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .is_some_and(|name| name == "ant")
+        is_ant_executable_name(Path::new(&path))
     }
 }
 
@@ -718,7 +797,7 @@ fn read_pid_file(path: &Path) -> Result<u32> {
 }
 
 /// What the PID file says about the daemon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RecordedDaemon {
     /// No readable PID file.
     Absent,
@@ -727,13 +806,18 @@ enum RecordedDaemon {
     /// The daemon exited without removing its files (a reboot, an OOM kill, SIGKILL). The
     /// recorded PID is now dead, or belongs to an unrelated process.
     Stale(u32),
+    /// The recorded PID is a live process that can't be confirmed or ruled out as the daemon
+    /// ([`Confirmation::Inconclusive`]). Its files must be left alone.
+    Unverified { pid: u32, reason: String },
 }
 
 impl RecordedDaemon {
-    fn pid(self) -> Option<u32> {
+    fn pid(&self) -> Option<u32> {
         match self {
             RecordedDaemon::Absent => None,
-            RecordedDaemon::Live(pid) | RecordedDaemon::Stale(pid) => Some(pid),
+            RecordedDaemon::Live(pid)
+            | RecordedDaemon::Stale(pid)
+            | RecordedDaemon::Unverified { pid, .. } => Some(*pid),
         }
     }
 }
@@ -742,15 +826,18 @@ impl RecordedDaemon {
 ///
 /// A live PID is not enough on its own: the files outlive an unclean exit, and after a reboot the
 /// PID is often reused by an unrelated process. The process must also be confirmed as the daemon
-/// ([`is_confirmed_daemon`]), the same test `stop` applies before signalling it.
+/// ([`confirm_daemon`]), the same test `stop` applies before signalling it.
 fn recorded_daemon(config: &DaemonConfig) -> RecordedDaemon {
     let Ok(pid) = read_pid_file(&config.pid_file_path) else {
         return RecordedDaemon::Absent;
     };
-    if is_process_alive(pid) && is_confirmed_daemon(config, pid) {
-        RecordedDaemon::Live(pid)
-    } else {
-        RecordedDaemon::Stale(pid)
+    if !is_process_alive(pid) {
+        return RecordedDaemon::Stale(pid);
+    }
+    match confirm_daemon(config, pid) {
+        Confirmation::Daemon => RecordedDaemon::Live(pid),
+        Confirmation::NotDaemon => RecordedDaemon::Stale(pid),
+        Confirmation::Inconclusive(reason) => RecordedDaemon::Unverified { pid, reason },
     }
 }
 
@@ -759,9 +846,18 @@ fn recorded_daemon(config: &DaemonConfig) -> RecordedDaemon {
 /// Otherwise removes any PID and port files a previous daemon left behind, so the next daemon
 /// starts clean: the port poll in [`start`] would otherwise read the dead daemon's port straight
 /// back. That is also why a file that can't be removed is an error rather than ignored.
+///
+/// A recorded process that can't be told apart from the daemon is an error too, with its files
+/// left in place: deleting them could orphan a live daemon and let a second one start.
 fn running_daemon_or_clear_stale(config: &DaemonConfig) -> Result<Option<u32>> {
     match recorded_daemon(config) {
         RecordedDaemon::Live(pid) => Ok(Some(pid)),
+        RecordedDaemon::Unverified { pid, reason } => Err(Error::ProcessSpawn(format!(
+            "cannot tell whether PID {pid} is the running daemon: {reason}. Nothing was removed. \
+             If no daemon is running, stop that process or delete {} and {}, then start again",
+            config.pid_file_path.display(),
+            config.port_file_path.display()
+        ))),
         RecordedDaemon::Absent | RecordedDaemon::Stale(_) => {
             remove_stale_file(&config.pid_file_path)?;
             remove_stale_file(&config.port_file_path)?;
@@ -1018,6 +1114,14 @@ mod tests {
             !is_ant_executable_name(&std::env::current_exe().unwrap()),
             "this test binary must never pass for `ant`"
         );
+        // File names are case-insensitive on Windows only.
+        for exe in ["ANT.EXE", "Ant.exe", "Autonomi/ANT"] {
+            assert_eq!(
+                is_ant_executable_name(Path::new(exe)),
+                cfg!(windows),
+                "{exe}"
+            );
+        }
     }
 
     #[test]
@@ -1037,12 +1141,21 @@ mod tests {
         assert_eq!(identity_from(false, unreadable), ProcessIdentity::Other);
     }
 
-    /// A one-shot stand-in for the daemon's API: answers a single request with a `DaemonStatus`
-    /// reporting `pid`.
+    /// A one-shot stand-in for the daemon's API on `127.0.0.1`: answers a single request with a
+    /// `DaemonStatus` reporting `pid`.
     fn serve_status_once(pid: u32) -> (u16, std::thread::JoinHandle<()>) {
+        serve_status_once_on(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), pid)
+            .expect("bind 127.0.0.1")
+    }
+
+    /// [`serve_status_once`] on `ip`, or `None` where it can't be bound (a host without IPv6).
+    fn serve_status_once_on(
+        ip: std::net::IpAddr,
+        pid: u32,
+    ) -> Option<(u16, std::thread::JoinHandle<()>)> {
         use std::io::{Read, Write};
 
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener = std::net::TcpListener::bind((ip, 0)).ok()?;
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -1067,7 +1180,7 @@ mod tests {
             )
             .unwrap();
         });
-        (port, server)
+        Some((port, server))
     }
 
     /// A port with nothing listening on it, as a dead daemon's port usually is.
@@ -1079,41 +1192,88 @@ mod tests {
             .port()
     }
 
-    #[test]
-    fn the_daemon_api_must_report_the_same_pid() {
-        let tmp = tempfile::tempdir().unwrap();
-        let port_file = tmp.path().join("daemon.port");
-        assert!(!daemon_api_reports_pid(&port_file, 42), "no port file");
+    /// A port that accepts connections but never answers, as a hung daemon's would.
+    fn silent_port() -> (u16, std::net::TcpListener) {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        (listener.local_addr().unwrap().port(), listener)
+    }
 
-        std::fs::write(&port_file, unused_port().to_string()).unwrap();
-        assert!(!daemon_api_reports_pid(&port_file, 42), "nothing listening");
+    #[test]
+    fn the_daemon_api_reports_its_pid_or_why_it_did_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_in(tmp.path());
+        assert!(daemon_api_pid(&config).is_err(), "no port file");
+
+        std::fs::write(&config.port_file_path, unused_port().to_string()).unwrap();
+        assert!(daemon_api_pid(&config).is_err(), "nothing listening");
+
+        let (port, _listener) = silent_port();
+        std::fs::write(&config.port_file_path, port.to_string()).unwrap();
+        assert!(
+            daemon_api_pid(&config).is_err(),
+            "no answer before the timeout"
+        );
 
         let (port, server) = serve_status_once(42);
-        std::fs::write(&port_file, port.to_string()).unwrap();
-        assert!(daemon_api_reports_pid(&port_file, 42));
-        server.join().unwrap();
-
-        let (port, server) = serve_status_once(43);
-        std::fs::write(&port_file, port.to_string()).unwrap();
-        assert!(
-            !daemon_api_reports_pid(&port_file, 42),
-            "another daemon's PID"
-        );
+        std::fs::write(&config.port_file_path, port.to_string()).unwrap();
+        assert_eq!(daemon_api_pid(&config), Ok(42));
         server.join().unwrap();
     }
 
     #[test]
-    fn only_a_200_with_the_pid_confirms_the_daemon() {
+    fn the_daemon_api_is_found_on_ipv6_too() {
+        use std::net::{IpAddr, Ipv6Addr};
+
+        let ipv6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let tmp = tempfile::tempdir().unwrap();
+        // Configured for `::1`, as `daemon run --listen-addr ::1`, and with the default config,
+        // as a call that doesn't know which address the daemon was started on.
+        for listen_addr in [ipv6, DaemonConfig::default().listen_addr] {
+            let config = DaemonConfig {
+                listen_addr,
+                ..config_in(tmp.path())
+            };
+            let Some((port, server)) = serve_status_once_on(ipv6, 42) else {
+                eprintln!("skipped: this host can't bind ::1");
+                return;
+            };
+            std::fs::write(&config.port_file_path, port.to_string()).unwrap();
+            assert_eq!(daemon_api_pid(&config), Ok(42), "configured {listen_addr}");
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn the_api_is_looked_for_on_the_listen_address_then_both_loopbacks() {
+        use std::net::{IpAddr, Ipv6Addr};
+
+        let v4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
+        assert_eq!(api_addresses(v4), vec![v4, v6]);
+        assert_eq!(
+            api_addresses(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            vec![v4, v6]
+        );
+        assert_eq!(api_addresses(v6), vec![v6, v4]);
+        assert_eq!(
+            api_addresses(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            vec![v6, v4]
+        );
+        assert_eq!(api_addresses(lan), vec![lan, v4, v6]);
+    }
+
+    #[test]
+    fn only_a_200_daemon_status_carries_a_pid() {
         let ok = |body: &str| format!("HTTP/1.1 200 OK\r\n\r\n{body}");
         let status = r#"{"running":true,"pid":42,"port":1,"uptime_secs":1,"nodes_total":0,"nodes_running":0,"nodes_stopped":0,"nodes_errored":0}"#;
-        assert!(status_response_reports_pid(ok(status).as_bytes(), 42));
-        assert!(!status_response_reports_pid(ok(status).as_bytes(), 7));
-        assert!(!status_response_reports_pid(
-            format!("HTTP/1.1 404 Not Found\r\n\r\n{status}").as_bytes(),
-            42
-        ));
-        assert!(!status_response_reports_pid(ok("not json").as_bytes(), 42));
-        assert!(!status_response_reports_pid(b"garbage", 42));
+        assert_eq!(status_response_pid(ok(status).as_bytes()), Some(42));
+        assert_eq!(
+            status_response_pid(format!("HTTP/1.1 404 Not Found\r\n\r\n{status}").as_bytes()),
+            None
+        );
+        assert_eq!(status_response_pid(ok("not json").as_bytes()), None);
+        assert_eq!(status_response_pid(b"garbage"), None);
     }
 
     /// Test-name filter that selects [`sleep_as_an_ant_named_process`] in a copy of this binary.
@@ -1145,10 +1305,13 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     impl AntNamedProcess {
         fn spawn(args: &[&str]) -> Self {
+            Self::spawn_as(if cfg!(windows) { "ant.exe" } else { "ant" }, args)
+        }
+
+        /// [`spawn`](Self::spawn) with the copy named `file_name`.
+        fn spawn_as(file_name: &str, args: &[&str]) -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let exe = dir
-                .path()
-                .join(if cfg!(windows) { "ant.exe" } else { "ant" });
+            let exe = dir.path().join(file_name);
             std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
             let mut command = std::process::Command::new(&exe);
             command
@@ -1226,7 +1389,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
-    fn another_ant_command_holding_the_pid_is_not_the_daemon() {
+    fn another_ant_command_holding_the_pid_is_never_confirmed_by_its_arguments() {
         // `daemon run` as another command's arguments, the review's example.
         let mut process = AntNamedProcess::spawn(&["file", "upload", "daemon", "run"]);
         let pid = process.pid();
@@ -1235,8 +1398,90 @@ mod tests {
         std::fs::write(&config.port_file_path, unused_port().to_string()).unwrap();
 
         assert_eq!(process_identity(pid), ProcessIdentity::Unconfirmed);
-        assert!(!is_confirmed_daemon(&config, pid));
+        assert!(matches!(
+            confirm_daemon(&config, pid),
+            Confirmation::Inconclusive(_)
+        ));
         process.assert_still_running();
+    }
+
+    /// An `ant` process that can't be confirmed, recorded with a port whose API is unavailable or
+    /// silent: a live daemon whose API was briefly slow looks exactly like this.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    fn unverified_daemon_files(process: &AntNamedProcess, dir: &Path, port: u16) -> DaemonConfig {
+        let config = config_in(dir);
+        std::fs::write(&config.pid_file_path, process.pid().to_string()).unwrap();
+        std::fs::write(&config.port_file_path, port.to_string()).unwrap();
+        config
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn start_keeps_the_files_of_a_daemon_it_cannot_verify() {
+        let mut process = AntNamedProcess::spawn(&["file", "upload", "daemon", "run"]);
+        let (silent, _listener) = silent_port();
+        for (port, api) in [(unused_port(), "unavailable"), (silent, "timed out")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = unverified_daemon_files(&process, tmp.path(), port);
+
+            let err = running_daemon_or_clear_stale(&config).unwrap_err();
+            assert!(
+                err.to_string().contains("cannot tell whether PID"),
+                "{api}: {err}"
+            );
+            assert!(config.pid_file_path.exists(), "{api}: PID file removed");
+            assert!(config.port_file_path.exists(), "{api}: port file removed");
+            assert!(!info(&config).running, "{api}");
+        }
+        process.assert_still_running();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[tokio::test]
+    async fn stop_neither_signals_nor_clears_a_daemon_it_cannot_verify() {
+        let mut process = AntNamedProcess::spawn(&["file", "upload", "daemon", "run"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let config = unverified_daemon_files(&process, tmp.path(), unused_port());
+
+        let err = stop(&config).await.unwrap_err();
+        assert!(err.to_string().contains("cannot tell whether PID"), "{err}");
+        process.assert_still_running();
+        assert!(config.pid_file_path.exists());
+        assert!(config.port_file_path.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn another_daemon_answering_on_the_port_rules_the_process_out() {
+        let mut process = AntNamedProcess::spawn(&["file", "upload", "daemon", "run"]);
+        let (port, server) = serve_status_once(process.pid() + 1);
+        let tmp = tempfile::tempdir().unwrap();
+        let config = unverified_daemon_files(&process, tmp.path(), port);
+
+        assert_eq!(running_daemon_or_clear_stale(&config).unwrap(), None);
+        assert!(!config.pid_file_path.exists());
+        assert!(!config.port_file_path.exists());
+        server.join().unwrap();
+        process.assert_still_running();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_upper_or_mixed_case_ant_exe_is_ant_on_windows() {
+        for file_name in ["ANT.EXE", "Ant.exe"] {
+            let mut process = AntNamedProcess::spawn_as(file_name, &["node", "daemon", "run"]);
+            let identified = (0..250).any(|_| {
+                process_identity(process.pid()) == ProcessIdentity::Daemon || {
+                    std::thread::sleep(Duration::from_millis(20));
+                    false
+                }
+            });
+            process.assert_still_running();
+            assert!(
+                identified,
+                "{file_name} running `node daemon run` is the daemon"
+            );
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
