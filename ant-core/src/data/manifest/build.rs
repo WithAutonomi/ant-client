@@ -26,15 +26,12 @@ use super::journal::UploadJournal;
 use super::path::{check_collisions, validate_component, validate_path, PATH_SEPARATOR};
 use super::{
     data_map_address, ContentRef, Manifest, ManifestEntry, ManifestError, TorrentReference,
-    ADDRESS_LEN, MANIFEST_HEADER_LEN, MAX_MANIFEST_BYTES, MAX_MANIFEST_ENTRIES, SHA256_LEN,
+    ADDRESS_LEN, MANIFEST_HEADER_LEN, MAX_MANIFEST_BYTES, MAX_MANIFEST_ENTRIES,
+    MAX_PUBLISHED_MAP_CHUNKS, SHA256_LEN,
 };
 
 /// Capacity of the per-file upload progress channel.
 const UPLOAD_PROGRESS_CAPACITY: usize = 64;
-/// Chunks an upload's own DataMap lists: self_encryption splits every file
-/// into at least three chunks and shrinks a longer map until it lists at
-/// most three (`shrink_data_map`), so the map an upload returns lists three.
-const UPLOAD_MAP_CHUNKS: usize = 3;
 /// Bytes the entry array's msgpack header can grow by as entries are added:
 /// small counts live in the marker byte, the largest take four more bytes.
 const ENTRY_ARRAY_HEADER_GROWTH: usize = std::mem::size_of::<u32>();
@@ -792,11 +789,11 @@ fn upload_entry(path: &str, size: u64, source: ContentRef) -> ManifestEntry {
     }
 }
 
-/// The largest DataMap an upload returns, as the manifest encodes it: three
-/// chunk records at the deepest child level. The manifest writes every chunk
+/// The largest DataMap an upload returns, as the manifest encodes it: its
+/// most chunk records, at the deepest child level. The manifest writes every chunk
 /// record at a fixed size, so only the child level varies.
 fn largest_upload_map() -> DataMap {
-    let infos = (0..UPLOAD_MAP_CHUNKS)
+    let infos = (0..MAX_PUBLISHED_MAP_CHUNKS)
         .map(|index| ChunkInfo {
             index,
             dst_hash: XorName::default(),
@@ -846,7 +843,7 @@ mod tests {
     fn the_largest_upload_map_bounds_a_real_shrunk_map() {
         let (shrunk, _) = shrink_data_map(root_of(1_000), |_, _| Ok(())).unwrap();
         assert!(shrunk.is_child());
-        assert_eq!(shrunk.len(), UPLOAD_MAP_CHUNKS);
+        assert_eq!(shrunk.len(), MAX_PUBLISHED_MAP_CHUNKS);
         let real = encoded_len(&upload_entry("dir/f.bin", 12_345, embedded(shrunk))).unwrap();
         let bound = encoded_len(&upload_entry(
             "dir/f.bin",
@@ -860,7 +857,7 @@ mod tests {
     #[test]
     fn every_upload_entry_fits_what_its_file_is_counted_at() {
         let (shrunk, _) = shrink_data_map(root_of(1_000), |_, _| Ok(())).unwrap();
-        let small_file = root_of(UPLOAD_MAP_CHUNKS);
+        let small_file = root_of(MAX_PUBLISHED_MAP_CHUNKS);
         let budget = SizeBudget::new(&BuildOptions::default()).unwrap();
         let counted = encoded_len(&upload_entry(
             "dir/f.bin",
