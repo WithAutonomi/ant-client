@@ -775,9 +775,12 @@ about 0.4 s.
   for WebKit, which opens many more sockets for overlapping gatherings.
   Chromium is recognized by `navigator.userAgentData`, which only it exposes.
   WebKit and Firefox keep the turn; Firefox was not measured.
+- **Only Chromium starts fetching at the read budget's 8 GETs.** Where dials
+  take turns to gather, more concurrent reads queue more dials for the turn,
+  so other engines keep the native cold start of 4.
 
-Together they let the fetch start of 8, which on its own made mainnet
-downloads 15-26% slower by overflowing the pool, pay off. Measured with
+In Chromium, the first two let the fetch start of 8, which on its own made
+mainnet downloads 15-26% slower by overflowing the pool, pay off. Measured with
 headless Chromium on macOS against mainnet, each arm downloading the same
 64 MiB public file with a fresh client, in rotating order. The first run
 separates the changes on the branch before it merged main; the second compares
@@ -798,6 +801,19 @@ In the second run the fetch start of 8 was faster than 4 in every round. A
 612 MB public video took 195 and 270 s with both changes, against main's 398
 and 323 s. The faster branch opens more connections per download: 243 instead
 of 187 for the 64 MiB file, and 2,977 instead of 2,019 for the video.
+
+In WebKit, which keeps the gathering turn, the fetch start of 8 still made
+downloads slower. A dial waited 1.9 s at the median before its ICE checks,
+against 0.7 s at a start of 4, and a lookup round took 3.6 s against 1.3 s.
+Against main, the same 64 MiB file took, at the median:
+
+| engine | rounds | main | fetch start 8 | engine's start | against main, paired | faster |
+| --- | --: | --: | --: | --: | --: | --: |
+| Safari 26.5.2 | 4 | 31.5 s | 38.8 s | 25.5 s (4) | -19% | 4/4 |
+| WebKit (Playwright) | 5 | 32.3 s | | 25.9 s (4) | -18% | 5/5 |
+| Chromium (Playwright) | 3 | 35.3 s | | 18.6 s (8) | -46% | 3/3 |
+
+In Safari the fetch start of 8 was slower than main in all 4 rounds.
 
 In traces of the branch before the merge, a successful dial took 0.4 s at the
 median instead of 1.9-2.7 s, a failed one 3.0 s instead of 10.4-11.0 s, and a
