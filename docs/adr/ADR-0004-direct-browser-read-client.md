@@ -747,3 +747,52 @@ budgets; manifest validation; and native index, range and retry tests. The
 generated WASM tests use mocked WebRTC hosts with real Rust protocol and crypto
 processing. They do not establish real-browser or live-network compatibility by
 themselves.
+
+## Dial failure and ICE gathering (2026-10-26)
+
+Related: [V2-1483](https://linear.app/autonominetwork/issue/V2-1483).
+
+Browser downloads from mainnet spent most of their time dialling. In traced
+downloads of a 64 MiB public file, 42-50% of fresh dials went to WebRTC Direct
+endpoints that never answered ICE. Each held a pool slot, and kept its lookup
+round waiting, until the 10-second channel-opening timeout: 18-30 of the 64
+slots at a time. A file whose DataMap had child records could not start reading
+data until the slowest of them arrived, and one such 418-byte record took 10 s.
+Dials to live nodes also queued for the page's ICE gathering turn. In Chromium,
+a dial waited 0.6 s at the median at a fetch concurrency of 4, and 1.7 s at 8,
+before sending its offer. ICE, DTLS, SCTP and the PQ handshake together took
+about 0.4 s.
+
+- **A dial fails when ICE has not connected 3 s after its offer.** Live nodes
+  answered ICE checks in 110 ms at the median and 1.2-1.4 s at p99; the slowest
+  of 788 took 2.7 s. Every failed dial in the traces was one whose ICE never
+  connected. A fresh connection still `new` or `checking` at 3 s fails, and
+  enters the dial-failure cache like any other failed dial. One whose ICE
+  connected keeps the opening timeout for DTLS, SCTP and the channel. Endpoints
+  that failed in one download and connected in another were 4% of failures with
+  the deadline and 5% without it.
+- **Chromium dials gather ICE candidates at once.** The gathering turn exists
+  for WebKit, which opens many more sockets for overlapping gatherings.
+  Chromium is recognized by `navigator.userAgentData`, which only it exposes.
+  WebKit and Firefox keep the turn; Firefox was not measured.
+
+Together they let the fetch start of 8, which on its own made mainnet
+downloads 15-26% slower by overflowing the pool, pay off. Measured with
+headless Chromium on macOS against mainnet, each arm downloading the same
+64 MiB file with a fresh client, in rotating order:
+
+| build | rounds | p50 | against main, paired | faster |
+| --- | --: | --: | --: | --: |
+| main | 4 | 39.1 s | | |
+| fetch start 8 (before this section) | 4 | 45.0 s | +15% | 1/4 |
+| fetch start 4, ICE deadline | 4 | 32.3 s | -15% | 3/4 |
+| fetch start 4, both changes | 4 | 25.3 s | -34% | 4/4 |
+| fetch start 8, both changes | 4 | 19.7 s | -49% | 4/4 |
+| main (second run) | 5 | 35.0 s | | |
+| fetch start 8, both changes | 5 | 19.2 s | -46% | 5/5 |
+
+In the last arm's traces a successful dial took 0.4 s at the median instead of
+1.9-2.7 s, a failed one 3.0 s instead of 10.4-11.0 s, and a lookup round 1.2 s
+instead of 1.6-3.8 s. Failing dials held 14 pool slots on average, and the
+first data read started at 7-8 s instead of 13.5-14.3 s. The lookup width, its
+grace period, the pool size and the dial-failure cooldown are unchanged.
