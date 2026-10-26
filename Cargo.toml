@@ -2,3 +2,11 @@
 members = ["ant-core", "ant-cli"]
 resolver = "2"
 
+# ant-node ADR-0020 (V2-1358): saorsa-core's lookup steps, ant-protocol's
+# get-or-closer request, and ant-node answering it (for the in-process test
+# nodes), each rebased onto its main. Drop these once releases include
+# them.
+[patch.crates-io]
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "c3c4c81e63db7e3048f488f7cf0fec4cff3131d4" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "0c6ae27b6261227a32e6fe0f976163c42bde960e" }
+ant-node = { git = "https://github.com/WithAutonomi/ant-node", rev = "6a14b538412665436996516b636ca85538cb5fdf" }
