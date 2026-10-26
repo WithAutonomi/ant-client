@@ -19,6 +19,18 @@ export async function closesSettled() {
   } while (pendingCloses.size);
 }
 
+// Run `test` as a Chromium page, which alone exposes User-Agent Client Hints.
+// There the client lets concurrent dials gather ICE candidates at once, and
+// starts fetching at the read budget's capacity.
+export async function asChromium(test) {
+  Object.defineProperty(globalThis.navigator, "userAgentData", { value: {}, configurable: true });
+  try {
+    return await test();
+  } finally {
+    delete globalThis.navigator.userAgentData;
+  }
+}
+
 // Reset for each test. Only browser-owned RTC objects are mocked; all node
 // responses use the shared Rust wire contract and real session encryption.
 // ICE gathering completes `gatheringMs` after setLocalDescription; Infinity

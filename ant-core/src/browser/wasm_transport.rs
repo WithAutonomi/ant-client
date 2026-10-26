@@ -2544,18 +2544,28 @@ impl BrowserNetworkClient {
         let adapter = Rc::new(SharedNetworkAdapter::new(Rc::clone(&inner)));
         let network = crate::data::Network::from_browser(adapter.clone());
         // Fetches beyond the GETs the read budget admits at once would only
-        // queue, so the fetch channel starts there and never probes past it. A
-        // WebRTC DataChannel carries a record more slowly than QUIC, so the
-        // native cold start would leave much of the budget idle. The adaptive
-        // controller still backs off from here. A hedge or a GET after
-        // discovery may then wait for a permit another fetch's GET frees, and
-        // holds nothing of its peer's meanwhile.
+        // queue, so the fetch channel never probes past them. Where dials
+        // gather ICE candidates at once, it also starts there: a WebRTC
+        // DataChannel carries a record more slowly than QUIC, so the native
+        // cold start would leave much of the budget idle. Where dials take
+        // turns to gather, more concurrent reads queue more dials for the turn.
+        // In WebKit on mainnet, starting at the budget made a dial wait 1.9 s
+        // at the median before its ICE checks, against 0.7 s at the native
+        // cold start, and downloads were slower, so it keeps that start. The
+        // adaptive controller moves from either start. A hedge or a GET after
+        // discovery may wait for a permit another fetch's GET frees, and holds
+        // nothing of its peer's meanwhile.
         let read_capacity = inner.pool.read_budget.capacity();
         let mut config = crate::data::ClientConfig::default();
         config.adaptive.max.fetch = read_capacity;
+        let cold_start = crate::data::client::adaptive::ChannelStart::default();
         let start = crate::data::client::adaptive::ChannelStart {
-            fetch: read_capacity,
-            ..Default::default()
+            fetch: if ice_gathering_may_overlap() {
+                read_capacity
+            } else {
+                cold_start.fetch
+            },
+            ..cold_start
         };
         let shared = Rc::new(
             crate::data::Client::from_network_with_start(network, config, start).with_chunk_cache(

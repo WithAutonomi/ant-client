@@ -2,7 +2,7 @@ import { BrowserNetworkClient } from "./client-fixture.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { contentAddress, encryptPublicFile, parseWebRtcDirectMultiaddr, test_encode_public_data_map } from "./pkg/ant_core.js";
-import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
+import { asChromium, mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 
 const content = new TextEncoder().encode("Discoverable storage holder regression.".repeat(100));
 const encrypted = encryptPublicFile(content);
@@ -266,9 +266,10 @@ let largeFile;
 // Larger than the read-ahead window plus the last record.
 const large = () => (largeFile ??= recordFile(12));
 
-test("a download keeps as many GETs in flight as the read budget admits", async () => {
-  // Every node holds every record and multiplexes, so neither one session nor
-  // one holder bounds the download; the read budget, of 8 GETs, does.
+// The most GETs in flight during a download of the large file. Every node holds
+// every record and multiplexes, so neither one session nor one holder bounds
+// the download; the fetch channel and the read budget, of 8 GETs, do.
+async function peakGetsInFlight() {
   const { original, encrypted } = large();
   let active = 0, peak = 0;
   const rtc = mockWebRtc(Array.from({ length: 4 }, () => ({
@@ -284,8 +285,18 @@ test("a download keeps as many GETs in flight as the read budget admits", async 
   try {
     const result = await client.downloadPublicFile(encrypted.address, undefined);
     assert.deepEqual(result.content, original);
-    assert(peak > 4 && peak <= 8, `${peak} GETs in flight`);
   } finally { client.close(); }
+  return peak;
+}
+
+test("in Chromium, a download keeps as many GETs in flight as the read budget admits", async () => {
+  const peak = await asChromium(peakGetsInFlight);
+  assert(peak > 4 && peak <= 8, `${peak} GETs in flight`);
+});
+
+test("where dials take turns to gather ICE, a download starts at the native fetch start", async () => {
+  const peak = await peakGetsInFlight();
+  assert(peak <= 4, `${peak} GETs in flight`);
 });
 
 test("a streaming reader reads ahead from any read; an ordinary one only fetches the next record", async () => {

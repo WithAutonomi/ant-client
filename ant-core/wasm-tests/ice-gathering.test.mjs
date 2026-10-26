@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { test_preconnect_pool } from "./pkg/ant_core.js";
-import { mockWebRtc } from "./mock-webrtc.mjs";
+import { asChromium, mockWebRtc } from "./mock-webrtc.mjs";
 
 // The transport passes the turn on after polling for completion every 10 ms,
 // and gives up on a gathering that has not completed after 1 s.
@@ -31,18 +31,12 @@ test("a gathering that never completes passes the turn on after the timeout", as
   assert.equal(rtc.requests.filter(r => r.method === "hello").length, 2);
 });
 
-test("in Chromium, concurrent dials gather ICE candidates at once", async () => {
-  // Only Chromium exposes User-Agent Client Hints.
-  Object.defineProperty(globalThis.navigator, "userAgentData", { value: {}, configurable: true });
-  try {
-    const gatheringMs = 30;
-    const rtc = mockWebRtc(Array.from({ length: 12 }, () => ({})), { gatheringMs });
-    await test_preconnect_pool(rtc.endpoints, true, false, 64);
-    const spans = byStart(rtc.gathering);
-    assert.equal(spans.length, 8);
-    const spread = spans.at(-1).start - spans[0].start;
-    assert.ok(spread < gatheringMs, `gatherings started over ${spread.toFixed(1)} ms`);
-  } finally {
-    delete globalThis.navigator.userAgentData;
-  }
-});
+test("in Chromium, concurrent dials gather ICE candidates at once", () => asChromium(async () => {
+  const gatheringMs = 30;
+  const rtc = mockWebRtc(Array.from({ length: 12 }, () => ({})), { gatheringMs });
+  await test_preconnect_pool(rtc.endpoints, true, false, 64);
+  const spans = byStart(rtc.gathering);
+  assert.equal(spans.length, 8);
+  const spread = spans.at(-1).start - spans[0].start;
+  assert.ok(spread < gatheringMs, `gatherings started over ${spread.toFixed(1)} ms`);
+}));
