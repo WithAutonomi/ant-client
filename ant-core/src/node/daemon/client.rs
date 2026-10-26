@@ -67,7 +67,7 @@ pub async fn stop(config: &DaemonConfig) -> Result<DaemonStopResult> {
         return Ok(DaemonStopResult { pid });
     }
 
-    if !validate_daemon_process(pid) {
+    if !is_confirmed_daemon(config, pid) {
         // PID is alive but isn't our daemon — clean up stale files without killing
         let _ = std::fs::remove_file(&config.pid_file_path);
         let _ = std::fs::remove_file(&config.port_file_path);
@@ -106,7 +106,7 @@ pub async fn stop(config: &DaemonConfig) -> Result<DaemonStopResult> {
 /// If the daemon is already running, returns a result with `already_running: true`.
 /// Otherwise, spawns the daemon and polls for the port file to confirm startup.
 pub async fn start(config: &DaemonConfig) -> Result<DaemonStartResult> {
-    if let Some(pid) = running_daemon_or_clear_stale(config) {
+    if let Some(pid) = running_daemon_or_clear_stale(config)? {
         let port = read_port_file(&config.port_file_path);
         return Ok(DaemonStartResult {
             already_running: true,
@@ -115,9 +115,28 @@ pub async fn start(config: &DaemonConfig) -> Result<DaemonStartResult> {
         });
     }
 
+    // In ant-core's own unit tests the current executable is the test harness. It would read
+    // `node daemon run` as test-name filters and re-run the tests that got here, each spawning
+    // again. A unit-test build never spawns it.
+    if cfg!(test) {
+        return Err(Error::ProcessSpawn(
+            "a unit-test build of ant-core does not spawn the daemon".to_string(),
+        ));
+    }
+
     // Get the path to the current executable
     let exe = std::env::current_exe()
         .map_err(|e| Error::ProcessSpawn(format!("Failed to get current executable: {e}")))?;
+    // The daemon is recognised as an `ant` executable running `node daemon run`
+    // (`process_identity`), so only the `ant` binary can start one that `info` and `start` will
+    // recognise. This also covers test harnesses outside ant-core's unit tests, such as
+    // integration tests, which would read `node daemon run` as test-name filters.
+    if !is_ant_executable_name(&exe) {
+        return Err(Error::ProcessSpawn(format!(
+            "only the `ant` binary can start the daemon, not {}",
+            exe.display()
+        )));
+    }
     let exe_str = exe
         .to_str()
         .ok_or_else(|| Error::ProcessSpawn("Executable path is not valid UTF-8".to_string()))?;
@@ -421,10 +440,11 @@ pub async fn stop_all_nodes(config: &DaemonConfig) -> Result<StopNodeResult> {
 /// Get daemon connection info for programmatic use.
 ///
 /// Reads the PID and port files. `running` is true only if the recorded PID is a live process
-/// identifiable as the daemon, since a PID left behind by a daemon that died may have been
-/// reused; `pid` and `port` are reported as recorded either way.
+/// confirmed as the daemon, since a PID left behind by a daemon that died may have been reused.
+/// The process confirms itself by running `ant node daemon run`; failing that, the daemon's API on
+/// the recorded port must report the PID. `pid` and `port` are reported as recorded either way.
 pub fn info(config: &DaemonConfig) -> DaemonInfo {
-    let recorded = recorded_daemon(&config.pid_file_path);
+    let recorded = recorded_daemon(config);
     let port = read_port_file(&config.port_file_path);
 
     DaemonInfo {
@@ -460,62 +480,84 @@ pub async fn run(config: DaemonConfig) -> Result<()> {
     Ok(())
 }
 
-/// Validate that a PID belongs to an ant daemon process by checking its
-/// command line. This guards against PID reuse after a daemon crash.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn validate_daemon_process(pid: u32) -> bool {
-    let cmdline_path = format!("/proc/{pid}/cmdline");
-    match std::fs::read(&cmdline_path) {
-        Ok(raw) => {
-            // /proc/PID/cmdline uses null bytes as separators.
-            // Check that the executable basename is exactly "ant" and the
-            // arguments run the daemon. This avoids false positives from
-            // processes like "rant" or "phantom-daemon", and from other `ant`
-            // commands that reuse the PID.
-            let args: Vec<String> = raw
-                .split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).to_string())
-                .collect();
-            let exe_matches = args
-                .first()
-                .and_then(|exe| std::path::Path::new(exe).file_name())
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name == "ant" || name == "ant.exe");
-            exe_matches && runs_the_daemon(&args)
-        }
-        Err(_) => {
-            // Without /proc there's no cheap way to inspect the command line
-            // without shelling out, so fall back to trusting the PID file.
-            true
-        }
+/// What a live process's own details show about whether it is the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessIdentity {
+    /// An `ant` executable running exactly the detached daemon's command line.
+    Daemon,
+    /// Not an `ant` executable, so not the daemon.
+    Other,
+    /// An `ant` executable whose arguments don't show that it is the daemon. They are another
+    /// command line, such as another `ant` command or a foreground daemon started behind global
+    /// options, or they can't be read: a process owned by another user, an elevated one on
+    /// Windows, or no `/proc`. [`is_confirmed_daemon`] asks the daemon's API instead.
+    Unconfirmed,
+}
+
+/// Classify a process from whether its executable is `ant` and from its arguments (`argv[0]`
+/// first), `None` when they can't be read. Unreadable arguments are never taken as proof.
+fn identity_from<S: AsRef<std::ffi::OsStr>>(
+    executable_is_ant: bool,
+    args: Option<&[S]>,
+) -> ProcessIdentity {
+    if !executable_is_ant {
+        ProcessIdentity::Other
+    } else if args.is_some_and(is_daemon_command) {
+        ProcessIdentity::Daemon
+    } else {
+        ProcessIdentity::Unconfirmed
     }
 }
 
-/// Whether a command line runs the daemon: `daemon run`, as [`daemon_run_args`] passes to the
-/// detached child (and as a foreground `ant node daemon run` has). Other `ant` commands, including
-/// `daemon start` and `daemon status`, do not match.
-fn runs_the_daemon<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> bool {
-    args.windows(2)
-        .any(|pair| pair[0].as_ref() == "daemon" && pair[1].as_ref() == "run")
+/// Whether `args` (`argv[0]` first) are the detached daemon's command line: `node daemon run`
+/// straight after the executable, as [`start`] spawns it with [`daemon_run_args`]. `daemon run`
+/// anywhere else, as in `ant file upload daemon run`, is not proof.
+fn is_daemon_command<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> bool {
+    matches!(
+        args.get(1..4),
+        Some([node, daemon, run])
+            if node.as_ref() == "node" && daemon.as_ref() == "daemon" && run.as_ref() == "run"
+    )
 }
 
-/// Validate that a PID belongs to an ant daemon process: its executable is `ant` and its arguments
-/// run the daemon.
-#[cfg(any(target_os = "macos", windows))]
-fn validate_daemon_process(pid: u32) -> bool {
-    executable_is_ant(pid) && arguments_allow_daemon(pid)
+/// Identify a process from `/proc/PID/cmdline`, which holds its NUL-separated arguments.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn process_identity(pid: u32) -> ProcessIdentity {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        // No /proc (other Unixes) or a hidepid mount: nothing to go on.
+        return ProcessIdentity::Unconfirmed;
+    };
+    let args: Vec<String> = raw
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    let executable_is_ant = args
+        .first()
+        .is_some_and(|exe| is_ant_executable_name(Path::new(exe)));
+    identity_from(executable_is_ant, Some(args.as_slice()))
 }
 
-/// Whether the process's arguments are the daemon's. `sysinfo` reads them (`KERN_PROCARGS2` on
-/// macOS, the process environment block on Windows).
-///
-/// The arguments of a process owned by another user, or of an elevated process on Windows, can't
-/// be read, and `sysinfo` then reports none. Every real process has at least `argv[0]`, so an
-/// empty list means "unreadable", and the executable-name check alone decides. Calling a live
-/// daemon stale would make `start` launch a second one.
+/// Whether an executable path names the `ant` binary. The basename must be exactly `ant` or
+/// `ant.exe`, which rules out processes like `rant`.
+fn is_ant_executable_name(exe: &Path) -> bool {
+    exe.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "ant" || name == "ant.exe")
+}
+
+/// Identify a process from its executable name and its arguments.
 #[cfg(any(target_os = "macos", windows))]
-fn arguments_allow_daemon(pid: u32) -> bool {
+fn process_identity(pid: u32) -> ProcessIdentity {
+    identity_from(executable_is_ant(pid), process_args(pid).as_deref())
+}
+
+/// The process's arguments, read through `sysinfo` (`KERN_PROCARGS2` on macOS, the process
+/// environment block on Windows), or `None` if they can't be read. `sysinfo` reports none for a
+/// process owned by another user, or for an elevated one on Windows; every real process has at
+/// least `argv[0]`.
+#[cfg(any(target_os = "macos", windows))]
+fn process_args(pid: u32) -> Option<Vec<std::ffi::OsString>> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
     let pid = Pid::from_u32(pid);
@@ -525,15 +567,66 @@ fn arguments_allow_daemon(pid: u32) -> bool {
         true,
         ProcessRefreshKind::new().with_cmd(UpdateKind::Always),
     );
-    let Some(process) = system.process(pid) else {
+    let args = system.process(pid)?.cmd();
+    (!args.is_empty()).then(|| args.to_vec())
+}
+
+/// Whether the live process `pid` is the daemon that `config`'s files record.
+///
+/// The process's own details settle it when they can (see [`ProcessIdentity`]). An
+/// [`Unconfirmed`](ProcessIdentity::Unconfirmed) `ant` process counts only if the daemon's API, on
+/// the recorded port, reports that PID.
+fn is_confirmed_daemon(config: &DaemonConfig, pid: u32) -> bool {
+    match process_identity(pid) {
+        ProcessIdentity::Daemon => true,
+        ProcessIdentity::Other => false,
+        ProcessIdentity::Unconfirmed => daemon_api_reports_pid(&config.port_file_path, pid),
+    }
+}
+
+/// Whether the daemon API on the port recorded in `port_file` reports `pid` as its PID
+/// (`GET /api/v1/status`).
+///
+/// A dead daemon's port has nothing listening on it, or something that isn't the daemon. This is a
+/// blocking local request with one-second timeouts, made only for an unconfirmed process.
+fn daemon_api_reports_pid(port_file: &Path, pid: u32) -> bool {
+    use std::io::{Read, Write};
+
+    let Some(port) = read_port_file(port_file) else {
         return false;
     };
-    let args = process.cmd();
-    args.is_empty() || runs_the_daemon(args)
+    let timeout = Duration::from_secs(1);
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
+    let request = format!(
+        "GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    );
+    let mut response = Vec::new();
+    stream.set_read_timeout(Some(timeout)).is_ok()
+        && stream.set_write_timeout(Some(timeout)).is_ok()
+        && stream.write_all(request.as_bytes()).is_ok()
+        && stream.take(64 * 1024).read_to_end(&mut response).is_ok()
+        && status_response_reports_pid(&response, pid)
+}
+
+/// Whether a raw HTTP response is a `200` whose [`DaemonStatus`] body reports `pid`.
+fn status_response_reports_pid(response: &[u8], pid: u32) -> bool {
+    let Some(end_of_head) = response.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let status_code = std::str::from_utf8(&response[..end_of_head])
+        .ok()
+        .and_then(|head| head.lines().next())
+        .and_then(|status_line| status_line.split_whitespace().nth(1));
+    status_code == Some("200")
+        && serde_json::from_slice::<DaemonStatus>(&response[end_of_head + 4..])
+            .is_ok_and(|status| status.pid == Some(pid))
 }
 
 /// Whether the process's executable is named `ant`. `proc_pidpath` works for any user's process,
-/// so this holds even where the arguments can't be read.
+/// even where the arguments can't be read.
 #[cfg(target_os = "macos")]
 fn executable_is_ant(pid: u32) -> bool {
     let Some(pid) = pid_to_i32(pid) else {
@@ -555,7 +648,7 @@ fn executable_is_ant(pid: u32) -> bool {
 }
 
 /// Whether the process's executable is named `ant`. `PROCESS_QUERY_LIMITED_INFORMATION` is granted
-/// even for elevated processes, so this holds even where the arguments can't be read.
+/// even for an elevated process, whose arguments can't be read.
 #[cfg(windows)]
 fn executable_is_ant(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -645,16 +738,16 @@ impl RecordedDaemon {
     }
 }
 
-/// Classify the daemon recorded in `pid_file`.
+/// Classify the daemon recorded in `config`'s PID file.
 ///
 /// A live PID is not enough on its own: the files outlive an unclean exit, and after a reboot the
-/// PID is often reused by an unrelated process. The process must also be identifiable as the
-/// daemon, the same test `stop` applies before signalling it.
-fn recorded_daemon(pid_file: &Path) -> RecordedDaemon {
-    let Ok(pid) = read_pid_file(pid_file) else {
+/// PID is often reused by an unrelated process. The process must also be confirmed as the daemon
+/// ([`is_confirmed_daemon`]), the same test `stop` applies before signalling it.
+fn recorded_daemon(config: &DaemonConfig) -> RecordedDaemon {
+    let Ok(pid) = read_pid_file(&config.pid_file_path) else {
         return RecordedDaemon::Absent;
     };
-    if is_process_alive(pid) && validate_daemon_process(pid) {
+    if is_process_alive(pid) && is_confirmed_daemon(config, pid) {
         RecordedDaemon::Live(pid)
     } else {
         RecordedDaemon::Stale(pid)
@@ -665,15 +758,26 @@ fn recorded_daemon(pid_file: &Path) -> RecordedDaemon {
 ///
 /// Otherwise removes any PID and port files a previous daemon left behind, so the next daemon
 /// starts clean: the port poll in [`start`] would otherwise read the dead daemon's port straight
-/// back.
-fn running_daemon_or_clear_stale(config: &DaemonConfig) -> Option<u32> {
-    match recorded_daemon(&config.pid_file_path) {
-        RecordedDaemon::Live(pid) => Some(pid),
+/// back. That is also why a file that can't be removed is an error rather than ignored.
+fn running_daemon_or_clear_stale(config: &DaemonConfig) -> Result<Option<u32>> {
+    match recorded_daemon(config) {
+        RecordedDaemon::Live(pid) => Ok(Some(pid)),
         RecordedDaemon::Absent | RecordedDaemon::Stale(_) => {
-            let _ = std::fs::remove_file(&config.pid_file_path);
-            let _ = std::fs::remove_file(&config.port_file_path);
-            None
+            remove_stale_file(&config.pid_file_path)?;
+            remove_stale_file(&config.port_file_path)?;
+            Ok(None)
         }
+    }
+}
+
+/// Remove a file a previous daemon left behind. A file that is already gone is fine.
+fn remove_stale_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Error::ProcessSpawn(format!(
+            "could not remove the stale daemon file {}: {e}",
+            path.display()
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -860,30 +964,156 @@ mod tests {
         assert_eq!(info.pid, None);
     }
 
-    // The fallback for other Unixes trusts any live PID, so these hold only where the process can
-    // be identified.
+    // Other Unixes have no /proc to read, so there every process is unconfirmed.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
-    fn validate_rejects_a_live_process_that_is_not_the_daemon() {
-        assert!(!validate_daemon_process(std::process::id()));
+    fn a_process_that_is_not_ant_is_not_the_daemon() {
+        assert_eq!(process_identity(std::process::id()), ProcessIdentity::Other);
     }
 
     #[test]
-    fn only_daemon_run_is_the_daemon_command() {
-        assert!(runs_the_daemon(&["/usr/bin/ant", "node", "daemon", "run"]));
-        assert!(runs_the_daemon(&[
+    fn only_node_daemon_run_after_the_executable_is_the_daemon_command() {
+        assert!(is_daemon_command(&[
+            "/usr/bin/ant",
+            "node",
+            "daemon",
+            "run"
+        ]));
+        assert!(is_daemon_command(&[
             "ant.exe", "node", "daemon", "run", "--port", "8765"
         ]));
         for args in [
-            &["ant", "node", "daemon", "start"][..],
+            // The review's example: `daemon run` as arguments to another command.
+            &["ant", "file", "upload", "daemon", "run"][..],
+            // A foreground daemon behind a global option: left to the daemon's API.
+            &["ant", "--json", "node", "daemon", "run"],
+            &["ant", "node", "daemon", "start"],
             &["ant", "node", "daemon", "status"],
-            &["ant", "file", "upload", "daemon"],
-            &["ant", "run", "daemon"],
+            &["ant", "node", "daemon"],
             &["ant"],
             &[],
         ] {
-            assert!(!runs_the_daemon(args), "{args:?} is not the daemon");
+            assert!(!is_daemon_command(args), "{args:?} is not proof");
         }
+    }
+
+    /// `start` refuses to spawn from any other executable, which is what keeps a test harness
+    /// from spawning itself as `node daemon run`.
+    #[test]
+    fn only_the_ant_binary_is_an_ant_executable() {
+        // Forward slashes, which every platform's `Path` splits on.
+        for exe in ["/usr/local/bin/ant", "ant", "ant.exe", "Autonomi/ant.exe"] {
+            assert!(is_ant_executable_name(Path::new(exe)), "{exe}");
+        }
+        for exe in [
+            "target/debug/deps/ant_core-ea7d791ec7076b25",
+            "target/debug/deps/ant_core-ea7d791ec7076b25.exe",
+            "/usr/bin/rant",
+            "/usr/bin/ant-node",
+            "",
+        ] {
+            assert!(!is_ant_executable_name(Path::new(exe)), "{exe}");
+        }
+        assert!(
+            !is_ant_executable_name(&std::env::current_exe().unwrap()),
+            "this test binary must never pass for `ant`"
+        );
+    }
+
+    #[test]
+    fn unreadable_arguments_never_confirm_the_daemon() {
+        let daemon = Some(&["ant", "node", "daemon", "run"][..]);
+        let unreadable: Option<&[&str]> = None;
+        assert_eq!(identity_from(true, daemon), ProcessIdentity::Daemon);
+        assert_eq!(
+            identity_from(true, unreadable),
+            ProcessIdentity::Unconfirmed
+        );
+        assert_eq!(
+            identity_from(true, Some(&["ant", "file", "upload", "daemon", "run"][..])),
+            ProcessIdentity::Unconfirmed
+        );
+        assert_eq!(identity_from(false, daemon), ProcessIdentity::Other);
+        assert_eq!(identity_from(false, unreadable), ProcessIdentity::Other);
+    }
+
+    /// A one-shot stand-in for the daemon's API: answers a single request with a `DaemonStatus`
+    /// reporting `pid`.
+    fn serve_status_once(pid: u32) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let body = serde_json::to_string(&DaemonStatus {
+                running: true,
+                pid: Some(pid),
+                port: Some(port),
+                uptime_secs: Some(1),
+                nodes_total: 0,
+                nodes_running: 0,
+                nodes_stopped: 0,
+                nodes_errored: 0,
+            })
+            .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        (port, server)
+    }
+
+    /// A port with nothing listening on it, as a dead daemon's port usually is.
+    fn unused_port() -> u16 {
+        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[test]
+    fn the_daemon_api_must_report_the_same_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let port_file = tmp.path().join("daemon.port");
+        assert!(!daemon_api_reports_pid(&port_file, 42), "no port file");
+
+        std::fs::write(&port_file, unused_port().to_string()).unwrap();
+        assert!(!daemon_api_reports_pid(&port_file, 42), "nothing listening");
+
+        let (port, server) = serve_status_once(42);
+        std::fs::write(&port_file, port.to_string()).unwrap();
+        assert!(daemon_api_reports_pid(&port_file, 42));
+        server.join().unwrap();
+
+        let (port, server) = serve_status_once(43);
+        std::fs::write(&port_file, port.to_string()).unwrap();
+        assert!(
+            !daemon_api_reports_pid(&port_file, 42),
+            "another daemon's PID"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn only_a_200_with_the_pid_confirms_the_daemon() {
+        let ok = |body: &str| format!("HTTP/1.1 200 OK\r\n\r\n{body}");
+        let status = r#"{"running":true,"pid":42,"port":1,"uptime_secs":1,"nodes_total":0,"nodes_running":0,"nodes_stopped":0,"nodes_errored":0}"#;
+        assert!(status_response_reports_pid(ok(status).as_bytes(), 42));
+        assert!(!status_response_reports_pid(ok(status).as_bytes(), 7));
+        assert!(!status_response_reports_pid(
+            format!("HTTP/1.1 404 Not Found\r\n\r\n{status}").as_bytes(),
+            42
+        ));
+        assert!(!status_response_reports_pid(ok("not json").as_bytes(), 42));
+        assert!(!status_response_reports_pid(b"garbage", 42));
     }
 
     /// Test-name filter that selects [`sleep_as_an_ant_named_process`] in a copy of this binary.
@@ -920,16 +1150,41 @@ mod tests {
                 .path()
                 .join(if cfg!(windows) { "ant.exe" } else { "ant" });
             std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
-            let child = std::process::Command::new(&exe)
+            let mut command = std::process::Command::new(&exe);
+            command
                 .args(args)
                 .args(["--exact", "--ignored", SLEEPER])
                 .env(SLEEP_ENV, "1")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap();
-            Self { child, _dir: dir }
+                .stderr(std::process::Stdio::null());
+            // On Linux, executing a file that was just written fails with ETXTBSY while a process
+            // forked by another test thread still holds the copy's write descriptor. That clears
+            // once the other child execs, so retry briefly.
+            let mut attempts = 0;
+            let child = loop {
+                match command.spawn() {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 =>
+                    {
+                        attempts += 1;
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    result => break result.unwrap(),
+                }
+            };
+            let process = Self { child, _dir: dir };
+            // `spawn` returns once the exec has begun, but on Linux /proc only shows the new
+            // arguments a moment later: until then the process reads as `Other`. Hand tests a
+            // process that already shows as `ant`.
+            let shows_as_ant = (0..250).any(|_| {
+                process_identity(process.pid()) != ProcessIdentity::Other || {
+                    std::thread::sleep(Duration::from_millis(20));
+                    false
+                }
+            });
+            assert!(shows_as_ant, "the ant-named helper never showed as `ant`");
+            process
         }
 
         fn pid(&self) -> u32 {
@@ -954,25 +1209,58 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
-    fn validate_accepts_an_ant_process_running_the_daemon() {
+    fn an_ant_process_running_node_daemon_run_is_the_daemon() {
         let mut process = AntNamedProcess::spawn(&["node", "daemon", "run"]);
         let pid = process.pid();
-        // The child is visible once spawn returns; the retry only absorbs a slow process table.
-        let accepted = (0..50).any(|_| {
-            validate_daemon_process(pid) || {
-                std::thread::sleep(Duration::from_millis(100));
+        // The arguments can still be unreadable for a moment after the exec, which reads as
+        // `Unconfirmed`; the retry only absorbs that.
+        let identified = (0..250).any(|_| {
+            process_identity(pid) == ProcessIdentity::Daemon || {
+                std::thread::sleep(Duration::from_millis(20));
                 false
             }
         });
         process.assert_still_running();
-        assert!(accepted, "an `ant node daemon run` process is the daemon");
+        assert!(identified, "an `ant node daemon run` process is the daemon");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
-    fn validate_rejects_another_ant_command_holding_the_pid() {
-        let mut process = AntNamedProcess::spawn(&["file", "upload", "photo.jpg"]);
-        assert!(!validate_daemon_process(process.pid()));
+    fn another_ant_command_holding_the_pid_is_not_the_daemon() {
+        // `daemon run` as another command's arguments, the review's example.
+        let mut process = AntNamedProcess::spawn(&["file", "upload", "daemon", "run"]);
+        let pid = process.pid();
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_in(tmp.path());
+        std::fs::write(&config.port_file_path, unused_port().to_string()).unwrap();
+
+        assert_eq!(process_identity(pid), ProcessIdentity::Unconfirmed);
+        assert!(!is_confirmed_daemon(&config, pid));
+        process.assert_still_running();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn an_unconfirmed_ant_process_is_the_daemon_only_if_its_api_says_so() {
+        let mut process = AntNamedProcess::spawn(&["file", "upload", "daemon", "run"]);
+        let pid = process.pid();
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_in(tmp.path());
+        std::fs::write(&config.pid_file_path, pid.to_string()).unwrap();
+
+        std::fs::write(&config.port_file_path, unused_port().to_string()).unwrap();
+        assert!(
+            !info(&config).running,
+            "nothing answers on the recorded port"
+        );
+
+        let (port, server) = serve_status_once(pid);
+        std::fs::write(&config.port_file_path, port.to_string()).unwrap();
+        assert!(
+            info(&config).running,
+            "the daemon's own API reports this PID"
+        );
+        server.join().unwrap();
         process.assert_still_running();
     }
 
@@ -1016,7 +1304,7 @@ mod tests {
         let config = config_in(tmp.path());
         write_files_with_reused_pid(&config);
 
-        assert_eq!(running_daemon_or_clear_stale(&config), None);
+        assert_eq!(running_daemon_or_clear_stale(&config).unwrap(), None);
         assert!(!config.pid_file_path.exists());
         assert!(
             !config.port_file_path.exists(),
@@ -1030,7 +1318,28 @@ mod tests {
         let config = config_in(tmp.path());
         std::fs::write(&config.port_file_path, "39007").unwrap();
 
-        assert_eq!(running_daemon_or_clear_stale(&config), None);
+        assert_eq!(running_daemon_or_clear_stale(&config).unwrap(), None);
         assert!(!config.port_file_path.exists());
+    }
+
+    /// A stale port file that can't be removed: a directory in its place makes `remove_file` fail
+    /// on every platform.
+    fn config_with_an_unremovable_port_file(dir: &Path) -> DaemonConfig {
+        let config = config_in(dir);
+        std::fs::create_dir(&config.port_file_path).unwrap();
+        config
+    }
+
+    #[test]
+    fn a_stale_file_that_cannot_be_removed_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_with_an_unremovable_port_file(tmp.path());
+
+        let err = running_daemon_or_clear_stale(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("could not remove the stale daemon file"),
+            "{err}"
+        );
     }
 }
