@@ -94,8 +94,9 @@ pub struct UploadRecord {
     pub recorded_at: u64,
     /// The label part of the id.
     pub label: String,
-    /// The manifest itself. For an upload that has not finished, every
-    /// entry that reached the disk.
+    /// The manifest itself. For an interrupted upload, every entry that
+    /// reached the disk. For one in progress, none yet: a running build's
+    /// entries are read once it stops.
     pub manifest: Manifest,
     /// Whether the upload finished.
     #[serde(default)]
@@ -232,11 +233,15 @@ pub fn list_uploads(dir: &Path) -> Result<UploadListing, ManifestError> {
             // A journal whose record exists is left over from a build that
             // stopped between writing the record and removing the journal.
             Some(id) if record_path(dir, id).is_file() => continue,
-            // One that stopped holding nothing paid for nothing.
             Some(id) => match load_journal(&path, id) {
+                // Its build finished since the directory was read.
+                Err(ManifestError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                // One that stopped holding nothing paid for nothing, and
+                // one whose build has just written its record is that record.
                 Ok(record)
                     if record.state == RecordState::Interrupted
-                        && record.manifest.entries.is_empty() =>
+                        && (record.manifest.entries.is_empty()
+                            || record_path(dir, id).is_file()) =>
                 {
                     continue
                 }
@@ -274,7 +279,9 @@ fn id_sort_key(id: &str) -> (&str, u32) {
         .unwrap_or((id, FIRST_ID_SEQUENCE))
 }
 
-/// Load the record with `id` from `dir`, or `None` when there is none.
+/// Load the record with `id` from `dir`, or `None` when there is none. An
+/// upload still in progress is refused: its entries are not read until its
+/// build stops.
 pub fn load_upload(dir: &Path, id: &str) -> Result<Option<UploadRecord>, ManifestError> {
     if id.is_empty() || id.contains(['/', '\\']) {
         return Ok(None);
@@ -285,7 +292,13 @@ pub fn load_upload(dir: &Path, id: &str) -> Result<Option<UploadRecord>, Manifes
     }
     let journal = journal_path(dir, id);
     if is_regular_file(&journal)? {
-        return load_journal(&journal, id).map(Some);
+        let record = load_journal(&journal, id)?;
+        if record.state == RecordState::InProgress {
+            return Err(ManifestError::Build(format!(
+                "upload {id} is still in progress; use it once it has finished"
+            )));
+        }
+        return Ok(Some(record));
     }
     Ok(None)
 }
@@ -302,7 +315,10 @@ fn is_regular_file(path: &Path) -> Result<bool, ManifestError> {
 /// An unfinished build's journal as a record: in progress while its build
 /// holds the journal, interrupted otherwise.
 fn load_journal(path: &Path, id: &str) -> Result<UploadRecord, ManifestError> {
-    let (manifest, in_progress) = read_journal(path)?;
+    let (manifest, state) = match read_journal(path)? {
+        Some(manifest) => (manifest, RecordState::Interrupted),
+        None => (Manifest::default(), RecordState::InProgress),
+    };
     let (recorded_at, label) = match parse_id(id) {
         Some(parsed) => parsed,
         None => (modified_secs(path)?, id.to_string()),
@@ -313,11 +329,7 @@ fn load_journal(path: &Path, id: &str) -> Result<UploadRecord, ManifestError> {
         recorded_at,
         label,
         manifest,
-        state: if in_progress {
-            RecordState::InProgress
-        } else {
-            RecordState::Interrupted
-        },
+        state,
     })
 }
 
@@ -367,10 +379,11 @@ fn read_record(path: &Path) -> Result<Manifest, ManifestError> {
 /// Bring a record written under looser path rules in line with the current
 /// ones, the way a new record's names are repaired: an invalid name or path
 /// component is made portable, a path that cannot be is dropped so the entry
-/// extracts under its content address, and of two entries whose names now
-/// collide the later loses its path. A client update so never makes a
-/// recorded upload unreachable. A manifest that is already valid is
-/// returned unchanged.
+/// extracts under its content address, of two entries whose names now
+/// collide the later loses its path, and a file whose name is now that of a
+/// directory other entries are in loses its path rather than they theirs. A
+/// client update so never makes a recorded upload unreachable. A manifest
+/// that is already valid is returned unchanged.
 pub(super) fn repair_names(mut manifest: Manifest) -> Result<Manifest, ManifestError> {
     if manifest.validate().is_ok() {
         return Ok(manifest);
@@ -387,30 +400,41 @@ pub(super) fn repair_names(mut manifest: Manifest) -> Result<Manifest, ManifestE
             }
         }
     }
+    let mut names = manifest
+        .entries
+        .iter()
+        .map(ManifestEntry::effective_name)
+        .collect::<Result<Vec<_>, _>>()?;
     // Each round drops a path or a duplicate entry, so this ends.
     loop {
-        let names = manifest
-            .entries
-            .iter()
-            .map(ManifestEntry::effective_name)
-            .collect::<Result<Vec<_>, _>>()?;
-        let colliding = match check_collisions(names.iter().map(String::as_str)) {
+        let index = match check_collisions(names.iter().map(String::as_str)) {
             Ok(()) => break,
-            Err(PathError::Duplicate(name)) | Err(PathError::PrefixConflict { file: name, .. }) => {
-                name
-            }
+            Err(PathError::Duplicate(name)) => last_named(&names, &name),
+            // The file in the way gives way, or, when it is already under
+            // its content address, the entry in the directory does.
+            Err(PathError::PrefixConflict { dir, file }) => last_named(&names, &dir)
+                .filter(|&index| manifest.entries[index].path.is_some())
+                .or_else(|| last_named(&names, &file)),
             Err(other) => return Err(ManifestError::Conflict(other)),
         };
-        let Some(index) = names.iter().rposition(|name| *name == colliding) else {
+        let Some(index) = index else {
             break;
         };
-        if manifest.entries[index].path.take().is_none() {
+        if manifest.entries[index].path.take().is_some() {
+            names[index] = manifest.entries[index].effective_name()?;
+        } else {
             // Already under its content address: the same content twice.
             manifest.entries.remove(index);
+            names.remove(index);
         }
     }
     manifest.validate()?;
     Ok(manifest)
+}
+
+/// The index of the last entry named `name`.
+fn last_named(names: &[String], name: &str) -> Option<usize> {
+    names.iter().rposition(|candidate| candidate == name)
 }
 
 /// `path` with every component made portable, or `None` when a component
@@ -457,7 +481,8 @@ fn parse_id(id: &str) -> Option<(u64, String)> {
     let (stamp, label) = id.split_at_checked(TIMESTAMP_LEN)?;
     let label = label.strip_prefix(ID_SEPARATOR)?;
     let bytes = stamp.as_bytes();
-    if bytes[8] != b'T' || bytes[15] != b'Z' {
+    // ASCII, so the fields below are sliced on character boundaries.
+    if !stamp.is_ascii() || bytes[8] != b'T' || bytes[15] != b'Z' {
         return None;
     }
     let num = |range: std::ops::Range<usize>| stamp[range].parse::<u64>().ok();
@@ -593,11 +618,39 @@ mod tests {
             .collect();
         assert!(paths.contains(&Some("next_line.txt".into())));
         assert!(paths.contains(&Some("ab".into())));
-        assert!(paths.contains(&Some("strasse".into())));
-        // The later of each colliding pair extracts under its address.
+        assert!(paths.contains(&Some("stra\u{1e9e}e/x".into())));
+        // The later of the duplicates, and the file in the way of the
+        // directory, extract under their addresses.
         assert_eq!(paths.iter().filter(|p| p.is_none()).count(), 2);
         let listing = list_uploads(dir.path()).unwrap();
         assert_eq!(listing.records.len(), 1, "{:?}", listing.unreadable);
+    }
+
+    /// A file named like a directory, apart from a character the filesystem
+    /// ignores: the one file gives way, not every entry in the directory.
+    #[test]
+    fn a_file_in_the_way_of_a_directory_loses_its_path_not_the_entries_in_it() {
+        let entry = |path: String, seed: u8| ManifestEntry {
+            path: Some(path),
+            size: Some(1),
+            sha256: None,
+            source: ContentRef::Public {
+                address: [seed; 32],
+            },
+        };
+        let mut entries = vec![entry("docs\u{200C}".into(), 0)];
+        entries.extend((1..=100).map(|seed| entry(format!("docs/{seed}.bin"), seed)));
+        let old = Manifest {
+            name: None,
+            torrent: None,
+            entries,
+        };
+        assert!(old.validate().is_err());
+        let repaired = repair_names(old).unwrap();
+        repaired.validate().unwrap();
+        assert_eq!(repaired.entries.len(), 101);
+        assert!(repaired.entries[0].path.is_none());
+        assert!(repaired.entries[1..].iter().all(|e| e.path.is_some()));
     }
 
     #[test]
@@ -614,6 +667,7 @@ mod tests {
         assert_eq!(format_compact_timestamp(1_759_759_391), "20251006T140311Z");
         assert!(parse_id("not-an-id").is_none());
         assert!(parse_id("20261332T000000Z-x").is_none());
+        assert!(parse_id("202\u{e9}001T000000Z-x").is_none());
     }
 
     #[test]

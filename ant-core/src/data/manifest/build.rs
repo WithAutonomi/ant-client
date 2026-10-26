@@ -274,9 +274,9 @@ impl<'a> ManifestBuilder<'a> {
 
     /// Check everything that could make the finished manifest invalid
     /// before the first paid upload: file sizes, the name, collisions among
-    /// all queued paths and address entries, and whether the manifest can
-    /// fit [`MAX_MANIFEST_BYTES`] even with every file at its smallest
-    /// entry. Returns the size budget the uploads are admitted against.
+    /// all queued paths and address entries, and whether the manifest fits
+    /// [`MAX_MANIFEST_BYTES`] with every file at the largest entry it can
+    /// end as. Returns the size budget the uploads are admitted against.
     fn preflight(&self) -> Result<SizeBudget, ManifestError> {
         let count = self.pending.len().saturating_add(self.entries.len());
         if count > MAX_MANIFEST_ENTRIES {
@@ -309,7 +309,7 @@ impl<'a> ManifestBuilder<'a> {
                 )));
             }
             names.push(file.path.clone());
-            budget.queue_upload(&file.path, size)?;
+            budget.queue_upload(&file.path)?;
         }
         for entry in &self.entries {
             names.push(entry.effective_name()?);
@@ -425,10 +425,14 @@ impl<'a> ManifestBuilder<'a> {
             let journaled = journal
                 .as_mut()
                 .map_or(Ok(()), |journal| journal.append(&uploaded));
+            let storage_cost = parse_atto(&result.storage_cost_atto);
             self.entries.push(uploaded);
             files_uploaded += 1;
             chunks_stored += result.chunks_stored;
             gas_cost_wei = gas_cost_wei.saturating_add(result.gas_cost_wei);
+            if let Ok(cost) = &storage_cost {
+                storage_cost_atto = storage_cost_atto.saturating_add(*cost);
+            }
             if let Err(error) = journaled {
                 failure = Some((file.path, error));
                 break;
@@ -440,12 +444,9 @@ impl<'a> ManifestBuilder<'a> {
                     break;
                 }
             };
-            match parse_atto(&result.storage_cost_atto) {
-                Ok(cost) => storage_cost_atto = storage_cost_atto.saturating_add(cost),
-                Err(error) => {
-                    failure = Some((file.path, error));
-                    break;
-                }
+            if let Err(error) = storage_cost {
+                failure = Some((file.path, error));
+                break;
             }
 
             let source = match self
@@ -555,11 +556,9 @@ impl<'a> ManifestBuilder<'a> {
             self.options.name.as_deref(),
             self.options.torrent.as_ref(),
         )?;
-        for entry in &self.entries {
-            if let Err(error) = journal.append(entry) {
-                let _ = journal.discard();
-                return Err(error);
-            }
+        if let Err(error) = journal.append_all(&self.entries) {
+            let _ = journal.discard();
+            return Err(error);
         }
         Ok(Some(journal))
     }
@@ -634,62 +633,69 @@ fn file_name_utf8(path: &Path) -> Result<String, ManifestError> {
 }
 
 /// Keeps a build's manifest within [`MAX_MANIFEST_BYTES`] however its
-/// uploads turn out.
+/// uploads turn out, so a build that passes preflight never stops for size.
 ///
-/// Each queued file is counted at the smallest entry it can be expected to
-/// become, and a file is uploaded only if the largest entry it can become
-/// would still fit. Once uploaded it is counted at its real size, and a larger
-/// reference, such as an embedded root map, is taken only if it fits as
-/// well. Every partial or complete result can therefore be encoded and
-/// recorded, and nothing is paid for that could not be.
+/// Each queued file is counted at the largest entry it can end as, and room
+/// is kept for one upload in flight on top: the uploaded map its entry holds
+/// until a smaller final reference replaces it. Once uploaded, a file is
+/// counted at its real size, and a larger reference, such as an embedded
+/// root map, is taken only if that room is still kept. Every partial or
+/// complete result can therefore be encoded and recorded, and nothing is
+/// paid for that could not be.
 struct SizeBudget {
-    /// Encoded bytes the manifest needs at least, as counted so far.
+    /// Encoded bytes the manifest can need, as counted so far.
     reserved: usize,
-    /// Each queued file's smallest entry, in queue order.
-    smallest: Vec<usize>,
-    /// The smallest reference an upload becomes under the build's options.
-    smallest_source: ContentRef,
+    /// Each queued file's counted entry, in queue order.
+    counted: Vec<usize>,
+    /// The reference a queued file is counted with.
+    counted_source: ContentRef,
+    /// Bytes an upload in flight can need beyond its counted entry.
+    in_flight: usize,
 }
 
 impl SizeBudget {
     /// The fixed part of a manifest with these options and no entries.
     ///
-    /// An upload becomes a public address only in compact mode, and there
-    /// always only when the upload itself is public. Every other upload is
-    /// embedded, at least as its own three-chunk map. A private file in
-    /// compact mode that turns out to be public already ends up smaller than
-    /// counted, so the budget may refuse a build that would just have
-    /// fitted, never the reverse.
+    /// An upload ends as a public address only in compact mode, and there
+    /// always when the upload itself is public. Every other upload ends
+    /// embedded, as its own three-chunk map unless a root map fits. A private
+    /// file in compact mode that turns out to be public already ends up
+    /// smaller than counted, so the budget may refuse a build that would just
+    /// have fitted, never the reverse.
     fn new(options: &BuildOptions) -> Result<Self, ManifestError> {
         let empty = Manifest {
             name: options.name.clone(),
             torrent: options.torrent.clone(),
             entries: Vec::new(),
         };
-        let smallest_source = if options.reference_mode == ReferenceMode::Compact
+        let uploaded_source = ContentRef::Embedded {
+            data_map: largest_upload_map(),
+        };
+        let counted_source = if options.reference_mode == ReferenceMode::Compact
             && options.visibility == Visibility::Public
         {
             ContentRef::Public {
                 address: [0; ADDRESS_LEN],
             }
         } else {
-            ContentRef::Embedded {
-                data_map: upload_map(None),
-            }
+            uploaded_source.clone()
         };
+        let in_flight =
+            encoded_len(&uploaded_source)?.saturating_sub(encoded_len(&counted_source)?);
         Ok(Self {
             reserved: MANIFEST_HEADER_LEN + encoded_len(&empty)? + ENTRY_ARRAY_HEADER_GROWTH,
-            smallest: Vec::new(),
-            smallest_source,
+            counted: Vec::new(),
+            counted_source,
+            in_flight,
         })
     }
 
-    /// Count a queued file at the smallest entry it can be expected to
-    /// become.
-    fn queue_upload(&mut self, path: &str, size: u64) -> Result<(), ManifestError> {
-        let smallest = encoded_len(&upload_entry(path, size, self.smallest_source.clone()))?;
-        self.smallest.push(smallest);
-        self.reserved = self.reserved.saturating_add(smallest);
+    /// Count a queued file at the largest entry it can end as, with the
+    /// largest size, since the file can grow before it is uploaded.
+    fn queue_upload(&mut self, path: &str) -> Result<(), ManifestError> {
+        let counted = encoded_len(&upload_entry(path, u64::MAX, self.counted_source.clone()))?;
+        self.counted.push(counted);
+        self.reserved = self.reserved.saturating_add(counted);
         Ok(())
     }
 
@@ -699,36 +705,38 @@ impl SizeBudget {
         Ok(())
     }
 
-    /// Refuse a manifest that cannot fit even with every file at its
-    /// smallest entry.
+    /// Refuse a manifest that could outgrow the limit: every file at its
+    /// largest entry and one upload in flight.
     fn ensure_fits(&self) -> Result<(), ManifestError> {
-        fits(self.reserved)
+        fits(self.reserved.saturating_add(self.in_flight))
     }
 
     /// Refuse to upload queued file `index` unless the largest entry it can
-    /// become would still fit.
+    /// become would still fit. Preflight makes sure it does; checking again
+    /// keeps that true whatever an earlier upload ended as.
     fn admit_upload(&self, index: usize, path: &str) -> Result<(), ManifestError> {
         let largest = encoded_len(&upload_entry(
             path,
             u64::MAX,
             ContentRef::Embedded {
-                data_map: upload_map(Some(usize::MAX)),
+                data_map: largest_upload_map(),
             },
         ))?;
-        fits(self.swapped(self.smallest_of(index), largest))
+        fits(self.swapped(self.counted_of(index), largest))
     }
 
     /// Count queued file `index` at its uploaded entry from now on, and
     /// return that entry's size.
     fn uploaded(&mut self, index: usize, entry: &ManifestEntry) -> Result<usize, ManifestError> {
         let len = encoded_len(entry)?;
-        self.reserved = self.swapped(self.smallest_of(index), len);
+        self.reserved = self.swapped(self.counted_of(index), len);
         Ok(len)
     }
 
     /// Give `entry`, counted at `current` bytes, the reference `source` when
-    /// the manifest still fits with it; otherwise it keeps the one it has.
-    /// Returns whether the reference changed.
+    /// the manifest still fits with it and room for an upload in flight;
+    /// otherwise it keeps the one it has. Returns whether the reference
+    /// changed.
     fn offer_source(
         &mut self,
         entry: &mut ManifestEntry,
@@ -744,7 +752,7 @@ impl SizeBudget {
             }
         };
         let projected = self.swapped(current, offered);
-        if projected <= MAX_MANIFEST_BYTES {
+        if projected.saturating_add(self.in_flight) <= MAX_MANIFEST_BYTES {
             self.reserved = projected;
             Ok(entry.source != previous)
         } else {
@@ -753,8 +761,8 @@ impl SizeBudget {
         }
     }
 
-    fn smallest_of(&self, index: usize) -> usize {
-        self.smallest.get(index).copied().unwrap_or_default()
+    fn counted_of(&self, index: usize) -> usize {
+        self.counted.get(index).copied().unwrap_or_default()
     }
 
     /// The reserved total with `old` bytes replaced by `new`.
@@ -784,11 +792,10 @@ fn upload_entry(path: &str, size: u64, source: ContentRef) -> ManifestEntry {
     }
 }
 
-/// A DataMap the size of the one an upload returns, as the manifest encodes
-/// it: three chunk records, and the child level of a shrunk map if any. The
-/// manifest writes every chunk record at a fixed size, so only the child
-/// level varies: none is the smallest, `usize::MAX` the largest.
-fn upload_map(child: Option<usize>) -> DataMap {
+/// The largest DataMap an upload returns, as the manifest encodes it: three
+/// chunk records at the deepest child level. The manifest writes every chunk
+/// record at a fixed size, so only the child level varies.
+fn largest_upload_map() -> DataMap {
     let infos = (0..UPLOAD_MAP_CHUNKS)
         .map(|index| ChunkInfo {
             index,
@@ -797,10 +804,7 @@ fn upload_map(child: Option<usize>) -> DataMap {
             src_size: 0,
         })
         .collect();
-    match child {
-        Some(level) => DataMap::with_child(infos, level),
-        None => DataMap::new(infos),
-    }
+    DataMap::with_child(infos, usize::MAX)
 }
 
 /// Bytes `value` takes in a manifest's msgpack encoding.
@@ -847,28 +851,30 @@ mod tests {
         let bound = encoded_len(&upload_entry(
             "dir/f.bin",
             u64::MAX,
-            embedded(upload_map(Some(usize::MAX))),
+            embedded(largest_upload_map()),
         ))
         .unwrap();
         assert!(real <= bound, "{real} > {bound}");
     }
 
     #[test]
-    fn every_upload_entry_is_at_least_the_counted_smallest() {
+    fn every_upload_entry_fits_what_its_file_is_counted_at() {
         let (shrunk, _) = shrink_data_map(root_of(1_000), |_, _| Ok(())).unwrap();
         let small_file = root_of(UPLOAD_MAP_CHUNKS);
         let budget = SizeBudget::new(&BuildOptions::default()).unwrap();
-        let smallest = encoded_len(&upload_entry(
+        let counted = encoded_len(&upload_entry(
             "dir/f.bin",
-            12_345,
-            budget.smallest_source.clone(),
+            u64::MAX,
+            budget.counted_source.clone(),
         ))
         .unwrap();
         for map in [shrunk, small_file] {
             let real = encoded_len(&upload_entry("dir/f.bin", 12_345, embedded(map))).unwrap();
-            assert!(smallest <= real, "{smallest} > {real}");
+            assert!(real <= counted, "{real} > {counted}");
         }
-        // Only compact mode with public uploads counts an address.
+        assert_eq!(budget.in_flight, 0);
+        // Only compact mode with public uploads counts an address, keeping
+        // room for the uploaded map an entry holds until then.
         let compact_public = SizeBudget::new(&BuildOptions {
             reference_mode: ReferenceMode::Compact,
             visibility: Visibility::Public,
@@ -876,9 +882,59 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            compact_public.smallest_source,
+            compact_public.counted_source,
             ContentRef::Public { .. }
         ));
+        let address = encoded_len(&upload_entry(
+            "dir/f.bin",
+            u64::MAX,
+            compact_public.counted_source.clone(),
+        ))
+        .unwrap();
+        assert_eq!(address + compact_public.in_flight, counted);
+    }
+
+    /// Preflight passes with less than one more file to spare. Every upload
+    /// then returns a shrunk map with a child level and is offered a larger
+    /// reference, and none is refused.
+    #[test]
+    fn a_build_that_passes_preflight_never_stops_for_size() {
+        let path = format!("{}/f.bin", "d".repeat(60_000));
+        let (shrunk, _) = shrink_data_map(root_of(1_000), |_, _| Ok(())).unwrap();
+        let compact_public = BuildOptions {
+            reference_mode: ReferenceMode::Compact,
+            visibility: Visibility::Public,
+            ..BuildOptions::default()
+        };
+        let address = ContentRef::Public {
+            address: [7; ADDRESS_LEN],
+        };
+        for (options, offered) in [
+            (BuildOptions::default(), embedded(root_of(100))),
+            (compact_public, address),
+        ] {
+            let mut budget = SizeBudget::new(&options).unwrap();
+            let per_file = encoded_len(&upload_entry(
+                &path,
+                u64::MAX,
+                budget.counted_source.clone(),
+            ))
+            .unwrap();
+            while budget.reserved + per_file + budget.in_flight <= MAX_MANIFEST_BYTES {
+                budget.queue_upload(&path).unwrap();
+            }
+            budget.ensure_fits().unwrap();
+            for index in 0..budget.counted.len() {
+                budget.admit_upload(index, &path).unwrap();
+                let mut entry = upload_entry(&path, 12_345_678_901, embedded(shrunk.clone()));
+                let counted = budget.uploaded(index, &entry).unwrap();
+                assert!(budget.reserved <= MAX_MANIFEST_BYTES);
+                budget
+                    .offer_source(&mut entry, counted, offered.clone())
+                    .unwrap();
+                assert!(budget.reserved <= MAX_MANIFEST_BYTES);
+            }
+        }
     }
 
     /// Many long paths in the default embedded mode: as addresses they would
@@ -897,7 +953,7 @@ mod tests {
         let mut budget = SizeBudget::new(&BuildOptions::default()).unwrap();
         let files = MAX_MANIFEST_BYTES / address_len - 1;
         for _ in 0..files {
-            budget.queue_upload(&path, 4_096).unwrap();
+            budget.queue_upload(&path).unwrap();
         }
         assert!(files * address_len < MAX_MANIFEST_BYTES);
         assert!(matches!(
@@ -928,18 +984,18 @@ mod tests {
     #[test]
     fn an_upload_is_admitted_only_when_its_largest_entry_fits() {
         let mut budget = SizeBudget::new(&BuildOptions::default()).unwrap();
-        budget.queue_upload("a.bin", 4_096).unwrap();
+        budget.queue_upload("a.bin").unwrap();
         budget.ensure_fits().unwrap();
         budget.admit_upload(0, "a.bin").unwrap();
 
         let largest = encoded_len(&upload_entry(
             "a.bin",
             u64::MAX,
-            embedded(upload_map(Some(usize::MAX))),
+            embedded(largest_upload_map()),
         ))
         .unwrap();
         // One byte less headroom than the largest entry needs.
-        budget.reserved = MAX_MANIFEST_BYTES - largest + budget.smallest[0] + 1;
+        budget.reserved = MAX_MANIFEST_BYTES - largest + budget.counted[0] + 1;
         assert!(matches!(
             budget.admit_upload(0, "a.bin"),
             Err(ManifestError::TooLarge { .. })
@@ -955,8 +1011,8 @@ mod tests {
     #[test]
     fn a_larger_reference_is_taken_only_when_it_fits() {
         let mut budget = SizeBudget::new(&BuildOptions::default()).unwrap();
-        budget.queue_upload("a.bin", 4_096).unwrap();
-        let mut entry = upload_entry("a.bin", 4_096, embedded(upload_map(Some(usize::MAX))));
+        budget.queue_upload("a.bin").unwrap();
+        let mut entry = upload_entry("a.bin", 4_096, embedded(largest_upload_map()));
         let counted = budget.uploaded(0, &entry).unwrap();
 
         // With room, a large root map replaces the uploaded map.

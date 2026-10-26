@@ -324,42 +324,21 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
             .add_public([9; 32], Some("existing.bin".into()), None)
             .unwrap();
         let (tx, mut rx) = mpsc::channel(1);
-        let history_dir = history.path().to_path_buf();
         let sabotage = tokio::spawn(async move {
-            let mut journaled = None;
             while let Some(event) = rx.recv().await {
-                match event {
-                    BuildEvent::FileStarted { index: 0, .. } => {
-                        // Preflight has passed. The first file still needs
-                        // real network/payment work before the next is read.
-                        if remove {
-                            fs::remove_file(&later).unwrap();
-                        } else {
-                            fs::write(&later, [0x01]).unwrap();
-                        }
+                if let BuildEvent::FileStarted { index: 0, .. } = event {
+                    // Preflight has passed. The first file still needs real
+                    // network/payment work before the next is read.
+                    if remove {
+                        fs::remove_file(&later).unwrap();
+                    } else {
+                        fs::write(&later, [0x01]).unwrap();
                     }
-                    // The paid upload is on disk before the build goes on,
-                    // so a crash from here on cannot lose it.
-                    BuildEvent::FileFinished { path, .. } if path == "first.bin" => {
-                        journaled = Some(list_uploads(&history_dir).unwrap().records);
-                    }
-                    _ => {}
                 }
             }
-            journaled
         });
         let error = builder.finish(Some(tx)).await.unwrap_err();
-        let journaled = sabotage.await.unwrap().unwrap();
-        assert_eq!(journaled.len(), 1);
-        assert_eq!(journaled[0].state, RecordState::InProgress);
-        let mut names: Vec<_> = journaled[0]
-            .manifest
-            .entries
-            .iter()
-            .filter_map(|entry| entry.path.clone())
-            .collect();
-        names.sort();
-        assert_eq!(names, ["existing.bin", "first.bin"]);
+        sabotage.await.unwrap();
         let ManifestError::BuildFailed {
             path,
             cause,
@@ -412,6 +391,67 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
         assert_eq!(report.written(), 1);
         assert_eq!(fs::read(out.path().join("first.bin")).unwrap(), expected);
     }
+
+    // A crash once the second upload has started: the build is dropped
+    // there, as a killed process would stop. The first upload was journaled
+    // before the second began, so it is listed as interrupted and usable.
+    let first = source.path().join("first.bin");
+    let second = source.path().join("second.bin");
+    let expected = vec![0x94; FILE_BYTES];
+    fs::write(&first, &expected).unwrap();
+    fs::write(&second, vec![0x95; FILE_BYTES]).unwrap();
+    let history = TempDir::new().unwrap();
+    let mut builder = ManifestBuilder::new(
+        &client,
+        BuildOptions {
+            history: Some(history.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    builder.add_file(&first, "first.bin".into()).unwrap();
+    builder.add_file(&second, "second.bin".into()).unwrap();
+    builder
+        .add_public([9; 32], Some("existing.bin".into()), None)
+        .unwrap();
+    let (tx, mut rx) = mpsc::channel(1);
+    // Polled only here, so the build cannot go on once the event is seen.
+    let mut build = Box::pin(builder.finish(Some(tx)));
+    loop {
+        tokio::select! {
+            _ = &mut build => panic!("the build ended before the second upload started"),
+            event = rx.recv() => match event {
+                Some(BuildEvent::FileStarted { index: 1, .. }) => break,
+                Some(_) => {}
+                None => panic!("the build stopped sending progress"),
+            },
+        }
+    }
+    drop(build);
+    drop(rx);
+    let listing = list_uploads(history.path()).unwrap();
+    assert_eq!(listing.records.len(), 1, "{:?}", listing.unreadable);
+    let crashed = &listing.records[0];
+    assert_eq!(crashed.state, RecordState::Interrupted);
+    let mut names: Vec<_> = crashed
+        .manifest
+        .entries
+        .iter()
+        .filter_map(|entry| entry.path.clone())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["existing.bin", "first.bin"]);
+    let record = load_upload(history.path(), &crashed.id).unwrap().unwrap();
+    let out = TempDir::new().unwrap();
+    let report = extract_manifest(
+        &client,
+        &record.manifest,
+        &extract_options(out.path(), vec!["first.bin".into()]),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.written(), 1);
+    assert_eq!(fs::read(out.path().join("first.bin")).unwrap(), expected);
 
     // References do not count toward the original upload total, including
     // when cancellation happens before the first upload starts.

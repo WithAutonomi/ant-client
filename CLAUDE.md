@@ -165,7 +165,8 @@ cargo run --bin ant -- --help  # Run the CLI
   a manifest under `<data dir>/uploads/`; `ant manifest list` shows them and `show`/`link`/`export`/`download`
   accept a record id. Entry paths obey the portable rules in `data/manifest/path.rs` at build,
   decode and extract time, and extraction never follows symlinks inside the output directory
-  and resolves every name from directories it holds open (`data/manifest/output/`). A manifest
+  and resolves every name from directories it holds open (`data/manifest/output/`: by
+  descriptor on Unix, by path under held handles on Windows). A manifest
   build journals each completed upload to `<id>.ant.partial` before paying for the next, so a
   crash loses no paid upload; leftover journals list as interrupted records.
   See `docs/adr/ADR-0006-file-manifests-and-links.md`.

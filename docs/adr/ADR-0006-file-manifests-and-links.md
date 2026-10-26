@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-09-23
-- **Last amended:** 2026-10-19
+- **Last amended:** 2026-10-26
 - **Decision owners:** Mick
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -413,19 +413,21 @@ the output location is checked before it too.
 
 The finished manifest must also fit `MAX_MANIFEST_BYTES`, which a few
 thousand embedded root maps can exceed. Before the first upload every queued
-file is counted at the smallest entry it can be expected to become, with its
-path, size and hash: its public address in compact mode with public uploads,
-and otherwise its own DataMap of three chunk records, since every other
-upload is embedded. A build that cannot fit even so is refused. (A private
+file is counted at the largest entry it can end as, with its path, the
+largest size and a hash: its public address in compact mode with public
+uploads, and otherwise its own DataMap of three chunk records at the deepest
+child level, since every other upload is embedded. Room is kept on top for
+one upload in flight, whose entry holds the uploaded map until its final
+reference replaces it. A build that cannot fit so is refused. (A private
 file in compact mode that turns out to be public already ends up smaller, so
 the check can refuse a build that would just have fitted, never the
-reverse.) A file is uploaded only when the largest entry it can become, its
-own three-record DataMap at the deepest child level, would still fit; otherwise the build
-stops before paying for it, as a file failure that keeps the partial result.
-After an upload the entry is counted at its real size, and a larger
-reference such as an embedded root map is used only when the manifest still
-fits with it; the shrunk map is kept otherwise. Every partial or complete
-result can therefore be encoded and recorded. Cancellation stops between
+reverse.) After an upload the entry is counted at its real size, and a
+larger reference such as an embedded root map is used only when the
+manifest still fits with it and that room; the shrunk map is kept
+otherwise. A build that passes the check therefore never stops for size,
+and every partial or complete result can be encoded and recorded. Each file
+is still admitted only when the largest entry it can become fits, so nothing
+is paid for that could not be. Cancellation stops between
 files or abandons the upload in flight and returns the partial manifest,
 which the builder records in the upload history so paid uploads are not
 lost. Ordinary file failures also preserve the partial result in
@@ -465,9 +467,10 @@ DataMap, whether or not the upload was public, and records the upload's
 portable path rules is repaired for the record, or dropped so the entry
 extracts under its content address, rather than losing the record. A record
 written under earlier, looser path rules is repaired the same way when it is
-loaded, and of two entries whose names now collide the later extracts under
-its content address, so a client update never makes a recorded upload
-unreachable. Records loaded from anywhere else, such as a shared `.ant` file
+loaded: of two entries whose names now collide the later extracts under
+its content address, and a file whose name is now that of a directory other
+entries are in does, rather than every entry in it. A client update so
+never makes a recorded upload unreachable. Records loaded from anywhere else, such as a shared `.ant` file
 or a link, are still refused when they break the rules. Recording never fails an
 upload that has already succeeded; an unusable history directory is reported
 and the upload result still shown.
@@ -487,7 +490,9 @@ kill, a power cut or a forced quit cannot lose an upload that was paid for:
   the ordinary record under the same id. The history directory is synced
   before the journal is removed, so a power cut cannot lose both. A build
   that stops before anything was uploaded paid for nothing and leaves no
-  record. If the record cannot be written, the journal stays.
+  record. If the record cannot be written, the journal stays; the CLI then
+  writes a stopped build's partial manifest to the output file, since the
+  journal may lack an upload whose entry could not be appended.
 - Holding an id's journal is what claims the id: every record, a
   single-file upload's included, is written by the holder of its journal,
   which is created exclusively before the record is looked for. Two writers
@@ -496,11 +501,13 @@ kill, a power cut or a forced quit cannot lose an upload that was paid for:
 - A journal left behind is listed as an **interrupted** upload holding every
   entry that reached the disk, and its id is accepted wherever a record id
   is, with a reminder that it is partial. While its build runs the journal
-  is locked, and it is listed as **in progress**; its id is refused until the
-  build ends, since it is still growing and on Windows cannot be read at
-  all. A journal beside a record of the same id, left by a build that
-  stopped between the steps above, is ignored, and so is one that stopped
-  before holding any entry.
+  is locked, and it is listed as **in progress** without its entries, which
+  are not read; its id is refused until the build ends, since it is still
+  growing and on Windows cannot be read at all. A journal beside a record of
+  the same id, left by a build that stopped between the steps above, is
+  ignored, and so is one that stopped before holding any entry.
+- On Unix the journal is readable by its owner only, as records are, since
+  it holds the DataMaps of private uploads.
 
 The journal is the magic `0xC1 'A' 'N' 'J'`, a version byte (1), and frames:
 a little-endian `u32` payload length, the payload's CRC-32, and the payload.
@@ -543,18 +550,23 @@ Containment is a filesystem contract, not a string check. Within the output
 root the extractor never follows a symlink or a junction, that is, anything
 the platform's no-follow metadata reports as a link (on Windows, the
 name-surrogate reparse points). It resolves every name from directories it
-holds open, never again from a path string once checked, so nothing that
-changes while an entry downloads can redirect where the entry is written,
-even a concurrent local process that can write inside the output root:
+holds open:
 
 - On Unix each directory is held as a file descriptor opened without
   following links, and every create, rename and check is relative to it.
   Renaming a directory or replacing any path to it with a symlink does not
-  change the directory a descriptor refers to.
+  change the directory a descriptor refers to, so nothing that changes
+  while an entry downloads can redirect where it is written, even a
+  concurrent local process that can write inside the output root.
 - On Windows each directory from the root down is held open without delete
-  sharing, which stops it from being renamed, deleted or replaced by a link
-  while the entry is written. Directories beneath the root are opened as the
-  reparse point itself, so a link is seen rather than followed.
+  sharing, which stops it from being renamed or deleted while the entry is
+  written. Directories beneath the root are opened as the reparse point
+  itself, so a link is seen rather than followed. Operations still go by
+  path, so a concurrent process that can write inside the output root can
+  turn a directory the extraction created, while it is still empty, into a
+  junction. Containing that needs handle-relative opens through the native
+  API and is left to a later change; links that exist when a name is
+  resolved are always refused.
 
 The output root itself may be a link, since it is the caller's choice; links
 in its own path are resolved once when it is opened. Each intermediate
@@ -580,7 +592,7 @@ file download and write as above. When the entry records a `sha256`, the
 download is hashed as it is written, in the same pass, and checked before
 the file takes its name; a mismatch is a per-entry failure and the temporary
 file is removed, so nothing unverified is left at the target. The file is
-flushed to disk before the rename. The recorded `size` decides nothing; tools show it
+flushed to disk before the rename, where the filesystem can flush. The recorded `size` decides nothing; tools show it
 marked as the creator's claim, and show the exact size instead wherever an
 embedded root map provides one. Extracted files get the platform's default
 permissions.
@@ -705,16 +717,21 @@ initial release.
   record and removes the journal; journals and records never share an id;
   a journal beside its record is not listed, nor is one cut short before its
   opening; recording a single upload leaves no journal; a record written
-  under looser rules loads repaired, with nothing lost. On a local network, a build
-  that fails after its first upload shows that upload in its in-progress
-  journal before going on, records its partial result itself, and a build
-  cancelled before any upload leaves no record.
+  under looser rules loads repaired, with nothing lost, and a file in the
+  way of a directory loses its path rather than the entries in it. On a
+  local network, a build that fails after its first upload records its
+  partial result itself; a build dropped once its second upload has started,
+  as a killed process stops, leaves an interrupted record holding the first
+  upload, which extracts; and a build cancelled before any upload leaves no
+  record.
 - Size budget tests: the largest entry an upload can become bounds a real
-  shrunk map, and every real upload map is at least the counted smallest;
+  shrunk map, and every real upload entry fits what its file is counted at;
   a build of long paths that would fit as addresses but not embedded is
   refused before paying; the fixed part counts everything but the entries;
   an upload is admitted only when its largest entry fits; a larger reference
-  is taken only when it fits.
+  is taken only when it fits; a build that passes preflight with less than
+  a file to spare, whose uploads all return shrunk maps and are offered
+  larger references, is never refused.
 - End-to-end on a local network: build a manifest with an embedded entry, a
   compact entry and an entry added by address; extract it from a `.ant` file
   and from a manifest link; extract a selection; verify bytes and per-entry

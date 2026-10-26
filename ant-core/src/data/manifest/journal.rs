@@ -20,12 +20,20 @@
 //! and again once its reference is final.
 //!
 //! The builder holds an exclusive lock on the journal while it runs, so a
-//! listing can tell an upload in progress from an interrupted one.
+//! listing can tell an upload in progress from an interrupted one. A locked
+//! journal is not read: it is still growing, and on Windows the lock keeps
+//! it from being read at all.
+//!
+//! On Unix the journal is readable by its owner only, as a record is, since
+//! it holds the DataMaps of private uploads.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +47,8 @@ use super::{Manifest, ManifestEntry, ManifestError, TorrentReference, MAX_MANIFE
 use super::history::{list_uploads, load_upload};
 #[cfg(test)]
 use super::ContentRef;
+#[cfg(all(test, unix))]
+use std::os::unix::fs::PermissionsExt;
 
 /// Suffix of a journal's file name after its record id.
 pub(super) const JOURNAL_SUFFIX: &str = ".ant.partial";
@@ -54,6 +64,9 @@ const FRAME_FIELD_LEN: usize = std::mem::size_of::<u32>();
 /// frame's header is small next to an entry, so a journal of any manifest
 /// within the limit stays under three times that limit.
 const MAX_JOURNAL_BYTES: u64 = 3 * MAX_MANIFEST_BYTES as u64;
+/// Permissions of a new journal on Unix: read and write for its owner only.
+#[cfg(unix)]
+const JOURNAL_MODE: u32 = 0o600;
 
 /// The first frame: what a manifest carries besides its entries.
 #[derive(Serialize, Deserialize)]
@@ -93,7 +106,11 @@ impl UploadJournal {
         let mut ids = new_ids(label.or(name));
         while let Some(id) = ids.next() {
             let path = journal_path(dir, &id);
-            let file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(JOURNAL_MODE);
+            let file = match options.open(&path) {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e.into()),
@@ -223,19 +240,15 @@ pub(super) fn journal_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}{JOURNAL_SUFFIX}"))
 }
 
-/// The manifest a journal holds, and whether its build is still running.
-/// A running build on Windows keeps its journal from being read, so only
-/// that it is running is known then.
-pub(super) fn read_journal(path: &Path) -> Result<(Manifest, bool), ManifestError> {
-    let file = File::open(path)?;
-    let in_progress = match file.try_lock_shared() {
-        Ok(()) => {
-            let _ = file.unlock();
-            false
-        }
-        Err(TryLockError::WouldBlock) => true,
+/// The manifest a journal holds, or `None` while its build is still running.
+/// It is read from the handle whose lock was checked, under a shared lock.
+pub(super) fn read_journal(path: &Path) -> Result<Option<Manifest>, ManifestError> {
+    let mut file = File::open(path)?;
+    match file.try_lock_shared() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(None),
         Err(TryLockError::Error(error)) => return Err(error.into()),
-    };
+    }
     let len = file.metadata()?.len();
     if len > MAX_JOURNAL_BYTES {
         return Err(ManifestError::TooLarge {
@@ -243,12 +256,9 @@ pub(super) fn read_journal(path: &Path) -> Result<(Manifest, bool), ManifestErro
             max: usize::try_from(MAX_JOURNAL_BYTES).unwrap_or(usize::MAX),
         });
     }
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(_) if in_progress => return Ok((Manifest::default(), true)),
-        Err(error) => return Err(error.into()),
-    };
-    Ok((parse_journal(&bytes)?, in_progress))
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    parse_journal(&bytes).map(Some)
 }
 
 /// The manifest in a journal's bytes, up to the first frame that is cut
@@ -372,9 +382,14 @@ mod tests {
         // The same name again: the final reference replaces the first.
         journal.append(&entry("a.bin", 3)).unwrap();
 
-        // While the build runs, the record is in progress.
-        let running = load_upload(dir.path(), &id).unwrap().unwrap();
-        assert_eq!(running.state, RecordState::InProgress);
+        // While the build runs, the record lists as in progress, with no
+        // entries read, and its id is refused.
+        let running = list_uploads(dir.path()).unwrap();
+        assert_eq!(running.records.len(), 1, "{:?}", running.unreadable);
+        assert_eq!(running.records[0].state, RecordState::InProgress);
+        assert!(running.records[0].manifest.entries.is_empty());
+        let error = load_upload(dir.path(), &id).unwrap_err();
+        assert!(error.to_string().contains("still in progress"), "{error}");
 
         // The process stops without finishing: the lock is released.
         drop(journal);
@@ -403,8 +418,7 @@ mod tests {
 
         // Torn in the middle of the last frame.
         fs::write(&path, &full[..full.len() - 3]).unwrap();
-        let (manifest, in_progress) = read_journal(&path).unwrap();
-        assert!(!in_progress);
+        let manifest = read_journal(&path).unwrap().unwrap();
         assert_eq!(manifest.entries, vec![entry("a.bin", 1)]);
 
         // Garbage where the last frame was: its checksum fails.
@@ -413,16 +427,28 @@ mod tests {
         damaged[last] ^= 0xff;
         fs::write(&path, &damaged).unwrap();
         assert_eq!(
-            read_journal(&path).unwrap().0.entries,
+            read_journal(&path).unwrap().unwrap().entries,
             vec![entry("a.bin", 1)]
         );
 
         // Cut before the header: an interrupted record with nothing in it.
         fs::write(&path, &full[..JOURNAL_HEADER_LEN + 2]).unwrap();
-        assert!(read_journal(&path).unwrap().0.entries.is_empty());
+        assert!(read_journal(&path).unwrap().unwrap().entries.is_empty());
 
         fs::write(&path, b"something else").unwrap();
         assert!(read_journal(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_is_readable_by_its_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = UploadJournal::create(dir.path(), None, None, None).unwrap();
+        let mode = fs::metadata(journal_path(dir.path(), journal.id()))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, JOURNAL_MODE);
     }
 
     #[test]

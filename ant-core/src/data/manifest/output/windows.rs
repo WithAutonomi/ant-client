@@ -1,8 +1,9 @@
 //! Windows containment: each directory from the output root down is held
-//! open without delete sharing, so none of them can be renamed, deleted or
-//! replaced while an entry is written, and operations by path stay inside
-//! the chain. Directories beneath the root are opened as the reparse point
-//! itself, so a junction or symlink is seen rather than followed.
+//! open without delete sharing, so none of them can be renamed or deleted
+//! while an entry is written. Directories beneath the root are opened as the
+//! reparse point itself, so a junction or symlink is seen rather than
+//! followed. Operations go by path, so a concurrent writer in the output
+//! root that turns an empty directory into a junction is not contained.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -52,9 +53,10 @@ pub(super) struct Dir {
 
 impl Dir {
     /// Open the output root. A link in the root's own path is resolved once;
-    /// holding the result keeps that resolution valid.
+    /// holding the result keeps that resolution valid. A volume that cannot
+    /// report final paths, such as a RAM disk, is used by its absolute path.
     pub(super) fn open_root(path: &Path) -> io::Result<Self> {
-        let resolved = fs::canonicalize(path)?;
+        let resolved = fs::canonicalize(path).or_else(|_| std::path::absolute(path))?;
         let held = hold(&resolved, FILE_FLAG_BACKUP_SEMANTICS)?;
         if !held.metadata()?.is_dir() {
             return Err(io::ErrorKind::NotADirectory.into());
@@ -114,7 +116,7 @@ impl Dir {
             EntryKind::Other
         };
         let identity = match kind {
-            EntryKind::File => Some(identity_at(&path)?),
+            EntryKind::File => identity_at(&path)?,
             _ => None,
         };
         Ok(Some(Entry { kind, identity }))
@@ -166,8 +168,15 @@ fn hold(path: &Path, flags: u32) -> io::Result<File> {
         .open(path)
 }
 
-/// The identity of the file at `path`, opened as itself if it is a link.
-fn identity_at(path: &Path) -> io::Result<FileIdentity> {
+/// Whether a flush failed only because the filesystem cannot flush.
+pub(super) fn flush_unsupported(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Unsupported
+}
+
+/// The identity of the file at `path`, opened as itself if it is a link, or
+/// `None` when the filesystem has no real file ids. Such a filesystem, as
+/// the WebDAV redirector does, reports zero or all ones for every file.
+fn identity_at(path: &Path) -> io::Result<Option<FileIdentity>> {
     let file = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(LOOK_SHARE_MODE)
@@ -186,10 +195,11 @@ fn identity_at(path: &Path) -> io::Result<FileIdentity> {
         )
     };
     if found != 0 {
-        return Ok(FileIdentity {
+        let file = u128::from_le_bytes(info.FileId.Identifier);
+        return Ok((file != 0 && file != u128::MAX).then_some(FileIdentity {
             volume: info.VolumeSerialNumber,
-            file: u128::from_le_bytes(info.FileId.Identifier),
-        });
+            file,
+        }));
     }
     // Filesystems without 128-bit ids report the 64-bit index instead.
     let mut basic = BY_HANDLE_FILE_INFORMATION::default();
@@ -198,8 +208,8 @@ fn identity_at(path: &Path) -> io::Result<FileIdentity> {
         return Err(io::Error::last_os_error());
     }
     let index = (u64::from(basic.nFileIndexHigh) << u32::BITS) | u64::from(basic.nFileIndexLow);
-    Ok(FileIdentity {
+    Ok((index != 0 && index != u64::MAX).then_some(FileIdentity {
         volume: u64::from(basic.dwVolumeSerialNumber),
         file: u128::from(index),
-    })
+    }))
 }

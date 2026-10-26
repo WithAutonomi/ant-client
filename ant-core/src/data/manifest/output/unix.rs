@@ -26,6 +26,8 @@ pub(super) const HOLD_ANCESTORS: bool = false;
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 const NO_ATOMIC_NOREPLACE: &[Errno] =
     &[Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP];
+/// Errors from a flush on a filesystem that cannot do one.
+const NO_FLUSH: &[Errno] = &[Errno::NOTSUP, Errno::OPNOTSUPP];
 
 /// Identity of a file: its device and inode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -71,7 +73,12 @@ impl Dir {
                     kind: EntryKind::Symlink,
                     ..
                 })) => not_followed(&display),
-                Ok(Some(_)) => not_a_directory(&display),
+                Ok(Some(Entry {
+                    kind: EntryKind::File | EntryKind::Other,
+                    ..
+                })) => not_a_directory(&display),
+                // A directory that could not be opened, as one without read
+                // permission: the error says why.
                 _ => io::Error::from(error).into(),
             }),
         }
@@ -148,6 +155,11 @@ impl Dir {
     pub(super) fn display(&self) -> &Path {
         &self.display
     }
+}
+
+/// Whether a flush failed only because the filesystem cannot flush.
+pub(super) fn flush_unsupported(error: &io::Error) -> bool {
+    Errno::from_io_error(error).is_some_and(|errno| NO_FLUSH.contains(&errno))
 }
 
 /// `rwx` for everyone, narrowed by the umask, as `std::fs::create_dir` does.

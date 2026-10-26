@@ -1,6 +1,6 @@
 //! Containment for extraction: every name beneath the output root is
-//! resolved from directories held open, never re-resolved from a path
-//! string after it was checked.
+//! resolved from directories held open, and nothing beneath the root is
+//! followed through a link.
 //!
 //! On Unix each directory is a file descriptor and every operation is
 //! relative to one (`openat`, `mkdirat`, `renameat`), opened without
@@ -9,9 +9,12 @@
 //!
 //! On Windows each directory from the output root down is held open
 //! without delete sharing. While those handles are open, Windows refuses to
-//! rename, delete or replace any directory on the chain, so operations by
-//! path stay inside it. Directories beneath the root are opened as the
-//! reparse point itself, so a junction or symlink is detected, not followed.
+//! rename or delete any directory on the chain. Directories beneath the
+//! root are opened as the reparse point itself, so a junction or symlink is
+//! detected, not followed. Operations still go by path, so a concurrent
+//! process that can write in the output root can turn a directory this
+//! extraction created, while it is still empty, into a junction; containing
+//! that would take handle-relative opens through the native API.
 //!
 //! A file is written under a temporary name in its parent and renamed into
 //! place without replacing anything. An existing name is replaced only when
@@ -228,7 +231,13 @@ impl Staged<'_> {
     /// and recording the result happen as one step.
     pub(super) fn commit(mut self, overwrite: bool) -> Result<(), ManifestError> {
         if let Some(file) = self.file.take() {
-            file.sync_all()?;
+            match file.sync_all() {
+                // A filesystem that cannot flush, as an SMB share on macOS
+                // refuses the full flush, keeps the file as it keeps any
+                // other write.
+                Err(error) if platform::flush_unsupported(&error) => {}
+                result => result?,
+            }
         }
         let target = self.target;
         let dir = target.dir();

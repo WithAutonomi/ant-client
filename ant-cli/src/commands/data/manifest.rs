@@ -550,7 +550,7 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         result
     };
 
-    let (result, history_id) = build_outcome(built)?;
+    let (result, history_id) = build_outcome(built, &out, args.overwrite)?;
     write_manifest(&result.manifest, &out, args.overwrite)?;
     if !json {
         eprintln!(
@@ -573,11 +573,14 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
     )
 }
 
-/// Turn a build's outcome into its result and record id, or an error that
-/// says where the completed uploads are recorded. The builder has already
-/// recorded them in the history, complete or partial.
+/// Turn a build's outcome into its result and the id of the record that
+/// holds it, or an error that says where the completed uploads are kept. The
+/// builder has already recorded them in the history, complete or partial;
+/// when it could not, a stopped build's partial manifest is written to `out`.
 fn build_outcome(
     built: Result<BuildResult, ManifestError>,
+    out: &Path,
+    overwrite: bool,
 ) -> anyhow::Result<(BuildResult, Option<String>)> {
     let result = match built {
         Ok(result) => result,
@@ -586,7 +589,6 @@ fn build_outcome(
             cause,
             partial,
         }) => {
-            warn_unfinished_record(&partial);
             let at = if path.is_empty() {
                 String::new()
             } else {
@@ -596,27 +598,47 @@ fn build_outcome(
                 "manifest build failed{at} after {} of {} file(s): {cause}{}",
                 partial.files_uploaded,
                 partial.total_to_upload,
-                partial_record_message(partial.history_id.as_deref()),
+                keep_partial(&partial, out, overwrite),
             );
         }
         Err(error) => return Err(error.into()),
     };
-    warn_unfinished_record(&result);
-    let history_id = result.history_id.clone();
     if result.cancelled {
-        return Err(cancelled_build_error(&result, history_id.as_deref()));
+        return Err(cancelled_build_error(
+            &result,
+            &keep_partial(&result, out, overwrite),
+        ));
     }
+    let history_id = recorded_id(&result);
     Ok((result, history_id))
 }
 
-/// Say when a build's record could not be written. Its journal stays in the
-/// history with every completed upload, listed as interrupted.
-fn warn_unfinished_record(result: &BuildResult) {
-    if let (Some(id), Some(error)) = (&result.history_id, &result.history_error) {
-        eprintln!(
-            "warning: the record of upload {id} could not be written ({error}); \
-             it stays in the history as interrupted, with every completed file"
-        );
+/// The id of the record that holds a build's manifest, or `None`, with a
+/// warning, when its record could not be written.
+fn recorded_id(result: &BuildResult) -> Option<String> {
+    match (&result.history_id, &result.history_error) {
+        (Some(id), Some(error)) => {
+            eprintln!(
+                "warning: the record of upload {id} could not be written ({error}); \
+                 its journal stays in the history, listed as interrupted"
+            );
+            None
+        }
+        (id, _) => id.clone(),
+    }
+}
+
+/// Where a stopped build's partial manifest is kept, for its error message:
+/// its record, or `out` when the record could not be written, since a
+/// journal the build could not finish may also lack the last upload.
+fn keep_partial(partial: &BuildResult, out: &Path, overwrite: bool) -> String {
+    match recorded_id(partial) {
+        Some(id) => format!("; the partial manifest is recorded as {id}"),
+        None if partial.files_uploaded == 0 => String::new(),
+        None => match write_manifest(&partial.manifest, out, overwrite) {
+            Ok(()) => format!("; the partial manifest is written to {}", out.display()),
+            Err(error) => format!("; the partial manifest could not be kept: {error}"),
+        },
     }
 }
 
@@ -640,21 +662,12 @@ fn resolve_download_root(manifest: &Manifest, output: Option<PathBuf>) -> anyhow
     }))
 }
 
-fn partial_record_message(history_id: Option<&str>) -> String {
-    history_id
-        .map(|id| format!("; the partial manifest is recorded as {id}"))
-        .unwrap_or_default()
-}
-
-fn cancelled_build_error(
-    result: &ant_core::data::BuildResult,
-    history_id: Option<&str>,
-) -> anyhow::Error {
+/// `kept` says where the partial manifest is kept, as [`keep_partial`] does.
+fn cancelled_build_error(result: &ant_core::data::BuildResult, kept: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "cancelled after {} of {} file(s){}",
+        "cancelled after {} of {} file(s){kept}",
         result.files_uploaded,
         result.total_to_upload,
-        partial_record_message(history_id),
     )
 }
 
@@ -1017,7 +1030,7 @@ fn load_manifest(source: &str) -> anyhow::Result<Manifest> {
     }
     let dir = default_history_dir()?;
     match load_upload(&dir, source)? {
-        Some(record) => record_manifest(record),
+        Some(record) => Ok(record_manifest(record)),
         None => anyhow::bail!(
             "{source} is not a manifest file, a manifest link, or a recorded upload id \
              (see `ant manifest list`)"
@@ -1025,23 +1038,17 @@ fn load_manifest(source: &str) -> anyhow::Result<Manifest> {
     }
 }
 
-/// A recorded upload's manifest. One still in progress is refused: it is
-/// still growing, and while it runs it may not be readable at all. One that
-/// was interrupted is used, with a reminder of what it holds.
-fn record_manifest(record: UploadRecord) -> anyhow::Result<Manifest> {
-    match record.state {
-        RecordState::Complete => {}
-        RecordState::InProgress => anyhow::bail!(
-            "upload {} is still in progress; use it once it has finished",
-            record.id
-        ),
-        RecordState::Interrupted => eprintln!(
+/// A recorded upload's manifest, with a reminder of what an interrupted one
+/// holds. One still in progress is never loaded: the history refuses it.
+fn record_manifest(record: UploadRecord) -> Manifest {
+    if record.state == RecordState::Interrupted {
+        eprintln!(
             "warning: upload {} was interrupted; it holds the {} file(s) uploaded before it stopped",
             record.id,
             record.manifest.entries.len()
-        ),
+        );
     }
-    Ok(record.manifest)
+    record.manifest
 }
 
 /// Parse the `--torrent-hash` values into one reference, or `None` if none.
@@ -1271,8 +1278,11 @@ mod tests {
                     address: [index; 32],
                 },
             });
+            let out = PathBuf::from("unused.ant");
             assert_eq!(
-                cancelled_build_error(&result, Some("record-id")).to_string(),
+                build_outcome(Ok(result.clone()), &out, false)
+                    .unwrap_err()
+                    .to_string(),
                 "cancelled after 1 of 10 file(s); the partial manifest is recorded as record-id"
             );
         }
@@ -1312,7 +1322,8 @@ mod tests {
                     partial: Box::new(partial),
                 })
             };
-            let error = build_outcome(built).unwrap_err();
+            let out = PathBuf::from("unused.ant");
+            let error = build_outcome(built, &out, false).unwrap_err();
             assert!(error
                 .to_string()
                 .contains("the partial manifest is recorded as 20261019T120000Z-partial"));
@@ -1321,23 +1332,56 @@ mod tests {
                 assert!(error.to_string().contains("later.bin"));
                 assert!(error.to_string().contains("forced failure"));
             }
+            assert!(!out.exists());
         }
     }
 
+    /// A build whose record could not be written, as on a full disk, may have
+    /// a journal that lacks its last upload, so the partial manifest goes to
+    /// the output file instead, and no record is claimed.
     #[test]
-    fn records_in_progress_are_refused_and_interrupted_ones_used() {
-        let record = |state| UploadRecord {
-            id: "20261019T120000Z-set".into(),
-            path: PathBuf::from("20261019T120000Z-set.ant.partial"),
-            recorded_at: 0,
-            label: "set".into(),
-            manifest: Manifest::new(Some("set".into())),
-            state,
+    fn a_stopped_build_that_could_not_be_recorded_is_written_to_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = Manifest {
+            name: Some("partial".into()),
+            torrent: None,
+            entries: vec![ant_core::data::ManifestEntry {
+                path: Some("completed.bin".into()),
+                size: Some(10),
+                sha256: None,
+                source: ContentRef::Public { address: [1; 32] },
+            }],
         };
-        assert!(record_manifest(record(RecordState::Complete)).is_ok());
-        assert!(record_manifest(record(RecordState::Interrupted)).is_ok());
-        let error = record_manifest(record(RecordState::InProgress)).unwrap_err();
-        assert!(error.to_string().contains("still in progress"), "{error}");
+        let partial = BuildResult {
+            manifest: manifest.clone(),
+            cancelled: false,
+            skipped_symlinks: vec![],
+            files_uploaded: 1,
+            total_to_upload: 2,
+            chunks_stored: 3,
+            storage_cost_atto: 12,
+            gas_cost_wei: 34,
+            history_id: Some("20261019T120000Z-partial".into()),
+            history_error: Some("No space left on device".into()),
+        };
+        let out = dir.path().join("partial.ant");
+        let built = Err(ManifestError::BuildFailed {
+            path: "later.bin".into(),
+            cause: Box::new(ManifestError::Build("No space left on device".into())),
+            partial: Box::new(partial.clone()),
+        });
+        let error = build_outcome(built, &out, false).unwrap_err().to_string();
+        assert!(!error.contains("recorded as"), "{error}");
+        assert!(
+            error.contains(&format!("written to {}", out.display())),
+            "{error}"
+        );
+        assert_eq!(read_manifest_file(&out).unwrap(), manifest);
+
+        // A finished build keeps its manifest in the output anyway; only
+        // the record id is not claimed.
+        let (_, history_id) = build_outcome(Ok(partial), &out, true).unwrap();
+        assert!(history_id.is_none());
     }
 
     #[test]
