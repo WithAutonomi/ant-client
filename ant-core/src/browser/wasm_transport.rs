@@ -91,6 +91,10 @@ const ICE_UNREACHABLE: &str = "WebRTC endpoint did not answer ICE connectivity c
 const NAVIGATOR: &str = "navigator";
 /// User-Agent Client Hints, which only Chromium exposes on `Navigator`.
 const CHROMIUM_USER_AGENT_DATA: &str = "userAgentData";
+/// `Navigator`'s vendor, which pages do not change.
+const NAVIGATOR_VENDOR: &str = "vendor";
+/// The vendor every WebKit browser reports, Safari and all iOS browsers.
+const WEBKIT_VENDOR: &str = "Apple Computer, Inc.";
 const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 // Retain useful associations across concurrent close-group walks. Active leases
 // remain non-evictable, and the pool still imposes a hard resource bound.
@@ -3643,15 +3647,23 @@ fn transfer_timeout_ms(content_bytes: usize) -> u32 {
 /// opens no extra sockets for overlapping gatherings, and on mainnet waiting
 /// for the turn delayed its typical dial by 0.6-1.7 s, more as more lookups ran.
 /// Only Chromium exposes User-Agent Client Hints, so every other engine, WebKit
-/// and also the unmeasured Firefox, keeps taking turns.
+/// and also the unmeasured Firefox, keeps taking turns. A page can add
+/// `userAgentData` itself, as a polyfill does, so WebKit's vendor also keeps
+/// the turn: overlapping there would cut established connections.
 fn ice_gathering_may_overlap() -> bool {
-    js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str(NAVIGATOR))
+    let Some(navigator) = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str(NAVIGATOR))
         .ok()
         .filter(JsValue::is_object)
-        .and_then(|navigator| {
-            js_sys::Reflect::has(&navigator, &JsValue::from_str(CHROMIUM_USER_AGENT_DATA)).ok()
-        })
-        .unwrap_or(false)
+    else {
+        return false;
+    };
+    let chromium = js_sys::Reflect::has(&navigator, &JsValue::from_str(CHROMIUM_USER_AGENT_DATA))
+        .unwrap_or(false);
+    let webkit = js_sys::Reflect::get(&navigator, &JsValue::from_str(NAVIGATOR_VENDOR))
+        .ok()
+        .and_then(|vendor| vendor.as_string())
+        .is_some_and(|vendor| vendor == WEBKIT_VENDOR);
+    chromium && !webkit
 }
 
 /// Wait for the page's ICE gathering turn, or `None` where connections may

@@ -135,9 +135,14 @@ test("a dial fails once its endpoint has not answered ICE checks in time", async
 });
 
 test("a dial whose ICE checks succeeded waits for a slow channel to open", async () => {
-  const rtc = mockWebRtc([{ connectDelay: ICE_TIMEOUT_MS + 500 }]);
+  // The channel opens after the ICE deadline has passed, with ICE connected.
+  const openDelay = ICE_TIMEOUT_MS + 500;
+  const rtc = mockWebRtc([{ openDelay }]);
+  const started = Date.now();
   const client = await test_connect_node(rtc.endpoints[0]);
+  const took = Date.now() - started;
   client.close();
+  assert.ok(took >= openDelay - TIMER_SLACK_MS, `took ${took} ms`);
   assert.equal(rtc.connections.length, 1);
 });
 

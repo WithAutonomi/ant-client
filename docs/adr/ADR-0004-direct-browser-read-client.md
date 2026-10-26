@@ -773,8 +773,9 @@ about 0.4 s.
   the deadline and 5% without it.
 - **Chromium dials gather ICE candidates at once.** The gathering turn exists
   for WebKit, which opens many more sockets for overlapping gatherings.
-  Chromium is recognized by `navigator.userAgentData`, which only it exposes.
-  WebKit and Firefox keep the turn; Firefox was not measured.
+  Chromium is recognized by `navigator.userAgentData`, which only it exposes,
+  unless the page reports WebKit's vendor: a Client Hints polyfill in Safari
+  must not lift the turn. WebKit and Firefox keep it; Firefox was not measured.
 - **Only Chromium starts fetching at the read budget's 8 GETs.** Where dials
   take turns to gather, more concurrent reads queue more dials for the turn,
   so other engines keep the native cold start of 4.

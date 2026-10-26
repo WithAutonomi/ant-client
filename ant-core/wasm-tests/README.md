@@ -122,7 +122,8 @@ reauthentication and capability checks after timeout, bounded admission without
 closing active work, pool closure during setup, and strict queued session handles.
 It also checks that a dial fails if its endpoint has not answered ICE checks
 3 s after the offer, while one whose ICE succeeded may take longer to open its
-channel. The mock leaves a node with `iceUnreachable` checking forever.
+channel. The mock leaves a node with `iceUnreachable` checking forever, and
+`openDelay` delays a channel's opening without holding up its offer.
 
 `failed-peer-connection.test.mjs` emulates WebKit, which reports a lost peer
 connection as `failed` but leaves its DataChannels "open" without a close event
@@ -142,8 +143,9 @@ connection at a time, and that a gathering which never completes hands the turn
 on after its timeout. WebKit opens many more UDP sockets for connections whose
 gathering overlaps and closes the oldest past its per-page cap, cutting
 established connections. Chromium, which the test recognizes by
-`navigator.userAgentData`, gathers for concurrent dials at once. The mock
-completes gathering after `gatheringMs`.
+`navigator.userAgentData`, gathers for concurrent dials at once, unless the
+page reports WebKit's vendor, as Safari with a Client Hints polyfill would. The
+mock completes gathering after `gatheringMs`.
 
 `lookup-reuse.test.mjs` covers draining admitted lookups after grace cancellation,
 retaining actual dial failures, cancelling queued work, closing background work,

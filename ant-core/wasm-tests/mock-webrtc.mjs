@@ -35,7 +35,9 @@ export async function asChromium(test) {
 // responses use the shared Rust wire contract and real session encryption.
 // ICE gathering completes `gatheringMs` after setLocalDescription; Infinity
 // never completes. A node with `iceUnreachable` never answers ICE checks, so its
-// connection stays "checking" and its channels never open.
+// connection stays "checking" and its channels never open. `connectDelay` holds
+// up setRemoteDescription, while `openDelay` only delays a channel's opening
+// after ICE has connected, as slow DTLS and SCTP would.
 // How soon a refusing node's transport fails a dial, as a STUN error response
 // to the browser's first answered connectivity check would.
 const REFUSAL_MS = 20;
@@ -233,7 +235,7 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
       }
       if (channel.options.connectDelay) await new Promise(resolve => setTimeout(resolve, channel.options.connectDelay));
       if (this.connectionState === "new") this.connectionState = "connected";
-      setTimeout(() => channel.onopen?.({}), 0);
+      setTimeout(() => channel.onopen?.({}), channel.options.openDelay ?? 0);
     }
     close() {
       if (this.closed) return;

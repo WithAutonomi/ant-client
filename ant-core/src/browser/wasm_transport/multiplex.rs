@@ -186,6 +186,11 @@ impl RpcSession {
         let mut changed = read.changed.clone();
         let admission = async {
             loop {
+                // A speculative GET over its share never tries the slots,
+                // which is how a closed session would otherwise fail it.
+                if self.is_closed() {
+                    return Err("WebRTC session closed".to_string().into());
+                }
                 if !(read.speculative)() {
                     return self
                         .slots
