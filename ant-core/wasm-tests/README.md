@@ -134,7 +134,9 @@ rather than open a lane on the failed association.
 connection at a time, and that a gathering which never completes hands the turn
 on after its timeout. WebKit opens many more UDP sockets for connections whose
 gathering overlaps and closes the oldest past its per-page cap, cutting
-established connections. The mock completes gathering after `gatheringMs`.
+established connections. Chromium, which the test recognizes by
+`navigator.userAgentData`, gathers for concurrent dials at once. The mock
+completes gathering after `gatheringMs`.
 
 `lookup-reuse.test.mjs` covers draining admitted lookups after grace cancellation,
 retaining actual dial failures, cancelling queued work, closing background work,

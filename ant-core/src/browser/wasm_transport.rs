@@ -85,6 +85,10 @@ const ICE_GATHERING_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ICE_CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Dial failure of an endpoint that did not answer ICE checks in time.
 const ICE_UNREACHABLE: &str = "WebRTC endpoint did not answer ICE connectivity checks";
+/// The global holding the browser's `Navigator`.
+const NAVIGATOR: &str = "navigator";
+/// User-Agent Client Hints, which only Chromium exposes on `Navigator`.
+const CHROMIUM_USER_AGENT_DATA: &str = "userAgentData";
 const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 // Retain useful associations across concurrent close-group walks. Active leases
 // remain non-evictable, and the pool still imposes a hard resource bound.
@@ -123,11 +127,12 @@ const MAX_UPLOAD_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_UPLOAD_RECORDS: usize = 4096;
 
 thread_local! {
-    /// One connection in the page gathers ICE candidates at a time. WebKit opens
-    /// up to thirty UDP sockets for each connection whose gathering overlaps
-    /// another's, instead of two, and past 256 sockets per page it closes the
-    /// oldest, silently cutting established connections. The cap is per page,
-    /// so the turn is shared by every client in it.
+    /// One connection in the page gathers ICE candidates at a time, except in
+    /// Chromium (see [`ice_gathering_may_overlap`]). WebKit opens up to thirty
+    /// UDP sockets for each connection whose gathering overlaps another's,
+    /// instead of two, and past 256 sockets per page it closes the oldest,
+    /// silently cutting established connections. The cap is per page, so the
+    /// turn is shared by every client in it.
     static ICE_GATHERING_TURN: Arc<Semaphore> = Arc::new(Semaphore::new(1));
 }
 
@@ -925,7 +930,12 @@ impl Connection {
             JsFuture::from(connection.peer_connection.set_local_description(&local))
                 .await
                 .map_err(js_error_message)?;
-            pass_ice_gathering_turn(RtcPeerConnection::clone(&connection.peer_connection), turn);
+            if let Some(turn) = turn {
+                pass_ice_gathering_turn(
+                    RtcPeerConnection::clone(&connection.peer_connection),
+                    turn,
+                );
+            }
             let local_sdp = connection
                 .peer_connection
                 .local_description()
@@ -3504,9 +3514,27 @@ fn transfer_timeout_ms(content_bytes: usize) -> u32 {
     u32::try_from(transfer_timeout(content_bytes).as_millis()).unwrap_or(u32::MAX)
 }
 
-/// Wait for the page's ICE gathering turn. The semaphore is never closed, so
-/// this always returns a turn; `None` would only skip the wait.
+/// Whether this page's connections may gather ICE candidates at once. Chromium
+/// opens no extra sockets for overlapping gatherings, and on mainnet waiting
+/// for the turn delayed its typical dial by 0.6-1.7 s, more as more lookups ran.
+/// Only Chromium exposes User-Agent Client Hints, so every other engine, WebKit
+/// and also the unmeasured Firefox, keeps taking turns.
+fn ice_gathering_may_overlap() -> bool {
+    js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str(NAVIGATOR))
+        .ok()
+        .filter(JsValue::is_object)
+        .and_then(|navigator| {
+            js_sys::Reflect::has(&navigator, &JsValue::from_str(CHROMIUM_USER_AGENT_DATA)).ok()
+        })
+        .unwrap_or(false)
+}
+
+/// Wait for the page's ICE gathering turn, or `None` where connections may
+/// gather at once. The semaphore is never closed.
 async fn ice_gathering_turn() -> Option<OwnedSemaphorePermit> {
+    if ice_gathering_may_overlap() {
+        return None;
+    }
     ICE_GATHERING_TURN
         .with(Arc::clone)
         .acquire_owned()
@@ -3516,7 +3544,7 @@ async fn ice_gathering_turn() -> Option<OwnedSemaphorePermit> {
 
 /// Pass the turn on once `connection` finishes gathering, or after
 /// [`ICE_GATHERING_TURN_TIMEOUT`]. The connection itself carries on at once.
-fn pass_ice_gathering_turn(connection: RtcPeerConnection, turn: Option<OwnedSemaphorePermit>) {
+fn pass_ice_gathering_turn(connection: RtcPeerConnection, turn: OwnedSemaphorePermit) {
     wasm_bindgen_futures::spawn_local(async move {
         let deadline = web_time::Instant::now() + ICE_GATHERING_TURN_TIMEOUT;
         while connection.ice_gathering_state() != RtcIceGatheringState::Complete
