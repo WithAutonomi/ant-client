@@ -779,20 +779,28 @@ about 0.4 s.
 Together they let the fetch start of 8, which on its own made mainnet
 downloads 15-26% slower by overflowing the pool, pay off. Measured with
 headless Chromium on macOS against mainnet, each arm downloading the same
-64 MiB file with a fresh client, in rotating order:
+64 MiB public file with a fresh client, in rotating order. The first run
+separates the changes on the branch before it merged main; the second compares
+the merged branch with main at `ccd4106`:
 
-| build | rounds | p50 | against main, paired | faster |
-| --- | --: | --: | --: | --: |
-| main | 4 | 39.1 s | | |
-| fetch start 8 (before this section) | 4 | 45.0 s | +15% | 1/4 |
-| fetch start 4, ICE deadline | 4 | 32.3 s | -15% | 3/4 |
-| fetch start 4, both changes | 4 | 25.3 s | -34% | 4/4 |
-| fetch start 8, both changes | 4 | 19.7 s | -49% | 4/4 |
-| main (second run) | 5 | 35.0 s | | |
-| fetch start 8, both changes | 5 | 19.2 s | -46% | 5/5 |
+| run | build | rounds | p50 | against main, paired | faster |
+| --: | --- | --: | --: | --: | --: |
+| 1 | main | 4 | 39.1 s | | |
+| 1 | fetch start 8 alone | 4 | 45.0 s | +15% | 1/4 |
+| 1 | fetch start 4, ICE deadline | 4 | 32.3 s | -15% | 3/4 |
+| 1 | fetch start 4, both changes | 4 | 25.3 s | -34% | 4/4 |
+| 1 | fetch start 8, both changes | 4 | 19.7 s | -49% | 4/4 |
+| 2 | main | 5 | 37.6 s | | |
+| 2 | fetch start 4, both changes | 5 | 28.9 s | -23% | 4/5 |
+| 2 | fetch start 8, both changes | 5 | 21.6 s | -40% | 5/5 |
 
-In the last arm's traces a successful dial took 0.4 s at the median instead of
-1.9-2.7 s, a failed one 3.0 s instead of 10.4-11.0 s, and a lookup round 1.2 s
-instead of 1.6-3.8 s. Failing dials held 14 pool slots on average, and the
+In the second run the fetch start of 8 was faster than 4 in every round. A
+612 MB public video took 195 and 270 s with both changes, against main's 398
+and 323 s. The faster branch opens more connections per download: 243 instead
+of 187 for the 64 MiB file, and 2,977 instead of 2,019 for the video.
+
+In traces of the branch before the merge, a successful dial took 0.4 s at the
+median instead of 1.9-2.7 s, a failed one 3.0 s instead of 10.4-11.0 s, and a
+lookup round 1.2 s instead of 1.6-3.8 s. Failing dials held 14 pool slots on average, and the
 first data read started at 7-8 s instead of 13.5-14.3 s. The lookup width, its
 grace period, the pool size and the dial-failure cooldown are unchanged.
