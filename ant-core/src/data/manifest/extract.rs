@@ -9,8 +9,7 @@
 //! anything. A regular file already at a target with the entry's recorded
 //! SHA-256 is kept as that entry, so an extraction that stopped part way can
 //! be run again. Any other existing target is a per-entry failure unless
-//! overwrite was requested, and even then only a regular file this
-//! extraction did not write is replaced.
+//! overwrite was requested, and even then only a regular file is replaced.
 
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
@@ -278,8 +277,11 @@ impl Extraction<'_> {
         let overwrite = self.options.overwrite;
         let target = self.root.target(name)?;
         // Hashing a large file blocks, so keep it off the async workers.
+        // The size, exact or as the creator recorded it, spares reading a
+        // file that cannot be the entry.
         if let Some(expected) = &entry.sha256 {
-            if let Some(bytes) = tokio::task::block_in_place(|| target.identical(expected))? {
+            let size = entry.known_size().or(entry.size);
+            if let Some(bytes) = tokio::task::block_in_place(|| target.identical(expected, size)) {
                 return Ok(EntryStatus::Present { bytes });
             }
         }

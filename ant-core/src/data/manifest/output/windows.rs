@@ -8,17 +8,17 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 
 use tempfile::TempPath;
+use windows_sys::Win32::Foundation::{
+    ERROR_CALL_NOT_IMPLEMENTED, ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, WIN32_ERROR,
+};
 use windows_sys::Win32::Storage::FileSystem::{
-    FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
-use super::{not_a_directory, not_followed, Entry, EntryKind};
+use super::{not_a_directory, not_followed, EntryKind};
 use crate::data::manifest::ManifestError;
 
 /// Only open handles keep a directory from being renamed, so every
@@ -28,18 +28,13 @@ pub(super) const HOLD_ANCESTORS: bool = true;
 /// Sharing for a held directory: others may read and write in it, but not
 /// open it for deletion, which renaming it needs as well.
 const HOLD_SHARE_MODE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
-/// Sharing for a brief look at a file's identity, which must not get in
-/// anyone's way.
-const LOOK_SHARE_MODE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-/// Size of the 128-bit identity record, as the API takes it.
-const FILE_ID_INFO_SIZE: u32 = std::mem::size_of::<FILE_ID_INFO>() as u32;
-
-/// Identity of a file: its volume and its id on that volume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct FileIdentity {
-    volume: u64,
-    file: u128,
-}
+/// Errors from a flush on a volume that cannot do one: drivers without a
+/// flush handler report the first two.
+const NO_FLUSH: &[WIN32_ERROR] = &[
+    ERROR_INVALID_FUNCTION,
+    ERROR_NOT_SUPPORTED,
+    ERROR_CALL_NOT_IMPLEMENTED,
+];
 
 /// A directory held open.
 pub(super) struct Dir {
@@ -98,7 +93,7 @@ impl Dir {
 
     /// What `name` is in this directory, without following a link, or
     /// `None` when nothing has that name.
-    pub(super) fn entry(&self, name: &str) -> io::Result<Option<Entry>> {
+    pub(super) fn entry(&self, name: &str) -> io::Result<Option<EntryKind>> {
         let path = self.path.join(name);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -106,7 +101,7 @@ impl Dir {
             Err(error) => return Err(error),
         };
         let file_type = metadata.file_type();
-        let kind = if file_type.is_symlink() {
+        Ok(Some(if file_type.is_symlink() {
             EntryKind::Symlink
         } else if file_type.is_dir() {
             EntryKind::Directory
@@ -114,12 +109,7 @@ impl Dir {
             EntryKind::File
         } else {
             EntryKind::Other
-        };
-        let identity = match kind {
-            EntryKind::File => identity_at(&path)?,
-            _ => None,
-        };
-        Ok(Some(Entry { kind, identity }))
+        }))
     }
 
     /// Create the file `name`, failing if anything has that name.
@@ -176,48 +166,10 @@ fn hold(path: &Path, flags: u32) -> io::Result<File> {
         .open(path)
 }
 
-/// Whether a flush failed only because the filesystem cannot flush.
+/// Whether a flush failed only because the volume cannot flush.
 pub(super) fn flush_unsupported(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::Unsupported
-}
-
-/// The identity of the file at `path`, opened as itself if it is a link, or
-/// `None` when the filesystem has no real file ids. Such a filesystem, as
-/// the WebDAV redirector does, reports zero or all ones for every file.
-fn identity_at(path: &Path) -> io::Result<Option<FileIdentity>> {
-    let file = OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
-        .share_mode(LOOK_SHARE_MODE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
-    let handle = file.as_raw_handle();
-    let mut info = FILE_ID_INFO::default();
-    // SAFETY: `handle` stays open while `file` is alive, and `info` is a
-    // writable FILE_ID_INFO whose size is passed alongside it.
-    let found = unsafe {
-        GetFileInformationByHandleEx(
-            handle,
-            FileIdInfo,
-            std::ptr::from_mut(&mut info).cast(),
-            FILE_ID_INFO_SIZE,
-        )
-    };
-    if found != 0 {
-        let file = u128::from_le_bytes(info.FileId.Identifier);
-        return Ok((file != 0 && file != u128::MAX).then_some(FileIdentity {
-            volume: info.VolumeSerialNumber,
-            file,
-        }));
-    }
-    // Filesystems without 128-bit ids report the 64-bit index instead.
-    let mut basic = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: as above, for a writable BY_HANDLE_FILE_INFORMATION.
-    if unsafe { GetFileInformationByHandle(handle, &mut basic) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let index = (u64::from(basic.nFileIndexHigh) << u32::BITS) | u64::from(basic.nFileIndexLow);
-    Ok((index != 0 && index != u64::MAX).then_some(FileIdentity {
-        volume: u64::from(basic.dwVolumeSerialNumber),
-        file: u128::from(index),
-    }))
+    error
+        .raw_os_error()
+        .and_then(|code| WIN32_ERROR::try_from(code).ok())
+        .is_some_and(|code| NO_FLUSH.contains(&code))
 }

@@ -168,7 +168,7 @@ cargo run --bin ant -- --help  # Run the CLI
   and resolves every name from directories it holds open (`data/manifest/output/`: by
   descriptor on Unix, by path under held handles on Windows). A manifest
   build journals each completed upload to `<id>.ant.partial` before paying for the next, so a
-  crash loses no paid upload; leftover journals list as interrupted records.
+  crash loses no paid upload; journals list as unfinished records.
   See `docs/adr/ADR-0006-file-manifests-and-links.md`.
 - **Log forwarding is opt-in and node-logging-dependent**: `ant node logs forward enable` is the
   consent act. It only forwards nodes whose `NodeConfig.log_dir` is `Some` — node file logging is

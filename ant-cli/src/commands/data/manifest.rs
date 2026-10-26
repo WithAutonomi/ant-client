@@ -17,10 +17,11 @@ use ant_core::data::{
     apply_compaction, data_map_address, default_history_dir, embeddable_data_map, extract_manifest,
     format_timestamp, is_link, list_uploads, load_upload, manifest_filename_for,
     manifest_link_bytes, manifest_link_from_bytes, parse_link, plan_compaction, publish_data_maps,
-    read_manifest_file, record_upload, write_manifest_file, BuildEvent, BuildOptions, BuildResult,
-    Client, ContentRef, DownloadEvent, EntryStatus, ExtractEvent, ExtractOptions, Link, Manifest,
-    ManifestBuilder, ManifestError, PaymentMode, RecordState, ReferenceMode, TorrentReference,
-    UploadEvent, UploadRecord, Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+    read_manifest_file, record_upload, select_entries, write_manifest_file, BuildEvent,
+    BuildOptions, BuildResult, Client, ContentRef, DownloadEvent, EntryStatus, ExtractEvent,
+    ExtractOptions, Link, Manifest, ManifestBuilder, ManifestError, PaymentMode, RecordState,
+    ReferenceMode, TorrentReference, UploadEvent, UploadRecord, Visibility,
+    MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
 };
 use clap::Subcommand;
 use serde_json::json;
@@ -45,8 +46,9 @@ const FORCE_QUIT_EXIT_CODE: i32 = 130;
 const CLAIMED_SIZE_MARK: char = '*';
 /// Where a download's default directory is made: the current directory.
 const DEFAULT_DOWNLOAD_PARENT: &str = ".";
-/// First character of a hidden name, which a download never defaults to.
-const HIDDEN_NAME_PREFIX: char = '.';
+/// Extension of a stopped build's partial manifest, written beside an
+/// output file that already exists rather than over it.
+const PARTIAL_MANIFEST_EXTENSION: &str = "partial.ant";
 /// Directory under the data directory that records the default download
 /// directories whose download has not finished, so a re-run can continue.
 const DOWNLOAD_RECORDS_DIR: &str = "downloads";
@@ -562,7 +564,7 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         result
     };
 
-    let (result, history_id) = build_outcome(built, &out, args.overwrite)?;
+    let (result, history_id) = build_outcome(built, &out)?;
     write_manifest(&result.manifest, &out, args.overwrite)?;
     if !json {
         eprintln!(
@@ -592,7 +594,6 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
 fn build_outcome(
     built: Result<BuildResult, ManifestError>,
     out: &Path,
-    overwrite: bool,
 ) -> anyhow::Result<(BuildResult, Option<String>)> {
     let result = match built {
         Ok(result) => result,
@@ -610,16 +611,13 @@ fn build_outcome(
                 "manifest build failed{at} after {} of {} file(s): {cause}{}",
                 partial.files_uploaded,
                 partial.total_to_upload,
-                keep_partial(&partial, out, overwrite),
+                keep_partial(&partial, out),
             );
         }
         Err(error) => return Err(error.into()),
     };
     if result.cancelled {
-        return Err(cancelled_build_error(
-            &result,
-            &keep_partial(&result, out, overwrite),
-        ));
+        return Err(cancelled_build_error(&result, &keep_partial(&result, out)));
     }
     let history_id = recorded_id(&result);
     Ok((result, history_id))
@@ -632,7 +630,7 @@ fn recorded_id(result: &BuildResult) -> Option<String> {
         (Some(id), Some(error)) => {
             eprintln!(
                 "warning: the record of upload {id} could not be written ({error}); \
-                 its journal stays in the history, listed as interrupted"
+                 its journal stays in the history, listed as unfinished"
             );
             None
         }
@@ -642,15 +640,23 @@ fn recorded_id(result: &BuildResult) -> Option<String> {
 
 /// Where a stopped build's partial manifest is kept, for its error message:
 /// its record, or `out` when the record could not be written, since a
-/// journal the build could not finish may also lack the last upload.
-fn keep_partial(partial: &BuildResult, out: &Path, overwrite: bool) -> String {
-    match recorded_id(partial) {
-        Some(id) => format!("; the partial manifest is recorded as {id}"),
-        None if partial.files_uploaded == 0 => String::new(),
-        None => match write_manifest(&partial.manifest, out, overwrite) {
-            Ok(()) => format!("; the partial manifest is written to {}", out.display()),
-            Err(error) => format!("; the partial manifest could not be kept: {error}"),
-        },
+/// journal the build could not finish may also lack the last upload. A file
+/// already at `out`, which may be a complete manifest, is never replaced;
+/// the partial manifest goes beside it instead.
+fn keep_partial(partial: &BuildResult, out: &Path) -> String {
+    if let Some(id) = recorded_id(partial) {
+        return format!("; the partial manifest is recorded as {id}");
+    }
+    if partial.files_uploaded == 0 {
+        return String::new();
+    }
+    let beside = out.with_extension(PARTIAL_MANIFEST_EXTENSION);
+    let written = write_manifest(&partial.manifest, out, false)
+        .map(|()| out)
+        .or_else(|_| write_manifest(&partial.manifest, &beside, false).map(|()| beside.as_path()));
+    match written {
+        Ok(path) => format!("; the partial manifest is written to {}", path.display()),
+        Err(error) => format!("; the partial manifest could not be kept: {error}"),
     }
 }
 
@@ -692,7 +698,7 @@ fn resolve_download_root(
     let Some(name) = manifest.name.as_deref() else {
         anyhow::bail!("this manifest has no name; pass --output to choose where to extract it");
     };
-    if name.starts_with(HIDDEN_NAME_PREFIX) {
+    if ant_core::data::manifest::path::is_hidden(name) {
         anyhow::bail!(
             "this manifest is named {name:?}, a hidden directory; \
              pass --output to choose where to extract it"
@@ -720,7 +726,8 @@ fn resolve_download_root(
                     record: Some(record),
                 }),
                 None => anyhow::bail!(
-                    "{} already exists; pass --output {name:?} to extract into it",
+                    "{} already exists; choose where to extract with --output, \
+                     which may be that directory",
                     path.display()
                 ),
             }
@@ -857,7 +864,7 @@ fn report_created(
         }
     );
     if let Some(id) = history_id {
-        println!("Recorded as {id} (ant manifest download {id})");
+        println!("Recorded as {id} (ant manifest download {id} --output <directory>)");
     }
     if let Some((link, len)) = link_text {
         warn_if_long_link(len);
@@ -928,8 +935,7 @@ fn print_history_row(record: &UploadRecord) {
     let stamp = stamp.strip_suffix(" UTC").unwrap_or(&stamp);
     let state = match record.state {
         RecordState::Complete => "",
-        RecordState::InProgress => "  (in progress)",
-        RecordState::Interrupted => "  (interrupted: the files listed were uploaded)",
+        RecordState::Unfinished => "  (unfinished: the files listed were uploaded)",
     };
     println!(
         "{:<23}  {:>7}  {:>12}  {}{state}",
@@ -1041,6 +1047,9 @@ async fn download(
     concurrency: NonZeroUsize,
     json: bool,
 ) -> anyhow::Result<()> {
+    // Before the default directory is made, so a selection matching nothing
+    // leaves nothing behind.
+    select_entries(manifest, &selection)?;
     let records = ant_core::config::data_dir()
         .ok()
         .map(|dir| dir.join(DOWNLOAD_RECORDS_DIR));
@@ -1146,12 +1155,12 @@ fn load_manifest(source: &str) -> anyhow::Result<Manifest> {
     }
 }
 
-/// A recorded upload's manifest, with a reminder of what an interrupted one
-/// holds. One still in progress is never loaded: the history refuses it.
+/// A recorded upload's manifest, with a reminder of what an unfinished one
+/// holds.
 fn record_manifest(record: UploadRecord) -> Manifest {
-    if record.state == RecordState::Interrupted {
+    if record.state == RecordState::Unfinished {
         eprintln!(
-            "warning: upload {} was interrupted; it holds the {} file(s) uploaded before it stopped",
+            "warning: upload {} has not finished; it holds the {} file(s) uploaded so far",
             record.id,
             record.manifest.entries.len()
         );
@@ -1391,6 +1400,7 @@ mod tests {
         // Hidden and unnamed manifests need --output, and nothing is made.
         for manifest in [
             Manifest::new(Some(".ssh".into())),
+            Manifest::new(Some("\u{200C}.ssh".into())),
             Manifest::new(Some(".config".into())),
             Manifest::new(None),
         ] {
@@ -1440,7 +1450,7 @@ mod tests {
             });
             let out = PathBuf::from("unused.ant");
             assert_eq!(
-                build_outcome(Ok(result.clone()), &out, false)
+                build_outcome(Ok(result.clone()), &out)
                     .unwrap_err()
                     .to_string(),
                 "cancelled after 1 of 10 file(s); the partial manifest is recorded as record-id"
@@ -1483,7 +1493,7 @@ mod tests {
                 })
             };
             let out = PathBuf::from("unused.ant");
-            let error = build_outcome(built, &out, false).unwrap_err();
+            let error = build_outcome(built, &out).unwrap_err();
             assert!(error
                 .to_string()
                 .contains("the partial manifest is recorded as 20261019T120000Z-partial"));
@@ -1530,7 +1540,7 @@ mod tests {
             cause: Box::new(ManifestError::Build("No space left on device".into())),
             partial: Box::new(partial.clone()),
         });
-        let error = build_outcome(built, &out, false).unwrap_err().to_string();
+        let error = build_outcome(built, &out).unwrap_err().to_string();
         assert!(!error.contains("recorded as"), "{error}");
         assert!(
             error.contains(&format!("written to {}", out.display())),
@@ -1538,9 +1548,27 @@ mod tests {
         );
         assert_eq!(read_manifest_file(&out).unwrap(), manifest);
 
+        // A file already at the output, which may be a complete manifest, is
+        // never replaced: the partial manifest goes beside it.
+        let complete = Manifest::new(Some("complete".into()));
+        write_manifest_file(&out, &complete, true).unwrap();
+        let built = Err(ManifestError::BuildFailed {
+            path: "later.bin".into(),
+            cause: Box::new(ManifestError::Build("No space left on device".into())),
+            partial: Box::new(partial.clone()),
+        });
+        let error = build_outcome(built, &out).unwrap_err().to_string();
+        let beside = dir.path().join("partial.partial.ant");
+        assert!(
+            error.contains(&format!("written to {}", beside.display())),
+            "{error}"
+        );
+        assert_eq!(read_manifest_file(&out).unwrap(), complete);
+        assert_eq!(read_manifest_file(&beside).unwrap(), manifest);
+
         // A finished build keeps its manifest in the output anyway; only
         // the record id is not claimed.
-        let (_, history_id) = build_outcome(Ok(partial), &out, true).unwrap();
+        let (_, history_id) = build_outcome(Ok(partial), &out).unwrap();
         assert!(history_id.is_none());
     }
 

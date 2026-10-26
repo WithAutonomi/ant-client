@@ -414,20 +414,16 @@ the output location is checked before it too.
 The finished manifest must also fit `MAX_MANIFEST_BYTES`, which a few
 thousand embedded root maps can exceed. Before the first upload every queued
 file is counted at the largest entry it can end as, with its path, the
-largest size and a hash: its public address in compact mode with public
-uploads, and otherwise its own DataMap of three chunk records at the deepest
-child level, since every other upload is embedded. Room is kept on top for
-one upload in flight, whose entry holds the uploaded map until its final
-reference replaces it. A build that cannot fit so is refused. (A private
-file in compact mode that turns out to be public already ends up smaller, so
-the check can refuse a build that would just have fitted, never the
+largest size and a hash: its own DataMap of three chunk records at the
+deepest child level, which bounds every map an upload returns. A build that
+cannot fit so is refused. (A file that ends as a public address is smaller,
+so the check can refuse a build that would just have fitted, never the
 reverse.) After an upload the entry is counted at its real size, and a
 larger reference such as an embedded root map is used only when the
-manifest still fits with it and that room; the shrunk map is kept
-otherwise. A build that passes the check therefore never stops for size,
-and every partial or complete result can be encoded and recorded. Each file
-is still admitted only when the largest entry it can become fits, so nothing
-is paid for that could not be. Cancellation stops between
+manifest still fits with it; the shrunk map is kept otherwise. A build that
+passes the check therefore never stops for size, every partial or complete
+result can be encoded and recorded, and nothing is paid for that could not
+be. Cancellation stops between
 files or abandons the upload in flight and returns the partial manifest,
 which the builder records in the upload history so paid uploads are not
 lost. Ordinary file failures also preserve the partial result in
@@ -492,20 +488,21 @@ kill, a power cut or a forced quit cannot lose an upload that was paid for:
   that stops before anything was uploaded paid for nothing and leaves no
   record. If the record cannot be written, the journal stays; the CLI then
   writes a stopped build's partial manifest to the output file, since the
-  journal may lack an upload whose entry could not be appended.
+  journal may lack an upload whose entry could not be appended. An existing
+  output file is never replaced by a partial manifest, which goes beside it
+  as `<name>.partial.ant` instead.
 - Holding an id's journal is what claims the id: every record, a
   single-file upload's included, is written by the holder of its journal,
   which is created exclusively before the record is looked for. Two writers
   therefore never take one id, and a record never takes the id of a running
   build.
-- A journal left behind is listed as an **interrupted** upload holding every
-  entry that reached the disk, and its id is accepted wherever a record id
-  is, with a reminder that it is partial. While its build runs the journal
-  is locked, and it is listed as **in progress** without its entries, which
-  are not read; its id is refused until the build ends, since it is still
-  growing and on Windows cannot be read at all. A journal beside a record of
-  the same id, left by a build that stopped between the steps above, is
-  ignored, and so is one that stopped before holding any entry.
+- A journal is listed as an **unfinished** upload holding every entry that
+  reached the disk, whether its build is still running or stopped without
+  finishing, and its id is accepted wherever a record id is, with a reminder
+  that it is partial. A journal is read up to its last whole frame, so one
+  still being written reads as the uploads so far. A journal beside a record
+  of the same id, left by a build that stopped between the steps above, is
+  ignored, and so is one holding no entry yet.
 - On Unix the journal is readable by its owner only, as records are, since
   it holds the DataMaps of private uploads.
 
@@ -548,10 +545,13 @@ extracts into a new directory named after the manifest, made in the current
 directory before anything is downloaded; making it is the check. The sender
 chooses that name, and a terminal usually starts in the home directory, so
 a default never lands in a directory that exists already or has a hidden
-name: a manifest named `.ssh` would otherwise plant `authorized_keys`, and
-one named `AppData` a login script on Windows. Such a manifest, and one
+name, one starting with a dot once the code points HFS+ ignores are
+dropped: a manifest named `.ssh` would otherwise plant `authorized_keys`,
+and one named `AppData` a login script on Windows. Such a manifest, and one
 without a name, needs an explicit output directory, which may be any
-directory, existing or not. A download that stops can be run again: the CLI
+directory, existing or not. The CLI's messages never echo a sender's name
+inside a suggested command. The selection is checked before the directory
+is made. A download that stops can be run again: the CLI
 records the directory it made under `<data dir>/downloads/`, keyed by a hash
 of the manifest and the directory's path, until every entry is in place, and
 a re-run of the same download continues into it. The sender cannot make that
@@ -591,17 +591,11 @@ filesystem has one, otherwise a hard link, otherwise a check just before the
 rename). A regular file already at the target with the entry's recorded
 `sha256` is that entry, as an earlier run left it: it is kept and reported
 as present, and nothing is downloaded, so an extraction that stopped can be
-run again. A file the same extraction has already counted, under that name
-or another the filesystem treats as the same, does not count twice. Any
-other entry whose path would traverse a link, or whose target already
-exists, is a per-entry failure unless overwrite was requested. Even then only
-a regular file is replaced, never a link, and never a file this extraction
-already wrote: two entries that a filesystem treats as one name, such as a
-long name and its Windows 8.3 alias, end with the second failing rather than
-silently replacing the first. Files are told apart by device and inode on
-Unix and by volume and file id on Windows. Commits within one extraction are
-serialised, so that check, the rename and recording the written file are
-one step.
+run again. Its length is compared with the entry's size first, so a large
+file that is not the entry is never read, and a file that cannot be read is
+not the entry. Any other entry whose path would traverse a link, or whose
+target already exists, is a per-entry failure unless overwrite was
+requested. Even then only a regular file is replaced, never a link.
 
 Per entry: resolve the DataMap (`Public` needs one fetch), resolve it to its
 root (a shrunk map needs its wrapper records), and check that the target's
@@ -723,7 +717,8 @@ initial release.
 - Default output tests: without an explicit output, a download makes a new
   directory named after the manifest and records it; the same download
   continues into it, while another manifest of that name, or this one once
-  its record is gone, is refused; a hidden name or no name is refused,
+  its record is gone, is refused; a hidden name, also behind a code point
+  HFS+ ignores, or no name is refused,
   making nothing; an explicit output is used as given.
 - Containment tests, run on Unix and macOS in CI: a pre-existing symlink at
   every depth inside the output root causes a per-entry failure and nothing
@@ -731,16 +726,16 @@ initial release.
   and is replaced only when it is a regular file; a link at the target is
   never followed even with overwrite; a directory swapped for a symlink to
   elsewhere while an entry downloads cannot redirect the file; a name that
-  appears during the download is not replaced; overwrite never replaces a
-  file the same extraction wrote under another name (simulated with a hard
-  link); an abandoned temporary file is removed; a file with the entry's
-  hash is kept and counts once, and a link at the target never counts. The
+  appears during the download is not replaced; an abandoned temporary file
+  is removed; a file with the entry's hash and size is kept, while a link, a
+  FIFO or an unreadable file at the target never counts, and overwrite still
+  replaces an unreadable one. The
   Windows implementation
   is type-checked and linted for `x86_64-pc-windows-msvc`, but CI has no
   Windows test runner. Junction tests are to be added with one.
-- Upload journal tests: a journal left behind lists as an interrupted record
-  of exactly the entries written, with a later record of a name replacing an
-  earlier one; while locked it lists as in progress; a write cut short, or a
+- Upload journal tests: a journal lists as an unfinished record of exactly
+  the entries written, while its build runs and after it stops, with a later
+  record of a name replacing an earlier one; a write cut short, or a
   damaged last frame, keeps every entry before it; finishing writes the
   record and removes the journal; journals and records never share an id;
   a journal beside its record is not listed, nor is one cut short before its
@@ -749,17 +744,15 @@ initial release.
   way of a directory loses its path rather than the entries in it. On a
   local network, a build that fails after its first upload records its
   partial result itself; a build dropped once its second upload has started,
-  as a killed process stops, leaves an interrupted record holding the first
+  as a killed process stops, leaves an unfinished record holding the first
   upload, which extracts; and a build cancelled before any upload leaves no
   record.
-- Size budget tests: the largest entry an upload can become bounds a real
-  shrunk map, and every real upload entry fits what its file is counted at;
-  a build of long paths that would fit as addresses but not embedded is
-  refused before paying; the fixed part counts everything but the entries;
-  an upload is admitted only when its largest entry fits; a larger reference
-  is taken only when it fits; a build that passes preflight with less than
-  a file to spare, whose uploads all return shrunk maps and are offered
-  larger references, is never refused.
+- Size budget tests: the largest entry an upload can become bounds every
+  real one; a build of long paths that would fit as addresses but not
+  embedded is refused before paying; the fixed part counts everything but
+  the entries; a larger reference is taken only when it fits; a build that
+  passes preflight with less than a file to spare, whose uploads all return
+  shrunk maps and are offered other references, never outgrows the limit.
 - End-to-end on a local network: build a manifest with an embedded entry, a
   compact entry and an entry added by address; extract it from a `.ant` file
   and from a manifest link; extract a selection; verify bytes and per-entry

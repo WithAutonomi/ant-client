@@ -415,7 +415,7 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
 
     // A crash once the second upload has started: the build is dropped
     // there, as a killed process would stop. The first upload was journaled
-    // before the second began, so it is listed as interrupted and usable.
+    // before the second began, so it is listed as unfinished and usable.
     let first = source.path().join("first.bin");
     let second = source.path().join("second.bin");
     let expected = vec![0x94; FILE_BYTES];
@@ -452,7 +452,7 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
     let listing = list_uploads(history.path()).unwrap();
     assert_eq!(listing.records.len(), 1, "{:?}", listing.unreadable);
     let crashed = &listing.records[0];
-    assert_eq!(crashed.state, RecordState::Interrupted);
+    assert_eq!(crashed.state, RecordState::Unfinished);
     let mut names: Vec<_> = crashed
         .manifest
         .entries

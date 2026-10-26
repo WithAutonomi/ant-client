@@ -6,9 +6,10 @@
 //! creates `<id>.ant.partial` in the history directory. As each upload
 //! completes it appends the entry and flushes it to disk before the next
 //! upload is paid for. When the build ends the journal becomes the ordinary
-//! `<id>.ant` record and is removed. A journal left behind is an interrupted
-//! upload: the history lists it, and every entry that reached the disk can
-//! be shown, linked, exported and downloaded like any other record.
+//! `<id>.ant` record and is removed. Until then, and for good if the build
+//! stops without finishing, the history lists it as an unfinished upload,
+//! and every entry that reached the disk can be shown, linked, exported and
+//! downloaded like any other record.
 //!
 //! The file is magic bytes, a version byte, and frames: each a little-endian
 //! `u32` length, the CRC-32 of the payload, and the payload. The first
@@ -17,18 +18,14 @@
 //! the first frame that is incomplete or fails its check, which is where a
 //! write was cut short. A later entry with the same effective name replaces
 //! an earlier one, so an entry is recorded as soon as its upload completes
-//! and again once its reference is final.
-//!
-//! The builder holds an exclusive lock on the journal while it runs, so a
-//! listing can tell an upload in progress from an interrupted one. A locked
-//! journal is not read: it is still growing, and on Windows the lock keeps
-//! it from being read at all.
+//! and again once its reference is final. A journal is read up to its last
+//! whole frame, so one still being written reads as the uploads so far.
 //!
 //! On Unix the journal is readable by its owner only, as a record is, since
 //! it holds the DataMaps of private uploads.
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -41,6 +38,7 @@ use super::file::write_manifest_file;
 use super::history::{
     new_ids, no_free_id, record_path, record_upload, repair_names, RecordState, UploadRecord,
 };
+use super::output::unless_unflushable;
 use super::{Manifest, ManifestEntry, ManifestError, TorrentReference, MAX_MANIFEST_BYTES};
 
 #[cfg(test)]
@@ -77,7 +75,7 @@ struct JournalHeader {
     torrent: Option<TorrentReference>,
 }
 
-/// A running build's journal, held open and locked until the build ends.
+/// A running build's journal, held open until the build ends.
 pub(super) struct UploadJournal {
     dir: PathBuf,
     id: String,
@@ -115,13 +113,6 @@ impl UploadJournal {
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e.into()),
             };
-            // A listing holds a shared lock only for an instant, so wait for
-            // it rather than fail.
-            if let Err(error) = file.lock() {
-                drop(file);
-                let _ = fs::remove_file(&path);
-                return Err(error.into());
-            }
             let journal = Self {
                 dir: dir.to_path_buf(),
                 id,
@@ -158,7 +149,7 @@ impl UploadJournal {
     /// Record `entry` and flush it to disk before returning.
     pub(super) fn append(&mut self, entry: &ManifestEntry) -> Result<(), ManifestError> {
         self.write_frame(entry)?;
-        self.file.sync_data().map_err(Into::into)
+        self.flush()
     }
 
     /// Record every entry, flushing them to disk once at the end.
@@ -166,7 +157,7 @@ impl UploadJournal {
         for entry in entries {
             self.write_frame(entry)?;
         }
-        self.file.sync_data().map_err(Into::into)
+        self.flush()
     }
 
     /// Write `manifest` as the build's record and remove the journal.
@@ -200,7 +191,6 @@ impl UploadJournal {
     /// Remove the journal of a build that recorded nothing worth keeping.
     pub(super) fn discard(self) -> Result<(), ManifestError> {
         let Self { file, path, .. } = self;
-        // Close, and so unlock, before removing.
         drop(file);
         fs::remove_file(path).map_err(Into::into)
     }
@@ -210,8 +200,13 @@ impl UploadJournal {
     fn start(&mut self, header: &JournalHeader) -> Result<(), ManifestError> {
         self.file.write_all(&opening())?;
         self.write_frame(header)?;
-        self.file.sync_data()?;
+        self.flush()?;
         sync_directory(&self.dir)
+    }
+
+    /// Flush what was written to disk, where the filesystem can.
+    fn flush(&mut self) -> Result<(), ManifestError> {
+        unless_unflushable(self.file.sync_data()).map_err(Into::into)
     }
 
     /// Write one frame, not yet flushed to disk.
@@ -240,15 +235,9 @@ pub(super) fn journal_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}{JOURNAL_SUFFIX}"))
 }
 
-/// The manifest a journal holds, or `None` while its build is still running.
-/// It is read from the handle whose lock was checked, under a shared lock.
-pub(super) fn read_journal(path: &Path) -> Result<Option<Manifest>, ManifestError> {
+/// The manifest a journal holds: every entry that reached the disk.
+pub(super) fn read_journal(path: &Path) -> Result<Manifest, ManifestError> {
     let mut file = File::open(path)?;
-    match file.try_lock_shared() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Ok(None),
-        Err(TryLockError::Error(error)) => return Err(error.into()),
-    }
     let len = file.metadata()?.len();
     if len > MAX_JOURNAL_BYTES {
         return Err(ManifestError::TooLarge {
@@ -258,7 +247,7 @@ pub(super) fn read_journal(path: &Path) -> Result<Option<Manifest>, ManifestErro
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    parse_journal(&bytes).map(Some)
+    parse_journal(&bytes)
 }
 
 /// The manifest in a journal's bytes, up to the first frame that is cut
@@ -350,7 +339,7 @@ impl<'a> Frames<'a> {
 /// directory entries durable without being asked.
 fn sync_directory(dir: &Path) -> Result<(), ManifestError> {
     #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
+    unless_unflushable(File::open(dir)?.sync_all())?;
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
@@ -373,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn a_journal_left_behind_is_an_interrupted_record_of_what_reached_the_disk() {
+    fn a_journal_is_an_unfinished_record_of_what_reached_the_disk() {
         let dir = tempfile::tempdir().unwrap();
         let mut journal = UploadJournal::create(dir.path(), None, Some("photos"), None).unwrap();
         let id = journal.id().to_string();
@@ -382,22 +371,16 @@ mod tests {
         // The same name again: the final reference replaces the first.
         journal.append(&entry("a.bin", 3)).unwrap();
 
-        // While the build runs, the record lists as in progress, with no
-        // entries read, and its id is refused.
-        let running = list_uploads(dir.path()).unwrap();
-        assert_eq!(running.records.len(), 1, "{:?}", running.unreadable);
-        assert_eq!(running.records[0].state, RecordState::InProgress);
-        assert!(running.records[0].manifest.entries.is_empty());
-        let error = load_upload(dir.path(), &id).unwrap_err();
-        assert!(error.to_string().contains("still in progress"), "{error}");
-
-        // The process stops without finishing: the lock is released.
+        // While the build runs, and once it stops without finishing, the
+        // record is unfinished and holds every upload so far.
+        let running = load_upload(dir.path(), &id).unwrap().unwrap();
         drop(journal);
         let listing = list_uploads(dir.path()).unwrap();
         assert_eq!(listing.records.len(), 1, "{:?}", listing.unreadable);
         let record = &listing.records[0];
+        assert_eq!(*record, running);
         assert_eq!(record.id, id);
-        assert_eq!(record.state, RecordState::Interrupted);
+        assert_eq!(record.state, RecordState::Unfinished);
         assert_eq!(record.manifest.name.as_deref(), Some("photos"));
         assert_eq!(
             record.manifest.entries,
@@ -418,7 +401,7 @@ mod tests {
 
         // Torn in the middle of the last frame.
         fs::write(&path, &full[..full.len() - 3]).unwrap();
-        let manifest = read_journal(&path).unwrap().unwrap();
+        let manifest = read_journal(&path).unwrap();
         assert_eq!(manifest.entries, vec![entry("a.bin", 1)]);
 
         // Garbage where the last frame was: its checksum fails.
@@ -427,13 +410,13 @@ mod tests {
         damaged[last] ^= 0xff;
         fs::write(&path, &damaged).unwrap();
         assert_eq!(
-            read_journal(&path).unwrap().unwrap().entries,
+            read_journal(&path).unwrap().entries,
             vec![entry("a.bin", 1)]
         );
 
-        // Cut before the header: an interrupted record with nothing in it.
+        // Cut before the header: an unfinished record with nothing in it.
         fs::write(&path, &full[..JOURNAL_HEADER_LEN + 2]).unwrap();
-        assert!(read_journal(&path).unwrap().unwrap().entries.is_empty());
+        assert!(read_journal(&path).unwrap().entries.is_empty());
 
         fs::write(&path, b"something else").unwrap();
         assert!(read_journal(&path).is_err());

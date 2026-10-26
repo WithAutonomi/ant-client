@@ -71,6 +71,8 @@ const HFS_IGNORABLE_CHARS: &[char] = &[
 const COMPONENT_REPLACEMENT: char = '_';
 /// Prefix that turns a reserved device name into an ordinary one.
 const RESERVED_NAME_PREFIX: char = '_';
+/// First character of a hidden name.
+const HIDDEN_NAME_PREFIX: char = '.';
 
 /// Which portable rule a path broke.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -135,6 +137,15 @@ pub fn validate_path(path: &str) -> Result<(), PathError> {
         validate_component(component)?;
     }
     Ok(())
+}
+
+/// Whether `component` names a hidden file or directory on some
+/// filesystem: it starts with a dot, ignoring the code points HFS+ ignores,
+/// since `\u{200C}.ssh` there is `.ssh`.
+pub fn is_hidden(component: &str) -> bool {
+    component
+        .trim_start_matches(HFS_IGNORABLE_CHARS)
+        .starts_with(HIDDEN_NAME_PREFIX)
 }
 
 /// Validate one path component, also used for the manifest `name`.
@@ -265,6 +276,16 @@ pub fn check_collisions<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_names_are_found_behind_ignorable_code_points() {
+        for name in [".ssh", "\u{200C}.ssh", "\u{FEFF}\u{200D}.config"] {
+            assert!(is_hidden(name), "{name:?}");
+        }
+        for name in ["ssh", "a.ssh", "\u{200C}ssh"] {
+            assert!(!is_hidden(name), "{name:?}");
+        }
+    }
 
     #[test]
     fn accepts_ordinary_paths() {

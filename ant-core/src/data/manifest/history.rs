@@ -11,8 +11,7 @@
 //! Apart from the journal of a manifest build that has not finished
 //! (`<id>.ant.partial`, see the `journal` module), nothing else is stored, so
 //! the history directory is just a folder of manifests that any manifest
-//! tool can read. An unfinished build's journal is listed as a record in
-//! progress or interrupted.
+//! tool can read. That journal is listed as an unfinished record.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -94,9 +93,8 @@ pub struct UploadRecord {
     pub recorded_at: u64,
     /// The label part of the id.
     pub label: String,
-    /// The manifest itself. For an interrupted upload, every entry that
-    /// reached the disk. For one in progress, none yet: a running build's
-    /// entries are read once it stops.
+    /// The manifest itself. For an unfinished upload, every entry that
+    /// reached the disk so far.
     pub manifest: Manifest,
     /// Whether the upload finished.
     #[serde(default)]
@@ -110,11 +108,10 @@ pub enum RecordState {
     /// The upload ended and its record was written, complete or partial.
     #[default]
     Complete,
-    /// A manifest build is still running and adding entries.
-    InProgress,
-    /// A manifest build stopped without finishing, as on a crash or a
-    /// forced quit. Its entries are every upload completed before then.
-    Interrupted,
+    /// A manifest build that has not finished: it is still running, or it
+    /// stopped on a crash or a forced quit. Its entries are every upload it
+    /// completed so far.
+    Unfinished,
 }
 
 /// Result of listing a history directory.
@@ -137,7 +134,7 @@ pub fn default_history_dir() -> Result<PathBuf, ManifestError> {
 /// The id is claimed through a journal, as a build claims its own, so a
 /// record never takes the id of a build that is still running. If the
 /// record itself cannot be written, the journal stays and the upload is
-/// listed as interrupted.
+/// listed as unfinished.
 pub fn record_upload(
     dir: &Path,
     manifest: &Manifest,
@@ -236,12 +233,10 @@ pub fn list_uploads(dir: &Path) -> Result<UploadListing, ManifestError> {
             Some(id) => match load_journal(&path, id) {
                 // Its build finished since the directory was read.
                 Err(ManifestError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                // One that stopped holding nothing paid for nothing, and
-                // one whose build has just written its record is that record.
+                // One holding nothing paid for nothing, and one whose build
+                // has just written its record is that record.
                 Ok(record)
-                    if record.state == RecordState::Interrupted
-                        && (record.manifest.entries.is_empty()
-                            || record_path(dir, id).is_file()) =>
+                    if record.manifest.entries.is_empty() || record_path(dir, id).is_file() =>
                 {
                     continue
                 }
@@ -279,9 +274,7 @@ fn id_sort_key(id: &str) -> (&str, u32) {
         .unwrap_or((id, FIRST_ID_SEQUENCE))
 }
 
-/// Load the record with `id` from `dir`, or `None` when there is none. An
-/// upload still in progress is refused: its entries are not read until its
-/// build stops.
+/// Load the record with `id` from `dir`, or `None` when there is none.
 pub fn load_upload(dir: &Path, id: &str) -> Result<Option<UploadRecord>, ManifestError> {
     if id.is_empty() || id.contains(['/', '\\']) {
         return Ok(None);
@@ -292,13 +285,7 @@ pub fn load_upload(dir: &Path, id: &str) -> Result<Option<UploadRecord>, Manifes
     }
     let journal = journal_path(dir, id);
     if is_regular_file(&journal)? {
-        let record = load_journal(&journal, id)?;
-        if record.state == RecordState::InProgress {
-            return Err(ManifestError::Build(format!(
-                "upload {id} is still in progress; use it once it has finished"
-            )));
-        }
-        return Ok(Some(record));
+        return load_journal(&journal, id).map(Some);
     }
     Ok(None)
 }
@@ -312,13 +299,9 @@ fn is_regular_file(path: &Path) -> Result<bool, ManifestError> {
     }
 }
 
-/// An unfinished build's journal as a record: in progress while its build
-/// holds the journal, interrupted otherwise.
+/// An unfinished build's journal as a record.
 fn load_journal(path: &Path, id: &str) -> Result<UploadRecord, ManifestError> {
-    let (manifest, state) = match read_journal(path)? {
-        Some(manifest) => (manifest, RecordState::Interrupted),
-        None => (Manifest::default(), RecordState::InProgress),
-    };
+    let manifest = read_journal(path)?;
     let (recorded_at, label) = match parse_id(id) {
         Some(parsed) => parsed,
         None => (modified_secs(path)?, id.to_string()),
@@ -329,7 +312,7 @@ fn load_journal(path: &Path, id: &str) -> Result<UploadRecord, ManifestError> {
         recorded_at,
         label,
         manifest,
-        state,
+        state: RecordState::Unfinished,
     })
 }
 

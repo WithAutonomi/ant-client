@@ -18,19 +18,13 @@
 //!
 //! A file is written under a temporary name in its parent and renamed into
 //! place without replacing anything. An existing name is replaced only when
-//! overwrite was requested and it is a regular file this extraction did not
-//! write. The last rule means two entries that a filesystem treats as one
-//! name, such as a long name and its Windows 8.3 alias, never end as one
-//! file: the second fails instead of silently replacing the first. A regular
-//! file already at a target with the entry's SHA-256 is that entry, as an
-//! earlier run left it, and is kept; the same rule keeps one file from
-//! counting for two entries.
+//! overwrite was requested and it is a regular file. A regular file already
+//! at a target with the entry's SHA-256 is that entry, as an earlier run
+//! left it, and is kept.
 
-use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
 
 use sha2::{Digest, Sha256};
 
@@ -40,7 +34,9 @@ use super::{ManifestError, SHA256_LEN};
 #[cfg(test)]
 use std::io::Write;
 #[cfg(all(test, unix))]
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, PermissionsExt};
+#[cfg(all(test, unix))]
+use std::process::Command;
 
 #[cfg(unix)]
 mod unix;
@@ -51,12 +47,14 @@ mod windows;
 #[cfg(windows)]
 use windows as platform;
 
-use platform::{Dir, FileIdentity};
+use platform::Dir;
 
 /// Prefix of the temporary name an entry is written under.
 const TEMP_PREFIX: &str = ".ant-extract-";
 /// Temporary names tried before giving up on finding a free one.
 const MAX_TEMP_ATTEMPTS: u32 = 16;
+/// Bytes read at a time when hashing a file already at a target.
+const HASH_READ_BYTES: usize = 1024 * 1024;
 
 /// What a name in a directory is, read without following a link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,18 +65,9 @@ enum EntryKind {
     Other,
 }
 
-/// A name found in a directory, with the file's identity when it is a
-/// regular file.
-struct Entry {
-    kind: EntryKind,
-    identity: Option<FileIdentity>,
-}
-
 /// The output root of one extraction, held open while it runs.
 pub(super) struct OutputRoot {
     dir: Dir,
-    /// Files this extraction has written, by filesystem identity.
-    written: Mutex<HashSet<FileIdentity>>,
 }
 
 impl OutputRoot {
@@ -88,7 +77,6 @@ impl OutputRoot {
         fs::create_dir_all(root)?;
         Ok(Self {
             dir: Dir::open_root(root)?,
-            written: Mutex::default(),
         })
     }
 
@@ -143,50 +131,29 @@ impl Target<'_> {
 
     /// Refuse, before any download, a target that could not be written.
     pub(super) fn check(&self, overwrite: bool) -> Result<(), ManifestError> {
-        let written = self
-            .root
-            .written
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        self.existing(overwrite, &written).map(|_| ())
+        self.existing(overwrite).map(|_| ())
     }
 
     /// The length of the regular file already at the target when its
-    /// SHA-256 is `expected`: the entry is there already and needs no
-    /// download. A file this extraction already counted, under this name or
-    /// another the filesystem treats as the same, does not count again.
-    pub(super) fn identical(
-        &self,
-        expected: &[u8; SHA256_LEN],
-    ) -> Result<Option<u64>, ManifestError> {
-        let Some(Entry {
-            kind: EntryKind::File,
-            identity,
-        }) = self.dir().entry(&self.file_name)?
-        else {
-            return Ok(None);
-        };
-        let mut file = self.dir().open_file(&self.file_name)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Ok(None);
+    /// SHA-256 is `expected` and, where `size` is known, its length is
+    /// `size`: the entry is there already and needs no download. Anything
+    /// else, including a file that cannot be read, is not the entry and is
+    /// left to [`Target::check`]. The length is compared first, so a large
+    /// file that is not the entry is not read.
+    pub(super) fn identical(&self, expected: &[u8; SHA256_LEN], size: Option<u64>) -> Option<u64> {
+        let file = self.dir().open_file(&self.file_name).ok()?;
+        // Checked on the handle that is read, whatever the name holds now.
+        let len = file.metadata().ok().filter(|meta| meta.is_file())?.len();
+        if size.is_some_and(|size| size != len) {
+            return None;
         }
         let mut hasher = Sha256::new();
-        io::copy(&mut file, &mut hasher)?;
-        if hasher.finalize().as_slice() != expected {
-            return Ok(None);
-        }
-        if let Some(identity) = identity {
-            let mut written = self
-                .root
-                .written
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if !written.insert(identity) {
-                return Ok(None);
-            }
-        }
-        Ok(Some(metadata.len()))
+        io::copy(
+            &mut BufReader::with_capacity(HASH_READ_BYTES, file),
+            &mut hasher,
+        )
+        .ok()?;
+        (hasher.finalize().as_slice() == expected).then_some(len)
     }
 
     /// Create the temporary file the entry is downloaded into.
@@ -214,19 +181,13 @@ impl Target<'_> {
     }
 
     /// Whether the target exists and may be replaced. Refuses a link, any
-    /// existing name without overwrite, anything but a regular file, and a
-    /// file this extraction already wrote under a name the filesystem
-    /// treats as the same.
-    fn existing(
-        &self,
-        overwrite: bool,
-        written: &HashSet<FileIdentity>,
-    ) -> Result<bool, ManifestError> {
-        let Some(entry) = self.dir().entry(&self.file_name)? else {
+    /// existing name without overwrite, and anything but a regular file.
+    fn existing(&self, overwrite: bool) -> Result<bool, ManifestError> {
+        let Some(kind) = self.dir().entry(&self.file_name)? else {
             return Ok(false);
         };
         let path = self.path();
-        match entry.kind {
+        match kind {
             EntryKind::Symlink => Err(ManifestError::Build(format!(
                 "{} is a symlink and will not be replaced",
                 path.display()
@@ -235,13 +196,6 @@ impl Target<'_> {
                 "{} already exists; pass overwrite to replace it",
                 path.display()
             ))),
-            EntryKind::File if entry.identity.is_some_and(|id| written.contains(&id)) => {
-                Err(ManifestError::Build(format!(
-                    "{} is a file this extraction already wrote, under a name this \
-                     filesystem treats as the same; it will not be replaced",
-                    path.display()
-                )))
-            }
             EntryKind::File => Ok(true),
             EntryKind::Directory | EntryKind::Other => Err(ManifestError::Build(format!(
                 "{} exists and is not a regular file",
@@ -269,18 +223,10 @@ impl Staged<'_> {
             .ok_or_else(|| ManifestError::Build("the temporary file is closed".to_string()))
     }
 
-    /// Make the file durable and give it the target's name. Commits within
-    /// one extraction are serialised, so the existence check, the rename
-    /// and recording the result happen as one step.
+    /// Make the file durable and give it the target's name.
     pub(super) fn commit(mut self, overwrite: bool) -> Result<(), ManifestError> {
         if let Some(file) = self.file.take() {
-            match file.sync_all() {
-                // A filesystem that cannot flush, as an SMB share on macOS
-                // refuses the full flush, keeps the file as it keeps any
-                // other write.
-                Err(error) if platform::flush_unsupported(&error) => {}
-                result => result?,
-            }
+            unless_unflushable(file.sync_all())?;
         }
         let target = self.target;
         let dir = target.dir();
@@ -288,12 +234,7 @@ impl Staged<'_> {
             .temp_name
             .clone()
             .ok_or_else(|| ManifestError::Build("the entry was already committed".to_string()))?;
-        let mut written = target
-            .root
-            .written
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if target.existing(overwrite, &written)? {
+        if target.existing(overwrite)? {
             dir.rename_replace(&temp_name, &target.file_name)?;
         } else {
             dir.rename_noreplace(&temp_name, &target.file_name)
@@ -309,16 +250,6 @@ impl Staged<'_> {
         // rename done as a hard link may have left the temporary name too.
         let _ = dir.remove_file(&temp_name);
         self.temp_name = None;
-        // Read the identity back from the final name: on some filesystems,
-        // such as FAT, a rename changes it. A file whose identity cannot be
-        // read is only left unguarded against a later alias.
-        if let Ok(Some(Entry {
-            identity: Some(identity),
-            ..
-        })) = dir.entry(&target.file_name)
-        {
-            written.insert(identity);
-        }
         Ok(())
     }
 }
@@ -331,6 +262,16 @@ impl Drop for Staged<'_> {
         if let Some(temp_name) = &self.temp_name {
             let _ = self.target.dir().remove_file(temp_name);
         }
+    }
+}
+
+/// The result of flushing a file to disk, with a refusal from a filesystem
+/// that cannot flush taken as success. Such a filesystem, as an SMB share
+/// on macOS refuses the full flush, keeps the file as it keeps any write.
+pub(super) fn unless_unflushable(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if platform::flush_unsupported(&error) => Ok(()),
+        result => result,
     }
 }
 
@@ -379,8 +320,7 @@ mod tests {
         let target = root.target("x/y/z.txt").unwrap();
         assert_eq!(target.path(), path);
         assert!(target.check(false).is_err());
-        // This extraction wrote it, so overwrite does not replace it either.
-        assert!(target.check(true).is_err());
+        assert!(target.check(true).is_ok());
         // A directory where a file should go is never replaced.
         assert!(root.target("x/y").unwrap().check(true).is_err());
         // A file where a directory should go.
@@ -399,28 +339,49 @@ mod tests {
     }
 
     #[test]
-    fn a_file_with_the_entry_hash_is_kept_and_counts_once() {
+    fn a_file_with_the_entry_hash_and_size_is_kept() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("kept.bin"), b"earlier run").unwrap();
         let root = OutputRoot::open(dir.path()).unwrap();
         let hash: [u8; SHA256_LEN] = Sha256::digest(b"earlier run").into();
         let target = root.target("kept.bin").unwrap();
-        assert_eq!(target.identical(&[0; SHA256_LEN]).unwrap(), None);
-        assert_eq!(target.identical(&hash).unwrap(), Some(11));
-        // Counted once: a second entry for the same file is refused.
-        assert_eq!(target.identical(&hash).unwrap(), None);
-        assert!(target.check(true).is_err());
+        assert_eq!(target.identical(&hash, Some(11)), Some(11));
+        assert_eq!(target.identical(&hash, None), Some(11));
+        assert_eq!(target.identical(&hash, Some(12)), None);
+        assert_eq!(target.identical(&[0; SHA256_LEN], None), None);
         assert_eq!(
             fs::read(dir.path().join("kept.bin")).unwrap(),
             b"earlier run"
         );
-        assert_eq!(
-            root.target("missing.bin")
-                .unwrap()
-                .identical(&hash)
-                .unwrap(),
-            None
-        );
+        let missing = root.target("missing.bin").unwrap();
+        assert_eq!(missing.identical(&hash, None), None);
+    }
+
+    /// A file that cannot be read is not the entry, and overwrite still
+    /// replaces it. A FIFO at the target is not the entry either, and
+    /// looking at it does not block.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_target_or_a_fifo_is_not_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked.bin");
+        fs::write(&locked, b"earlier run").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o200)).unwrap();
+        let root = OutputRoot::open(dir.path()).unwrap();
+        let hash: [u8; SHA256_LEN] = Sha256::digest(b"earlier run").into();
+        let target = root.target("locked.bin").unwrap();
+        assert_eq!(target.identical(&hash, None), None);
+        write_entry(&root, "locked.bin", b"new", true);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(&locked).unwrap(), b"new");
+
+        let made = Command::new("mkfifo")
+            .arg(dir.path().join("fifo.bin"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let fifo = root.target("fifo.bin").unwrap();
+        assert_eq!(fifo.identical(&hash, None), None);
     }
 
     #[test]
@@ -481,7 +442,7 @@ mod tests {
         // A symlink at the target itself, with and without overwrite.
         symlink(outside.path().join("victim"), dir.path().join("t.txt")).unwrap();
         let target = root.target("t.txt").unwrap();
-        assert_eq!(target.identical(&[0; SHA256_LEN]).unwrap(), None);
+        assert_eq!(target.identical(&[0; SHA256_LEN], None), None);
         assert!(target.check(false).is_err());
         assert!(target.check(true).is_err());
         assert!(!outside.path().join("victim").exists());
@@ -510,28 +471,5 @@ mod tests {
             b"payload"
         );
         assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
-    }
-
-    /// Two names the filesystem resolves to one file, as a long name and
-    /// its 8.3 alias do on Windows, simulated with a hard link.
-    #[cfg(unix)]
-    #[test]
-    fn overwrite_never_replaces_a_file_this_extraction_wrote_under_another_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = OutputRoot::open(dir.path()).unwrap();
-        write_entry(&root, "report final.pdf", b"first entry", true);
-        fs::hard_link(
-            dir.path().join("report final.pdf"),
-            dir.path().join("REPORT~1.PDF"),
-        )
-        .unwrap();
-
-        let target = root.target("REPORT~1.PDF").unwrap();
-        let error = target.check(true).unwrap_err();
-        assert!(error.to_string().contains("already wrote"), "{error}");
-        assert_eq!(
-            fs::read(dir.path().join("report final.pdf")).unwrap(),
-            b"first entry"
-        );
     }
 }
