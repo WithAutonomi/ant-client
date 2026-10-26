@@ -240,6 +240,16 @@ impl BrowserNetwork for SharedNetworkAdapter {
             .collect()
     }
 
+    fn refused_peers(&self) -> Vec<(PeerId, Duration)> {
+        self.inner
+            .pool
+            .dial_failures
+            .borrow()
+            .refusals()
+            .filter_map(|(peer, remaining)| Some((PeerId::from_hex(peer).ok()?, remaining)))
+            .collect()
+    }
+
     fn accepts_pointer_writes<'a>(
         &'a self,
         peer: &'a PeerId,

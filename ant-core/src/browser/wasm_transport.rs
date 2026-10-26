@@ -53,13 +53,15 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Event, MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelState,
-    RtcDataChannelType, RtcIceGatheringState, RtcPeerConnection, RtcPeerConnectionState,
-    RtcSdpType, RtcSessionDescriptionInit,
+    RtcDataChannelType, RtcIceConnectionState, RtcIceGatheringState, RtcPeerConnection,
+    RtcPeerConnectionState, RtcSdpType, RtcSessionDescriptionInit,
 };
 
 const REQUEST_TIMEOUT_MS: u32 = 10_000;
 /// Lane failure reported when the browser declares the peer connection dead.
 const PEER_CONNECTION_FAILED: &str = "WebRTC peer connection failed";
+/// Lane failure recorded when the node closes a DataChannel.
+const DATA_CHANNEL_CLOSED: &str = "WebRTC DataChannel closed";
 /// Advertised by a node whose `chunk_protocol` admits pointer reads and paid
 /// pointer writes (ADR-0016).
 const POINTER_PROTOCOL_CAPABILITY: &str = "pointer_protocol";
@@ -91,6 +93,18 @@ const MAX_LOOKUP_PRECONNECTS: usize = 8;
 const BROWSER_LOOKUP_ALPHA: usize = 6;
 const MAX_BOOTSTRAP_CONNECTIONS: usize = 4;
 const ENDPOINT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+/// A node that answers a dial and declines it is up, but full. Skip it only
+/// briefly: long enough not to redial it for every chunk of a stream (a 4 MiB
+/// chunk plays for several seconds at video bit rates), short enough that it
+/// rejoins lookups and reads soon after its sessions free up (ant-node
+/// ADR-0023).
+const ENDPOINT_REFUSAL_COOLDOWN: Duration = Duration::from_secs(15);
+/// A fresh association that the browser declares failed this soon after its
+/// ICE checks began, before ICE ever connected, was answered with a STUN
+/// error: the node's transport refused it for capacity. A refusal arrives within a
+/// few round trips (67 ms in Chromium, 54 ms in WebKit on loopback), while
+/// both kept checking an unanswering node until the 10 s channel-open timeout.
+const REFUSAL_DETECTION_WINDOW: Duration = Duration::from_secs(3);
 const MAX_BROWSER_ROUTING_ENTRIES: usize = 256;
 const MAX_BROWSER_ENDPOINT_FAILURES: usize = 256;
 const DEFAULT_BROWSER_QUOTE_CONCURRENCY: usize = 4;
@@ -325,6 +339,7 @@ impl BrowserClientPool {
             dial_failures: Rc::new(RefCell::new(
                 crate::client_engine::EndpointFailureCache::new(
                     ENDPOINT_FAILURE_COOLDOWN,
+                    ENDPOINT_REFUSAL_COOLDOWN,
                     MAX_BROWSER_ENDPOINT_FAILURES,
                 ),
             )),
@@ -628,7 +643,24 @@ impl BrowserClientPool {
 struct PeerAssociation {
     connection: RtcPeerConnection,
     channels: RefCell<Vec<AssociationChannel>>,
+    /// ICE and DTLS completed at least once: the node answered as the holder
+    /// of the advertised certificate.
+    connected: Cell<bool>,
+    /// Ticks on every connection state change.
+    state_changes: watch::Sender<()>,
     _on_state_change: Closure<dyn FnMut(Event)>,
+}
+
+/// What a failed setup learned about its endpoint, which decides how long the
+/// endpoint stays out of lookups and reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialOutcome {
+    /// Setup reused a live association, so the endpoint was not dialled.
+    NotDialled,
+    /// The endpoint never answered, or answered as the wrong node.
+    Failed,
+    /// The node answered and declined: up, but full right now.
+    Refused,
 }
 
 /// One lane's channel, with the inbox that records when this client stopped
@@ -666,16 +698,34 @@ impl PeerAssociation {
             let association = association.clone();
             let on_state_change = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
                 if let Some(association) = association.upgrade() {
+                    if association.connection.connection_state()
+                        == RtcPeerConnectionState::Connected
+                    {
+                        association.connected.set(true);
+                    }
                     association.fail_lanes_if_dead();
+                    association.state_changes.send_replace(());
                 }
             });
             connection.set_onconnectionstatechange(Some(on_state_change.as_ref().unchecked_ref()));
             Self {
                 connection,
                 channels: RefCell::new(Vec::new()),
+                connected: Cell::new(false),
+                state_changes: watch::channel(()).0,
                 _on_state_change: on_state_change,
             }
         })
+    }
+
+    /// Resolve once the browser reports the association dead.
+    async fn ended(&self) {
+        let mut changes = self.state_changes.subscribe();
+        while !self.is_dead() {
+            if changes.changed().await.is_err() {
+                futures::future::pending::<()>().await;
+            }
+        }
     }
 
     /// The browser reports that the association can carry nothing more.
@@ -739,7 +789,7 @@ impl Connection {
     async fn open(
         endpoint: &WebRtcDirectEndpoint,
         source: &SharedAssociation,
-        attempted_dial: &Cell<bool>,
+        outcome: &Cell<DialOutcome>,
         dial_failures: Option<&DialFailures>,
     ) -> Result<Self, String> {
         // Serialize only setup. Each lane has its own RPC lock, inbox, request
@@ -769,7 +819,11 @@ impl Connection {
         }
         #[cfg(feature = "test-utils")]
         trace.event("dial", if fresh { "fresh" } else { "reused" });
-        attempted_dial.set(fresh);
+        outcome.set(if fresh {
+            DialOutcome::Failed
+        } else {
+            DialOutcome::NotDialled
+        });
         let peer_connection = if let Some(existing) = existing {
             existing
         } else {
@@ -836,7 +890,7 @@ impl Connection {
         let close_inbox = Rc::clone(&inbox);
         let close_open = Rc::clone(&open_tx);
         let on_close = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
-            close_inbox.fail("WebRTC DataChannel closed".to_string());
+            close_inbox.fail(DATA_CHANNEL_CLOSED.to_string());
             if let Some(sender) = close_open.borrow_mut().take() {
                 let _ = sender.send(Err("WebRTC DataChannel closed before opening".into()));
             }
@@ -866,6 +920,7 @@ impl Connection {
             _on_open: on_open,
         };
 
+        let mut checks_started = None;
         if fresh {
             let offer = JsFuture::from(connection.peer_connection.create_offer())
                 .await
@@ -903,22 +958,45 @@ impl Connection {
             JsFuture::from(connection.peer_connection.set_remote_description(&remote))
                 .await
                 .map_err(js_error_message)?;
+            checks_started = Some(web_time::Instant::now());
         }
 
-        timeout(
+        let opened = async move {
+            open_rx
+                .await
+                .map_err(|_| "WebRTC DataChannel closed before opening".to_string())?
+        };
+        let ended = async {
+            connection.peer_connection.ended().await;
+            Err(PEER_CONNECTION_FAILED.to_string())
+        };
+        let open = timeout(
             async move {
-                open_rx
-                    .await
-                    .map_err(|_| "WebRTC DataChannel closed before opening".to_string())?
+                match select(Box::pin(opened), Box::pin(ended)).await {
+                    Either::Left((result, _)) | Either::Right((result, _)) => result,
+                }
             },
             "WebRTC DataChannel opening timed out",
         )
-        .await?;
+        .await;
+        if let Err(error) = open {
+            connection.note_refusal(checks_started, outcome);
+            return Err(error);
+        }
+        // An open channel proves ICE and DTLS completed, including in browsers
+        // that do not report `connectionState`.
+        connection.peer_connection.connected.set(true);
         connection.data_channel.set_onopen(None);
         #[cfg(feature = "test-utils")]
         trace.event("channel-open", "");
 
-        let session = establish_pq_session(&connection, endpoint).await?;
+        let session = match establish_pq_session(&connection, endpoint).await {
+            Ok(session) => session,
+            Err(error) => {
+                connection.note_refusal(checks_started, outcome);
+                return Err(error);
+            }
+        };
         connection.pq_session.replace(Some(session));
         connection.rpc.replace(Some(multiplex::RpcSession::new(
             connection.data_channel.clone(),
@@ -935,6 +1013,36 @@ impl Connection {
 
     fn rpc(&self) -> Option<Rc<multiplex::RpcSession>> {
         self.rpc.borrow().clone()
+    }
+
+    /// Mark a failed fresh dial `Refused` when the node answered it and
+    /// turned it away (ant-node ADR-0023): its transport refused the ICE
+    /// check, or it hung up after ICE and DTLS completed. Anything else keeps
+    /// the full failure cooldown: DTLS failing after ICE connected (a
+    /// different node answered), an authentication failure, or a lane this
+    /// client closed itself.
+    fn note_refusal(&self, checks_started: Option<web_time::Instant>, outcome: &Cell<DialOutcome>) {
+        let Some(checks_started) = checks_started else {
+            return;
+        };
+        let association = &self.peer_connection;
+        let refused = if association.connected.get() {
+            association.is_dead() || self.inbox.failed_with(DATA_CHANNEL_CLOSED)
+        } else {
+            // Chromium declares the association failed while its legacy ICE
+            // state still reads "checking", so test that ICE never connected
+            // rather than that it reads "failed".
+            let ice_connected = matches!(
+                association.ice_connection_state(),
+                RtcIceConnectionState::Connected | RtcIceConnectionState::Completed
+            );
+            association.is_dead()
+                && !ice_connected
+                && checks_started.elapsed() < REFUSAL_DETECTION_WINDOW
+        };
+        if refused {
+            outcome.set(DialOutcome::Refused);
+        }
     }
 
     /// Usable for a new RPC. Every local close (a failed exchange, malformed
@@ -1046,12 +1154,12 @@ impl BrowserNodeClientCore {
             }
         }
         let generation = self.generation.get();
-        let attempted_dial = Cell::new(false);
+        let outcome = Cell::new(DialOutcome::NotDialled);
         let connection = match timeout_with_ms(
             Connection::open(
                 &self.endpoint,
                 &self.association,
-                &attempted_dial,
+                &outcome,
                 self.dial_failures.as_ref(),
             ),
             "WebRTC connection/authentication setup timed out",
@@ -1063,11 +1171,14 @@ impl BrowserNodeClientCore {
             Err(error) => {
                 #[cfg(feature = "test-utils")]
                 trace.finish(&error);
-                if let Some(cache) = self.dial_failures.as_ref().filter(|_| attempted_dial.get()) {
-                    cache.borrow_mut().record_failure(
-                        self.endpoint.peer_id.clone(),
-                        self.endpoint.multiaddr.clone(),
-                    );
+                if let Some(cache) = &self.dial_failures {
+                    let peer = self.endpoint.peer_id.clone();
+                    let endpoint = self.endpoint.multiaddr.clone();
+                    match outcome.get() {
+                        DialOutcome::NotDialled => {}
+                        DialOutcome::Failed => cache.borrow_mut().record_failure(peer, endpoint),
+                        DialOutcome::Refused => cache.borrow_mut().record_refusal(peer, endpoint),
+                    }
                 }
                 return Err(error);
             }
@@ -3452,6 +3563,26 @@ fn pass_ice_gathering_turn(connection: RtcPeerConnection, turn: Option<OwnedSema
         }
         drop(turn);
     });
+}
+
+/// Refuse an input object holding a key outside `known`. `serde_wasm_bindgen`
+/// reads only the fields a struct declares, so `#[serde(deny_unknown_fields)]`
+/// never sees the others; a value that is not an object is left to serde.
+///
+/// Any object is checked, whatever its prototype or realm: `dyn_ref` would
+/// test `instanceof Object`, which `Object.create(null)` and an object from
+/// another frame both fail.
+pub(crate) fn reject_unknown_keys(value: &JsValue, known: &[&str]) -> Result<(), String> {
+    if !value.is_object() {
+        return Ok(());
+    }
+    for key in js_sys::Object::keys(value.unchecked_ref::<js_sys::Object>()).iter() {
+        let key = key.as_string().unwrap_or_default();
+        if !known.contains(&key.as_str()) {
+            return Err(format!("unknown field `{key}`, expected one of {known:?}"));
+        }
+    }
+    Ok(())
 }
 
 fn js_error_message(value: JsValue) -> String {

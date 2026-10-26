@@ -177,6 +177,12 @@ pub trait BrowserNetwork {
     fn connected_read_peers(&self) -> Vec<PeerId> {
         Vec::new()
     }
+    /// Peers that declined a session because they were full, each with the
+    /// time until the adapter dials them again. Discovery and reads skip them
+    /// until then. Adapters that never skip a peer for that report none.
+    fn refused_peers(&self) -> Vec<(PeerId, std::time::Duration)> {
+        Vec::new()
+    }
     /// Whether `peer` would take a paid pointer write from this client, as
     /// far as can be told before one is sent: `Some(true)` if it would,
     /// `Some(false)` if it would refuse, `None` if it cannot be told in time.
@@ -532,6 +538,20 @@ impl Network {
                 })
                 .collect(),
         );
+    }
+
+    /// Peers skipped for now because they declined a session while full,
+    /// each with the time until they are tried again. Only browser sessions
+    /// are refused this way (ant-node ADR-0023), so native reports none.
+    pub(crate) fn refused_peers(&self) -> Vec<(PeerId, std::time::Duration)> {
+        #[cfg(feature = "native")]
+        {
+            Vec::new()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.backend.refused_peers()
+        }
     }
 
     /// Whether `peer` would take a paid pointer write from this client, as
