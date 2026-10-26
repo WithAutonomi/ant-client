@@ -24,8 +24,14 @@ export async function closesSettled() {
 // ICE gathering completes `gatheringMs` after setLocalDescription; Infinity
 // never completes. A node with `iceUnreachable` never answers ICE checks, so its
 // connection stays "checking" and its channels never open.
+// How soon a refusing node's transport fails a dial, as a STUN error response
+// to the browser's first answered connectivity check would.
+const REFUSAL_MS = 20;
+
 export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
   const connections = [];
+  // Dials each node has received, for nodes that refuse their first few.
+  const dials = nodes.map(() => 0);
   const requests = [];
   // When each connection started and completed ICE gathering.
   const gathering = [];
@@ -73,6 +79,12 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
         quoteHash: this.server.last_put_quote_hash(),
       } : {}), ...(address ? { address } : {}) });
       if (this.options.respond?.(this, method, response) === false) return;
+      // A full node's application closes an authenticated-to-be association
+      // instead of answering its handshake (ADR-0015).
+      if (method === "handshake" && this.connection.dial <= (this.options.closeHandshakes ?? 0)) {
+        this.close();
+        return;
+      }
       setTimeout(() => {
         if (this.options.multiplex && method !== "handshake") response = this.server.seal_response(response);
         this.options.delivered?.(this, method);
@@ -154,6 +166,27 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
       this.remoteSeed = Number(remote.sdp.match(/m=application (\d+)/)[1]) - 24_000;
       this.iceConnectionState = "checking";
       if (nodes[this.remoteSeed - 1].iceUnreachable) return;
+      this.dial = ++dials[this.remoteSeed - 1];
+      // A node at transport capacity answers the check with a STUN error, and
+      // the browser fails the association without connecting (ant-node ADR-0023).
+      if (this.dial <= (nodes[this.remoteSeed - 1].refuseDials ?? 0)) {
+        setTimeout(() => {
+          this.iceConnectionState = "failed";
+          this.connectionState = "failed";
+          this.onconnectionstatechange?.(new Event("connectionstatechange"));
+        }, REFUSAL_MS);
+        return;
+      }
+      // A different node at the endpoint answers ICE, but fails the DTLS
+      // certificate check, so the association fails after ICE connected.
+      if (this.dial <= (nodes[this.remoteSeed - 1].failDtlsDials ?? 0)) {
+        setTimeout(() => {
+          this.iceConnectionState = "connected";
+          this.connectionState = "failed";
+          this.onconnectionstatechange?.(new Event("connectionstatechange"));
+        }, REFUSAL_MS);
+        return;
+      }
       await this.prepareChannel(this.channel);
     }
     async prepareChannel(channel) {
