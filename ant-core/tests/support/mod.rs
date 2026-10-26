@@ -35,11 +35,11 @@ use ant_protocol::pqc::ops::{MlDsaOperations, MlDsaSecretKey};
 use ant_protocol::transport::{
     CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
 };
-use ant_protocol::{CLOSE_GROUP_SIZE, MAX_WIRE_MESSAGE_SIZE};
+use ant_protocol::{CLOSE_GROUP_SIZE, GET_OR_CLOSER_AGENT_TOKEN, MAX_WIRE_MESSAGE_SIZE};
 use rand::Rng;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -155,13 +155,45 @@ impl Silence {
     }
 }
 
-/// Chunk GET requests a node has received, by chunk address, counted as each
-/// message arrives and before the node handles it.
+/// Chunk reads the test nodes received, counted across the whole network.
+///
+/// Lets a test tell which kind of read a client sent, over the real
+/// transport.
+#[derive(Default)]
+pub struct ReadRequestCounts {
+    gets: AtomicUsize,
+    get_or_closers: AtomicUsize,
+}
+
+impl ReadRequestCounts {
+    fn record(&self, data: &[u8]) {
+        let counter = match ChunkMessage::decode(data).map(|message| message.body) {
+            Ok(ChunkMessageBody::GetRequest(_)) => &self.gets,
+            Ok(ChunkMessageBody::GetOrCloserRequest(_)) => &self.get_or_closers,
+            _ => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Plain GETs received so far.
+    pub fn gets(&self) -> usize {
+        self.gets.load(Ordering::Relaxed)
+    }
+
+    /// Get-or-closer requests received so far.
+    pub fn get_or_closers(&self) -> usize {
+        self.get_or_closers.load(Ordering::Relaxed)
+    }
+}
+
+/// Chunk read requests a node has received, by chunk address, counted as each
+/// message arrives and before the node handles it. A GET and a get-or-closer
+/// request (ADR-0020) are both reads.
 #[derive(Default)]
 pub struct ChunkGetCounts(Mutex<HashMap<[u8; 32], usize>>);
 
 impl ChunkGetCounts {
-    /// A GET request is a few dozen bytes, so anything larger, such as a PUT
+    /// A read request is a few dozen bytes, so anything larger, such as a PUT
     /// carrying a chunk, is not decoded.
     const MAX_GET_REQUEST_BYTES: usize = 1024;
 
@@ -169,21 +201,20 @@ impl ChunkGetCounts {
         if data.len() > Self::MAX_GET_REQUEST_BYTES {
             return;
         }
-        if let Ok(ChunkMessage {
-            body: ChunkMessageBody::GetRequest(request),
-            ..
-        }) = ChunkMessage::decode(data)
-        {
-            *self
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(request.address)
-                .or_default() += 1;
-        }
+        let address = match ChunkMessage::decode(data).map(|message| message.body) {
+            Ok(ChunkMessageBody::GetRequest(request)) => request.address,
+            Ok(ChunkMessageBody::GetOrCloserRequest(request)) => request.address,
+            _ => return,
+        };
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(address)
+            .or_default() += 1;
     }
 
-    /// GET requests received for `address`.
+    /// Read requests received for `address`.
     pub fn get(&self, address: &[u8; 32]) -> usize {
         self.0
             .lock()
@@ -196,6 +227,8 @@ impl ChunkGetCounts {
 
 pub struct MiniTestnet {
     pub nodes: Vec<TestNode>,
+    /// Chunk reads received by every node.
+    pub reads: Arc<ReadRequestCounts>,
     _temp_dirs: Vec<tempfile::TempDir>,
     /// Keeps the Anvil process alive for the lifetime of the testnet.
     _testnet: Testnet,
@@ -238,6 +271,7 @@ impl MiniTestnet {
             .gen_range(TEST_PORT_RANGE_MIN..TEST_PORT_RANGE_MAX - node_count as u16);
         let mut nodes = Vec::with_capacity(node_count);
         let mut temp_dirs = Vec::with_capacity(node_count);
+        let reads = Arc::new(ReadRequestCounts::default());
         let mut bootstrap_addrs = Vec::new();
 
         // Phase 1: Spawn bootstrap nodes
@@ -253,6 +287,7 @@ impl MiniTestnet {
                 &evm_network,
                 i,
                 commitment_key_count,
+                Arc::clone(&reads),
             )
             .await;
 
@@ -281,6 +316,7 @@ impl MiniTestnet {
                 &evm_network,
                 i,
                 commitment_key_count,
+                Arc::clone(&reads),
             )
             .await;
 
@@ -361,6 +397,7 @@ impl MiniTestnet {
 
         Self {
             nodes,
+            reads,
             _temp_dirs: temp_dirs,
             _testnet: testnet,
             wallet,
@@ -390,6 +427,7 @@ impl MiniTestnet {
         evm_network: &EvmNetwork,
         node_index: usize,
         commitment_key_count: Option<u32>,
+        reads: Arc<ReadRequestCounts>,
     ) -> (
         Arc<P2PNode>,
         Arc<AntProtocol>,
@@ -417,6 +455,11 @@ impl MiniTestnet {
             .collect();
         core_config.connection_timeout = Duration::from_secs(5);
         core_config.node_identity = Some(Arc::clone(&identity));
+        // Every test node answers get-or-closer (ant-node ADR-0020), as
+        // ant-node's own user agent announces. The `node/` prefix keeps it in
+        // routing tables.
+        core_config.custom_user_agent =
+            Some(format!("node/ant-core-test {GET_OR_CLOSER_AGENT_TOKEN}"));
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
         let node = Arc::new(P2PNode::new(core_config).await.expect("create P2P node"));
@@ -526,6 +569,9 @@ impl MiniTestnet {
                             if handler_silence.drops(&data) {
                                 continue;
                             }
+                        }
+                        if topic == ant_protocol::CHUNK_PROTOCOL_ID {
+                            reads.record(&data);
                         }
                         let protocol = Arc::clone(&handler_protocol);
                         let node = Arc::clone(&handler_node);
