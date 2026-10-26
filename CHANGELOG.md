@@ -68,10 +68,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the check `stop` already applied, and `start` removes the stale files before starting a new
   daemon. On every platform the process must be `ant` running `ant node daemon run`, so another
   `ant` command holding the reused PID is not taken for the daemon either. Where a process's
-  arguments can't be read (another user's, an elevated one on Windows) or don't show that, the
-  daemon's own API on the recorded port decides, on the configured listen address or either
-  loopback (IPv4 or IPv6). If that API doesn't answer, `start` and `stop` say they can't tell and
-  leave the files alone, rather than risk orphaning a live daemon. Previously macOS trusted any
+  arguments or executable can't be read (another user's, an elevated or protected one on
+  Windows) or don't show that, it counts as the daemon only if the daemon's own API on the
+  recorded port reports its PID, on the configured listen address or either loopback (IPv4 or
+  IPv6), each asked with a one-second deadline. Otherwise `start` and `stop` say they can't tell
+  and leave the files alone, rather than risk orphaning a live daemon. Previously macOS trusted any
   live PID and Windows checked only the executable's name, case-sensitively. `start` now fails
   instead of carrying on when a stale file can't be removed, and it only spawns the daemon from
   the `ant` binary. The `info` help text and README no longer claim its output is always JSON:
