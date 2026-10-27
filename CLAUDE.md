@@ -81,11 +81,13 @@ ant-core/src/
 │       ├── link.rs           # ant://<address> and ant://manifest/<base64url> links
 │       ├── file.rs           # .ant file read/write
 │       ├── history.rs        # Upload history: one .ant per upload under <data dir>/uploads
+│       ├── journal.rs        # Crash-safe journal of a running build (<id>.ant.partial)
 │       ├── wire.rs           # Manifest-owned DataMap layout; pre-decode structure check
 │       ├── build.rs          # ManifestBuilder (uploads files, embedded or compact refs)
 │       ├── embed.rs          # Root-vs-shrunk DataMap choice for embedding
 │       ├── compact.rs        # Plan/publish/apply compaction (embedded DataMaps -> addresses)
-│       └── extract.rs        # Containment-safe extraction with per-entry results
+│       ├── extract.rs        # Containment-safe extraction with per-entry results
+│       └── output/           # Handle-relative output directories (fds on Unix, held handles on Windows)
 └── node/                     # Node management
     ├── mod.rs                # add_nodes, remove_node, reset
     ├── types.rs              # DaemonConfig, DaemonStatus, NodeConfig, NodeInfo, AddNodeOpts, etc.
@@ -150,7 +152,7 @@ cargo run --bin ant -- --help  # Run the CLI
 - **CLI output**: All commands support `--json` global flag. Human-readable output by default, structured JSON when `--json` is passed.
 - **Hidden commands**: `ant node daemon run` is hidden (runs daemon in foreground, used internally by `daemon start`).
 - **REST API conflict responses**: All 409 responses include a `current_state` field so retrying clients can confirm desired state already exists.
-- **Platform paths**: Use `ant_core::config::data_dir()` and `ant_core::config::log_dir()` for platform-appropriate paths. Never hardcode paths.
+- **Platform paths**: Use `ant_core::config::data_dir()`, `ant_core::config::log_dir()` and `ant_core::config::download_dir()` for platform-appropriate paths. Never hardcode paths.
 - **OpenAPI schema**: Types exposed in the REST API derive `utoipa::ToSchema`. Use `#[schema(value_type = String)]` for `PathBuf` fields.
 - **Tests**: Unit tests go in `#[cfg(test)] mod tests` inside the source file. Integration tests go in `ant-core/tests/`.
 - **Progress reporting**: Long-running operations (e.g., binary downloads) accept a `&dyn ProgressReporter` from `ant_core::node::binary`. CLI provides a terminal-printing implementation; use `NoopProgress` in tests and daemon API handlers.
@@ -161,8 +163,13 @@ cargo run --bin ant -- --help  # Run the CLI
   is shared off-network; only the files it references live on Autonomi. `ant://<hex>` is always
   a plain file link. Every upload (`ant file upload`, `ant manifest create`) is also recorded as
   a manifest under `<data dir>/uploads/`; `ant manifest list` shows them and `show`/`link`/`export`/`download`
-  accept a record id. Entry paths obey the portable rules in `data/manifest/path.rs` at build,
-  decode and extract time, and extraction never follows symlinks inside the output directory.
+  accept a record id. Without `--output`, `download` extracts into a new directory named after
+  the manifest in the user's downloads directory. Entry paths obey the portable rules in `data/manifest/path.rs` at build,
+  decode and extract time, and extraction never follows symlinks inside the output directory
+  and resolves every name from directories it holds open (`data/manifest/output/`: by
+  descriptor on Unix, by path under held handles on Windows). A manifest
+  build journals each completed upload to `<id>.ant.partial` before paying for the next, so a
+  crash loses no paid upload; journals list as unfinished records.
   See `docs/adr/ADR-0006-file-manifests-and-links.md`.
 - **Log forwarding is opt-in and node-logging-dependent**: `ant node logs forward enable` is the
   consent act. It only forwards nodes whose `NodeConfig.log_dir` is `Some` — node file logging is

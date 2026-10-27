@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-09-23
-- **Last amended:** 2026-10-15
+- **Last amended:** 2026-10-26
 - **Decision owners:** Mick
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -283,8 +283,14 @@ A path is valid when all of the following hold:
 - Valid UTF-8, with `/` as the only separator. `\` is a forbidden character,
   never a separator.
 - No leading `/`, no empty component, no component equal to `.` or `..`.
-- No component contains NUL, a control character (below `0x20`, or `0x7F`),
-  or any of `< > : " | ? * \`.
+- No component contains a Unicode control character (`U+0000`–`U+001F`,
+  `U+007F`–`U+009F`; some terminals act on the C1 range, and entry names are
+  printed), a bidirectional embedding, override or isolate control
+  (`U+202A`–`U+202E`, `U+2066`–`U+2069`), or any of `< > : " | ? * \`.
+  Bidirectional controls make a name display as something it is not:
+  `invoice<U+202E>fdp.exe` shows as `invoiceexe.pdf`. Joiners and directional
+  marks stay allowed because real names in Persian, emoji and right-to-left
+  scripts use them.
 - No component ends with a space or a `.`.
 - No component, with any extension and the spaces before it removed,
   equals a Windows reserved device name ignoring case: `CON`, `PRN`, `AUX`,
@@ -292,13 +298,19 @@ A path is valid when all of the following hold:
   and `LPT¹`–`LPT³`. So `CON .txt` is rejected as well as `CON.txt`.
 - Each component is at most `MAX_PATH_COMPONENT_BYTES` (255) bytes; the whole
   path is at most `MAX_PATH_BYTES` (1024) bytes.
-- Effective names are compared under a folded key: NFC normalisation, then
-  uppercasing followed by lowercasing, then NFC again. Lowercasing alone
-  misses pairs that APFS and NTFS merge because their uppercase forms are
-  equal (`ſ` and `s`, `ς` and `σ`, `ı` and `i`); going through uppercase
-  joins them, and the final normalisation recomposes anything case mapping
-  decomposed. The key may reject a few pairs a given filesystem would keep
-  apart (`ß` and `ss`), which is the safe direction. Under that comparison
+- Effective names are compared under a folded key: the code points HFS+
+  ignores in names are dropped (zero-width joiners, directional marks and
+  formatting controls, and `U+FEFF`), then NFC normalisation, uppercasing,
+  full Unicode case folding, and NFC again. Each step covers merges the
+  others miss. NTFS compares uppercase forms (`ſ` and `s`, `ς` and `σ` on
+  older volumes). APFS applies full case folding (`ß`, `ẞ` and `ss`; `µ` and
+  `μ`), which lowercasing the uppercase form would miss for `ẞ`. HFS+ treats
+  `ab` and `a<U+200C>b` as one name. The final normalisation recomposes
+  anything case mapping decomposed. The key is checked against every BMP
+  character in the Windows XP and Windows 7 NTFS upcase tables and against
+  every cased character on a live case-insensitive APFS volume; it misses
+  no merge either makes. It rejects a few pairs those filesystems keep
+  apart (`ı` and `i`), which is the safe direction. Under that comparison
   no two effective names are equal, and none is a directory prefix of
   another: `a` and `a/b` cannot both be entries, and neither can `A` and
   `a/b`.
@@ -397,11 +409,27 @@ Two reference modes for uploaded files:
 
 Everything that could make the finished manifest invalid, such as file sizes,
 the name and path collisions, is checked before the first paid upload, and
-the output location is checked before it too. Cancellation stops between
+the output location is checked before it too.
+
+The finished manifest must also fit `MAX_MANIFEST_BYTES`, which a few
+thousand embedded root maps can exceed. Before the first upload every queued
+file is counted at the largest entry it can end as, with its path, the
+largest size and a hash: its own DataMap of three chunk records at the
+deepest child level, which bounds every map an upload returns. A build that
+cannot fit so is refused. (A file that ends as a public address is smaller,
+so the check can refuse a build that would just have fitted, never the
+reverse.) After an upload the entry is counted at its real size, and a
+larger reference such as an embedded root map is used only when the
+manifest still fits with it; the shrunk map is kept otherwise. A build that
+passes the check therefore never stops for size, every partial or complete
+result can be encoded and recorded, and nothing is paid for that could not
+be. Cancellation stops between
 files or abandons the upload in flight and returns the partial manifest,
-which the client records in the upload history so paid uploads are not lost.
-Ordinary file failures also preserve the partial result in
-`ManifestError::BuildFailed`; the CLI records it before reporting failure.
+which the builder records in the upload history so paid uploads are not
+lost. Ordinary file failures also preserve the partial result in
+`ManifestError::BuildFailed`, recorded the same way before it is returned.
+A crash or a forced quit loses no paid upload either: the build journals
+every completed upload as it goes (see Upload history).
 Each successful upload's DataMap is retained before reference optimisation,
 so a root-map resolution failure cannot discard that upload. Partial results
 carry the original number of local files to upload, excluding entries added
@@ -424,17 +452,66 @@ A single-file upload becomes a one-entry manifest; a manifest build is
 recorded as itself. Records live under `<data dir>/uploads/` as ordinary
 `.ant` files named `<UTC timestamp>-<label>.ant`, where the filename stem is
 the record id. When that id is taken, as when uploads with the same label
-finish within one second, `-2`, `-3` and so on are appended. Nothing else is
-stored, so the history is a plain folder of manifests. The client lists
+finish within one second, `-2`, `-3` and so on are appended. Apart from the
+journals of builds that have not finished, nothing else is stored, so the
+history is a plain folder of manifests. The client lists
 records newest first, ordering ids within one second by their suffix as a
 number, and accepts a record id wherever it accepts a manifest file or link:
 `show`, `link`, `export` and `download`. Every record embeds the full
 DataMap, whether or not the upload was public, and records the upload's
 `sha256`. A file name that breaks the
 portable path rules is repaired for the record, or dropped so the entry
-extracts under its content address, rather than losing the record. Recording never fails an
+extracts under its content address, rather than losing the record. A record
+written under earlier, looser path rules is repaired the same way when it is
+loaded: of two entries whose names now collide the later extracts under
+its content address, and a file whose name is now that of a directory other
+entries are in does, rather than every entry in it. A client update so
+never makes a recorded upload unreachable. Records loaded from anywhere else, such as a shared `.ant` file
+or a link, are still refused when they break the rules. Recording never fails an
 upload that has already succeeded; an unusable history directory is reported
 and the upload result still shown.
+
+A manifest build pays for its uploads one at a time, so it also keeps a
+journal in the history while it runs, `<id>.ant.partial`, and a crash, a
+kill, a power cut or a forced quit cannot lose an upload that was paid for:
+
+- The journal is created, and its name made durable, before the first paid
+  upload. A build that cannot create it stops before paying for anything.
+  Entries added without uploading are recorded first.
+- Each completed upload's entry is flushed to disk before the next upload is
+  paid for. When the entry's reference is then finalised, for example by
+  embedding the root map, it is recorded again; the later record of a name
+  wins.
+- When the build ends, complete, cancelled or failed, its manifest becomes
+  the ordinary record under the same id. The history directory is synced
+  before the journal is removed, so a power cut cannot lose both. A build
+  that stops before anything was uploaded paid for nothing and leaves no
+  record. If the record cannot be written, the journal stays; the CLI then
+  writes a stopped build's partial manifest to the output file, since the
+  journal may lack an upload whose entry could not be appended. An existing
+  output file is never replaced by a partial manifest, which goes beside it
+  as `<name>.partial.ant` instead.
+- Holding an id's journal is what claims the id: every record, a
+  single-file upload's included, is written by the holder of its journal,
+  which is created exclusively before the record is looked for. Two writers
+  therefore never take one id, and a record never takes the id of a running
+  build.
+- A journal is listed as an **unfinished** upload holding every entry that
+  reached the disk, whether its build is still running or stopped without
+  finishing, and its id is accepted wherever a record id is, with a reminder
+  that it is partial. A journal is read up to its last whole frame, so one
+  still being written reads as the uploads so far. A journal beside a record
+  of the same id, left by a build that stopped between the steps above, is
+  ignored, and so is one holding no entry yet.
+- On Unix the journal is readable by its owner only, as records are, since
+  it holds the DataMaps of private uploads.
+
+The journal is the magic `0xC1 'A' 'N' 'J'`, a version byte (1), and frames:
+a little-endian `u32` payload length, the payload's CRC-32, and the payload.
+The first payload is the manifest's `name` and `torrent`; every other
+payload is one entry in the manifest's own msgpack form. Reading stops at
+the first frame that is incomplete or fails its checksum, which is where a
+write was cut short; every frame before it is kept.
 
 ### Export and compaction
 
@@ -463,38 +540,85 @@ manifest untouched. Entries already referenced by address are unaffected.
 Input: a manifest, an output root, and an optional selection by exact
 effective name or directory prefix. Empty selection means everything.
 
+The output root is the caller's choice. When the CLI is not given one, it
+extracts into a new directory named after the manifest, made in the user's
+downloads directory before anything is downloaded; making it is the check.
+That is the platform's Downloads folder (the known folder on Windows,
+`XDG_DOWNLOAD_DIR` on Linux), or `~/Downloads` where the platform names
+none, made if missing, and the CLI prints the directory before it starts.
+Like a browser's, this default keeps a sender's name out of the directory
+the command runs in, where a name can mean something: a project directory
+loads a package named `json` before the real one, and a home directory
+holds `.ssh` and `AppData`. It also belongs to the user, so no other user
+can swap the new directory for a link while it fills. The sender still
+chooses that name, and a downloads directory may be the home directory, so
+a default never lands in a directory that exists already or has a hidden
+name, one starting with a dot once the code points HFS+ ignores are
+dropped: a manifest named `.ssh` would otherwise plant `authorized_keys`.
+Such a manifest, and one without a name, needs an explicit output
+directory, which may be any directory, existing or not. The CLI's messages never echo a sender's name
+inside a suggested command. The selection is checked before the directory
+is made. A download that stops can be run again: the CLI
+records the directory it made under `<data dir>/downloads/`, keyed by a hash
+of the manifest and the directory's path, until every entry is in place, and
+a re-run of the same download continues into it. The sender cannot make that
+record, so it does not let a name pick an existing directory.
+
 Before any network access, every effective name is re-validated against the
 portable path rules. Any violation rejects the manifest.
 
 Containment is a filesystem contract, not a string check. Within the output
 root the extractor never follows a symlink or a junction, that is, anything
 the platform's no-follow metadata reports as a link (on Windows, the
-name-surrogate reparse points): each
-intermediate directory is created, or confirmed to be a real directory, by a
-non-following metadata check immediately before use, and the file is
-downloaded into a reserved temporary name in its parent directory and renamed
-into place with no-clobber semantics. The target is checked again, without
-following links, immediately before the rename. An entry whose path would
-traverse a link, or whose target already exists, is a per-entry failure
-unless overwrite was requested, in which case only a regular file at the
-exact target is replaced, never a link. Handle-relative (resolve-beneath)
-opening would close the remaining check-to-use window against a concurrent
-local attacker and is a later hardening step, not part of this decision.
+name-surrogate reparse points). It resolves every name from directories it
+holds open:
+
+- On Unix each directory is held as a file descriptor opened without
+  following links, and every create, rename and check is relative to it.
+  Renaming a directory or replacing any path to it with a symlink does not
+  change the directory a descriptor refers to, so nothing that changes
+  while an entry downloads can redirect where it is written, even a
+  concurrent local process that can write inside the output root.
+- On Windows each directory from the root down is held open without delete
+  sharing, which stops it from being renamed or deleted while the entry is
+  written. Directories beneath the root are opened as the reparse point
+  itself, so a link is seen rather than followed. Operations still go by
+  path, so a concurrent process that can write inside the output root can
+  turn a directory the extraction created, while it is still empty, into a
+  junction. Containing that needs handle-relative opens through the native
+  API and is left to a later change; links that exist when a name is
+  resolved are always refused.
+
+The output root itself may be a link, since it is the caller's choice; links
+in its own path are resolved once when it is opened. Each intermediate
+directory is created, or confirmed to be a real directory, as it is opened.
+The file is downloaded into a temporary name in its parent and renamed into
+place without replacing anything (an atomic no-replace rename where the
+filesystem has one, otherwise a hard link, otherwise a check just before the
+rename). A regular file already at the target with the entry's recorded
+`sha256` is that entry, as an earlier run left it: it is kept and reported
+as present, and nothing is downloaded, so an extraction that stopped can be
+run again. Its length is compared with the entry's size first, so a large
+file that is not the entry is never read, and a file that cannot be read is
+not the entry. Any other entry whose path would traverse a link, or whose
+target already exists, is a per-entry failure unless overwrite was
+requested. Even then only a regular file is replaced, never a link.
 
 Per entry: resolve the DataMap (`Public` needs one fetch), resolve it to its
 root (a shrunk map needs its wrapper records), and check that the target's
 filesystem has room for the root's exact plaintext size before downloading;
 too little space is a per-entry failure. Then download through the ordinary
 file download and write as above. When the entry records a `sha256`, the
-downloaded temporary file is hashed before it takes its name; a mismatch is
-a per-entry failure and the temporary file is removed, so nothing unverified
-is left at the target. The recorded `size` decides nothing; tools show it
+download is hashed as it is written, in the same pass, and checked before
+the file takes its name; a mismatch is a per-entry failure and the temporary
+file is removed, so nothing unverified is left at the target. The file is
+flushed to disk before the rename, where the filesystem can flush. The recorded `size` decides nothing; tools show it
 marked as the creator's claim, and show the exact size instead wherever an
 embedded root map provides one. Extracted files get the platform's default
 permissions.
 
 A bounded number of entries are in flight at once, one by default. Results
-are per entry: written, failed with its error, or cancelled. One failure does
+are per entry: written, already present, failed with its error, or cancelled. One failure does
 not abort the rest. The operation reports progress at manifest and file level
 and accepts a cancellation token; cancelling abandons the in-flight download
 and marks every unstarted entry cancelled.
@@ -552,8 +676,10 @@ initial release.
 - A link's embedded entries carry the shrunk map, so a recipient of a large
   file fetches its wrapper records before its data, which a `.ant` file
   with the root map avoids.
-- Existing files in the output directory are never reused; a re-download
-  fails per entry or overwrites on request.
+- An existing file in the output directory is reused only when it has its
+  entry's recorded `sha256`. An entry without one, such as an entry added by
+  address, fails per entry when its file exists, or is downloaded again with
+  overwrite.
 - A new format is a new compatibility surface; the version byte and the
   forward-compatibility rules bound it.
 
@@ -595,17 +721,52 @@ initial release.
 - Portable path tests, run on Unix and macOS in CI: every rule above,
   positive and negative, including the extended reserved names and the
   case-folding pairs above.
+- Default output tests: without an explicit output, a download makes a new
+  directory named after the manifest in the downloads directory, making
+  that too if it is missing, and records it; the same download continues
+  into it, while another manifest of that name, or this one once its record
+  is gone, is refused; a hidden name, also behind a code point HFS+
+  ignores, or no name is refused, making nothing.
 - Containment tests, run on Unix and macOS in CI: a pre-existing symlink at
   every depth inside the output root causes a per-entry failure and nothing
   is written outside the root; an existing target fails without overwrite
   and is replaced only when it is a regular file; a link at the target is
-  never followed even with overwrite. Windows uses the same no-follow
-  metadata checks, but CI has no Windows unit-test runner. Junction tests
-  are to be added with one.
+  never followed even with overwrite; a directory swapped for a symlink to
+  elsewhere while an entry downloads cannot redirect the file; a name that
+  appears during the download is not replaced; an abandoned temporary file
+  is removed; a file with the entry's hash and size is kept, while a link, a
+  FIFO or an unreadable file at the target never counts, and overwrite still
+  replaces an unreadable one. The
+  Windows implementation
+  is type-checked and linted for `x86_64-pc-windows-msvc`, but CI has no
+  Windows test runner. Junction tests are to be added with one.
+- Upload journal tests: a journal lists as an unfinished record of exactly
+  the entries written, while its build runs and after it stops, with a later
+  record of a name replacing an earlier one; a write cut short, or a
+  damaged last frame, keeps every entry before it; finishing writes the
+  record and removes the journal; journals and records never share an id;
+  a journal beside its record is not listed, nor is one cut short before its
+  opening; recording a single upload leaves no journal; a record written
+  under looser rules loads repaired, with nothing lost, and a file in the
+  way of a directory loses its path rather than the entries in it. On a
+  local network, a build that fails after its first upload records its
+  partial result itself; a build dropped once its second upload has started,
+  as a killed process stops, leaves an unfinished record holding the first
+  upload, which extracts; and a build cancelled before any upload leaves no
+  record.
+- Size budget tests: the largest entry an upload can become bounds every
+  real one; a build of long paths that would fit as addresses but not
+  embedded is refused before paying; the fixed part counts everything but
+  the entries; a larger reference is taken only when it fits; a build that
+  passes preflight with less than a file to spare, whose uploads all return
+  shrunk maps and are offered other references, never outgrows the limit.
 - End-to-end on a local network: build a manifest with an embedded entry, a
   compact entry and an entry added by address; extract it from a `.ant` file
   and from a manifest link; extract a selection; verify bytes and per-entry
-  results; download a file link through the ordinary file download.
+  results; run it again into the same directory, where every file with its
+  recorded hash is kept without a download, while a file without one, or
+  one that differs from its entry, fails until overwrite replaces it;
+  download a file link through the ordinary file download.
 - Review trigger: any new `ContentRef` variant, or any change to the header,
   path rules or containment contract, requires an amending or superseding
   ADR.

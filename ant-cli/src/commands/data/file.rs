@@ -801,7 +801,7 @@ struct UploadJsonResult {
 /// Tell the user where the upload was recorded.
 fn print_recorded(manifest_id: Option<&str>) {
     if let Some(id) = manifest_id {
-        println!("Recorded as {id} (ant manifest download {id})");
+        println!("Recorded as {id} (ant manifest download {id} --output <directory>)");
     }
 }
 

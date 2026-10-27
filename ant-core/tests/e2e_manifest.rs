@@ -13,10 +13,10 @@ use std::sync::Arc;
 
 use ant_core::data::{
     apply_compaction, data_map_address, embeddable_data_map, embedded_len, extract_manifest,
-    manifest_link, parse_link, plan_compaction, publish_data_maps, read_manifest_file,
-    record_upload, write_manifest_file, BuildEvent, BuildOptions, Client, ContentRef, EntryStatus,
-    ExtractOptions, Link, Manifest, ManifestBuilder, ManifestEntry, ManifestError, PaymentMode,
-    ReferenceMode, Visibility, MAX_EMBEDDED_ROOT_MAP_BYTES,
+    list_uploads, load_upload, manifest_link, parse_link, plan_compaction, publish_data_maps,
+    read_manifest_file, write_manifest_file, BuildEvent, BuildOptions, Client, ContentRef,
+    EntryStatus, ExtractOptions, Link, Manifest, ManifestBuilder, ManifestEntry, ManifestError,
+    PaymentMode, RecordState, ReferenceMode, Visibility, MAX_EMBEDDED_ROOT_MAP_BYTES,
 };
 use self_encryption::{shrink_data_map, ChunkInfo, DataMap};
 use serial_test::serial;
@@ -118,6 +118,7 @@ async fn manifest_round_trips_through_file_and_link() {
             payment_mode: PaymentMode::Auto,
             follow_symlinks: false,
             cancel: CancellationToken::new(),
+            history: None,
         },
     );
     builder.add_directory(source.path(), None).unwrap();
@@ -196,8 +197,11 @@ async fn manifest_round_trips_through_file_and_link() {
     assert!(!partial.path().join("a.bin").exists());
     assert!(partial.path().join("docs/b.bin").exists());
 
-    // Existing targets fail per entry without overwrite and nothing else is
-    // touched; with overwrite they are replaced.
+    // Running it again keeps every file that still has its recorded
+    // SHA-256, without downloading it, so a download that stopped can be
+    // continued. The entry added by address records no hash, so its file
+    // fails as existing, and so does a file that differs from its entry;
+    // with overwrite both are replaced.
     let report = extract_manifest(
         &client,
         &from_file,
@@ -206,17 +210,35 @@ async fn manifest_round_trips_through_file_and_link() {
     )
     .await
     .expect("second extract runs");
-    assert_eq!(report.failed(), 4);
-    assert!(report
-        .entries
-        .iter()
-        .all(|e| matches!(&e.status, EntryStatus::Failed { error } if error.contains("exists"))));
-    let mut overwrite = extract_options(out.path(), vec!["a.bin".into()]);
+    assert_eq!(report.present(), 3, "{:?}", report.entries);
+    assert_eq!(report.failed(), 1, "{:?}", report.entries);
+    assert!(report.entries.iter().any(|e| e.name == "extra/extra.bin"
+        && matches!(&e.status, EntryStatus::Failed { error } if error.contains("exists"))));
+    fs::write(out.path().join("a.bin"), b"changed locally").unwrap();
+    let both = vec!["a.bin".into(), "extra/extra.bin".into()];
+    let report = extract_manifest(
+        &client,
+        &from_file,
+        &extract_options(out.path(), both.clone()),
+        None,
+    )
+    .await
+    .expect("third extract runs");
+    assert_eq!(report.failed(), 2, "{:?}", report.entries);
+    assert_eq!(
+        fs::read(out.path().join("a.bin")).unwrap(),
+        b"changed locally"
+    );
+    let mut overwrite = extract_options(out.path(), both);
     overwrite.overwrite = true;
     let report = extract_manifest(&client, &from_file, &overwrite, None)
         .await
         .expect("overwrite extract");
-    assert_eq!(report.written(), 1);
+    assert_eq!(report.written(), 2, "{:?}", report.entries);
+    assert_eq!(
+        fs::read(out.path().join("a.bin")).unwrap(),
+        vec![0x11u8; FILE_BYTES]
+    );
 
     drop(client);
     testnet.teardown().await;
@@ -239,6 +261,7 @@ async fn uploads_record_sha256_and_extraction_checks_it() {
             payment_mode: PaymentMode::Auto,
             follow_symlinks: false,
             cancel: CancellationToken::new(),
+            history: None,
         },
     );
     builder.add_directory(source.path(), None).unwrap();
@@ -308,7 +331,14 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
         fs::write(&first, &expected).unwrap();
         fs::write(&later, vec![0x93; FILE_BYTES]).unwrap();
 
-        let mut builder = ManifestBuilder::new(&client, BuildOptions::default());
+        let history = TempDir::new().unwrap();
+        let mut builder = ManifestBuilder::new(
+            &client,
+            BuildOptions {
+                history: Some(history.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
         builder.add_file(&first, "first.bin".into()).unwrap();
         builder.add_file(&later, "later.bin".into()).unwrap();
         builder
@@ -317,9 +347,9 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
         let (tx, mut rx) = mpsc::channel(1);
         let sabotage = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                if matches!(event, BuildEvent::FileStarted { index: 0, .. }) {
+                if let BuildEvent::FileStarted { index: 0, .. } = event {
                     // Preflight has passed. The first file still needs real
-                    // network/payment work before the next file is read.
+                    // network/payment work before the next is read.
                     if remove {
                         fs::remove_file(&later).unwrap();
                     } else {
@@ -359,9 +389,17 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
             .iter()
             .any(|entry| entry.path.as_deref() == Some("later.bin")));
 
-        let history = TempDir::new().unwrap();
-        let record = record_upload(history.path(), &partial.manifest, None).unwrap();
+        // The builder recorded the partial result itself.
+        let id = partial
+            .history_id
+            .clone()
+            .expect("the partial build is recorded");
+        assert!(partial.history_error.is_none());
+        let record = load_upload(history.path(), &id).unwrap().unwrap();
+        assert_eq!(record.state, RecordState::Complete);
+        assert_eq!(list_uploads(history.path()).unwrap().records.len(), 1);
         let recovered = read_manifest_file(&record.path).unwrap();
+        assert_eq!(recovered, partial.manifest);
         let out = TempDir::new().unwrap();
         let report = extract_manifest(
             &client,
@@ -375,14 +413,77 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
         assert_eq!(fs::read(out.path().join("first.bin")).unwrap(), expected);
     }
 
+    // A crash once the second upload has started: the build is dropped
+    // there, as a killed process would stop. The first upload was journaled
+    // before the second began, so it is listed as unfinished and usable.
+    let first = source.path().join("first.bin");
+    let second = source.path().join("second.bin");
+    let expected = vec![0x94; FILE_BYTES];
+    fs::write(&first, &expected).unwrap();
+    fs::write(&second, vec![0x95; FILE_BYTES]).unwrap();
+    let history = TempDir::new().unwrap();
+    let mut builder = ManifestBuilder::new(
+        &client,
+        BuildOptions {
+            history: Some(history.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    builder.add_file(&first, "first.bin".into()).unwrap();
+    builder.add_file(&second, "second.bin".into()).unwrap();
+    builder
+        .add_public([9; 32], Some("existing.bin".into()), None)
+        .unwrap();
+    let (tx, mut rx) = mpsc::channel(1);
+    // Polled only here, so the build cannot go on once the event is seen.
+    let mut build = Box::pin(builder.finish(Some(tx)));
+    loop {
+        tokio::select! {
+            _ = &mut build => panic!("the build ended before the second upload started"),
+            event = rx.recv() => match event {
+                Some(BuildEvent::FileStarted { index: 1, .. }) => break,
+                Some(_) => {}
+                None => panic!("the build stopped sending progress"),
+            },
+        }
+    }
+    drop(build);
+    drop(rx);
+    let listing = list_uploads(history.path()).unwrap();
+    assert_eq!(listing.records.len(), 1, "{:?}", listing.unreadable);
+    let crashed = &listing.records[0];
+    assert_eq!(crashed.state, RecordState::Unfinished);
+    let mut names: Vec<_> = crashed
+        .manifest
+        .entries
+        .iter()
+        .filter_map(|entry| entry.path.clone())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["existing.bin", "first.bin"]);
+    let record = load_upload(history.path(), &crashed.id).unwrap().unwrap();
+    let out = TempDir::new().unwrap();
+    let report = extract_manifest(
+        &client,
+        &record.manifest,
+        &extract_options(out.path(), vec!["first.bin".into()]),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.written(), 1);
+    assert_eq!(fs::read(out.path().join("first.bin")).unwrap(), expected);
+
     // References do not count toward the original upload total, including
     // when cancellation happens before the first upload starts.
     let cancel = CancellationToken::new();
     cancel.cancel();
+    let history = TempDir::new().unwrap();
     let mut builder = ManifestBuilder::new(
         &client,
         BuildOptions {
             cancel,
+            history: Some(history.path().to_path_buf()),
             ..Default::default()
         },
     );
@@ -396,6 +497,9 @@ async fn failed_build_keeps_completed_uploads_for_history_and_extraction() {
     assert!(cancelled.cancelled);
     assert_eq!(cancelled.files_uploaded, 0);
     assert_eq!(cancelled.total_to_upload, 2);
+    // Nothing was paid for, so nothing is recorded.
+    assert!(cancelled.history_id.is_none());
+    assert!(fs::read_dir(history.path()).unwrap().next().is_none());
     assert_eq!(cancelled.manifest.entries.len(), 1);
 
     drop(client);
@@ -428,6 +532,7 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
             payment_mode: PaymentMode::Auto,
             follow_symlinks: false,
             cancel: CancellationToken::new(),
+            history: None,
         },
     );
     builder.add_directory(source.path(), None).unwrap();
@@ -457,6 +562,7 @@ async fn compact_mode_uses_public_addresses_only_when_the_datamap_is_on_the_netw
             payment_mode: PaymentMode::Auto,
             follow_symlinks: false,
             cancel: CancellationToken::new(),
+            history: None,
         },
     );
     embedded_builder.add_directory(source.path(), None).unwrap();

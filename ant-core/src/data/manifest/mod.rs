@@ -46,6 +46,10 @@ pub mod extract;
 pub mod file;
 #[cfg(feature = "native")]
 pub mod history;
+#[cfg(feature = "native")]
+mod journal;
+#[cfg(feature = "native")]
+mod output;
 
 #[cfg(feature = "native")]
 pub use self::embed::embeddable_data_map;
@@ -289,7 +293,8 @@ pub enum ManifestError {
     #[cfg(feature = "native")]
     #[error("manifest build failed at {path:?}: {cause}")]
     BuildFailed {
-        /// Manifest path being processed when the failure occurred.
+        /// Manifest path being processed when the failure occurred, or
+        /// empty when the failure concerned the manifest as a whole.
         path: String,
         /// The underlying failure.
         #[source]
@@ -538,6 +543,15 @@ impl Manifest {
     /// limits and the portable path rules. The structure, including the
     /// entry count, is checked before any entry is decoded.
     pub fn decode(bytes: &[u8]) -> Result<Self, ManifestError> {
+        let manifest = Self::decode_unvalidated(bytes)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// [`Manifest::decode`] without the final validation of names, paths and
+    /// collisions, for a reader that repairs them instead. Every size, depth,
+    /// structure and entry-count limit still applies.
+    pub(crate) fn decode_unvalidated(bytes: &[u8]) -> Result<Self, ManifestError> {
         if bytes.len() > MAX_MANIFEST_BYTES {
             return Err(ManifestError::TooLarge {
                 len: bytes.len(),
@@ -555,10 +569,7 @@ impl Manifest {
         wire::check_structure(body)?;
         let mut deserializer = rmp_serde::Deserializer::from_read_ref(body);
         deserializer.set_max_depth(MAX_DECODE_DEPTH);
-        let manifest = Manifest::deserialize(&mut deserializer)
-            .map_err(|e| ManifestError::Decode(e.to_string()))?;
-        manifest.validate()?;
-        Ok(manifest)
+        Manifest::deserialize(&mut deserializer).map_err(|e| ManifestError::Decode(e.to_string()))
     }
 
     /// Whether `bytes` start with the manifest magic. Cheap classification

@@ -21,6 +21,11 @@ pub fn manifest_filename_for(name: Option<&str>) -> String {
 
 /// Read and decode a `.ant` file, refusing oversized files before reading.
 pub fn read_manifest_file(path: &Path) -> Result<Manifest, ManifestError> {
+    Manifest::decode(&read_manifest_bytes(path)?)
+}
+
+/// The bytes of a `.ant` file, refusing an oversized file before reading.
+pub(super) fn read_manifest_bytes(path: &Path) -> Result<Vec<u8>, ManifestError> {
     let len = fs::metadata(path)?.len();
     if len > MAX_MANIFEST_BYTES as u64 {
         return Err(ManifestError::TooLarge {
@@ -28,7 +33,7 @@ pub fn read_manifest_file(path: &Path) -> Result<Manifest, ManifestError> {
             max: MAX_MANIFEST_BYTES,
         });
     }
-    Manifest::decode(&fs::read(path)?)
+    Ok(fs::read(path)?)
 }
 
 /// Encode and write a manifest atomically. Refuses to replace an existing

@@ -17,13 +17,15 @@ use ant_core::data::{
     apply_compaction, data_map_address, default_history_dir, embeddable_data_map, extract_manifest,
     format_timestamp, is_link, list_uploads, load_upload, manifest_filename_for,
     manifest_link_bytes, manifest_link_from_bytes, parse_link, plan_compaction, publish_data_maps,
-    read_manifest_file, record_upload, write_manifest_file, BuildEvent, BuildOptions, BuildResult,
-    Client, ContentRef, DownloadEvent, EntryStatus, ExtractEvent, ExtractOptions, Link, Manifest,
-    ManifestBuilder, ManifestError, PaymentMode, ReferenceMode, TorrentReference, UploadEvent,
-    UploadRecord, Visibility, MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
+    read_manifest_file, record_upload, select_entries, write_manifest_file, BuildEvent,
+    BuildOptions, BuildResult, Client, ContentRef, DownloadEvent, EntryStatus, ExtractEvent,
+    ExtractOptions, Link, Manifest, ManifestBuilder, ManifestError, PaymentMode, RecordState,
+    ReferenceMode, TorrentReference, UploadEvent, UploadRecord, Visibility,
+    MANIFEST_LINK_RECOMMENDED_MAX_BYTES,
 };
 use clap::Subcommand;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -42,6 +44,12 @@ const YES_ANSWERS: &[&str] = &["y", "yes"];
 const FORCE_QUIT_EXIT_CODE: i32 = 130;
 /// Marks a size in `manifest show` that only the manifest's creator vouches for.
 const CLAIMED_SIZE_MARK: char = '*';
+/// Extension of a stopped build's partial manifest, written beside an
+/// output file that already exists rather than over it.
+const PARTIAL_MANIFEST_EXTENSION: &str = "partial.ant";
+/// Directory under the data directory that records the default download
+/// directories whose download has not finished, so a re-run can continue.
+const DOWNLOAD_RECORDS_DIR: &str = "downloads";
 
 /// Manifest subcommands.
 #[derive(Subcommand, Debug)]
@@ -143,8 +151,13 @@ pub enum ManifestAction {
         /// A `.ant` file, an `ant://manifest/...` link, or an upload id
         /// from `ant manifest list`.
         source: String,
-        /// Directory to extract into. Defaults to the manifest name, or
-        /// the current directory when it has none.
+        /// Directory to extract into, existing or not. Defaults to a new
+        /// directory named after the manifest in your downloads directory,
+        /// which must not exist yet unless an earlier run of this download
+        /// made it and did not finish. A manifest without a name, or with a
+        /// hidden one, needs --output. Files already in place with their
+        /// recorded SHA-256 are kept, so a download that stopped can be run
+        /// again.
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Only extract these entries or directories. Repeatable.
@@ -491,6 +504,9 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         payment_mode: args.payment_mode,
         follow_symlinks: args.follow_symlinks,
         cancel: CancellationToken::new(),
+        // Each completed upload is journaled here before the next is paid
+        // for; a build that cannot record itself stops before paying.
+        history: Some(default_history_dir()?),
     };
     // Fail before any paid upload if the manifest could not be written.
     let out = resolve_output(options.name.as_deref(), args.output.clone())?;
@@ -547,8 +563,7 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
         result
     };
 
-    let (result, history_id) =
-        record_build_result(built, |manifest| record_upload_manifest(manifest, None))?;
+    let (result, history_id) = build_outcome(built, &out)?;
     write_manifest(&result.manifest, &out, args.overwrite)?;
     if !json {
         eprintln!(
@@ -571,10 +586,13 @@ async fn create(client: &Client, args: CreateArgs, json: bool) -> anyhow::Result
     )
 }
 
-/// Persist completed uploads before reporting cancellation or failure.
-fn record_build_result(
+/// Turn a build's outcome into its result and the id of the record that
+/// holds it, or an error that says where the completed uploads are kept. The
+/// builder has already recorded them in the history, complete or partial;
+/// when it could not, a stopped build's partial manifest is written to `out`.
+fn build_outcome(
     built: Result<BuildResult, ManifestError>,
-    record: impl FnOnce(&Manifest) -> Option<String>,
+    out: &Path,
 ) -> anyhow::Result<(BuildResult, Option<String>)> {
     let result = match built {
         Ok(result) => result,
@@ -583,22 +601,62 @@ fn record_build_result(
             cause,
             partial,
         }) => {
-            let history_id = record(&partial.manifest);
+            let at = if path.is_empty() {
+                String::new()
+            } else {
+                format!(" at {path:?}")
+            };
             anyhow::bail!(
-                "manifest build failed at {path:?} after {} of {} file(s): {cause}{}",
+                "manifest build failed{at} after {} of {} file(s): {cause}{}",
                 partial.files_uploaded,
                 partial.total_to_upload,
-                partial_record_message(history_id.as_deref()),
+                keep_partial(&partial, out),
             );
         }
         Err(error) => return Err(error.into()),
     };
-
-    let history_id = record(&result.manifest);
     if result.cancelled {
-        return Err(cancelled_build_error(&result, history_id.as_deref()));
+        return Err(cancelled_build_error(&result, &keep_partial(&result, out)));
     }
+    let history_id = recorded_id(&result);
     Ok((result, history_id))
+}
+
+/// The id of the record that holds a build's manifest, or `None`, with a
+/// warning, when its record could not be written.
+fn recorded_id(result: &BuildResult) -> Option<String> {
+    match (&result.history_id, &result.history_error) {
+        (Some(id), Some(error)) => {
+            eprintln!(
+                "warning: the record of upload {id} could not be written ({error}); \
+                 its journal stays in the history, listed as unfinished"
+            );
+            None
+        }
+        (id, _) => id.clone(),
+    }
+}
+
+/// Where a stopped build's partial manifest is kept, for its error message:
+/// its record, or `out` when the record could not be written, since a
+/// journal the build could not finish may also lack the last upload. A file
+/// already at `out`, which may be a complete manifest, is never replaced;
+/// the partial manifest goes beside it instead.
+fn keep_partial(partial: &BuildResult, out: &Path) -> String {
+    if let Some(id) = recorded_id(partial) {
+        return format!("; the partial manifest is recorded as {id}");
+    }
+    if partial.files_uploaded == 0 {
+        return String::new();
+    }
+    let beside = out.with_extension(PARTIAL_MANIFEST_EXTENSION);
+    let written = write_manifest(&partial.manifest, out, false)
+        .map(|()| out)
+        .or_else(|_| write_manifest(&partial.manifest, &beside, false).map(|()| beside.as_path()));
+    match written {
+        Ok(path) => format!("; the partial manifest is written to {}", path.display()),
+        Err(error) => format!("; the partial manifest could not be kept: {error}"),
+    }
 }
 
 /// The output path: the one given, or `<name>.ant` in the current directory.
@@ -610,32 +668,99 @@ fn resolve_output(name: Option<&str>, output: Option<PathBuf>) -> anyhow::Result
     Ok(output.unwrap_or_else(|| PathBuf::from(manifest_filename_for(name))))
 }
 
-fn resolve_download_root(manifest: &Manifest, output: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+/// Where a download extracts to.
+struct DownloadRoot {
+    path: PathBuf,
+    /// The record marking `path` as this manifest's unfinished default
+    /// download, removed once every entry is in place.
+    record: Option<PathBuf>,
+}
+
+/// The directory a download extracts into without `--output`: a new
+/// directory named after the manifest, made in `parent`, the downloads
+/// directory, and recorded in `records` until the download finishes. The
+/// sender chooses that name, so it never picks a hidden directory or one
+/// that already exists, unless an unfinished run of this same download made
+/// it; a manifest without a name needs `--output`. Making the directory is
+/// the check, so nothing can appear there in between.
+fn default_download_root(
+    manifest: &Manifest,
+    parent: &Path,
+    records: Option<&Path>,
+) -> anyhow::Result<DownloadRoot> {
     manifest.validate()?;
-    Ok(output.unwrap_or_else(|| {
-        manifest
-            .name
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
-    }))
+    let Some(name) = manifest.name.as_deref() else {
+        anyhow::bail!("this manifest has no name; pass --output to choose where to extract it");
+    };
+    if ant_core::data::manifest::path::is_hidden(name) {
+        anyhow::bail!(
+            "this manifest is named {name:?}, a hidden directory; \
+             pass --output to choose where to extract it"
+        );
+    }
+    std::fs::create_dir_all(parent)
+        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", parent.display()))?;
+    let path = parent.join(name);
+    match std::fs::create_dir(&path) {
+        Ok(()) => {
+            let record = records.and_then(|records| {
+                start_download_record(records, manifest, &path)
+                    .inspect_err(|e| {
+                        eprintln!("warning: this download cannot be continued if it stops: {e}")
+                    })
+                    .ok()
+            });
+            Ok(DownloadRoot { path, record })
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let unfinished = records
+                .and_then(|records| download_record(records, manifest, &path).ok())
+                .filter(|record| record.is_file());
+            match unfinished {
+                Some(record) => Ok(DownloadRoot {
+                    path,
+                    record: Some(record),
+                }),
+                None => anyhow::bail!(
+                    "{} already exists; choose where to extract with --output, \
+                     which may be that directory",
+                    path.display()
+                ),
+            }
+        }
+        Err(e) => Err(anyhow::anyhow!("cannot create {}: {e}", path.display())),
+    }
 }
 
-fn partial_record_message(history_id: Option<&str>) -> String {
-    history_id
-        .map(|id| format!("; the partial manifest is recorded as {id}"))
-        .unwrap_or_default()
+/// The record marking `root` as the unfinished default download of
+/// `manifest`, named after both, so no other download or directory matches.
+fn download_record(records: &Path, manifest: &Manifest, root: &Path) -> anyhow::Result<PathBuf> {
+    let root = std::fs::canonicalize(root).or_else(|_| std::path::absolute(root))?;
+    let mut key = Sha256::new();
+    key.update(manifest.encode()?);
+    key.update(root.as_os_str().as_encoded_bytes());
+    Ok(records.join(hex::encode(key.finalize())))
 }
 
-fn cancelled_build_error(
-    result: &ant_core::data::BuildResult,
-    history_id: Option<&str>,
-) -> anyhow::Error {
+/// Record that `root` was just made for `manifest`'s download. The record
+/// holds the directory's path for anyone looking.
+fn start_download_record(
+    records: &Path,
+    manifest: &Manifest,
+    root: &Path,
+) -> anyhow::Result<PathBuf> {
+    let record = download_record(records, manifest, root)?;
+    std::fs::create_dir_all(records)?;
+    std::fs::write(&record, root.display().to_string())?;
+    Ok(record)
+}
+
+/// `kept` says where the partial manifest is kept, as [`keep_partial`] does.
+fn cancelled_build_error(result: &ant_core::data::BuildResult, kept: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "cancelled after {} of {} file(s){}",
+        "cancelled after {} of {} file(s){kept}",
         result.files_uploaded,
         result.total_to_upload,
-        partial_record_message(history_id),
     )
 }
 
@@ -735,7 +860,7 @@ fn report_created(
         }
     );
     if let Some(id) = history_id {
-        println!("Recorded as {id} (ant manifest download {id})");
+        println!("Recorded as {id} (ant manifest download {id} --output <directory>)");
     }
     if let Some((link, len)) = link_text {
         warn_if_long_link(len);
@@ -759,6 +884,7 @@ fn list_history(json: bool) -> anyhow::Result<()> {
                     "name": r.manifest.name,
                     "entries": r.manifest.entries.len(),
                     "total_size": r.manifest.total_size(),
+                    "state": r.state,
                     "file": r.path.display().to_string(),
                 })
             })
@@ -803,8 +929,12 @@ fn print_history_row(record: &UploadRecord) {
     // Drop the trailing " UTC"; the header already says so.
     let stamp = format_timestamp(record.recorded_at);
     let stamp = stamp.strip_suffix(" UTC").unwrap_or(&stamp);
+    let state = match record.state {
+        RecordState::Complete => "",
+        RecordState::Unfinished => "  (unfinished: the files listed were uploaded)",
+    };
     println!(
-        "{:<23}  {:>7}  {:>12}  {}",
+        "{:<23}  {:>7}  {:>12}  {}{state}",
         stamp,
         record.manifest.entries.len(),
         size,
@@ -913,7 +1043,21 @@ async fn download(
     concurrency: NonZeroUsize,
     json: bool,
 ) -> anyhow::Result<()> {
-    let output_root = resolve_download_root(manifest, output)?;
+    // Before the default directory is made, so a selection matching nothing
+    // leaves nothing behind.
+    select_entries(manifest, &selection)?;
+    let records = ant_core::config::data_dir()
+        .ok()
+        .map(|dir| dir.join(DOWNLOAD_RECORDS_DIR));
+    let root = match output {
+        Some(path) => DownloadRoot { path, record: None },
+        None => default_download_root(
+            manifest,
+            &ant_core::config::download_dir()?,
+            records.as_deref(),
+        )?,
+    };
+    let output_root = root.path.clone();
     let options = ExtractOptions {
         output_root: output_root.clone(),
         selection,
@@ -928,12 +1072,19 @@ async fn download(
     let report = if json {
         extract_manifest(client, manifest, &options, None).await?
     } else {
+        eprintln!("Downloading into {}", output_root.display());
         let (tx, rx) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         let ui = tokio::spawn(drive_extract_progress(rx));
         let report = extract_manifest(client, manifest, &options, Some(tx)).await;
         let _ = ui.await;
         report?
     };
+    // Every entry is in place, so there is nothing left to continue.
+    if let Some(record) = &root.record {
+        if options.selection.is_empty() && report.failed() == 0 && report.cancelled() == 0 {
+            let _ = std::fs::remove_file(record);
+        }
+    }
 
     if json {
         println!(
@@ -941,6 +1092,7 @@ async fn download(
             serde_json::to_string_pretty(&json!({
                 "output": output_root.display().to_string(),
                 "written": report.written(),
+                "present": report.present(),
                 "failed": report.failed(),
                 "cancelled": report.cancelled(),
                 "entries": report.entries,
@@ -950,13 +1102,15 @@ async fn download(
         for e in &report.entries {
             match &e.status {
                 EntryStatus::Written { bytes } => println!("written   {} ({bytes} bytes)", e.name),
+                EntryStatus::Present { bytes } => println!("present   {} ({bytes} bytes)", e.name),
                 EntryStatus::Failed { error } => println!("failed    {}: {error}", e.name),
                 EntryStatus::Cancelled => println!("cancelled {}", e.name),
             }
         }
         eprintln!(
-            "{} written, {} failed in {:.1}s -> {}",
+            "{} written, {} already present, {} failed in {:.1}s -> {}",
             report.written(),
+            report.present(),
             report.failed(),
             start.elapsed().as_secs_f64(),
             output_root.display()
@@ -992,12 +1146,25 @@ fn load_manifest(source: &str) -> anyhow::Result<Manifest> {
     }
     let dir = default_history_dir()?;
     match load_upload(&dir, source)? {
-        Some(record) => Ok(record.manifest),
+        Some(record) => Ok(record_manifest(record)),
         None => anyhow::bail!(
             "{source} is not a manifest file, a manifest link, or a recorded upload id \
              (see `ant manifest list`)"
         ),
     }
+}
+
+/// A recorded upload's manifest, with a reminder of what an unfinished one
+/// holds.
+fn record_manifest(record: UploadRecord) -> Manifest {
+    if record.state == RecordState::Unfinished {
+        eprintln!(
+            "warning: upload {} has not finished; it holds the {} file(s) uploaded so far",
+            record.id,
+            record.manifest.entries.len()
+        );
+    }
+    record.manifest
 }
 
 /// Parse the `--torrent-hash` values into one reference, or `None` if none.
@@ -1176,32 +1343,73 @@ mod tests {
             };
             assert!(action.execute_offline(false).is_err());
             assert!(resolve_output(Some(name), None).is_err());
-            assert!(resolve_download_root(&manifest, None).is_err());
+            assert!(default_download_root(&manifest, dir.path(), None).is_err());
         }
         assert!(!outside.with_extension("ant").exists());
 
-        let valid = Manifest::new(Some("pack".into()));
         assert_eq!(
             resolve_output(Some("pack"), None).unwrap(),
             PathBuf::from("pack.ant")
-        );
-        assert_eq!(
-            resolve_download_root(&valid, None).unwrap(),
-            PathBuf::from("pack")
         );
         let explicit = dir.path().join("chosen/destination");
         assert_eq!(
             resolve_output(Some("pack"), Some(explicit.clone())).unwrap(),
             explicit
         );
-        assert_eq!(
-            resolve_download_root(&valid, Some(explicit.clone())).unwrap(),
-            explicit
-        );
-        assert_eq!(
-            resolve_download_root(&Manifest::new(None), None).unwrap(),
-            PathBuf::from(".")
-        );
+    }
+
+    /// The sender names the manifest, so without --output a download only
+    /// ever extracts into a new directory it has just made in the downloads
+    /// directory, or into one an unfinished run of the same download made.
+    #[test]
+    fn a_download_defaults_only_to_a_new_directory_named_after_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("Downloads");
+        let records = dir.path().join("records");
+        let valid = Manifest::new(Some("pack".into()));
+        // A missing downloads directory is made.
+        let first = default_download_root(&valid, &parent, Some(&records)).unwrap();
+        assert_eq!(first.path, parent.join("pack"));
+        assert!(first.path.is_dir());
+        let record = first.record.expect("the new directory is recorded");
+        assert!(record.is_file());
+
+        // The same download again continues into the directory it made.
+        let again = default_download_root(&valid, &parent, Some(&records)).unwrap();
+        assert_eq!(again.path, first.path);
+        assert_eq!(again.record.as_ref(), Some(&record));
+
+        // Another manifest of the same name does not, nor does this one
+        // once its download has finished and the record is gone.
+        let mut other = Manifest::new(Some("pack".into()));
+        other.entries.push(ant_core::data::ManifestEntry {
+            path: Some("a.bin".into()),
+            size: None,
+            sha256: None,
+            source: ContentRef::Public { address: [1; 32] },
+        });
+        std::fs::remove_file(&record).unwrap();
+        for manifest in [&other, &valid] {
+            let error = default_download_root(manifest, &parent, Some(&records))
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("already exists"), "{error}");
+        }
+
+        // Hidden and unnamed manifests need --output, and nothing is made.
+        for manifest in [
+            Manifest::new(Some(".ssh".into())),
+            Manifest::new(Some("\u{200C}.ssh".into())),
+            Manifest::new(Some(".config".into())),
+            Manifest::new(None),
+        ] {
+            let error = default_download_root(&manifest, &parent, Some(&records))
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("--output"), "{error}");
+        }
+        assert!(!parent.join(".ssh").exists());
+        assert!(!parent.join(".config").exists());
     }
 
     #[test]
@@ -1215,6 +1423,8 @@ mod tests {
             chunks_stored: 3,
             storage_cost_atto: 0,
             gas_cost_wei: 0,
+            history_id: Some("record-id".into()),
+            history_error: None,
         };
         for index in 0..3 {
             result.manifest.entries.push(ant_core::data::ManifestEntry {
@@ -1225,15 +1435,18 @@ mod tests {
                     address: [index; 32],
                 },
             });
+            let out = PathBuf::from("unused.ant");
             assert_eq!(
-                cancelled_build_error(&result, Some("record-id")).to_string(),
+                build_outcome(Ok(result.clone()), &out)
+                    .unwrap_err()
+                    .to_string(),
                 "cancelled after 1 of 10 file(s); the partial manifest is recorded as record-id"
             );
         }
     }
 
     #[test]
-    fn build_failure_and_cancellation_are_recorded_before_returning_an_error() {
+    fn build_failure_and_cancellation_report_where_the_build_was_recorded() {
         let manifest = Manifest {
             name: Some("partial".into()),
             torrent: None,
@@ -1254,6 +1467,8 @@ mod tests {
                 chunks_stored: 3,
                 storage_cost_atto: 12,
                 gas_cost_wei: 34,
+                history_id: Some("20261019T120000Z-partial".into()),
+                history_error: None,
             };
             let built = if cancelled {
                 Ok(partial)
@@ -1264,21 +1479,84 @@ mod tests {
                     partial: Box::new(partial),
                 })
             };
-            let history = tempfile::tempdir().unwrap();
-            let error = record_build_result(built, |manifest| {
-                Some(record_upload(history.path(), manifest, None).unwrap().id)
-            })
-            .unwrap_err();
-            let listing = list_uploads(history.path()).unwrap();
-            assert_eq!(listing.records.len(), 1);
-            assert_eq!(listing.records[0].manifest, manifest);
-            assert!(error.to_string().contains(&listing.records[0].id));
+            let out = PathBuf::from("unused.ant");
+            let error = build_outcome(built, &out).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("the partial manifest is recorded as 20261019T120000Z-partial"));
             assert!(error.to_string().contains("1 of 2 file(s)"));
             if !cancelled {
                 assert!(error.to_string().contains("later.bin"));
                 assert!(error.to_string().contains("forced failure"));
             }
+            assert!(!out.exists());
         }
+    }
+
+    /// A build whose record could not be written, as on a full disk, may have
+    /// a journal that lacks its last upload, so the partial manifest goes to
+    /// the output file instead, and no record is claimed.
+    #[test]
+    fn a_stopped_build_that_could_not_be_recorded_is_written_to_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = Manifest {
+            name: Some("partial".into()),
+            torrent: None,
+            entries: vec![ant_core::data::ManifestEntry {
+                path: Some("completed.bin".into()),
+                size: Some(10),
+                sha256: None,
+                source: ContentRef::Public { address: [1; 32] },
+            }],
+        };
+        let partial = BuildResult {
+            manifest: manifest.clone(),
+            cancelled: false,
+            skipped_symlinks: vec![],
+            files_uploaded: 1,
+            total_to_upload: 2,
+            chunks_stored: 3,
+            storage_cost_atto: 12,
+            gas_cost_wei: 34,
+            history_id: Some("20261019T120000Z-partial".into()),
+            history_error: Some("No space left on device".into()),
+        };
+        let out = dir.path().join("partial.ant");
+        let built = Err(ManifestError::BuildFailed {
+            path: "later.bin".into(),
+            cause: Box::new(ManifestError::Build("No space left on device".into())),
+            partial: Box::new(partial.clone()),
+        });
+        let error = build_outcome(built, &out).unwrap_err().to_string();
+        assert!(!error.contains("recorded as"), "{error}");
+        assert!(
+            error.contains(&format!("written to {}", out.display())),
+            "{error}"
+        );
+        assert_eq!(read_manifest_file(&out).unwrap(), manifest);
+
+        // A file already at the output, which may be a complete manifest, is
+        // never replaced: the partial manifest goes beside it.
+        let complete = Manifest::new(Some("complete".into()));
+        write_manifest_file(&out, &complete, true).unwrap();
+        let built = Err(ManifestError::BuildFailed {
+            path: "later.bin".into(),
+            cause: Box::new(ManifestError::Build("No space left on device".into())),
+            partial: Box::new(partial.clone()),
+        });
+        let error = build_outcome(built, &out).unwrap_err().to_string();
+        let beside = dir.path().join("partial.partial.ant");
+        assert!(
+            error.contains(&format!("written to {}", beside.display())),
+            "{error}"
+        );
+        assert_eq!(read_manifest_file(&out).unwrap(), complete);
+        assert_eq!(read_manifest_file(&beside).unwrap(), manifest);
+
+        // A finished build keeps its manifest in the output anyway; only
+        // the record id is not claimed.
+        let (_, history_id) = build_outcome(Ok(partial), &out).unwrap();
+        assert!(history_id.is_none());
     }
 
     #[test]

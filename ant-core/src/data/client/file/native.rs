@@ -3617,6 +3617,27 @@ impl Client {
         })
         .await
     }
+
+    /// Download and decrypt a file into `writer`, with optional progress
+    /// events.
+    ///
+    /// For callers that open the destination themselves, such as a manifest
+    /// extraction that resolves every path from directories it holds open.
+    /// Constant memory (one decrypt batch resident at a time). Nothing is
+    /// renamed or removed here: on an error `writer` may hold part of the
+    /// file, and the caller decides what to do with it.
+    pub async fn file_download_to_writer<W: Write + Send>(
+        &self,
+        data_map: &DataMap,
+        writer: &mut W,
+        progress: Option<mpsc::Sender<DownloadEvent>>,
+    ) -> Result<u64> {
+        let peer_count = self.config().close_group_size;
+        self.download_decrypted_chunks(data_map, progress, peer_count, None, None, |bytes| {
+            std::future::ready(writer.write_all(&bytes).map_err(Error::from))
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
