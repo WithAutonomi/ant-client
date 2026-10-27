@@ -2,11 +2,3 @@
 members = ["ant-core", "ant-cli"]
 resolver = "2"
 
-# ADR-0023 testnet builds use immutable tips, including optional runtime and
-# dev-dependencies. Dependency-local patches are ignored, so repeat the transport
-# pin here to keep native, browser and node paths on one source. Remove after
-# publication of the corresponding crates.
-[patch.crates-io]
-ant-node = { git = "https://github.com/WithAutonomi/ant-node", rev = "611f204b4cedc78ae0118a8ce7b7c17c735c4658" }
-saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "520dd3ef7540b1743e644ecdd8a74f2b58ec43a9" }
-
