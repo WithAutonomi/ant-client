@@ -2547,8 +2547,11 @@ impl BrowserNetworkClient {
         let inner = Rc::new(inner);
         let adapter = Rc::new(SharedNetworkAdapter::new(Rc::clone(&inner)));
         let network = crate::data::Network::from_browser(adapter.clone());
-        // Fetches beyond the GETs the read budget admits at once would only
-        // queue, so the fetch channel never probes past them. Where dials
+        // The fetch channel never probes past the GETs the read budget admits
+        // at once. A fetch beyond them adds only a lookup, and on mainnet more
+        // lookups cost dials more than they overlap transfers: allowed the
+        // default ceiling, the controller probed 10, a successful dial's p90
+        // rose from 2.7 s to 4.8 s, and downloads were slower. Where dials
         // gather ICE candidates at once, it also starts there: a WebRTC
         // DataChannel carries a record more slowly than QUIC, so the native
         // cold start would leave much of the budget idle. Where dials take

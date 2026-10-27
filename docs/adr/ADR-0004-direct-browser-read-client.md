@@ -778,7 +778,12 @@ about 0.4 s.
   must not lift the turn. WebKit and Firefox keep it; Firefox was not measured.
 - **Only Chromium starts fetching at the read budget's 8 GETs.** Where dials
   take turns to gather, more concurrent reads queue more dials for the turn,
-  so other engines keep the native cold start of 4.
+  so other engines keep the native cold start of 4. No engine's fetch
+  controller climbs past the read budget. A fetch beyond it adds only a
+  lookup, which costs dials more than it overlaps transfers: given the default
+  ceiling of 256, the controller probed 10 and came back, a successful dial's
+  p90 rose from 2.7 s to 4.8 s, and downloads were slower in 6 of 8 pairs
+  (612 MB in Chromium and Safari, 64 MiB in Chromium).
 
 In Chromium, the first two let the fetch start of 8, which on its own made
 mainnet downloads 15-26% slower by overflowing the pool, pay off. Measured with
