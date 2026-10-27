@@ -4,6 +4,8 @@
 //! is the BLAKE3 hash of the content.
 
 #[cfg(feature = "native")]
+use crate::client_engine::kad_read::KadReadOutcome;
+#[cfg(feature = "native")]
 use crate::data::client::diagnostics::{
     bounded_error, unix_now_ms, DownloadDiagnosticsOutcome, DownloadDiagnosticsRecord,
     DownloadDiagnosticsSender, DownloadRequestCorrelation,
@@ -326,6 +328,28 @@ struct ChunkPeerGetTarget {
     peer_id: PeerId,
     peer_addrs: Vec<MultiAddr>,
     xor_distance: [u8; 32],
+}
+
+/// Check a chunk a peer sent for `asked` against that address.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidData`] if the peer sent another address, or
+/// content that does not hash to it.
+pub(crate) fn verified_chunk(
+    asked: &XorName,
+    address: XorName,
+    content: Bytes,
+) -> Result<DataChunk> {
+    if address != *asked {
+        return Err(Error::InvalidData(format!(
+            "Mismatched chunk address: expected {}, got {}",
+            hex::encode(asked),
+            hex::encode(address)
+        )));
+    }
+    crate::record::verify(&address, &content).map_err(Error::InvalidData)?;
+    Ok(DataChunk::new(address, content))
 }
 
 fn chunk_peer_get_targets(
@@ -858,24 +882,46 @@ impl Client {
             self.chunk_cache().remove(address);
         }
 
-        // ADR-0020: ask every peer the lookup queries for the chunk as well as
-        // for closer peers, and stop at the first verified chunk. A peer whose
-        // content fails verification only drops out. A lookup that finds no
-        // holder says nothing about absence, so the ordinary read below runs
-        // then, with its own discovery, absence rule and bad-content rule.
+        // ADR-0020: ask the peers the lookup finds likely to hold the chunk
+        // for it as well as for closer peers, and stop at the first verified
+        // chunk. A peer whose content fails verification only drops out. A
+        // lookup that finds no holder, or fails, says nothing about absence,
+        // so the ordinary read below runs then, with its own absence rule and
+        // bad-content rule. It starts from the peers the lookup ended on
+        // rather than look them up again.
         #[cfg(feature = "native")]
-        if let Some(chunk) = self.chunk_get_kad(address, peer_count).await? {
-            if let Some(diag) = diag {
-                diag.emit_chunk_level(
-                    "kad",
-                    chunk.content.len() as u64,
-                    DownloadDiagnosticsOutcome::Found,
-                    None,
-                );
+        let kad_closest = match self.chunk_get_kad(address, peer_count).await {
+            Ok(KadReadOutcome::Found(chunk)) => {
+                if let Some(diag) = diag {
+                    diag.emit_chunk_level(
+                        "kad",
+                        chunk.content.len() as u64,
+                        DownloadDiagnosticsOutcome::Found,
+                        None,
+                    );
+                }
+                self.chunk_cache().put(chunk.address, chunk.content.clone());
+                return Ok(Some(chunk));
             }
-            self.chunk_cache().put(chunk.address, chunk.content.clone());
-            return Ok(Some(chunk));
-        }
+            Ok(KadReadOutcome::NotFound { closest }) => {
+                std::sync::Mutex::new((!closest.is_empty()).then(|| {
+                    closest
+                        .into_iter()
+                        .map(|node| {
+                            let addrs = node.addresses_by_priority();
+                            (node.peer_id, addrs)
+                        })
+                        .collect::<Vec<_>>()
+                }))
+            }
+            Err(e) => {
+                debug!(
+                    "Kad read of {} failed: {e}; reading it the ordinary way",
+                    hex::encode(address)
+                );
+                std::sync::Mutex::new(None)
+            }
+        };
 
         #[cfg(feature = "native")]
         let observation = diag.map(|_| std::sync::Mutex::new(ReadObservation::default()));
@@ -893,6 +939,8 @@ impl Client {
             |sender| {
                 #[cfg(feature = "native")]
                 let observation = &observation;
+                #[cfg(feature = "native")]
+                let kad_closest = &kad_closest;
                 async move {
                     let progress = crate::data::network::ReadProgress::new(
                         *address,
@@ -904,8 +952,14 @@ impl Client {
                     let lookup_started = Instant::now();
                     #[cfg(feature = "native")]
                     let mut contexts = Vec::new();
+                    // Only the first round reuses the kad lookup's peers; a
+                    // retry looks them up afresh.
                     #[cfg(feature = "native")]
-                    let closest_result = if diag.is_some() {
+                    let reused = kad_closest.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    #[cfg(feature = "native")]
+                    let closest_result = if let Some(closest) = reused {
+                        Ok(closest)
+                    } else if diag.is_some() {
                         self.network()
                             .find_closest_peers_with_diagnostics(address, peer_count)
                             .await
@@ -1186,25 +1240,15 @@ impl Client {
                 ChunkMessageBody::GetResponse(ChunkGetResponse::Success {
                     address: addr,
                     content,
-                }) => {
-                    if addr != *address {
-                        return Some(Err(Error::InvalidData(format!(
-                            "Mismatched chunk address: expected {addr_hex}, got {}",
-                            hex::encode(addr)
-                        ))));
-                    }
-
-                    if let Err(error) = crate::record::verify(&addr, &content) {
-                        return Some(Err(Error::InvalidData(error)));
-                    }
-
-                    debug!(
-                        "Retrieved chunk {} ({} bytes) from peer {peer}",
-                        hex::encode(addr),
-                        content.len()
-                    );
-                    Some(Ok(Some(DataChunk::new(addr, Bytes::from(content)))))
-                }
+                }) => Some(
+                    verified_chunk(address, addr, Bytes::from(content)).map(|chunk| {
+                        debug!(
+                            "Retrieved chunk {addr_hex} ({} bytes) from peer {peer}",
+                            chunk.content.len()
+                        );
+                        Some(chunk)
+                    }),
+                ),
                 ChunkMessageBody::GetResponse(ChunkGetResponse::NotFound { .. }) => Some(Ok(None)),
                 ChunkMessageBody::GetResponse(ChunkGetResponse::Error(e)) => Some(Err(
                     Error::Protocol(format!("Remote GET error for {addr_hex}: {e}")),

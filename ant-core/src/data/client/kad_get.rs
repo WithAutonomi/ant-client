@@ -6,6 +6,7 @@
 
 use crate::client_engine::kad_read::{kad_read, KadNetwork, KadReadOutcome, StepAnswer};
 use crate::client_engine::read::{uniform_choice, RequestDispatched};
+use crate::data::client::chunk::verified_chunk;
 use crate::data::client::Client;
 use crate::data::error::{Error, Result};
 use ant_protocol::transport::{DHTNode, P2PNode};
@@ -29,19 +30,6 @@ impl NativeKadNetwork<'_> {
 
     fn request_timeout(&self) -> Duration {
         Duration::from_secs(self.client.config().chunk_get_timeout_secs)
-    }
-
-    /// Check a chunk a peer sent against the address it was asked for.
-    fn verified(&self, address: XorName, content: bytes::Bytes) -> Result<DataChunk> {
-        if address != self.address {
-            return Err(Error::InvalidData(format!(
-                "asked for chunk {} and was sent {}",
-                hex::encode(self.address),
-                hex::encode(address)
-            )));
-        }
-        crate::record::verify(&address, &content).map_err(Error::InvalidData)?;
-        Ok(DataChunk::new(address, content))
     }
 }
 
@@ -103,7 +91,7 @@ impl KadNetwork for NativeKadNetwork<'_> {
         .await?;
         match response.result? {
             ChunkGetOrCloserResponse::Found { address, content } => Ok(StepAnswer::Found(
-                note_bad_content(peer, self.verified(address, content))?,
+                note_bad_content(peer, verified_chunk(&self.address, address, content))?,
             )),
             ChunkGetOrCloserResponse::Closer { address, peers } if address == self.address => {
                 let nodes = self
@@ -178,17 +166,17 @@ fn note_bad_content<T>(peer: &DHTNode, result: Result<T>) -> Result<T> {
 }
 
 impl Client {
-    /// Read a chunk through a lookup that asks every peer it queries for the
-    /// chunk as well as for closer peers (ant-node ADR-0020).
+    /// Read a chunk through a lookup that asks the peers likely to hold it
+    /// for the chunk as well as for closer peers (ant-node ADR-0020).
     ///
-    /// Returns `None` when the lookup ends without any queried peer sending
-    /// the chunk. That is not evidence the chunk is missing: the caller's
-    /// ordinary read path, with its absence rule, decides that.
+    /// [`KadReadOutcome::NotFound`] is not evidence the chunk is missing: the
+    /// caller's ordinary read path, with its absence rule, decides that, and
+    /// can start from the peers the lookup ended on.
     pub(crate) async fn chunk_get_kad(
         &self,
         address: &XorName,
         peer_count: usize,
-    ) -> Result<Option<DataChunk>> {
+    ) -> Result<KadReadOutcome<DataChunk>> {
         let network = NativeKadNetwork {
             client: self,
             address: *address,
@@ -199,21 +187,15 @@ impl Client {
             .dht()
             .find_closest_nodes_local(address, peer_count)
             .await;
-        Ok(
-            match kad_read(
-                &network,
-                *address,
-                peer_count,
-                seeds,
-                is_retryable,
-                uniform_choice,
-            )
-            .await?
-            {
-                KadReadOutcome::Found(chunk) => Some(chunk),
-                KadReadOutcome::NotFound => None,
-            },
+        kad_read(
+            &network,
+            *address,
+            peer_count,
+            seeds,
+            is_retryable,
+            uniform_choice,
         )
+        .await
     }
 }
 
@@ -224,12 +206,18 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns an error if a peer sends content that does not match its
-    /// address.
+    /// Returns an error if a request fails in a way that ends the read.
     #[doc(hidden)]
     pub async fn chunk_get_kad_only(&self, address: &XorName) -> Result<Option<DataChunk>> {
-        self.chunk_get_kad(address, self.config().close_group_size)
-            .await
+        Ok(
+            match self
+                .chunk_get_kad(address, self.config().close_group_size)
+                .await?
+            {
+                KadReadOutcome::Found(chunk) => Some(chunk),
+                KadReadOutcome::NotFound { .. } => None,
+            },
+        )
     }
 }
 

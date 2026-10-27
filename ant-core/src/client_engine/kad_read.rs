@@ -1,20 +1,25 @@
 //! Chunk reads through a client-driven Kademlia lookup (ant-node ADR-0020).
 //!
-//! Each peer the lookup queries is asked for the chunk and for closer peers
-//! in one step. A peer that answers get-or-closer requests gets one. Any other
-//! peer gets FIND_NODE and a GET at once, which takes the same round trip and
-//! works with every node in service today. The read stops at the first
-//! verified chunk.
+//! Every peer the lookup queries answers it at once, so discovery runs as
+//! fast as saorsa-core's own lookup. Only peers that probably hold the chunk
+//! are asked for it, because each holder that is asked sends the whole chunk:
+//!
+//! - The likely holder chosen to go next gets one step that does both. A peer
+//!   that answers get-or-closer requests gets one; any other peer gets
+//!   FIND_NODE and a GET at once, which takes the same round trip.
+//! - Other likely holders answer the lookup with FIND_NODE now and wait their
+//!   turn for a GET. When it comes, a waiting peer that the lookup has since
+//!   learnt is not among the nearest is skipped.
+//! - Peers far from the chunk only answer the lookup, with FIND_NODE.
+//!
+//! Likely holders are asked one at a time: the next once the current one has
+//! answered without the chunk, or once it has sent for [`HOLDER_HEDGE_DELAY`],
+//! and never more than [`MAX_HOLDER_REQUESTS`] at once. The read stops at the
+//! first verified chunk.
 //!
 //! Requests belong to the read, not to the lookup round that started them:
 //! a round waits for closer peers only within its grace period, but a chunk
 //! that is still arriving when the round moves on is not cancelled.
-//!
-//! Every holder that is asked sends the whole chunk, so peers that probably
-//! hold it are asked one at a time. One that turns out not to hold it answers
-//! with closer peers in a round trip, and the next is asked at once; one that
-//! is slow to send is hedged after [`HOLDER_HEDGE_DELAY`]. Peers far from the
-//! chunk are still asked in parallel, so discovery is as fast as before.
 //!
 //! Which likely holder goes first is chosen as the ordinary read chooses its
 //! first GET (ant-node ADR-0023): uniformly among those the lookup has
@@ -36,6 +41,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -57,9 +63,15 @@ const LOOKUP_DEADLINE: Duration = Duration::from_secs(LOOKUP_TIMEOUT_SECS as u64
 /// to 18%.
 const HOLDER_HEDGE_DELAY: Duration = Duration::from_millis(500);
 
+/// Most likely holders a read asks for the chunk at once, as the ordinary
+/// read never runs more than two GETs. On a link too slow to receive a chunk
+/// within [`HOLDER_HEDGE_DELAY`], each further copy would only slow the
+/// others.
+const MAX_HOLDER_REQUESTS: usize = 2;
+
 /// Peers a lookup must know of before it can tell likely holders apart. With
-/// fewer, as on a cold start, every known peer looks close and all are asked
-/// in parallel.
+/// fewer, as on a cold start, any peer may hold the chunk, so every peer
+/// counts as a likely holder.
 const MIN_KNOWN_FOR_HOLDERS: usize = 2 * CLOSE_GROUP_SIZE;
 
 /// What a peer answered one lookup step with.
@@ -102,18 +114,23 @@ pub(crate) trait KadNetwork {
 pub(crate) enum KadReadOutcome<T> {
     /// A queried peer returned the verified chunk.
     Found(T),
-    /// The lookup ended and no queried peer returned the chunk. This is not
-    /// evidence that the chunk is missing: the caller's ordinary read path,
-    /// with its absence rule, decides that.
-    NotFound,
+    /// The lookup ended and no peer asked for the chunk returned it. This is
+    /// not evidence that the chunk is missing: the caller's ordinary read
+    /// path, with its absence rule, decides that.
+    NotFound {
+        /// The peers the lookup ended on, nearest first, as saorsa-core's
+        /// own lookup would return them. The ordinary read can start from
+        /// them instead of looking them up again.
+        closest: Vec<DHTNode>,
+    },
 }
 
 /// A queried peer, handed from the lookup round to the read.
 struct Step {
     peer: DHTNode,
     reply: oneshot::Sender<StepReply>,
-    /// Fewer than a close group of the peers this lookup knows of are closer
-    /// to the target, so the peer probably holds the chunk.
+    /// Whether the peer probably holds the chunk, as [`Known::likely_holder`]
+    /// judged it when the step was sent.
     likely_holder: bool,
 }
 
@@ -125,19 +142,53 @@ enum StepReply {
     Failed,
 }
 
+/// Every peer a read has queried or been told about, shared by its lookup and
+/// its holder gate.
+struct Known(Mutex<HashSet<PeerId>>);
+
+impl Known {
+    fn new(peers: impl IntoIterator<Item = PeerId>) -> Self {
+        Self(Mutex::new(peers.into_iter().collect()))
+    }
+
+    fn learn(&self, peers: impl IntoIterator<Item = PeerId>) {
+        self.lock().extend(peers);
+    }
+
+    /// Whether `peer` probably holds the chunk at `target`: fewer than a close
+    /// group of the known peers are nearer it. Until the read knows
+    /// [`MIN_KNOWN_FOR_HOLDERS`] peers it cannot tell, and every peer is one.
+    fn likely_holder(&self, peer: &PeerId, target: &LookupKey) -> bool {
+        let known = self.lock();
+        if known.len() < MIN_KNOWN_FOR_HOLDERS {
+            return true;
+        }
+        let distance = xor_distance(peer.as_bytes(), target);
+        known
+            .iter()
+            .filter(|known| xor_distance(known.as_bytes(), target) < distance)
+            .count()
+            < CLOSE_GROUP_SIZE
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashSet<PeerId>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// Read `target` through a lookup seeded with `seeds`, returning the first
-/// verified chunk any queried peer sends.
+/// verified chunk any likely holder sends.
 ///
-/// `choose` picks which queued likely holder is asked next, as an index below
-/// its argument into those holders in XOR order. A uniform `choose` spreads
+/// `choose` picks which likely holder is asked next, as an index below its
+/// argument into those waiting, in XOR order. A uniform `choose` spreads
 /// first reads across them; one that always returns zero asks the nearest
 /// first.
 ///
 /// # Errors
 ///
-/// Returns the first error `retryable` rejects. Every other failure, bad
-/// content included if `retryable` accepts it, only removes that peer from
-/// the lookup.
+/// Returns the first error `retryable` rejects from a request for the chunk.
+/// Every other failure, bad content included if `retryable` accepts it, only
+/// removes that peer from the read.
 pub(crate) async fn kad_read<N: KadNetwork>(
     network: &N,
     target: LookupKey,
@@ -147,8 +198,11 @@ pub(crate) async fn kad_read<N: KadNetwork>(
     mut choose: impl FnMut(usize) -> usize,
 ) -> Result<KadReadOutcome<N::Chunk>, N::Error> {
     let Ok(mut lookup) = IterativeLookup::new(target, LookupConfig::saorsa(count)) else {
-        return Ok(KadReadOutcome::NotFound);
+        return Ok(KadReadOutcome::NotFound {
+            closest: Vec::new(),
+        });
     };
+    let known = Known::new(seeds.iter().map(|seed| seed.peer_id));
     for seed in seeds {
         if lookup.is_contactable(seed.peer_id.as_bytes()) {
             let _ = lookup.add_candidate(seed);
@@ -160,65 +214,99 @@ pub(crate) async fn kad_read<N: KadNetwork>(
         steps: steps_tx,
         reports: HashMap::new(),
         contacted: HashSet::new(),
-        known: HashSet::new(),
+        known: &known,
     };
-    let walk = run_iterative_lookup(
-        &mut lookup,
-        &mut query,
-        crate::runtime::sleep(LOOKUP_DEADLINE),
-    );
-    tokio::pin!(walk);
-    let mut requests = FuturesUnordered::new();
-    let mut holders = HolderGate::new(target);
-    let mut arrived = Vec::new();
-    let mut walking = true;
+    {
+        let walk = run_iterative_lookup(
+            &mut lookup,
+            &mut query,
+            crate::runtime::sleep(LOOKUP_DEADLINE),
+        );
+        tokio::pin!(walk);
+        let mut fetches = FuturesUnordered::new();
+        let mut routes = FuturesUnordered::new();
+        let mut holders = HolderGate::new(target);
+        let mut arrived = Vec::new();
+        let mut walking = true;
 
-    loop {
-        // A lookup round sends all its steps at once, so take every step
-        // already sent before choosing which likely holder to ask.
-        arrived.extend(std::iter::from_fn(|| steps.try_recv().ok()));
-        for step in arrived.drain(..) {
-            if step.likely_holder {
-                holders.queue(step);
-            } else {
-                requests.push(serve(network, step, false, &retryable));
+        loop {
+            // A lookup round sends all its steps at once, so take every step
+            // already sent before choosing which likely holder to ask.
+            arrived.extend(std::iter::from_fn(|| steps.try_recv().ok()));
+            for step in arrived.drain(..) {
+                if step.likely_holder {
+                    holders.queue(Holder::Unanswered(step));
+                } else {
+                    routes.push(route(network, &known, step, false));
+                }
             }
-        }
-        while let Some(step) = holders.next_ready(Instant::now(), &mut choose) {
-            requests.push(serve(network, step, true, &retryable));
-        }
-        if !walking && requests.is_empty() && !holders.has_queued() {
-            break;
-        }
-        let hedge = holders.hedge_deadline();
-        // Steps first, so every queried peer is asked before the lookup's
-        // end is observed.
-        tokio::select! {
-            biased;
-            Some(step) = steps.recv() => arrived.push(step),
-            Some((holder, result)) = requests.next(), if !requests.is_empty() => {
-                if holder {
+            while let Some(holder) = holders.next_ready(
+                Instant::now(),
+                |peer| known.likely_holder(peer, &target),
+                &mut choose,
+            ) {
+                fetches.push(fetch(network, &known, holder, &retryable));
+            }
+            // Likely holders that must wait still answer the lookup now.
+            for step in holders.take_unanswered() {
+                routes.push(route(network, &known, step, true));
+            }
+            if !walking && fetches.is_empty() && routes.is_empty() && !holders.has_queued() {
+                break;
+            }
+            let hedge = holders.hedge_deadline();
+            // Steps first, so every queried peer is served before the lookup's
+            // end is observed.
+            tokio::select! {
+                biased;
+                Some(step) = steps.recv() => arrived.push(step),
+                Some(result) = fetches.next(), if !fetches.is_empty() => {
                     holders.finished();
+                    match result {
+                        Ok(Some(chunk)) => return Ok(KadReadOutcome::Found(chunk)),
+                        Err(error) => return Err(error),
+                        Ok(None) => {}
+                    }
                 }
-                match result {
-                    Ok(Some(chunk)) => return Ok(KadReadOutcome::Found(chunk)),
-                    Err(error) => return Err(error),
-                    Ok(None) => {}
+                Some(waiting) = routes.next(), if !routes.is_empty() => {
+                    if let Some(peer) = waiting {
+                        holders.queue(Holder::Answered(peer));
+                    }
                 }
+                () = tokio::time::sleep_until(hedge.unwrap_or_else(Instant::now)), if hedge.is_some() => {}
+                _ = &mut walk, if walking => walking = false,
             }
-            () = tokio::time::sleep_until(hedge.unwrap_or_else(Instant::now)), if hedge.is_some() => {}
-            _ = &mut walk, if walking => walking = false,
         }
     }
-    Ok(KadReadOutcome::NotFound)
+    Ok(KadReadOutcome::NotFound {
+        closest: lookup.results(),
+    })
 }
 
-/// Releases likely-holder steps one at a time, in the order a `choose`
-/// picks: the next once the current one has answered without the chunk, or
-/// once it has run for [`HOLDER_HEDGE_DELAY`].
+/// A likely holder waiting to be asked for the chunk.
+enum Holder {
+    /// Its lookup step has not been answered yet.
+    Unanswered(Step),
+    /// It has answered the lookup, so only a GET is left to send.
+    Answered(DHTNode),
+}
+
+impl Holder {
+    fn peer(&self) -> &DHTNode {
+        match self {
+            Self::Unanswered(step) => &step.peer,
+            Self::Answered(peer) => peer,
+        }
+    }
+}
+
+/// Releases likely holders one at a time, in the order a `choose` picks: the
+/// next once the current one has answered without the chunk, or once it has
+/// run for [`HOLDER_HEDGE_DELAY`], with at most [`MAX_HOLDER_REQUESTS`]
+/// running.
 struct HolderGate {
     target: LookupKey,
-    queued: Vec<Step>,
+    queued: Vec<Holder>,
     in_flight: usize,
     newest_start: Option<Instant>,
 }
@@ -233,46 +321,70 @@ impl HolderGate {
         }
     }
 
-    fn queue(&mut self, step: Step) {
-        self.queued.push(step);
+    fn queue(&mut self, holder: Holder) {
+        self.queued.push(holder);
     }
 
     fn has_queued(&self) -> bool {
         !self.queued.is_empty()
     }
 
-    /// The queued step `choose` picks among them in XOR order, if one may
-    /// start now.
+    fn hedge_due(&self, now: Instant) -> bool {
+        self.in_flight < MAX_HOLDER_REQUESTS
+            && self
+                .newest_start
+                .is_some_and(|started| now >= started + HOLDER_HEDGE_DELAY)
+    }
+
+    /// The queued holder `choose` picks among them in XOR order, if one may
+    /// start now. An answered holder that `still_likely` no longer counts as
+    /// one is dropped first.
     fn next_ready(
         &mut self,
         now: Instant,
+        still_likely: impl Fn(&PeerId) -> bool,
         choose: &mut impl FnMut(usize) -> usize,
-    ) -> Option<Step> {
-        let due = self.in_flight == 0
-            || self
-                .newest_start
-                .is_some_and(|started| now >= started + HOLDER_HEDGE_DELAY);
-        let last = self.queued.len().checked_sub(1)?;
-        if !due {
+    ) -> Option<Holder> {
+        if self.in_flight > 0 && !self.hedge_due(now) {
             return None;
         }
+        self.queued.retain(|holder| match holder {
+            Holder::Unanswered(_) => true,
+            Holder::Answered(peer) => still_likely(&peer.peer_id),
+        });
+        let last = self.queued.len().checked_sub(1)?;
         let target = self.target;
         self.queued
-            .sort_by_key(|step| xor_distance(step.peer.peer_id.as_bytes(), &target));
+            .sort_by_key(|holder| xor_distance(holder.peer().peer_id.as_bytes(), &target));
         let chosen = choose(self.queued.len()).min(last);
         self.in_flight += 1;
         self.newest_start = Some(now);
         Some(self.queued.remove(chosen))
     }
 
-    /// A released step finished without the chunk.
+    /// The queued steps that have not answered the lookup, which must not
+    /// wait for their turn to.
+    fn take_unanswered(&mut self) -> Vec<Step> {
+        let mut steps = Vec::new();
+        let mut kept = Vec::with_capacity(self.queued.len());
+        for holder in self.queued.drain(..) {
+            match holder {
+                Holder::Unanswered(step) => steps.push(step),
+                answered @ Holder::Answered(_) => kept.push(answered),
+            }
+        }
+        self.queued = kept;
+        steps
+    }
+
+    /// A released holder finished without the chunk.
     fn finished(&mut self) {
         self.in_flight = self.in_flight.saturating_sub(1);
     }
 
-    /// When the next queued step may start, if one waits on a running one.
+    /// When the next queued holder may start, if one waits on a running one.
     fn hedge_deadline(&self) -> Option<Instant> {
-        if self.queued.is_empty() || self.in_flight == 0 {
+        if self.queued.is_empty() || self.in_flight == 0 || self.in_flight >= MAX_HOLDER_REQUESTS {
             return None;
         }
         self.newest_start
@@ -280,14 +392,41 @@ impl HolderGate {
     }
 }
 
-/// [`serve_step`], tagged with whether the step was a likely holder.
-async fn serve<N: KadNetwork>(
+/// Ask a released likely holder for the chunk: in its lookup step if that is
+/// still unanswered, otherwise with a GET.
+///
+/// Returns the chunk if the holder sent it, `None` otherwise, or an error
+/// that `retryable` rejects.
+async fn fetch<N: KadNetwork>(
     network: &N,
-    step: Step,
-    holder: bool,
+    known: &Known,
+    holder: Holder,
     retryable: &impl Fn(&N::Error) -> bool,
-) -> (bool, Result<Option<N::Chunk>, N::Error>) {
-    (holder, serve_step(network, step, retryable).await)
+) -> Result<Option<N::Chunk>, N::Error> {
+    match holder {
+        Holder::Unanswered(step) => serve_step(network, known, step, retryable).await,
+        Holder::Answered(peer) => match network.get(&peer).await {
+            Ok(found) => Ok(found),
+            Err(error) => fatal(error, retryable),
+        },
+    }
+}
+
+/// Answer a lookup step with FIND_NODE alone. Returns the peer when it
+/// answered and `wait_for_chunk` says it should still be asked for the chunk.
+async fn route<N: KadNetwork>(
+    network: &N,
+    known: &Known,
+    Step { peer, reply, .. }: Step,
+    wait_for_chunk: bool,
+) -> Option<DHTNode> {
+    let answer = match network.prepare(&peer).await {
+        Ok(_) => closer_reply(network.find_node(&peer).await, known),
+        Err(_) => StepReply::Failed,
+    };
+    let answered = matches!(answer, StepReply::Closer(_));
+    let _ = reply.send(answer);
+    (answered && wait_for_chunk).then_some(peer)
 }
 
 /// Ask one queried peer for the chunk and for closer peers, replying to the
@@ -297,6 +436,7 @@ async fn serve<N: KadNetwork>(
 /// `retryable` rejects.
 async fn serve_step<N: KadNetwork>(
     network: &N,
+    known: &Known,
     Step { peer, reply, .. }: Step,
     retryable: &impl Fn(&N::Error) -> bool,
 ) -> Result<Option<N::Chunk>, N::Error> {
@@ -310,7 +450,7 @@ async fn serve_step<N: KadNetwork>(
     if capable {
         let (answer, result) = match network.get_or_closer(&peer).await {
             Ok(StepAnswer::Found(chunk)) => (StepReply::Answered, Ok(Some(chunk))),
-            Ok(StepAnswer::Closer(nodes)) => (StepReply::Closer(nodes), Ok(None)),
+            Ok(StepAnswer::Closer(nodes)) => (closer(nodes, known), Ok(None)),
             Err(error) => (StepReply::Failed, fatal(error, retryable)),
         };
         let _ = reply.send(answer);
@@ -329,7 +469,7 @@ async fn serve_step<N: KadNetwork>(
             biased;
             nodes = &mut find, if reply.is_some() => {
                 if let Some(reply) = reply.take() {
-                    let _ = reply.send(closer_reply(nodes));
+                    let _ = reply.send(closer_reply(nodes, known));
                 }
             }
             fetched = &mut get => break fetched,
@@ -339,7 +479,7 @@ async fn serve_step<N: KadNetwork>(
         let answer = if matches!(fetched, Ok(Some(_))) {
             StepReply::Answered
         } else {
-            closer_reply((&mut find).await)
+            closer_reply((&mut find).await, known)
         };
         let _ = reply.send(answer);
     }
@@ -349,11 +489,15 @@ async fn serve_step<N: KadNetwork>(
     }
 }
 
-fn closer_reply<E>(nodes: Result<Vec<DHTNode>, E>) -> StepReply {
-    match nodes {
-        Ok(nodes) => StepReply::Closer(nodes),
-        Err(_) => StepReply::Failed,
-    }
+/// The lookup's reply to a peer's closer peers. The read learns of them
+/// first, so a holder waiting for its turn is judged with them.
+fn closer(nodes: Vec<DHTNode>, known: &Known) -> StepReply {
+    known.learn(nodes.iter().map(|node| node.peer_id));
+    StepReply::Closer(nodes)
+}
+
+fn closer_reply<E>(nodes: Result<Vec<DHTNode>, E>, known: &Known) -> StepReply {
+    nodes.map_or(StepReply::Failed, |nodes| closer(nodes, known))
 }
 
 /// An error ends the read only when `retryable` rejects it.
@@ -373,25 +517,10 @@ struct KadQuery<'a, N> {
     /// Every responder's report about each peer, as in saorsa-core's lookup.
     reports: HashMap<PeerId, SubjectReports>,
     contacted: HashSet<PeerId>,
-    /// Every peer this lookup has queried or been told about.
-    known: HashSet<PeerId>,
+    known: &'a Known,
 }
 
 impl<N> KadQuery<'_, N> {
-    /// Whether `peer` probably holds the chunk: fewer than a close group of
-    /// the peers this lookup knows of are closer to `target`.
-    fn likely_holder(&self, peer: &PeerId, target: &LookupKey) -> bool {
-        if self.known.len() < MIN_KNOWN_FOR_HOLDERS {
-            return false;
-        }
-        let distance = xor_distance(peer.as_bytes(), target);
-        self.known
-            .iter()
-            .filter(|known| xor_distance(known.as_bytes(), target) < distance)
-            .count()
-            < CLOSE_GROUP_SIZE
-    }
-
     /// The candidates `responder` reported, each replaced by the view that
     /// wins across every responder's report about it.
     fn winners(&mut self, responder: LookupKey, nodes: Vec<DHTNode>) -> Vec<DHTNode> {
@@ -402,7 +531,6 @@ impl<N> KadQuery<'_, N> {
                 continue;
             }
             let subject = node.peer_id;
-            self.known.insert(subject);
             let reports = self.reports.entry(subject).or_default();
             reports.insert(responder, node);
             if let Some((_, winner)) = compute_winner(&subject, reports) {
@@ -428,12 +556,12 @@ impl<N: KadNetwork> LookupQuery<DHTNode> for KadQuery<'_, N> {
         batch: Vec<DHTNode>,
     ) -> Result<Vec<LookupQueryOutcome<DHTNode>>, Infallible> {
         self.contacted.extend(batch.iter().map(|node| node.peer_id));
-        self.known.extend(batch.iter().map(|node| node.peer_id));
+        self.known.learn(batch.iter().map(|node| node.peer_id));
         let replies: FuturesUnordered<_> = batch
             .into_iter()
             .map(|peer| {
                 let responder = *peer.peer_id.as_bytes();
-                let likely_holder = self.likely_holder(&peer.peer_id, &target);
+                let likely_holder = self.known.likely_holder(&peer.peer_id, &target);
                 let (reply, answer) = oneshot::channel();
                 let sent = self
                     .steps
@@ -482,6 +610,10 @@ mod tests {
     /// Peers far from the target that a router also reports, so the lookup
     /// knows enough peers to tell likely holders apart.
     const FAR_PEERS: std::ops::RangeInclusive<u8> = 40..=56;
+    /// As many peers as a close group, all nearer the target than any far peer.
+    const NEAR_PEERS: std::ops::RangeInclusive<u8> = 1..=7;
+    /// A seed far from the target, which a router's report soon passes.
+    const FAR_SEED: u8 = 50;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum MockError {
@@ -617,7 +749,21 @@ mod tests {
         retryable: impl Fn(&MockError) -> bool,
         choose: impl FnMut(usize) -> usize,
     ) -> Result<Option<&'static str>, MockError> {
-        let outcome = kad_read(
+        Ok(
+            match read_outcome(network, seeds, retryable, choose).await? {
+                KadReadOutcome::Found(chunk) => Some(chunk),
+                KadReadOutcome::NotFound { .. } => None,
+            },
+        )
+    }
+
+    async fn read_outcome(
+        network: &MockNetwork,
+        seeds: &[u8],
+        retryable: impl Fn(&MockError) -> bool,
+        choose: impl FnMut(usize) -> usize,
+    ) -> Result<KadReadOutcome<&'static str>, MockError> {
+        kad_read(
             network,
             [0; 32],
             ant_protocol::CLOSE_GROUP_SIZE,
@@ -625,11 +771,7 @@ mod tests {
             retryable,
             choose,
         )
-        .await?;
-        Ok(match outcome {
-            KadReadOutcome::Found(chunk) => Some(chunk),
-            KadReadOutcome::NotFound => None,
-        })
+        .await
     }
 
     fn router(closer: &[u8]) -> MockPeer {
@@ -654,8 +796,12 @@ mod tests {
         }
     }
 
-    fn asked(network: &MockNetwork, peer: u8) -> bool {
-        network.requests().iter().any(|(asked, _)| *asked == peer)
+    /// Whether `peer` was asked for the chunk, not only for closer peers.
+    fn asked_for_chunk(network: &MockNetwork, peer: u8) -> bool {
+        network
+            .requests()
+            .iter()
+            .any(|(asked, request)| *asked == peer && *request != "find_node")
     }
 
     fn holder() -> MockPeer {
@@ -801,9 +947,15 @@ mod tests {
         ]);
 
         assert_eq!(read(&network, &[9]).await, Ok(Some("chunk")));
-        assert!(asked(&network, 1));
-        assert!(!asked(&network, 2), "the closest holder delivered in time");
-        assert!(!asked(&network, 3), "the closest holder delivered in time");
+        assert!(asked_for_chunk(&network, 1));
+        assert!(
+            !asked_for_chunk(&network, 2),
+            "the closest holder delivered in time"
+        );
+        assert!(
+            !asked_for_chunk(&network, 3),
+            "the closest holder delivered in time"
+        );
     }
 
     /// The lookup round hands over its three likely holders together, so the
@@ -822,9 +974,15 @@ mod tests {
             read_with(&network, &[9], retryable, |_| usize::MAX).await,
             Ok(Some("chunk"))
         );
-        assert!(asked(&network, 3));
-        assert!(!asked(&network, 1), "the chosen holder delivered in time");
-        assert!(!asked(&network, 2), "the chosen holder delivered in time");
+        assert!(asked_for_chunk(&network, 3));
+        assert!(
+            !asked_for_chunk(&network, 1),
+            "the chosen holder delivered in time"
+        );
+        assert!(
+            !asked_for_chunk(&network, 2),
+            "the chosen holder delivered in time"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -839,8 +997,8 @@ mod tests {
 
         assert_eq!(read(&network, &[9]).await, Ok(Some("chunk")));
         assert!(started.elapsed() < SLOW_TRANSFER);
-        assert!(asked(&network, 2));
-        assert!(!asked(&network, 3), "one hedge was enough");
+        assert!(asked_for_chunk(&network, 2));
+        assert!(!asked_for_chunk(&network, 3), "one hedge was enough");
     }
 
     #[tokio::test(start_paused = true)]
@@ -855,6 +1013,114 @@ mod tests {
 
         assert_eq!(read(&network, &[9]).await, Ok(Some("chunk")));
         assert!(started.elapsed() < HOLDER_HEDGE_DELAY);
-        assert!(!asked(&network, 3));
+        assert!(!asked_for_chunk(&network, 3));
+    }
+
+    /// Two slow holders take both request slots, so a third likely holder
+    /// waits however long they take, and only two copies are ever in flight.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_asks_at_most_two_likely_holders_at_once() {
+        let network = MockNetwork::with([
+            (9, well_known_router(&[1, 2, 3])),
+            (1, holder_after(SLOW_TRANSFER)),
+            (2, holder_after(SLOW_TRANSFER)),
+            (3, holder_after(SLOW_TRANSFER)),
+        ]);
+
+        assert_eq!(read(&network, &[9]).await, Ok(Some("chunk")));
+        assert!(asked_for_chunk(&network, 2), "the first holder was hedged");
+        assert!(
+            !asked_for_chunk(&network, 3),
+            "two requests were already running"
+        );
+    }
+
+    /// The lookup does not wait for the holder gate: likely holders that are
+    /// not asked for the chunk yet answer it with FIND_NODE straight away.
+    #[tokio::test(start_paused = true)]
+    async fn likely_holders_waiting_their_turn_answer_the_lookup_at_once() {
+        let network = MockNetwork::with([
+            (9, well_known_router(&[1, 2, 3])),
+            (1, holder_after(SLOW_TRANSFER)),
+            (2, router(&[])),
+            (3, router(&[])),
+        ]);
+
+        let before_any_hedge = HOLDER_HEDGE_DELAY / 2;
+        assert!(
+            tokio::time::timeout(before_any_hedge, read(&network, &[9]))
+                .await
+                .is_err(),
+            "the only holder is still sending"
+        );
+        let requests = network.requests();
+        assert!(requests.contains(&(1, "get_or_closer")));
+        assert!(requests.contains(&(2, "find_node")));
+        assert!(requests.contains(&(3, "find_node")));
+        assert!(!asked_for_chunk(&network, 2));
+        assert!(!asked_for_chunk(&network, 3));
+    }
+
+    /// A seed counts as a likely holder while the lookup knows few peers, so
+    /// it waits its turn. Once a router reports a close group of peers
+    /// nearer the chunk, it is not asked for it at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_peer_the_lookup_has_passed_is_not_asked_for_the_chunk() {
+        let network = MockNetwork::with([
+            (9, well_known_router(&[1, 2, 3])),
+            (FAR_SEED, router(&[])),
+            (1, holder()),
+        ]);
+
+        assert_eq!(read(&network, &[9, FAR_SEED]).await, Ok(Some("chunk")));
+        assert!(network.requests().contains(&(FAR_SEED, "find_node")));
+        assert!(!asked_for_chunk(&network, FAR_SEED));
+    }
+
+    /// Peers far from the chunk only route: the lookup asks them for closer
+    /// peers and never for the chunk. Here every nearer peer is unreachable,
+    /// so the lookup goes on to them.
+    #[tokio::test(start_paused = true)]
+    async fn peers_far_from_the_chunk_are_only_asked_for_closer_peers() {
+        let unreachable = MockPeer {
+            unreachable: true,
+            ..MockPeer::default()
+        };
+        let near = NEAR_PEERS.collect::<Vec<_>>();
+        let network = MockNetwork::with(
+            std::iter::once((9, well_known_router(&near)))
+                .chain(NEAR_PEERS.map(|peer| (peer, unreachable.clone()))),
+        );
+
+        assert_eq!(read(&network, &[9]).await, Ok(None));
+        let requests = network.requests();
+        assert!(
+            FAR_PEERS
+                .clone()
+                .any(|far| requests.contains(&(far, "find_node"))),
+            "the lookup went on to the far peers"
+        );
+        for far in FAR_PEERS {
+            assert!(
+                !asked_for_chunk(&network, far),
+                "{far} has a close group of known peers nearer the chunk"
+            );
+        }
+    }
+
+    /// A lookup that finds no holder hands back the peers it ended on, nearest
+    /// first, for the ordinary read to start from.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_without_a_holder_hands_back_the_peers_it_ended_on() {
+        let network = MockNetwork::with([(9, router(&[3, 2])), (3, router(&[])), (2, router(&[]))]);
+
+        let KadReadOutcome::NotFound { closest } =
+            read_outcome(&network, &[9], retryable, nearest_first)
+                .await
+                .expect("the read should end without an error")
+        else {
+            panic!("no peer holds the chunk");
+        };
+        assert_eq!(closest.iter().map(id).collect::<Vec<_>>(), vec![2, 3, 9]);
     }
 }
