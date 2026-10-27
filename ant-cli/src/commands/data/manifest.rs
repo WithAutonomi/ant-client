@@ -44,8 +44,6 @@ const YES_ANSWERS: &[&str] = &["y", "yes"];
 const FORCE_QUIT_EXIT_CODE: i32 = 130;
 /// Marks a size in `manifest show` that only the manifest's creator vouches for.
 const CLAIMED_SIZE_MARK: char = '*';
-/// Where a download's default directory is made: the current directory.
-const DEFAULT_DOWNLOAD_PARENT: &str = ".";
 /// Extension of a stopped build's partial manifest, written beside an
 /// output file that already exists rather than over it.
 const PARTIAL_MANIFEST_EXTENSION: &str = "partial.ant";
@@ -154,11 +152,12 @@ pub enum ManifestAction {
         /// from `ant manifest list`.
         source: String,
         /// Directory to extract into, existing or not. Defaults to a new
-        /// directory named after the manifest, which must not exist yet
-        /// unless an earlier run of this download made it and did not
-        /// finish. A manifest without a name, or with a hidden one, needs
-        /// --output. Files already in place with their recorded SHA-256 are
-        /// kept, so a download that stopped can be run again.
+        /// directory named after the manifest in your downloads directory,
+        /// which must not exist yet unless an earlier run of this download
+        /// made it and did not finish. A manifest without a name, or with a
+        /// hidden one, needs --output. Files already in place with their
+        /// recorded SHA-256 are kept, so a download that stopped can be run
+        /// again.
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Only extract these entries or directories. Repeatable.
@@ -677,24 +676,19 @@ struct DownloadRoot {
     record: Option<PathBuf>,
 }
 
-/// The directory a download extracts into. An `--output` given is used as
-/// it is, existing or not. Without one, a new directory named after the
-/// manifest is made in `parent`, and recorded in `records` until the
-/// download finishes. The sender chooses that name, so it never picks a
-/// hidden directory, such as `~/.ssh` or `~/.config`, or one that already
-/// exists, unless an unfinished run of this same download made it; a
-/// manifest without a name needs `--output`. Making the directory is the
-/// check, so nothing can appear there in between.
-fn resolve_download_root(
+/// The directory a download extracts into without `--output`: a new
+/// directory named after the manifest, made in `parent`, the downloads
+/// directory, and recorded in `records` until the download finishes. The
+/// sender chooses that name, so it never picks a hidden directory or one
+/// that already exists, unless an unfinished run of this same download made
+/// it; a manifest without a name needs `--output`. Making the directory is
+/// the check, so nothing can appear there in between.
+fn default_download_root(
     manifest: &Manifest,
-    output: Option<PathBuf>,
     parent: &Path,
     records: Option<&Path>,
 ) -> anyhow::Result<DownloadRoot> {
     manifest.validate()?;
-    if let Some(path) = output {
-        return Ok(DownloadRoot { path, record: None });
-    }
     let Some(name) = manifest.name.as_deref() else {
         anyhow::bail!("this manifest has no name; pass --output to choose where to extract it");
     };
@@ -704,6 +698,8 @@ fn resolve_download_root(
              pass --output to choose where to extract it"
         );
     }
+    std::fs::create_dir_all(parent)
+        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", parent.display()))?;
     let path = parent.join(name);
     match std::fs::create_dir(&path) {
         Ok(()) => {
@@ -1053,12 +1049,14 @@ async fn download(
     let records = ant_core::config::data_dir()
         .ok()
         .map(|dir| dir.join(DOWNLOAD_RECORDS_DIR));
-    let root = resolve_download_root(
-        manifest,
-        output,
-        Path::new(DEFAULT_DOWNLOAD_PARENT),
-        records.as_deref(),
-    )?;
+    let root = match output {
+        Some(path) => DownloadRoot { path, record: None },
+        None => default_download_root(
+            manifest,
+            &ant_core::config::download_dir()?,
+            records.as_deref(),
+        )?,
+    };
     let output_root = root.path.clone();
     let options = ExtractOptions {
         output_root: output_root.clone(),
@@ -1074,6 +1072,7 @@ async fn download(
     let report = if json {
         extract_manifest(client, manifest, &options, None).await?
     } else {
+        eprintln!("Downloading into {}", output_root.display());
         let (tx, rx) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
         let ui = tokio::spawn(drive_extract_progress(rx));
         let report = extract_manifest(client, manifest, &options, Some(tx)).await;
@@ -1344,7 +1343,7 @@ mod tests {
             };
             assert!(action.execute_offline(false).is_err());
             assert!(resolve_output(Some(name), None).is_err());
-            assert!(resolve_download_root(&manifest, None, dir.path(), None).is_err());
+            assert!(default_download_root(&manifest, dir.path(), None).is_err());
         }
         assert!(!outside.with_extension("ant").exists());
 
@@ -1360,23 +1359,23 @@ mod tests {
     }
 
     /// The sender names the manifest, so without --output a download only
-    /// ever extracts into a new directory it has just made, or into one an
-    /// unfinished run of the same download made.
+    /// ever extracts into a new directory it has just made in the downloads
+    /// directory, or into one an unfinished run of the same download made.
     #[test]
     fn a_download_defaults_only_to_a_new_directory_named_after_the_manifest() {
         let dir = tempfile::tempdir().unwrap();
-        let parent = dir.path().join("cwd");
+        let parent = dir.path().join("Downloads");
         let records = dir.path().join("records");
-        std::fs::create_dir(&parent).unwrap();
         let valid = Manifest::new(Some("pack".into()));
-        let first = resolve_download_root(&valid, None, &parent, Some(&records)).unwrap();
+        // A missing downloads directory is made.
+        let first = default_download_root(&valid, &parent, Some(&records)).unwrap();
         assert_eq!(first.path, parent.join("pack"));
         assert!(first.path.is_dir());
         let record = first.record.expect("the new directory is recorded");
         assert!(record.is_file());
 
         // The same download again continues into the directory it made.
-        let again = resolve_download_root(&valid, None, &parent, Some(&records)).unwrap();
+        let again = default_download_root(&valid, &parent, Some(&records)).unwrap();
         assert_eq!(again.path, first.path);
         assert_eq!(again.record.as_ref(), Some(&record));
 
@@ -1391,7 +1390,7 @@ mod tests {
         });
         std::fs::remove_file(&record).unwrap();
         for manifest in [&other, &valid] {
-            let error = resolve_download_root(manifest, None, &parent, Some(&records))
+            let error = default_download_root(manifest, &parent, Some(&records))
                 .err()
                 .unwrap();
             assert!(error.to_string().contains("already exists"), "{error}");
@@ -1404,25 +1403,13 @@ mod tests {
             Manifest::new(Some(".config".into())),
             Manifest::new(None),
         ] {
-            let error = resolve_download_root(&manifest, None, &parent, Some(&records))
+            let error = default_download_root(&manifest, &parent, Some(&records))
                 .err()
                 .unwrap();
             assert!(error.to_string().contains("--output"), "{error}");
         }
         assert!(!parent.join(".ssh").exists());
         assert!(!parent.join(".config").exists());
-
-        // An explicit --output is used as it is, existing or not.
-        for output in [parent.join("pack"), parent.join("chosen/new")] {
-            for manifest in [&valid, &Manifest::new(Some(".ssh".into()))] {
-                let root =
-                    resolve_download_root(manifest, Some(output.clone()), &parent, Some(&records))
-                        .unwrap();
-                assert_eq!(root.path, output);
-                assert!(root.record.is_none());
-            }
-        }
-        assert!(!parent.join("chosen").exists());
     }
 
     #[test]

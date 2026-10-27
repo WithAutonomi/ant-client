@@ -42,6 +42,9 @@ web-time = "1.1"
 # Node management
 async-stream = { version = "0.3", optional = true }
 axum = { version = "0.8", optional = true }
+# The user's downloads directory, the default for manifest downloads
+# (ADR-0006). Already in the tree through saorsa-core.
+dirs = { version = "6", optional = true }
 flate2 = { version = "1", optional = true }
 fs2 = { version = "0.4", optional = true }
 futures-core = { version = "0.3" }
@@ -148,6 +151,7 @@ native = [
     "ant-protocol/logging",
     "dep:async-stream",
     "dep:axum",
+    "dep:dirs",
     "dep:flate2",
     "dep:fs2",
     "dep:reqwest",

@@ -152,7 +152,7 @@ cargo run --bin ant -- --help  # Run the CLI
 - **CLI output**: All commands support `--json` global flag. Human-readable output by default, structured JSON when `--json` is passed.
 - **Hidden commands**: `ant node daemon run` is hidden (runs daemon in foreground, used internally by `daemon start`).
 - **REST API conflict responses**: All 409 responses include a `current_state` field so retrying clients can confirm desired state already exists.
-- **Platform paths**: Use `ant_core::config::data_dir()` and `ant_core::config::log_dir()` for platform-appropriate paths. Never hardcode paths.
+- **Platform paths**: Use `ant_core::config::data_dir()`, `ant_core::config::log_dir()` and `ant_core::config::download_dir()` for platform-appropriate paths. Never hardcode paths.
 - **OpenAPI schema**: Types exposed in the REST API derive `utoipa::ToSchema`. Use `#[schema(value_type = String)]` for `PathBuf` fields.
 - **Tests**: Unit tests go in `#[cfg(test)] mod tests` inside the source file. Integration tests go in `ant-core/tests/`.
 - **Progress reporting**: Long-running operations (e.g., binary downloads) accept a `&dyn ProgressReporter` from `ant_core::node::binary`. CLI provides a terminal-printing implementation; use `NoopProgress` in tests and daemon API handlers.
@@ -163,7 +163,8 @@ cargo run --bin ant -- --help  # Run the CLI
   is shared off-network; only the files it references live on Autonomi. `ant://<hex>` is always
   a plain file link. Every upload (`ant file upload`, `ant manifest create`) is also recorded as
   a manifest under `<data dir>/uploads/`; `ant manifest list` shows them and `show`/`link`/`export`/`download`
-  accept a record id. Entry paths obey the portable rules in `data/manifest/path.rs` at build,
+  accept a record id. Without `--output`, `download` extracts into a new directory named after
+  the manifest in the user's downloads directory. Entry paths obey the portable rules in `data/manifest/path.rs` at build,
   decode and extract time, and extraction never follows symlinks inside the output directory
   and resolves every name from directories it holds open (`data/manifest/output/`: by
   descriptor on Unix, by path under held handles on Windows). A manifest

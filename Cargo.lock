@@ -865,6 +865,7 @@ dependencies = [
  "bytes",
  "console_error_panic_hook",
  "crc32fast",
+ "dirs",
  "fips204",
  "flate2",
  "fs2",

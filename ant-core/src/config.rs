@@ -4,6 +4,10 @@ use std::path::PathBuf;
 use crate::data::{CustomNetwork, DevnetManifest, EvmAddress, EvmNetwork, MultiAddr};
 use crate::error::{Error, Result};
 
+/// The downloads directory under the home directory, where the platform
+/// does not say where it is.
+const DOWNLOADS_DIR_NAME: &str = "Downloads";
+
 /// Returns the platform-appropriate data directory for ant.
 ///
 /// - Linux: `~/.local/share/ant`
@@ -54,6 +58,19 @@ pub fn log_dir() -> Result<PathBuf> {
         Ok(home_dir()?.join("Library").join("Logs").join("ant"))
     } else {
         Ok(data_dir()?.join("logs"))
+    }
+}
+
+/// Returns the user's downloads directory, where downloads go unless told
+/// otherwise.
+///
+/// - Linux: `XDG_DOWNLOAD_DIR`, or `~/Downloads`
+/// - macOS: `~/Downloads`
+/// - Windows: the Downloads known folder, `%USERPROFILE%\Downloads` unless moved
+pub fn download_dir() -> Result<PathBuf> {
+    match dirs::download_dir() {
+        Some(dir) => Ok(dir),
+        None => Ok(home_dir()?.join(DOWNLOADS_DIR_NAME)),
     }
 }
 
@@ -221,6 +238,11 @@ mod tests {
     fn config_dir_ends_with_ant() {
         let dir = config_dir().unwrap();
         assert_eq!(dir.file_name().unwrap(), "ant");
+    }
+
+    #[test]
+    fn download_dir_is_absolute() {
+        assert!(download_dir().unwrap().is_absolute());
     }
 
     #[test]

@@ -541,15 +541,22 @@ Input: a manifest, an output root, and an optional selection by exact
 effective name or directory prefix. Empty selection means everything.
 
 The output root is the caller's choice. When the CLI is not given one, it
-extracts into a new directory named after the manifest, made in the current
-directory before anything is downloaded; making it is the check. The sender
-chooses that name, and a terminal usually starts in the home directory, so
+extracts into a new directory named after the manifest, made in the user's
+downloads directory before anything is downloaded; making it is the check.
+That is the platform's Downloads folder (the known folder on Windows,
+`XDG_DOWNLOAD_DIR` on Linux), or `~/Downloads` where the platform names
+none, made if missing, and the CLI prints the directory before it starts.
+Like a browser's, this default keeps a sender's name out of the directory
+the command runs in, where a name can mean something: a project directory
+loads a package named `json` before the real one, and a home directory
+holds `.ssh` and `AppData`. It also belongs to the user, so no other user
+can swap the new directory for a link while it fills. The sender still
+chooses that name, and a downloads directory may be the home directory, so
 a default never lands in a directory that exists already or has a hidden
 name, one starting with a dot once the code points HFS+ ignores are
-dropped: a manifest named `.ssh` would otherwise plant `authorized_keys`,
-and one named `AppData` a login script on Windows. Such a manifest, and one
-without a name, needs an explicit output directory, which may be any
-directory, existing or not. The CLI's messages never echo a sender's name
+dropped: a manifest named `.ssh` would otherwise plant `authorized_keys`.
+Such a manifest, and one without a name, needs an explicit output
+directory, which may be any directory, existing or not. The CLI's messages never echo a sender's name
 inside a suggested command. The selection is checked before the directory
 is made. A download that stops can be run again: the CLI
 records the directory it made under `<data dir>/downloads/`, keyed by a hash
@@ -715,11 +722,11 @@ initial release.
   positive and negative, including the extended reserved names and the
   case-folding pairs above.
 - Default output tests: without an explicit output, a download makes a new
-  directory named after the manifest and records it; the same download
-  continues into it, while another manifest of that name, or this one once
-  its record is gone, is refused; a hidden name, also behind a code point
-  HFS+ ignores, or no name is refused,
-  making nothing; an explicit output is used as given.
+  directory named after the manifest in the downloads directory, making
+  that too if it is missing, and records it; the same download continues
+  into it, while another manifest of that name, or this one once its record
+  is gone, is refused; a hidden name, also behind a code point HFS+
+  ignores, or no name is refused, making nothing.
 - Containment tests, run on Unix and macOS in CI: a pre-existing symlink at
   every depth inside the output root causes a per-entry failure and nothing
   is written outside the root; an existing target fails without overwrite
