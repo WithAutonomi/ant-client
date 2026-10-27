@@ -109,6 +109,13 @@ jobs:
 
       - name: verify binary
         run: |
+          # GitHub's runner images also ship Apache Ant, which is called `ant` too, so first check
+          # that `ant` resolves to npm's install.
+          npm_ant="$(npm prefix -g)/bin/ant"
+          if [ "$(command -v ant)" != "$npm_ant" ]; then
+            echo "ERROR: ant resolves to $(command -v ant), not npm's $npm_ant"
+            exit 1
+          fi
           ant --help
           echo "Binary runs successfully"
 
@@ -126,8 +133,10 @@ jobs:
       - name: verify uninstall leaves the config directory
         run: |
           npm uninstall -g @withautonomi/ant
-          if command -v ant >/dev/null 2>&1; then
-            echo "ERROR: ant is still on PATH after uninstall"
+          # Only npm's own ant has to be gone: the runner image's Apache Ant is still on PATH.
+          npm_ant="$(npm prefix -g)/bin/ant"
+          if [ -e "$npm_ant" ] || [ -L "$npm_ant" ]; then
+            echo "ERROR: $npm_ant is still there after uninstall"
             exit 1
           fi
           config_file="${XDG_CONFIG_HOME:-$HOME/.config}/ant/bootstrap_peers.toml"
@@ -150,6 +159,13 @@ jobs:
 
       - name: verify binary
         run: |
+          # GitHub's runner images also ship Apache Ant, which is called `ant` too, so first check
+          # that `ant` resolves to npm's install.
+          npm_ant="$(npm prefix -g)/bin/ant"
+          if [ "$(command -v ant)" != "$npm_ant" ]; then
+            echo "ERROR: ant resolves to $(command -v ant), not npm's $npm_ant"
+            exit 1
+          fi
           ant --help
           echo "Binary runs successfully"
 
@@ -166,6 +182,12 @@ jobs:
       - name: verify uninstall leaves the config directory
         run: |
           npm uninstall -g @withautonomi/ant
+          # Only npm's own ant has to be gone: the runner image's Apache Ant is still on PATH.
+          npm_ant="$(npm prefix -g)/bin/ant"
+          if [ -e "$npm_ant" ] || [ -L "$npm_ant" ]; then
+            echo "ERROR: $npm_ant is still there after uninstall"
+            exit 1
+          fi
           config_file="$HOME/Library/Application Support/ant/bootstrap_peers.toml"
           if [ ! -f "$config_file" ]; then
             echo "ERROR: uninstall removed $config_file, which it must leave alone"
@@ -188,6 +210,13 @@ jobs:
       - name: verify binary
         shell: pwsh
         run: |
+          # Check that `ant` resolves to npm's install before running it (see the Linux job).
+          $npmPrefix = (npm prefix -g).Trim()
+          $antPath = (Get-Command ant).Source
+          if ((Split-Path $antPath) -ne $npmPrefix) {
+            Write-Error "ant resolves to $antPath, not npm's install in $npmPrefix"
+            exit 1
+          }
           ant --help
           Write-Host "Binary runs successfully"
 
@@ -206,6 +235,14 @@ jobs:
         shell: pwsh
         run: |
           npm uninstall -g @withautonomi/ant
+          # npm writes three shims on Windows: `ant` (for sh), `ant.cmd`, and `ant.ps1`, which
+          # PowerShell runs in preference to `ant.cmd`. None of them may be left behind.
+          $npmPrefix = (npm prefix -g).Trim()
+          $left = Get-ChildItem -LiteralPath $npmPrefix -File | Where-Object { $_.BaseName -eq 'ant' }
+          if ($left) {
+            Write-Error "npm's ant shims are still in ${npmPrefix} after uninstall: $($left.Name -join ', ')"
+            exit 1
+          }
           $configFile = Join-Path $env:APPDATA "ant\bootstrap_peers.toml"
           if (-not (Test-Path $configFile)) {
             Write-Error "uninstall removed $configFile, which it must leave alone"
@@ -230,6 +267,13 @@ jobs:
 
       - name: verify binary still runs
         run: |
+          # GitHub's runner images also ship Apache Ant, which is called `ant` too, so first check
+          # that `ant` resolves to npm's install.
+          npm_ant="$(npm prefix -g)/bin/ant"
+          if [ "$(command -v ant)" != "$npm_ant" ]; then
+            echo "ERROR: ant resolves to $(command -v ant), not npm's $npm_ant"
+            exit 1
+          fi
           ant --help
           ant --version
           echo "Binary runs successfully without postinstall"
@@ -249,12 +293,12 @@ jobs:
           if echo "$output" | grep -qi "No bootstrap peers available"; then
             echo "$output"
             echo "ERROR: ant could not resolve bootstrap peers without a config file."
-            echo "The embedded fallback in ant-core/src/config.rs is not working."
+            echo "The bundled fallback in ant-core/src/config.rs is not working."
             exit 1
           fi
-          if ! echo "$output" | grep -q "embedded bootstrap peer"; then
+          if ! echo "$output" | grep -q "bundled bootstrap seed"; then
             echo "$output"
-            echo "ERROR: expected ant to report using its embedded bootstrap peers."
+            echo "ERROR: expected ant to report using its bundled bootstrap seeds."
             exit 1
           fi
-          echo "Bootstrap peers resolved from the embedded list, with no config file present"
+          echo "Bootstrap peers resolved from the bundled seeds, with no config file present"
