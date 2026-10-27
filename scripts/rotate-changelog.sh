@@ -88,8 +88,11 @@ fi
 
 # Keep the `[Unreleased]` heading, open `[X.Y.Z] - <date>` under it and move the entries
 # there unchanged. An empty `## [X.Y.Z]` heading left by hand is dropped, not duplicated.
-tmp="$(mktemp)"
+# The result goes to a temporary file next to the changelog, which is then renamed over it, so
+# an interrupted run leaves the old changelog whole. `cp -p` gives that file the changelog's mode.
+tmp="$(mktemp "$(dirname "$changelog")/.rotate-changelog.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
+cp -p "$changelog" "$tmp"
 awk -v ver="$version" -v date="$date" '
   index($0, "## [" ver "]") == 1 { skip_empty = 1; next }
   skip_empty && /^[[:space:]]*$/ { next }
@@ -102,6 +105,6 @@ awk -v ver="$version" -v date="$date" '
     next
   }
   { print }' "$changelog" > "$tmp"
-cat "$tmp" > "$changelog"
+mv -f "$tmp" "$changelog"
 
 echo "rotate-changelog: moved ## [Unreleased] into ## [$version] - $date in $changelog."
