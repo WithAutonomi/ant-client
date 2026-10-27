@@ -54,10 +54,11 @@ jobs:
           done
           fresh bash -lc 'ant --version'
 
-      # INSTALL_DIR goes into the startup files as shell code, so a name with shell syntax in it
-      # must read back as that literal directory and run nothing. It gets its own HOME, and zsh and
-      # fish are installed so their lines are checked too. sh is dash.
-      - name: verify an install directory with shell syntax in its name is written literally
+      # Shells can run part of a PATH entry containing $, `, " or \ as code (macOS login shells
+      # re-read PATH through path_helper unescaped), so the installer must leave such a directory
+      # out of every startup file, and the line it prints instead must be safe to paste. zsh and
+      # fish are installed so their startup files are checked too. sh is dash.
+      - name: verify an install directory with shell syntax in its name is refused
         env:
           ANT_VERSION: ${{ inputs.version }}
         run: |
@@ -69,21 +70,42 @@ jobs:
           dir="$home"'/odd $(touch $HOME/ran-subst) `touch $HOME/ran-backtick` "quoted" back\slash'
           out="$(fresh ANT_VERSION="$ANT_VERSION" INSTALL_DIR="$dir" bash install.sh)"
           echo "$out"
+          if ! echo "$out" | grep -q "was not added to your shell startup files"; then
+            echo "ERROR: expected the installer to refuse this directory"
+            exit 1
+          fi
+          for f in .profile .bashrc .zshenv .config/fish/conf.d/ant.fish; do
+            if [ -e "$home/$f" ]; then
+              echo "ERROR: $f was written"
+              exit 1
+            fi
+          done
+          line="$(echo "$out" | grep -m1 '^  export PATH=')"
+          found="$(env -i HOME="$home" PATH=/usr/bin:/bin sh -c "$line; command -v ant" || true)"
+          echo "printed line: ${found:-<not found>}"
+          [ "$found" = "$dir/ant" ] || exit 1
+          if ls "$home"/ran-* 2> /dev/null; then
+            echo "ERROR: code from the install directory's name ran"
+            exit 1
+          fi
+
+      # Every other character is safe inside the double quotes of the lines written, so a name with
+      # spaces, quotes and other punctuation must still be added and resolve in each new shell.
+      - name: verify an install directory with other punctuation in its name is added
+        env:
+          ANT_VERSION: ${{ inputs.version }}
+        run: |
+          home="$RUNNER_TEMP/punct-home"
+          mkdir -p "$home"
+          fresh() { env -i HOME="$home" SHELL=/bin/bash PATH=/usr/bin:/bin "$@"; }
+          dir="$home/my apps (x86) & 'quoted' #1 *"
+          fresh ANT_VERSION="$ANT_VERSION" INSTALL_DIR="$dir" bash install.sh
           for shell in "bash -lc" "bash -ic" "sh -lc" "zsh -c" "fish -c"; do
             # shellcheck disable=SC2086 # $shell is a shell and its flag, split on purpose.
             found="$(fresh $shell 'command -v ant' 2> /dev/null || true)"
             echo "$shell: ${found:-<not found>}"
             [ "$found" = "$dir/ant" ] || exit 1
           done
-          # The line the installer prints for the current shell must be as safe to paste.
-          line="$(echo "$out" | grep -m1 '^  export PATH=')"
-          found="$(env -i HOME="$home" PATH=/usr/bin:/bin sh -c "$line; command -v ant" || true)"
-          echo "printed line: ${found:-<not found>}"
-          [ "$found" = "$dir/ant" ] || exit 1
-          if ls "$home"/ran-* 2> /dev/null; then
-            echo "ERROR: a shell ran code from the install directory's name"
-            exit 1
-          fi
 
       # A relative INSTALL_DIR is made absolute with `cd`, which also prints the directory when it
       # is found through CDPATH.
@@ -154,10 +176,10 @@ jobs:
           done
           fresh zsh -c 'ant --version'
 
-      # As on Linux, a name with shell syntax in it must read back as that literal directory and run
-      # nothing, here with the stock /bin/bash running the installer and macOS's own sed. Login
-      # shells are checked for the directory on PATH, as above.
-      - name: verify an install directory with shell syntax in its name is written literally
+      # As on Linux, a name with shell syntax in it is refused and runs nothing, here with the stock
+      # /bin/bash running the installer and macOS's own sed. Login shells run path_helper, which is
+      # why such a name can't be put on PATH here at all.
+      - name: verify an install directory with shell syntax in its name is refused
         env:
           ANT_VERSION: ${{ inputs.version }}
         run: |
@@ -168,6 +190,38 @@ jobs:
           dir="$home"'/odd $(touch $HOME/ran-subst) `touch $HOME/ran-backtick` "quoted" back\slash'
           out="$(fresh ANT_VERSION="$ANT_VERSION" INSTALL_DIR="$dir" /bin/bash install.sh)"
           echo "$out"
+          if ! echo "$out" | grep -q "was not added to your shell startup files"; then
+            echo "ERROR: expected the installer to refuse this directory"
+            exit 1
+          fi
+          for f in .profile .bash_profile .zshenv; do
+            if [ -e "$home/$f" ]; then
+              echo "ERROR: $f was written"
+              exit 1
+            fi
+          done
+          fresh zsh -lc true
+          fresh /bin/bash -lc true
+          line="$(echo "$out" | grep -m1 '^  export PATH=')"
+          found="$(env -i HOME="$home" PATH=/usr/bin:/bin /bin/sh -c "$line; command -v ant" || true)"
+          echo "printed line: ${found:-<not found>}"
+          [ "$found" = "$dir/ant" ] || exit 1
+          if ls "$home"/ran-* 2> /dev/null; then
+            echo "ERROR: code from the install directory's name ran"
+            exit 1
+          fi
+
+      # A name with spaces, quotes and other punctuation must still be added, and come through
+      # path_helper intact in login shells.
+      - name: verify an install directory with other punctuation in its name is added
+        env:
+          ANT_VERSION: ${{ inputs.version }}
+        run: |
+          home="$RUNNER_TEMP/punct-home"
+          mkdir -p "$home"
+          fresh() { env -i HOME="$home" SHELL=/bin/zsh PATH=/usr/bin:/bin "$@"; }
+          dir="$home/my apps (x86) & 'quoted' #1 *"
+          fresh ANT_VERSION="$ANT_VERSION" INSTALL_DIR="$dir" /bin/bash install.sh
           found="$(fresh zsh -c 'command -v ant' || true)"
           echo "zsh -c: ${found:-<not found>}"
           [ "$found" = "$dir/ant" ] || exit 1
@@ -177,15 +231,6 @@ jobs:
             echo "$shell: $p"
             case ":$p:" in *":$dir:"*) ;; *) exit 1 ;; esac
           done
-          # The line the installer prints for the current shell must be as safe to paste.
-          line="$(echo "$out" | grep -m1 '^  export PATH=')"
-          found="$(env -i HOME="$home" PATH=/usr/bin:/bin /bin/sh -c "$line; command -v ant" || true)"
-          echo "printed line: ${found:-<not found>}"
-          [ "$found" = "$dir/ant" ] || exit 1
-          if ls "$home"/ran-* 2> /dev/null; then
-            echo "ERROR: a shell ran code from the install directory's name"
-            exit 1
-          fi
 
   test-install-script-windows:
     name: test install.ps1 (Windows)

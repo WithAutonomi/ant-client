@@ -81,18 +81,27 @@ default_install_dir() {
   echo "$HOME/.local/bin"
 }
 
-# $1 escaped to read back literally inside double quotes: \ " $ and ` for POSIX shells, and
-# \ " and $ for fish, where ` is not special. sed rather than ${1//...}, whose replacement quoting
-# differs between bash 3.2 and 5.2.
+# $1 escaped to read back literally inside double quotes in a POSIX shell, for the `export PATH=`
+# lines printed for the user to paste. sed rather than ${1//...}, whose replacement quoting differs
+# between bash 3.2 and 5.2.
 sh_quoted() { printf '%s\n' "$1" | sed 's/[\\"$`]/\\&/g'; }
-fish_quoted() { printf '%s\n' "$1" | sed 's/[\\"$]/\\&/g'; }
 
-# $1 for use inside double quotes in a startup file, escaped by $2 (sh_quoted or fish_quoted), with
-# a leading $HOME spelled as a literal `$HOME`, so the line keeps working if the home directory moves.
-startup_path() {
+# Whether $1 is unsafe to put on PATH from a startup file: shells can end up running part of a name
+# containing $, `, " or \ as code, however the line is quoted. macOS login shells, for one, re-read
+# PATH through `eval $(path_helper -s)`, and path_helper does not escape it. A newline would split
+# the line, which is checked for line by line.
+unsafe_on_path() {
   case "$1" in
-    "$HOME"/*) printf '%s\n' "\$HOME$("$2" "${1#"$HOME"}")" ;;
-    *)         "$2" "$1" ;;
+    *'$'* | *'`'* | *'"'* | *\\* | *$'\n'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# $1 with a leading $HOME spelled as a literal `$HOME`, for lines written into startup files.
+home_relative() {
+  case "$1" in
+    "$HOME"/*) printf '%s\n' "\$HOME${1#"$HOME"}" ;;
+    *)         printf '%s\n' "$1" ;;
   esac
 }
 
@@ -140,27 +149,28 @@ append_startup_line() {
 
 # Put INSTALL_DIR on PATH for future shells, and tell the user what changed.
 add_install_dir_to_path() {
-  local posix_dir fish_dir posix_line fish_line rc i status
+  local dir posix_line fish_line rc i status
   local entries=() changed=() present=() failed=()
 
-  # Each startup line has to fit on one line, and is checked for line by line.
-  case "$INSTALL_DIR" in
-    *$'\n'*)
-      say ""
-      say "WARNING: ${INSTALL_DIR} contains a newline, so it was not added to your shell startup files."
-      say "Add it to your PATH yourself."
-      return
-      ;;
-  esac
+  if unsafe_on_path "$INSTALL_DIR"; then
+    say ""
+    say "WARNING: ${INSTALL_DIR} was not added to your shell startup files."
+    # shellcheck disable=SC2016 # The characters are listed, not expanded.
+    say 'Its name contains $, `, ", \ or a newline, which some shells would run as code: macOS login'
+    say "shells, for one, re-read PATH without escaping it. Install to a directory without them, or"
+    say "to use ant in the current shell only, run:"
+    say "  export PATH=\"$(sh_quoted "$INSTALL_DIR"):\$PATH\""
+    return
+  fi
 
-  posix_dir="$(startup_path "$INSTALL_DIR" sh_quoted)"
-  fish_dir="$(startup_path "$INSTALL_DIR" fish_quoted)"
+  dir="$(home_relative "$INSTALL_DIR")"
   # Guarded, so a shell that reads several of these files (Ubuntu's ~/.profile sources ~/.bashrc)
-  # still ends up with one entry.
+  # still ends up with one entry. unsafe_on_path has ruled out everything that is special inside
+  # double quotes, in POSIX shells and in fish.
   # shellcheck disable=SC2016 # $PATH is meant to reach the startup file unexpanded.
-  posix_line="$(printf 'case ":${PATH}:" in *":%s:"*) ;; *) export PATH="%s:$PATH" ;; esac' "$posix_dir" "$posix_dir")"
+  posix_line="$(printf 'case ":${PATH}:" in *":%s:"*) ;; *) export PATH="%s:$PATH" ;; esac' "$dir" "$dir")"
   # shellcheck disable=SC2016
-  fish_line="$(printf 'contains "%s" $PATH; or set -gx PATH "%s" $PATH' "$fish_dir" "$fish_dir")"
+  fish_line="$(printf 'contains "%s" $PATH; or set -gx PATH "%s" $PATH' "$dir" "$dir")"
 
   # Pairs of (startup file, line to add to it).
   while IFS= read -r rc; do
