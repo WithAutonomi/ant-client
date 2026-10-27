@@ -256,6 +256,12 @@ pub enum Error {
         spend: Box<PartialUploadSpend>,
         /// Root cause description.
         reason: String,
+        /// The error that stopped the upload before every chunk was tried, kept
+        /// typed: for example [`Error::InsufficientFunds`] when the wallet could
+        /// not pay for a later batch, so a caller can offer a top-up and resume.
+        /// `None` when the chunks themselves failed to store. `reason` already
+        /// includes its message.
+        cause: Option<Box<Error>>,
     },
 }
 
@@ -318,6 +324,7 @@ impl Error {
                 total_chunks,
                 spend,
                 reason,
+                cause,
             } => Self::PartialUpload {
                 stored: stored.clone(),
                 stored_count: *stored_count,
@@ -326,6 +333,7 @@ impl Error {
                 total_chunks: *total_chunks,
                 spend: spend.clone(),
                 reason: reason.clone(),
+                cause: cause.as_ref().map(|cause| Box::new(cause.duplicate())),
             },
         }
     }

@@ -243,6 +243,7 @@ impl Client {
                 failed,
                 spend,
                 reason,
+                cause,
                 ..
             }) => {
                 let stored_set = stored.into_iter().collect::<HashSet<_>>();
@@ -273,6 +274,7 @@ impl Client {
                     total_chunks: original.len(),
                     spend,
                     reason,
+                    cause,
                 })
             }
             Err(error) => Err(error),
@@ -290,43 +292,9 @@ impl Client {
             mode: PaymentMode::Single,
             ..Default::default()
         };
-        match self
-            .upload_unique_records_inner(&records, state, adapter, mode, &mut outcome)
+        self.upload_unique_records_inner(&records, state, adapter, mode, &mut outcome)
             .await
-        {
-            Err(error @ Error::PartialUpload { .. }) => Err(error),
-            Err(error)
-                if outcome.amount != Amount::ZERO
-                    || outcome.gas != 0
-                    || !outcome.addresses.is_empty() =>
-            {
-                let reason = match error {
-                    Error::ClientUpdateRequired(reason) => format!(
-                        "Further payment refused; reported spend covers earlier settled batches. {reason}"
-                    ),
-                    error => error.to_string(),
-                };
-                let stored = outcome.addresses.iter().copied().collect::<HashSet<_>>();
-                let failed = records
-                    .iter()
-                    .filter(|r| !stored.contains(&r.address))
-                    .map(|r| (r.address, reason.clone()))
-                    .collect::<Vec<_>>();
-                Err(Error::PartialUpload {
-                    stored_count: outcome.addresses.len(),
-                    stored: outcome.addresses,
-                    failed_count: failed.len(),
-                    failed,
-                    total_chunks: records.len(),
-                    spend: Box::new(PartialUploadSpend {
-                        storage_cost_atto: outcome.amount.to_string(),
-                        gas_cost_wei: outcome.gas,
-                    }),
-                    reason,
-                })
-            }
-            result => result,
-        }
+            .map_err(|error| after_spend(error, &records, &outcome))
     }
 
     async fn upload_unique_records_inner<A: UploadAdapter>(
@@ -365,35 +333,7 @@ impl Client {
         let storage = self
             .store_upload_merkle(&mut unique, state, adapter, outcome, total)
             .await;
-        match (preparation, storage) {
-            (
-                Err(payment_error),
-                Err(Error::PartialUpload {
-                    stored,
-                    stored_count,
-                    failed,
-                    failed_count,
-                    total_chunks,
-                    spend,
-                    reason,
-                }),
-            ) => {
-                return Err(Error::PartialUpload {
-                    stored,
-                    stored_count,
-                    failed,
-                    failed_count,
-                    total_chunks,
-                    spend,
-                    reason: format!("{payment_error}; {reason}"),
-                });
-            }
-            (Err(payment_error), Err(storage_error)) => {
-                return Err(Error::Payment(format!("{payment_error}; {storage_error}")));
-            }
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
-            (Ok(()), Ok(())) => {}
-        }
+        payment_and_storage(preparation, storage, records, outcome)?;
         let waves = unique
             .chunks(super::batch::PAYMENT_WAVE_SIZE)
             .collect::<Vec<_>>();
@@ -547,6 +487,7 @@ impl Client {
                     storage_cost_atto: outcome.amount.to_string(),
                     gas_cost_wei: outcome.gas,
                 }),
+                cause: None,
             });
         }
         Ok(std::mem::take(outcome))
@@ -767,6 +708,7 @@ impl Client {
                 reason: fatal.unwrap_or_else(|| {
                     "Merkle storage short of quorum after deferred retries".into()
                 }),
+                cause: None,
             });
         }
         records.retain(|r| !merkle.contains_key(&r.address));
@@ -1087,6 +1029,101 @@ impl UploadAdapter for MemoryUploadAdapter<'_> {
     }
 }
 
+/// Settle a failed payment preparation against the storage of already-paid batches, which runs
+/// after it either way so that earlier paid batches are not stranded.
+///
+/// A payment error is kept typed as the `cause` of the partial upload it ends in, so a caller can
+/// still tell, for example, that the wallet ran short.
+fn payment_and_storage(
+    preparation: Result<()>,
+    storage: Result<()>,
+    records: &[UploadRecord],
+    outcome: &UploadOutcome,
+) -> Result<()> {
+    match (preparation, storage) {
+        (
+            Err(payment_error),
+            Err(Error::PartialUpload {
+                stored,
+                stored_count,
+                failed,
+                failed_count,
+                total_chunks,
+                spend,
+                reason,
+                ..
+            }),
+        ) => Err(Error::PartialUpload {
+            stored,
+            stored_count,
+            failed,
+            failed_count,
+            total_chunks,
+            spend,
+            reason: format!("{payment_error}; {reason}"),
+            cause: Some(Box::new(payment_error)),
+        }),
+        // Storing paid batches only fails with `PartialUpload` today. Should that change, the
+        // payment error still stays typed.
+        (Err(payment_error), Err(storage_error)) => Err(partial_upload(
+            records,
+            outcome,
+            format!("{payment_error}; {storage_error}"),
+            Some(payment_error),
+        )),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// The error an upload ends with. Once `outcome` records spend or stored chunks, that is a
+/// [`Error::PartialUpload`] reporting them, so a resume knows what is already paid for and
+/// stored, with `error` kept as its `cause`. A `PartialUpload`, or an error before anything was
+/// spent or stored, is returned as it is.
+fn after_spend(error: Error, records: &[UploadRecord], outcome: &UploadOutcome) -> Error {
+    let nothing_spent_or_stored =
+        outcome.amount == Amount::ZERO && outcome.gas == 0 && outcome.addresses.is_empty();
+    if nothing_spent_or_stored || matches!(error, Error::PartialUpload { .. }) {
+        return error;
+    }
+    let reason = match &error {
+        Error::ClientUpdateRequired(reason) => format!(
+            "Further payment refused; reported spend covers earlier settled batches. {reason}"
+        ),
+        error => error.to_string(),
+    };
+    partial_upload(records, outcome, reason, Some(error))
+}
+
+/// A [`Error::PartialUpload`] of `records` as `outcome` left them: its stored chunks and spend,
+/// with every other record failed for `reason`.
+fn partial_upload(
+    records: &[UploadRecord],
+    outcome: &UploadOutcome,
+    reason: String,
+    cause: Option<Error>,
+) -> Error {
+    let stored = outcome.addresses.iter().copied().collect::<HashSet<_>>();
+    let failed = records
+        .iter()
+        .filter(|r| !stored.contains(&r.address))
+        .map(|r| (r.address, reason.clone()))
+        .collect::<Vec<_>>();
+    Error::PartialUpload {
+        stored_count: outcome.addresses.len(),
+        stored: outcome.addresses.clone(),
+        failed_count: failed.len(),
+        failed,
+        total_chunks: records.len(),
+        spend: Box::new(PartialUploadSpend {
+            storage_cost_atto: outcome.amount.to_string(),
+            gas_cost_wei: outcome.gas,
+        }),
+        reason,
+        cause: cause.map(Box::new),
+    }
+}
+
 fn merge_stats(total: &mut WaveAggregateStats, next: WaveAggregateStats) {
     total.chunk_attempts_total = total
         .chunk_attempts_total
@@ -1098,5 +1135,187 @@ fn merge_stats(total: &mut WaveAggregateStats, next: WaveAggregateStats) {
         .zip(next.retries_histogram)
     {
         *total = total.saturating_add(next);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn records(count: u8) -> Vec<UploadRecord> {
+        (0..count)
+            .map(|i| UploadRecord {
+                address: [i; 32],
+                size: 1,
+                index: usize::from(i),
+            })
+            .collect()
+    }
+
+    fn shortfall() -> Error {
+        Error::InsufficientFunds {
+            have: Amount::from(5),
+            need: Amount::from(300),
+        }
+    }
+
+    /// The first of three records paid for and stored, as when an earlier batch settled.
+    fn first_batch_settled() -> UploadOutcome {
+        UploadOutcome {
+            addresses: vec![[0; 32]],
+            amount: Amount::from(100),
+            gas: 7,
+            ..Default::default()
+        }
+    }
+
+    fn assert_caused_by_the_shortfall(error: &Error) {
+        match error {
+            Error::PartialUpload {
+                cause: Some(cause), ..
+            } => assert!(
+                matches!(
+                    **cause,
+                    Error::InsufficientFunds { have, need }
+                        if have == Amount::from(5) && need == Amount::from(300)
+                ),
+                "cause: {cause:?}"
+            ),
+            other => panic!("expected a partial upload caused by the shortfall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_later_shortfall_with_failed_storage_keeps_what_was_stored_and_the_typed_cause() {
+        let records = records(3);
+        let storage = Err(Error::PartialUpload {
+            stored: vec![[0; 32]],
+            stored_count: 1,
+            failed: vec![
+                ([1; 32], "short of quorum".into()),
+                ([2; 32], "upload interrupted before storage".into()),
+            ],
+            failed_count: 2,
+            total_chunks: 3,
+            spend: Box::new(PartialUploadSpend {
+                storage_cost_atto: "100".into(),
+                gas_cost_wei: 7,
+            }),
+            reason: "Merkle storage short of quorum after deferred retries".into(),
+            cause: None,
+        });
+
+        let error =
+            payment_and_storage(Err(shortfall()), storage, &records, &first_batch_settled())
+                .unwrap_err();
+
+        assert_caused_by_the_shortfall(&error);
+        let Error::PartialUpload {
+            stored,
+            failed_count,
+            spend,
+            reason,
+            ..
+        } = &error
+        else {
+            unreachable!()
+        };
+        assert_eq!(stored, &[[0; 32]]);
+        assert_eq!(*failed_count, 2);
+        assert_eq!(spend.storage_cost_atto, "100");
+        assert_eq!(spend.gas_cost_wei, 7);
+        assert!(
+            reason.contains("insufficient funds") && reason.contains("short of quorum"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_later_shortfall_with_another_storage_error_is_a_partial_upload_with_the_typed_cause() {
+        let records = records(3);
+        let storage = Err(Error::Storage("disk full".into()));
+
+        let error =
+            payment_and_storage(Err(shortfall()), storage, &records, &first_batch_settled())
+                .unwrap_err();
+
+        assert_caused_by_the_shortfall(&error);
+        let Error::PartialUpload {
+            stored,
+            failed,
+            total_chunks,
+            spend,
+            reason,
+            ..
+        } = &error
+        else {
+            unreachable!()
+        };
+        assert_eq!(stored, &[[0; 32]]);
+        assert_eq!(
+            failed
+                .iter()
+                .map(|(address, _)| *address)
+                .collect::<Vec<_>>(),
+            [[1; 32], [2; 32]]
+        );
+        assert_eq!(*total_chunks, 3);
+        assert_eq!(spend.storage_cost_atto, "100");
+        assert!(
+            reason.contains("insufficient funds") && reason.contains("disk full"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_shortfall_with_nothing_to_store_is_returned_as_it_is() {
+        let records = records(3);
+        let outcome = first_batch_settled();
+        assert!(matches!(
+            payment_and_storage(Err(shortfall()), Ok(()), &records, &outcome),
+            Err(Error::InsufficientFunds { .. })
+        ));
+        assert!(payment_and_storage(Ok(()), Ok(()), &records, &outcome).is_ok());
+    }
+
+    #[test]
+    fn a_shortfall_after_an_earlier_batch_settled_is_a_partial_upload_caused_by_it() {
+        let records = records(3);
+
+        let error = after_spend(shortfall(), &records, &first_batch_settled());
+
+        assert_caused_by_the_shortfall(&error);
+        let Error::PartialUpload {
+            stored,
+            failed_count,
+            spend,
+            reason,
+            ..
+        } = &error
+        else {
+            unreachable!()
+        };
+        assert_eq!(stored, &[[0; 32]]);
+        assert_eq!(*failed_count, 2);
+        assert_eq!(spend.storage_cost_atto, "100");
+        assert_eq!(reason, &shortfall().to_string());
+    }
+
+    #[test]
+    fn a_shortfall_before_anything_was_spent_stays_insufficient_funds() {
+        assert!(matches!(
+            after_spend(shortfall(), &records(3), &UploadOutcome::default()),
+            Error::InsufficientFunds { .. }
+        ));
+    }
+
+    #[test]
+    fn a_partial_upload_keeps_its_cause_after_spend() {
+        let records = records(3);
+        let partial = after_spend(shortfall(), &records, &first_batch_settled());
+
+        let error = after_spend(partial, &records, &first_batch_settled());
+
+        assert_caused_by_the_shortfall(&error);
     }
 }

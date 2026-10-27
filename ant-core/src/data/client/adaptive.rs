@@ -3122,6 +3122,7 @@ mod tests {
                         gas_cost_wei: 0,
                     }),
                     reason: "r".to_string(),
+                    cause: None,
                 }),
             ),
         ];

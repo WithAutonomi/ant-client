@@ -53,7 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   journaled native path that file and data uploads use, the wave-batch and Merkle batch paths, and
   single-chunk payment. Nothing has been paid when it is returned, because the wallet checks its
   balance before sending. A shortfall after earlier batches of the same upload were paid still
-  surfaces as `PartialUpload`, with this error as its reason, so the spend is still reported. The
+  surfaces as `PartialUpload`, so the spend and the stored chunks are still reported, and it is now
+  kept typed in the new `PartialUpload::cause` field (also set when storing the paid batches
+  failed too). Code that builds `PartialUpload` or matches it without `..` must add the field. The
   CLI's message changes from `payment error: Insufficient tokens to pay for quotes. Have: …` to
   `insufficient funds: wallet has … atto, payment needs … atto`. A shortfall of gas (ETH) is not
   detected up front and is unchanged.
