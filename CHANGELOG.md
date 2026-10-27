@@ -62,7 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   works in a new terminal straight after installing (#194). When `INSTALL_DIR` is not already on
   `PATH` it adds a guarded line to `~/.profile`, to the user's existing bash startup files, to
   `~/.zshenv` when zsh is installed and to fish's `conf.d` when fish is, and lists each file it
-  changed. `--no-modify-path` or `ANT_NO_MODIFY_PATH=1` (also honoured by `install.ps1`) restores
+  changed. The directory is escaped in those lines and in the `export PATH=...` line it prints, so
+  a name containing quotes, `$`, backticks or backslashes is added literally and never run.
+  `--no-modify-path` or `ANT_NO_MODIFY_PATH=1` (also honoured by `install.ps1`) restores
   the old print-the-line behaviour. The macOS default install directory moves from
   `/usr/local/bin`, which is root-owned without Homebrew so the install failed without `sudo`, to
   `~/.local/bin`, matching Linux. If another `ant` is already on `PATH` — an earlier macOS

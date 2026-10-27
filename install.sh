@@ -81,11 +81,18 @@ default_install_dir() {
   echo "$HOME/.local/bin"
 }
 
-# $1 with a leading $HOME spelled as a literal `$HOME`, for lines written into startup files.
-home_relative() {
+# $1 escaped to read back literally inside double quotes: \ " $ and ` for POSIX shells, and
+# \ " and $ for fish, where ` is not special. sed rather than ${1//...}, whose replacement quoting
+# differs between bash 3.2 and 5.2.
+sh_quoted() { printf '%s\n' "$1" | sed 's/[\\"$`]/\\&/g'; }
+fish_quoted() { printf '%s\n' "$1" | sed 's/[\\"$]/\\&/g'; }
+
+# $1 for use inside double quotes in a startup file, escaped by $2 (sh_quoted or fish_quoted), with
+# a leading $HOME spelled as a literal `$HOME`, so the line keeps working if the home directory moves.
+startup_path() {
   case "$1" in
-    "$HOME"/*) printf '%s\n' "\$HOME${1#"$HOME"}" ;;
-    *)         printf '%s\n' "$1" ;;
+    "$HOME"/*) printf '%s\n' "\$HOME$("$2" "${1#"$HOME"}")" ;;
+    *)         "$2" "$1" ;;
   esac
 }
 
@@ -133,16 +140,27 @@ append_startup_line() {
 
 # Put INSTALL_DIR on PATH for future shells, and tell the user what changed.
 add_install_dir_to_path() {
-  local dir posix_line fish_line rc i status
+  local posix_dir fish_dir posix_line fish_line rc i status
   local entries=() changed=() present=() failed=()
 
-  dir="$(home_relative "$INSTALL_DIR")"
+  # Each startup line has to fit on one line, and is checked for line by line.
+  case "$INSTALL_DIR" in
+    *$'\n'*)
+      say ""
+      say "WARNING: ${INSTALL_DIR} contains a newline, so it was not added to your shell startup files."
+      say "Add it to your PATH yourself."
+      return
+      ;;
+  esac
+
+  posix_dir="$(startup_path "$INSTALL_DIR" sh_quoted)"
+  fish_dir="$(startup_path "$INSTALL_DIR" fish_quoted)"
   # Guarded, so a shell that reads several of these files (Ubuntu's ~/.profile sources ~/.bashrc)
   # still ends up with one entry.
   # shellcheck disable=SC2016 # $PATH is meant to reach the startup file unexpanded.
-  posix_line="$(printf 'case ":${PATH}:" in *":%s:"*) ;; *) export PATH="%s:$PATH" ;; esac' "$dir" "$dir")"
+  posix_line="$(printf 'case ":${PATH}:" in *":%s:"*) ;; *) export PATH="%s:$PATH" ;; esac' "$posix_dir" "$posix_dir")"
   # shellcheck disable=SC2016
-  fish_line="$(printf 'contains "%s" $PATH; or set -gx PATH "%s" $PATH' "$dir" "$dir")"
+  fish_line="$(printf 'contains "%s" $PATH; or set -gx PATH "%s" $PATH' "$fish_dir" "$fish_dir")"
 
   # Pairs of (startup file, line to add to it).
   while IFS= read -r rc; do
@@ -179,7 +197,7 @@ add_install_dir_to_path() {
   else
     say "Open a new terminal to use ant, or run this to use it in the current one:"
   fi
-  say "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+  say "  export PATH=\"$(sh_quoted "$INSTALL_DIR"):\$PATH\""
 }
 
 # Whether a version is eligible for a release channel.
@@ -326,9 +344,10 @@ say "Extracting..."
 tar xzf "${TMPDIR}/${ARCHIVE}" -C "$TMPDIR"
 
 # Install binary
-mkdir -p "$INSTALL_DIR"
+mkdir -p -- "$INSTALL_DIR"
 # Absolute, so the PATH entry written below does not depend on where the installer was run from.
-INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)"
+# CDPATH cleared, or `cd` into a relative directory found through it prints that directory too.
+INSTALL_DIR="$(CDPATH='' cd -- "$INSTALL_DIR" && pwd)"
 cp "${TMPDIR}/${BINARY_NAME}-${VERSION}-${TARGET}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
 say "Installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
@@ -353,7 +372,7 @@ case ":$PATH:" in
       say ""
       say "WARNING: ${INSTALL_DIR} is not in your PATH."
       say "Add it with:"
-      say "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+      say "  export PATH=\"$(sh_quoted "$INSTALL_DIR"):\$PATH\""
     fi
     ;;
 esac
