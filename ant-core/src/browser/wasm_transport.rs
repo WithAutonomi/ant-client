@@ -29,7 +29,7 @@ use ant_protocol::transport::{
 };
 use futures_channel::oneshot;
 use futures_util::{
-    future::{join_all, select, Either},
+    future::{join_all, pending, select, Either},
     lock::{Mutex, MutexGuard},
     stream::FuturesUnordered,
 };
@@ -79,6 +79,22 @@ const CONNECTION_SETUP_TIMEOUT_MS: u32 = 30_000;
 const ICE_GATHERING_TURN_TIMEOUT: Duration = Duration::from_secs(1);
 /// How often the holder of the gathering turn checks whether its gathering completed.
 const ICE_GATHERING_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How long a new connection waits for ICE to find a path to its endpoint. On
+/// mainnet a live node answers ICE checks in about a tenth of a second (p99
+/// 1.4 s, slowest 2.7 s of 788). About two in five endpoints that lookups dial
+/// never answer, and each used to hold a pool slot, and keep its lookup round
+/// waiting, for the whole channel-opening timeout.
+const ICE_CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(3);
+/// Dial failure of an endpoint that did not answer ICE checks in time.
+const ICE_UNREACHABLE: &str = "WebRTC endpoint did not answer ICE connectivity checks";
+/// The global holding the browser's `Navigator`.
+const NAVIGATOR: &str = "navigator";
+/// User-Agent Client Hints, which only Chromium exposes on `Navigator`.
+const CHROMIUM_USER_AGENT_DATA: &str = "userAgentData";
+/// `Navigator`'s vendor, which pages do not change.
+const NAVIGATOR_VENDOR: &str = "vendor";
+/// The vendor every WebKit browser reports, Safari and all iOS browsers.
+const WEBKIT_VENDOR: &str = "Apple Computer, Inc.";
 const MAX_BUFFERED_AMOUNT: u32 = 2 * 1024 * 1024;
 // Retain useful associations across concurrent close-group walks. Active leases
 // remain non-evictable, and the pool still imposes a hard resource bound.
@@ -114,6 +130,13 @@ const DEFAULT_BROWSER_QUOTE_CONCURRENCY: usize = 4;
 const MAX_READ_RESPONSE_MEMORY: usize = 128 * 1024 * 1024;
 const READ_RESPONSE_RESERVATION: usize =
     3 * (MAX_BROWSER_RESPONSE_BYTES + PQ_ENCRYPTED_OVERHEAD_BYTES);
+/// How long a read's first GET waits for its response, once dispatched to its
+/// peer, before the read also asks another holder. A healthy peer takes 1-3 s to
+/// carry a 4 MiB record over a WebRTC DataChannel, so the native 1 s raced nearly
+/// every read and fetched a second copy. The delay also covers the GET's wait for
+/// its peer: a session slot, and replies its session carries ahead of it. A peer
+/// busy with several of this client's GETs may therefore be raced.
+const BROWSER_READ_HEDGE_DELAY: Duration = Duration::from_secs(3);
 const MAX_BROWSER_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_UPLOAD_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
@@ -122,11 +145,12 @@ const MAX_UPLOAD_CHECKPOINT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_UPLOAD_RECORDS: usize = 4096;
 
 thread_local! {
-    /// One connection in the page gathers ICE candidates at a time. WebKit opens
-    /// up to thirty UDP sockets for each connection whose gathering overlaps
-    /// another's, instead of two, and past 256 sockets per page it closes the
-    /// oldest, silently cutting established connections. The cap is per page,
-    /// so the turn is shared by every client in it.
+    /// One connection in the page gathers ICE candidates at a time, except in
+    /// Chromium (see [`ice_gathering_may_overlap`]). WebKit opens up to thirty
+    /// UDP sockets for each connection whose gathering overlaps another's,
+    /// instead of two, and past 256 sockets per page it closes the oldest,
+    /// silently cutting established connections. The cap is per page, so the
+    /// turn is shared by every client in it.
     static ICE_GATHERING_TURN: Arc<Semaphore> = Arc::new(Semaphore::new(1));
 }
 
@@ -252,7 +276,19 @@ impl Deref for BrowserClientLease {
 
 impl BrowserClientLease {
     async fn authenticated(&self) -> Result<LockedBrowserClient<'_>, RpcError> {
-        self.client.authenticated_before(&self.admission).await
+        self.client
+            .authenticated_before(&self.admission, None)
+            .await
+    }
+
+    /// Authenticate for a GET, whose session slot follows its read priority.
+    async fn authenticated_read(
+        &self,
+        read: &multiplex::ReadPriority<'_>,
+    ) -> Result<LockedBrowserClient<'_>, RpcError> {
+        self.client
+            .authenticated_before(&self.admission, Some(read))
+            .await
     }
 
     async fn hello(&self) -> Result<BrowserHello, String> {
@@ -295,7 +331,7 @@ impl BrowserClientLease {
                     client.authenticate().await?;
                     drop(client);
                     let client = match select(
-                        Box::pin(self.client.authenticated_before(&self.admission)),
+                        Box::pin(self.client.authenticated_before(&self.admission, None)),
                         Box::pin(sender.cancellation()),
                     )
                     .await
@@ -620,11 +656,14 @@ impl BrowserClientPool {
         }
     }
 
+    /// Physical GETs admitted at once: the adaptive fetch cap within the read
+    /// budget, or the budget's capacity before a client installs its limiter.
     fn read_limit(&self) -> usize {
-        let desired = self.fetch_limiter.borrow().as_ref().map_or_else(
-            || crate::data::client::adaptive::ChannelStart::default().fetch,
-            |limiter| limiter.current(),
-        );
+        let desired = self
+            .fetch_limiter
+            .borrow()
+            .as_ref()
+            .map_or_else(|| self.read_budget.capacity(), |limiter| limiter.current());
         self.read_budget.limit(desired)
     }
 
@@ -748,6 +787,15 @@ impl PeerAssociation {
         for lane in self.channels.borrow().iter() {
             lane.inbox.fail(PEER_CONNECTION_FAILED.to_string());
         }
+    }
+
+    /// ICE has found no path to the peer yet. A browser without
+    /// `iceConnectionState` never reports that.
+    fn awaits_connectivity(&self) -> bool {
+        matches!(
+            self.connection.ice_connection_state(),
+            RtcIceConnectionState::New | RtcIceConnectionState::Checking
+        )
     }
 
     /// Reuse the association only while another lane still uses it. A
@@ -941,7 +989,12 @@ impl Connection {
             JsFuture::from(connection.peer_connection.set_local_description(&local))
                 .await
                 .map_err(js_error_message)?;
-            pass_ice_gathering_turn(RtcPeerConnection::clone(&connection.peer_connection), turn);
+            if let Some(turn) = turn {
+                pass_ice_gathering_turn(
+                    RtcPeerConnection::clone(&connection.peer_connection),
+                    turn,
+                );
+            }
             let local_sdp = connection
                 .peer_connection
                 .local_description()
@@ -966,14 +1019,35 @@ impl Connection {
                 .await
                 .map_err(|_| "WebRTC DataChannel closed before opening".to_string())?
         };
-        let ended = async {
-            connection.peer_connection.ended().await;
-            Err(PEER_CONNECTION_FAILED.to_string())
+        // The browser reports a refused dial dead at once. A live endpoint
+        // answers ICE checks well within the connectivity timeout, so a new
+        // dial to one that has not fails then, rather than at the opening
+        // timeout.
+        let failed = async {
+            let unanswered = async {
+                if fresh {
+                    crate::runtime::sleep(ICE_CONNECTIVITY_TIMEOUT).await;
+                    if connection.peer_connection.awaits_connectivity() {
+                        return;
+                    }
+                }
+                pending::<()>().await
+            };
+            match select(
+                Box::pin(connection.peer_connection.ended()),
+                Box::pin(unanswered),
+            )
+            .await
+            {
+                Either::Left(_) => PEER_CONNECTION_FAILED,
+                Either::Right(_) => ICE_UNREACHABLE,
+            }
         };
         let open = timeout(
             async move {
-                match select(Box::pin(opened), Box::pin(ended)).await {
-                    Either::Left((result, _)) | Either::Right((result, _)) => result,
+                match select(Box::pin(opened), Box::pin(failed)).await {
+                    Either::Left((result, _)) => result,
+                    Either::Right((error, _)) => Err(error.to_string()),
                 }
             },
             "WebRTC DataChannel opening timed out",
@@ -1248,6 +1322,7 @@ impl BrowserNodeClientCore {
     async fn authenticated_before(
         &self,
         admission: &TransferDeadline,
+        read: Option<&multiplex::ReadPriority<'_>>,
     ) -> Result<LockedBrowserClient<'_>, RpcError> {
         loop {
             let mut client = self.lock_before(admission).await?;
@@ -1257,7 +1332,11 @@ impl BrowserNodeClientCore {
                 .current_rpc()
                 .ok_or_else(|| "WebRTC session unavailable".to_string())?;
             let generation = self.generation.get();
-            match rpc.admit(admission.remaining()).await {
+            let admitted = match read {
+                Some(read) => rpc.admit_read(admission.remaining(), read).await,
+                None => rpc.admit(admission.remaining()).await,
+            };
+            match admitted {
                 Ok(_) if generation != self.generation.get() => continue,
                 Ok(slot) if !rpc.is_closed() => {
                     client.slot.replace(Some(slot));
@@ -1284,7 +1363,7 @@ impl BrowserNodeClientCore {
 
     #[cfg(feature = "test-utils")]
     async fn authenticated(&self) -> Result<LockedBrowserClient<'_>, RpcError> {
-        self.authenticated_before(&TransferDeadline::new(RPC_ADMISSION_TIMEOUT))
+        self.authenticated_before(&TransferDeadline::new(RPC_ADMISSION_TIMEOUT), None)
             .await
     }
 
@@ -1325,7 +1404,7 @@ impl Drop for BrowserNodeClientCore {
 struct LockedBrowserClient<'a> {
     client: &'a BrowserNodeClientCore,
     _guard: Option<MutexGuard<'a, ()>>,
-    slot: RefCell<Option<tokio::sync::OwnedSemaphorePermit>>,
+    slot: RefCell<Option<multiplex::SessionSlot>>,
     authenticated_generation: Option<u64>,
 }
 
@@ -2468,11 +2547,37 @@ impl BrowserNetworkClient {
         let inner = Rc::new(inner);
         let adapter = Rc::new(SharedNetworkAdapter::new(Rc::clone(&inner)));
         let network = crate::data::Network::from_browser(adapter.clone());
+        // The fetch channel never probes past the GETs the read budget admits
+        // at once. A fetch beyond them adds only a lookup, and on mainnet more
+        // lookups cost dials more than they overlap transfers: allowed the
+        // default ceiling, the controller probed 10, a successful dial's p90
+        // rose from 2.7 s to 4.8 s, and downloads were slower. Where dials
+        // gather ICE candidates at once, it also starts there: a WebRTC
+        // DataChannel carries a record more slowly than QUIC, so the native
+        // cold start would leave much of the budget idle. Where dials take
+        // turns to gather, more concurrent reads queue more dials for the turn.
+        // In WebKit on mainnet, starting at the budget made a dial wait 1.9 s
+        // at the median before its ICE checks, against 0.7 s at the native
+        // cold start, and downloads were slower, so it keeps that start. The
+        // adaptive controller moves from either start. A hedge or a GET after
+        // discovery may wait for a permit another fetch's GET frees, and holds
+        // nothing of its peer's meanwhile.
+        let read_capacity = inner.pool.read_budget.capacity();
+        let mut config = crate::data::ClientConfig::default();
+        config.adaptive.max.fetch = read_capacity;
+        let cold_start = crate::data::client::adaptive::ChannelStart::default();
+        let start = crate::data::client::adaptive::ChannelStart {
+            fetch: if ice_gathering_may_overlap() {
+                read_capacity
+            } else {
+                cold_start.fetch
+            },
+            ..cold_start
+        };
         let shared = Rc::new(
-            crate::data::Client::from_network(network, crate::data::ClientConfig::default())
-                .with_chunk_cache(crate::data::ChunkCache::new(
-                    MAX_RANGE_CACHE_BYTES / MAX_BROWSER_RECORD_BYTES,
-                )),
+            crate::data::Client::from_network_with_start(network, config, start).with_chunk_cache(
+                crate::data::ChunkCache::new(MAX_RANGE_CACHE_BYTES / MAX_BROWSER_RECORD_BYTES),
+            ),
         );
         *inner.pool.fetch_limiter.borrow_mut() = Some(shared.controller().fetch.clone());
         let read_ahead = read_ahead::ReadAheadPool::new(&inner, &shared);
@@ -3541,9 +3646,35 @@ fn transfer_timeout_ms(content_bytes: usize) -> u32 {
     u32::try_from(transfer_timeout(content_bytes).as_millis()).unwrap_or(u32::MAX)
 }
 
-/// Wait for the page's ICE gathering turn. The semaphore is never closed, so
-/// this always returns a turn; `None` would only skip the wait.
+/// Whether this page's connections may gather ICE candidates at once. Chromium
+/// opens no extra sockets for overlapping gatherings, and on mainnet waiting
+/// for the turn delayed its typical dial by 0.6-1.7 s, more as more lookups ran.
+/// Only Chromium exposes User-Agent Client Hints, so every other engine, WebKit
+/// and also the unmeasured Firefox, keeps taking turns. A page can add
+/// `userAgentData` itself, as a polyfill does, so WebKit's vendor also keeps
+/// the turn: overlapping there would cut established connections.
+fn ice_gathering_may_overlap() -> bool {
+    let Some(navigator) = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str(NAVIGATOR))
+        .ok()
+        .filter(JsValue::is_object)
+    else {
+        return false;
+    };
+    let chromium = js_sys::Reflect::has(&navigator, &JsValue::from_str(CHROMIUM_USER_AGENT_DATA))
+        .unwrap_or(false);
+    let webkit = js_sys::Reflect::get(&navigator, &JsValue::from_str(NAVIGATOR_VENDOR))
+        .ok()
+        .and_then(|vendor| vendor.as_string())
+        .is_some_and(|vendor| vendor == WEBKIT_VENDOR);
+    chromium && !webkit
+}
+
+/// Wait for the page's ICE gathering turn, or `None` where connections may
+/// gather at once. The semaphore is never closed.
 async fn ice_gathering_turn() -> Option<OwnedSemaphorePermit> {
+    if ice_gathering_may_overlap() {
+        return None;
+    }
     ICE_GATHERING_TURN
         .with(Arc::clone)
         .acquire_owned()
@@ -3553,7 +3684,7 @@ async fn ice_gathering_turn() -> Option<OwnedSemaphorePermit> {
 
 /// Pass the turn on once `connection` finishes gathering, or after
 /// [`ICE_GATHERING_TURN_TIMEOUT`]. The connection itself carries on at once.
-fn pass_ice_gathering_turn(connection: RtcPeerConnection, turn: Option<OwnedSemaphorePermit>) {
+fn pass_ice_gathering_turn(connection: RtcPeerConnection, turn: OwnedSemaphorePermit) {
     wasm_bindgen_futures::spawn_local(async move {
         let deadline = web_time::Instant::now() + ICE_GATHERING_TURN_TIMEOUT;
         while connection.ice_gathering_state() != RtcIceGatheringState::Complete

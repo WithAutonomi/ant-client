@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { test_multiplex_requests, test_cancelled_read_reservation, test_stale_rpc_admission, test_admitted_hello_never_redials, test_closed_session_error, test_draining_pool_capacity, test_multiplex_puts } from './pkg/ant_core.js';
+import { test_multiplex_requests, test_cancelled_read_reservation, test_stale_rpc_admission, test_admitted_hello_never_redials, test_closed_session_error, test_draining_pool_capacity, test_multiplex_puts, test_speculative_read_after_abandoned_put } from './pkg/ant_core.js';
 import { mockWebRtc } from './mock-webrtc.mjs';
 const object = v => v instanceof Map ? Object.fromEntries([...v].map(([k,x]) => [k, object(x)])) : Array.isArray(v) ? v.map(object) : v;
 
@@ -86,4 +86,10 @@ test('PUTs retain per-lane serialization on multiplex-capable nodes', async () =
   assert.equal(peak, 1);
   assert.equal(rtc.connections.length, 1);
   assert.equal(rtc.requests.filter(r => r.method === 'hello').length, 1);
+});
+
+test('a speculative GET takes the slots an abandoned exclusive request hands back', async () => {
+  const rtc = mockWebRtc([{ multiplex: true }]);
+  assert.equal(await test_speculative_read_after_abandoned_put(rtc.endpoints[0]), true);
+  assert.equal(rtc.connections.length, 1);
 });
