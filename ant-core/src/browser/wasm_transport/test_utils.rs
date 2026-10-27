@@ -20,6 +20,13 @@ use saorsa_transport::webrtc::{
     accept_pq_session, encode_response_frame, parse_request_frame, BrowserResponse,
 };
 
+/// Lets an exclusive request gather the slots it can before a GET queues.
+const EXCLUSIVE_GATHERS_FIRST: Duration = Duration::from_millis(10);
+/// When the exclusive request is abandoned, still waiting for its last slot.
+const EXCLUSIVE_ABANDONED_AFTER: Duration = Duration::from_millis(50);
+/// Well past the abandonment, and far short of an ordinary admission timeout.
+const SPECULATIVE_ADMISSION_WAIT: Duration = Duration::from_millis(500);
+
 /// Exercise bootstrap readiness after actual LRU pool eviction.
 #[wasm_bindgen]
 pub async fn test_bootstrap_eviction(endpoints: JsValue) -> Result<(), JsValue> {
@@ -1490,6 +1497,40 @@ pub async fn test_draining_pool_capacity(endpoints: JsValue) {
         .await
         .unwrap();
     pool.close();
+}
+
+/// Abandon an exclusive request while it holds three of a multiplexed session's
+/// four slots and waits for the fourth, which an active request holds. A
+/// speculative GET queued meanwhile must be admitted to the slots it hands back,
+/// with no slot released and no change to the GET's read priority.
+#[wasm_bindgen]
+pub async fn test_speculative_read_after_abandoned_put(endpoint: &str) -> bool {
+    let client = BrowserNodeClientCore::new(parse_webrtc_direct_multiaddr(endpoint).unwrap());
+    client.hello().await.unwrap();
+    let rpc = client.current_rpc().unwrap();
+    let active = rpc.admit(RPC_ADMISSION_TIMEOUT).await.unwrap();
+    let put = rpc.request(0, Vec::new(), RPC_ADMISSION_TIMEOUT, None, None, true);
+    let speculative = || true;
+    // Never changes, so only the returned slots can admit the GET.
+    let (_priority, changed) = watch::channel(());
+    let read = multiplex::ReadPriority {
+        speculative: &speculative,
+        changed,
+    };
+    let queued_read = async {
+        crate::runtime::sleep(EXCLUSIVE_GATHERS_FIRST).await;
+        rpc.admit_read(SPECULATIVE_ADMISSION_WAIT, &read).await
+    };
+    let (put, admitted) = futures::future::join(
+        crate::runtime::timeout(EXCLUSIVE_ABANDONED_AFTER, put),
+        queued_read,
+    )
+    .await;
+    assert!(put.is_err(), "the exclusive request was admitted");
+    let admitted = admitted.is_ok();
+    drop(active);
+    client.close();
+    admitted
 }
 
 #[wasm_bindgen]

@@ -49,6 +49,17 @@ impl Drop for SessionSlot {
     }
 }
 
+/// Wakes those waiting on `released` when dropped. An exclusive request's
+/// wait for every slot that times out or is cancelled hands back the permits it
+/// had gathered, and no `SessionSlot` release reports them.
+struct WakeOnDrop<'a>(&'a watch::Sender<()>);
+
+impl Drop for WakeOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.send_replace(());
+    }
+}
+
 /// Resolves on the next change. A closed channel never changes again.
 async fn next_change(receiver: &mut watch::Receiver<()>) {
     if receiver.changed().await.is_err() {
@@ -241,6 +252,9 @@ impl RpcSession {
         let permit = if exclusive {
             drop(permit);
             let count = self.capacity() as u32;
+            // However the wait ends, a speculative GET waiting on `released`
+            // learns of any permits it hands back.
+            let _wake = WakeOnDrop(&self.released);
             let permit = crate::runtime::timeout(
                 RPC_ADMISSION_TIMEOUT,
                 self.slots.clone().acquire_many_owned(count),
