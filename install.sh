@@ -88,13 +88,29 @@ sh_quoted() { printf '%s\n' "$1" | sed 's/[\\"$`]/\\&/g'; }
 
 # Whether $1 is unsafe to put on PATH from a startup file: shells can end up running part of a name
 # containing $, `, " or \ as code, however the line is quoted. macOS login shells, for one, re-read
-# PATH through `eval $(path_helper -s)`, and path_helper does not escape it. A newline would split
-# the line, which is checked for line by line.
+# PATH through `eval $(path_helper -s)`, and path_helper does not escape it. (A newline is rejected
+# before anything is installed.)
 unsafe_on_path() {
   case "$1" in
-    *'$'* | *'`'* | *'"'* | *\\* | *$'\n'*) return 0 ;;
+    *'$'* | *'`'* | *'"'* | *\\*) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# PATH is colon-separated, so a directory with `:` in its name can't be one of its entries: a
+# trailing `:` adds an empty entry, which searches the current directory, and one in the middle
+# adds a second, different directory.
+has_colon() {
+  case "$1" in
+    *:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+say_colon_refusal() {
+  say ""
+  say "WARNING: ${INSTALL_DIR} can't be added to your PATH: ':' in its name separates PATH entries."
+  say "Install to a directory without it, or run ${INSTALL_DIR}/${BINARY_NAME} by its full path."
 }
 
 # $1 with a leading $HOME spelled as a literal `$HOME`, for lines written into startup files.
@@ -152,13 +168,17 @@ add_install_dir_to_path() {
   local dir posix_line fish_line rc i status
   local entries=() changed=() present=() failed=()
 
+  if has_colon "$INSTALL_DIR"; then
+    say_colon_refusal
+    return
+  fi
   if unsafe_on_path "$INSTALL_DIR"; then
     say ""
     say "WARNING: ${INSTALL_DIR} was not added to your shell startup files."
     # shellcheck disable=SC2016 # The characters are listed, not expanded.
-    say 'Its name contains $, `, ", \ or a newline, which some shells would run as code: macOS login'
-    say "shells, for one, re-read PATH without escaping it. Install to a directory without them, or"
-    say "to use ant in the current shell only, run:"
+    say 'Its name contains $, `, " or \, which some shells would run as code: macOS login shells,'
+    say "for one, re-read PATH without escaping it. Install to a directory without them, or to use"
+    say "ant in the current shell only, run:"
     say "  export PATH=\"$(sh_quoted "$INSTALL_DIR"):\$PATH\""
     return
   fi
@@ -334,6 +354,11 @@ TARGET="$(detect_target)"
 CHANNEL="${ANT_CHANNEL:-stable}"
 VERSION="${ANT_VERSION:-$(resolve_version "$CHANNEL")}"
 INSTALL_DIR="${INSTALL_DIR:-$(default_install_dir)}"
+# Checked before anything is downloaded or created: making the path absolute below strips a
+# trailing newline, which would install somewhere else, and no PATH line can hold one anyway.
+case "$INSTALL_DIR" in
+  *$'\n'*) err "INSTALL_DIR must not contain a newline" ;;
+esac
 
 if [ -n "${ANT_VERSION:-}" ]; then
   say "Installing ant ${VERSION} for ${TARGET}..."
@@ -378,6 +403,8 @@ case ":$PATH:" in
   *)
     if [ "$MODIFY_PATH" = 1 ]; then
       add_install_dir_to_path
+    elif has_colon "$INSTALL_DIR"; then
+      say_colon_refusal
     else
       say ""
       say "WARNING: ${INSTALL_DIR} is not in your PATH."

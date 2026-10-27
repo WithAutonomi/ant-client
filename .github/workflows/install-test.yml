@@ -107,6 +107,46 @@ jobs:
             [ "$found" = "$dir/ant" ] || exit 1
           done
 
+      # PATH is colon-separated, so a name with `:` can't be a PATH entry at all: no startup file,
+      # fish's included, and no `export PATH=` line, with or without --no-modify-path. A newline is
+      # rejected before anything is installed; `pwd` would strip a trailing one, and the install
+      # would land in the directory without it.
+      - name: verify an install directory with a colon or a newline in its name is refused
+        env:
+          ANT_VERSION: ${{ inputs.version }}
+        run: |
+          home="$RUNNER_TEMP/colon-home"
+          mkdir -p "$home"
+          fresh() { env -i HOME="$home" SHELL=/bin/bash PATH=/usr/bin:/bin "$@"; }
+          for case in "$home/with:colon|" "$home/trailing:|" "$home/no-modify:path|1"; do
+            dir="${case%|*}"
+            out="$(fresh ANT_VERSION="$ANT_VERSION" INSTALL_DIR="$dir" ANT_NO_MODIFY_PATH="${case##*|}" bash install.sh)"
+            echo "$out"
+            if ! echo "$out" | grep -q "can't be added to your PATH"; then
+              echo "ERROR: expected the installer to refuse $dir"
+              exit 1
+            fi
+            if echo "$out" | grep -q '^  export PATH='; then
+              echo "ERROR: the installer printed an export line for $dir"
+              exit 1
+            fi
+          done
+          for f in .profile .bashrc .zshenv .config/fish/conf.d/ant.fish; do
+            if [ -e "$home/$f" ]; then
+              echo "ERROR: $f was written"
+              exit 1
+            fi
+          done
+          mkdir -p "$home/nl"
+          if fresh ANT_VERSION="$ANT_VERSION" INSTALL_DIR="$home/nl"$'\n' bash install.sh; then
+            echo "ERROR: an INSTALL_DIR ending in a newline was accepted"
+            exit 1
+          fi
+          if [ -e "$home/nl/ant" ] || [ -e "$home/nl"$'\n' ]; then
+            echo "ERROR: something was installed for an INSTALL_DIR ending in a newline"
+            exit 1
+          fi
+
       # A relative INSTALL_DIR is made absolute with `cd`, which also prints the directory when it
       # is found through CDPATH.
       - name: verify a relative install directory with CDPATH set
