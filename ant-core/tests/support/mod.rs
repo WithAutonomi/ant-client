@@ -35,11 +35,11 @@ use ant_protocol::pqc::ops::{MlDsaOperations, MlDsaSecretKey};
 use ant_protocol::transport::{
     CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
 };
-use ant_protocol::{CLOSE_GROUP_SIZE, MAX_WIRE_MESSAGE_SIZE};
+use ant_protocol::{CLOSE_GROUP_SIZE, GET_OR_CLOSER_AGENT_TOKEN, MAX_WIRE_MESSAGE_SIZE};
 use rand::Rng;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -49,6 +49,9 @@ const TEST_PORT_RANGE_MAX: u16 = 60_000;
 const BOOTSTRAP_COUNT: usize = 2;
 const SPAWN_DELAY_MS: u64 = 200;
 const STABILIZATION_TIMEOUT_SECS: u64 = 180;
+/// A chunk read request is a few dozen bytes, so anything larger, such as a
+/// PUT carrying a chunk, is not decoded.
+const MAX_READ_REQUEST_BYTES: usize = 1024;
 
 /// Default node count for standard E2E tests.
 ///
@@ -155,35 +158,85 @@ impl Silence {
     }
 }
 
-/// Chunk GET requests a node has received, by chunk address, counted as each
-/// message arrives and before the node handles it.
+/// A chunk read request, as a node receives it.
+enum ReadRequest {
+    Get([u8; 32]),
+    /// A get-or-closer request (ant-node ADR-0020).
+    GetOrCloser([u8; 32]),
+}
+
+impl ReadRequest {
+    fn of(data: &[u8]) -> Option<Self> {
+        if data.len() > MAX_READ_REQUEST_BYTES {
+            return None;
+        }
+        match ChunkMessage::decode(data).ok()?.body {
+            ChunkMessageBody::GetRequest(request) => Some(Self::Get(request.address)),
+            ChunkMessageBody::GetOrCloserRequest(request) => {
+                Some(Self::GetOrCloser(request.address))
+            }
+            _ => None,
+        }
+    }
+
+    fn address(&self) -> [u8; 32] {
+        match self {
+            Self::Get(address) | Self::GetOrCloser(address) => *address,
+        }
+    }
+}
+
+/// Chunk reads the test nodes received, counted across the whole network.
+///
+/// Lets a test tell which kind of read a client sent, over the real
+/// transport.
+#[derive(Default)]
+pub struct ReadRequestCounts {
+    gets: AtomicUsize,
+    get_or_closers: AtomicUsize,
+}
+
+impl ReadRequestCounts {
+    fn record(&self, data: &[u8]) {
+        let counter = match ReadRequest::of(data) {
+            Some(ReadRequest::Get(_)) => &self.gets,
+            Some(ReadRequest::GetOrCloser(_)) => &self.get_or_closers,
+            None => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Plain GETs received so far.
+    pub fn gets(&self) -> usize {
+        self.gets.load(Ordering::Relaxed)
+    }
+
+    /// Get-or-closer requests received so far.
+    pub fn get_or_closers(&self) -> usize {
+        self.get_or_closers.load(Ordering::Relaxed)
+    }
+}
+
+/// Chunk read requests a node has received, by chunk address, counted as each
+/// message arrives and before the node handles it. A GET and a get-or-closer
+/// request (ADR-0020) are both reads.
 #[derive(Default)]
 pub struct ChunkGetCounts(Mutex<HashMap<[u8; 32], usize>>);
 
 impl ChunkGetCounts {
-    /// A GET request is a few dozen bytes, so anything larger, such as a PUT
-    /// carrying a chunk, is not decoded.
-    const MAX_GET_REQUEST_BYTES: usize = 1024;
-
     fn note(&self, data: &[u8]) {
-        if data.len() > Self::MAX_GET_REQUEST_BYTES {
+        let Some(request) = ReadRequest::of(data) else {
             return;
-        }
-        if let Ok(ChunkMessage {
-            body: ChunkMessageBody::GetRequest(request),
-            ..
-        }) = ChunkMessage::decode(data)
-        {
-            *self
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(request.address)
-                .or_default() += 1;
-        }
+        };
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(request.address())
+            .or_default() += 1;
     }
 
-    /// GET requests received for `address`.
+    /// Read requests received for `address`.
     pub fn get(&self, address: &[u8; 32]) -> usize {
         self.0
             .lock()
@@ -194,8 +247,22 @@ impl ChunkGetCounts {
     }
 }
 
+/// How every node of a test network is set up.
+#[derive(Clone, Copy)]
+struct NodeOptions {
+    /// ADR-0004: give each node a live storage commitment over this many
+    /// synthetic keys.
+    commitment_key_count: Option<u32>,
+    /// Whether nodes announce get-or-closer (ant-node ADR-0020) as ant-node
+    /// does, or look like older nodes that a client reads with FIND_NODE and
+    /// GET.
+    announces_get_or_closer: bool,
+}
+
 pub struct MiniTestnet {
     pub nodes: Vec<TestNode>,
+    /// Chunk reads received by every node.
+    pub reads: Arc<ReadRequestCounts>,
     _temp_dirs: Vec<tempfile::TempDir>,
     /// Keeps the Anvil process alive for the lifetime of the testnet.
     _testnet: Testnet,
@@ -209,7 +276,14 @@ impl MiniTestnet {
     /// Use `DEFAULT_NODE_COUNT` for standard tests, 35+ for merkle tests (need 16 peers per pool).
     /// Nodes emit baseline `(0, None)` quotes (no commitment source wired).
     pub async fn start(node_count: usize) -> Self {
-        Self::start_inner(node_count, None).await
+        Self::start_inner(
+            node_count,
+            NodeOptions {
+                commitment_key_count: None,
+                announces_get_or_closer: true,
+            },
+        )
+        .await
     }
 
     /// ADR-0004: start a testnet where every node carries a live storage
@@ -218,10 +292,31 @@ impl MiniTestnet {
     /// in the quote response). Exercises the full node→client→storer binding
     /// handshake against real QUIC + Anvil.
     pub async fn start_with_commitments(node_count: usize, key_count: u32) -> Self {
-        Self::start_inner(node_count, Some(key_count)).await
+        Self::start_inner(
+            node_count,
+            NodeOptions {
+                commitment_key_count: Some(key_count),
+                announces_get_or_closer: true,
+            },
+        )
+        .await
     }
 
-    async fn start_inner(node_count: usize, commitment_key_count: Option<u32>) -> Self {
+    /// ADR-0020: start a testnet whose nodes do not announce get-or-closer,
+    /// as nodes released before it do not, so a client reads them with
+    /// FIND_NODE and GET.
+    pub async fn start_without_get_or_closer(node_count: usize) -> Self {
+        Self::start_inner(
+            node_count,
+            NodeOptions {
+                commitment_key_count: None,
+                announces_get_or_closer: false,
+            },
+        )
+        .await
+    }
+
+    async fn start_inner(node_count: usize, options: NodeOptions) -> Self {
         // Start Anvil EVM testnet FIRST
         let testnet = Testnet::new().await.expect("start Anvil testnet");
         let evm_network = testnet.to_network();
@@ -238,6 +333,7 @@ impl MiniTestnet {
             .gen_range(TEST_PORT_RANGE_MIN..TEST_PORT_RANGE_MAX - node_count as u16);
         let mut nodes = Vec::with_capacity(node_count);
         let mut temp_dirs = Vec::with_capacity(node_count);
+        let reads = Arc::new(ReadRequestCounts::default());
         let mut bootstrap_addrs = Vec::new();
 
         // Phase 1: Spawn bootstrap nodes
@@ -252,7 +348,8 @@ impl MiniTestnet {
                 temp_dir.path(),
                 &evm_network,
                 i,
-                commitment_key_count,
+                options,
+                Arc::clone(&reads),
             )
             .await;
 
@@ -280,7 +377,8 @@ impl MiniTestnet {
                 temp_dir.path(),
                 &evm_network,
                 i,
-                commitment_key_count,
+                options,
+                Arc::clone(&reads),
             )
             .await;
 
@@ -361,6 +459,7 @@ impl MiniTestnet {
 
         Self {
             nodes,
+            reads,
             _temp_dirs: temp_dirs,
             _testnet: testnet,
             wallet,
@@ -389,7 +488,8 @@ impl MiniTestnet {
         data_dir: &std::path::Path,
         evm_network: &EvmNetwork,
         node_index: usize,
-        commitment_key_count: Option<u32>,
+        options: NodeOptions,
+        reads: Arc<ReadRequestCounts>,
     ) -> (
         Arc<P2PNode>,
         Arc<AntProtocol>,
@@ -417,6 +517,14 @@ impl MiniTestnet {
             .collect();
         core_config.connection_timeout = Duration::from_secs(5);
         core_config.node_identity = Some(Arc::clone(&identity));
+        // Every test node answers get-or-closer (ant-node ADR-0020); a client
+        // only sends one to a node whose user agent announces it, as
+        // ant-node's does. The `node/` prefix keeps it in routing tables.
+        core_config.custom_user_agent = Some(if options.announces_get_or_closer {
+            format!("node/ant-core-test {GET_OR_CLOSER_AGENT_TOKEN}")
+        } else {
+            "node/ant-core-test".to_string()
+        });
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
 
         let node = Arc::new(P2PNode::new(core_config).await.expect("create P2P node"));
@@ -499,7 +607,7 @@ impl MiniTestnet {
         // pinned, with the signed commitment shipped in the quote response).
         // Without this the node has no commitment source and emits baseline
         // `(0, None)` quotes — the path the rest of the suite exercises.
-        if let Some(key_count) = commitment_key_count {
+        if let Some(key_count) = options.commitment_key_count {
             let source = build_commitment_source(key_count, &identity);
             protocol.attach_commitment_source(source);
         }
@@ -526,6 +634,9 @@ impl MiniTestnet {
                             if handler_silence.drops(&data) {
                                 continue;
                             }
+                        }
+                        if topic == ant_protocol::CHUNK_PROTOCOL_ID {
+                            reads.record(&data);
                         }
                         let protocol = Arc::clone(&handler_protocol);
                         let node = Arc::clone(&handler_node);
