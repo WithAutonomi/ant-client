@@ -168,15 +168,54 @@ async fn test_chunk_put_duplicate_is_idempotent() {
     testnet.teardown().await;
 }
 
-/// ADR-0020: every test node announces get-or-closer, so a kad read must ask
-/// each peer for the chunk and for closer peers in one request, never a plain
-/// GET, and find a stored chunk without the ordinary read path behind it.
+/// ADR-0020: every test node announces get-or-closer, so a kad read asks
+/// likely holders for the chunk with get-or-closer requests and finds a
+/// stored chunk without the ordinary read path behind it.
 #[cfg(feature = "test-utils")]
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_chunk_get_or_closer_reads_from_upgraded_nodes() {
     let (client, testnet) = setup().await;
     let content = Bytes::from("ant-core get-or-closer e2e payload");
+    let address = client
+        .chunk_put(content.clone())
+        .await
+        .expect("chunk_put should succeed with payment");
+    let get_or_closers_before = testnet.reads.get_or_closers();
+
+    let chunk = client
+        .chunk_get_kad_only(&address)
+        .await
+        .expect("kad read should succeed")
+        .expect("a stored chunk should be found");
+    assert_eq!(chunk.content.as_ref(), content.as_ref());
+    assert!(
+        testnet.reads.get_or_closers() > get_or_closers_before,
+        "a node that announces get-or-closer should be asked with one"
+    );
+
+    let missing = client
+        .chunk_get_kad_only(&[0xDE; 32])
+        .await
+        .expect("kad read should succeed");
+    assert!(missing.is_none(), "a missing chunk should not be found");
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// ADR-0020: nodes that do not announce get-or-closer, as nodes released
+/// before it do not, are read with FIND_NODE and GET, and never sent a
+/// request they would drop unanswered.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_chunk_kad_read_uses_get_on_older_nodes() {
+    let testnet = MiniTestnet::start_without_get_or_closer(DEFAULT_NODE_COUNT).await;
+    let node = testnet.node(3).expect("Node 3 should exist");
+    let client = Client::from_node(Arc::clone(&node), test_client_config())
+        .with_wallet(testnet.wallet().clone());
+    let content = Bytes::from("ant-core legacy kad read e2e payload");
     let address = client
         .chunk_put(content.clone())
         .await
@@ -189,18 +228,15 @@ async fn test_chunk_get_or_closer_reads_from_upgraded_nodes() {
         .expect("kad read should succeed")
         .expect("a stored chunk should be found");
     assert_eq!(chunk.content.as_ref(), content.as_ref());
-    assert!(testnet.reads.get_or_closers() > 0);
-    assert_eq!(
-        testnet.reads.gets(),
-        gets_before,
-        "no plain GET should go to a node that answers get-or-closer"
+    assert!(
+        testnet.reads.gets() > gets_before,
+        "an older node should be read with a GET"
     );
-
-    let missing = client
-        .chunk_get_kad_only(&[0xDE; 32])
-        .await
-        .expect("kad read should succeed");
-    assert!(missing.is_none(), "a missing chunk should not be found");
+    assert_eq!(
+        testnet.reads.get_or_closers(),
+        0,
+        "no node announced get-or-closer"
+    );
 
     drop(client);
     testnet.teardown().await;
