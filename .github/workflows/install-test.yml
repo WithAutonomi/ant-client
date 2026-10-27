@@ -235,9 +235,12 @@ jobs:
         shell: pwsh
         run: |
           npm uninstall -g @withautonomi/ant
+          # npm writes three shims on Windows: `ant` (for sh), `ant.cmd`, and `ant.ps1`, which
+          # PowerShell runs in preference to `ant.cmd`. None of them may be left behind.
           $npmPrefix = (npm prefix -g).Trim()
-          if (Test-Path (Join-Path $npmPrefix "ant.cmd")) {
-            Write-Error "npm's ant.cmd is still in $npmPrefix after uninstall"
+          $left = Get-ChildItem -LiteralPath $npmPrefix -File | Where-Object { $_.BaseName -eq 'ant' }
+          if ($left) {
+            Write-Error "npm's ant shims are still in ${npmPrefix} after uninstall: $($left.Name -join ', ')"
             exit 1
           }
           $configFile = Join-Path $env:APPDATA "ant\bootstrap_peers.toml"
