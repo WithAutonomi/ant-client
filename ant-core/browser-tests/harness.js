@@ -158,3 +158,40 @@ globalThis.runPointerRecoveryIntegration = async ({ endpoint, payment, rpcUrl })
     manifestBytes: Array.from(created.bytes), link: created.link,
     linkMatches: JSON.stringify(parseManifestLink(created.link).manifest) === JSON.stringify(decoded) };
 };
+// The swarm: pages reading the same file share its records over WebRTC, met
+// through the nodes closest to it. A page's client stays open after a read,
+// in the file's room, to serve the pages that read it next.
+const sha256 = async bytes => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
+  byte => byte.toString(16).padStart(2, "0")).join("");
+globalThis.runSwarmUpload = async ({ endpoint, payment, rpcUrl, size }) => {
+  const wallet = await chainWallet(payment, rpcUrl);
+  const content = new Uint8Array(size);
+  // Incompressible, so the records are full size; at most 64 KiB per call.
+  for (let at = 0; at < size; at += 65_536) crypto.getRandomValues(content.subarray(at, at + 65_536));
+  const encrypted = encryptPublicFile(content);
+  const staged = { name: "swarm.bin", content_type: "application/octet-stream", address: encrypted.address,
+    records: encrypted.records.map(record => ({ address: record.address, size: record.content.length })) };
+  const uploader = new BrowserNetworkClient([endpoint]);
+  const result = await uploader.uploadStagedPublicFile(staged, payment, index => encrypted.records[index].content,
+    wallet.pay, undefined, undefined, () => {}, "single");
+  uploader.close(); uploader.free(); wallet.destroy();
+  return { address: result.file.address, records: result.records, sha: await sha256(content) };
+};
+globalThis.runSwarmRead = async ({ endpoint, address, meet }) => {
+  const client = new BrowserNetworkClient([endpoint]);
+  const hello = await client.connect();
+  await client.joinSwarm(address);
+  if (meet) {
+    const deadline = Date.now() + 60_000;
+    while (client.swarmStats().links === 0) {
+      if (Date.now() > deadline) throw new Error(`never met another reader: ${JSON.stringify(client.swarmStats())}`);
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    // The first messages on a new link say what each side holds.
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  const downloaded = await client.downloadPublicFile(address, 4);
+  globalThis.swarmClient = client;
+  return { capabilities: hello.capabilities ?? [], sha: await sha256(downloaded.content), stats: client.swarmStats() };
+};
+globalThis.swarmStatsNow = () => globalThis.swarmClient.swarmStats();

@@ -84,6 +84,17 @@ refused before the wallet says "payment was not submitted". It also builds a
 manifest in the page and writes the `.ant` file and link to its test output
 directory, for decoding with `ant manifest show`.
 
+The swarm test (`swarm.spec.js`) uploads a 6 MiB file, reads it in one page,
+and keeps that page's client open in the file's room. A second page, in its
+own browser context, then reads the file. Against nodes that advertise
+`swarm_rendezvous`, the two meet through the file's rendezvous nodes, which
+also answer their STUN, and the second page must take every data record
+from the first (the DataMap, whose root names the room, comes from the
+nodes). Against the pinned node, which predates
+swarm rooms, the second page must read from the nodes with no link and no
+swarm message sent. Run it against a node with swarm rooms by pointing
+`ANT_NODE_DIR` at one.
+
 ## Large-file disk streaming
 
 `large-file.mjs` is an opt-in check, not run in CI, that a file larger than

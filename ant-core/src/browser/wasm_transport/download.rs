@@ -1,6 +1,7 @@
 //! Bounded plaintext reads with 64-bit positions and caller-owned destinations.
 use super::*;
 use crate::client_engine::files::ordered_pipeline;
+use crate::data::client::chunk::ChunkServer;
 use bytes::Bytes;
 use self_encryption::DataMapIndex;
 use std::ops::Range;
@@ -42,16 +43,18 @@ fn chunk_progress(written: usize, total: usize) -> String {
 }
 
 /// Progress of one delivered chunk: the `Downloaded chunk n/total` prefix the
-/// startup probes match, then the peer that served it — its 64-character
-/// lowercase hex, or `cache` when no GET was sent — and the GETs it cost.
+/// startup probes match, then who served it — the node's 64-character
+/// lowercase hex, `cache` when no GET served it, or `a reader` when another
+/// client reading the file sent it — and the GETs it cost.
 fn chunk_source_progress(
     written: usize,
     total: usize,
     source: &crate::data::client::chunk::ChunkSource,
 ) -> String {
-    let from = match &source.peer {
-        Some(peer) => peer.to_string(),
-        None => "cache".to_string(),
+    let from = match &source.server {
+        ChunkServer::Node(peer) => peer.to_string(),
+        ChunkServer::Cache => "cache".to_string(),
+        ChunkServer::Reader => "a reader".to_string(),
     };
     format!(
         "{} from {from} after {} attempts",
@@ -405,6 +408,9 @@ pub struct BrowserFileReader {
     /// Fetches ahead of sequential range reads; see `read_ahead`.
     pub(super) read_ahead: Rc<read_ahead::ReadAhead>,
     closed: Cell<bool>,
+    /// The file's swarm room, joined when the file was opened, and again by
+    /// a read if this client has left it since.
+    room: Option<(RoomKey, [u8; 32])>,
 }
 
 #[wasm_bindgen(js_class = BrowserFileReader)]
@@ -439,6 +445,7 @@ impl BrowserFileReader {
                 "browser range reads are limited to {MAX_BROWSER_RANGE_BYTES} bytes"
             )));
         }
+        self.join_room();
         let lease = self.read_ahead.begin_read(start, length as usize);
         let bytes = self
             .shared
@@ -523,6 +530,16 @@ impl BrowserFileReader {
             read_ahead: read_ahead::ReadAhead::new(read_ahead, Rc::clone(&index), streaming),
             index,
             closed: Cell::new(false),
+            room: resolved.room,
+        }
+    }
+
+    /// Joins the file's room again as a read starts, if reading other files
+    /// has left it since the file was opened, which joined it.
+    fn join_room(&self) {
+        if let Some((room, secret)) = self.room {
+            self.shared
+                .join_swarm_room(room, secret, swarm_records(&self.index));
         }
     }
 
@@ -575,6 +592,7 @@ impl BrowserFileReader {
         let mut hasher = blake3::Hasher::new();
         cancel
             .run(async {
+                self.join_room();
                 stream_chunks(
                     &self.shared,
                     &self.index,

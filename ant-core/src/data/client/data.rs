@@ -21,6 +21,8 @@ use ant_protocol::compute_address;
 use bytes::Bytes;
 #[cfg(feature = "native")]
 use futures::stream::StreamExt;
+#[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
+use rand::seq::SliceRandom;
 use self_encryption::{encrypt, DataMap};
 use sha2::{Digest, Sha256};
 use std::num::NonZeroUsize;
@@ -376,10 +378,23 @@ impl Client {
                 "download concurrency must be positive".into(),
             ));
         }
+        let fetch = |address| self.fetch_data_record(address);
+        let map_record = |address| self.fetch_map_record(address);
+        let cap = || self.controller().fetch.current().min(concurrency);
+        // The file's room and records are its root map's: resolve that first,
+        // within the same bound as the download.
+        let root = if data_map.is_child() {
+            crate::client_engine::files::resolve(data_map, &map_record, &cap)
+                .await
+                .map_err(map_read_error)?
+        } else {
+            data_map.clone()
+        };
+        self.swarm_room(&root);
         crate::client_engine::files::download(
-            data_map,
-            &|address| self.fetch_data_record(address),
-            &|| self.controller().fetch.current().min(concurrency),
+            &root,
+            &fetch,
+            &cap,
             &crate::runtime::sleep,
             retry_data_fetch,
         )
@@ -401,10 +416,12 @@ impl Client {
         length: usize,
     ) -> Result<Bytes> {
         let fetch = |address| self.fetch_data_record(address);
+        let map_record = |address| self.fetch_map_record(address);
         let cap = || self.controller().fetch.current();
-        let root = crate::client_engine::files::resolve(data_map, &fetch, &cap)
+        let root = crate::client_engine::files::resolve(data_map, &map_record, &cap)
             .await
             .map_err(map_read_error)?;
+        self.swarm_room(&root);
         crate::client_engine::files::read_range(
             &root,
             start as u64,
@@ -429,7 +446,7 @@ impl Client {
         if !data_map.is_child() {
             return Ok(data_map.clone());
         }
-        let fetch = |address| async move { self.fetch_data_record(address).await };
+        let fetch = |address| async move { self.fetch_map_record(address).await };
         let cap = || self.controller().fetch.current();
         crate::client_engine::files::resolve(data_map, &fetch, &cap)
             .await
@@ -476,6 +493,12 @@ impl Client {
     /// within the adaptive fetch cap and `concurrency`, missing records retried
     /// together in deferred rounds. Each chunk goes to `deliver` as it arrives,
     /// in any order.
+    ///
+    /// The records are asked for in an order of this download's own, as
+    /// BitTorrent picks pieces: readers of one file who start together then
+    /// hold different records early on, and a record one is still waiting
+    /// for can come from another reader that has it. A download delivers its
+    /// chunks in any order, so its order costs it nothing.
     #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
     pub(crate) async fn data_download_indexed_chunks(
         &self,
@@ -502,9 +525,11 @@ impl Client {
         let spent: std::cell::RefCell<std::collections::HashMap<[u8; 32], usize>> =
             std::cell::RefCell::new(std::collections::HashMap::new());
         let infos = index.infos();
+        let mut order: Vec<usize> = (0..infos.len()).collect();
+        order.shuffle(&mut rand::thread_rng());
         crate::client_engine::files::read_chunks(
             index,
-            0..infos.len(),
+            order,
             &|address| {
                 let (sources, spent) = (&sources, &spent);
                 async move {
@@ -522,11 +547,11 @@ impl Client {
                         *total += dispatched.load(std::sync::atomic::Ordering::Relaxed);
                         *total
                     };
-                    let (bytes, peer) = fetched?;
+                    let (bytes, server) = fetched?;
                     sources.borrow_mut().insert(
                         address,
                         crate::data::client::chunk::ChunkSource {
-                            peer,
+                            server,
                             attempts: total,
                         },
                     );
@@ -575,6 +600,20 @@ impl Client {
             .expect("a completed pass delivers its one chunk"))
     }
 
+    /// A DataMap wrapper record, from nodes only (see
+    /// [`Client::chunk_get_observed_from_nodes`]).
+    async fn fetch_map_record(&self, address: [u8; 32]) -> Result<Bytes> {
+        self.chunk_get_observed_from_nodes(&address)
+            .await?
+            .map(|chunk| chunk.content)
+            .ok_or_else(|| {
+                Error::NotFound(format!(
+                    "Missing DataMap record {} required for data reconstruction",
+                    hex::encode(address)
+                ))
+            })
+    }
+
     async fn fetch_data_record(&self, address: [u8; 32]) -> Result<Bytes> {
         self.chunk_get_observed(&address)
             .await?
@@ -589,10 +628,10 @@ impl Client {
         &self,
         address: [u8; 32],
         dispatched: &std::sync::atomic::AtomicUsize,
-    ) -> Result<(Bytes, Option<ant_protocol::transport::PeerId>)> {
+    ) -> Result<(Bytes, crate::data::client::chunk::ChunkServer)> {
         self.chunk_get_observed_with_source(&address, dispatched)
             .await?
-            .map(|(chunk, peer)| (chunk.content, peer))
+            .map(|(chunk, server)| (chunk.content, server))
             .ok_or_else(|| missing_data_record(address))
     }
 }

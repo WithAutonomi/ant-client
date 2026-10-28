@@ -26,6 +26,29 @@ pub use protocol::{
 
 #[cfg(all(target_arch = "wasm32", feature = "browser-wasm"))]
 mod wasm_transport;
+/// The page's ICE gathering turn, shared by node and client connections.
+#[cfg(all(target_arch = "wasm32", feature = "browser-wasm"))]
+pub(crate) use wasm_transport::{
+    discovery_turn, ice_gathering_turn_after_reads, pass_ice_gathering_turn,
+    reads_not_waiting_to_gather,
+};
+
+/// A build with neither the native stack nor a browser takes no ICE
+/// gathering turns: its swarm, which has no WebRTC to run on, never waits.
+#[cfg(not(any(
+    feature = "native",
+    all(target_arch = "wasm32", feature = "browser-wasm")
+)))]
+pub(crate) async fn reads_not_waiting_to_gather() {}
+
+/// As [`reads_not_waiting_to_gather`]: no turn to hold.
+#[cfg(not(any(
+    feature = "native",
+    all(target_arch = "wasm32", feature = "browser-wasm")
+)))]
+pub(crate) async fn discovery_turn() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    None
+}
 
 use bytes::Bytes;
 use self_encryption::{ChunkInfo, DataMap, EncryptedChunk};

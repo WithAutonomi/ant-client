@@ -61,6 +61,9 @@ pub use client::pointer::{
 // Re-export self-encryption types
 pub use self_encryption::DataMap;
 
+// What a client shared with other clients reading the same files.
+pub use crate::swarm::{DiscoveryStats, RoomStats, SwarmStats};
+
 // File manifests and `ant://` links (ADR-0006).
 #[cfg(feature = "native")]
 pub use manifest::{

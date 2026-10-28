@@ -56,6 +56,60 @@ test("a private DataMap with nested records opens for range reads", async () => 
   } finally { reader?.close(); client.close(); }
 });
 
+// Opening a file joins its swarm room at once, and the room starts finding
+// the file's other readers once a read's first record is in, so its requests
+// never compete with that record. Joining returns at once: these nodes host no
+// rooms, and the reader opens, and reads, all the same. The room's lookup
+// starts from the routes the read's own lookups found.
+test("opening a private file joins its swarm room at once and finds readers after its first record", async () => {
+  const { records, dataMap } = privateRecords(content);
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  for (const store of rtc.stores) for (const record of records) store.set(record.address, record.content);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const messages = [];
+  let reader;
+  try {
+    reader = await client.openPrivateFile({ data_map: dataMap }, message => messages.push(String(message)), { streaming: true });
+    assert.equal(client.swarmStats().rooms, 1, "the file's room is joined as it opens");
+    assert.equal(messages.filter(message => /^Swarm room [0-9a-f]{16}$/u.test(message)).length, 1);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    assert.equal(client.swarmStats().discovery.lookups, 0, "the room asks nothing before a read's first record");
+    assert.equal(rtc.connections.length, 0, "opening dials nothing of its own");
+    assert.deepEqual(await reader.readRange(0, 10), content.slice(0, 10));
+    assert.ok(rtc.connections.length > 0, "the read reaches the nodes");
+    for (let waited = 0; client.swarmStats().discovery.lookups === 0 && waited < 5000; waited += 50) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.equal(client.swarmStats().discovery.lookups, 1, "one lookup serves the room's places, after the first record");
+    // The nodes it found say in their hellos that they host no rooms: none
+    // of them is sent a swarm request, which a node that predates rooms
+    // would close the channel on, as the nodes' own log of what they were
+    // sent shows.
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    assert.deepEqual(rtc.requests.filter(request => request.method === "chunk_protocol"), [],
+      "a node without rooms is sent no swarm request");
+  } finally { reader?.close(); client.close(); }
+});
+
+// A download joins its room as it resolves the file, before its first record.
+test("a private download joins its swarm room before its first record", async () => {
+  const { records, dataMap } = privateRecords(content);
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  for (const store of rtc.stores) for (const record of records) store.set(record.address, record.content);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const abort = new AbortController();
+    let rooms = null;
+    await assert.rejects(client.downloadPrivateFile({ data_map: dataMap }, undefined, message => {
+      if (/^Downloaded chunk 0\//u.test(String(message))) {
+        rooms = client.swarmStats().rooms;
+        abort.abort();
+      }
+    }, { signal: abort.signal }));
+    assert.equal(rooms, 1, "the room is joined when the download reports its first progress");
+  } finally { client.close(); }
+});
+
 test("oversized and corrupt private DataMaps fail before fetching records", async () => {
   const rtc = mockWebRtc([{}]);
   const client = new BrowserNetworkClient(rtc.endpoints);

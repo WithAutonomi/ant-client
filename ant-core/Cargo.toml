@@ -56,6 +56,13 @@ utoipa = { version = "5", features = ["axum_extras"], optional = true }
 # the backend the `flate2` dependency above selects.
 zip = { version = "9", default-features = false, features = ["deflate-flate2"], optional = true }
 tower-http = { version = "0.6.8", features = ["cors"], optional = true }
+# Native clients share records with other clients over WebRTC data channels
+# (the same stack saorsa-transport's WebRTC Direct uses on nodes).
+webrtc = { version = "0.14", optional = true }
+# The webrtc-rs DTLS handshake takes rustls's process-wide provider. Both
+# providers are compiled in (webrtc-rs brings ring), so one is named: the
+# aws-lc-rs provider QUIC already uses.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"], optional = true }
 
 # Data operations
 # Wire protocol crate: gives us `ant_protocol::{chunk, payment, …}` plus
@@ -96,10 +103,15 @@ wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 web-sys = { version = "0.3", optional = true, features = [
     "AbortSignal",
+    "Document",
     "Event",
+    "EventTarget",
+    "MessageChannel",
     "MessageEvent",
+    "MessagePort",
     "RtcConfiguration",
     "RtcDataChannel",
+    "RtcDataChannelEvent",
     "RtcDataChannelInit",
     "RtcDataChannelState",
     "RtcDataChannelType",
@@ -110,6 +122,8 @@ web-sys = { version = "0.3", optional = true, features = [
     "RtcSdpType",
     "RtcSessionDescription",
     "RtcSessionDescriptionInit",
+    "VisibilityState",
+    "Window",
     "WritableStream",
     "WritableStreamDefaultWriter",
 ] }
@@ -154,6 +168,8 @@ native = [
     "dep:tower-http",
     "dep:tracing-subscriber",
     "dep:utoipa",
+    "dep:rustls",
+    "dep:webrtc",
     "dep:zip",
 ]
 browser-wasm = [

@@ -24,6 +24,7 @@ pub mod install;
 #[cfg(feature = "native")]
 pub mod node;
 mod runtime;
+mod swarm;
 #[cfg(feature = "native")]
 pub mod update;
 

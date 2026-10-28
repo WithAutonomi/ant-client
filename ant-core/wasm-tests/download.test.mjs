@@ -654,11 +654,14 @@ test("read-ahead of a misdeclared DataMap stays within its record bounds and sto
     assert(peak.fetching <= 5, `${peak.fetching} records in flight`);
     assert(peak.total <= maxHeld, `${peak.total} records held or in flight`);
     // The records do not decrypt, so read-ahead stops and releases them. A
-    // later read fetches only its own record.
+    // later read fetches only its own record, or none: the swarm keeps the
+    // checked records a read fetched, to serve the file's other readers, and
+    // a read uses them first.
     assert.deepEqual(reader.testReadAhead(), { fetching: 0, held: 0 });
     const stopped = gets(rtc);
     await assert.rejects(reader.readRange(5 * declared, 1));
-    assert.equal(await watch(rtc, [reader], peak) - stopped, 1);
+    const later = await watch(rtc, [reader], peak) - stopped;
+    assert(later <= 1, `a later read fetched ${later} records`);
   } finally { reader?.close(); client.close(); }
 });
 
