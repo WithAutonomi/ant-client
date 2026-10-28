@@ -851,18 +851,22 @@ record's holder started a median 4.1 s after the read began:
 
 The decisions:
 
-- **Peers that cannot hold the record are not read or preconnected.**
+- **Peers that cannot hold the record are not read early.**
   `ReadProgress::listed` records the peers each lookup reply lists, with its
   responder. A record is stored by its close group, so a peer with
   `CLOSE_GROUP_SIZE` listed peers nearer the record cannot hold it, and
-  `ReadProgress::may_hold` is false for it. Such a peer leaves the read's hints,
-  and the read's preconnects skip it. A holder is in the close group by
-  definition, so the rule never excludes one, whether or not the peers nearer
-  it are reachable.
-  - Listing only removes candidates from early reads. The read after discovery,
-    and its absence and closeness decisions, are unchanged.
-  - A responder that lists invented identities near the record can at most
-    suppress early reads, leaving the read to finish after discovery.
+  `ReadProgress::may_hold` is false for it. Such a peer leaves the read's hints.
+  A holder is in the close group by definition, so the rule never excludes one,
+  whether or not the peers nearer it are reachable.
+  - Only proven identities are listed: the responder, which its session
+    authenticated, and the peers whose owner-signed address records `find_node`
+    verified. A peer a reply lists without a record proves nothing, so it does
+    not count.
+  - Listing only removes hints from early reads. Discovery, its preconnects,
+    the read after it, and that read's absence and closeness decisions are
+    unchanged. A responder with signed records for invented identities near the
+    record can therefore at most suppress early reads, leaving the read to
+    finish after discovery.
   - Native reads never list peers, so their hints are unchanged.
 - **A read that continues no other fetches the record after it only once it
   has finished.** It used to start that fetch at once, in case the read starts
@@ -903,15 +907,18 @@ this change, one served all six; in Chromium it served 10 of 10, against 9 of
 record, but the first such hint is now asked at once. A holder that is full
 declines new sessions and is skipped for 15 s (ant-node ADR-0023).
 
-Unchanged: the lookup's width and grace period, the preconnect bound, the
-hedge delay, and the read after discovery.
+Unchanged: the lookup's width and grace period, its preconnects, the hedge
+delay, and the read after discovery.
 
 Left for later:
 
 - **DTLS:** it took 1.39 s at the median after ICE connected (p90 3.5 s), in
   both engines, and its times cluster at the browsers' DTLS resend timers. The
   node creates its DTLS endpoint only once its own ICE has completed, and drops
-  an earlier ClientHello; that is saorsa-transport#229.
+  an earlier ClientHello; that is saorsa-transport#229 (V2-1770).
+- **Preconnect slots:** they are still first come, first served, and a node
+  that finds them full is skipped, not queued. Ordering pending preconnects by
+  distance to the target would help every lookup, not only reads.
 - **Lookup answers:** each took about five of its node's round trips. It
   carries 20 owner-signed records, whose ML-DSA-65 keys and signatures alone
   come to over 100 KB.

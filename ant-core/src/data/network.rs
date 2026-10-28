@@ -98,14 +98,15 @@ pub type PeerAddresses = Vec<(PeerId, Vec<MultiAddr>)>;
 /// start authenticated GETs; they never establish closeness, absence or payment
 /// authority. The receiver may cancel discovery after verifying content.
 ///
-/// Discovery also reports the peers its lookup replies list, authenticated or
-/// not. A record is stored by its close group, the `CLOSE_GROUP_SIZE` peers
-/// nearest it, so a peer with that many listed peers nearer the record cannot
-/// hold it. Such peers are dropped from the hints, and transports need not
-/// connect to them for the read: a browser's first hints are its bootstrap
-/// peers, which share few or no leading bits with the record, and each GET to
-/// one costs a new connection lane and a round trip before the read can ask a
-/// holder.
+/// Discovery also reports the peers its lookup replies list. A record is stored
+/// by its close group, the `CLOSE_GROUP_SIZE` peers nearest it, so a peer with
+/// that many listed peers nearer the record cannot hold it, and is dropped
+/// from the hints: a browser's first hints are its bootstrap peers, which share
+/// few or no leading bits with the record, and each GET to one costs a new
+/// connection lane and a round trip before the read can ask a holder.
+/// Transports list only peers whose identity they have verified, so a peer
+/// cannot rule out holders with identities it invents. Listing only removes
+/// hints: discovery, and the read after it, are unchanged.
 #[derive(Clone)]
 pub struct ReadProgress {
     target: [u8; 32],
@@ -168,25 +169,31 @@ impl ReadProgress {
         }
         if !self.sender.is_closed() {
             self.sender
-                .send_modify(|current| self.retain_possible_holders(current));
+                .send_if_modified(|current| self.retain_possible_holders(current));
         }
     }
 
     /// Whether `peer` may hold the record: fewer than `CLOSE_GROUP_SIZE` peers
     /// listed so far are nearer to it.
     pub fn may_hold(&self, peer: &PeerId) -> bool {
-        let distance = xor_distance(peer.as_bytes(), &self.target);
-        self.listed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|listed| xor_distance(listed.as_bytes(), &self.target) < distance)
-            .count()
-            < CLOSE_GROUP_SIZE
+        let listed = self.listed.lock().unwrap_or_else(|e| e.into_inner());
+        self.may_hold_given(&listed, peer)
     }
 
-    fn retain_possible_holders(&self, hints: &mut PeerAddresses) {
-        hints.retain(|peer| self.may_hold(&peer.0));
+    fn may_hold_given(&self, listed: &[PeerId], peer: &PeerId) -> bool {
+        crate::client_engine::read::may_hold(
+            listed.iter().map(PeerId::as_bytes),
+            peer.as_bytes(),
+            &self.target,
+        )
+    }
+
+    /// Drop the hints that cannot hold the record, and report whether any was.
+    fn retain_possible_holders(&self, hints: &mut PeerAddresses) -> bool {
+        let listed = self.listed.lock().unwrap_or_else(|e| e.into_inner());
+        let before = hints.len();
+        hints.retain(|peer| self.may_hold_given(&listed, &peer.0));
+        hints.len() != before
     }
 }
 
@@ -759,7 +766,8 @@ mod tests {
     const LOCAL: u8 = 0x01;
     /// First byte of the nearest listed peer; a close group follows it.
     const NEAREST_LISTED: u8 = 0x10;
-    /// First byte of a peer with only two listed peers nearer the record.
+    /// First byte of a peer inside the listed close group: with a nonzero tie
+    /// it has three listed peers nearer the record.
     const WITHIN_CLOSE_GROUP: u8 = NEAREST_LISTED + 2;
     /// First byte of a peer with a whole close group listed nearer the record.
     const BEYOND_CLOSE_GROUP: u8 = 0xf0;
@@ -830,17 +838,36 @@ mod tests {
     }
 
     #[test]
-    fn listing_ignores_the_local_peer_repeats_and_farther_peers() {
+    fn listing_ignores_the_local_peer_and_repeats() {
         let (progress, _receiver) = read_progress();
-        let group = close_group();
-        let farthest = group[CLOSE_GROUP_SIZE - 1];
+        let farthest = close_group()[CLOSE_GROUP_SIZE - 1];
         let local = peer(LOCAL, 0);
-        progress.listed(std::iter::repeat_n(group[0], CLOSE_GROUP_SIZE).chain([local]));
+        progress.listed(std::iter::repeat_n(close_group()[0], CLOSE_GROUP_SIZE).chain([local]));
         assert!(progress.may_hold(&farthest));
+    }
 
-        progress.listed(group.iter().copied());
+    #[test]
+    fn listing_keeps_only_the_nearest_close_group() {
+        let (progress, _receiver) = read_progress();
+        // The first peer past the close group has all of it listed nearer.
+        let past_group = peer(NEAREST_LISTED + CLOSE_GROUP_SIZE as u8, 0);
+        progress.listed(close_group());
         progress.listed((0..CLOSE_GROUP_SIZE as u8).map(|tie| peer(BEYOND_CLOSE_GROUP, tie)));
-        assert!(progress.may_hold(&farthest));
+        assert_eq!(
+            *progress.listed.lock().unwrap_or_else(|e| e.into_inner()),
+            close_group()
+        );
+        assert!(!progress.may_hold(&past_group));
+    }
+
+    #[test]
+    fn a_listing_that_rules_out_no_hint_does_not_wake_the_read() {
+        let (progress, mut receiver) = read_progress();
+        progress.offer(vec![hint(peer(WITHIN_CLOSE_GROUP, 1))]);
+        receiver.borrow_and_update();
+
+        progress.listed(close_group());
+        assert!(!receiver.has_changed().unwrap());
     }
 
     #[test]

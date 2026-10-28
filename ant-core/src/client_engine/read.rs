@@ -157,11 +157,16 @@ fn settle<T, E>(
 }
 
 /// Discovery converges on the target, so a hint with fewer than a close group of
-/// attempted peers nearer the target may still hold the record.
-fn may_hold(attempted: &HashSet<[u8; 32]>, candidate: &[u8; 32], target: &[u8; 32]) -> bool {
+/// `known` peers nearer the target, such as peers already attempted, may still
+/// hold the record.
+pub(crate) fn may_hold<'a>(
+    known: impl IntoIterator<Item = &'a [u8; 32]>,
+    candidate: &[u8; 32],
+    target: &[u8; 32],
+) -> bool {
     let distance = ant_protocol::transport::xor_distance(candidate, target);
-    attempted
-        .iter()
+    known
+        .into_iter()
         .filter(|peer| ant_protocol::transport::xor_distance(peer, target) < distance)
         .count()
         < ant_protocol::CLOSE_GROUP_SIZE
@@ -484,7 +489,7 @@ where
                 .iter()
                 .map(|(peer, _)| peer)
                 .chain(refused_now.keys())
-                .filter(|peer| !misses.contains(*peer) && may_hold(&misses, peer, &target))
+                .filter(|peer| !misses.contains(*peer) && may_hold(misses.iter(), peer, &target))
                 .map(|peer| refused_now.get(peer).copied().unwrap_or_default())
                 .min();
             (absent, refusal)
