@@ -873,39 +873,42 @@ The decisions:
   a stream, so its lookup and transfer competed with the record the read waits
   for. Reads that continue a stream are unchanged.
 
-This was measured against main on mainnet, from one macOS machine, with the
-arms in rotating order and a fresh browser context per sample. The traced read
-of the first 1 MiB, at the median:
+This was measured against main on mainnet, from one macOS machine, on
+2026-10-28, with the arms in rotating order and a fresh browser context per
+sample. The traced read of the first 1 MiB, at the median:
 
 | engine | rounds | holder's GET, main → this | 1 MiB read, main → this | sooner |
 | --- | --: | --: | --: | --: |
-| Chromium | 10 | 3.7 → 1.6 s | 4.8 → 2.6 s | 9/10 |
-| WebKit (Playwright) | 6 | 6.3 → 3.0 s | 7.4 → 3.8 s | 6/6 |
+| Chromium | 10 | 4.3 → 1.9 s | 5.0 → 3.4 s | 10/10 |
+| WebKit (Playwright) | 6 | 4.4 → 2.2 s | 5.1 → 3.0 s | 5/6 |
 
-GETs before the holder's fell from 6 to 1 in Chromium, and from 8 to 2 in
-WebKit. The time from the read knowing the holder to asking it fell from 0.55
-s to 0 in Chromium, and from 1.66 s to 0 in WebKit.
+GETs before the holder's fell from 6 to 1 in Chromium, and from 7 to 1 in
+WebKit. Once the read knew the holder, it asked it at once.
 
-Through the SDK's `createMediaSource()`, as released in 0.1.4 and with this
-change's bindings, the same video was timed to its first decoded frame. It then
-played for ten seconds and was sought to 85%, beyond the read-ahead window:
+The same video was then streamed on try.autonomi.com's own page. Two copies of
+the page differed only in the core, main's and this change's:
+- each sample clicked Stream 3 s after the page's client connected;
+- it was timed to the first decoded frame;
+- the video played for ten seconds, then was sought to 85%, beyond the
+  read-ahead window.
 
 | engine | rounds | first frame, median | sooner | seek to 85%, median | sooner |
 | --- | --: | --: | --: | --: | --: |
-| Chromium | 20 | 4.4 → 3.0 s | 13/20 | 4.9 → 4.4 s | 12/20 |
-| WebKit (Playwright) | 6 | 4.8 → 3.8 s | 4/5 | 5.3 → 2.9 s | 4/5 |
+| Chromium | 20 | 5.8 → 3.1 s | 16/20 | 5.1 → 4.1 s | 14/20 |
+| WebKit (Playwright) | 6 | 4.0 → 3.1 s | 5/6 | 2.9 → 2.8 s | 3/6 |
 
-In Chromium the median paired saving was 0.7 s for the first frame and 0.5 s
-for the seek. Seeks over 6 s fell from 5 of 20 to 3. One baseline WebKit sample
-failed: its seek never produced a frame. The SDK reads the file's tail beside
-its head, and that read competes with the head's.
+- In Chromium, the median paired saving was 1.6 s for the first frame and
+  1.0 s for the seek.
+- First frames over 6 s fell from 9 of 20 to 3.
+- The WebKit seek was level, at a median paired difference of 0.4 s later.
+- All 52 samples played, and no page reported an error.
 
-**Cost: first reads concentrate on the first holder found.** In the WebKit
-traces on main, two holders each served three of the six first reads. With
-this change, one served all six; in Chromium it served 10 of 10, against 9 of
-10. Early GETs still choose uniformly among the hints that may hold the
-record, but the first such hint is now asked at once. A holder that is full
-declines new sessions and is skipped for 15 s (ant-node ADR-0023).
+**Cost: first reads concentrate on the first holder found.** In the Chromium
+traces, three holders served main's first reads (5, 4 and 1 of 10); with this
+change one served 9 of 10. In WebKit it served all 6, against 5 of 6. Early
+GETs still choose uniformly among the hints that may hold the record, but the
+first such hint is now asked at once. A holder that is full declines new
+sessions and is skipped for 15 s (ant-node ADR-0023).
 
 Unchanged: the lookup's width and grace period, its preconnects, the hedge
 delay, and the read after discovery.
@@ -914,8 +917,9 @@ Left for later:
 
 - **DTLS:** it took 1.39 s at the median after ICE connected (p90 3.5 s), in
   both engines, and its times cluster at the browsers' DTLS resend timers. The
-  node creates its DTLS endpoint only once its own ICE has completed, and drops
-  an earlier ClientHello; that is saorsa-transport#229 (V2-1770).
+  node's ICE-lite agent starts DTLS only once the browser nominates the
+  connection, which the browser does late; that is V2-1770
+  (saorsa-transport#229).
 - **Preconnect slots:** they are still first come, first served, and a node
   that finds them full is skipped, not queued. Ordering pending preconnects by
   distance to the target would help every lookup, not only reads.
