@@ -2,6 +2,7 @@
 
 use ant_protocol::transport::DEFAULT_K_VALUE as DEFAULT_LOOKUP_K;
 use ant_protocol::CLOSE_GROUP_MAJORITY;
+use ant_protocol::{RoomKey, XorName};
 
 use super::manifest::{
     assert_upload_node, validate_browser_payment_network, BrowserPaymentNetwork,
@@ -18,6 +19,7 @@ use super::protocol::{
 };
 use super::{BrowserRecord, BrowserRecordInfo, BrowserStagedFile};
 use crate::data::client::merkle::PaymentMode;
+use crate::data::DataMap;
 #[cfg(feature = "test-utils")]
 use crate::transfer_policy::PutRejection;
 use crate::transfer_policy::RpcError;
@@ -65,6 +67,9 @@ const DATA_CHANNEL_CLOSED: &str = "WebRTC DataChannel closed";
 /// Advertised by a node whose `chunk_protocol` admits pointer reads and paid
 /// pointer writes (ADR-0016).
 const POINTER_PROTOCOL_CAPABILITY: &str = "pointer_protocol";
+/// Advertised by a node that hosts swarm rooms: it introduces clients reading
+/// the same file to each other and answers their STUN requests.
+const SWARM_CAPABILITY: &str = "swarm_rendezvous";
 // A queued operation may wait behind a maximum-sized request and response
 // (180 seconds each), plus connection/authentication setup. Admission has its
 // own ceiling and never spends the caller's response allowance.
@@ -152,7 +157,24 @@ thread_local! {
     /// silently cutting established connections. The cap is per page, so the
     /// turn is shared by every client in it.
     static ICE_GATHERING_TURN: Arc<Semaphore> = Arc::new(Semaphore::new(1));
+    /// Connections to nodes waiting for that turn now: the swarm's own
+    /// gatherings and lookups wait while any does (see
+    /// [`ice_gathering_turn_after_reads`]).
+    static ICE_GATHERING_WAITERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The swarm's one place, page-wide, for work that takes the ICE
+    /// gathering turn (a room lookup's dial, a connection to another
+    /// reader), where connections take turns: discovery so holds or waits
+    /// for at most one turn at a time.
+    static DISCOVERY_TURN: Arc<Semaphore> = Arc::new(Semaphore::new(1));
 }
+
+/// How often the swarm looks again whether the page's ICE gathering turn is
+/// free with no connection to a node waiting for it.
+const ICE_GATHERING_YIELD_POLL: Duration = Duration::from_millis(100);
+/// How often, and how many times, a swarm room's lookup looks for a route the
+/// reads' own lookups found before it gives up for now: about 10 s.
+const ROOM_LOOKUP_ROUTE_POLL: Duration = Duration::from_millis(250);
+const ROOM_LOOKUP_ROUTE_POLLS: usize = 40;
 
 mod bootstrap;
 mod download;
@@ -1726,7 +1748,7 @@ impl BrowserNetworkCore {
         progress: &ProgressReporter,
         count: usize,
     ) -> Result<BrowserLookupResult, String> {
-        self.find_closest_with_progress(target, progress, count, None)
+        self.find_closest_with_progress(target, progress, count, None, Warm::Yes)
             .await
     }
 
@@ -1736,6 +1758,7 @@ impl BrowserNetworkCore {
         progress: &ProgressReporter,
         count: usize,
         read_progress: Option<crate::data::network::ReadProgress>,
+        warm: Warm,
     ) -> Result<BrowserLookupResult, String> {
         // Only authenticated, recently contacted endpoints bootstrap another walk.
         self.routing.borrow_mut().retain(|peer, _| {
@@ -1744,14 +1767,49 @@ impl BrowserNetworkCore {
                 .get(peer)
                 .is_some_and(|last| last.elapsed() < Duration::from_secs(15 * 60))
         });
-        let cached = !self.routing.borrow().is_empty();
+        let mut cached = !self.routing.borrow().is_empty();
+        // A swarm room's lookup never starts the seeds' bootstrap, which
+        // opens several connections at once: it starts from the routes the
+        // reads' own lookups found, waiting a little for them, and keeps what
+        // that walk finds. With none (a tab left seeding whose routes went
+        // with its network), it goes through one seed, dialled as discovery
+        // dials are.
+        if warm == Warm::No {
+            for _ in 0..ROOM_LOOKUP_ROUTE_POLLS {
+                if cached {
+                    break;
+                }
+                crate::runtime::sleep(ROOM_LOOKUP_ROUTE_POLL).await;
+                cached = !self.routing.borrow().is_empty();
+            }
+            if cached {
+                return self
+                    .find_closest_attempt(target, progress, count, false, read_progress, warm)
+                    .await;
+            }
+            let seed = self.room_seed_candidate().await?;
+            let deadline = TransferDeadline::new(Duration::from_secs(
+                u64::from(ant_protocol::transport::LOOKUP_TIMEOUT_SECS) / 2,
+            ));
+            return self
+                .find_closest_from(
+                    target,
+                    progress,
+                    count,
+                    vec![seed],
+                    read_progress,
+                    deadline,
+                    warm,
+                )
+                .await;
+        }
         if !cached {
             return self
-                .find_closest_attempt(target, progress, count, true, read_progress.clone())
+                .find_closest_attempt(target, progress, count, true, read_progress.clone(), warm)
                 .await;
         }
         let first = self
-            .find_closest_attempt(target, progress, count, false, read_progress.clone())
+            .find_closest_attempt(target, progress, count, false, read_progress.clone(), warm)
             .await;
         if first
             .as_ref()
@@ -1761,7 +1819,7 @@ impl BrowserNetworkCore {
         }
         progress.report("Retrying lookup through configured seeds");
         let seeded = self
-            .find_closest_attempt(target, progress, count, true, read_progress.clone())
+            .find_closest_attempt(target, progress, count, true, read_progress.clone(), warm)
             .await;
         match (first, seeded) {
             (Ok(first), Ok(second)) if first.nodes.len() > second.nodes.len() => Ok(first),
@@ -1771,6 +1829,34 @@ impl BrowserNetworkCore {
         }
     }
 
+    /// A seed to start a swarm room's lookup from when no route is left:
+    /// the first configured seed that answers, tried one at a time in the
+    /// swarm's discovery turn, once no read's connection waits to gather.
+    async fn room_seed_candidate(&self) -> Result<BrowserLookupCandidate, String> {
+        let _discovery = discovery_turn().await;
+        reads_not_waiting_to_gather().await;
+        let mut last = "no seed to start a swarm room's lookup from".to_string();
+        for seed in &self.seeds {
+            if self.pool.bootstrap_policy.check(&seed.multiaddr).is_err() {
+                continue;
+            }
+            let attempt = async {
+                let client = self.pool.client(seed).await?;
+                let hello = client.hello().await?;
+                self.pool
+                    .bootstrap_policy
+                    .validate(&seed.multiaddr, &hello)?;
+                bootstrap::candidate(&hello)
+            }
+            .await;
+            match attempt {
+                Ok(candidate) => return Ok(candidate),
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
+    }
+
     async fn find_closest_attempt(
         &self,
         target: &str,
@@ -1778,6 +1864,7 @@ impl BrowserNetworkCore {
         count: usize,
         use_seeds: bool,
         read_progress: Option<crate::data::network::ReadProgress>,
+        warm: Warm,
     ) -> Result<BrowserLookupResult, String> {
         let deadline = TransferDeadline::new(Duration::from_secs(
             u64::from(ant_protocol::transport::LOOKUP_TIMEOUT_SECS) / if use_seeds { 1 } else { 2 },
@@ -1785,7 +1872,15 @@ impl BrowserNetworkCore {
         if !use_seeds {
             let candidates = self.routing.borrow().values().cloned().collect();
             return self
-                .find_closest_from(target, progress, count, candidates, read_progress, deadline)
+                .find_closest_from(
+                    target,
+                    progress,
+                    count,
+                    candidates,
+                    read_progress,
+                    deadline,
+                    warm,
+                )
                 .await;
         }
         let mut updates = self.bootstrap.subscribe(self, None)?;
@@ -1820,6 +1915,7 @@ impl BrowserNetworkCore {
                     candidates,
                     read_progress.clone(),
                     deadline,
+                    warm,
                 );
                 // Publish newly authenticated seeds to early reads while the
                 // unchanged shared DHT walker progresses through the first ones.
@@ -1885,6 +1981,7 @@ impl BrowserNetworkCore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // What the walk is for travels with it to each query.
     async fn find_closest_from(
         &self,
         target: &str,
@@ -1893,12 +1990,19 @@ impl BrowserNetworkCore {
         initial_candidates: Vec<BrowserLookupCandidate>,
         read_progress: Option<crate::data::network::ReadProgress>,
         deadline: TransferDeadline,
+        warm: Warm,
     ) -> Result<BrowserLookupResult, String> {
         let target_key = parse_lookup_key(target, "lookup target")?;
         let failures = Rc::new(RefCell::new(Vec::new()));
         let views = Rc::new(RefCell::new(HashMap::new()));
         let config = LookupConfig {
-            alpha: BROWSER_LOOKUP_ALPHA,
+            // A swarm room's lookup, where connections take turns to gather
+            // ICE, asks one node at a time: it holds at most one turn.
+            alpha: if warm == Warm::No && !ice_gathering_may_overlap() {
+                1
+            } else {
+                BROWSER_LOOKUP_ALPHA
+            },
             ..LookupConfig::saorsa(count)
         };
         let mut lookup =
@@ -1932,6 +2036,7 @@ impl BrowserNetworkCore {
             owner_views: Rc::clone(&self.owner_views),
             reports: HashMap::new(),
             read_progress,
+            warm,
         };
         run_iterative_lookup(
             &mut lookup,
@@ -1980,8 +2085,20 @@ impl BrowserNetworkCore {
     }
 }
 
+/// Whether a lookup is for reads: it warms connections to the nodes it
+/// learns of for the reads that follow, and dials as reads do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Warm {
+    Yes,
+    /// A swarm room's lookup: it warms no connections, and where the browser
+    /// makes connections take turns to gather ICE it asks one node at a time,
+    /// each dialled only while no read's connection waits for a turn.
+    No,
+}
+
 struct BrowserNetworkLookupQuery {
     read_progress: Option<crate::data::network::ReadProgress>,
+    warm: Warm,
     pool: Rc<BrowserClientPool>,
     progress: ProgressReporter,
     failures: Rc<RefCell<Vec<BrowserLookupFailure>>>,
@@ -2030,6 +2147,7 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                 let routing = Rc::clone(&self.routing);
                 let contacted = Rc::clone(&self.contacted);
                 let read_progress = self.read_progress.clone();
+                let warm = self.warm;
                 let target = target.clone();
                 async move {
                     let responder = candidate.peer_id;
@@ -2038,7 +2156,21 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                         let endpoint = candidate.wire.webrtc_direct.as_ref().ok_or_else(|| {
                             "lookup candidate has no WebRTC Direct endpoint".to_string()
                         })?;
-                        let client = pool.client(endpoint).await?;
+                        // A swarm room's lookup connects only while no read's
+                        // connection waits for the page's ICE gathering turn,
+                        // one discovery dial at a time page-wide. A lease does
+                        // not connect; the session's hello does, so the turn
+                        // is held through it and let go before the lookup,
+                        // which waits on the control lane.
+                        let client = if warm == Warm::No {
+                            let _discovery = discovery_turn().await;
+                            reads_not_waiting_to_gather().await;
+                            let client = pool.client(endpoint).await?;
+                            client.hello().await?;
+                            client
+                        } else {
+                            pool.client(endpoint).await?
+                        };
                         client
                             .lookup(
                                 target.clone(),
@@ -2077,7 +2209,9 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                                     .collect();
                                 progress.offer(hints);
                             }
-                            pool.preconnect(&nodes, read_progress.clone());
+                            if warm == Warm::Yes {
+                                pool.preconnect(&nodes, read_progress.clone());
+                            }
                             routing.borrow_mut().insert(responder, candidate.clone());
                             contacted
                                 .borrow_mut()
@@ -2333,6 +2467,15 @@ struct ResolvedBrowserFile {
     file: PublicFileDescriptor,
     data_map_node: Option<BrowserNode>,
     index: self_encryption::DataMapIndex,
+    /// The file's swarm room and its secret, joined as soon as the file is
+    /// resolved, and again by a read if reading other files has left it
+    /// since. `None` for a file too large for a room.
+    room: Option<(RoomKey, [u8; 32])>,
+}
+
+/// The records of the file `index` covers, as its room shares them.
+fn swarm_records(index: &self_encryption::DataMapIndex) -> impl Iterator<Item = XorName> + '_ {
+    index.infos().iter().map(|info| info.dst_hash.0)
 }
 
 struct UploadRecord {
@@ -2604,6 +2747,59 @@ impl BrowserNetworkClient {
         })
     }
 
+    /// Join the room of the public file at `address`, so other clients reading
+    /// it can serve this one, and this one them. Every read of the file does
+    /// this itself; joining before a read gives the client time to meet the
+    /// others first, so more of the file comes from them. Reads the file's
+    /// DataMap, whose root names the room.
+    #[wasm_bindgen(js_name = joinSwarm)]
+    pub async fn join_swarm(&self, address: String) -> Result<(), JsValue> {
+        let address = super::protocol::normalize_hex(&address, 32)
+            .map_err(|error| JsValue::from_str(&error))?;
+        let progress = ProgressReporter(None);
+        let (encoded, _) = self
+            .get_shared_chunk(&address, &progress)
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
+        let published = crate::client_engine::files::decode_map(&encoded)
+            .map_err(|error| JsValue::from_str(&error))?;
+        let root = self
+            .resolve_root(&published, &progress)
+            .await
+            .map_err(|error| JsValue::from_str(&error))?;
+        if crate::swarm::file_records(&root).is_none() {
+            return Err(JsValue::from_str("not the DataMap of a file"));
+        }
+        // A file too large for a room is read from the nodes alone: joining
+        // it does nothing.
+        self.shared.swarm_room_now(&root);
+        Ok(())
+    }
+
+    /// What this client fetched from and served to other clients reading the
+    /// same files: records and bytes each way, records that failed their
+    /// check, and the links and rooms open now.
+    #[wasm_bindgen(js_name = swarmStats)]
+    pub fn swarm_stats(&self) -> Result<JsValue, JsValue> {
+        self.shared
+            .swarm_stats()
+            .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// The same, for each room this client is in now: `{ tag, ... }` per
+    /// room, one room per file read lately. A read reports its file's room as
+    /// `Swarm room <tag>` once it resolves the file, and every link of the
+    /// room carries a data channel labelled `ant-swarm-<tag>`, so a page can
+    /// tell which file each link and count belongs to.
+    #[wasm_bindgen(js_name = swarmRoomStats)]
+    pub fn swarm_room_stats(&self) -> Result<JsValue, JsValue> {
+        self.shared
+            .swarm_room_stats()
+            .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
     /// Authenticate the first usable configured seed in this client's own pool.
     /// Remaining seeds connect in the background within the bootstrap bound.
     pub async fn connect(&self, expected_payment: Option<JsValue>) -> Result<JsValue, JsValue> {
@@ -2844,6 +3040,7 @@ impl BrowserNetworkClient {
 
     /// Close all pooled WebRTC associations.
     pub fn close(&self) {
+        self.shared.swarm().shutdown();
         self.inner.pool.close();
     }
 }
@@ -2868,7 +3065,7 @@ impl BrowserNetworkClient {
         &self,
         address: &str,
         progress: &ProgressReporter,
-    ) -> Result<(Vec<u8>, BrowserNode), String> {
+    ) -> Result<(Vec<u8>, Option<BrowserNode>), String> {
         let key = parse_lookup_key(address, "record address")?;
         progress.report(&format!("Fetching {address}"));
         // Source metadata is bounded separately from the content cache. A
@@ -2882,13 +3079,8 @@ impl BrowserNetworkClient {
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("record {address} not found"))?;
-        let node = self
-            .adapter
-            .sources
-            .borrow_mut()
-            .get(&key)
-            .cloned()
-            .ok_or("record source metadata missing")?;
+        // A record another client sent has no node behind it.
+        let node = self.adapter.sources.borrow_mut().get(&key).cloned();
         Ok((chunk.content.to_vec(), node))
     }
 
@@ -2993,7 +3185,7 @@ impl BrowserNetworkClient {
             .resolve_data_map(&encoded_data_map, descriptor, progress)
             .await?;
         resolved.file.address = address;
-        resolved.data_map_node = Some(data_map_node);
+        resolved.data_map_node = data_map_node;
         Ok(resolved)
     }
 
@@ -3029,16 +3221,14 @@ impl BrowserNetworkClient {
             .await
     }
 
-    /// Resolve nested DataMap records and describe the file the root map covers.
-    async fn resolve_data_map(
+    /// The root map of `published`, resolving nested DataMap records.
+    async fn resolve_root(
         &self,
-        encoded_data_map: &[u8],
-        mut file: PublicFileDescriptor,
+        published: &DataMap,
         progress: &ProgressReporter,
-    ) -> Result<ResolvedBrowserFile, String> {
-        let published_data_map = crate::client_engine::files::decode_map(encoded_data_map)?;
-        let root_data_map = crate::client_engine::files::resolve(
-            &published_data_map,
+    ) -> Result<DataMap, String> {
+        crate::client_engine::files::resolve(
+            published,
             &|address| async move {
                 progress.report(&format!(
                     "Resolving nested DataMap record {}",
@@ -3051,8 +3241,18 @@ impl BrowserNetworkClient {
             &|| self.shared.controller().fetch.current(),
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())
+    }
 
+    /// Resolve nested DataMap records and describe the file the root map covers.
+    async fn resolve_data_map(
+        &self,
+        encoded_data_map: &[u8],
+        mut file: PublicFileDescriptor,
+        progress: &ProgressReporter,
+    ) -> Result<ResolvedBrowserFile, String> {
+        let published_data_map = crate::client_engine::files::decode_map(encoded_data_map)?;
+        let root_data_map = self.resolve_root(&published_data_map, progress).await?;
         let index = self_encryption::DataMapIndex::new(&root_data_map)
             .map_err(|error| error.to_string())?;
         if index.infos().len() < crate::client_engine::files::MIN_FILE_CHUNKS {
@@ -3060,6 +3260,15 @@ impl BrowserNetworkClient {
         }
         if index.file_size() > super::manifest::MAX_SAFE_JS_INTEGER {
             return Err("file size exceeds JavaScript's exact integer range".into());
+        }
+        // The file's room and records are its root map's, once it is known to
+        // be one this page can read. Joined at once, so its other readers are
+        // being found while the first records come from the nodes.
+        let room = crate::swarm::room_of(&root_data_map);
+        if let Some((room, secret)) = room {
+            progress.report(&format!("Swarm room {}", crate::swarm::room_tag(&secret)));
+            self.shared
+                .join_swarm_room(room, secret, swarm_records(&index));
         }
 
         file.size = index.file_size();
@@ -3071,6 +3280,7 @@ impl BrowserNetworkClient {
             file,
             data_map_node: None,
             index,
+            room,
         })
     }
 
@@ -3686,10 +3896,19 @@ fn ice_gathering_may_overlap() -> bool {
 
 /// Wait for the page's ICE gathering turn, or `None` where connections may
 /// gather at once. The semaphore is never closed.
-async fn ice_gathering_turn() -> Option<OwnedSemaphorePermit> {
+pub(crate) async fn ice_gathering_turn() -> Option<OwnedSemaphorePermit> {
     if ice_gathering_may_overlap() {
         return None;
     }
+    // Counted while it waits, so the swarm's gatherings let it go first.
+    struct Waiting;
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            ICE_GATHERING_WAITERS.with(|waiters| waiters.set(waiters.get().saturating_sub(1)));
+        }
+    }
+    ICE_GATHERING_WAITERS.with(|waiters| waiters.set(waiters.get() + 1));
+    let _waiting = Waiting;
     ICE_GATHERING_TURN
         .with(Arc::clone)
         .acquire_owned()
@@ -3697,9 +3916,49 @@ async fn ice_gathering_turn() -> Option<OwnedSemaphorePermit> {
         .ok()
 }
 
+/// The page's ICE gathering turn for the swarm's own connections to other
+/// readers, or `None` where connections may gather at once: taken only while
+/// it is free and no connection to a node waits for it, so finding other
+/// readers never puts a read's connection behind it in the queue.
+pub(crate) async fn ice_gathering_turn_after_reads() -> Option<OwnedSemaphorePermit> {
+    if ice_gathering_may_overlap() {
+        return None;
+    }
+    loop {
+        if ICE_GATHERING_WAITERS.with(std::cell::Cell::get) == 0 {
+            if let Ok(turn) = ICE_GATHERING_TURN.with(Arc::clone).try_acquire_owned() {
+                return Some(turn);
+            }
+        }
+        crate::runtime::sleep(ICE_GATHERING_YIELD_POLL).await;
+    }
+}
+
+/// The swarm's page-wide place for work that takes the ICE gathering turn
+/// (see `DISCOVERY_TURN`), held until that work has let the turn go, or
+/// `None` where connections may gather at once.
+pub(crate) async fn discovery_turn() -> Option<OwnedSemaphorePermit> {
+    if ice_gathering_may_overlap() {
+        return None;
+    }
+    DISCOVERY_TURN.with(Arc::clone).acquire_owned().await.ok()
+}
+
+/// Waits until no connection to a node waits for the page's ICE gathering
+/// turn, where connections take turns: a swarm room's lookup, whose
+/// connections take turns too, starts after the reads' connections.
+pub(crate) async fn reads_not_waiting_to_gather() {
+    if ice_gathering_may_overlap() {
+        return;
+    }
+    while ICE_GATHERING_WAITERS.with(std::cell::Cell::get) > 0 {
+        crate::runtime::sleep(ICE_GATHERING_YIELD_POLL).await;
+    }
+}
+
 /// Pass the turn on once `connection` finishes gathering, or after
 /// [`ICE_GATHERING_TURN_TIMEOUT`]. The connection itself carries on at once.
-fn pass_ice_gathering_turn(connection: RtcPeerConnection, turn: OwnedSemaphorePermit) {
+pub(crate) fn pass_ice_gathering_turn(connection: RtcPeerConnection, turn: OwnedSemaphorePermit) {
     wasm_bindgen_futures::spawn_local(async move {
         let deadline = web_time::Instant::now() + ICE_GATHERING_TURN_TIMEOUT;
         while connection.ice_gathering_state() != RtcIceGatheringState::Complete

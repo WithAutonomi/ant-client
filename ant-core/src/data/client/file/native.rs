@@ -3195,16 +3195,24 @@ impl Client {
         let addr_hex = hex::encode(addr);
 
         let chunk_content = if let Some(peer_reports) = context.peer_reports {
-            match self
+            // A file's read, as every other: counted while it runs.
+            let reading = self.swarm().reading(&addr);
+            let fetched = self
                 .chunk_get_from_closest_peer_group(&addr, context.peer_count)
-                .await
-            {
+                .await;
+            drop(reading);
+            match fetched {
                 Ok(results) => {
                     let (content, sweep) = file_chunk_sweep_report_from_peer_results(
                         attempt,
                         is_deferred_retry,
                         &results,
                     );
+                    // A file read shares what it got (checked by the fetch)
+                    // with the file's room.
+                    if let Some(content) = &content {
+                        self.swarm().seed(addr, content.clone());
+                    }
                     peer_reports
                         .lock()
                         .map_err(|_| {
@@ -3261,7 +3269,12 @@ impl Client {
                 )
             });
             match self
-                .chunk_get_observed_from_closest_peers(&addr, context.peer_count, diag.as_ref())
+                .chunk_get_observed_from_closest_peers(
+                    &addr,
+                    context.peer_count,
+                    true,
+                    diag.as_ref(),
+                )
                 .await
             {
                 Ok(Some(chunk)) => Some(chunk.content),
@@ -3368,6 +3381,8 @@ impl Client {
                             .chunk_get_observed_from_closest_peers(
                                 &address,
                                 peer_count,
+                                // A map record: nodes only, shared with no room.
+                                false,
                                 diag.as_ref(),
                             )
                             .await?
@@ -3398,6 +3413,8 @@ impl Client {
         } else {
             data_map.clone()
         };
+        // The file's room and records are its root map's.
+        self.swarm_room(&root_map);
 
         // Phase 2: Now we know the real chunk count.
         let total_chunks = root_map.len();

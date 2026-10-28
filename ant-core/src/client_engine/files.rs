@@ -8,7 +8,9 @@ use futures_util::future::{select, Either};
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use self_encryption::{DataMap, DataMapIndex, EncryptedChunk};
-use std::{cell::RefCell, collections::HashMap, future::Future, ops::Range, sync::Mutex};
+#[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
+use std::ops::Range;
+use std::{cell::RefCell, collections::HashMap, future::Future, sync::Mutex};
 
 /// self_encryption splits every encryptable file into at least three chunks.
 pub(crate) const MIN_FILE_CHUNKS: usize = 3;
@@ -152,10 +154,12 @@ where
 
 /// Fetch, verify and decrypt `chunks` in one deferred retry pass, handing each
 /// plaintext chunk to `deliver` as it arrives, in any order. Nothing is kept
-/// once delivered, so memory is bounded by the fetches in flight.
+/// once delivered, so memory is bounded by the fetches in flight. The records
+/// are asked for in the order `chunks` lists them; a chunk the map does not
+/// have is skipped.
 pub(crate) async fn read_chunks<E, F, Fut, C, S, SF, D>(
     index: &DataMapIndex,
-    chunks: Range<usize>,
+    chunks: impl IntoIterator<Item = usize>,
     fetch: &F,
     cap: &C,
     sleep: &S,
@@ -170,8 +174,10 @@ where
     SF: Future<Output = ()>,
     D: Fn(usize, Bytes) -> Result<(), String>,
 {
-    let requests = index.infos()[chunks]
-        .iter()
+    let infos = index.infos();
+    let requests = chunks
+        .into_iter()
+        .filter_map(|chunk| infos.get(chunk))
         .map(|info| (info.index, info.dst_hash.0))
         .collect();
     fetch_records_deferred(

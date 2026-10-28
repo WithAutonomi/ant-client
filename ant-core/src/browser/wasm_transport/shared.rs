@@ -10,6 +10,7 @@ use crate::data::network::{BrowserNetwork, RequestDispatched};
 use ant_protocol::transport::{DHTNode, MultiAddr, PeerId, WitnessedCloseGroup};
 use ant_protocol::{ChunkMessage, ChunkMessageBody};
 use futures::future::LocalBoxFuture;
+use std::net::IpAddr;
 
 pub(super) struct SharedNetworkAdapter {
     pub(super) inner: Rc<BrowserNetworkCore>,
@@ -98,6 +99,31 @@ impl BrowserNetwork for SharedNetworkAdapter {
         })
     }
 
+    fn find_rendezvous_peers<'a>(
+        &'a self,
+        target: &'a LookupKey,
+        count: usize,
+    ) -> LocalBoxFuture<'a, DataResult<Vec<(PeerId, Vec<MultiAddr>)>>> {
+        Box::pin(async move {
+            let result = self
+                .inner
+                .find_closest_with_progress(
+                    &hex::encode(target),
+                    &ProgressReporter(None),
+                    count,
+                    None,
+                    Warm::No,
+                )
+                .await
+                .map_err(DataError::Network)?;
+            result
+                .nodes
+                .iter()
+                .map(|node| peer_record(node).map(|node| (node.peer_id, node.addresses)))
+                .collect()
+        })
+    }
+
     fn find_read_peers<'a>(
         &'a self,
         target: &'a LookupKey,
@@ -115,6 +141,7 @@ impl BrowserNetwork for SharedNetworkAdapter {
                     &ProgressReporter(None),
                     count,
                     Some(progress),
+                    Warm::Yes,
                 )
                 .await
                 .map_err(DataError::Network)?;
@@ -241,6 +268,61 @@ impl BrowserNetwork for SharedNetworkAdapter {
             .collect()
     }
 
+    fn reached_ips(&self, peer: &PeerId) -> Vec<IpAddr> {
+        let peer = peer.to_hex();
+        self.inner
+            .pool
+            .clients
+            .borrow()
+            .values()
+            .filter(|entry| {
+                [&entry.client, &entry.data_client]
+                    .iter()
+                    .any(|client| client.is_connected() && client.hello.borrow().is_some())
+            })
+            .filter(|entry| entry.client.endpoint.peer_id == peer)
+            .filter_map(|entry| entry.client.endpoint.host.parse::<IpAddr>().ok())
+            .collect()
+    }
+
+    fn supports_swarm(&self) -> bool {
+        true
+    }
+
+    fn hosts_swarm(&self, peer: &PeerId) -> Option<bool> {
+        let peer = peer.to_hex();
+        let clients = self.inner.pool.clients.borrow();
+        let mut hellos = clients
+            .values()
+            .filter(|entry| entry.client.endpoint.peer_id == peer)
+            .flat_map(|entry| [&entry.client, &entry.data_client])
+            .filter(|client| client.is_connected())
+            .filter_map(|client| client.hello.borrow().clone());
+        hellos.next().map(|hello| {
+            hello
+                .capabilities
+                .iter()
+                .any(|capability| capability == SWARM_CAPABILITY)
+        })
+    }
+
+    fn connect_for_swarm<'a>(
+        &'a self,
+        peer: &'a PeerId,
+        addrs: &'a [MultiAddr],
+    ) -> LocalBoxFuture<'a, ()> {
+        Box::pin(async move {
+            // The control lane, where swarm requests go; the request reports
+            // any failure.
+            let Ok(endpoint) = webrtc_endpoint(peer, addrs) else {
+                return;
+            };
+            if let Ok(client) = self.inner.pool.client(&endpoint).await {
+                let _ = client.hello().await;
+            }
+        })
+    }
+
     fn refused_peers(&self) -> Vec<(PeerId, Duration)> {
         self.inner
             .pool
@@ -281,6 +363,7 @@ impl BrowserNetwork for SharedNetworkAdapter {
                     Admission {
                         pointer: true,
                         paid: true,
+                        swarm: false,
                     },
                     self.payment_network.as_ref(),
                 )
@@ -488,6 +571,8 @@ struct Admission {
     /// A paid request: the node must take paid uploads on the client's
     /// payment network, when the client has one.
     paid: bool,
+    /// A swarm request: the node must host swarm rooms.
+    swarm: bool,
 }
 
 impl Admission {
@@ -505,6 +590,12 @@ impl Admission {
                     | ChunkMessageBody::MerkleCandidateQuoteRequestV2(_)
                     | ChunkMessageBody::PutRequest(_)
                     | ChunkMessageBody::PointerPutRequest(_)
+            ),
+            swarm: matches!(
+                body,
+                ChunkMessageBody::SwarmAnnounceRequest(_)
+                    | ChunkMessageBody::SwarmAnswerRequest(_)
+                    | ChunkMessageBody::SwarmLeaveRequest(_)
             ),
         }
     }
@@ -531,6 +622,11 @@ fn admits(
         return Err(DataError::Network(
             "node does not support browser pointers".into(),
         ));
+    }
+    // A node that predates swarm rooms would close the channel on a message it
+    // cannot decode, failing the reads in flight on it, so it is not asked.
+    if needs.swarm && !advertises(SWARM_CAPABILITY) {
+        return Err(DataError::Network("node does not host swarm rooms".into()));
     }
     if needs.paid {
         if let Some(network) = payment_network {
