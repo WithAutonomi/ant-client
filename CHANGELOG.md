@@ -66,7 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shells can run part of such a PATH entry as code (macOS login shells re-read `PATH` through
   `path_helper` without escaping it). The installer says so and prints an escaped line for the
   current shell instead. A name with `:`, which separates `PATH` entries, can't be added at all,
-  and an `INSTALL_DIR` containing a newline is rejected before anything is installed.
+  and an install directory containing a newline (in `INSTALL_DIR`, or in the current directory
+  for a relative one) is rejected before anything is installed.
   `--no-modify-path` or `ANT_NO_MODIFY_PATH=1` (also honoured by `install.ps1`) restores
   the old print-the-line behaviour. The macOS default install directory moves from
   `/usr/local/bin`, which is root-owned without Homebrew so the install failed without `sudo`, to

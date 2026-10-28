@@ -109,12 +109,14 @@ jobs:
 
       # PATH is colon-separated, so a name with `:` can't be a PATH entry at all: no startup file,
       # fish's included, and no `export PATH=` line, with or without --no-modify-path. A newline is
-      # rejected before anything is installed; `pwd` would strip a trailing one, and the install
-      # would land in the directory without it.
+      # rejected before anything is installed, whether it is in INSTALL_DIR or, for a relative one,
+      # in the current directory; `pwd` would strip a trailing one, and the install would land in
+      # the directory without it.
       - name: verify an install directory with a colon or a newline in its name is refused
         env:
           ANT_VERSION: ${{ inputs.version }}
         run: |
+          installer="$PWD/install.sh"
           home="$RUNNER_TEMP/colon-home"
           mkdir -p "$home"
           fresh() { env -i HOME="$home" SHELL=/bin/bash PATH=/usr/bin:/bin "$@"; }
@@ -144,6 +146,20 @@ jobs:
           fi
           if [ -e "$home/nl/ant" ] || [ -e "$home/nl"$'\n' ]; then
             echo "ERROR: something was installed for an INSTALL_DIR ending in a newline"
+            exit 1
+          fi
+          # A relative INSTALL_DIR from a current directory whose name ends in a newline, with the
+          # directory without it present, and from one with a newline in the middle.
+          mkdir -p "$home/work" "$home/work"$'\n' "$home/a"$'\n'"b"
+          for cwd_dir in "$home/work"$'\n'"|." "$home/a"$'\n'"b|bin"; do
+            cwd="${cwd_dir%|*}"
+            if (cd "$cwd" && fresh ANT_VERSION="$ANT_VERSION" INSTALL_DIR="${cwd_dir##*|}" bash "$installer"); then
+              echo "ERROR: a relative INSTALL_DIR under a directory with a newline in its name was accepted"
+              exit 1
+            fi
+          done
+          if [ -e "$home/work/ant" ] || [ -e "$home/work"$'\n'"/ant" ] || [ -e "$home/a"$'\n'"b/bin" ]; then
+            echo "ERROR: something was installed for a current directory with a newline in its name"
             exit 1
           fi
 

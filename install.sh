@@ -354,10 +354,15 @@ TARGET="$(detect_target)"
 CHANNEL="${ANT_CHANNEL:-stable}"
 VERSION="${ANT_VERSION:-$(resolve_version "$CHANNEL")}"
 INSTALL_DIR="${INSTALL_DIR:-$(default_install_dir)}"
-# Checked before anything is downloaded or created: making the path absolute below strips a
-# trailing newline, which would install somewhere else, and no PATH line can hold one anyway.
+# Checked before anything is downloaded or created, on the path as it will be used: a relative
+# INSTALL_DIR is resolved against the current directory, whose own name could hold the newline.
+# No PATH line can hold one. ($PWD, unlike `$(pwd)`, keeps a trailing newline.)
 case "$INSTALL_DIR" in
-  *$'\n'*) err "INSTALL_DIR must not contain a newline" ;;
+  /*) effective_install_dir="$INSTALL_DIR" ;;
+  *) effective_install_dir="$PWD/$INSTALL_DIR" ;;
+esac
+case "$effective_install_dir" in
+  *$'\n'*) err "the install directory must not contain a newline (in INSTALL_DIR, or in the current directory for a relative one)" ;;
 esac
 
 if [ -n "${ANT_VERSION:-}" ]; then
@@ -382,7 +387,9 @@ tar xzf "${TMPDIR}/${ARCHIVE}" -C "$TMPDIR"
 mkdir -p -- "$INSTALL_DIR"
 # Absolute, so the PATH entry written below does not depend on where the installer was run from.
 # CDPATH cleared, or `cd` into a relative directory found through it prints that directory too.
-INSTALL_DIR="$(CDPATH='' cd -- "$INSTALL_DIR" && pwd)"
+# The `x` stops `$(...)` stripping newlines from the end of the path; only pwd's own is cut off.
+INSTALL_DIR="$(CDPATH='' cd -- "$INSTALL_DIR" && pwd && printf x)"
+INSTALL_DIR="${INSTALL_DIR%$'\n'x}"
 cp "${TMPDIR}/${BINARY_NAME}-${VERSION}-${TARGET}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
 say "Installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
