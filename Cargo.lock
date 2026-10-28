@@ -890,6 +890,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rmp-serde",
+ "rustls",
  "saorsa-transport",
  "self-replace",
  "self_encryption",
@@ -918,6 +919,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "web-time",
+ "webrtc",
  "windows-sys 0.61.2",
  "xor_name",
  "zip",
@@ -934,9 +936,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f14d30621fa4e9908e2c89b361eb5fcf0bcdee26cf21e1f05154e5a78a700b8e"
+version = "0.23.1"
+source = "git+https://github.com/grumbach/ant-node?branch=feat%2Fpeer-swarm#e5e86480d978edb6219f660685b89259e57f24f2"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -989,9 +990,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28e38869b71a547db27d565d6256c371ec410700d646e0eb7b683684cdaa93de"
+version = "5.0.1"
+source = "git+https://github.com/grumbach/ant-protocol?branch=feat%2Fpeer-swarm#ffbed67b484506f9de27a52308ab1ddc6a95d84a"
 dependencies = [
  "blake3",
  "bytes",
@@ -5580,9 +5580,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25e3b19c7be5ab56d900ce4c0af1029f4009ef9142d4bb229e0370db0d31b131"
+version = "0.29.2"
+source = "git+https://github.com/grumbach/saorsa-core?branch=feat%2Fpeer-swarm#e04065db8dc2ae83523febcb64b2e3042988e8e5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5649,9 +5648,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.39.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "beeb14b4a6d7a652dc0433eec1db536901c12c9532f0aaa922b1dd7e0fb58841"
+version = "0.38.2"
+source = "git+https://github.com/grumbach/saorsa-transport?branch=feat%2Fpeer-swarm#5e6ea135b5e7cdcf349f613d55e7c645859633c9"
 dependencies = [
  "anyhow",
  "async-trait",
