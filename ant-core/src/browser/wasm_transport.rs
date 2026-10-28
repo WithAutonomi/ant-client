@@ -575,12 +575,21 @@ impl BrowserClientPool {
     /// Overlap ICE/PQ/HELLO with the iterative walk, using only owner-signed
     /// addresses that `find_node` has already verified. Publish a read hint
     /// after authentication; these are not lookup votes or storage receipts.
+    /// A read's preconnects skip nodes its listed peers show cannot hold the
+    /// record, so they do not hold the preconnect slots a holder needs.
     fn preconnect(
         self: &Rc<Self>,
         nodes: &[BrowserNode],
         read_progress: Option<crate::data::network::ReadProgress>,
     ) {
         for node in nodes {
+            let ruled_out = read_progress.as_ref().is_some_and(|progress| {
+                parse_lookup_key(&node.peer_id, "peer ID")
+                    .is_ok_and(|key| !progress.may_hold(&PeerId::from_bytes(key)))
+            });
+            if ruled_out {
+                continue;
+            }
             let at_capacity = {
                 let clients = self.clients.borrow();
                 let pending = self.preconnecting.borrow();
@@ -2050,6 +2059,13 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                     match result {
                         Ok(nodes) => {
                             if let Some(progress) = &read_progress {
+                                progress.listed(
+                                    std::iter::once(responder)
+                                        .chain(nodes.iter().filter_map(|node| {
+                                            parse_lookup_key(&node.peer_id, "peer ID").ok()
+                                        }))
+                                        .map(PeerId::from_bytes),
+                                );
                                 let hints = std::iter::once(&candidate.wire)
                                     .chain(nodes.iter())
                                     .filter(|node| {

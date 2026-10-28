@@ -162,6 +162,48 @@ test("cold closer hints cannot occupy the read slots before a connected holder",
   } finally { clearTimeout(deadline); reader?.close(); client.close(); }
 });
 
+// A record's close group, which stores it, and the bootstrap nodes a client
+// connects to at most.
+const closeGroupSize = 7;
+const bootstrapNodes = 4;
+// How long a far bootstrap node takes to answer a GET for a record it lacks,
+// and how long the close group takes to connect.
+const farMissMs = 100;
+const groupConnectMs = 600;
+
+test("a read stops asking hints once a lookup lists a close group nearer the record", async () => {
+  // The read's first hints are its bootstrap nodes, the farthest from the
+  // record. Their lookup replies list the record's close group, which takes a
+  // while to connect, and whose farthest member holds the record. A hint with
+  // a whole close group listed nearer cannot hold the record, so the read asks
+  // no bootstrap node after those replies and waits for the close group.
+  const nodes = Array.from({ length: 16 }, () => ({}));
+  const rtc = mockWebRtc(nodes);
+  const target = BigInt(`0x${datamap.address}`);
+  const ordered = rtc.endpoints.map((endpoint, index) => ({ index,
+    distance: BigInt(`0x${parseWebRtcDirectMultiaddr(endpoint).peerId}`) ^ target,
+  })).sort((a, b) => a.distance < b.distance ? -1 : 1).map(({ index }) => index);
+  const group = ordered.slice(0, closeGroupSize);
+  const far = ordered.slice(-bootstrapNodes);
+  const holder = group.at(-1);
+  nodes[holder].chunk = datamap.content;
+  for (const index of group) nodes[index].connectDelay = groupConnectMs;
+  for (const index of far) {
+    nodes[index].view = group;
+    nodes[index].delay = method => method === "get_chunk" ? farMissMs : 0;
+  }
+  const client = new BrowserNetworkClient(far.map(index => rtc.endpoints[index]));
+  let reader;
+  try {
+    reader = await client.openPublicFile(datamap.address);
+    assert.equal(reader.size, content.length);
+    const gets = rtc.requests.filter(r => r.method === "get_chunk");
+    assert.ok(gets.some(r => r.node === holder));
+    const farGets = gets.filter(r => far.includes(r.node)).length;
+    assert.ok(farGets <= 1, `the read asked ${farGets} far hints`);
+  } finally { reader?.close(); client.close(); }
+});
+
 test("shared Client rejects corrupt content immediately, matching native GET", async () => {
   const rtc = mockWebRtc(Array.from({ length: 24 }, () => ({ chunk: new Uint8Array([1, 2, 3]), respond: failDiscovery })));
   const client = new BrowserNetworkClient(rtc.endpoints);
@@ -345,6 +387,29 @@ test("an ordinary reader reads ahead only once a read continues another", async 
     assert.deepEqual(await reader.readRange(10, 10), original.slice(10, 20));
     const window = await settled(rtc, 500) - opened;
     assert(window > 2 && window < starts.length, `fetched ${window} records`);
+  } finally { reader?.close(); client.close(); }
+});
+
+// The first record's GET takes this long, and timers may fire this much early.
+const firstRecordMs = 400;
+const timerSlackMs = 20;
+
+test("a read that continues no other fetches the record after it only once it has finished", async () => {
+  // The record after a header read is fetched in case the read starts a
+  // stream. Fetched alongside, its GET would compete with the one the read,
+  // such as a player's first, waits for.
+  const { original, encrypted } = recordFile(3);
+  const rtc = serve(encrypted, new Set(), new Map([[0, firstRecordMs]]));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let reader;
+  try {
+    reader = await client.openPublicFile(encrypted.address);
+    assert.deepEqual(await reader.readRange(0, 10), original.slice(0, 10));
+    await settled(rtc);
+    const sent = index => rtc.requests.find(r => r.method === "get_chunk" && r.address === encrypted.chunks[index].dst_hash);
+    assert.ok(sent(1), "the record after the read was not fetched");
+    assert.ok(sent(1).at - sent(0).at >= firstRecordMs - timerSlackMs,
+      `the next record was fetched ${Math.round(sent(1).at - sent(0).at)} ms after the read's record`);
   } finally { reader?.close(); client.close(); }
 });
 
