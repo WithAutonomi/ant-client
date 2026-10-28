@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-10-13
+- **Last amended:** 2026-10-28
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -826,3 +826,94 @@ median instead of 1.9-2.7 s, a failed one 3.0 s instead of 10.4-11.0 s, and a
 lookup round 1.2 s instead of 1.6-3.8 s. Failing dials held 14 pool slots on average, and the
 first data read started at 7-8 s instead of 13.5-14.3 s. The lookup width, its
 grace period, the pool size and the dial-failure cooldown are unchanged.
+
+## First record of a read (2026-10-28)
+
+Related: [V2-1769](https://linear.app/autonominetwork/issue/V2-1769); the
+node-side DTLS delay is
+[saorsa-transport#229](https://github.com/WithAutonomi/saorsa-transport/issues/229).
+
+A stream's first frame waits for its first record. This was traced on mainnet
+with a test-utils build of `7a432e7`, over 15 rounds in Chromium. A warm client
+read the first 1 MiB of a 54.9 MB video 3 s after connecting. The GET to the
+record's holder started a median 4.1 s after the read began:
+
+- A lookup reply first named the holder at 1.1 s.
+- The read's early GETs went first to hints that could not hold the record.
+  Its first hints are its bootstrap peers, which share 0-2 leading bits with
+  the record. A median 6 GETs ran one at a time before the holder's, and each
+  waited 0.46 s for a new connection lane before its NotFound.
+- In 15 of 15 rounds, the preconnect slots were full when the holder was named.
+  The peers in them shared a median 1 bit with the record, and half were dead
+  endpoints. A third had come from the lookup for the record after this one,
+  which a header read started at the same time. A skipped node is not queued,
+  so the holder waited for the lookup's next round or another reply.
+
+The decisions:
+
+- **Peers that cannot hold the record are not read or preconnected.**
+  `ReadProgress::listed` records the peers each lookup reply lists, with its
+  responder. A record is stored by its close group, so a peer with
+  `CLOSE_GROUP_SIZE` listed peers nearer the record cannot hold it, and
+  `ReadProgress::may_hold` is false for it. Such a peer leaves the read's hints,
+  and the read's preconnects skip it. A holder is in the close group by
+  definition, so the rule never excludes one, whether or not the peers nearer
+  it are reachable.
+  - Listing only removes candidates from early reads. The read after discovery,
+    and its absence and closeness decisions, are unchanged.
+  - A responder that lists invented identities near the record can at most
+    suppress early reads, leaving the read to finish after discovery.
+  - Native reads never list peers, so their hints are unchanged.
+- **A read that continues no other fetches the record after it only once it
+  has finished.** It used to start that fetch at once, in case the read starts
+  a stream, so its lookup and transfer competed with the record the read waits
+  for. Reads that continue a stream are unchanged.
+
+This was measured against main on mainnet, from one macOS machine, with the
+arms in rotating order and a fresh browser context per sample. The traced read
+of the first 1 MiB, at the median:
+
+| engine | rounds | holder's GET, main → this | 1 MiB read, main → this | sooner |
+| --- | --: | --: | --: | --: |
+| Chromium | 10 | 3.7 → 1.6 s | 4.8 → 2.6 s | 9/10 |
+| WebKit (Playwright) | 6 | 6.3 → 3.0 s | 7.4 → 3.8 s | 6/6 |
+
+GETs before the holder's fell from 6 to 1 in Chromium, and from 8 to 2 in
+WebKit. The time from the read knowing the holder to asking it fell from 0.55
+s to 0 in Chromium, and from 1.66 s to 0 in WebKit.
+
+Through the SDK's `createMediaSource()`, as released in 0.1.4 and with this
+change's bindings, the same video was timed to its first decoded frame. It then
+played for ten seconds and was sought to 85%, beyond the read-ahead window:
+
+| engine | rounds | first frame, median | sooner | seek to 85%, median | sooner |
+| --- | --: | --: | --: | --: | --: |
+| Chromium | 20 | 4.4 → 3.0 s | 13/20 | 4.9 → 4.4 s | 12/20 |
+| WebKit (Playwright) | 6 | 4.8 → 3.8 s | 4/5 | 5.3 → 2.9 s | 4/5 |
+
+In Chromium the median paired saving was 0.7 s for the first frame and 0.5 s
+for the seek. Seeks over 6 s fell from 5 of 20 to 3. One baseline WebKit sample
+failed: its seek never produced a frame. The SDK reads the file's tail beside
+its head, and that read competes with the head's.
+
+**Cost: first reads concentrate on the first holder found.** In the WebKit
+traces on main, two holders each served three of the six first reads. With
+this change, one served all six; in Chromium it served 10 of 10, against 9 of
+10. Early GETs still choose uniformly among the hints that may hold the
+record, but the first such hint is now asked at once. A holder that is full
+declines new sessions and is skipped for 15 s (ant-node ADR-0023).
+
+Unchanged: the lookup's width and grace period, the preconnect bound, the
+hedge delay, and the read after discovery.
+
+Left for later:
+
+- **DTLS:** it took 1.39 s at the median after ICE connected (p90 3.5 s), in
+  both engines, and its times cluster at the browsers' DTLS resend timers. The
+  node creates its DTLS endpoint only once its own ICE has completed, and drops
+  an earlier ClientHello; that is saorsa-transport#229.
+- **Lookup answers:** each took about five of its node's round trips. It
+  carries 20 owner-signed records, whose ML-DSA-65 keys and signatures alone
+  come to over 100 KB.
+- **Lookup rounds:** each round waits for its slowest answer, up to its grace
+  period.
