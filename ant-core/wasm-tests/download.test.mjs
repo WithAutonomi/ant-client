@@ -2,7 +2,7 @@ import { BrowserNetworkClient } from "./client-fixture.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { contentAddress, encryptPublicFile, parseWebRtcDirectMultiaddr, test_encode_public_data_map } from "./pkg/ant_core.js";
-import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
+import { asChromium, mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 
 const content = new TextEncoder().encode("Discoverable storage holder regression.".repeat(100));
 const encrypted = encryptPublicFile(content);
@@ -57,6 +57,41 @@ test("a connected known holder can finish a verified read while discovery is sti
   } finally { clearTimeout(deadline); reader?.close(); client.close(); }
 });
 
+
+test("an early read is hedged only after a DataChannel transfer's time", async () => {
+  // Both nodes hold the DataMap and discovery never completes, so only the
+  // early read's hedge can send a second GET. A browser races a GET 3 s after
+  // dispatching it to its peer: a first reply within that time is the only GET,
+  // and a slower one is raced a full 3 s later, as the GETs' arrivals show.
+  const hedge = 3_000;
+  // Timers may fire this much early.
+  const timerSlack = 50;
+  for (const [firstReply, expectedGets] of [[hedge / 2, 1], [hedge * 2, 2]]) {
+    let asked = 0, delivered = 0;
+    const options = [{ chunk: datamap.content }, { chunk: datamap.content }];
+    const rtc = mockWebRtc(options);
+    const client = new BrowserNetworkClient(rtc.endpoints);
+    let reader;
+    try {
+      await client.findClosest(datamap.address);
+      for (const node of options) {
+        node.respond = (_channel, method) => method === "find_node" ? false : undefined;
+        node.delay = method => method === "get_chunk" && asked++ === 0 ? firstReply : 0;
+        node.delivered = (_channel, method) => { if (method === "get_chunk") delivered++; };
+      }
+      reader = await client.openPublicFile(datamap.address);
+      assert.equal(reader.size, content.length);
+      const gets = rtc.requests.filter(r => r.method === "get_chunk" && r.address === datamap.address);
+      assert.equal(gets.length, expectedGets, `first reply after ${firstReply} ms`);
+      if (expectedGets > 1) {
+        const raced = gets[1].at - gets[0].at;
+        assert(raced >= hedge - timerSlack && raced < firstReply, `raced after ${raced} ms`);
+      }
+      // Drain the slow reply before the client closes.
+      await until(() => delivered === expectedGets, "every GET's reply");
+    } finally { reader?.close(); client.close(); }
+  }
+});
 
 test("a newly discovered holder is readable before a slow lookup round finishes", async () => {
   const nodes = [{ view: [1, 2] }, {}, {}];
@@ -231,6 +266,39 @@ let largeFile;
 // Larger than the read-ahead window plus the last record.
 const large = () => (largeFile ??= recordFile(12));
 
+// The most GETs in flight during a download of the large file. Every node holds
+// every record and multiplexes, so neither one session nor one holder bounds
+// the download; the fetch channel and the read budget, of 8 GETs, do.
+async function peakGetsInFlight() {
+  const { original, encrypted } = large();
+  let active = 0, peak = 0;
+  const rtc = mockWebRtc(Array.from({ length: 4 }, () => ({
+    multiplex: true,
+    respond(_channel, method) { if (method === "get_chunk") peak = Math.max(peak, ++active); },
+    delay: method => method === "get_chunk" ? 200 : 0,
+    delivered(_channel, method) { if (method === "get_chunk") active--; },
+  })));
+  for (const store of rtc.stores) {
+    for (const record of encrypted.records) store.set(record.address, record.content);
+  }
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const result = await client.downloadPublicFile(encrypted.address, undefined);
+    assert.deepEqual(result.content, original);
+  } finally { client.close(); }
+  return peak;
+}
+
+test("in Chromium, a download keeps as many GETs in flight as the read budget admits", async () => {
+  const peak = await asChromium(peakGetsInFlight);
+  assert(peak > 4 && peak <= 8, `${peak} GETs in flight`);
+});
+
+test("where dials take turns to gather ICE, a download starts at the native fetch start", async () => {
+  const peak = await peakGetsInFlight();
+  assert(peak <= 4, `${peak} GETs in flight`);
+});
+
 test("a streaming reader reads ahead from any read; an ordinary one only fetches the next record", async () => {
   const { original, encrypted, starts } = recordFile(5);
   for (const streaming of [true, false]) {
@@ -293,6 +361,24 @@ test("a zero-length read is not a read that a later one continues", async () => 
     // The header read starts no window: its record and the next only.
     assert.deepEqual(await reader.readRange(0, 10), original.slice(0, 10));
     assert.equal(await settled(rtc, 500) - opened, 2);
+  } finally { reader?.close(); client.close(); }
+});
+
+test("read-ahead holds at most half of a node's request slots", async () => {
+  // No read waits for the window's slow records, so only two of its four
+  // fetches go out to the one node. Its other two slots stay free for reads.
+  const slow = 1_000;
+  const { original, encrypted } = large();
+  const rtc = serve(encrypted, new Set(), new Map([1, 2, 3, 4].map(index => [index, slow])));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let reader;
+  try {
+    reader = await client.openPublicFile(encrypted.address, undefined, { streaming: true });
+    assert.deepEqual(await reader.readRange(0, 10), original.slice(0, 10));
+    await settled(rtc, slow / 5);
+    const sent = [1, 2, 3, 4].filter(index => getsOf(rtc, encrypted.chunks[index].dst_hash) > 0);
+    assert.equal(sent.length, 2, `read-ahead sent GETs for records ${sent}`);
+    await settled(rtc, slow);
   } finally { reader?.close(); client.close(); }
 });
 

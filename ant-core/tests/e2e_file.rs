@@ -4,7 +4,9 @@
 
 mod support;
 
-use ant_core::data::{compute_address, Client, ExternalPaymentInfo, PaymentMode, Visibility};
+use ant_core::data::{
+    compute_address, Client, ExternalPaymentInfo, FinalizeOutcome, PaymentMode, Visibility,
+};
 use ant_protocol::evm::{QuoteHash, TxHash};
 use serial_test::serial;
 use sha2::{Digest, Sha256};
@@ -369,6 +371,126 @@ async fn test_public_upload_round_trip_wave_batch() {
     assert_eq!(
         downloaded, original,
         "downloaded bytes must equal the original file"
+    );
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// An external-signer finalize survives a storage outage after payment (wave-batch path, #144).
+///
+/// Prepare (public) → pay the quotes with the testnet wallet → every node drops chunk PUTs →
+/// the finalize stores nothing and hands back a resume handle → the nodes recover → resuming
+/// stores everything against the same payment → the public DataMap address resolves and the
+/// download matches. The nodes keep their identities and addresses throughout, which matters
+/// because every paid chunk is bound to the peers that quoted it. The wallet's token balance
+/// must not move after the signer's payment: neither the failed finalize nor the resume pays.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_finalize_resume_after_post_payment_outage_wave_batch() {
+    let (client, testnet) = setup().await;
+
+    let original: Vec<u8> = (0u8..=255).cycle().skip(7).take(4096).collect();
+    let mut input_file = NamedTempFile::new().expect("create temp file");
+    input_file.write_all(&original).expect("write temp file");
+    input_file.flush().expect("flush temp file");
+
+    let prepared = client
+        .file_prepare_upload_with_visibility(input_file.path(), Visibility::Public)
+        .await
+        .expect("public prepare should succeed");
+    let data_map_address = prepared
+        .data_map_address
+        .expect("public prepare must record the DataMap address");
+    let payments = match &prepared.payment_info {
+        ExternalPaymentInfo::WaveBatch { payment_intent, .. } => payment_intent.payments.clone(),
+        other => panic!("expected wave-batch payment for a 4KB file, got {other:?}"),
+    };
+    let (tx_hash_map, _gas) = testnet
+        .wallet()
+        .pay_for_quotes(payments)
+        .await
+        .expect("testnet wallet should pay for quotes");
+    let tx_hash_map: HashMap<QuoteHash, TxHash> = tx_hash_map.into_iter().collect();
+    let balance_after_payment = testnet.wallet().balance_of_tokens().await.unwrap();
+
+    // Outage: every node is up but drops chunk PUTs. Nothing answers a silenced PUT, so each
+    // attempt waits out the fixed 10 s store-response timeout: about 90 s in all.
+    testnet.silence_chunk_puts(true);
+    let started = std::time::Instant::now();
+    let outcome = client
+        .finalize_upload_resumable(prepared, &tx_hash_map)
+        .await
+        .expect("a store-side failure must come back as Partial, not Err");
+    eprintln!(
+        "finalize during the outage returned after {:?}",
+        started.elapsed()
+    );
+    let mut resume = match outcome {
+        FinalizeOutcome::Partial { result, resume } => {
+            assert_eq!(result.chunks_stored, 0, "no node accepted a PUT");
+            assert_eq!(result.chunks_failed, result.total_chunks);
+            assert_eq!(result.data_map_address, Some(data_map_address));
+            resume
+        }
+        FinalizeOutcome::Complete(_) => panic!("finalize cannot complete while PUTs are dropped"),
+    };
+    assert_eq!(
+        testnet.wallet().balance_of_tokens().await.unwrap(),
+        balance_after_payment,
+        "the failed finalize must not pay"
+    );
+
+    // Recovery: resume against the same payment. Bounded, as `finalize_resume` documents.
+    testnet.silence_chunk_puts(false);
+    let mut completed = None;
+    for attempt in 1..=3 {
+        match client
+            .finalize_resume(resume)
+            .await
+            .expect("resume must not error")
+        {
+            FinalizeOutcome::Complete(result) => {
+                completed = Some(result);
+                break;
+            }
+            FinalizeOutcome::Partial {
+                result,
+                resume: rest,
+            } => {
+                eprintln!(
+                    "resume attempt {attempt}: {}/{} stored",
+                    result.chunks_stored, result.total_chunks
+                );
+                resume = rest;
+            }
+        }
+    }
+    let result = completed.expect("resume should complete once the nodes accept PUTs");
+    assert_eq!(result.chunks_failed, 0);
+    assert_eq!(result.chunks_stored, result.total_chunks);
+    assert_eq!(result.data_map_address, Some(data_map_address));
+    assert_eq!(
+        testnet.wallet().balance_of_tokens().await.unwrap(),
+        balance_after_payment,
+        "resuming must reuse the original payment, not pay again"
+    );
+
+    // A fresh retriever needs only the public address.
+    let fetched_data_map = client
+        .data_map_fetch(&data_map_address)
+        .await
+        .expect("data_map_fetch must retrieve the stored DataMap");
+    let output_dir = TempDir::new().expect("create output temp dir");
+    let output_path = output_dir.path().join("resumed.bin");
+    client
+        .file_download(&fetched_data_map, &output_path)
+        .await
+        .expect("file_download should succeed");
+    let downloaded = std::fs::read(&output_path).expect("read downloaded file");
+    assert_eq!(
+        downloaded, original,
+        "downloaded bytes must equal the original"
     );
 
     drop(client);
