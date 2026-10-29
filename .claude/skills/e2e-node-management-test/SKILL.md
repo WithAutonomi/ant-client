@@ -104,6 +104,28 @@ ant node daemon start --json
 
 Re-run `ant node daemon info --json` and update the saved `api_base` URL (the port will have changed).
 
+**Step 5.5 — Stale PID file recovery:**
+
+A daemon that dies without cleaning up (a reboot, an OOM kill) leaves `daemon.pid` and
+`daemon.port` behind, and its PID can be reused by an unrelated process. Simulate that by
+recording the shell's own PID and a dead port as the daemon's. Run everything as **one** shell
+command so the shell (the "unrelated process") is still alive while `ant` runs:
+
+```bash
+# Linux:   DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/ant"
+# macOS:   DATA_DIR="$HOME/Library/Application Support/ant"
+# Windows: DATA_DIR="$APPDATA/ant", and write $(cat /proc/$$/winpid) instead of $$
+ant node daemon stop --json
+echo $$ > "$DATA_DIR/daemon.pid"; echo 1 > "$DATA_DIR/daemon.port"
+ant node daemon info --json; ant node daemon status --json; ant node daemon start --json
+```
+
+Verify: `info` and `status` both report `running: false`, and `start` reports
+`already_running: false` with a `port` that is present and not `1`. A stale port file must not be
+read back as the new daemon's port.
+
+Re-run `ant node daemon info --json` and update the saved `api_base` URL.
+
 ### Phase 6: Node management
 
 **Step 6.1 — Add nodes:**
@@ -516,6 +538,7 @@ Phase 5: Daemon Lifecycle
   [PASS] 5.2 Daemon status
   [PASS] 5.3 Daemon info
   [PASS] 5.4 Pinned-port flag round-trip
+  [PASS] 5.5 Stale PID file recovery
 
 Phase 6: Node Management
   [PASS] 6.1 Add 3 nodes
