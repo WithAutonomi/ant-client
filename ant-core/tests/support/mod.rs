@@ -98,49 +98,58 @@ pub fn test_client_config() -> ClientConfig {
 pub struct TestNode {
     pub p2p_node: Option<Arc<P2PNode>>,
     pub protocol: Option<Arc<AntProtocol>>,
-    /// Which pointer requests the node takes off the wire and ignores.
-    pub pointer_silence: Arc<PointerSilence>,
+    /// Which requests the node takes off the wire and ignores.
+    pub silence: Arc<Silence>,
     /// Chunk GET requests the node has received.
     pub chunk_gets: Arc<ChunkGetCounts>,
     _handler_task: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Switches that make a node ignore pointer requests while staying in the
+/// Switches that make a node ignore some requests while staying in the
 /// network, as a peer that is up but unreachable for them would.
 ///
 /// A silenced request is read off the wire and dropped: nothing is stored and
 /// nothing is answered, so the sender waits out its own timeout. Everything
 /// else the node handles as usual. Lets a test choose how many of a close group
-/// a read or a write actually reaches, over the real transport.
+/// a read or a write actually reaches, over the real transport, and then lift
+/// the silence with every node keeping its identity and address, which a node
+/// shut down and restarted would not.
 ///
 /// The decision is taken as each message arrives, before any work is spawned
 /// for it, so a request that arrived while its kind was silenced is dropped
 /// even if the switch is lifted a moment later.
 #[derive(Default)]
-pub struct PointerSilence {
+pub struct Silence {
     /// Ignore pointer GETs.
-    pub gets: AtomicBool,
+    pub pointer_gets: AtomicBool,
     /// Ignore pointer PUTs.
-    pub puts: AtomicBool,
+    pub pointer_puts: AtomicBool,
+    /// Ignore chunk PUTs, paid by either payment path.
+    pub chunk_puts: AtomicBool,
 }
 
-impl PointerSilence {
-    /// Whether `data` is a pointer request this node is ignoring.
+impl Silence {
+    /// Whether `data` is a request this node is ignoring.
     fn drops(&self, data: &[u8]) -> bool {
-        let gets = self.gets.load(Ordering::Relaxed);
-        let puts = self.puts.load(Ordering::Relaxed);
-        if !gets && !puts {
+        let pointer_gets = self.pointer_gets.load(Ordering::Relaxed);
+        let pointer_puts = self.pointer_puts.load(Ordering::Relaxed);
+        let chunk_puts = self.chunk_puts.load(Ordering::Relaxed);
+        if !pointer_gets && !pointer_puts && !chunk_puts {
             return false;
         }
         match ChunkMessage::decode(data) {
             Ok(ChunkMessage {
                 body: ChunkMessageBody::PointerGetRequest(_),
                 ..
-            }) => gets,
+            }) => pointer_gets,
             Ok(ChunkMessage {
                 body: ChunkMessageBody::PointerPutRequest(_),
                 ..
-            }) => puts,
+            }) => pointer_puts,
+            Ok(ChunkMessage {
+                body: ChunkMessageBody::PutRequest(_),
+                ..
+            }) => chunk_puts,
             _ => false,
         }
     }
@@ -237,7 +246,7 @@ impl MiniTestnet {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
             let temp_dir = tempfile::TempDir::new().expect("create temp dir");
-            let (node, protocol, pointer_silence, chunk_gets, handler) = Self::spawn_node(
+            let (node, protocol, silence, chunk_gets, handler) = Self::spawn_node(
                 addr,
                 &bootstrap_addrs,
                 temp_dir.path(),
@@ -251,7 +260,7 @@ impl MiniTestnet {
             nodes.push(TestNode {
                 p2p_node: Some(Arc::clone(&node)),
                 protocol: Some(protocol),
-                pointer_silence,
+                silence,
                 chunk_gets,
                 _handler_task: Some(handler),
             });
@@ -265,7 +274,7 @@ impl MiniTestnet {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
             let temp_dir = tempfile::TempDir::new().expect("create temp dir");
-            let (node, protocol, pointer_silence, chunk_gets, handler) = Self::spawn_node(
+            let (node, protocol, silence, chunk_gets, handler) = Self::spawn_node(
                 addr,
                 &bootstrap_addrs,
                 temp_dir.path(),
@@ -278,7 +287,7 @@ impl MiniTestnet {
             nodes.push(TestNode {
                 p2p_node: Some(Arc::clone(&node)),
                 protocol: Some(protocol),
-                pointer_silence,
+                silence,
                 chunk_gets,
                 _handler_task: Some(handler),
             });
@@ -384,7 +393,7 @@ impl MiniTestnet {
     ) -> (
         Arc<P2PNode>,
         Arc<AntProtocol>,
-        Arc<PointerSilence>,
+        Arc<Silence>,
         Arc<ChunkGetCounts>,
         tokio::task::JoinHandle<()>,
     ) {
@@ -496,8 +505,8 @@ impl MiniTestnet {
         }
 
         // Start message handler loop
-        let pointer_silence = Arc::new(PointerSilence::default());
-        let handler_silence = Arc::clone(&pointer_silence);
+        let silence = Arc::new(Silence::default());
+        let handler_silence = Arc::clone(&silence);
         let chunk_gets = Arc::new(ChunkGetCounts::default());
         let handler_gets = Arc::clone(&chunk_gets);
         let handler_node = Arc::clone(&node);
@@ -562,7 +571,7 @@ impl MiniTestnet {
             }
         });
 
-        (node, protocol, pointer_silence, chunk_gets, handler)
+        (node, protocol, silence, chunk_gets, handler)
     }
 
     /// Shut down a node by index, simulating a failure.
@@ -576,6 +585,13 @@ impl MiniTestnet {
             }
             node.protocol = None;
             node.p2p_node = None;
+        }
+    }
+
+    /// Make every node drop (`true`) or handle (`false`) chunk PUTs. See [`Silence`].
+    pub fn silence_chunk_puts(&self, silenced: bool) {
+        for node in &self.nodes {
+            node.silence.chunk_puts.store(silenced, Ordering::Relaxed);
         }
     }
 

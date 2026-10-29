@@ -546,12 +546,15 @@ impl Default for ClientConfig {
     }
 }
 
-/// Build the adaptive controller for a `Client`. Loads any persisted
-/// snapshot, clamps cold-start values into the deprecated-flag bounds
-/// **per channel** (so a pin on `--store-concurrency` does NOT bleed
-/// into the fetch / quote channels), and returns the persistence path
-/// so callers can save back at shutdown.
-fn build_controller(config: &ClientConfig) -> (AdaptiveController, Option<PathBuf>) {
+/// Build the adaptive controller for a `Client`, cold-starting each channel
+/// at `start`. Loads any persisted snapshot, clamps cold-start values into
+/// the deprecated-flag bounds **per channel** (so a pin on
+/// `--store-concurrency` does NOT bleed into the fetch / quote channels),
+/// and returns the persistence path so callers can save back at shutdown.
+fn build_controller(
+    config: &ClientConfig,
+    start: ChannelStart,
+) -> (AdaptiveController, Option<PathBuf>) {
     let mut adaptive_cfg = config.adaptive.clone();
 
     // Per-channel ceilings: each legacy field is interpreted as a cap
@@ -580,10 +583,11 @@ fn build_controller(config: &ClientConfig) -> (AdaptiveController, Option<PathBu
         adaptive_cfg.max.store = user_store_max;
     }
 
-    // Cold-start values: matched to the prior static defaults. If the
-    // legacy field caps the channel below the cold-start, lower the
-    // start to match — never start above the channel's max.
-    let mut start = ChannelStart::default();
+    // Cold-start values: the caller's, by default matched to the prior
+    // static defaults. If the legacy field caps the channel below the
+    // cold-start, lower the start to match — never start above the
+    // channel's max.
+    let mut start = start;
     start.quote = start.quote.min(adaptive_cfg.max.quote);
     start.store = start.store.min(adaptive_cfg.max.store);
     start.fetch = start.fetch.min(adaptive_cfg.max.fetch);
@@ -713,7 +717,18 @@ impl Client {
     /// Create a client using a platform network adapter.
     #[must_use]
     pub fn from_network(network: Network, config: ClientConfig) -> Self {
-        let (controller, _persist_path) = build_controller(&config);
+        Self::from_network_with_start(network, config, ChannelStart::default())
+    }
+
+    /// Create a client using a platform network adapter whose channels
+    /// cold-start at `start`, such as a transport whose own admission sets
+    /// how many fetches run at once.
+    pub(crate) fn from_network_with_start(
+        network: Network,
+        config: ClientConfig,
+        start: ChannelStart,
+    ) -> Self {
+        let (controller, _persist_path) = build_controller(&config, start);
         Self {
             config,
             network,
@@ -760,7 +775,7 @@ impl Client {
         #[cfg(feature = "native")] peer_cache_path: Option<PathBuf>,
     ) -> Self {
         let network = Network::from_node(node);
-        let (controller, persist_path) = build_controller(&config);
+        let (controller, persist_path) = build_controller(&config, ChannelStart::default());
         Self {
             config,
             network,
@@ -815,7 +830,7 @@ impl Client {
         );
         let network =
             Network::new_multiaddrs(bootstrap_peers, config.allow_loopback, config.ipv6).await?;
-        let (controller, persist_path) = build_controller(&config);
+        let (controller, persist_path) = build_controller(&config, ChannelStart::default());
         Ok(Self {
             config,
             network,
@@ -1199,7 +1214,7 @@ mod tests {
             store_concurrency: 2,
             ..ClientConfig::default()
         };
-        let (controller, _) = build_controller(&cfg);
+        let (controller, _) = build_controller(&cfg, ChannelStart::default());
         // The store/quote caps must be clamped to the user's pin.
         assert_eq!(controller.config.max.quote, 4, "quote pin not respected");
         assert_eq!(controller.config.max.store, 2, "store pin not respected");
@@ -1221,6 +1236,30 @@ mod tests {
         );
     }
 
+    /// A caller's cold start replaces the default one, whether or not the
+    /// controller adapts, and stays within each channel's ceiling.
+    #[test]
+    fn build_controller_cold_starts_at_the_callers_start_within_its_ceiling() {
+        let defaults = ChannelStart::default();
+        let start = ChannelStart {
+            fetch: defaults.fetch * 2,
+            ..defaults
+        };
+        let mut cfg = ClientConfig::default();
+        cfg.adaptive.enabled = false;
+        let (controller, _) = build_controller(&cfg, start);
+        assert_eq!(controller.fetch.current(), start.fetch);
+        assert_eq!(controller.quote.current(), defaults.quote);
+
+        // A ceiling below the start wins, so even a persisted snapshot
+        // cannot move this channel.
+        let ceiling = defaults.fetch + 1;
+        cfg.adaptive.enabled = true;
+        cfg.adaptive.max.fetch = ceiling;
+        let (controller, _) = build_controller(&cfg, start);
+        assert_eq!(controller.fetch.current(), ceiling);
+    }
+
     /// Default ClientConfig must NOT silently lower the controller's
     /// per-channel ceilings — the adaptive defaults give every channel
     /// real headroom to grow. This guards against future commits
@@ -1228,7 +1267,7 @@ mod tests {
     #[test]
     fn default_client_config_does_not_clamp_controller_max() {
         let cfg = ClientConfig::default();
-        let (controller, _) = build_controller(&cfg);
+        let (controller, _) = build_controller(&cfg, ChannelStart::default());
         let defaults = adaptive::ChannelMax::default();
         // The legacy fields default to 32/8 (the prior static knobs),
         // both of which are <= the per-channel adaptive defaults

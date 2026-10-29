@@ -20,6 +20,18 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # The release workflow's notes fallback and the train cut's changelog rotation only run at
+  # release time, so their scripts are tested here, against fake `gh` and `git` (V2-1107).
+  release-scripts:
+    name: Release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the release notes fallback
+        run: bash scripts/test-release-notes.sh
+      - name: Test the changelog rotation
+        run: bash scripts/test-rotate-changelog.sh
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

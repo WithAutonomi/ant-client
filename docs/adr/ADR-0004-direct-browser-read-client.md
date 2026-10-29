@@ -747,3 +747,82 @@ budgets; manifest validation; and native index, range and retry tests. The
 generated WASM tests use mocked WebRTC hosts with real Rust protocol and crypto
 processing. They do not establish real-browser or live-network compatibility by
 themselves.
+
+## Dial failure and ICE gathering (2026-10-26)
+
+Related: [V2-1483](https://linear.app/autonominetwork/issue/V2-1483).
+
+Browser downloads from mainnet spent most of their time dialling. In traced
+downloads of a 64 MiB public file, 42-50% of fresh dials went to WebRTC Direct
+endpoints that never answered ICE. Each held a pool slot, and kept its lookup
+round waiting, until the 10-second channel-opening timeout: 18-30 of the 64
+slots at a time. A file whose DataMap had child records could not start reading
+data until the slowest of them arrived, and one such 418-byte record took 10 s.
+Dials to live nodes also queued for the page's ICE gathering turn. In Chromium,
+a dial waited 0.6 s at the median at a fetch concurrency of 4, and 1.7 s at 8,
+before sending its offer. ICE, DTLS, SCTP and the PQ handshake together took
+about 0.4 s.
+
+- **A dial fails when ICE has not connected 3 s after its offer.** Live nodes
+  answered ICE checks in 110 ms at the median and 1.2-1.4 s at p99; the slowest
+  of 788 took 2.7 s. Every failed dial in the traces was one whose ICE never
+  connected. A fresh connection still `new` or `checking` at 3 s fails, and
+  enters the dial-failure cache like any other failed dial. One whose ICE
+  connected keeps the opening timeout for DTLS, SCTP and the channel. Endpoints
+  that failed in one download and connected in another were 4% of failures with
+  the deadline and 5% without it.
+- **Chromium dials gather ICE candidates at once.** The gathering turn exists
+  for WebKit, which opens many more sockets for overlapping gatherings.
+  Chromium is recognized by `navigator.userAgentData`, which only it exposes,
+  unless the page reports WebKit's vendor: a Client Hints polyfill in Safari
+  must not lift the turn. WebKit and Firefox keep it; Firefox was not measured.
+- **Only Chromium starts fetching at the read budget's 8 GETs.** Where dials
+  take turns to gather, more concurrent reads queue more dials for the turn,
+  so other engines keep the native cold start of 4. No engine's fetch
+  controller climbs past the read budget. A fetch beyond it adds only a
+  lookup, which costs dials more than it overlaps transfers: given the default
+  ceiling of 256, the controller probed 10 and came back, a successful dial's
+  p90 rose from 2.7 s to 4.8 s, and downloads were slower in 6 of 8 pairs
+  (612 MB in Chromium and Safari, 64 MiB in Chromium).
+
+In Chromium, the first two let the fetch start of 8, which on its own made
+mainnet downloads 15-26% slower by overflowing the pool, pay off. Measured with
+headless Chromium on macOS against mainnet, each arm downloading the same
+64 MiB public file with a fresh client, in rotating order. The first run
+separates the changes on the branch before it merged main; the second compares
+the merged branch with main at `ccd4106`:
+
+| run | build | rounds | p50 | against main, paired | faster |
+| --: | --- | --: | --: | --: | --: |
+| 1 | main | 4 | 39.1 s | | |
+| 1 | fetch start 8 alone | 4 | 45.0 s | +15% | 1/4 |
+| 1 | fetch start 4, ICE deadline | 4 | 32.3 s | -15% | 3/4 |
+| 1 | fetch start 4, both changes | 4 | 25.3 s | -34% | 4/4 |
+| 1 | fetch start 8, both changes | 4 | 19.7 s | -49% | 4/4 |
+| 2 | main | 5 | 37.6 s | | |
+| 2 | fetch start 4, both changes | 5 | 28.9 s | -23% | 4/5 |
+| 2 | fetch start 8, both changes | 5 | 21.6 s | -40% | 5/5 |
+
+In the second run the fetch start of 8 was faster than 4 in every round. A
+612 MB public video took 195 and 270 s with both changes, against main's 398
+and 323 s. The faster branch opens more connections per download: 243 instead
+of 187 for the 64 MiB file, and 2,977 instead of 2,019 for the video.
+
+In WebKit, which keeps the gathering turn, the fetch start of 8 still made
+downloads slower. A dial waited 1.9 s at the median before its ICE checks,
+against 0.7 s at a start of 4, and a lookup round took 3.6 s against 1.3 s.
+Against main, the same 64 MiB file took, at the median:
+
+| engine | rounds | main | fetch start 8 | engine's start | against main, paired | faster |
+| --- | --: | --: | --: | --: | --: | --: |
+| Safari 26.5.2 | 4 | 31.5 s | 38.8 s | 25.5 s (4) | -19% | 4/4 |
+| WebKit (Playwright) | 5 | 32.3 s | | 25.9 s (4) | -18% | 5/5 |
+| Chromium (Playwright) | 3 | 35.3 s | | 18.6 s (8) | -46% | 3/3 |
+
+In Safari the fetch start of 8 was slower than main in all 4 rounds.
+
+In traces of the branch before the merge, a successful dial took 0.4 s at the
+median instead of 1.9-2.7 s, a failed one 3.0 s instead of 10.4-11.0 s, and a
+lookup round 1.2 s instead of 1.6-3.8 s. Failing dials held 14 pool slots on average, and the
+first data read started at 7-8 s instead of 13.5-14.3 s. The lookup width, its
+grace period, the pool size and the dial-failure cooldown are unchanged.

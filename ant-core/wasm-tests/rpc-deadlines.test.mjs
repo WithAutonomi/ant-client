@@ -119,6 +119,33 @@ test("pool closure during setup cannot publish a replacement association", async
   assert.equal(rtc.requests.filter(r => r.method === "hello").length, 0);
 });
 
+// A new dial gives up on an endpoint that has not answered ICE checks after
+// 3 s, well before the 10 s its channel may take to open.
+const ICE_TIMEOUT_MS = 3_000;
+const TIMER_SLACK_MS = 50;
+
+test("a dial fails once its endpoint has not answered ICE checks in time", async () => {
+  const rtc = mockWebRtc([{ iceUnreachable: true }]);
+  const started = Date.now();
+  await assert.rejects(test_connect_node(rtc.endpoints[0]), /did not answer ICE connectivity checks/);
+  const took = Date.now() - started;
+  assert.ok(took >= ICE_TIMEOUT_MS - TIMER_SLACK_MS && took < ICE_TIMEOUT_MS + 20 * TIMER_SLACK_MS, `took ${took} ms`);
+  assert.equal(rtc.connections.length, 1);
+  assert.equal(rtc.connections[0].closed, true);
+});
+
+test("a dial whose ICE checks succeeded waits for a slow channel to open", async () => {
+  // The channel opens after the ICE deadline has passed, with ICE connected.
+  const openDelay = ICE_TIMEOUT_MS + 500;
+  const rtc = mockWebRtc([{ openDelay }]);
+  const started = Date.now();
+  const client = await test_connect_node(rtc.endpoints[0]);
+  const took = Date.now() - started;
+  client.close();
+  assert.ok(took >= openDelay - TIMER_SLACK_MS, `took ${took} ms`);
+  assert.equal(rtc.connections.length, 1);
+});
+
 test("queued transport generation handles stay closed after their active RPC fails", async () => {
   const rtc = mockWebRtc([{ respond(channel, method) {
     if (method !== "find_node") return;
