@@ -19,6 +19,7 @@ jobs:
         env:
           ANT_VERSION: ${{ inputs.version }}
           INSTALL_DIR: ${{ runner.temp }}/bin
+          ANT_NO_MODIFY_PATH: "1"
         run: bash install.sh
 
       - name: verify binary
@@ -37,6 +38,149 @@ jobs:
           echo "Bootstrap config installed at $config_file"
           cat "$config_file"
 
+      # A default install must leave `ant` on PATH in new shells with no manual edit (#194). env -i
+      # starts each shell from a PATH without ~/.local/bin, as on a fresh machine.
+      - name: verify a default install is on PATH in new shells
+        env:
+          ANT_VERSION: ${{ inputs.version }}
+        run: |
+          fresh() { env -i HOME="$HOME" SHELL=/bin/bash PATH=/usr/bin:/bin "$@"; }
+          fresh ANT_VERSION="$ANT_VERSION" bash install.sh
+          for shell in "bash -lc" "bash -ic"; do
+            # shellcheck disable=SC2086 # $shell is a shell and its flag, split on purpose.
+            found="$(fresh $shell 'command -v ant' 2> /dev/null || true)"
+            echo "$shell: ${found:-<not found>}"
+            [ "$found" = "$HOME/.local/bin/ant" ] || exit 1
+          done
+          fresh bash -lc 'ant --version'
+
+      # Shells can run part of a PATH entry containing $, `, " or \ as code (macOS login shells
+      # re-read PATH through path_helper unescaped), so the installer must leave such a directory
+      # out of every startup file, and the line it prints instead must be safe to paste. zsh and
+      # fish are installed so their startup files are checked too. sh is dash.
+      - name: verify an install directory with shell syntax in its name is refused
+        env:
+          ANT_VERSION: ${{ inputs.version }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq zsh fish > /dev/null
+          home="$RUNNER_TEMP/odd-home"
+          mkdir -p "$home"
+          fresh() { env -i HOME="$home" SHELL=/bin/bash PATH=/usr/bin:/bin "$@"; }
+          # shellcheck disable=SC2016 # The syntax is meant to reach the installer unexpanded.
+          dir="$home"'/odd $(touch $HOME/ran-subst) `touch $HOME/ran-backtick` "quoted" back\slash'
+          out="$(fresh ANT_VERSION="$ANT_VERSION" INSTALL_DIR="$dir" bash install.sh)"
+          echo "$out"
+          if ! echo "$out" | grep -q "was not added to your shell startup files"; then
+            echo "ERROR: expected the installer to refuse this directory"
+            exit 1
+          fi
+          for f in .profile .bashrc .zshenv .config/fish/conf.d/ant.fish; do
+            if [ -e "$home/$f" ]; then
+              echo "ERROR: $f was written"
+              exit 1
+            fi
+          done
+          line="$(echo "$out" | grep -m1 '^  export PATH=')"
+          found="$(env -i HOME="$home" PATH=/usr/bin:/bin sh -c "$line; command -v ant" || true)"
+          echo "printed line: ${found:-<not found>}"
+          [ "$found" = "$dir/ant" ] || exit 1
+          if ls "$home"/ran-* 2> /dev/null; then
+            echo "ERROR: code from the install directory's name ran"
+            exit 1
+          fi
+
+      # Every other character is safe inside the double quotes of the lines written, so a name with
+      # spaces, quotes and other punctuation must still be added and resolve in each new shell.
+      - name: verify an install directory with other punctuation in its name is added
+        env:
+          ANT_VERSION: ${{ inputs.version }}
+        run: |
+          home="$RUNNER_TEMP/punct-home"
+          mkdir -p "$home"
+          fresh() { env -i HOME="$home" SHELL=/bin/bash PATH=/usr/bin:/bin "$@"; }
+          dir="$home/my apps (x86) & 'quoted' #1 *"
+          fresh ANT_VERSION="$ANT_VERSION" INSTALL_DIR="$dir" bash install.sh
+          for shell in "bash -lc" "bash -ic" "sh -lc" "zsh -c" "fish -c"; do
+            # shellcheck disable=SC2086 # $shell is a shell and its flag, split on purpose.
+            found="$(fresh $shell 'command -v ant' 2> /dev/null || true)"
+            echo "$shell: ${found:-<not found>}"
+            [ "$found" = "$dir/ant" ] || exit 1
+          done
+
+      # PATH is colon-separated, so a name with `:` can't be a PATH entry at all: no startup file,
+      # fish's included, and no `export PATH=` line, with or without --no-modify-path. A newline is
+      # rejected before anything is installed, whether it is in INSTALL_DIR or, for a relative one,
+      # in the current directory; `pwd` would strip a trailing one, and the install would land in
+      # the directory without it.
+      - name: verify an install directory with a colon or a newline in its name is refused
+        env:
+          ANT_VERSION: ${{ inputs.version }}
+        run: |
+          installer="$PWD/install.sh"
+          home="$RUNNER_TEMP/colon-home"
+          mkdir -p "$home"
+          fresh() { env -i HOME="$home" SHELL=/bin/bash PATH=/usr/bin:/bin "$@"; }
+          for case in "$home/with:colon|" "$home/trailing:|" "$home/no-modify:path|1"; do
+            dir="${case%|*}"
+            out="$(fresh ANT_VERSION="$ANT_VERSION" INSTALL_DIR="$dir" ANT_NO_MODIFY_PATH="${case##*|}" bash install.sh)"
+            echo "$out"
+            if ! echo "$out" | grep -q "can't be added to your PATH"; then
+              echo "ERROR: expected the installer to refuse $dir"
+              exit 1
+            fi
+            if echo "$out" | grep -q '^  export PATH='; then
+              echo "ERROR: the installer printed an export line for $dir"
+              exit 1
+            fi
+          done
+          for f in .profile .bashrc .zshenv .config/fish/conf.d/ant.fish; do
+            if [ -e "$home/$f" ]; then
+              echo "ERROR: $f was written"
+              exit 1
+            fi
+          done
+          mkdir -p "$home/nl"
+          if fresh ANT_VERSION="$ANT_VERSION" INSTALL_DIR="$home/nl"$'\n' bash install.sh; then
+            echo "ERROR: an INSTALL_DIR ending in a newline was accepted"
+            exit 1
+          fi
+          if [ -e "$home/nl/ant" ] || [ -e "$home/nl"$'\n' ]; then
+            echo "ERROR: something was installed for an INSTALL_DIR ending in a newline"
+            exit 1
+          fi
+          # A relative INSTALL_DIR from a current directory whose name ends in a newline, with the
+          # directory without it present, and from one with a newline in the middle.
+          mkdir -p "$home/work" "$home/work"$'\n' "$home/a"$'\n'"b"
+          for cwd_dir in "$home/work"$'\n'"|." "$home/a"$'\n'"b|bin"; do
+            cwd="${cwd_dir%|*}"
+            if (cd "$cwd" && fresh ANT_VERSION="$ANT_VERSION" INSTALL_DIR="${cwd_dir##*|}" bash "$installer"); then
+              echo "ERROR: a relative INSTALL_DIR under a directory with a newline in its name was accepted"
+              exit 1
+            fi
+          done
+          if [ -e "$home/work/ant" ] || [ -e "$home/work"$'\n'"/ant" ] || [ -e "$home/a"$'\n'"b/bin" ]; then
+            echo "ERROR: something was installed for a current directory with a newline in its name"
+            exit 1
+          fi
+
+      # A relative INSTALL_DIR is made absolute with `cd`, which also prints the directory when it
+      # is found through CDPATH.
+      - name: verify a relative install directory with CDPATH set
+        env:
+          ANT_VERSION: ${{ inputs.version }}
+        run: |
+          work="$RUNNER_TEMP/relative"
+          mkdir -p "$work"
+          cp install.sh "$work/"
+          cd "$work"
+          out="$(CDPATH=. INSTALL_DIR=bin ANT_NO_MODIFY_PATH=1 bash install.sh)"
+          echo "$out"
+          if ! echo "$out" | grep -qxF "Installed ant to $work/bin/ant"; then
+            echo "ERROR: expected ant to be installed to $work/bin/ant"
+            exit 1
+          fi
+          "$work/bin/ant" --version
+
   test-install-script-macos:
     name: test install.sh (macOS)
     runs-on: macos-latest
@@ -47,6 +191,7 @@ jobs:
         env:
           ANT_VERSION: ${{ inputs.version }}
           INSTALL_DIR: ${{ runner.temp }}/bin
+          ANT_NO_MODIFY_PATH: "1"
         run: bash install.sh
 
       - name: verify binary
@@ -64,6 +209,84 @@ jobs:
           fi
           echo "Bootstrap config installed at $config_file"
           cat "$config_file"
+
+      # As on Linux (#194), from a fresh-machine PATH. /bin/bash is the 3.2 that `curl | bash` runs
+      # on a stock Mac, and zsh is the default login shell. zsh login shells run /etc/zprofile's
+      # path_helper and Homebrew's shellenv after ~/.zshenv, which put ~/.local/bin behind
+      # /opt/homebrew/bin, where this runner image has Apache Ant (also `ant`). So login shells are
+      # checked for ~/.local/bin on PATH rather than for which `ant` wins.
+      - name: verify a default install is on PATH in new shells
+        env:
+          ANT_VERSION: ${{ inputs.version }}
+        run: |
+          fresh() { env -i HOME="$HOME" SHELL=/bin/zsh PATH=/usr/bin:/bin "$@"; }
+          fresh ANT_VERSION="$ANT_VERSION" /bin/bash install.sh
+          found="$(fresh zsh -c 'command -v ant' || true)"
+          echo "zsh -c: ${found:-<not found>}"
+          [ "$found" = "$HOME/.local/bin/ant" ]
+          for shell in "zsh -lc" "zsh -ic" "/bin/bash -lc"; do
+            # shellcheck disable=SC2016,SC2086 # $PATH is for the new shell; $shell is split on purpose.
+            p="$(fresh $shell 'echo $PATH' 2> /dev/null || true)"
+            echo "$shell: $p"
+            case ":$p:" in *":$HOME/.local/bin:"*) ;; *) exit 1 ;; esac
+          done
+          fresh zsh -c 'ant --version'
+
+      # As on Linux, a name with shell syntax in it is refused and runs nothing, here with the stock
+      # /bin/bash running the installer and macOS's own sed. Login shells run path_helper, which is
+      # why such a name can't be put on PATH here at all.
+      - name: verify an install directory with shell syntax in its name is refused
+        env:
+          ANT_VERSION: ${{ inputs.version }}
+        run: |
+          home="$RUNNER_TEMP/odd-home"
+          mkdir -p "$home"
+          fresh() { env -i HOME="$home" SHELL=/bin/zsh PATH=/usr/bin:/bin "$@"; }
+          # shellcheck disable=SC2016 # The syntax is meant to reach the installer unexpanded.
+          dir="$home"'/odd $(touch $HOME/ran-subst) `touch $HOME/ran-backtick` "quoted" back\slash'
+          out="$(fresh ANT_VERSION="$ANT_VERSION" INSTALL_DIR="$dir" /bin/bash install.sh)"
+          echo "$out"
+          if ! echo "$out" | grep -q "was not added to your shell startup files"; then
+            echo "ERROR: expected the installer to refuse this directory"
+            exit 1
+          fi
+          for f in .profile .bash_profile .zshenv; do
+            if [ -e "$home/$f" ]; then
+              echo "ERROR: $f was written"
+              exit 1
+            fi
+          done
+          fresh zsh -lc true
+          fresh /bin/bash -lc true
+          line="$(echo "$out" | grep -m1 '^  export PATH=')"
+          found="$(env -i HOME="$home" PATH=/usr/bin:/bin /bin/sh -c "$line; command -v ant" || true)"
+          echo "printed line: ${found:-<not found>}"
+          [ "$found" = "$dir/ant" ] || exit 1
+          if ls "$home"/ran-* 2> /dev/null; then
+            echo "ERROR: code from the install directory's name ran"
+            exit 1
+          fi
+
+      # A name with spaces, quotes and other punctuation must still be added, and come through
+      # path_helper intact in login shells.
+      - name: verify an install directory with other punctuation in its name is added
+        env:
+          ANT_VERSION: ${{ inputs.version }}
+        run: |
+          home="$RUNNER_TEMP/punct-home"
+          mkdir -p "$home"
+          fresh() { env -i HOME="$home" SHELL=/bin/zsh PATH=/usr/bin:/bin "$@"; }
+          dir="$home/my apps (x86) & 'quoted' #1 *"
+          fresh ANT_VERSION="$ANT_VERSION" INSTALL_DIR="$dir" /bin/bash install.sh
+          found="$(fresh zsh -c 'command -v ant' || true)"
+          echo "zsh -c: ${found:-<not found>}"
+          [ "$found" = "$dir/ant" ] || exit 1
+          for shell in "zsh -lc" "zsh -ic" "/bin/bash -lc"; do
+            # shellcheck disable=SC2016,SC2086 # $PATH is for the new shell; $shell is split on purpose.
+            p="$(fresh $shell 'printf "%s\n" "$PATH"' 2> /dev/null || true)"
+            echo "$shell: $p"
+            case ":$p:" in *":$dir:"*) ;; *) exit 1 ;; esac
+          done
 
   test-install-script-windows:
     name: test install.ps1 (Windows)

@@ -7,6 +7,8 @@
 #   ANT_CHANNEL   - release channel to install from: "stable" (default) or "beta".
 #   ANT_VERSION   - install a specific version (e.g. "0.1.1"). Overrides ANT_CHANNEL.
 #   INSTALL_DIR   - override install directory (default: %LOCALAPPDATA%\ant\bin).
+#   ANT_NO_MODIFY_PATH - set to 1 to leave your user PATH alone; the installer prints the
+#                        directory to add instead.
 #
 # Examples:
 #   irm <this-script> | iex                                   # newest stable
@@ -199,12 +201,19 @@ try {
 
     # Add to user PATH if not already there
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $ModifyPath = (-not $env:ANT_NO_MODIFY_PATH) -or ($env:ANT_NO_MODIFY_PATH -eq "0")
     if ($UserPath -notlike "*$InstallDir*") {
         Say ""
-        Say "Adding $InstallDir to your user PATH..."
-        [Environment]::SetEnvironmentVariable("Path", "$InstallDir;$UserPath", "User")
-        $env:Path = "$InstallDir;$env:Path"
-        Say "Restart your terminal for the PATH change to take effect."
+        if ($ModifyPath) {
+            Say "Adding $InstallDir to your user PATH..."
+            [Environment]::SetEnvironmentVariable("Path", "$InstallDir;$UserPath", "User")
+            $env:Path = "$InstallDir;$env:Path"
+            Say "Restart your terminal for the PATH change to take effect."
+        } else {
+            Say "WARNING: $InstallDir is not in your user PATH."
+            Say "Add it for this session with:"
+            Say "  `$env:Path = `"$InstallDir;`$env:Path`""
+        }
     }
 } finally {
     Remove-Item -Path $TempDir -Recurse -Force -ErrorAction SilentlyContinue
