@@ -1,7 +1,7 @@
 //! `web-sys` WebRTC Direct transport and typed node operations.
 
 use ant_protocol::transport::DEFAULT_K_VALUE as DEFAULT_LOOKUP_K;
-use ant_protocol::CLOSE_GROUP_MAJORITY;
+use ant_protocol::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
 
 use super::manifest::{
     assert_upload_node, validate_browser_payment_network, BrowserPaymentNetwork,
@@ -2016,6 +2016,16 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
         batch: Vec<BrowserLookupCandidate>,
     ) -> Result<Vec<LookupQueryOutcome<BrowserLookupCandidate>>, Self::Error> {
         let target = hex::encode(target);
+        // A read needs each node's view of its record's close group. Quotes and
+        // uploads cross-check every responder's full witnessed view, so their
+        // lookups keep asking for it. Each listed node carries its owner-signed
+        // record, about 6 KB, and a node's first answer on a connection grows
+        // from a small SCTP send window, so a full view takes more round trips.
+        let answer_count = if self.read_progress.is_some() {
+            count.max(CLOSE_GROUP_SIZE)
+        } else {
+            count.max(crate::quote_policy::SINGLE_NODE_WITNESSED_VIEW_COUNT)
+        };
         let attempted = batch
             .iter()
             .map(|candidate| candidate.peer_id)
@@ -2039,12 +2049,7 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                             "lookup candidate has no WebRTC Direct endpoint".to_string()
                         })?;
                         let client = pool.client(endpoint).await?;
-                        client
-                            .lookup(
-                                target.clone(),
-                                count.max(crate::quote_policy::SINGLE_NODE_WITNESSED_VIEW_COUNT),
-                            )
-                            .await
+                        client.lookup(target.clone(), answer_count).await
                     }
                     .await;
                     match result {

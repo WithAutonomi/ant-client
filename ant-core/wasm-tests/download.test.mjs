@@ -215,13 +215,31 @@ test("a read stops asking hints once a lookup lists a close group nearer the rec
   } finally { reader?.close(); client.close(); }
 });
 
+test("a read's lookups ask each node for its record's close group", async () => {
+  // A read needs each node's view of the record's close group, not the full
+  // witnessed view quotes cross-check, whose owner-signed records make each
+  // answer several times larger.
+  const rtc = mockWebRtc([{ chunk: datamap.content }, {}, {}]);
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let reader;
+  try {
+    reader = await client.openPublicFile(datamap.address);
+    assert.equal(reader.size, content.length);
+    const lookups = rtc.requests.filter(r => r.method === "find_node");
+    assert.ok(lookups.length > 0, "the read ran no lookup");
+    assert.deepEqual([...new Set(lookups.map(r => r.count))], [closeGroupSize]);
+  } finally { reader?.close(); client.close(); }
+});
+
 test("peers a lookup reply lists without an owner proof do not rule out a holder", async () => {
   // A bootstrap node without signed addresses lists a close group of
-  // identities nearer the record than its holder. Unproven, they cannot rule
-  // the holder out, so the read asks it once the lookup reaches it, instead of
-  // waiting for a slow node to end the lookup.
-  const [bootstrap, holder, slow] = [0, 1, 2];
-  const nodes = [{}, {}, {}];
+  // identities nearer the record than its holder; another lists the holder.
+  // Unproven, the invented identities cannot rule the holder out, so the read
+  // asks it once the lookup reaches it, instead of waiting for a slow node to
+  // end the lookup. A read asks each node for a close group, so the holder is
+  // named by a node other than the one listing the invented identities.
+  const [bootstrap, holder, slow, honest] = [0, 1, 2, 3];
+  const nodes = [{}, {}, {}, {}];
   const rtc = mockWebRtc(nodes);
   const listing = index => ({
     peer_id: parseWebRtcDirectMultiaddr(rtc.endpoints[index]).peerId,
@@ -232,10 +250,11 @@ test("peers a lookup reply lists without an owner proof do not rule out a holder
     peer_id: (target ^ BigInt(offset + 1)).toString(16).padStart(64, "0"),
     native_addresses: [inventedAddress], reliability: 1,
   }));
-  nodes[bootstrap].peers = [...invented, listing(holder), listing(slow)];
+  nodes[bootstrap].peers = invented;
+  nodes[honest].peers = [listing(holder), listing(slow)];
   nodes[holder].chunk = datamap.content;
   nodes[slow].delay = method => method === "find_node" ? slowLookupMs : 0;
-  const client = new BrowserNetworkClient([rtc.endpoints[bootstrap]]);
+  const client = new BrowserNetworkClient([rtc.endpoints[bootstrap], rtc.endpoints[honest]]);
   let reader, deadline;
   try {
     reader = await Promise.race([
