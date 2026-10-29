@@ -19,10 +19,25 @@ export async function closesSettled() {
   } while (pendingCloses.size);
 }
 
+// Run `test` as a Chromium page, which alone exposes User-Agent Client Hints.
+// There the client lets concurrent dials gather ICE candidates at once, and
+// starts fetching at the read budget's capacity.
+export async function asChromium(test) {
+  Object.defineProperty(globalThis.navigator, "userAgentData", { value: {}, configurable: true });
+  try {
+    return await test();
+  } finally {
+    delete globalThis.navigator.userAgentData;
+  }
+}
+
 // Reset for each test. Only browser-owned RTC objects are mocked; all node
 // responses use the shared Rust wire contract and real session encryption.
 // ICE gathering completes `gatheringMs` after setLocalDescription; Infinity
-// never completes.
+// never completes. A node with `iceUnreachable` never answers ICE checks, so its
+// connection stays "checking" and its channels never open. `connectDelay` holds
+// up setRemoteDescription, while `openDelay` only delays a channel's opening
+// after ICE has connected, as slow DTLS and SCTP would.
 // How soon a refusing node's transport fails a dial, as a STUN error response
 // to the browser's first answered connectivity check would.
 const REFUSAL_MS = 20;
@@ -73,7 +88,7 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
       }
       const put = method === "put_chunk" || method === "put_pointer";
       const address = method === "get_chunk" ? this.server.last_get_address() : undefined;
-      requests.push({ node: this.index, method, ...(put ? {
+      requests.push({ node: this.index, method, at: performance.now(), ...(put ? {
         address: this.server.last_put_address(),
         quoteHash: this.server.last_put_quote_hash(),
       } : {}), ...(address ? { address } : {}) });
@@ -163,6 +178,8 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
     }
     async setRemoteDescription(remote) {
       this.remoteSeed = Number(remote.sdp.match(/m=application (\d+)/)[1]) - 24_000;
+      this.iceConnectionState = "checking";
+      if (nodes[this.remoteSeed - 1].iceUnreachable) return;
       this.dial = ++dials[this.remoteSeed - 1];
       // A node at transport capacity answers the check with a STUN error, and
       // the browser fails the association without connecting (ant-node ADR-0023).
@@ -191,6 +208,8 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
       channel.options = nodes[this.remoteSeed - 1];
       if (channel.options.connectErrorDelay) await new Promise(resolve => setTimeout(resolve, channel.options.connectErrorDelay));
       if (channel.options.connectError) throw new Error(channel.options.connectError);
+      // ICE finds a path before DTLS and SCTP, which `connectDelay` stands for.
+      if (this.iceConnectionState === "checking") this.iceConnectionState = "connected";
       channel.server = new BrowserTestNode(
         this.remoteSeed,
         channel.options.alreadyStored ?? false,
@@ -216,14 +235,14 @@ export function mockWebRtc(nodes = [{}], { gatheringMs = 0 } = {}) {
       }
       if (channel.options.connectDelay) await new Promise(resolve => setTimeout(resolve, channel.options.connectDelay));
       if (this.connectionState === "new") this.connectionState = "connected";
-      this.iceConnectionState = "connected";
-      setTimeout(() => channel.onopen?.({}), 0);
+      setTimeout(() => channel.onopen?.({}), channel.options.openDelay ?? 0);
     }
     close() {
       if (this.closed) return;
       this.closed = true;
       // Browsers report closed at once, without a connectionstatechange event.
       this.connectionState = "closed";
+      this.iceConnectionState = "closed";
       for (const channel of this.channels) channel.close();
     }
   };

@@ -13,7 +13,9 @@
 mod support;
 
 use ant_core::data::client::merkle::{merkle_billable_leaves, PaymentMode};
-use ant_core::data::{compute_address, Client, ClientConfig, ExternalPaymentInfo, Visibility};
+use ant_core::data::{
+    compute_address, Client, ClientConfig, ExternalPaymentInfo, FinalizeOutcome, Visibility,
+};
 use serial_test::serial;
 use std::io::Write;
 use std::sync::Arc;
@@ -606,6 +608,122 @@ async fn test_external_merkle_partial_payment_is_partial_upload() {
     }
 
     eprintln!("External partial payment correctly surfaced as PartialUpload.");
+
+    drop(client);
+    testnet.teardown().await;
+}
+
+/// Merkle counterpart of `e2e_file::test_finalize_resume_after_post_payment_outage_wave_batch`
+/// (#144): pay every sub-batch as an external signer → every node drops chunk PUTs → the
+/// resumable finalize stores nothing and hands back a resume handle → the nodes recover →
+/// resuming stores everything against the same merkle payments → the public DataMap address
+/// resolves and the download matches. Neither the failed finalize nor the resume may pay.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_external_merkle_finalize_resume_after_post_payment_outage() {
+    let (mut client, testnet) = setup_external_merkle_testnet().await;
+
+    // A pattern no other test in this file uses, so content never collides.
+    let data: Vec<u8> = (0u8..=255).cycle().skip(31).take(500_000).collect();
+    let mut input_file = NamedTempFile::new().expect("create temp file");
+    input_file.write_all(&data).expect("write temp file");
+    input_file.flush().expect("flush temp file");
+
+    let (prepared, batch_payloads) = prepare_external_multi_batch(&client, &input_file).await;
+    let public_address = prepared
+        .data_map_address
+        .expect("public prepare must record the DataMap address");
+    let mut winner_hashes = Vec::with_capacity(batch_payloads.len());
+    for (depth, commitments, ts) in batch_payloads {
+        let (winner, _amount, _gas) = testnet
+            .wallet()
+            .pay_for_merkle_tree(depth, commitments, ts)
+            .await
+            .expect("testnet wallet should pay the merkle sub-batch");
+        winner_hashes.push(Some(winner));
+    }
+    let balance_after_payment = testnet.wallet().balance_of_tokens().await.unwrap();
+
+    // Outage: every node is up but drops chunk PUTs. Nothing answers a silenced PUT, so each
+    // attempt waits out `merkle_store_timeout_secs`. Its 270 s default, sized for the storer's
+    // closeness lookup, would hold this phase for over an hour; no storer verifies anything
+    // while PUTs are dropped, so a short one is safe until the silence lifts.
+    testnet.silence_chunk_puts(true);
+    let merkle_store_timeout_secs = client.config().merkle_store_timeout_secs;
+    client.config_mut().merkle_store_timeout_secs = 2;
+    let started = std::time::Instant::now();
+    let outcome = client
+        .finalize_upload_merkle_multi_resumable(prepared, winner_hashes)
+        .await
+        .expect("a store-side failure must come back as Partial, not Err");
+    eprintln!(
+        "finalize during the outage returned after {:?}",
+        started.elapsed()
+    );
+    let mut resume = match outcome {
+        FinalizeOutcome::Partial { result, resume } => {
+            assert_eq!(result.chunks_stored, 0, "no node accepted a PUT");
+            assert_eq!(result.chunks_failed, result.total_chunks);
+            assert_eq!(result.data_map_address, Some(public_address));
+            resume
+        }
+        FinalizeOutcome::Complete(_) => panic!("finalize cannot complete while PUTs are dropped"),
+    };
+    assert_eq!(
+        testnet.wallet().balance_of_tokens().await.unwrap(),
+        balance_after_payment,
+        "the failed finalize must not pay"
+    );
+
+    // Recovery: resume against the same payments. Bounded, as `finalize_resume` documents.
+    testnet.silence_chunk_puts(false);
+    client.config_mut().merkle_store_timeout_secs = merkle_store_timeout_secs;
+    let mut completed = None;
+    for attempt in 1..=3 {
+        match client
+            .finalize_resume(resume)
+            .await
+            .expect("resume must not error")
+        {
+            FinalizeOutcome::Complete(result) => {
+                completed = Some(result);
+                break;
+            }
+            FinalizeOutcome::Partial {
+                result,
+                resume: rest,
+            } => {
+                eprintln!(
+                    "resume attempt {attempt}: {}/{} stored",
+                    result.chunks_stored, result.total_chunks
+                );
+                resume = rest;
+            }
+        }
+    }
+    let result = completed.expect("resume should complete once the nodes accept PUTs");
+    assert_eq!(result.payment_mode_used, PaymentMode::Merkle);
+    assert_eq!(result.chunks_failed, 0);
+    assert_eq!(result.chunks_stored, result.total_chunks);
+    assert_eq!(result.data_map_address, Some(public_address));
+    assert_eq!(
+        testnet.wallet().balance_of_tokens().await.unwrap(),
+        balance_after_payment,
+        "resuming must reuse the original payments, not pay again"
+    );
+
+    let fetched_map = client
+        .data_map_fetch(&public_address)
+        .await
+        .expect("public DataMap chunk should be retrievable");
+    let output_dir = TempDir::new().expect("create temp dir");
+    let output_path = output_dir.path().join("resumed.bin");
+    client
+        .file_download(&fetched_map, &output_path)
+        .await
+        .expect("download should succeed");
+    let downloaded = std::fs::read(&output_path).expect("read downloaded file");
+    assert_eq!(downloaded, data, "downloaded content must match original");
 
     drop(client);
     testnet.teardown().await;

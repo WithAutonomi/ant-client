@@ -10,11 +10,12 @@
 //! only within those bounds; the read fetches any record refused here itself.
 //!
 //! Read-ahead fetches through a client of its own. Its GETs are speculative
-//! unless a read waits for their record, and the read budget admits speculative
-//! GETs, cancelled ones included, only within a share of its cap. Only fetches a
-//! read waited for inform the reads' adaptive concurrency, and read-ahead keeps
-//! its records out of the shared chunk cache. Readers reading ahead the same
-//! record at the same time share one fetch.
+//! unless a read waits for their record. The read budget admits speculative
+//! GETs, cancelled ones included, only within a share of its cap, and each
+//! node's session only within a share of its slots, never ahead of a GET a read
+//! waits for. Only fetches a read waited for inform the reads' adaptive
+//! concurrency, and read-ahead keeps its records out of the shared chunk cache.
+//! Readers reading ahead the same record at the same time share one fetch.
 use super::{BrowserNetworkCore, SharedNetworkAdapter};
 use crate::client_engine::read_ahead::{read_ahead_window, releasable};
 use crate::client_engine::read_budget::ReadBudget;
