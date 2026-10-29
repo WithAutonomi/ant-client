@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ML-DSA-65 key and signature of about 6 KB, so an answer shrinks from about 115 KB to 42 KB. On
   mainnet it arrived in about 4 round trips instead of 5 on a fresh connection, and 1 instead of 3
   on a used one. Lookups for uploads, quotes, PUT targets, Merkle payments and pointers still ask
-  for the full view. (V2-1779)
+  for the full view. (V2-1779, #243)
 
 ## [0.3.12] - 2026-10-22
 
