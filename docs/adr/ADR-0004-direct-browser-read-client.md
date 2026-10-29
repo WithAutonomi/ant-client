@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-10-13
+- **Last amended:** 2026-10-28
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -826,3 +826,105 @@ median instead of 1.9-2.7 s, a failed one 3.0 s instead of 10.4-11.0 s, and a
 lookup round 1.2 s instead of 1.6-3.8 s. Failing dials held 14 pool slots on average, and the
 first data read started at 7-8 s instead of 13.5-14.3 s. The lookup width, its
 grace period, the pool size and the dial-failure cooldown are unchanged.
+
+## First record of a read (2026-10-28)
+
+Related: [V2-1769](https://linear.app/autonominetwork/issue/V2-1769); the
+node-side DTLS delay is
+[saorsa-transport#229](https://github.com/WithAutonomi/saorsa-transport/issues/229).
+
+A stream's first frame waits for its first record. This was traced on mainnet
+with a test-utils build of `7a432e7`, over 15 rounds in Chromium. A warm client
+read the first 1 MiB of a 54.9 MB video 3 s after connecting. The GET to the
+record's holder started a median 4.1 s after the read began:
+
+- A lookup reply first named the holder at 1.1 s.
+- The read's early GETs went first to hints that could not hold the record.
+  Its first hints are its bootstrap peers, which share 0-2 leading bits with
+  the record. A median 6 GETs ran one at a time before the holder's, and each
+  waited 0.46 s for a new connection lane before its NotFound.
+- In 15 of 15 rounds, the preconnect slots were full when the holder was named.
+  The peers in them shared a median 1 bit with the record, and half were dead
+  endpoints. A third had come from the lookup for the record after this one,
+  which a header read started at the same time. A skipped node is not queued,
+  so the holder waited for the lookup's next round or another reply.
+
+The decisions:
+
+- **Peers that cannot hold the record are not read early.**
+  `ReadProgress::listed` records the peers each lookup reply lists, with its
+  responder. A record is stored by its close group, so a peer with
+  `CLOSE_GROUP_SIZE` listed peers nearer the record cannot hold it, and
+  `ReadProgress::may_hold` is false for it. Such a peer leaves the read's hints.
+  A holder is in the close group by definition, so the rule never excludes one,
+  whether or not the peers nearer it are reachable.
+  - Only proven identities are listed: the responder, which its session
+    authenticated, and the peers whose owner-signed address records `find_node`
+    verified. A peer a reply lists without a record proves nothing, so it does
+    not count.
+  - Listing only removes hints from early reads. Discovery, its preconnects,
+    the read after it, and that read's absence and closeness decisions are
+    unchanged. A responder with signed records for invented identities near the
+    record can therefore at most suppress early reads, leaving the read to
+    finish after discovery.
+  - Native reads never list peers, so their hints are unchanged.
+- **A read that continues no other fetches the record after it only once it
+  has finished.** It used to start that fetch at once, in case the read starts
+  a stream, so its lookup and transfer competed with the record the read waits
+  for. Reads that continue a stream are unchanged.
+
+This was measured against main on mainnet, from one macOS machine, on
+2026-10-28, with the arms in rotating order and a fresh browser context per
+sample. The traced read of the first 1 MiB, at the median:
+
+| engine | rounds | holder's GET, main → this | 1 MiB read, main → this | sooner |
+| --- | --: | --: | --: | --: |
+| Chromium | 10 | 4.3 → 1.9 s | 5.0 → 3.4 s | 10/10 |
+| WebKit (Playwright) | 6 | 4.4 → 2.2 s | 5.1 → 3.0 s | 5/6 |
+
+GETs before the holder's fell from 6 to 1 in Chromium, and from 7 to 1 in
+WebKit. Once the read knew the holder, it asked it at once.
+
+The same video was then streamed on try.autonomi.com's own page. Two copies of
+the page differed only in the core, main's and this change's:
+- each sample clicked Stream 3 s after the page's client connected;
+- it was timed to the first decoded frame;
+- the video played for ten seconds, then was sought to 85%, beyond the
+  read-ahead window.
+
+| engine | rounds | first frame, median | sooner | seek to 85%, median | sooner |
+| --- | --: | --: | --: | --: | --: |
+| Chromium | 20 | 5.8 → 3.1 s | 16/20 | 5.1 → 4.1 s | 14/20 |
+| WebKit (Playwright) | 6 | 4.0 → 3.1 s | 5/6 | 2.9 → 2.8 s | 3/6 |
+
+- In Chromium, the median paired saving was 1.6 s for the first frame and
+  1.0 s for the seek.
+- First frames over 6 s fell from 9 of 20 to 3.
+- The WebKit seek was level, at a median paired difference of 0.4 s later.
+- All 52 samples played, and no page reported an error.
+
+**Cost: first reads concentrate on the first holder found.** In the Chromium
+traces, three holders served main's first reads (5, 4 and 1 of 10); with this
+change one served 9 of 10. In WebKit it served all 6, against 5 of 6. Early
+GETs still choose uniformly among the hints that may hold the record, but the
+first such hint is now asked at once. A holder that is full declines new
+sessions and is skipped for 15 s (ant-node ADR-0023).
+
+Unchanged: the lookup's width and grace period, its preconnects, the hedge
+delay, and the read after discovery.
+
+Left for later:
+
+- **DTLS:** it took 1.39 s at the median after ICE connected (p90 3.5 s), in
+  both engines, and its times cluster at the browsers' DTLS resend timers. The
+  node's ICE-lite agent starts DTLS only once the browser nominates the
+  connection, which the browser does late; that is V2-1770
+  (saorsa-transport#229).
+- **Preconnect slots:** they are still first come, first served, and a node
+  that finds them full is skipped, not queued. Ordering pending preconnects by
+  distance to the target would help every lookup, not only reads.
+- **Lookup answers:** each took about five of its node's round trips. It
+  carries 20 owner-signed records, whose ML-DSA-65 keys and signatures alone
+  come to over 100 KB.
+- **Lookup rounds:** each round waits for its slowest answer, up to its grace
+  period.

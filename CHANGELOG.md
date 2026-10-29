@@ -317,6 +317,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it (`npm update -g @withautonomi/ant`). Self-replacing an npm-managed binary left npm's
   metadata describing a file that was no longer there, so the next `npm update` silently rolled
   the user back.
+- A browser read asks a record's holders sooner. Its first hints are its bootstrap peers, which
+  rarely hold the record, and it used to ask them one at a time, each over a new connection,
+  while discovery had already reached a holder. Now a hint stops being read once lookup replies
+  list a close group of peers nearer the record. Only peers a reply proves, with an owner-signed
+  address record, and its authenticated responder count. A read that continues no other now
+  fetches the record after it once it has finished, so that fetch no longer competes with the
+  record the read waits for. In `ant-core`, a `BrowserNetwork` adapter reports listed peers
+  through the new `ReadProgress::listed`; `ReadProgress::may_hold` gives the rule. Native reads
+  are unchanged. (#242)
 
 ### Fixed
 - Uploads no longer fail outright when the public RPC briefly answers the fee estimate with a 429
