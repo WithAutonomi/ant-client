@@ -5,6 +5,7 @@ import {
   contentAddress,
   encryptPublicFile,
   parseWebRtcDirectMultiaddr,
+  test_witnessed_view_count,
 } from "./pkg/ant_core.js";
 import { mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 
@@ -43,6 +44,19 @@ for (const existing of [1, 3]) {
     }
   });
 }
+
+test("an upload's lookups still ask each node for a full witnessed view", async () => {
+  // Quotes cross-check every responder's witnessed view, so the smaller
+  // answers a read asks for must not reach uploads.
+  const rtc = mockWebRtc(Array.from({ length: 7 }, () => ({})));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    await upload(client, wallet());
+    const lookups = rtc.requests.filter(r => r.method === "find_node");
+    assert.ok(lookups.length > 0, "the upload ran no lookup");
+    assert.deepEqual([...new Set(lookups.map(r => r.count))], [test_witnessed_view_count()]);
+  } finally { client.close(); }
+});
 
 test("four distinct already-stored votes skip both payment and PUTs", async () => {
   const rtc = mockWebRtc(Array.from({ length: 7 }, (_, i) => ({ alreadyStored: i < 4 })));
