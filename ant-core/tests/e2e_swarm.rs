@@ -18,6 +18,9 @@ use tempfile::{NamedTempFile, TempDir};
 
 /// How long two clients may take to meet and open a link.
 const MEET_TIMEOUT: Duration = Duration::from_secs(60);
+/// About the size of each record of a file three times as long: several 16
+/// KiB pieces on a link.
+const RECORD_BYTES: usize = 64 * 1024;
 
 fn reader(testnet: &MiniTestnet, node: usize) -> Client {
     Client::from_node(
@@ -103,7 +106,12 @@ async fn node_gets(testnet: &MiniTestnet, client: &Client, data_map: &DataMap) -
 #[serial]
 async fn a_second_reader_is_served_by_the_first_instead_of_the_nodes() {
     let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
-    let (data, data_map) = upload(&testnet, 8 * 1024 * 1024).await;
+    // Records small enough to cross the link well inside a read's head start
+    // on a slow runner. In a debug build the link's encryption is
+    // unoptimised Rust and the nodes' is native code: a 2.7 MiB record took
+    // the link 1.3 s of the 2 s a read gives it on a laptop, and longer than
+    // that on CI runners, where the nodes then served every record.
+    let (data, data_map) = upload(&testnet, 3 * RECORD_BYTES).await;
     let records = data_map.infos().len() as u64;
     let out = TempDir::new().expect("temp dir");
 
@@ -144,8 +152,8 @@ async fn a_second_reader_is_served_by_the_first_instead_of_the_nodes() {
     // read.
     assert!(first.swarm_stats().records_served >= from_peers);
     assert!(first.swarm_stats().bytes_served >= second_stats.bytes_from_peers);
-    // Whole records: an 8 MiB file's are over 2 MiB each.
-    assert!(second_stats.bytes_from_peers > from_peers * 2 * 1024 * 1024);
+    // Whole records, each sent in several pieces.
+    assert!(second_stats.bytes_from_peers >= from_peers * RECORD_BYTES as u64);
 
     // A record a peer sent says nothing of whether the network stores it:
     // checking each record asks the nodes for every one the first sent,
