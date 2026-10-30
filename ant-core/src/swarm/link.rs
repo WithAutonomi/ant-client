@@ -15,7 +15,9 @@ use web_time::Instant;
 use super::room::{count, member_key, name_of, signed_by, Room};
 use super::rtc::{ChannelEvent, ChannelSender};
 use super::wire::{self, Assembly, Message, MAX_HAVE_ADDRESSES};
-use super::{or_stopped, spawn, Counters, DiscoveryCounters, Inner, Pace, PeerRef, Stop};
+use super::{
+    or_stopped, spawn, update_usize, Counters, DiscoveryCounters, Inner, Pace, PeerRef, Stop,
+};
 use crate::data::XorName;
 
 /// How long a new link may take to open.
@@ -880,12 +882,11 @@ struct Waiting<'a>(&'a AtomicUsize);
 impl<'a> Waiting<'a> {
     /// A place among those waiting, if there is one left.
     fn enter(count: &'a AtomicUsize) -> Option<Self> {
-        count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
-                (waiting < MAX_WAITING_PER_LINK).then_some(waiting + 1)
-            })
-            .ok()
-            .map(|_| Self(count))
+        update_usize(count, |waiting| {
+            (waiting < MAX_WAITING_PER_LINK).then_some(waiting + 1)
+        })
+        .ok()
+        .map(|_| Self(count))
     }
 }
 

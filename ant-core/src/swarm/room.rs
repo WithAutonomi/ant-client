@@ -27,7 +27,9 @@ use web_time::Instant;
 
 use super::link::{self, CONNECT_TIMEOUT};
 use super::rtc::{channel_label, PendingOffer, RtcError};
-use super::{or_stopped, spawn, Connecting, Counters, DiscoveryCounters, Inner, PeerRef, Stop};
+use super::{
+    or_stopped, spawn, update_usize, Connecting, Counters, DiscoveryCounters, Inner, PeerRef, Stop,
+};
 use crate::data::error::Error;
 use crate::data::network::{send_and_await_chunk_response, ChunkRequest, RequestDispatched};
 use crate::data::Network;
@@ -404,11 +406,7 @@ impl Room {
     /// unread from then.
     pub(super) fn end_read(&self, now: crate::runtime::Clock) {
         self.note_read(now);
-        let _ = self
-            .reads
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reads| {
-                Some(reads.saturating_sub(1))
-            });
+        let _ = update_usize(&self.reads, |reads| Some(reads.saturating_sub(1)));
     }
 
     /// The label of the data channel on each of the room's links.

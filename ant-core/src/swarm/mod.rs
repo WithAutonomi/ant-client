@@ -411,6 +411,39 @@ pub(crate) async fn or_stopped<F: Future>(stop: &Stop, future: F) -> Option<F::O
     }
 }
 
+/// Changes `atomic` to what `change` makes of its value, in one step, unless
+/// `change` gives `None`: the value before, or the one `change` refused. As
+/// the atomics' own `fetch_update`, which Rust 1.99 renames.
+fn update_usize(
+    atomic: &AtomicUsize,
+    change: impl Fn(usize) -> Option<usize>,
+) -> Result<usize, usize> {
+    let mut current = atomic.load(Ordering::Acquire);
+    loop {
+        let Some(new) = change(current) else {
+            return Err(current);
+        };
+        match atomic.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(before) => return Ok(before),
+            Err(now) => current = now,
+        }
+    }
+}
+
+/// As [`update_usize`], for an `AtomicU64`.
+fn update_u64(atomic: &AtomicU64, change: impl Fn(u64) -> Option<u64>) -> Result<u64, u64> {
+    let mut current = atomic.load(Ordering::Acquire);
+    loop {
+        let Some(new) = change(current) else {
+            return Err(current);
+        };
+        match atomic.compare_exchange_weak(current, new, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(before) => return Ok(before),
+            Err(now) => current = now,
+        }
+    }
+}
+
 /// Whether [`spawn`] has an executor to run a task on.
 #[cfg(feature = "native")]
 fn can_spawn() -> bool {
@@ -1059,16 +1092,13 @@ impl Swarm {
     /// to them.
     pub(crate) fn note_node_read(&self, took: std::time::Duration) {
         let took = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
-        let _ =
-            self.inner
-                .node_read_ms
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |average| {
-                    Some(if average == 0 {
-                        took.max(1)
-                    } else {
-                        average.saturating_mul(4).saturating_add(took) / 5
-                    })
-                });
+        let _ = update_u64(&self.inner.node_read_ms, |average| {
+            Some(if average == 0 {
+                took.max(1)
+            } else {
+                average.saturating_mul(4).saturating_add(took) / 5
+            })
+        });
     }
 
     /// How long a read at most waits for a peer that keeps on pace before it
@@ -1209,11 +1239,10 @@ impl Inner {
         } else {
             MAX_UPLOADS
         };
-        self.uploads
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |running| {
-                (running < limit).then_some(running + 1)
-            })
-            .ok()?;
+        update_usize(&self.uploads, |running| {
+            (running < limit).then_some(running + 1)
+        })
+        .ok()?;
         Some(Upload(Arc::clone(&self.uploads)))
     }
 
