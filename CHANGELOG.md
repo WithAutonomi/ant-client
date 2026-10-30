@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ant-core`: `Client::join_swarm`, `swarm_stats` and `swarm_room_stats`, with `SwarmStats`
   (its `discovery` field a `DiscoveryStats`) and `RoomStats`. In the browser: `joinSwarm`,
   `swarmStats` and `swarmRoomStats`, and a `Swarm room <tag>` progress line when a file
-  opens. (PR number to follow.)
+  opens (#244).
 
 ## [0.3.12] - 2026-10-22
 
