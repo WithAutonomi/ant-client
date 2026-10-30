@@ -1114,7 +1114,7 @@ impl Swarm {
     /// Whether a read of `address` could have it from this swarm now: it is
     /// held already, or a link of a room whose file holds it says it has it
     /// and takes an ask. A read waiting for its turn at the nodes looks.
-    #[cfg(any(test, not(feature = "native")))]
+    #[cfg(any(test, feature = "test-utils", not(feature = "native")))]
     pub(crate) fn could_serve(&self, address: &XorName) -> bool {
         let rooms = self.inner.rooms_holding(address);
         if rooms.is_empty() || crate::runtime::page_hidden() {
@@ -1341,7 +1341,7 @@ impl Inner {
     }
 
     /// The rooms whose file holds `address`.
-    #[cfg(any(test, not(feature = "native")))]
+    #[cfg(any(test, feature = "test-utils", not(feature = "native")))]
     fn rooms_holding(&self, address: &XorName) -> Vec<RoomKey> {
         self.rooms()
             .iter()

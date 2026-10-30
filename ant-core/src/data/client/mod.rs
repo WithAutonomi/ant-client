@@ -965,6 +965,15 @@ impl Client {
         self.swarm.stats()
     }
 
+    /// Whether a read of `address` could have it from the swarm now: this
+    /// client holds it, or a linked reader of a room whose file holds it says
+    /// it has it. For tests, which wait for what readers tell each other.
+    #[cfg(feature = "test-utils")]
+    #[must_use]
+    pub fn swarm_could_serve(&self, address: &XorName) -> bool {
+        self.swarm.could_serve(address)
+    }
+
     /// What each room this client is in now has fetched from and served to
     /// its other members: one room per file read lately.
     #[must_use]

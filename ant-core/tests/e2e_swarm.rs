@@ -65,6 +65,25 @@ async fn until_linked(clients: &[&Client]) {
     tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
+/// Waits until `client` has heard that a linked reader holds every record
+/// of the file, as the first messages on a link say: a read that starts
+/// before then goes to the nodes, as it should.
+async fn until_offered(client: &Client, data_map: &DataMap) {
+    let deadline = tokio::time::Instant::now() + MEET_TIMEOUT;
+    while !data_map
+        .infos()
+        .iter()
+        .all(|info| client.swarm_could_serve(&info.dst_hash.0))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never heard what the other reader holds: {:?}",
+            client.swarm_stats()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// GETs the nodes have received for the file's records.
 async fn node_gets(testnet: &MiniTestnet, client: &Client, data_map: &DataMap) -> usize {
     testnet.flush_chunk_gets(client.network().node()).await;
@@ -99,6 +118,7 @@ async fn a_second_reader_is_served_by_the_first_instead_of_the_nodes() {
     let second = reader(&testnet, 5);
     second.join_swarm(&data_map).await.expect("join");
     until_linked(&[&first, &second]).await;
+    until_offered(&second, &data_map).await;
     let before = node_gets(&testnet, &second, &data_map).await;
     assert_eq!(
         download(&second, &data_map, out.path(), "second").await,
