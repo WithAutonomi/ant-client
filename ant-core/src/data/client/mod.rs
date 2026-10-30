@@ -35,11 +35,12 @@ use crate::data::network::Network;
 use crate::data::network::NetworkHealth;
 #[cfg(feature = "native")]
 use crate::data::peer_cache;
+use crate::data::{DataMap, RoomStats, SwarmStats};
 use ant_protocol::evm::Wallet;
 #[cfg(feature = "native")]
 use ant_protocol::transport::P2PNode;
 use ant_protocol::transport::{MultiAddr, PeerId};
-use ant_protocol::{XorName, CLOSE_GROUP_SIZE};
+use ant_protocol::{RoomKey, XorName, CLOSE_GROUP_SIZE};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -639,9 +640,12 @@ pub struct Client {
     wallet: Option<Arc<Wallet>>,
     evm_network: Option<ant_protocol::evm::Network>,
     chunk_cache: ChunkCache,
-    /// Chunk GETs in flight, by address and peer count, so concurrent reads
-    /// of one chunk share a single network GET.
-    chunk_gets: SingleFlight<(XorName, usize), Result<Option<ant_protocol::DataChunk>>>,
+    /// Chunk GETs in flight, by address, peer count and whether other clients
+    /// may serve the read, so concurrent reads of one chunk share a single
+    /// network GET.
+    chunk_gets: SingleFlight<(XorName, usize, bool), Result<Option<ant_protocol::DataChunk>>>,
+    /// Records shared with other clients reading the same files.
+    swarm: crate::swarm::Swarm,
     next_request_id: AtomicU64,
     /// Adaptive concurrency controller: replaces the static
     /// quote/store concurrency knobs. See `adaptive` module.
@@ -729,6 +733,7 @@ impl Client {
         start: ChannelStart,
     ) -> Self {
         let (controller, _persist_path) = build_controller(&config, start);
+        let swarm = crate::swarm::Swarm::for_network(&network);
         Self {
             config,
             network,
@@ -736,6 +741,7 @@ impl Client {
             evm_network: None,
             chunk_cache: ChunkCache::default(),
             chunk_gets: SingleFlight::default(),
+            swarm,
             next_request_id: AtomicU64::new(1),
             controller,
             #[cfg(feature = "native")]
@@ -755,6 +761,15 @@ impl Client {
         self.unversioned_quote_peers = Arc::clone(&session.unversioned_quote_peers);
         self.versioned_capable_peers = Arc::clone(&session.versioned_capable_peers);
         self.settlement_refusals = session.settlement_refusals.clone();
+        self.swarm = session.swarm.clone();
+        self
+    }
+
+    /// Share `session`'s swarm, so records either client fetched are served
+    /// and found once.
+    #[cfg(not(feature = "native"))]
+    pub(crate) fn with_swarm_of(mut self, session: &Self) -> Self {
+        self.swarm = session.swarm.clone();
         self
     }
 
@@ -776,6 +791,7 @@ impl Client {
     ) -> Self {
         let network = Network::from_node(node);
         let (controller, persist_path) = build_controller(&config, ChannelStart::default());
+        let swarm = crate::swarm::Swarm::for_network(&network);
         Self {
             config,
             network,
@@ -783,6 +799,7 @@ impl Client {
             evm_network: None,
             chunk_cache: ChunkCache::default(),
             chunk_gets: SingleFlight::default(),
+            swarm,
             next_request_id: AtomicU64::new(1),
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
             versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
@@ -831,6 +848,7 @@ impl Client {
         let network =
             Network::new_multiaddrs(bootstrap_peers, config.allow_loopback, config.ipv6).await?;
         let (controller, persist_path) = build_controller(&config, ChannelStart::default());
+        let swarm = crate::swarm::Swarm::for_network(&network);
         Ok(Self {
             config,
             network,
@@ -838,6 +856,7 @@ impl Client {
             evm_network: None,
             chunk_cache: ChunkCache::default(),
             chunk_gets: SingleFlight::default(),
+            swarm,
             next_request_id: AtomicU64::new(1),
             unversioned_quote_peers: Arc::new(Mutex::new(HashSet::new())),
             versioned_capable_peers: Arc::new(Mutex::new(HashSet::new())),
@@ -931,6 +950,97 @@ impl Client {
     #[must_use]
     pub fn chunk_cache(&self) -> &ChunkCache {
         &self.chunk_cache
+    }
+
+    /// The records this client shares with other clients reading the same
+    /// files.
+    pub(crate) fn swarm(&self) -> &crate::swarm::Swarm {
+        &self.swarm
+    }
+
+    /// What this client has fetched from and served to other clients reading
+    /// the same files.
+    #[must_use]
+    pub fn swarm_stats(&self) -> SwarmStats {
+        self.swarm.stats()
+    }
+
+    /// Whether a read of `address` could have it from the swarm now: this
+    /// client holds it, or a linked reader of a room whose file holds it says
+    /// it has it. For tests, which wait for what readers tell each other.
+    #[cfg(feature = "test-utils")]
+    #[must_use]
+    pub fn swarm_could_serve(&self, address: &XorName) -> bool {
+        self.swarm.could_serve(address)
+    }
+
+    /// What each room this client is in now has fetched from and served to
+    /// its other members: one room per file read lately.
+    #[must_use]
+    pub fn swarm_room_stats(&self) -> Vec<RoomStats> {
+        self.swarm.room_stats()
+    }
+
+    /// Joins the room of the file `data_map` describes, so other clients
+    /// reading it can serve this one, and this one them. A shrunk map is
+    /// resolved to its root first: the room is the root map's.
+    ///
+    /// Every download does this itself. Joining before a download starts
+    /// gives the client time to meet the others first, so more of the file
+    /// can come from them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a shrunk map cannot be resolved, or the map is not
+    /// a valid file map. A file too large for a room (over 262,144 records)
+    /// joins nothing and is read from the nodes alone.
+    pub async fn join_swarm(&self, data_map: &DataMap) -> Result<()> {
+        let root = self.data_map_resolve_root(data_map).await?;
+        if crate::swarm::file_records(&root).is_none() {
+            return Err(Error::InvalidData("not the DataMap of a file".into()));
+        }
+        // A file too large for a room is read from the nodes alone: joining
+        // it does nothing.
+        self.swarm_room_now(&root);
+        Ok(())
+    }
+
+    /// As [`Self::swarm_room`], asked for: the room starts finding the
+    /// file's other readers at once, not after a read's first record.
+    pub(crate) fn swarm_room_now(&self, root: &DataMap) {
+        if let Some((room, secret)) = crate::swarm::room_of(root) {
+            self.join_swarm_room(
+                room,
+                secret,
+                root.infos().iter().map(|info| info.dst_hash.0),
+            );
+            self.swarm.start_finding(&room);
+        }
+    }
+
+    /// Joins the room of the file whose root map is `root`, with the records
+    /// it lists: the only ones shared in that room.
+    pub(crate) fn swarm_room(&self, root: &DataMap) {
+        if let Some((room, secret)) = crate::swarm::room_of(root) {
+            self.join_swarm_room(
+                room,
+                secret,
+                root.infos().iter().map(|info| info.dst_hash.0),
+            );
+        }
+    }
+
+    /// Joins `room`, whose file's readers derive `secret`, with the records
+    /// of that file, the only ones shared in it: listed when the room is
+    /// joined, a room already joined keeping its list (see
+    /// `Swarm::join`).
+    pub(crate) fn join_swarm_room(
+        &self,
+        room: RoomKey,
+        secret: [u8; 32],
+        records: impl IntoIterator<Item = XorName>,
+    ) {
+        self.swarm.join(room, secret, records, &self.network);
     }
 
     /// Adaptive concurrency controller. Hot loops read

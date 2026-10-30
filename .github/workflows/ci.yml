@@ -114,9 +114,21 @@ jobs:
           --test ./wasm-tests/*.test.mjs
 
   browser-integration:
-    name: Real Chromium and local nodes
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The whole suite against the pinned node release: this client
+          # against older nodes.
+          - name: Real Chromium and local nodes
+            node: pinned
+          # Pages sharing records through nodes that host swarm rooms: the
+          # ant-node this client is built with, as Cargo.lock names it.
+          - name: Real Chromium and swarm nodes
+            node: locked
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -154,11 +166,36 @@ jobs:
           anvil --version
           forge --version
       - name: Check out the pinned browser integration node
+        if: matrix.node == 'pinned'
         shell: bash
         run: |
           node_revision=$(cat ant-core/browser-tests/node-revision)
           git clone https://github.com/WithAutonomi/ant-node.git ../ant-node-web-support
           git -C ../ant-node-web-support checkout "$node_revision"
+      - name: Check out the ant-node this client is built with
+        if: matrix.node == 'locked'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node=$(cargo metadata --format-version 1 --locked \
+            | jq -c '.packages[] | select(.name == "ant-node") | {source, version}')
+          source=$(jq -r .source <<<"$node")
+          case "$source" in
+            git+*)
+              url=${source#git+}
+              revision=${url##*#}
+              url=${url%%#*}
+              url=${url%%\?*}
+              ;;
+            registry+*)
+              url=https://github.com/WithAutonomi/ant-node.git
+              revision="v$(jq -r .version <<<"$node")"
+              ;;
+            *) echo "unexpected ant-node source: $source"; exit 1 ;;
+          esac
+          echo "ant-node from $url at $revision"
+          git clone "$url" ../ant-node-web-support
+          git -C ../ant-node-web-support checkout "$revision"
       - run: cargo install wasm-pack --version 0.15.0 --locked
       - name: Build production browser bindings
         working-directory: ant-core
@@ -178,7 +215,17 @@ jobs:
         # so they must not fail the build here.
         env:
           RUSTFLAGS: ""
+        if: matrix.node == 'pinned'
         run: npm test
+      - name: Share records between real Chromium pages through swarm nodes
+        working-directory: ant-core/browser-tests
+        if: matrix.node == 'locked'
+        env:
+          # Not the pinned revision: start-devnet.mjs checks that one only
+          # when no node directory is named.
+          ANT_NODE_DIR: ${{ github.workspace }}/../ant-node-web-support
+          REQUIRE_SWARM: "1"
+        run: npx playwright test swarm.spec.js
 
   test-unit:
     name: Unit Tests (${{ matrix.os }})
@@ -239,7 +286,7 @@ jobs:
           anvil --version
           forge --version
       - name: Run E2E tests (serial)
-        run: cargo test -p ant-core --features test-utils --test e2e_chunk --test e2e_data --test e2e_file --test e2e_payment --test e2e_native_payment --test e2e_security --test e2e_cost_estimate --test e2e_adr0004 --test e2e_manifest -- --test-threads=1
+        run: cargo test -p ant-core --features test-utils --test e2e_chunk --test e2e_data --test e2e_file --test e2e_payment --test e2e_native_payment --test e2e_security --test e2e_cost_estimate --test e2e_adr0004 --test e2e_manifest --test e2e_swarm -- --test-threads=1
 
   test-merkle:
     name: Merkle E2E (${{ matrix.os }})

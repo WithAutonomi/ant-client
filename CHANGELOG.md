@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Readers of the same file share its records, BitTorrent style, in every client (ADR-0026 in
+  `ant-node`). Each download, stream or opened reader joins the file's swarm room as soon as it
+  has the root map, at the closest nodes that host rooms, meets the file's other readers over
+  WebRTC (webrtc-rs natively, the browser's own in WASM), and takes records they hold beside the
+  nodes, never instead of them: a peer keeps a read while it is on pace to finish within about
+  as long as the nodes take now, then the nodes are read too, and the first record that checks
+  against its address wins. Finding peers runs on its own and never delays a read, and a
+  client sends other readers one record at a time while its own reads run; nodes stay the last
+  seed, and nodes without swarm rooms are read as before. A browser download asks for its
+  records in an order of its own. Always on. In
+  `ant-core`: `Client::join_swarm`, `swarm_stats` and `swarm_room_stats`, with `SwarmStats`
+  (its `discovery` field a `DiscoveryStats`) and `RoomStats`. In the browser: `joinSwarm`,
+  `swarmStats` and `swarmRoomStats`, and a `Swarm room <tag>` progress line when a file
+  opens (#244).
+
 ## [0.3.12] - 2026-10-22
 
 ### Changed (breaking — `ant-core` browser API)

@@ -27,6 +27,7 @@ use ant_node::payment::{
 use ant_node::pointer::{service::PointerService, store::PointerStore};
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::storage::{AntProtocol, ChunkStore, ChunkStoreConfig};
+use ant_node::swarm::SwarmSession;
 // Wire / transport / EVM types: route through ant-protocol so the test
 // harness exercises the same surface the client does.
 use ant_protocol::chunk::{ChunkGetRequest, ChunkMessage, ChunkMessageBody};
@@ -504,6 +505,14 @@ impl MiniTestnet {
             protocol.attach_commitment_source(source);
         }
 
+        // A node hosts swarm rooms once browsers can reach it, when its
+        // browser listener names its STUN server. This test node has no
+        // listener: it names one at a documentation address, which the
+        // clients here never reached it on and so never use.
+        protocol
+            .swarm()
+            .set_ice_servers(vec!["stun:192.0.2.1:3478".to_string()]);
+
         // Start message handler loop
         let silence = Arc::new(Silence::default());
         let handler_silence = Arc::clone(&silence);
@@ -511,13 +520,17 @@ impl MiniTestnet {
         let handler_gets = Arc::clone(&chunk_gets);
         let handler_node = Arc::clone(&node);
         let handler_protocol = Arc::clone(&protocol);
+        // Swarm announces may wait for a signal; they end when the node does.
+        let handler_stopping = tokio_util::sync::CancellationToken::new();
         let handler = tokio::spawn(async move {
+            let _stop_on_exit = handler_stopping.clone().drop_guard();
             let mut events = handler_node.subscribe_events();
             loop {
                 match events.recv().await {
                     Ok(P2PEvent::Message {
                         topic,
                         source: Some(source_peer),
+                        transport_source,
                         data,
                         ..
                     }) => {
@@ -530,8 +543,29 @@ impl MiniTestnet {
                         let protocol = Arc::clone(&handler_protocol);
                         let node = Arc::clone(&handler_node);
                         let topic_clone = topic.clone();
+                        let stopping = handler_stopping.clone();
                         tokio::spawn(async move {
                             if topic_clone != ant_protocol::CHUNK_PROTOCOL_ID {
+                                return;
+                            }
+                            // Swarm requests go to the rendezvous, as a node routes them,
+                            // with the address the request came from.
+                            if ant_node::swarm::is_swarm_request_bytes(&data) {
+                                let session = SwarmSession::Native(*source_peer.to_bytes());
+                                let source_ip = transport_source.as_ref().and_then(MultiAddr::ip);
+                                if let Some(reply) = protocol
+                                    .handle_swarm_request(session, source_ip, &data, &stopping)
+                                    .await
+                                {
+                                    let _ = node
+                                        .send_message(
+                                            &source_peer,
+                                            &topic_clone,
+                                            reply.to_vec(),
+                                            &[],
+                                        )
+                                        .await;
+                                }
                                 return;
                             }
                             match protocol.try_handle_request(&data).await {

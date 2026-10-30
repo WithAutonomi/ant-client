@@ -14,8 +14,11 @@ use crate::data::network::ClosestPeerDiagnostics;
 use ant_protocol::{
     send_and_await_chunk_response_with_metadata, transport::PeerRouteKind, ChunkProtocolResponse,
 };
+use std::sync::atomic::AtomicBool;
 #[cfg(feature = "native")]
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::{Mutex, PoisonError};
 #[cfg(feature = "native")]
 static ACTIVE_DIAGNOSTIC_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
@@ -226,6 +229,7 @@ use ant_protocol::{
     XorName, CLOSE_GROUP_MAJORITY,
 };
 use bytes::Bytes;
+use futures::future::{select, Either};
 use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
@@ -383,6 +387,176 @@ fn timed_out_chunk_peer_get_result(
     }
 }
 
+/// What one read did with the swarm.
+#[derive(Default)]
+struct SwarmRead {
+    /// Another client sent the chunk.
+    from_peer: AtomicBool,
+    /// When the read turned to nodes, after asking peers.
+    nodes_from: Mutex<Option<Instant>>,
+    /// A GET of this read has left for a node: from then on its record is
+    /// the node's to send, and no peer is asked for it.
+    dispatched: AtomicBool,
+    /// How the node read went and how long it took, when it ended without
+    /// the record while a linked reader was still sending it: the nodes'
+    /// miss is theirs, for the node limiter, whatever the reader then did.
+    nodes_missed: Mutex<Option<(Outcome, Duration)>>,
+}
+
+/// What the nodes did for a read, for the node limiter: how long they took,
+/// and, when they ended without the record while a linked reader was still
+/// sending it, how their read went.
+#[derive(Clone, Copy, Debug)]
+// Read by the browser's read-ahead only; a native read observes in place.
+#[cfg_attr(feature = "native", allow(dead_code))]
+pub(crate) struct NodeTime {
+    pub(crate) latency: Duration,
+    pub(crate) missed: Option<Outcome>,
+}
+
+/// How often a read still waiting for its turn at the nodes looks whether a
+/// linked reader has its record.
+#[cfg(not(feature = "native"))]
+const QUEUED_PEER_POLL: Duration = Duration::from_millis(250);
+
+/// Where a read's record came from.
+#[derive(Debug, PartialEq)]
+enum Source<T> {
+    /// A linked reader, checked.
+    Peer(Bytes),
+    /// The nodes, as their read returned it.
+    Nodes(T),
+}
+
+/// How often a read whose reader is past its head start looks whether the
+/// reader keeps on pace.
+const PACE_POLL: Duration = Duration::from_millis(100);
+
+/// Reads a record from linked readers beside the nodes, never instead of
+/// them. `ask` asks the readers that offer it (`None` at once if none does),
+/// telling `pace` how far the record has come; `node_read` reads it from the
+/// nodes. A reader that has the record when the read starts gets
+/// `head_start` (the read's hedge delay, the time a node gets before another
+/// is asked) to send it. Past that, it keeps the read while, at its average
+/// rate so far, the whole record comes within `patience` of the ask (about
+/// as long as the nodes take to send a record now), and for `patience` at
+/// most; then, or as soon as it falls off that pace or fails, the node read
+/// starts beside it, and the first to bring the record wins. A node read
+/// already waiting for its turn keeps its place while a reader that offers
+/// the record meanwhile (`offered`) sends it. A slow or failing reader so
+/// delays a read by `patience` at most, and by `head_start` unless it was on
+/// pace to beat a node read started then; it never costs a node read its
+/// place. A node read that ends without the record (`has_record` says
+/// whether its answer is one, and may note one that is not) leaves a reader
+/// still sending to finish, as its own deadline allows. `to_nodes` marks
+/// when the read turned to the nodes.
+async fn beside_peers<T, A, AF, N, NF>(
+    ask: A,
+    pace: &crate::swarm::Pace,
+    node_read: N,
+    (head_start, patience): (Duration, Duration),
+    offered: impl std::future::Future<Output = ()>,
+    to_nodes: impl Fn(),
+    has_record: impl Fn(&Result<T>) -> bool,
+) -> Result<Source<T>>
+where
+    A: Fn() -> AF,
+    AF: std::future::Future<Output = Option<Bytes>>,
+    N: Fn() -> NF,
+    NF: std::future::Future<Output = Result<T>>,
+{
+    let longest = patience.max(head_start);
+    // The reader's whole window runs from the ask on the timers' own clock,
+    // so a timer that fires late on a busy or throttled page cannot stretch
+    // it, and the pace is judged on the time that really passed.
+    let asked_at = crate::runtime::Clock::now();
+    let deadline = asked_at + longest;
+    let asked = Box::pin(ask());
+    let head = Box::pin(crate::runtime::sleep(head_start));
+    match select(asked, head).await {
+        Either::Left((Some(record), _)) => return Ok(Source::Peer(record)),
+        // No reader had it, or the one asked failed: the nodes, while a
+        // reader that offers it later may still send it.
+        Either::Left((None, _)) => to_nodes(),
+        Either::Right(((), asked)) => {
+            let paced = Box::pin(async {
+                loop {
+                    let now = crate::runtime::Clock::now();
+                    let left = deadline.saturating_duration_since(now);
+                    if left.is_zero() || !pace.finishes_by(now.duration_since(asked_at), longest) {
+                        return;
+                    }
+                    crate::runtime::sleep(PACE_POLL.min(left)).await;
+                }
+            });
+            let asked = match select(asked, paced).await {
+                Either::Left((Some(record), _)) => return Ok(Source::Peer(record)),
+                Either::Left((None, _)) => {
+                    to_nodes();
+                    return Box::pin(node_read()).await.map(Source::Nodes);
+                }
+                Either::Right(((), asked)) => asked,
+            };
+            to_nodes();
+            return match select(asked, Box::pin(node_read())).await {
+                Either::Left((Some(record), _)) => Ok(Source::Peer(record)),
+                Either::Left((None, nodes)) => nodes.await.map(Source::Nodes),
+                Either::Right((result, asked)) => after_nodes(result, asked, &has_record).await,
+            };
+        }
+    }
+    let nodes = Box::pin(node_read());
+    match select(nodes, Box::pin(offered)).await {
+        Either::Left((result, _)) => result.map(Source::Nodes),
+        Either::Right(((), nodes)) => match select(Box::pin(ask()), nodes).await {
+            Either::Left((Some(record), _)) => Ok(Source::Peer(record)),
+            Either::Left((None, nodes)) => nodes.await.map(Source::Nodes),
+            Either::Right((result, asked)) => after_nodes(result, asked, &has_record).await,
+        },
+    }
+}
+
+/// The node read ended before the reader sending the record: its record if
+/// it brought one; otherwise (it failed, or found none) the reader's, if it
+/// still sends one within its own deadline, and only then the node read's
+/// answer. Busy or refusing nodes so never cancel a reader that has most of
+/// the record.
+async fn after_nodes<T>(
+    result: Result<T>,
+    asked: impl std::future::Future<Output = Option<Bytes>>,
+    has_record: impl Fn(&Result<T>) -> bool,
+) -> Result<Source<T>> {
+    if has_record(&result) {
+        return result.map(Source::Nodes);
+    }
+    match asked.await {
+        Some(record) => Ok(Source::Peer(record)),
+        None => result.map(Source::Nodes),
+    }
+}
+
+/// `dispatched`, for a GET whose dispatch `read`, if any, learns of: the
+/// notice the GET gets, and the future that passes it on, which the GET's
+/// own future runs beside.
+fn watch_dispatch<'a>(
+    dispatched: RequestDispatched,
+    read: Option<&'a SwarmRead>,
+) -> (
+    RequestDispatched,
+    impl std::future::Future<Output = ()> + 'a,
+) {
+    let (notice, sent) = RequestDispatched::channel();
+    let forward = async move {
+        if sent.await.is_ok() {
+            if let Some(read) = read {
+                read.dispatched.store(true, AtomicOrdering::Release);
+            }
+            dispatched.notify();
+        }
+    };
+    (notice, forward)
+}
+
 fn store_response_timeout_for_proof(proof: &[u8], merkle_timeout_secs: u64) -> Duration {
     match detect_proof_type(proof) {
         Some(ProofType::Merkle) => Duration::from_secs(merkle_timeout_secs),
@@ -405,16 +579,39 @@ impl Client {
         self.chunk_get_observed_from_closest_peers(
             address,
             self.config().close_group_size,
+            true,
             #[cfg(feature = "native")]
             None,
         )
         .await
     }
 
+    /// As [`Self::chunk_get_observed`], for a record that is not one of a
+    /// file's data records (a DataMap wrapper, say): only nodes are asked,
+    /// and the record is not offered to any room. A room lists its file's
+    /// data records alone, and a map record shared through one would tell
+    /// that room's members which other file this client is opening.
+    pub(crate) async fn chunk_get_observed_from_nodes(
+        &self,
+        address: &XorName,
+    ) -> Result<Option<DataChunk>> {
+        self.chunk_get_observed_from_closest_peers(
+            address,
+            self.config().close_group_size,
+            false,
+            #[cfg(feature = "native")]
+            None,
+        )
+        .await
+    }
+
+    /// With `swarm`, a read of a file's data record: other clients reading the
+    /// file are asked first, and what this fetch gets is offered to them.
     pub(crate) async fn chunk_get_observed_from_closest_peers(
         &self,
         address: &XorName,
         peer_count: usize,
+        swarm: bool,
         #[cfg(feature = "native")] diag: Option<&ChunkFetchDiagnostics<'_>>,
     ) -> Result<Option<DataChunk>> {
         // Diagnostics record the GETs their own caller sent, so a diagnosed
@@ -424,35 +621,75 @@ impl Client {
             let epoch = self.controller().fetch.observation_epoch();
             let started = Instant::now();
             let result = self
-                .chunk_get_from_closest_peers_with_diagnostics(address, peer_count, Some(diag))
+                .chunk_get_from_closest_peers_with_diagnostics(
+                    address,
+                    peer_count,
+                    None,
+                    swarm,
+                    Some(diag),
+                )
                 .await;
             self.observe_chunk_get(&result, started.elapsed(), epoch);
             return result;
         }
-        self.chunk_get_shared(address, peer_count, true).await
+        self.chunk_get_shared(address, peer_count, true, swarm)
+            .await
     }
 
     /// Fetch a chunk, or wait for this client's fetch of the same address and
     /// peer count if one is already in flight, so concurrent reads of a chunk
     /// send its GETs once. A shared fetch feeds the adaptive fetch limiter
-    /// once, if any caller sharing it observes.
+    /// once, if any caller sharing it observes. With `swarm`, other clients
+    /// reading the same file are asked before nodes.
     async fn chunk_get_shared(
         &self,
         address: &XorName,
         peer_count: usize,
         observe: bool,
+        swarm: bool,
     ) -> Result<Option<DataChunk>> {
+        self.chunk_get_sourced(address, peer_count, observe, swarm)
+            .await
+            .0
+    }
+
+    /// Fetch a chunk browser read-ahead holds for a read: as `chunk_get`
+    /// does, with how long nodes took if this call asked them. Read-ahead
+    /// tells the node limiter only about those.
+    #[cfg(not(feature = "native"))]
+    pub(crate) async fn chunk_get_for_read_ahead(
+        &self,
+        address: &XorName,
+    ) -> (Result<Option<DataChunk>>, Option<NodeTime>) {
+        self.chunk_get_sourced(address, self.config().close_group_size, false, true)
+            .await
+    }
+
+    /// [`Self::chunk_get_shared`], with what this call's fetch from nodes (or
+    /// its cache) did: `None` if another caller fetched it, or another client
+    /// sent the chunk before the nodes had missed it. Time spent asking peers
+    /// first is not the nodes'.
+    async fn chunk_get_sourced(
+        &self,
+        address: &XorName,
+        peer_count: usize,
+        observe: bool,
+        swarm: bool,
+    ) -> (Result<Option<DataChunk>>, Option<NodeTime>) {
         let mut started = None;
+        let read = SwarmRead::default();
         let flown = self
             .chunk_gets
             .run(
-                (*address, peer_count),
+                (*address, peer_count, swarm),
                 observe,
                 || {
                     started = Some((self.controller().fetch.observation_epoch(), Instant::now()));
                     self.chunk_get_from_closest_peers_with_diagnostics(
                         address,
                         peer_count,
+                        swarm.then_some(&read),
+                        swarm,
                         #[cfg(feature = "native")]
                         None,
                     )
@@ -465,12 +702,60 @@ impl Client {
             .await;
         match flown {
             Flown::Led { value, observe } => {
-                if let (true, Some((epoch, started))) = (observe, started) {
-                    self.observe_chunk_get(&value, started.elapsed(), epoch);
+                // The nodes ended without the record while a linked reader
+                // was still sending it: their miss, and their time to it, are
+                // theirs, whether the reader then sent it or failed too.
+                let missed = *read
+                    .nodes_missed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if let Some((outcome, latency)) = missed {
+                    if let (true, Some((epoch, _))) = (observe, started) {
+                        self.controller()
+                            .fetch
+                            .observe_fetch_in_epoch(outcome, latency, 0, epoch);
+                    }
+                    return (
+                        value,
+                        Some(NodeTime {
+                            latency,
+                            missed: Some(outcome),
+                        }),
+                    );
                 }
-                value
+                // A record another client sent says nothing about how the
+                // nodes are coping, so it does not move the node limiter.
+                if read.from_peer.load(AtomicOrdering::Relaxed) {
+                    return (value, None);
+                }
+                let Some((epoch, started)) = started else {
+                    return (value, None);
+                };
+                let nodes_from = *read
+                    .nodes_from
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let latency = nodes_from.unwrap_or(started).elapsed();
+                if observe {
+                    self.observe_chunk_get(&value, latency, epoch);
+                }
+                // How long the nodes take now sets how long a peer on pace
+                // may keep a read: reads someone waits for that turned to the
+                // nodes count, as for the limiter. Read-ahead nobody waits on
+                // queues behind a speculative share, which says nothing of
+                // the nodes.
+                if observe && nodes_from.is_some() && matches!(value, Ok(Some(_))) {
+                    self.swarm().note_node_read(latency);
+                }
+                (
+                    value,
+                    Some(NodeTime {
+                        latency,
+                        missed: None,
+                    }),
+                )
             }
-            Flown::Joined(value) => value,
+            Flown::Joined(value) => (value, None),
         }
     }
 
@@ -826,13 +1111,25 @@ impl Client {
         address: &XorName,
         peer_count: usize,
     ) -> Result<Option<DataChunk>> {
-        self.chunk_get_shared(address, peer_count, false).await
+        self.chunk_get_shared(address, peer_count, false, false)
+            .await
     }
 
+    /// Fetch a chunk from nodes, or this client's cache, never from another
+    /// client. With `swarm`, other clients reading the same file are asked
+    /// first, and `swarm` records whether one of them sent the chunk or when
+    /// the read turned to nodes. With `shares`, what the fetch gets is
+    /// offered to the rooms whose file lists it.
     async fn chunk_get_from_closest_peers_with_diagnostics(
         &self,
         address: &XorName,
         peer_count: usize,
+        swarm: Option<&SwarmRead>,
+        // Only a read of a file's data record shares what it gets with the
+        // file's room: one asking peers, or a diagnosed one (which asks only
+        // nodes, to measure them). A raw read, an existence check or a map
+        // record keeps it to itself.
+        shares: bool,
         #[cfg(feature = "native")] diag: Option<&ChunkFetchDiagnostics<'_>>,
     ) -> Result<Option<DataChunk>> {
         // Check cache first, with integrity verification.
@@ -848,6 +1145,11 @@ impl Client {
                         None,
                     );
                 }
+                // Read before its room was joined, a cached record is still
+                // offered to the other readers.
+                if shares {
+                    self.swarm().seed(*address, cached.clone());
+                }
                 return Ok(Some(DataChunk::new(*address, cached)));
             }
             // Cache entry corrupted — evict and fall through to network fetch.
@@ -858,119 +1160,141 @@ impl Client {
             self.chunk_cache().remove(address);
         }
 
+        // A file's read, whether it asks peers or only nodes, counts while it
+        // runs: the client then sends other readers less, and the file's
+        // room stays joined however long the nodes take.
+        let _reading = shares.then(|| self.swarm().reading(address));
         #[cfg(feature = "native")]
         let observation = diag.map(|_| std::sync::Mutex::new(ReadObservation::default()));
-        let result = crate::client_engine::read::retrieve_progressive(
-            *address,
-            // Use the same bounded fallback allowance while discovery is in
-            // flight. Stopping after just the close-group count can exhaust
-            // speculation on stale hints before a live holder is discovered.
-            // The final close-group size and absence rules still use peer_count.
-            crate::client_engine::read::EarlyReads {
-                limit: crate::client_engine::read::MAX_GET_FALLBACK_PEERS,
-                hedge_delay: self.network().read_hedge_delay(),
-            },
-            crate::client_engine::read::uniform_choice,
-            |sender| {
-                #[cfg(feature = "native")]
-                let observation = &observation;
-                async move {
-                    let progress = crate::data::network::ReadProgress::new(
-                        *address,
-                        *self.network().peer_id(),
-                        sender,
-                    );
-                    self.network().seed_read_candidates(&progress).await;
+        let node_read = || {
+            crate::client_engine::read::retrieve_progressive(
+                *address,
+                // Use the same bounded fallback allowance while discovery is in
+                // flight. Stopping after just the close-group count can exhaust
+                // speculation on stale hints before a live holder is discovered.
+                // The final close-group size and absence rules still use peer_count.
+                crate::client_engine::read::EarlyReads {
+                    limit: crate::client_engine::read::MAX_GET_FALLBACK_PEERS,
+                    hedge_delay: self.network().read_hedge_delay(),
+                },
+                crate::client_engine::read::uniform_choice,
+                |sender| {
                     #[cfg(feature = "native")]
-                    let lookup_started = Instant::now();
-                    #[cfg(feature = "native")]
-                    let mut contexts = Vec::new();
-                    #[cfg(feature = "native")]
-                    let closest_result = if diag.is_some() {
-                        self.network()
-                            .find_closest_peers_with_diagnostics(address, peer_count)
+                    let observation = &observation;
+                    async move {
+                        let progress = crate::data::network::ReadProgress::new(
+                            *address,
+                            *self.network().peer_id(),
+                            sender,
+                        );
+                        self.network().seed_read_candidates(&progress).await;
+                        #[cfg(feature = "native")]
+                        let lookup_started = Instant::now();
+                        #[cfg(feature = "native")]
+                        let mut contexts = Vec::new();
+                        #[cfg(feature = "native")]
+                        let closest_result = if diag.is_some() {
+                            self.network()
+                                .find_closest_peers_with_diagnostics(address, peer_count)
+                                .await
+                                .map(|found| {
+                                    let peers = found
+                                        .iter()
+                                        .map(|c| (c.peer_id, c.addresses.clone()))
+                                        .collect();
+                                    contexts = found;
+                                    peers
+                                })
+                        } else {
+                            self.closest_peers(address, peer_count).await
+                        };
+                        #[cfg(not(feature = "native"))]
+                        let closest_result = self
+                            .network()
+                            .find_read_peers(address, peer_count, progress)
+                            .await;
+                        let closest = closest_result.unwrap_or_else(|e| {
+                            #[cfg(feature = "native")]
+                            if let (Some(diag), Some(observation)) = (diag, &observation) {
+                                let round =
+                                    observation.lock().unwrap_or_else(|e| e.into_inner()).round;
+                                diag.emit_chunk_level(
+                                    if round == 0 { "initial" } else { "retry" },
+                                    0,
+                                    DownloadDiagnosticsOutcome::LookupError,
+                                    Some(bounded_error("lookup", &e.to_string())),
+                                );
+                            }
+                            info!(
+                                "Chunk discovery failed for {}: {e}; trying known peers",
+                                hex::encode(address)
+                            );
+                            Vec::new()
+                        });
+                        let known = self
+                            .network()
+                            .known_peers()
                             .await
-                            .map(|found| {
-                                let peers = found
-                                    .iter()
-                                    .map(|c| (c.peer_id, c.addresses.clone()))
-                                    .collect();
-                                contexts = found;
-                                peers
+                            .into_iter()
+                            .filter(|node| node.peer_id != *self.network().peer_id())
+                            .map(|node| {
+                                let addrs = node.addresses_by_priority();
+                                (node.peer_id, addrs)
                             })
-                    } else {
-                        self.closest_peers(address, peer_count).await
-                    };
-                    #[cfg(not(feature = "native"))]
-                    let closest_result = self
-                        .network()
-                        .find_read_peers(address, peer_count, progress)
-                        .await;
-                    let closest = closest_result.unwrap_or_else(|e| {
+                            .collect();
                         #[cfg(feature = "native")]
                         if let (Some(diag), Some(observation)) = (diag, &observation) {
-                            let round = observation.lock().unwrap_or_else(|e| e.into_inner()).round;
-                            diag.emit_chunk_level(
-                                if round == 0 { "initial" } else { "retry" },
-                                0,
-                                DownloadDiagnosticsOutcome::LookupError,
-                                Some(bounded_error("lookup", &e.to_string())),
+                            let mut state = observation.lock().unwrap_or_else(|e| e.into_inner());
+                            state.round += 1;
+                            state.peer_attempt = 0;
+                            state.lookup_ms = u64::try_from(lookup_started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX);
+                            state.lookup_id = format!(
+                                "{}-{}-{}-{}",
+                                diag.file_attempt,
+                                diag.chunk_index,
+                                hex::encode(address),
+                                NEXT_DIAGNOSTIC_LOOKUP_ID.fetch_add(1, AtomicOrdering::Relaxed)
                             );
+                            state.contexts = contexts.into_iter().map(|c| (c.peer_id, c)).collect();
                         }
-                        info!(
-                            "Chunk discovery failed for {}: {e}; trying known peers",
-                            hex::encode(address)
-                        );
-                        Vec::new()
-                    });
-                    let known = self
-                        .network()
-                        .known_peers()
-                        .await
-                        .into_iter()
-                        .filter(|node| node.peer_id != *self.network().peer_id())
-                        .map(|node| {
-                            let addrs = node.addresses_by_priority();
-                            (node.peer_id, addrs)
-                        })
-                        .collect();
-                    #[cfg(feature = "native")]
-                    if let (Some(diag), Some(observation)) = (diag, &observation) {
-                        let mut state = observation.lock().unwrap_or_else(|e| e.into_inner());
-                        state.round += 1;
-                        state.peer_attempt = 0;
-                        state.lookup_ms =
-                            u64::try_from(lookup_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        state.lookup_id = format!(
-                            "{}-{}-{}-{}",
-                            diag.file_attempt,
-                            diag.chunk_index,
-                            hex::encode(address),
-                            NEXT_DIAGNOSTIC_LOOKUP_ID.fetch_add(1, AtomicOrdering::Relaxed)
-                        );
-                        state.contexts = contexts.into_iter().map(|c| (c.peer_id, c)).collect();
+                        crate::client_engine::read::ReadCandidates { closest, known }
                     }
-                    crate::client_engine::read::ReadCandidates { closest, known }
-                }
-            },
-            |(peer, _)| *peer.as_bytes(),
-            |(peer, addrs), early, dispatched| {
-                #[cfg(feature = "native")]
-                let observation = &observation;
-                async move {
-                    if early {
+                },
+                |(peer, _)| *peer.as_bytes(),
+                |(peer, addrs), early, dispatched| {
+                    #[cfg(feature = "native")]
+                    let observation = &observation;
+                    let (dispatched, forward) = watch_dispatch(dispatched, swarm);
+                    let get = async move {
+                        if early {
+                            #[cfg(feature = "native")]
+                            if let Some(diag) = diag {
+                                let early_observation = std::sync::Mutex::new(ReadObservation {
+                                    lookup_id: format!(
+                                        "{}-{}-early-{}",
+                                        diag.file_attempt,
+                                        diag.chunk_index,
+                                        NEXT_DIAGNOSTIC_LOOKUP_ID
+                                            .fetch_add(1, AtomicOrdering::Relaxed)
+                                    ),
+                                    ..ReadObservation::default()
+                                });
+                                // A native GET is dispatched at once.
+                                dispatched.notify();
+                                return self
+                                    .chunk_get_diagnostic_attempt(
+                                        address,
+                                        &peer,
+                                        &addrs,
+                                        diag,
+                                        &early_observation,
+                                    )
+                                    .await;
+                            }
+                        }
                         #[cfg(feature = "native")]
-                        if let Some(diag) = diag {
-                            let early_observation = std::sync::Mutex::new(ReadObservation {
-                                lookup_id: format!(
-                                    "{}-{}-early-{}",
-                                    diag.file_attempt,
-                                    diag.chunk_index,
-                                    NEXT_DIAGNOSTIC_LOOKUP_ID.fetch_add(1, AtomicOrdering::Relaxed)
-                                ),
-                                ..ReadObservation::default()
-                            });
-                            // A native GET is dispatched at once.
+                        if let (Some(diag), Some(observation)) = (diag, observation) {
                             dispatched.notify();
                             return self
                                 .chunk_get_diagnostic_attempt(
@@ -978,44 +1302,52 @@ impl Client {
                                     &peer,
                                     &addrs,
                                     diag,
-                                    &early_observation,
+                                    observation,
                                 )
                                 .await;
                         }
-                    }
-                    #[cfg(feature = "native")]
-                    if let (Some(diag), Some(observation)) = (diag, observation) {
-                        dispatched.notify();
-                        return self
-                            .chunk_get_diagnostic_attempt(address, &peer, &addrs, diag, observation)
-                            .await;
-                    }
-                    self.chunk_get_from_peer(address, &peer, &addrs, dispatched)
-                        .await
+                        self.chunk_get_from_peer(address, &peer, &addrs, dispatched)
+                            .await
+                    };
+                    async move { futures::future::join(get, forward).await.0 }
+                },
+                |error| {
+                    matches!(
+                        error,
+                        Error::Timeout(_) | Error::Network(_) | Error::Protocol(_)
+                    )
+                },
+                || {
+                    self.network()
+                        .refused_peers()
+                        .into_iter()
+                        .map(|(peer, remaining)| (*peer.as_bytes(), remaining))
+                        .collect()
+                },
+                || {
+                    Error::Network(format!(
+                        "the nodes that may hold chunk {} are busy; try again shortly",
+                        hex::encode(address)
+                    ))
+                },
+                crate::runtime::sleep,
+            )
+        };
+        // Boxed, so the read's future stays small for the many callers that
+        // nest it.
+        let result = match swarm {
+            Some(read) => {
+                match Box::pin(self.chunk_get_beside_peers(address, read, node_read)).await? {
+                    // Checked, and kept for the room by the swarm itself; it
+                    // stays out of the chunk cache, which answers existence
+                    // checks: another client holding a record says nothing
+                    // about whether the network stores it.
+                    Source::Peer(content) => return Ok(Some(DataChunk::new(*address, content))),
+                    Source::Nodes(result) => result,
                 }
-            },
-            |error| {
-                matches!(
-                    error,
-                    Error::Timeout(_) | Error::Network(_) | Error::Protocol(_)
-                )
-            },
-            || {
-                self.network()
-                    .refused_peers()
-                    .into_iter()
-                    .map(|(peer, remaining)| (*peer.as_bytes(), remaining))
-                    .collect()
-            },
-            || {
-                Error::Network(format!(
-                    "the nodes that may hold chunk {} are busy; try again shortly",
-                    hex::encode(address)
-                ))
-            },
-            crate::runtime::sleep,
-        )
-        .await?;
+            }
+            None => Box::pin(node_read()).await?,
+        };
         #[cfg(feature = "native")]
         if result.is_none() {
             if let (Some(diag), Some(observation)) = (diag, &observation) {
@@ -1030,8 +1362,86 @@ impl Client {
         }
         if let Some(chunk) = &result {
             self.chunk_cache().put(chunk.address, chunk.content.clone());
+            if shares {
+                self.swarm().seed(chunk.address, chunk.content.clone());
+            }
         }
         Ok(result)
+    }
+
+    /// Reads `address` from the linked readers that offer it beside the
+    /// nodes, never instead of them (see [`beside_peers`]), and returns the
+    /// first record: a reader's checked against its address, or the nodes'
+    /// read as it returned.
+    async fn chunk_get_beside_peers<F, R>(
+        &self,
+        address: &XorName,
+        read: &SwarmRead,
+        node_read: F,
+    ) -> Result<Source<Option<DataChunk>>>
+    where
+        F: Fn() -> R,
+        R: std::future::Future<Output = Result<Option<DataChunk>>>,
+    {
+        let to_nodes = || {
+            *read
+                .nodes_from
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+        };
+        // Most of a browser download's reads wait for their turn at the
+        // nodes, and its links open only after they all began: a read with
+        // no GET sent yet looks whether a linked reader has its record
+        // meanwhile. A native read sends at once.
+        #[cfg(feature = "native")]
+        let offered = futures::future::pending::<()>();
+        #[cfg(not(feature = "native"))]
+        let offered = async {
+            loop {
+                crate::runtime::sleep(QUEUED_PEER_POLL).await;
+                if read.dispatched.load(AtomicOrdering::Acquire) {
+                    return futures::future::pending::<()>().await;
+                }
+                if self.swarm().could_serve(address) {
+                    return;
+                }
+            }
+        };
+        let pace = crate::swarm::Pace::default();
+        let hedge = self.network().read_hedge_delay();
+        let source = beside_peers(
+            || self.swarm().fetch_paced(address, &pace),
+            &pace,
+            node_read,
+            (hedge, self.swarm().patience(hedge.saturating_mul(2))),
+            offered,
+            to_nodes,
+            |result: &Result<Option<DataChunk>>| {
+                let found = matches!(result, Ok(Some(_)));
+                // A reader still sending may bring the record yet; how the
+                // nodes did is kept for the limiter all the same.
+                if !found {
+                    let since = *read
+                        .nodes_from
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    if let Some(since) = since {
+                        *read
+                            .nodes_missed
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) =
+                            Some((chunk_get_outcome(result), since.elapsed()));
+                    }
+                }
+                found
+            },
+        )
+        .await?;
+        if matches!(source, Source::Peer(_)) {
+            debug!("Chunk {} came from another client", hex::encode(address));
+            read.from_peer.store(true, AtomicOrdering::Relaxed);
+        }
+        Ok(source)
     }
 
     /// Retrieve a chunk from every peer in the close group.
@@ -1206,11 +1616,16 @@ impl Client {
 
     /// Check if a chunk exists on the network.
     ///
+    /// Only nodes answer: another client holding a record says nothing about
+    /// whether the network stores it.
+    ///
     /// # Errors
     ///
     /// Returns an error if the network operation fails.
     pub async fn chunk_exists(&self, address: &XorName) -> Result<bool> {
-        self.chunk_get(address).await.map(|opt| opt.is_some())
+        self.chunk_get_shared(address, self.config().close_group_size, false, false)
+            .await
+            .map(|opt| opt.is_some())
     }
 
     /// Finalize a single-chunk publish after an external signer has paid.
@@ -1255,6 +1670,438 @@ impl Client {
 mod tests {
     use super::*;
     use ant_protocol::{PROOF_TAG_MERKLE, PROOF_TAG_SINGLE_NODE};
+
+    /// What `beside_peers` did: where the record came from, how long it took,
+    /// how many node reads it started and when the read turned to nodes.
+    struct Raced {
+        source: Source<&'static str>,
+        took: Duration,
+        node_reads: usize,
+        turned_at: Option<Duration>,
+        /// Whether the race was told of a node read that ended without the
+        /// record.
+        node_missed: bool,
+    }
+
+    /// A reader in a race: its pieces arrive evenly, so that the record would
+    /// be whole at `whole`; it stops sending at `stops` if that comes first
+    /// and then never answers; otherwise it answers at `whole` with `record`
+    /// (`None`: it fails then, having sent nothing).
+    #[derive(Clone, Copy)]
+    struct Peer {
+        whole: Duration,
+        stops: Duration,
+        record: Option<&'static str>,
+    }
+
+    impl Peer {
+        fn sends(whole: Duration, record: &'static str) -> Self {
+            Self {
+                whole,
+                stops: NEVER,
+                record: Some(record),
+            }
+        }
+
+        fn fails(after: Duration) -> Self {
+            Self {
+                whole: after,
+                stops: Duration::ZERO,
+                record: None,
+            }
+        }
+
+        fn stalls() -> Self {
+            Self {
+                whole: NEVER,
+                stops: Duration::ZERO,
+                record: None,
+            }
+        }
+    }
+
+    const RECORD_BYTES: u64 = 4_000_000;
+
+    /// Races `peer` (`None`: no reader has the record) against node reads
+    /// that take `node` each, with a reader offering the record to a waiting
+    /// read after `offer`, if given. The reader asked a second time is
+    /// `second`.
+    async fn race(
+        peer: Option<Peer>,
+        second: Option<Peer>,
+        node: Duration,
+        offer: Option<Duration>,
+    ) -> Raced {
+        race_with_patience(peer, second, node, offer, HEAD_START * 2).await
+    }
+
+    /// [`race`], with a reader on pace kept for `patience` at most.
+    async fn race_with_patience(
+        peer: Option<Peer>,
+        second: Option<Peer>,
+        node: Duration,
+        offer: Option<Duration>,
+        patience: Duration,
+    ) -> Raced {
+        race_against_nodes(peer, second, (node, true), offer, patience).await
+    }
+
+    /// [`race_with_patience`], with node reads that each end after `node`
+    /// with the record, or failing if `nodes_have` is false.
+    async fn race_against_nodes(
+        peer: Option<Peer>,
+        second: Option<Peer>,
+        (node, nodes_have): (Duration, bool),
+        offer: Option<Duration>,
+        patience: Duration,
+    ) -> Raced {
+        let started = tokio::time::Instant::now();
+        let asks = std::cell::Cell::new(0usize);
+        let node_reads = std::cell::Cell::new(0usize);
+        let turned_at = std::cell::Cell::new(None);
+        let node_missed = std::cell::Cell::new(false);
+        let pace = crate::swarm::Pace::default();
+        let source = beside_peers(
+            || {
+                let answer = if asks.get() == 0 { peer } else { second };
+                asks.set(asks.get() + 1);
+                let pace = &pace;
+                async move {
+                    let peer = answer?;
+                    pace.note(0, 0);
+                    let step = Duration::from_millis(50);
+                    let mut at = Duration::ZERO;
+                    while at < peer.whole {
+                        if at >= peer.stops {
+                            if peer.record.is_some() {
+                                futures::future::pending::<()>().await;
+                            }
+                            tokio::time::sleep(peer.whole - at).await;
+                            return None;
+                        }
+                        let next = (at + step).min(peer.whole).min(peer.stops.max(at + step));
+                        tokio::time::sleep(next - at).await;
+                        at = next;
+                        let sent = u128::from(RECORD_BYTES) * at.as_millis()
+                            / peer.whole.as_millis().max(1);
+                        pace.note(
+                            u64::try_from(sent)
+                                .unwrap_or(RECORD_BYTES)
+                                .min(RECORD_BYTES),
+                            RECORD_BYTES,
+                        );
+                    }
+                    peer.record
+                        .map(|record| Bytes::from_static(record.as_bytes()))
+                }
+            },
+            &pace,
+            || {
+                node_reads.set(node_reads.get() + 1);
+                async move {
+                    tokio::time::sleep(node).await;
+                    if nodes_have {
+                        Ok("from nodes")
+                    } else {
+                        Err(Error::Network("the nodes are busy".into()))
+                    }
+                }
+            },
+            (HEAD_START, patience),
+            async move {
+                match offer {
+                    Some(after) => tokio::time::sleep(after).await,
+                    None => futures::future::pending::<()>().await,
+                }
+            },
+            || turned_at.set(Some(started.elapsed())),
+            |result| {
+                let found = result.is_ok();
+                if !found {
+                    node_missed.set(true);
+                }
+                found
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("the race failed: {error}"));
+        Raced {
+            source,
+            took: started.elapsed(),
+            node_reads: node_reads.get(),
+            turned_at: turned_at.get(),
+            node_missed: node_missed.get(),
+        }
+    }
+
+    const HEAD_START: Duration = Duration::from_secs(3);
+    const NODE_READ: Duration = Duration::from_secs(1);
+    /// Longer than any read here: a reader that never finishes in time.
+    const NEVER: Duration = Duration::from_secs(3600);
+
+    fn from_a_reader() -> Source<&'static str> {
+        Source::Peer(Bytes::from_static(b"from a reader"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_that_has_the_record_spares_the_nodes() {
+        let quick = Duration::from_millis(400);
+        let raced = race(
+            Some(Peer::sends(quick, "from a reader")),
+            None,
+            NODE_READ,
+            None,
+        )
+        .await;
+        assert_eq!(raced.source, from_a_reader());
+        assert_eq!(raced.took, quick);
+        assert_eq!(raced.node_reads, 0);
+        assert_eq!(raced.turned_at, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_that_sends_nothing_delays_a_read_by_the_head_start_at_most() {
+        let raced = race(Some(Peer::stalls()), None, NODE_READ, None).await;
+        assert_eq!(raced.source, Source::Nodes("from nodes"));
+        assert_eq!(raced.took, HEAD_START + NODE_READ);
+        assert_eq!(raced.node_reads, 1);
+        assert_eq!(raced.turned_at, Some(HEAD_START));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_reader_turns_the_read_to_the_nodes_at_once() {
+        let failed = Duration::from_millis(250);
+        let raced = race(Some(Peer::fails(failed)), None, NODE_READ, None).await;
+        assert_eq!(raced.source, Source::Nodes("from nodes"));
+        assert_eq!(raced.took, failed + NODE_READ);
+        assert_eq!(raced.turned_at, Some(failed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_too_slow_at_the_head_start_loses_the_race() {
+        // A third of the record by the head start: the rest would take
+        // twice as long again, so the nodes are asked then, and answer first.
+        let raced = race(
+            Some(Peer::sends(HEAD_START * 3, "late")),
+            None,
+            NODE_READ,
+            None,
+        )
+        .await;
+        assert_eq!(raced.source, Source::Nodes("from nodes"));
+        assert_eq!(raced.took, HEAD_START + NODE_READ);
+        assert_eq!(raced.turned_at, Some(HEAD_START));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_on_pace_at_the_head_start_keeps_the_read() {
+        // Five sixths of the record by the head start: the rest comes in
+        // well under another, and no node is asked.
+        let whole = HEAD_START + Duration::from_millis(600);
+        let raced = race(
+            Some(Peer::sends(whole, "from a reader")),
+            None,
+            NODE_READ,
+            None,
+        )
+        .await;
+        assert_eq!(raced.source, from_a_reader());
+        assert_eq!(raced.took, whole);
+        assert_eq!(raced.node_reads, 0);
+        assert_eq!(raced.turned_at, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_on_pace_keeps_the_read_for_the_patience_at_most() {
+        // On pace to finish just inside the patience, then nothing for the
+        // last few pieces: the nodes are asked when the patience is up.
+        let patience = HEAD_START * 2;
+        let whole = patience - Duration::from_millis(100);
+        let stuck = Peer {
+            whole,
+            stops: whole - Duration::from_millis(50),
+            record: Some("never sent"),
+        };
+        let raced = race(Some(stuck), None, NODE_READ, None).await;
+        assert_eq!(raced.source, Source::Nodes("from nodes"));
+        assert_eq!(raced.turned_at, Some(patience));
+        assert_eq!(raced.took, patience + NODE_READ);
+        assert_eq!(raced.node_reads, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_falling_behind_the_nodes_gives_up_the_read_early() {
+        // Nine tenths of a record that would be whole at 5 s, then nothing:
+        // by 5.6 s its average rate can no longer finish within the patience.
+        let whole = Duration::from_secs(5);
+        let behind = Peer {
+            whole,
+            stops: whole * 9 / 10,
+            record: Some("never sent"),
+        };
+        let raced = race(Some(behind), None, NODE_READ, None).await;
+        assert_eq!(raced.source, Source::Nodes("from nodes"));
+        let turned = raced.turned_at.unwrap_or(Duration::MAX);
+        assert!(turned > whole && turned < HEAD_START * 2, "{turned:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_beating_busy_nodes_keeps_the_read() {
+        // The nodes take 10 s a record now: a reader that sends one in 8 s
+        // keeps the read, and no node is asked.
+        let busy = Duration::from_secs(10);
+        let whole = Duration::from_secs(8);
+        let raced = race_with_patience(
+            Some(Peer::sends(whole, "from a reader")),
+            None,
+            busy,
+            None,
+            busy,
+        )
+        .await;
+        assert_eq!(raced.source, from_a_reader());
+        assert_eq!(raced.took, whole);
+        assert_eq!(raced.node_reads, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_page_frozen_past_the_head_start_does_not_stretch_the_window() {
+        // Right after the ask, the page stalls for 5 s (every timer fires
+        // late), and the reader looks on pace but sends nothing more: the
+        // nodes are asked when the patience from the ask is up, at 6 s, not a
+        // fresh window after the late head start.
+        let started = tokio::time::Instant::now();
+        let pace = crate::swarm::Pace::default();
+        let turned_at = std::cell::Cell::new(None);
+        let source = beside_peers(
+            || {
+                let pace = &pace;
+                async move {
+                    pace.note(RECORD_BYTES * 95 / 100, RECORD_BYTES);
+                    tokio::time::advance(HEAD_START + Duration::from_secs(2)).await;
+                    futures::future::pending::<Option<Bytes>>().await
+                }
+            },
+            &pace,
+            || async move {
+                tokio::time::sleep(NODE_READ).await;
+                Ok("from nodes")
+            },
+            (HEAD_START, HEAD_START * 2),
+            futures::future::pending::<()>(),
+            || turned_at.set(Some(started.elapsed())),
+            Result::is_ok,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("the race failed: {error}"));
+        assert_eq!(source, Source::Nodes("from nodes"));
+        let turned = turned_at.get().unwrap_or(Duration::MAX);
+        assert!(turned <= HEAD_START * 2 + PACE_POLL, "{turned:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nodes_that_fail_leave_a_reader_still_sending_to_finish() {
+        // A reader too slow to keep the read (whole at 8 s, past the 6 s
+        // patience) has the nodes asked at the head start; they refuse at
+        // 4 s, and the reader's record, still coming, is the read's.
+        let whole = Duration::from_secs(8);
+        let raced = race_against_nodes(
+            Some(Peer::sends(whole, "from a reader")),
+            None,
+            (NODE_READ, false),
+            None,
+            HEAD_START * 2,
+        )
+        .await;
+        assert_eq!(raced.source, from_a_reader());
+        assert_eq!(raced.took, whole);
+        assert_eq!(raced.node_reads, 1);
+        assert_eq!(raced.turned_at, Some(HEAD_START));
+        // The nodes' miss is told, for the node limiter.
+        assert!(raced.node_missed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_read_whose_nodes_fail_takes_the_record_still_coming() {
+        // The node read waits its turn and then fails at 8 s; a reader that
+        // offered at 2 s sends the record by 12 s.
+        let offered = Duration::from_secs(2);
+        let slow = Duration::from_secs(10);
+        let raced = race_against_nodes(
+            None,
+            Some(Peer::sends(slow, "from a reader")),
+            (Duration::from_secs(8), false),
+            Some(offered),
+            HEAD_START * 2,
+        )
+        .await;
+        assert_eq!(raced.source, from_a_reader());
+        assert_eq!(raced.took, offered + slow);
+        assert_eq!(raced.node_reads, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_nodes_answer_stands_when_the_reader_fails_too() {
+        // The nodes refuse at 4 s and the reader fails at 5 s: the read
+        // fails with the nodes' answer once the reader has.
+        let started = tokio::time::Instant::now();
+        let result = beside_peers(
+            || async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                None
+            },
+            &crate::swarm::Pace::default(),
+            || async {
+                tokio::time::sleep(NODE_READ).await;
+                Err::<&'static str, _>(Error::Network("the nodes are busy".into()))
+            },
+            (HEAD_START, HEAD_START * 2),
+            futures::future::pending::<()>(),
+            || {},
+            Result::is_ok,
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(Error::Network(message)) if message == "the nodes are busy"),
+            "{result:?}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_read_takes_a_record_a_reader_offers_meanwhile() {
+        // Nobody has it at first; the node read waits its turn (8 s here); a
+        // reader offers it after 2 s and sends it in half a second.
+        let offered = Duration::from_secs(2);
+        let quick = Duration::from_millis(500);
+        let raced = race(
+            None,
+            Some(Peer::sends(quick, "from a reader")),
+            Duration::from_secs(8),
+            Some(offered),
+        )
+        .await;
+        assert_eq!(raced.source, from_a_reader());
+        assert_eq!(raced.took, offered + quick);
+        assert_eq!(raced.node_reads, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_read_keeps_its_place_while_a_reader_fails() {
+        // The reader that offered fails after 5 s; the node read, which never
+        // gave up its turn, answers at 4 s as it would have anyway.
+        let node = Duration::from_secs(4);
+        let raced = race(
+            None,
+            Some(Peer::fails(Duration::from_secs(5))),
+            node,
+            Some(Duration::from_secs(1)),
+        )
+        .await;
+        assert_eq!(raced.source, Source::Nodes("from nodes"));
+        assert_eq!(raced.took, node);
+        assert_eq!(raced.node_reads, 1);
+    }
 
     #[cfg(feature = "native")]
     #[test]

@@ -2,3 +2,12 @@
 members = ["ant-core", "ant-cli"]
 resolver = "2"
 
+# The swarm's wire types (ant-protocol #50), the send on one named channel
+# (saorsa-core #183), the plain STUN answers (saorsa-transport #231) and the
+# rendezvous on every node (ant-node #262) are on these branches until they
+# merge.
+[patch.crates-io]
+ant-protocol = { git = "https://github.com/grumbach/ant-protocol", branch = "feat/peer-swarm" }
+saorsa-core = { git = "https://github.com/grumbach/saorsa-core", branch = "feat/peer-swarm" }
+saorsa-transport = { git = "https://github.com/grumbach/saorsa-transport", branch = "feat/peer-swarm" }
+ant-node = { git = "https://github.com/grumbach/ant-node", branch = "feat/peer-swarm" }
