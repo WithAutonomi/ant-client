@@ -62,7 +62,7 @@ pub use client::pointer::{
 pub use self_encryption::DataMap;
 
 // What a client shared with other clients reading the same files.
-pub use crate::swarm::{DiscoveryStats, RoomStats, SwarmStats};
+pub use crate::swarm::{DiscoveryStats, OpenLinkPeer, RoomStats, SwarmStats};
 
 // File manifests and `ant://` links (ADR-0006).
 #[cfg(feature = "native")]

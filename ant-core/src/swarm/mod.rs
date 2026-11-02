@@ -369,6 +369,29 @@ pub struct RoomStats {
     /// once its peer's proof checks out, so a page can tell a proven link's
     /// connection from one that merely carries a readers' channel.
     pub open_links: Vec<String>,
+    /// The peer at the other end of each of those links: two links to one
+    /// peer (while the client settles on one of them) name the same peer, so
+    /// a page counts and draws it once.
+    pub open_link_peers: Vec<OpenLinkPeer>,
+}
+
+/// One open link of a room and the peer it reaches, as a page tells them
+/// apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenLinkPeer {
+    /// This client's DTLS fingerprint on the link's connection, as in
+    /// [`RoomStats::open_links`].
+    pub fingerprint: String,
+    /// The peer, by a name that holds in this room only: a hash of the name
+    /// it uses in the room, which is its own in each room, so the same client
+    /// met in two rooms has two unrelated names here as well.
+    pub peer: String,
+}
+
+/// The name [`OpenLinkPeer`] gives a peer whose name in the room is `nonce`.
+fn page_peer_name(nonce: &[u8; 16]) -> String {
+    let hash = blake3::derive_key("ant-swarm page peer name v1", nonce);
+    hex::encode(hash.first_chunk::<8>().copied().unwrap_or_default())
 }
 
 /// A one-way stop signal tasks can wait on.
@@ -1210,12 +1233,15 @@ impl Swarm {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         // One lock at a time: rooms, then links.
         let rooms: Vec<Arc<Room>> = self.inner.rooms().iter().cloned().collect();
-        let links: Vec<(RoomKey, String)> = self
+        let links: Vec<(RoomKey, String, Option<String>)> = self
             .inner
             .links()
             .iter()
             .filter(|link| link.is_open())
-            .map(|link| (link.room, link.fingerprint.clone()))
+            .map(|link| {
+                let peer = link.peer_nonce().map(|nonce| page_peer_name(&nonce));
+                (link.room, link.fingerprint.clone(), peer)
+            })
             .collect();
         rooms
             .iter()
@@ -1228,11 +1254,21 @@ impl Swarm {
                     records_rejected: load(&counters.records_rejected),
                     records_served: load(&counters.records_served),
                     bytes_served: load(&counters.bytes_served),
-                    links: links.iter().filter(|(key, _)| *key == room.key).count() as u64,
+                    links: links.iter().filter(|(key, ..)| *key == room.key).count() as u64,
                     open_links: links
                         .iter()
-                        .filter(|(key, _)| *key == room.key)
-                        .map(|(_, fingerprint)| fingerprint.clone())
+                        .filter(|(key, ..)| *key == room.key)
+                        .map(|(_, fingerprint, _)| fingerprint.clone())
+                        .collect(),
+                    open_link_peers: links
+                        .iter()
+                        .filter(|(key, ..)| *key == room.key)
+                        .filter_map(|(_, fingerprint, peer)| {
+                            Some(OpenLinkPeer {
+                                fingerprint: fingerprint.clone(),
+                                peer: peer.clone()?,
+                            })
+                        })
                         .collect(),
                 }
             })

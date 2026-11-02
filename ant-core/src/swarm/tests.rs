@@ -1311,6 +1311,57 @@ async fn a_room_names_its_open_links_by_fingerprint_once_proven() {
     );
 }
 
+#[tokio::test]
+async fn a_rooms_open_links_name_their_peers_for_the_page() {
+    let rtc = SharedMemoryRtc::default();
+    let alice = client(&rtc);
+    let room = joined(&alice);
+    let names = || {
+        alice
+            .room_stats()
+            .first()
+            .map(|room| {
+                room.open_link_peers
+                    .iter()
+                    .map(|link| link.peer.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    // Member 3 on one link.
+    let first = unproven(&rtc, &alice, &room).await;
+    send(&first, hello_from(3)).await;
+    send(&first, offerer_proof(&room.secret)).await;
+    eventually("the link opens", || alice.stats().links == 1).await;
+    let named = names();
+    assert_eq!(named.len(), 1);
+    let peer = named.first().cloned().unwrap_or_default();
+    // A name of the page's own: 16 hex digits, not the member's name in the
+    // room.
+    assert_eq!(peer.len(), 16);
+    let in_room = room::name_of(member(3).public());
+    assert_ne!(
+        peer,
+        hex::encode(in_room.first_chunk::<8>().copied().unwrap_or_default())
+    );
+    // Member 3 again, on a second link: the same peer.
+    let second = unproven(&rtc, &alice, &room).await;
+    send(&second, hello_from(3)).await;
+    send(&second, offerer_proof(&room.secret)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let again = names();
+    assert!(!again.is_empty());
+    assert!(again.iter().all(|name| *name == peer), "{again:?}");
+    // Member 4: another peer.
+    let third = unproven(&rtc, &alice, &room).await;
+    send(&third, hello_from(4)).await;
+    send(&third, proof_from(4, &room.secret, &[1; 16], true)).await;
+    eventually("member 4's link opens", || {
+        names().iter().any(|name| *name != peer)
+    })
+    .await;
+}
+
 #[test]
 fn a_public_file_room_is_its_address() {
     // An empty map is no file's, and has no room.
