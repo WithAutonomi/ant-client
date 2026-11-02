@@ -147,6 +147,7 @@ mod tests {
             data_dir: PathBuf::from("/data/node-7"),
             log_dir: Some(PathBuf::from("/logs/node-7")),
             node_port: None,
+            webrtc_port: None,
             binary_path: PathBuf::from("/bin/antnode"),
             version: "0.17.2-beta.1".to_string(),
             env_variables: HashMap::new(),

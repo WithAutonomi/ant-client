@@ -109,11 +109,21 @@ Re-run `ant node daemon info --json` and update the saved `api_base` URL (the po
 **Step 6.1 — Add nodes:**
 
 ```
-ant node add --rewards-address 0x03B770D9cD32077cC0bF330c13C114a87643B124 --count 3 --bootstrap <bootstrap-address> --evm-network arbitrum-sepolia --json
+ant node add --rewards-address 0x03B770D9cD32077cC0bF330c13C114a87643B124 --count 3 --bootstrap <bootstrap-address> --evm-network arbitrum-sepolia --webrtc-port 24600-24602 --json
 ```
 
-Verify the JSON response shows 3 nodes were added (the `nodes_added` array has 3 entries) and
-that each node reports `"evm_network": "arbitrum_sepolia"`.
+Verify the JSON response shows 3 nodes were added (the `nodes_added` array has 3 entries), that
+each node reports `"evm_network": "arbitrum_sepolia"`, and that the nodes report `webrtc_port`
+24600, 24601 and 24602 in order.
+
+**Step 6.1b — Reject a port used twice:**
+
+```
+ant node add --rewards-address 0x03B770D9cD32077cC0bF330c13C114a87643B124 --count 2 --node-port 24700-24701 --webrtc-port 24701-24702 --json
+```
+
+Verify the command fails with an error naming port 24701 as both a node port and a WebRTC port,
+and that `ant node status --json` still lists only the 3 nodes from Step 6.1.
 
 **Step 6.2 — Start all nodes:**
 
@@ -134,6 +144,10 @@ ant node status --json
 
 Verify: `nodes` array has 3 entries and all are `running`. For each running node, verify that `pid`
 is present and is a number, and `uptime_secs` is present and is a number.
+
+Verify each node's browser listener took its fixed port: `lsof -nP -iUDP:24600 -iUDP:24601 -iUDP:24602`
+(or `ss -uanp` on Linux) shows each port held by one of the node PIDs. A node binary that rejected
+`--webrtc-direct-port` would have failed to start above.
 
 **Step 6.4 — Stop a single node:**
 

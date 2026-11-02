@@ -9,7 +9,7 @@ pub mod process;
 pub mod registry;
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config;
@@ -49,8 +49,8 @@ pub async fn add_nodes(
         });
     }
 
-    // Validate port ranges match count
-    if let Some(ref port_range) = opts.node_port {
+    // Validate port ranges match count, and that no port is used twice
+    for port_range in [&opts.node_port, &opts.webrtc_port].into_iter().flatten() {
         let range_len = port_range.len();
         if range_len != 1 && range_len != opts.count {
             return Err(Error::PortRangeMismatch {
@@ -59,6 +59,7 @@ pub async fn add_nodes(
             });
         }
     }
+    validate_distinct_ports(&opts)?;
 
     // Resolve the binary (downloads to cache if needed)
     let install_dir = binary::binary_install_dir()?;
@@ -84,6 +85,7 @@ pub async fn add_nodes(
 
     for i in 0..opts.count {
         let node_port = resolve_port(&opts.node_port, i, opts.count);
+        let webrtc_port = resolve_port(&opts.webrtc_port, i, opts.count);
 
         // We use a placeholder ID (0) here; the registry will assign the real one
         let placeholder_id = 0;
@@ -98,6 +100,7 @@ pub async fn add_nodes(
             data_dir,
             log_dir,
             node_port,
+            webrtc_port,
             binary_path: PathBuf::new(), // placeholder, updated below
             version: version.clone(),
             env_variables: env_map.clone(),
@@ -286,6 +289,23 @@ fn resolve_port(range: &Option<types::PortRange>, index: u16, _count: u16) -> Op
     range.as_ref().and_then(|r| r.port_at(index))
 }
 
+/// Reject a port assigned both as a node's QUIC port and as a WebRTC port. Both listen on UDP, so
+/// whichever listener binds it second would fail when its node starts.
+fn validate_distinct_ports(opts: &AddNodeOpts) -> Result<()> {
+    let node_ports: HashSet<u16> = (0..opts.count)
+        .filter_map(|i| resolve_port(&opts.node_port, i, opts.count))
+        .collect();
+    match (0..opts.count)
+        .filter_map(|i| resolve_port(&opts.webrtc_port, i, opts.count))
+        .find(|port| node_ports.contains(port))
+    {
+        Some(port) => Err(Error::InvalidPortRange(format!(
+            "port {port} is assigned both as a node port and as a WebRTC port"
+        ))),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +414,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_multiple_nodes_with_webrtc_port_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = create_fake_binary(tmp.path());
+        let reg_path = test_registry_path(tmp.path());
+
+        let opts = AddNodeOpts {
+            count: 3,
+            rewards_address: TEST_ADDR.to_string(),
+            node_port: Some(PortRange::Range(12000, 12002)),
+            webrtc_port: Some(PortRange::Range(13000, 13002)),
+            data_dir_path: Some(tmp.path().join("data")),
+            binary_source: BinarySource::LocalPath(binary),
+            ..Default::default()
+        };
+
+        let result = add_nodes(opts, &reg_path, &NoopProgress).await.unwrap();
+        let ports: Vec<_> = result
+            .nodes_added
+            .iter()
+            .map(|node| (node.node_port, node.webrtc_port))
+            .collect();
+        assert_eq!(
+            ports,
+            vec![
+                (Some(12000), Some(13000)),
+                (Some(12001), Some(13001)),
+                (Some(12002), Some(13002)),
+            ]
+        );
+
+        // The port survives the registry round trip the daemon starts nodes from.
+        let reg = NodeRegistry::load(&reg_path).unwrap();
+        assert_eq!(reg.get(1).unwrap().webrtc_port, Some(13000));
+    }
+
+    #[tokio::test]
+    async fn add_nodes_rejects_webrtc_port_range_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = create_fake_binary(tmp.path());
+        let reg_path = test_registry_path(tmp.path());
+
+        let opts = AddNodeOpts {
+            count: 3,
+            rewards_address: TEST_ADDR.to_string(),
+            webrtc_port: Some(PortRange::Range(13000, 13001)), // 2 ports, 3 nodes
+            binary_source: BinarySource::LocalPath(binary),
+            ..Default::default()
+        };
+
+        let result = add_nodes(opts, &reg_path, &NoopProgress).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::PortRangeMismatch {
+                range_len: 2,
+                count: 3
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_nodes_rejects_a_port_used_as_both_node_and_webrtc_port() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = create_fake_binary(tmp.path());
+        let reg_path = test_registry_path(tmp.path());
+
+        let opts = AddNodeOpts {
+            count: 3,
+            rewards_address: TEST_ADDR.to_string(),
+            node_port: Some(PortRange::Range(12000, 12002)),
+            webrtc_port: Some(PortRange::Range(12002, 12004)),
+            binary_source: BinarySource::LocalPath(binary),
+            ..Default::default()
+        };
+
+        let result = add_nodes(opts, &reg_path, &NoopProgress).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::InvalidPortRange(message) if message.starts_with("port 12002 ")
+        ));
+        // Nothing was registered.
+        assert_eq!(NodeRegistry::load(&reg_path).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn add_nodes_rejects_empty_rewards_address() {
         let tmp = tempfile::tempdir().unwrap();
         let reg_path = test_registry_path(tmp.path());
@@ -494,6 +598,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/test"),
             log_dir: None,
             node_port: None,
+            webrtc_port: None,
             binary_path: PathBuf::from("/usr/bin/antnode"),
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
@@ -579,6 +684,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/test1"),
             log_dir: None,
             node_port: None,
+            webrtc_port: None,
             binary_path: PathBuf::from("/usr/bin/antnode"),
             version: "0.110.0".to_string(),
             env_variables: HashMap::new(),
@@ -594,6 +700,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/test2"),
             log_dir: None,
             node_port: None,
+            webrtc_port: None,
             binary_path: PathBuf::from("/usr/bin/antnode"),
             version: "0.110.0".to_string(),
             env_variables: HashMap::new(),
@@ -640,6 +747,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/test-evicted"),
             log_dir: None,
             node_port: None,
+            webrtc_port: None,
             binary_path: PathBuf::from("/usr/bin/antnode"),
             version: "0.110.0".to_string(),
             env_variables: HashMap::new(),

@@ -555,6 +555,7 @@ If the daemon is running, the command routes through its REST API. Otherwise, it
 | `--rewards-address <ADDR>` | Required. EVM wallet address for node earnings. |
 | `--count <N>` | Number of nodes to add (default: 1). |
 | `--node-port <PORT\|RANGE>` | Port or range (e.g., `12000` or `12000-12004`). |
+| `--webrtc-port <PORT\|RANGE>` | UDP port or range for the browser (WebRTC Direct) listeners (e.g., `13000` or `13000-13004`), assigned like `--node-port`. Browsers reach a node only on this port, so forward it as well as `--node-port`. Without it each node picks a port at random. |
 | `--data-dir-path <PATH>` | Custom data directory prefix. |
 | `--log-dir-path <PATH>` | Custom log directory prefix. |
 | `--path <PATH>` | Path to a local `antnode` binary. |
