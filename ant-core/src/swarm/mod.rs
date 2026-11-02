@@ -1107,7 +1107,7 @@ impl Swarm {
     }
 
     /// How many fetches of this client's run now (see [`Self::fetching`]).
-    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(feature = "test-utils")]
     pub(crate) fn fetches_running(&self) -> usize {
         self.inner.reading.load(Ordering::Acquire)
     }
