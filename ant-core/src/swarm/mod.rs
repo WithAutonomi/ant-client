@@ -91,9 +91,9 @@ const MAX_LINKS_PER_ROOM: usize = 8;
 const MAX_LINKS: usize = 16;
 /// Records a client sends to other clients at once.
 const MAX_UPLOADS: usize = 4;
-/// Records a client sends at once while reads of its own are running: a
+/// Records a client sends at once while fetches of its own are running: a
 /// record sent costs the sender's CPU and line, which its own download needs
-/// first. A client done reading sends [`MAX_UPLOADS`].
+/// first. A client done fetching sends [`MAX_UPLOADS`].
 const UPLOADS_WHILE_READING: usize = 1;
 /// Offers a client answers at once, each until the node has taken its answer.
 const MAX_ANSWERS: usize = 8;
@@ -298,21 +298,22 @@ impl Drop for Upload {
     }
 }
 
-/// A read of this client's that other clients may serve, counted while it
-/// runs (see [`Swarm::reading`]).
+/// A fetch of this client's, counted while it runs (see
+/// [`Swarm::fetching`]).
 pub(crate) struct Reading {
     reading: Arc<AtomicUsize>,
-    /// The swarm, whose rooms holding `address` count as read while the
-    /// read runs, and the record read.
-    inner: Weak<Inner>,
-    address: XorName,
+    /// For a read of a file's data record, the swarm, whose rooms holding
+    /// the record count as read while the read runs, and the record read.
+    room: Option<(Weak<Inner>, XorName)>,
 }
 
 impl Drop for Reading {
     fn drop(&mut self) {
         self.reading.fetch_sub(1, Ordering::AcqRel);
-        if let Some(inner) = self.inner.upgrade() {
-            inner.end_read(&self.address);
+        if let Some((inner, address)) = &self.room {
+            if let Some(inner) = inner.upgrade() {
+                inner.end_read(address);
+            }
         }
     }
 }
@@ -614,7 +615,7 @@ pub(crate) struct Inner {
     leaving: Arc<Semaphore>,
     /// Records being sent to other clients now.
     uploads: Arc<AtomicUsize>,
-    /// This client's reads running now that other clients may serve.
+    /// This client's own fetches running now (see [`Swarm::fetching`]).
     reading: Arc<AtomicUsize>,
     /// The records those reads are reading, and how many reads each: a room
     /// joined meanwhile counts as read by those of its file's records too.
@@ -1073,18 +1074,23 @@ impl Swarm {
         None
     }
 
-    /// Counts a read of `address` as running until the guard goes: while any
-    /// read of this client's runs, it sends other clients one record at a
-    /// time; and a room whose file holds `address` counts as read the whole
-    /// time, so a read waiting at busy nodes never loses its room to another
-    /// file's (see [`room_to_leave`]).
-    pub(crate) fn reading(&self, address: &XorName) -> Reading {
+    /// Counts a fetch of `address` by this client as running until the guard
+    /// goes. While any fetch of this client's runs, whatever it is for (a
+    /// file's records or its map, a raw read or an existence check), it sends
+    /// other clients one record at a time: its own fetch needs its CPU and
+    /// line first. With `shares`, a read of a file's data record, a room
+    /// whose file holds `address` also counts as read the whole time, so a
+    /// read waiting at busy nodes never loses its room to another file's
+    /// (see [`room_to_leave`]).
+    pub(crate) fn fetching(&self, address: &XorName, shares: bool) -> Reading {
         self.inner.reading.fetch_add(1, Ordering::AcqRel);
-        self.inner.begin_read(address);
+        let room = shares.then(|| {
+            self.inner.begin_read(address);
+            (Arc::downgrade(&self.inner), *address)
+        });
         Reading {
             reading: Arc::clone(&self.inner.reading),
-            inner: Arc::downgrade(&self.inner),
-            address: *address,
+            room,
         }
     }
 
@@ -1230,7 +1236,7 @@ impl Swarm {
 
 impl Inner {
     /// A place to send a record now, or `None`: [`MAX_UPLOADS`] at once, and
-    /// [`UPLOADS_WHILE_READING`] while reads of this client's own run, taken
+    /// [`UPLOADS_WHILE_READING`] while fetches of this client's own run, taken
     /// in one step so two links never both take the last. Sends already
     /// running when a read starts finish.
     fn start_upload(&self) -> Option<Upload> {

@@ -895,7 +895,7 @@ async fn a_peer_still_reading_sends_one_record_at_a_time() {
         alice.seed(*address, content.clone());
     }
     // A read of Alice's own runs: her download keeps her CPU and line.
-    let reading = alice.reading(&[0; 32]);
+    let reading = alice.fetching(&[0; 32], true);
     for (id, (address, _)) in (0u32..).zip(&records) {
         send(
             &asker,
@@ -968,7 +968,7 @@ async fn a_peer_still_reading_sends_one_record_at_a_time_across_its_links() {
     for (address, content) in &records {
         alice.seed(*address, content.clone());
     }
-    let _reading = alice.reading(&[0; 32]);
+    let _reading = alice.fetching(&[0; 32], true);
     // One ask on each link, at once.
     for (peer, (address, _)) in [&first, &second].into_iter().zip(&records) {
         send(
@@ -1895,13 +1895,48 @@ async fn a_read_counts_its_rooms_as_read_while_it_runs() {
         .first()
         .cloned()
         .unwrap_or_else(|| panic!("a room"));
-    let reading = alice.reading(&address);
+    let reading = alice.fetching(&address, true);
     assert_eq!(
         room.unread_for(crate::runtime::Clock::now() + ROOM_TURNOVER * 2),
         Duration::ZERO
     );
     drop(reading);
     assert!(room.unread_for(crate::runtime::Clock::now() + ROOM_TURNOVER * 2) >= ROOM_TURNOVER);
+}
+
+#[tokio::test]
+async fn every_fetch_holds_sends_to_one_but_only_a_files_read_holds_its_room() {
+    let rtc = SharedMemoryRtc::default();
+    let alice = client(&rtc);
+    let (address, _) = record(4, 100);
+    knows(&[&alice], &[address]);
+    let room = joined(&alice);
+    let later = || crate::runtime::Clock::now() + ROOM_TURNOVER * 2;
+    // A fetch that shares nothing (a file's map, a raw read, an existence
+    // check): one send at a time while it runs, and no room counts as read.
+    let fetch = alice.fetching(&address, false);
+    let first = alice.inner.start_upload();
+    assert!(first.is_some());
+    assert!(alice.inner.start_upload().is_none());
+    assert!(room.unread_for(later()) >= ROOM_TURNOVER);
+    assert!(alice.inner.active_reads().is_empty());
+    drop(first);
+    drop(fetch);
+    // Nothing fetched: as many sends as any client makes.
+    let sends: Vec<_> = (0..=MAX_UPLOADS)
+        .filter_map(|_| alice.inner.start_upload())
+        .collect();
+    assert_eq!(sends.len(), MAX_UPLOADS);
+    drop(sends);
+    // A read of the file's data record holds its room as well.
+    let read = alice.fetching(&address, true);
+    assert_eq!(room.unread_for(later()), Duration::ZERO);
+    let first = alice.inner.start_upload();
+    assert!(first.is_some());
+    assert!(alice.inner.start_upload().is_none());
+    drop(first);
+    drop(read);
+    assert!(room.unread_for(later()) >= ROOM_TURNOVER);
 }
 
 #[tokio::test]
@@ -1912,7 +1947,7 @@ async fn a_room_joined_while_its_file_is_read_counts_that_read() {
     let (address, _) = record(4, 100);
     // A read of a record of a file whose room is not joined yet (it waited
     // for a room to make way, say).
-    let reading = alice.reading(&address);
+    let reading = alice.fetching(&address, true);
     let room = Room::new(LATER, 1, [6; 32]).unwrap_or_else(|| panic!("a room"));
     // Admitted as a join admits it.
     let _ = alice.inner.admit(

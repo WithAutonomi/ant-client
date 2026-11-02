@@ -1310,10 +1310,10 @@ impl Client {
             self.chunk_cache().remove(address);
         }
 
-        // A file's read, whether it asks peers or only nodes, counts while it
-        // runs: the client then sends other readers less, and the file's
-        // room stays joined however long the nodes take.
-        let _reading = shares.then(|| self.swarm().reading(address));
+        // Every fetch counts while it runs, so the client sends other readers
+        // less meanwhile; a file's read, whether it asks peers or only nodes,
+        // also keeps the file's room joined however long the nodes take.
+        let _fetching = self.swarm().fetching(address, shares);
         #[cfg(feature = "native")]
         let observation = diag.map(|_| std::sync::Mutex::new(ReadObservation::default()));
         // Peer GETs this call dispatched, across its early, ordinary and retry

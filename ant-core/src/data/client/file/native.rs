@@ -3199,7 +3199,7 @@ impl Client {
 
         let chunk_content = if let Some(peer_reports) = context.peer_reports {
             // A file's read, as every other: counted while it runs.
-            let reading = self.swarm().reading(&addr);
+            let reading = self.swarm().fetching(&addr, true);
             let fetched = self
                 .chunk_get_from_closest_peer_group(&addr, context.peer_count)
                 .await;
