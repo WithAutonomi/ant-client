@@ -33,6 +33,46 @@ const SIGNED_PEER_SEQUENCE: u64 = 1;
 /// Reliability a lookup reply reports for a mock node.
 const SIGNED_PEER_RELIABILITY: f64 = 1.0;
 
+/// Two discovery dials, as a swarm room's lookups make them, then a read's
+/// dial 50 ms later, where connections take turns to gather ICE. Returns
+/// when, in ms from the start, the read's connection and the second
+/// discovery dial were made, and the read's error if it had one.
+#[wasm_bindgen]
+pub async fn test_discovery_dials_then_read(endpoints: JsValue) -> JsValue {
+    let endpoints: Vec<String> = serde_wasm_bindgen::from_value(endpoints).unwrap();
+    let [first, second, read]: [String; 3] = endpoints.try_into().unwrap();
+    let endpoint = |multiaddr: String| BrowserEndpoint { multiaddr };
+    let (first, second, read) = (endpoint(first), endpoint(second), endpoint(read));
+    let core = BrowserNetworkCore::new(vec![first.clone()]).unwrap();
+    let pool = Rc::clone(&core.pool);
+    let started = web_time::Instant::now();
+    let since = move || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let discovery = |endpoint: BrowserEndpoint| {
+        let pool = Rc::clone(&pool);
+        async move {
+            let _discovery = discovery_turn().await;
+            ice_gathering_turn_idle().await;
+            if let Ok(client) = pool.client(&endpoint).await {
+                let _ = client.hello().await;
+            }
+            since()
+        }
+    };
+    let reading = async {
+        crate::runtime::sleep(Duration::from_millis(50)).await;
+        // A lease connects on its first request.
+        let error = match pool.client(&read).await {
+            Ok(client) => client.hello().await.err(),
+            Err(error) => Some(error),
+        };
+        (since(), error)
+    };
+    let (_, second_done, (read_done, read_error)) =
+        futures::future::join3(discovery(first), discovery(second), reading).await;
+    pool.close();
+    serde_wasm_bindgen::to_value(&(read_done, second_done, read_error)).unwrap()
+}
+
 /// Exercise bootstrap readiness after actual LRU pool eviction.
 #[wasm_bindgen]
 pub async fn test_bootstrap_eviction(endpoints: JsValue) -> Result<(), JsValue> {

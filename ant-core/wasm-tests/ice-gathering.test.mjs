@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { test_preconnect_pool } from "./pkg/ant_core.js";
+import { test_discovery_dials_then_read, test_preconnect_pool } from "./pkg/ant_core.js";
 import { asChromium, mockWebRtc } from "./mock-webrtc.mjs";
 
 // The transport passes the turn on after polling for completion every 10 ms,
@@ -57,3 +57,15 @@ test("in Chromium, concurrent dials gather ICE candidates at once", () => asChro
   const spread = spans.at(-1).start - spans[0].start;
   assert.ok(spread < gatheringMs, `gatherings started over ${spread.toFixed(1)} ms`);
 }));
+
+test("discovery dials never put two gatherings ahead of a read's connection", async () => {
+  // Gatherings never complete, so each turn lasts its timeout. The first
+  // discovery dial says hello long before its gathering ends; the second
+  // must not queue for the turn ahead of the read that arrives meanwhile.
+  const rtc = mockWebRtc(Array.from({ length: 3 }, () => ({})), { gatheringMs: Infinity });
+  const [readDone, secondDone, readError] = await test_discovery_dials_then_read(rtc.endpoints);
+  assert.equal(readError, undefined);
+  assert.equal(rtc.gathering.length, 3);
+  assert.ok(readDone < TURN_TIMEOUT_MS + 10 * TIMER_SLACK_MS, `the read connected after ${readDone} ms`);
+  assert.ok(readDone < secondDone, `the read connected at ${readDone} ms, the second discovery dial at ${secondDone} ms`);
+});

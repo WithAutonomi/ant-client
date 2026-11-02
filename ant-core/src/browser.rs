@@ -29,8 +29,8 @@ mod wasm_transport;
 /// The page's ICE gathering turn, shared by node and client connections.
 #[cfg(all(target_arch = "wasm32", feature = "browser-wasm"))]
 pub(crate) use wasm_transport::{
-    discovery_turn, ice_gathering_turn_after_reads, pass_ice_gathering_turn,
-    reads_not_waiting_to_gather,
+    discovery_turn, ice_gathering_turn_after_reads, ice_gathering_turn_idle,
+    pass_ice_gathering_turn,
 };
 
 /// A build with neither the native stack nor a browser takes no ICE
@@ -39,9 +39,9 @@ pub(crate) use wasm_transport::{
     feature = "native",
     all(target_arch = "wasm32", feature = "browser-wasm")
 )))]
-pub(crate) async fn reads_not_waiting_to_gather() {}
+pub(crate) async fn ice_gathering_turn_idle() {}
 
-/// As [`reads_not_waiting_to_gather`]: no turn to hold.
+/// As [`ice_gathering_turn_idle`]: no turn to hold.
 #[cfg(not(any(
     feature = "native",
     all(target_arch = "wasm32", feature = "browser-wasm")

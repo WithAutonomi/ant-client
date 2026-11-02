@@ -519,7 +519,7 @@ impl Room {
         // Its connections take the page's turns to gather ICE where the
         // browser makes them take turns: they start after the reads' own.
         #[cfg(not(feature = "native"))]
-        crate::browser::reads_not_waiting_to_gather().await;
+        crate::browser::ice_gathering_turn_idle().await;
         count(swarm, 1, |discovery| &discovery.lookups);
         let found = network
             .find_rendezvous_peers(&self.key, RENDEZVOUS_CANDIDATES)
@@ -1292,16 +1292,16 @@ async fn call(
 }
 
 /// Connects to `node` for a request if no open session has said hello: in the
-/// swarm's discovery turn where connections take turns to gather ICE, taken
-/// once no read's connection waits for one, and let go before the request
-/// waits on the node, as a room's lookup does.
+/// swarm's discovery turn where connections take turns to gather ICE, once
+/// the page's turn is idle (free, and no read's connection waiting for it),
+/// and let go before the request waits on the node, as a room's lookup does.
 #[cfg(not(feature = "native"))]
 async fn connect_in_turn(network: &Network, node: &Node) {
     if network.hosts_swarm(&node.0).is_some() {
         return;
     }
     let _turn = crate::browser::discovery_turn().await;
-    crate::browser::reads_not_waiting_to_gather().await;
+    crate::browser::ice_gathering_turn_idle().await;
     network.connect_for_swarm(&node.0, &node.1).await;
 }
 

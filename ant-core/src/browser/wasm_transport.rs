@@ -1831,15 +1831,17 @@ impl BrowserNetworkCore {
 
     /// A seed to start a swarm room's lookup from when no route is left:
     /// the first configured seed that answers, tried one at a time in the
-    /// swarm's discovery turn, once no read's connection waits to gather.
+    /// swarm's discovery turn, each once the page's ICE gathering turn is
+    /// idle (see [`ice_gathering_turn_idle`]).
     async fn room_seed_candidate(&self) -> Result<BrowserLookupCandidate, String> {
         let _discovery = discovery_turn().await;
-        reads_not_waiting_to_gather().await;
         let mut last = "no seed to start a swarm room's lookup from".to_string();
         for seed in &self.seeds {
             if self.pool.bootstrap_policy.check(&seed.multiaddr).is_err() {
                 continue;
             }
+            // Before each seed's dial: the last one may still be gathering.
+            ice_gathering_turn_idle().await;
             let attempt = async {
                 let client = self.pool.client(seed).await?;
                 let hello = client.hello().await?;
@@ -2156,15 +2158,16 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                         let endpoint = candidate.wire.webrtc_direct.as_ref().ok_or_else(|| {
                             "lookup candidate has no WebRTC Direct endpoint".to_string()
                         })?;
-                        // A swarm room's lookup connects only while no read's
-                        // connection waits for the page's ICE gathering turn,
-                        // one discovery dial at a time page-wide. A lease does
-                        // not connect; the session's hello does, so the turn
-                        // is held through it and let go before the lookup,
-                        // which waits on the control lane.
+                        // A swarm room's lookup connects only once the page's
+                        // ICE gathering turn is idle (free, and no read's
+                        // connection waiting for it), one discovery dial at a
+                        // time page-wide. A lease does not connect; the
+                        // session's hello does, so the turn is held through it
+                        // and let go before the lookup, which waits on the
+                        // control lane.
                         let client = if warm == Warm::No {
                             let _discovery = discovery_turn().await;
-                            reads_not_waiting_to_gather().await;
+                            ice_gathering_turn_idle().await;
                             let client = pool.client(endpoint).await?;
                             client.hello().await?;
                             client
@@ -3944,14 +3947,20 @@ pub(crate) async fn discovery_turn() -> Option<OwnedSemaphorePermit> {
     DISCOVERY_TURN.with(Arc::clone).acquire_owned().await.ok()
 }
 
-/// Waits until no connection to a node waits for the page's ICE gathering
-/// turn, where connections take turns: a swarm room's lookup, whose
-/// connections take turns too, starts after the reads' connections.
-pub(crate) async fn reads_not_waiting_to_gather() {
+/// Waits until the page's ICE gathering turn is free and no connection to a
+/// node waits for it, where connections take turns. A discovery dial made
+/// then takes the turn at once instead of queueing for it: the turn an
+/// earlier discovery dial still holds while its gathering finishes (its own
+/// discovery turn is let go once it has said hello) is never followed by
+/// another's in the queue, so a read's connection waits behind one
+/// discovery gathering at most.
+pub(crate) async fn ice_gathering_turn_idle() {
     if ice_gathering_may_overlap() {
         return;
     }
-    while ICE_GATHERING_WAITERS.with(std::cell::Cell::get) > 0 {
+    while ICE_GATHERING_WAITERS.with(std::cell::Cell::get) > 0
+        || ICE_GATHERING_TURN.with(|turn| turn.available_permits()) == 0
+    {
         crate::runtime::sleep(ICE_GATHERING_YIELD_POLL).await;
     }
 }
