@@ -1697,6 +1697,9 @@ impl Client {
         address: &XorName,
         peer_count: usize,
     ) -> Result<Vec<ChunkPeerGetResult>> {
+        // A fetch of this client's, lookup included: it sends other readers
+        // less meanwhile, as every fetch does.
+        let _fetching = self.swarm().fetching(address, false);
         let peers = self.closest_peers(address, peer_count).await?;
         let targets = chunk_peer_get_targets(peers, address);
         let concurrency_limit =

@@ -1074,14 +1074,20 @@ impl Swarm {
         None
     }
 
+    /// How many fetches of this client's run now (see [`Self::fetching`]).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn fetches_running(&self) -> usize {
+        self.inner.reading.load(Ordering::Acquire)
+    }
+
     /// Counts a fetch of `address` by this client as running until the guard
     /// goes. While any fetch of this client's runs, whatever it is for (a
-    /// file's records or its map, a raw read or an existence check), it sends
-    /// other clients one record at a time: its own fetch needs its CPU and
-    /// line first. With `shares`, a read of a file's data record, a room
-    /// whose file holds `address` also counts as read the whole time, so a
-    /// read waiting at busy nodes never loses its room to another file's
-    /// (see [`room_to_leave`]).
+    /// file's records or its map, a raw or close-group read, or an existence
+    /// check), it sends other clients one record at a time: its own fetch
+    /// needs its CPU and line first. With `shares`, a read of a file's data
+    /// record, a room whose file holds `address` also counts as read the
+    /// whole time, so a read waiting at busy nodes never loses its room to
+    /// another file's (see [`room_to_leave`]).
     pub(crate) fn fetching(&self, address: &XorName, shares: bool) -> Reading {
         self.inner.reading.fetch_add(1, Ordering::AcqRel);
         let room = shares.then(|| {

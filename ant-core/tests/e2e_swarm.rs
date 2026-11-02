@@ -104,6 +104,27 @@ async fn node_gets(testnet: &MiniTestnet, client: &Client, data_map: &DataMap) -
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
+async fn a_close_group_read_counts_as_a_fetch_while_it_runs() {
+    let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
+    let (_, data_map) = upload(&testnet, 3 * RECORD_BYTES).await;
+    let address = data_map.infos().first().expect("a record").dst_hash.0;
+    let client = reader(&testnet, 4);
+    assert_eq!(client.swarm_fetches_running(), 0);
+    let read = client.chunk_get_from_close_group(&address);
+    tokio::pin!(read);
+    // Its lookup waits on the network: from its first step until it ends, the
+    // client sends other readers one record at a time.
+    assert!(futures::poll!(read.as_mut()).is_pending());
+    assert_eq!(client.swarm_fetches_running(), 1);
+    let results = read.await.expect("close-group read");
+    assert!(results
+        .iter()
+        .any(|result| matches!(result.chunk_result, Ok(Some(_)))));
+    assert_eq!(client.swarm_fetches_running(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn a_second_reader_is_served_by_the_first_instead_of_the_nodes() {
     let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     // Records small enough to cross the link well inside a read's head start

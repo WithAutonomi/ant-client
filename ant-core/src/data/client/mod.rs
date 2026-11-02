@@ -968,6 +968,14 @@ impl Client {
         self.swarm.stats()
     }
 
+    /// How many of this client's own fetches from the nodes run now: while
+    /// any does, it sends other readers one record at a time. For tests.
+    #[cfg(feature = "test-utils")]
+    #[must_use]
+    pub fn swarm_fetches_running(&self) -> usize {
+        self.swarm.fetches_running()
+    }
+
     /// Whether a read of `address` could have it from the swarm now: this
     /// client holds it, or a linked reader of a room whose file holds it says
     /// it has it. For tests, which wait for what readers tell each other.
