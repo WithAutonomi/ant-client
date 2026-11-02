@@ -2043,6 +2043,56 @@ async fn a_join_past_the_room_limit_leaves_only_a_room_gone_unread() {
     assert_eq!(room_to_leave(&rooms, crate::runtime::Clock::now()), Some(2));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_join_is_made_once_a_room_goes_unread_when_its_file_is_joined_or_read() {
+    let rtc = SharedMemoryRtc::default();
+    let swarm = Swarm::with_rtc(Some(Arc::new(rtc.clone())), 1024 * 1024);
+    // A client network with no seeds: the rooms' own lookups find nobody.
+    let network = crate::data::Network::new_multiaddrs(&[], true, false)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let file = |n: u8| record(n, 100).0;
+    let join = |n: u8| swarm.join([n; 32], [n; 32], [file(n)], &network);
+    let read_now = |swarm: &Swarm| {
+        let now = crate::runtime::Clock::now();
+        for room in swarm.inner.rooms().iter() {
+            room.note_read(now);
+        }
+    };
+    let gone_unread = |swarm: &Swarm| {
+        let long_ago = crate::runtime::Clock::now()
+            .checked_sub(ROOM_TURNOVER * 2)
+            .unwrap_or_else(|| panic!("a time"));
+        for room in swarm.inner.rooms().iter() {
+            room.note_read(long_ago);
+        }
+    };
+    let rooms = u8::try_from(MAX_ROOMS).unwrap_or_else(|_| panic!("a count"));
+    for n in 1..=rooms {
+        assert!(join(n));
+    }
+    // A fifth file while every room was read just now: its join waits, and
+    // joining it again changes nothing yet.
+    let fifth = rooms + 1;
+    assert!(!join(fifth));
+    assert!(!join(fifth));
+    assert!(swarm.inner.room(&[fifth; 32]).is_none());
+    // Once a room has gone unread, joining it again makes it.
+    gone_unread(&swarm);
+    assert!(join(fifth));
+    assert!(swarm.inner.room(&[fifth; 32]).is_some());
+    // A sixth waits, and is made when a read of one of its records starts,
+    // before any record of it is in (the nodes may fail that read).
+    read_now(&swarm);
+    let sixth = fifth + 1;
+    assert!(!join(sixth));
+    gone_unread(&swarm);
+    let reading = swarm.fetching(&file(sixth), true);
+    assert!(swarm.inner.room(&[sixth; 32]).is_some());
+    drop(reading);
+    swarm.inner.stop.stop();
+}
+
 #[tokio::test]
 async fn a_read_out_of_time_does_not_mark_its_peer_slow() {
     let rtc = SharedMemoryRtc::default();

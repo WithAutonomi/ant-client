@@ -735,9 +735,9 @@ impl Swarm {
     /// (it was not in it, or had left it since). A room already joined counts
     /// as read now. Joining a room past [`MAX_ROOMS`] leaves the one unread
     /// longest, once no read has used it for [`ROOM_TURNOVER`]; with none
-    /// such, the join waits (at most [`MAX_WAITING_JOINS`] do) and is made at
-    /// a later read of one of the file's records, once a room has gone
-    /// unread.
+    /// such, the join waits (at most [`MAX_WAITING_JOINS`] do) and is made
+    /// once a room has gone unread, when the file is joined again or a read
+    /// of one of its records starts or ends.
     pub(crate) fn join(
         &self,
         key: RoomKey,
@@ -745,10 +745,15 @@ impl Swarm {
         records: impl IntoIterator<Item = XorName>,
         network: &Network,
     ) -> bool {
-        // Joined, or waiting already: a later read of the file makes a
-        // waiting join, so the records are not gathered again meanwhile.
-        if !self.can_join() || self.read_if_joined(&key) || self.waits_to_join(&key) {
+        if !self.can_join() || self.read_if_joined(&key) {
             return false;
+        }
+        // Waiting already: tried again now, with the records it kept, since a
+        // room may have gone unread meanwhile.
+        if self.waits_to_join(&key) {
+            return self
+                .stop_waiting(&key)
+                .is_some_and(|waiting| self.admit_waiting(waiting));
         }
         let records: HashSet<XorName> = records.into_iter().take(room::MAX_ROOM_RECORDS).collect();
         // A join made now takes the place of one that waited.
@@ -895,15 +900,19 @@ impl Swarm {
                 .store(!waiting.is_empty(), Ordering::Release);
             taken
         };
-        let Some(WaitingJoin {
+        taken.is_some_and(|waiting| self.admit_waiting(waiting))
+    }
+
+    /// Makes `waiting`, taken off the waiting list, if a room has gone unread
+    /// meanwhile; otherwise it goes back on the list. Returns whether this
+    /// client is in its room now.
+    fn admit_waiting(&self, waiting: WaitingJoin) -> bool {
+        let WaitingJoin {
             key,
             secret,
             records,
             network,
-        }) = taken
-        else {
-            return false;
-        };
+        } = waiting;
         match self.enter(key, secret, records, &network) {
             Ok(_) => self.inner.room(&key).is_some(),
             Err(records) => {
@@ -1114,6 +1123,10 @@ impl Swarm {
     pub(crate) fn fetching(&self, address: &XorName, shares: bool) -> Reading {
         self.inner.reading.fetch_add(1, Ordering::AcqRel);
         let room = shares.then(|| {
+            // A read of a file whose join waits for a room makes the join, if
+            // a room has gone unread: before its record is in, so the read can
+            // ask the file's other readers even when the nodes fail it.
+            let _ = self.join_waiting_for(address);
             self.inner.begin_read(address);
             (Arc::downgrade(&self.inner), *address)
         });
