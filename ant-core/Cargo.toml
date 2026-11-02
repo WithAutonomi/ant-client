@@ -274,3 +274,9 @@ path = "tests/datamap_file.rs"
 name = "e2e_native_payment"
 path = "tests/e2e_native_payment.rs"
 required-features = ["native", "test-utils"]
+
+# Waits on Client::swarm_could_serve, which only test-utils builds have.
+[[test]]
+name = "e2e_swarm"
+path = "tests/e2e_swarm.rs"
+required-features = ["native", "test-utils"]
