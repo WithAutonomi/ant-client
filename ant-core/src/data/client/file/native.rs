@@ -40,8 +40,10 @@ use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use xor_name::XorName;
 
@@ -110,6 +112,11 @@ const DOWNLOAD_STREAM_BATCH_MEMORY_BUDGET_DIVISOR: u64 = 4;
 /// and Vec/Bytes overhead. Use a conservative multiplier rather than assuming
 /// payload bytes alone.
 const DOWNLOAD_STREAM_BATCH_BYTES_PER_CHUNK_MULTIPLIER: u64 = 3;
+
+/// The longest a file download's last two retry rounds wait for a slow batch:
+/// each waits as long as the batch's longest round took, up to this (see
+/// [`crate::client_engine::files::deferred_batch`]).
+const DOWNLOAD_RETRY_PACE: Duration = Duration::from_secs(300);
 
 /// Maximum number of distinct chunk addresses to sample when probing for a
 /// representative quote in [`Client::estimate_upload_cost`].
@@ -3451,6 +3458,8 @@ impl Client {
             "Selected adaptive stream decrypt batch size"
         );
 
+        // The retry rounds' clock: tokio's, as their timer.
+        let clock_origin = Instant::now();
         let stream = streaming_decrypt_with_batch_size(
             &root_map,
             |batch: &[(usize, XorName)]| {
@@ -3480,6 +3489,8 @@ impl Client {
                             },
                             || fetch_limiter.current(),
                             tokio::time::sleep,
+                            DOWNLOAD_RETRY_PACE,
+                            || clock_origin.elapsed(),
                             |hash: XorName| {
                                 self_encryption::Error::Generic(format!(
                                     "Chunk not found after 3 deferred retry rounds: {}",
@@ -4642,7 +4653,7 @@ impl Client {
             to_store.clone(),
             cap,
             1,
-            std::time::Duration::ZERO,
+            Duration::ZERO,
             progress,
             total_stored,
             total_chunks,
