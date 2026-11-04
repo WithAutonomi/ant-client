@@ -325,20 +325,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-audit
         run: cargo install cargo-audit
+      # No ignores. `cargo audit` fails only on vulnerabilities, and prints
+      # unmaintained and unsound warnings without failing. The 14 ignores
+      # copied from saorsa-client in March all did nothing: 9 were for
+      # advisories already fixed in Cargo.lock, 5 for unmaintained warnings
+      # (V2-1854). A new ignore needs a comment naming the crate, the reason
+      # and the ticket that removes it.
       - name: Run security audit
-        run: >-
-          cargo audit
-          --ignore RUSTSEC-2023-0089
-          --ignore RUSTSEC-2024-0388
-          --ignore RUSTSEC-2024-0436
-          --ignore RUSTSEC-2025-0134
-          --ignore RUSTSEC-2025-0141
-          --ignore RUSTSEC-2026-0012
-          --ignore RUSTSEC-2026-0044
-          --ignore RUSTSEC-2026-0045
-          --ignore RUSTSEC-2026-0046
-          --ignore RUSTSEC-2026-0047
-          --ignore RUSTSEC-2026-0048
-          --ignore RUSTSEC-2026-0049
-          --ignore RUSTSEC-2026-0067
-          --ignore RUSTSEC-2026-0068
+        run: cargo audit
