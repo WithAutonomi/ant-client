@@ -46,7 +46,10 @@ Uploads retain their existing size limits.
 and its private-file counterpart allocate the output as one JavaScript
 `Uint8Array` and copy each decrypted chunk into place as it arrives, so WASM
 holds only the records in flight. Progress is reported as
-`Downloaded chunk n/total`, and an `AbortSignal` cancels the download. `maxMemoryBytes` limits the output buffer,
+`Downloaded chunk n/total from <peer hex> after <n> attempts`, naming the node
+that served the chunk and every GET it cost, retry rounds included
+(`from cache after 0 attempts` when the client's chunk cache answered it), and
+an `AbortSignal` cancels the download. `maxMemoryBytes` limits the output buffer,
 not total process memory; without it, allocation is attempted up to the
 JavaScript engine's buffer limit. Allocation errors reject with guidance to use
 streaming, since browsers do not expose a reliable amount of free memory.

@@ -41,6 +41,25 @@ fn chunk_progress(written: usize, total: usize) -> String {
     format!("Downloaded chunk {written}/{total}")
 }
 
+/// Progress of one delivered chunk: the `Downloaded chunk n/total` prefix the
+/// startup probes match, then the peer that served it — its 64-character
+/// lowercase hex, or `cache` when no GET was sent — and the GETs it cost.
+fn chunk_source_progress(
+    written: usize,
+    total: usize,
+    source: &crate::data::client::chunk::ChunkSource,
+) -> String {
+    let from = match &source.peer {
+        Some(peer) => peer.to_string(),
+        None => "cache".to_string(),
+    };
+    format!(
+        "{} from {from} after {} attempts",
+        chunk_progress(written, total),
+        source.attempts
+    )
+}
+
 /// An optional options object; `undefined` and `null` select the defaults.
 pub(super) fn options_from_js<T: Default + serde::de::DeserializeOwned>(
     value: Option<JsValue>,
@@ -308,18 +327,24 @@ pub(super) async fn collect(
     cancel
         .run(async {
             shared
-                .data_download_indexed_chunks(index, settings.concurrency, |chunk, plaintext| {
-                    let placed = view(index.chunk_range(chunk)).map_err(|error| {
-                        output_error.replace(Some(error.clone()));
-                        js_error_message(error)
-                    })?;
-                    placed.copy_from(&plaintext);
-                    written.set(written.get() + 1);
-                    settings
-                        .progress
-                        .report(&chunk_progress(written.get(), total));
-                    Ok(())
-                })
+                .data_download_indexed_chunks(
+                    index,
+                    settings.concurrency,
+                    |chunk, plaintext, source| {
+                        let placed = view(index.chunk_range(chunk)).map_err(|error| {
+                            output_error.replace(Some(error.clone()));
+                            js_error_message(error)
+                        })?;
+                        placed.copy_from(&plaintext);
+                        written.set(written.get() + 1);
+                        settings.progress.report(&chunk_source_progress(
+                            written.get(),
+                            total,
+                            &source,
+                        ));
+                        Ok(())
+                    },
+                )
                 .await
                 .map_err(|error| output_error.take().unwrap_or_else(|| js_string(error)))
         })

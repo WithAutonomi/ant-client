@@ -8,6 +8,8 @@ use crate::data::client::adaptive::{AdaptiveConfig, AdaptiveController, ChannelS
 use crate::data::network::{BrowserNetwork, RequestDispatched};
 use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
 use ant_protocol::pointer::Pointer;
+use ant_protocol::transport::signed_address::SignedAddressRecord;
+use ant_protocol::transport::{KnownReachability, NodeIdentity, TransportAddressRecord};
 use self_encryption::{ChunkInfo, DataMap, XorName};
 
 mod node_session;
@@ -26,6 +28,10 @@ const EXCLUSIVE_GATHERS_FIRST: Duration = Duration::from_millis(10);
 const EXCLUSIVE_ABANDONED_AFTER: Duration = Duration::from_millis(50);
 /// Well past the abandonment, and far short of an ordinary admission timeout.
 const SPECULATIVE_ADMISSION_WAIT: Duration = Duration::from_millis(500);
+/// Publication sequence of a mock node's owner proof; it never republishes.
+const SIGNED_PEER_SEQUENCE: u64 = 1;
+/// Reliability a lookup reply reports for a mock node.
+const SIGNED_PEER_RELIABILITY: f64 = 1.0;
 
 /// Exercise bootstrap readiness after actual LRU pool eviction.
 #[wasm_bindgen]
@@ -457,6 +463,32 @@ impl BrowserTestNode {
     }
     pub fn endpoint(&self) -> String {
         self.endpoint.clone()
+    }
+    /// This node as a lookup reply lists it, with an owner proof of its WebRTC
+    /// Direct endpoint signed with its own key.
+    pub fn signed_peer(&self) -> JsValue {
+        let identity = NodeIdentity::import(
+            &serde_json::from_value(serde_json::json!({
+                "secret_key": self.secret.clone().into_bytes().to_vec(),
+                "public_key": self.public,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let address = self.endpoint.parse().unwrap();
+        let record = TransportAddressRecord::from_multiaddr(&address, KnownReachability::Direct)
+            .unwrap()
+            .unwrap();
+        let signed =
+            SignedAddressRecord::sign(&identity, SIGNED_PEER_SEQUENCE, vec![record]).unwrap();
+        let node = shared::browser_record(
+            signed
+                .verify()
+                .unwrap()
+                .peer_record(SIGNED_PEER_RELIABILITY),
+        )
+        .unwrap();
+        serde_wasm_bindgen::to_value(&node).unwrap()
     }
     pub fn last_method(&self) -> String {
         self.last_method.clone()
@@ -1104,6 +1136,12 @@ pub async fn test_shared_identity_and_timers() {
             .unwrap(),
         42
     );
+}
+
+/// The close group size the read's rules use, for tests that build one.
+#[wasm_bindgen]
+pub fn test_close_group_size() -> usize {
+    ant_protocol::CLOSE_GROUP_SIZE
 }
 
 /// Build a real, non-expiring owner proof for browser forwarding regressions.

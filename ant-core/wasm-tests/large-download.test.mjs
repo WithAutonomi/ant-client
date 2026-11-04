@@ -6,7 +6,7 @@ import { Writable } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BrowserNetworkClient } from "./client-fixture.mjs";
-import { encryptPublicFile } from "./pkg/ant_core.js";
+import { encryptPublicFile, parseWebRtcDirectMultiaddr } from "./pkg/ant_core.js";
 import { mockWebRtc } from "./mock-webrtc.mjs";
 
 const large = JSON.parse(await readFile(new URL("./fixtures/large-file.json", import.meta.url)));
@@ -313,7 +313,7 @@ test("a writer rejection stops a stream and releases its lock", async () => {
 test("in-memory downloads use one JS output buffer and return recoverable allocation failures", async () => {
   const original = new TextEncoder().encode("In-memory download round trip.".repeat(100));
   const encrypted = encryptPublicFile(original);
-  const { client } = fixture(encrypted.records);
+  const { rtc, client } = fixture(encrypted.records);
   const NativeUint8Array = globalThis.Uint8Array;
   let reader;
   try {
@@ -322,9 +322,20 @@ test("in-memory downloads use one JS output buffer and return recoverable alloca
       { maxMemoryBytes: original.length });
     assert.deepEqual(result.content, original);
     assert.equal(result.file.chunks.length, 3);
-    // Probes time the first chunks by these messages.
+    // Probes time the first chunks by these messages, and a read investigation
+    // needs the node that served each chunk and the GETs it cost (V2-1872).
+    const peers = rtc.endpoints.map(endpoint => parseWebRtcDirectMultiaddr(endpoint).peerId);
     const chunkProgress = messages.filter(message => message.startsWith("Downloaded chunk "));
-    assert.deepEqual(chunkProgress, ["Downloaded chunk 0/3", "Downloaded chunk 1/3", "Downloaded chunk 2/3", "Downloaded chunk 3/3"]);
+    assert.equal(chunkProgress[0], "Downloaded chunk 0/3");
+    assert.equal(chunkProgress.length, 4);
+    chunkProgress.slice(1).forEach((message, delivered) => {
+      const parts = /^Downloaded chunk (\d+)\/3 from ([0-9a-f]{64}) after (\d+) attempts$/.exec(message);
+      assert(parts, `unexpected chunk progress ${message}`);
+      assert.equal(parts[1], String(delivered + 1));
+      assert(peers.includes(parts[2]), `${parts[2]} served a chunk but is not a mock node`);
+      // One uncontended mock holder: one GET per chunk.
+      assert.equal(parts[3], "1");
+    });
     const unset = await client.downloadPublicFile(encrypted.address, null, () => {});
     assert.equal(unset.hash, result.hash);
     globalThis.Uint8Array = class extends NativeUint8Array {
@@ -350,4 +361,123 @@ test("in-memory downloads use one JS output buffer and return recoverable alloca
     assert.equal(streamed.hash, result.hash);
     assert.deepEqual(Buffer.concat(chunks), Buffer.from(original));
   } finally { globalThis.Uint8Array = NativeUint8Array; reader?.close(); client.close(); }
+});
+
+test("a repeated in-memory download reports every chunk from the chunk cache", async () => {
+  const original = new TextEncoder().encode("Cached download round trip.".repeat(100));
+  const encrypted = encryptPublicFile(original);
+  const { rtc, client } = fixture(encrypted.records);
+  try {
+    await client.downloadPublicFile(encrypted.address, 2, () => {});
+    const before = rtc.requests.length;
+    const messages = [];
+    const again = await client.downloadPublicFile(encrypted.address, 2, message => messages.push(message));
+    assert.deepEqual(again.content, original);
+    // The client's chunk cache answers the second download, so it reports no
+    // serving peer and no GET.
+    assert.deepEqual(messages.filter(message => message.startsWith("Downloaded chunk ")), [
+      "Downloaded chunk 0/3",
+      "Downloaded chunk 1/3 from cache after 0 attempts",
+      "Downloaded chunk 2/3 from cache after 0 attempts",
+      "Downloaded chunk 3/3 from cache after 0 attempts",
+    ]);
+    // And it really sent none: the data records are the file's records other
+    // than its DataMap, which the download resolves on its own path.
+    const data = new Set(encrypted.records.map(record => record.address)
+      .filter(address => address !== encrypted.address));
+    const refetched = rtc.requests.slice(before)
+      .filter(request => request.method === "get_chunk" && data.has(request.address));
+    assert.deepEqual(refetched, []);
+  } finally { client.close(); }
+});
+
+test("a chunk retried in a later round reports every GET it cost", { timeout: 120_000 }, async () => {
+  const original = new TextEncoder().encode("Retried download round trip.".repeat(100));
+  const encrypted = encryptPublicFile(original);
+  const withheld = encrypted.records.find(record => record.address !== encrypted.address);
+  // Answer the first two GETs for one data record from a store that does not
+  // hold it. One `chunk_get` call cannot spend more than that before giving up
+  // here, so the record is only found in a later deferred round of
+  // `read_chunks` — which is a fresh `chunk_get` with its own attempt count.
+  const WITHHELD_GETS = 2;
+  let asked = 0;
+  let rtc;
+  rtc = mockWebRtc([{
+    respond(_channel, method) {
+      if (method !== "get_chunk") return;
+      if (rtc.requests.at(-1).address !== withheld.address) return;
+      // The NotFound is already built, so supplying the record now makes it
+      // available to the next GET, not this one.
+      if (++asked === WITHHELD_GETS) rtc.stores[0].set(withheld.address, withheld.content);
+    },
+  }]);
+  for (const record of encrypted.records) {
+    if (record.address !== withheld.address) rtc.stores[0].set(record.address, record.content);
+  }
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const messages = [];
+    const result = await client.downloadPublicFile(encrypted.address, 2, message => messages.push(message));
+    assert.deepEqual(result.content, original);
+    const served = rtc.requests
+      .filter(request => request.method === "get_chunk" && request.address === withheld.address).length;
+    // More GETs than one round can spend: the record was fetched again after a
+    // round returned NotFound, so the reported total has to span both.
+    assert(served > WITHHELD_GETS, `the withheld record was only asked for ${served} time(s)`);
+    const attempts = messages
+      .filter(message => message.startsWith("Downloaded chunk ") && message.includes(" after "))
+      .map(message => Number(/ after (\d+) attempts$/.exec(message)[1]));
+    assert.equal(attempts.length, 3);
+    // The retried chunk must report every GET the mock served for it, across
+    // the rounds that failed and the round that succeeded — not just the
+    // succeeding round's count.
+    assert.deepEqual(attempts.filter(count => count > 1), [served]);
+    assert.equal(attempts.filter(count => count === 1).length, 2);
+  } finally { client.close(); }
+});
+
+test("downloads sharing a failed round are both charged for it", { timeout: 120_000 }, async () => {
+  const original = new TextEncoder().encode("Shared retry round trip.".repeat(100));
+  const encrypted = encryptPublicFile(original);
+  const withheld = encrypted.records.find(record => record.address !== encrypted.address);
+  const WITHHELD_GETS = 2;
+  let asked = 0;
+  let rtc;
+  rtc = mockWebRtc([{
+    // Hold every GET open long enough that two concurrent downloads of the
+    // same file always overlap, so the second joins the first's fetch of a
+    // record instead of sending its own.
+    delay: method => method === "get_chunk" ? 60 : 0,
+    respond(_channel, method) {
+      if (method !== "get_chunk") return;
+      if (rtc.requests.at(-1).address !== withheld.address) return;
+      if (++asked === WITHHELD_GETS) rtc.stores[0].set(withheld.address, withheld.content);
+    },
+  }]);
+  for (const record of encrypted.records) {
+    if (record.address !== withheld.address) rtc.stores[0].set(record.address, record.content);
+  }
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const totals = message => Number(/ after (\d+) attempts$/.exec(message)?.[1] ?? NaN);
+  try {
+    const first = [], second = [];
+    const [a, b] = await Promise.all([
+      client.downloadPublicFile(encrypted.address, 2, message => first.push(message)),
+      client.downloadPublicFile(encrypted.address, 2, message => second.push(message)),
+    ]);
+    assert.deepEqual(a.content, original);
+    assert.deepEqual(b.content, original);
+    const served = rtc.requests
+      .filter(request => request.method === "get_chunk" && request.address === withheld.address).length;
+    assert(served > WITHHELD_GETS, `the withheld record was only asked for ${served} time(s)`);
+    const reported = [first, second].map(messages => messages
+      .filter(message => message.includes(" after "))
+      .map(totals)
+      .sort((x, y) => x - y));
+    // Both downloads sent the same GETs for the withheld record, because one
+    // joined the other's fetch of it — including the round that found nothing.
+    // Charging the joiner only for the round that succeeded would report 1.
+    assert.equal(reported[0].at(-1), served, `first download reported ${reported[0]}`);
+    assert.deepEqual(reported[0], reported[1]);
+  } finally { client.close(); }
 });
