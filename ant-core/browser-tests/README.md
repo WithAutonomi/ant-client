@@ -88,9 +88,11 @@ The swarm test (`swarm.spec.js`) uploads a 6 MiB file, reads it in one page,
 and keeps that page's client open in the file's room. A second page, in its
 own browser context, then reads the file. Against nodes that advertise
 `swarm_rendezvous`, the two meet through the file's rendezvous nodes, which
-also answer their STUN, and the second page must take every data record
-from the first (the DataMap, whose root names the room, comes from the
-nodes). Against the pinned node, which predates
+also answer their STUN, and the second page must take at least one data
+record from the first (a link takes one record asked and one waiting at
+once; further reads at once go to the nodes, which a busy machine may also
+let win a race), and the DataMap, whose root names the room, comes from the
+nodes. Against the pinned node, which predates
 swarm rooms, the second page must read from the nodes with no link and no
 swarm message sent. Run it against a node with swarm rooms by pointing
 `ANT_NODE_DIR` at one.

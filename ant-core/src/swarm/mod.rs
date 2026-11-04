@@ -515,8 +515,10 @@ pub(crate) fn spawn<F: Future<Output = ()> + 'static>(task: F) -> bool {
 }
 
 /// The room every client reading the file `data_map` describes meets in, and
-/// the room's secret. The room is the address the map has when stored as a
-/// public record, so a public file's room is its address. The secret comes
+/// the room's secret. The room is the address this root map has when stored
+/// as a public record: a public file's own address when the file was
+/// published with its root map, another when it was published with a shrunk
+/// map, which a reader resolves to this root first. The secret comes
 /// from the map itself: a node that knows only the room (for a private file,
 /// the hash of a map it never saw) cannot prove a link into it.
 ///

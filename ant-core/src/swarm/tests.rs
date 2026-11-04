@@ -1363,7 +1363,7 @@ async fn a_rooms_open_links_name_their_peers_for_the_page() {
 }
 
 #[test]
-fn a_public_file_room_is_its_address() {
+fn a_file_published_with_its_root_map_has_its_address_as_room() {
     // An empty map is no file's, and has no room.
     assert!(room_of(&DataMap::new(Vec::new())).is_none());
     let map = DataMap::new(
