@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-10-28
+- **Last amended:** 2026-10-29
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -928,3 +928,63 @@ Left for later:
   come to over 100 KB.
 - **Lookup rounds:** each round waits for its slowest answer, up to its grace
   period.
+
+## Lookup answers for reads (2026-10-29)
+
+Related: [V2-1779](https://linear.app/autonominetwork/issue/V2-1779).
+
+A browser read's lookups asked each node for 20 nodes, the witnessed-view size
+quotes and uploads cross-check (`SINGLE_NODE_WITNESSED_VIEW_COUNT`). Each listed
+node carries its owner-signed record, an ML-DSA-65 key and signature of about
+6 KB, so an answer was about 115 KB. A node's SCTP send window starts at 4,380
+bytes (webrtc-sctp's fixed initial window) and doubles each round trip, so the
+first answer on a connection took several round trips.
+
+**A read's lookups ask each node for `count.max(CLOSE_GROUP_SIZE)` nodes**: its
+record's close group, for a read of the default width. Lookups for quotes,
+uploads, PUT targets, Merkle payments and pointers keep the full view, since
+quotes cross-check every responder's view against the nodes' 20-node acceptance
+window. Native reads are unchanged.
+
+Measured against mainnet's seven seeds with a median round trip of 167 ms:
+
+| answer | 20 nodes (115 KB) | 7 nodes (42 KB) |
+| --- | --: | --: |
+| first on a connection | 1,091 ms, 5.3 round trips | 628 ms, 4.1 round trips |
+| later, on a used connection | 488 ms, 3.1 round trips | 184 ms, 1.0 round trip |
+
+**Traced read** of a stream's first 1 MiB, main against this change:
+
+| | Chromium (10 rounds) | WebKit (6 rounds) |
+| --- | --- | --- |
+| holder first named | 0.93 → 0.66 s | 0.87 → 0.63 s |
+| holder's GET | 1.73 → 1.57 s, sooner 6/10 | 2.0 → 1.6 s, sooner 6/6 |
+| read done | 3.1 → 5.0 s, sooner 3/10 | 2.7 → 2.3 s, sooner 6/6 |
+
+The later Chromium reads came from the holder's transfers, which took 0.6–4.9 s
+in both arms. Twice the holder stalled past the 3 s hedge.
+
+**Streaming on try.autonomi.com's page**, SDK 0.1.5 against this change:
+
+| | Chromium (20 rounds) | WebKit (6 rounds) |
+| --- | --- | --- |
+| first frame | 5.0 → 5.8 s, sooner 8/20 | 4.4 → 4.0 s, sooner 4/6 |
+| seek to 85% | 5.6 → 5.1 s, sooner 10/20 | 5.2 → 2.8 s, sooner 6/6 |
+| data received per sample | 74.3 → 63.8 MB | 67.7 → 55.0 MB |
+
+The lookups answer sooner in both engines, and WebKit streams start and seek
+sooner. Chromium streams did not start sooner: its first frames were a median
+1.0 s later, paired by round. Mainnet was slow in those batches (the baseline's
+median first frame was 5.0 s, against 2.4–3.9 s on other days), and the one
+holder's transfers dominated. This is not yet a measured gain for Chromium.
+
+Trade-offs:
+
+- A responder lists only a close group, so one that lists a close group of
+  invented identities fills its whole answer. The lookup still asks the other
+  responders, and invented identities cannot rule a holder out (only proven
+  peers are listed).
+- Holders stored only beyond the close group, such as ADR-0002 fallback peers,
+  are less likely to be named by a lookup answer.
+- Reads add fewer nodes to the client's cache of owner records, which other
+  lookups use to keep the newest record a node has published.

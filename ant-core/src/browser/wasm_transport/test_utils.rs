@@ -402,6 +402,7 @@ pub struct BrowserTestNode {
     last_put_address: String,
     last_put_quote_hash: String,
     last_get_address: String,
+    last_find_node_count: usize,
     closest_peers: Vec<BrowserNode>,
     put_error: Option<(String, String)>,
     pointers_enabled: bool,
@@ -456,6 +457,7 @@ impl BrowserTestNode {
             last_put_address: String::new(),
             last_put_quote_hash: String::new(),
             last_get_address: String::new(),
+            last_find_node_count: 0,
             closest_peers: Vec::new(),
             put_error: None,
             pointers_enabled: true,
@@ -542,6 +544,10 @@ impl BrowserTestNode {
     pub fn last_get_address(&self) -> String {
         self.last_get_address.clone()
     }
+    /// The node count the last FIND_NODE asked for.
+    pub fn last_find_node_count(&self) -> usize {
+        self.last_find_node_count
+    }
     pub fn push(&mut self, message: &[u8]) -> Vec<u8> {
         self.received.extend_from_slice(message);
         let Some(expected) = pq_frame_length(&self.received, 8 * 1024 * 1024).unwrap() else {
@@ -622,6 +628,7 @@ impl BrowserTestNode {
                 with_address_records,
             } => {
                 self.last_method = "find_node".into();
+                self.last_find_node_count = count.unwrap_or_default();
                 let key = parse_lookup_key(&target, "target").unwrap();
                 let mut nodes = self.closest_peers.clone();
                 nodes.sort_by_key(|node| {
@@ -1136,6 +1143,12 @@ pub async fn test_shared_identity_and_timers() {
             .unwrap(),
         42
     );
+}
+
+/// The view size quotes and uploads ask each lookup responder for.
+#[wasm_bindgen]
+pub fn test_witnessed_view_count() -> usize {
+    crate::quote_policy::SINGLE_NODE_WITNESSED_VIEW_COUNT
 }
 
 /// The close group size the read's rules use, for tests that build one.

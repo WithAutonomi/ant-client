@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- A browser read asks a record's holders sooner. Its first hints are its bootstrap peers, which
+  rarely hold the record, and it used to ask them one at a time, each over a new connection,
+  while discovery had already reached a holder. Now a hint stops being read once lookup replies
+  list a close group of peers nearer the record. Only peers a reply proves, with an owner-signed
+  address record, and its authenticated responder count. A read that continues no other now
+  fetches the record after it once it has finished, so that fetch no longer competes with the
+  record the read waits for. In `ant-core`, a `BrowserNetwork` adapter reports listed peers
+  through the new `ReadProgress::listed`; `ReadProgress::may_hold` gives the rule. Native reads
+  are unchanged. (#242)
+- A browser read's lookups ask each node for its record's close group (`CLOSE_GROUP_SIZE`, 7
+  nodes) instead of a 20-node witnessed view. Each listed node carries its owner-signed record, an
+  ML-DSA-65 key and signature of about 6 KB, so an answer shrinks from about 115 KB to 42 KB. On
+  mainnet it arrived in about 4 round trips instead of 5 on a fresh connection, and 1 instead of 3
+  on a used one. Lookups for uploads, quotes, PUT targets, Merkle payments and pointers still ask
+  for the full view. (V2-1779, #243)
+
 ## [0.3.12] - 2026-10-22
 
 ### Changed (breaking — `ant-core` browser API)
@@ -317,15 +334,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it (`npm update -g @withautonomi/ant`). Self-replacing an npm-managed binary left npm's
   metadata describing a file that was no longer there, so the next `npm update` silently rolled
   the user back.
-- A browser read asks a record's holders sooner. Its first hints are its bootstrap peers, which
-  rarely hold the record, and it used to ask them one at a time, each over a new connection,
-  while discovery had already reached a holder. Now a hint stops being read once lookup replies
-  list a close group of peers nearer the record. Only peers a reply proves, with an owner-signed
-  address record, and its authenticated responder count. A read that continues no other now
-  fetches the record after it once it has finished, so that fetch no longer competes with the
-  record the read waits for. In `ant-core`, a `BrowserNetwork` adapter reports listed peers
-  through the new `ReadProgress::listed`; `ReadProgress::may_hold` gives the rule. Native reads
-  are unchanged. (#242)
 
 ### Fixed
 - Uploads no longer fail outright when the public RPC briefly answers the fee estimate with a 429
