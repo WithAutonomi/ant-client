@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- In the browser, a complete download's per-chunk progress names the node that served the chunk
+  and the GETs it cost: `Downloaded chunk 3/147 from <peer hex> after 1 attempts`, or
+  `from cache after 0 attempts` when the client's chunk cache answered it (V2-1872). Read
+  investigations could previously see only `Downloaded chunk n/total`. The count covers every
+  GET the chunk cost — the deferred retry rounds that found nothing included, and the GETs of a
+  fetch shared with a concurrent download of the same chunk — so a costly retry shows up rather
+  than being reported as the succeeding round alone. The
+  `Downloaded chunk n/total` prefix is unchanged, so startup probes that match on it still work
+  (#249).
+
 ## [0.3.12] - 2026-10-22
 
 ### Changed (breaking — `ant-core` browser API)

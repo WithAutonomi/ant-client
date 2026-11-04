@@ -643,7 +643,7 @@ pub struct Client {
     chunk_cache: ChunkCache,
     /// Chunk GETs in flight, by address and peer count, so concurrent reads
     /// of one chunk share a single network GET.
-    chunk_gets: SingleFlight<(XorName, usize), Result<Option<ant_protocol::DataChunk>>>,
+    chunk_gets: SingleFlight<(XorName, usize), chunk::SharedChunkGet>,
     next_request_id: AtomicU64,
     /// Adaptive concurrency controller: replaces the static
     /// quote/store concurrency knobs. See `adaptive` module.

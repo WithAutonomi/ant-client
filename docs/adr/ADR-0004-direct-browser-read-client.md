@@ -687,7 +687,9 @@ adaptive fetch cap and its `concurrency` argument, with missing records retried
 together in deferred rounds, so retry waits do not add up across records. Each
 chunk is decrypted as it arrives and copied straight into its place in one
 JavaScript `Uint8Array` allocated up front, so WASM memory holds only the records
-in flight, and `Downloaded chunk n/total` counts chunks as they land. The file is
+in flight, and `Downloaded chunk n/total from <peer hex> after <n> attempts`
+counts chunks as they land, naming the node that served each one and the GETs it
+cost so a read investigation can attribute a slow download to a peer. The file is
 hashed afterwards, copied back in 4 MiB pieces. The optional `maxMemoryBytes`
 limits the allocation; allocation failure rejects before file-content transfer
 and directs the caller to streaming. Automatic free-memory detection and
