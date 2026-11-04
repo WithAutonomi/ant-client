@@ -508,26 +508,28 @@ impl Client {
             &|address| {
                 let (sources, spent) = (&sources, &spent);
                 async move {
+                    // Raised by the GETs the fetch sent on whatever it then
+                    // returns, and by the GETs of a fetch this one shared, so
+                    // every round is counted whether it found the record or
+                    // not and whether this caller led it or joined it.
                     let dispatched = std::sync::atomic::AtomicUsize::new(0);
                     let fetched = self
                         .fetch_data_record_with_source(address, &dispatched)
                         .await;
-                    // A round that found the record reports its GETs through
-                    // the source, which a single-flight joiner also receives;
-                    // a round that failed reports only through `dispatched`.
-                    let round = match &fetched {
-                        Ok((_, source)) => source.attempts,
-                        Err(_) => dispatched.load(std::sync::atomic::Ordering::Relaxed),
-                    };
                     let total = {
                         let mut spent = spent.borrow_mut();
                         let total = spent.entry(address).or_default();
-                        *total += round;
+                        *total += dispatched.load(std::sync::atomic::Ordering::Relaxed);
                         *total
                     };
-                    let (bytes, mut source) = fetched?;
-                    source.attempts = total;
-                    sources.borrow_mut().insert(address, source);
+                    let (bytes, peer) = fetched?;
+                    sources.borrow_mut().insert(
+                        address,
+                        crate::data::client::chunk::ChunkSource {
+                            peer,
+                            attempts: total,
+                        },
+                    );
                     Ok(bytes)
                 }
             },
@@ -587,10 +589,10 @@ impl Client {
         &self,
         address: [u8; 32],
         dispatched: &std::sync::atomic::AtomicUsize,
-    ) -> Result<(Bytes, crate::data::client::chunk::ChunkSource)> {
+    ) -> Result<(Bytes, Option<ant_protocol::transport::PeerId>)> {
         self.chunk_get_observed_with_source(&address, dispatched)
             .await?
-            .map(|(chunk, source)| (chunk.content, source))
+            .map(|(chunk, peer)| (chunk.content, peer))
             .ok_or_else(|| missing_data_record(address))
     }
 }

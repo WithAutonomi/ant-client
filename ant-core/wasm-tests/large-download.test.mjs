@@ -435,3 +435,49 @@ test("a chunk retried in a later round reports every GET it cost", { timeout: 12
     assert.equal(attempts.filter(count => count === 1).length, 2);
   } finally { client.close(); }
 });
+
+test("downloads sharing a failed round are both charged for it", { timeout: 120_000 }, async () => {
+  const original = new TextEncoder().encode("Shared retry round trip.".repeat(100));
+  const encrypted = encryptPublicFile(original);
+  const withheld = encrypted.records.find(record => record.address !== encrypted.address);
+  const WITHHELD_GETS = 2;
+  let asked = 0;
+  let rtc;
+  rtc = mockWebRtc([{
+    // Hold every GET open long enough that two concurrent downloads of the
+    // same file always overlap, so the second joins the first's fetch of a
+    // record instead of sending its own.
+    delay: method => method === "get_chunk" ? 60 : 0,
+    respond(_channel, method) {
+      if (method !== "get_chunk") return;
+      if (rtc.requests.at(-1).address !== withheld.address) return;
+      if (++asked === WITHHELD_GETS) rtc.stores[0].set(withheld.address, withheld.content);
+    },
+  }]);
+  for (const record of encrypted.records) {
+    if (record.address !== withheld.address) rtc.stores[0].set(record.address, record.content);
+  }
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  const totals = message => Number(/ after (\d+) attempts$/.exec(message)?.[1] ?? NaN);
+  try {
+    const first = [], second = [];
+    const [a, b] = await Promise.all([
+      client.downloadPublicFile(encrypted.address, 2, message => first.push(message)),
+      client.downloadPublicFile(encrypted.address, 2, message => second.push(message)),
+    ]);
+    assert.deepEqual(a.content, original);
+    assert.deepEqual(b.content, original);
+    const served = rtc.requests
+      .filter(request => request.method === "get_chunk" && request.address === withheld.address).length;
+    assert(served > WITHHELD_GETS, `the withheld record was only asked for ${served} time(s)`);
+    const reported = [first, second].map(messages => messages
+      .filter(message => message.includes(" after "))
+      .map(totals)
+      .sort((x, y) => x - y));
+    // Both downloads sent the same GETs for the withheld record, because one
+    // joined the other's fetch of it — including the round that found nothing.
+    // Charging the joiner only for the round that succeeded would report 1.
+    assert.equal(reported[0].at(-1), served, `first download reported ${reported[0]}`);
+    assert.deepEqual(reported[0], reported[1]);
+  } finally { client.close(); }
+});

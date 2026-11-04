@@ -236,33 +236,29 @@ use web_time::{Duration, Instant};
 /// Data type identifier for chunks (used in quote requests).
 const CHUNK_DATA_TYPE: u32 = 0;
 
-/// Where one `chunk_get` call's chunk came from, and what it cost.
+/// What a browser download reports about one delivered chunk: the peer that
+/// served it, and every peer GET it cost.
 ///
-/// `peer` is the peer that served the verified chunk, or `None` when no GET
-/// served it — a chunk cache hit, or the kad lookup's own early return.
-/// `attempts` is the number of peer GETs this call dispatched, counting its
-/// early, ordinary and retry rounds. A deferred retry round is a separate
-/// `chunk_get` call with its own count, so a caller that retries adds the
-/// rounds up itself; `chunk_get_observed_with_source` reports each call's
-/// count through its `dispatched` counter so a failed round is counted too.
-///
-/// Only the browser's complete-download progress reads the fields; the native
-/// build carries the value through `chunk_get` without inspecting it.
-#[cfg_attr(
-    not(all(feature = "browser-wasm", target_arch = "wasm32")),
-    allow(dead_code)
-)]
+/// `peer` is `None` when no GET served the chunk — the client's chunk cache
+/// answered it. `attempts` is the total across the deferred retry rounds
+/// `read_chunks` spent on the record, which the download path accumulates;
+/// a single `chunk_get` reports its own count through the `dispatched`
+/// counter of [`Client::chunk_get_observed_with_source`].
+#[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
 #[derive(Clone, Debug)]
 pub(crate) struct ChunkSource {
     pub peer: Option<PeerId>,
     pub attempts: usize,
 }
 
-/// A fetched chunk with the source it came from.
-pub(crate) type SourcedChunk = (DataChunk, ChunkSource);
+/// A fetched chunk and the peer that served it, or `None` when no GET did.
+pub(crate) type SourcedChunk = (DataChunk, Option<PeerId>);
 
-/// What one shared `chunk_get` resolves to, for the single-flight map.
-pub(crate) type SourcedChunkResult = Result<Option<SourcedChunk>>;
+/// What one shared `chunk_get` resolves to: its outcome, and the number of
+/// peer GETs the fetch dispatched. Both reach a joiner, so sharing a fetch
+/// costs a caller the same as leading it — including a round that found
+/// nothing, whose outcome is an error and so carries no chunk to report with.
+pub(crate) type SharedChunkGet = (Result<Option<SourcedChunk>>, usize);
 
 use crate::transfer_policy::{PutRejection, PutShortfall};
 
@@ -495,12 +491,12 @@ impl Client {
     /// it came from. Browser downloads name the serving peer and the GETs the
     /// chunk cost in their per-chunk progress.
     ///
-    /// `dispatched` is raised by the peer GETs this call sends, on every
+    /// `dispatched` is raised by the peer GETs the fetch sends, on every
     /// outcome, so a caller retrying the chunk in a later round can add up
     /// what the whole chunk cost — including the rounds that found nothing,
-    /// which return an error and so carry no [`ChunkSource`]. A call that
-    /// joins another's fetch sends no GET of its own and leaves it untouched;
-    /// the leader's count reaches the joiner in the returned `ChunkSource`.
+    /// which return an error and so carry no chunk to report with. A caller
+    /// that joins another's fetch is charged the same count as the one that
+    /// led it, because the same GETs served them both.
     #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
     pub(crate) async fn chunk_get_observed_with_source(
         &self,
@@ -521,8 +517,10 @@ impl Client {
     /// send its GETs once. A shared fetch feeds the adaptive fetch limiter
     /// once, if any caller sharing it observes.
     ///
-    /// A joiner receives the leader's [`ChunkSource`]: the same GET served it.
-    /// Only the leader raises `dispatched`, which it sends the GETs through.
+    /// The fetch's GET count rides in the shared result, so a joiner is
+    /// charged for the GETs it shared even when they found nothing and the
+    /// outcome is an error. `dispatched` is raised by that count for whichever
+    /// caller this is, leader or joiner.
     async fn chunk_get_shared(
         &self,
         address: &XorName,
@@ -538,29 +536,44 @@ impl Client {
                 observe,
                 || {
                     started = Some((self.controller().fetch.observation_epoch(), Instant::now()));
-                    self.chunk_get_from_closest_peers_with_diagnostics(
-                        address,
-                        peer_count,
-                        dispatched,
-                        #[cfg(feature = "native")]
-                        None,
-                    )
+                    async move {
+                        let sent = std::sync::atomic::AtomicUsize::new(0);
+                        let outcome = self
+                            .chunk_get_from_closest_peers_with_diagnostics(
+                                address,
+                                peer_count,
+                                Some(&sent),
+                                #[cfg(feature = "native")]
+                                None,
+                            )
+                            .await;
+                        (outcome, sent.load(std::sync::atomic::Ordering::Relaxed))
+                    }
                 },
-                |result| match result {
-                    Ok(chunk) => Ok(chunk.clone()),
-                    Err(error) => Err(error.duplicate()),
+                |(outcome, sent)| {
+                    (
+                        match outcome {
+                            Ok(chunk) => Ok(chunk.clone()),
+                            Err(error) => Err(error.duplicate()),
+                        },
+                        *sent,
+                    )
                 },
             )
             .await;
-        match flown {
+        let (outcome, sent) = match flown {
             Flown::Led { value, observe } => {
                 if let (true, Some((epoch, started))) = (observe, started) {
-                    self.observe_chunk_get(&value, started.elapsed(), epoch);
+                    self.observe_chunk_get(&value.0, started.elapsed(), epoch);
                 }
                 value
             }
             Flown::Joined(value) => value,
+        };
+        if let Some(dispatched) = dispatched {
+            dispatched.fetch_add(sent, std::sync::atomic::Ordering::Relaxed);
         }
+        outcome
     }
 
     /// Feed one `chunk_get` outcome to the adaptive fetch limiter, including
@@ -586,7 +599,7 @@ impl Client {
     }
 }
 
-/// Drop a fetch's [`ChunkSource`], for the callers that report only the chunk.
+/// Drop a fetch's serving peer, for the callers that report only the chunk.
 fn strip_chunk_source(found: Option<SourcedChunk>) -> Option<DataChunk> {
     found.map(|(chunk, _)| chunk)
 }
@@ -967,13 +980,7 @@ impl Client {
                         None,
                     );
                 }
-                return Ok(Some((
-                    DataChunk::new(*address, cached),
-                    ChunkSource {
-                        peer: None,
-                        attempts: 0,
-                    },
-                )));
+                return Ok(Some((DataChunk::new(*address, cached), None)));
             }
             // Cache entry corrupted — evict and fall through to network fetch.
             debug!(
@@ -1002,13 +1009,7 @@ impl Client {
                     );
                 }
                 self.chunk_cache().put(chunk.address, chunk.content.clone());
-                return Ok(Some((
-                    chunk,
-                    ChunkSource {
-                        peer: None,
-                        attempts: 0,
-                    },
-                )));
+                return Ok(Some((chunk, None)));
             }
             Ok(KadReadOutcome::NotFound { closest }) => {
                 std::sync::Mutex::new((!closest.is_empty()).then(|| {
@@ -1207,9 +1208,9 @@ impl Client {
         .await;
         // Report the GETs before the error path returns: a round that found
         // nothing still cost them, and a retrying caller needs them counted.
-        let attempts = attempts.load(std::sync::atomic::Ordering::Relaxed);
         if let Some(dispatched) = dispatched {
-            dispatched.fetch_add(attempts, std::sync::atomic::Ordering::Relaxed);
+            let sent = attempts.load(std::sync::atomic::Ordering::Relaxed);
+            dispatched.fetch_add(sent, std::sync::atomic::Ordering::Relaxed);
         }
         let result = outcome?;
         #[cfg(feature = "native")]
@@ -1226,13 +1227,7 @@ impl Client {
         }
         Ok(result.map(|(chunk, peer)| {
             self.chunk_cache().put(chunk.address, chunk.content.clone());
-            (
-                chunk,
-                ChunkSource {
-                    peer: Some(peer),
-                    attempts,
-                },
-            )
+            (chunk, Some(peer))
         }))
     }
 
@@ -1693,13 +1688,7 @@ mod tests {
 
         // The same classification for a chunk paired with its source, which
         // is what the browser download path carries (V2-1872).
-        let sourced = (
-            DataChunk::new([0u8; 32], Bytes::from_static(b"x")),
-            ChunkSource {
-                peer: None,
-                attempts: 0,
-            },
-        );
+        let sourced: SourcedChunk = (DataChunk::new([0u8; 32], Bytes::from_static(b"x")), None);
         assert_eq!(chunk_get_outcome(&Ok(Some(sourced))), Outcome::Success);
 
         // Ok(None): chunk_get exhausted the close group across first
