@@ -36,6 +36,7 @@ use ant_protocol::transport::{
     CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
 };
 use ant_protocol::{CLOSE_GROUP_SIZE, GET_OR_CLOSER_AGENT_TOKEN, MAX_WIRE_MESSAGE_SIZE};
+use futures::future::join_all;
 use rand::Rng;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -49,6 +50,17 @@ const TEST_PORT_RANGE_MAX: u16 = 60_000;
 const BOOTSTRAP_COUNT: usize = 2;
 const SPAWN_DELAY_MS: u64 = 200;
 const STABILIZATION_TIMEOUT_SECS: u64 = 180;
+/// The test nodes' saorsa-core `connection_timeout`.
+///
+/// saorsa-core also uses it as the request timeout for every DHT operation
+/// (`DhtNetworkConfig::request_timeout` is set from it), so it bounds how long
+/// a witnessed close-group lookup waits for each peer, as well as the DHT leave
+/// waits in `teardown` (which runs them concurrently, so they don't add up).
+/// At 5 s, slow but live peers were dropped on loaded CI runners, and uploads
+/// failed with "found 6 peers, need 7" (V2-1852); 10 s held on dev2 with the
+/// test capped to one CPU core. Production uses 25 s. ant-node's e2e harness
+/// uses the same value; keep the two in step.
+const TEST_CORE_CONNECTION_TIMEOUT_SECS: u64 = 10;
 /// A chunk read request is a few dozen bytes, so anything larger, such as a
 /// PUT carrying a chunk, is not decoded.
 const MAX_READ_REQUEST_BYTES: usize = 1024;
@@ -515,7 +527,7 @@ impl MiniTestnet {
             .iter()
             .map(|addr| MultiAddr::quic(*addr))
             .collect();
-        core_config.connection_timeout = Duration::from_secs(5);
+        core_config.connection_timeout = Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS);
         core_config.node_identity = Some(Arc::clone(&identity));
         // Every test node answers get-or-closer (ant-node ADR-0020); a client
         // only sends one to a node whose user agent announces it, as
@@ -784,11 +796,18 @@ impl MiniTestnet {
         //    OS can reclaim them before the next sequential test starts.
         //    Without this, ports remain in TIME_WAIT and subsequent tests
         //    encounter "Peer not found" / "Stream error" transport failures.
-        for node in &self.nodes {
-            if let Some(ref p2p_node) = node.p2p_node {
-                let _ = p2p_node.shutdown().await;
-            }
-        }
+        //    The nodes shut down concurrently, so their DHT leave waits (each
+        //    bounded by TEST_CORE_CONNECTION_TIMEOUT_SECS) overlap instead of
+        //    adding up.
+        join_all(
+            self.nodes
+                .iter()
+                .filter_map(|node| node.p2p_node.as_ref())
+                .map(|p2p_node| async move {
+                    let _ = p2p_node.shutdown().await;
+                }),
+        )
+        .await;
     }
 }
 
