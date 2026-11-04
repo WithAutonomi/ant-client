@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `install.sh` puts `ant` on `PATH`, as `install.ps1` already did on Windows, so `ant --version`
+  works in a new terminal straight after installing (#194). When `INSTALL_DIR` is not already on
+  `PATH` it adds a guarded line to `~/.profile`, to the user's existing bash startup files, to
+  `~/.zshenv` when zsh is installed and to fish's `conf.d` when fish is, and lists each file it
+  changed. A directory whose name contains `$`, a backtick, `"` or `\` is not added, because
+  shells can run part of such a PATH entry as code (macOS login shells re-read `PATH` through
+  `path_helper` without escaping it). The installer says so and prints an escaped line for the
+  current shell instead. A name with `:`, which separates `PATH` entries, can't be added at all,
+  and an install directory containing a newline (in `INSTALL_DIR`, or in the current directory
+  for a relative one) is rejected before anything is installed.
+  `--no-modify-path` or `ANT_NO_MODIFY_PATH=1` (also honoured by `install.ps1`) restores
+  the old print-the-line behaviour. The macOS default install directory moves from
+  `/usr/local/bin`, which is root-owned without Homebrew so the install failed without `sudo`, to
+  `~/.local/bin`, matching Linux. If another `ant` is already on `PATH` — an earlier macOS
+  install in `/usr/local/bin`, or an unrelated program such as Apache Ant — the installer says
+  so, since it may shadow the new one.
 - In the browser, a complete download's per-chunk progress names the node that served the chunk
   and the GETs it cost: `Downloaded chunk 3/147 from <peer hex> after 1 attempts`, or
   `from cache after 0 attempts` when the client's chunk cache answered it (V2-1872). Read
@@ -328,15 +344,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it (`npm update -g @withautonomi/ant`). Self-replacing an npm-managed binary left npm's
   metadata describing a file that was no longer there, so the next `npm update` silently rolled
   the user back.
-- A browser read asks a record's holders sooner. Its first hints are its bootstrap peers, which
-  rarely hold the record, and it used to ask them one at a time, each over a new connection,
-  while discovery had already reached a holder. Now a hint stops being read once lookup replies
-  list a close group of peers nearer the record. Only peers a reply proves, with an owner-signed
-  address record, and its authenticated responder count. A read that continues no other now
-  fetches the record after it once it has finished, so that fetch no longer competes with the
-  record the read waits for. In `ant-core`, a `BrowserNetwork` adapter reports listed peers
-  through the new `ReadProgress::listed`; `ReadProgress::may_hold` gives the rule. Native reads
-  are unchanged. (#242)
 
 ### Fixed
 - Uploads no longer fail outright when the public RPC briefly answers the fee estimate with a 429
