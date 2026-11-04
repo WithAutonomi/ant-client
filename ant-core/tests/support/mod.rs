@@ -61,6 +61,8 @@ const STABILIZATION_TIMEOUT_SECS: u64 = 180;
 /// test capped to one CPU core. Production uses 25 s. ant-node's e2e harness
 /// uses the same value; keep the two in step.
 const TEST_CORE_CONNECTION_TIMEOUT_SECS: u64 = 10;
+/// Attempts at creating each test node's `P2PNode` (see `spawn_node`).
+const NODE_CREATE_ATTEMPTS: u32 = 4;
 /// A chunk read request is a few dozen bytes, so anything larger, such as a
 /// PUT carrying a chunk, is not decoded.
 const MAX_READ_REQUEST_BYTES: usize = 1024;
@@ -512,34 +514,59 @@ impl MiniTestnet {
         // Generate ML-DSA-65 identity for this node
         let identity = Arc::new(NodeIdentity::generate().expect("generate node identity"));
 
-        // IPv4-only is intentional for these loopback-only tests: everything
-        // binds to 127.0.0.1 on the local host, so dual-stack would add no
-        // value and pulls in v6 loopback quirks on some CI runners.
-        let mut core_config = CoreNodeConfig::builder()
-            .port(listen_addr.port())
-            .ipv6(false)
-            .local(true)
-            .max_message_size(MAX_WIRE_MESSAGE_SIZE)
-            .build()
-            .expect("create core config");
+        // A fresh config per creation attempt, since `P2PNode::new` consumes it.
+        let build_core_config = || {
+            // IPv4-only is intentional for these loopback-only tests: everything
+            // binds to 127.0.0.1 on the local host, so dual-stack would add no
+            // value and pulls in v6 loopback quirks on some CI runners.
+            let mut core_config = CoreNodeConfig::builder()
+                .port(listen_addr.port())
+                .ipv6(false)
+                .local(true)
+                .max_message_size(MAX_WIRE_MESSAGE_SIZE)
+                .build()
+                .expect("create core config");
 
-        core_config.bootstrap_peers = bootstrap_peers
-            .iter()
-            .map(|addr| MultiAddr::quic(*addr))
-            .collect();
-        core_config.connection_timeout = Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS);
-        core_config.node_identity = Some(Arc::clone(&identity));
-        // Every test node answers get-or-closer (ant-node ADR-0020); a client
-        // only sends one to a node whose user agent announces it, as
-        // ant-node's does. The `node/` prefix keeps it in routing tables.
-        core_config.custom_user_agent = Some(if options.announces_get_or_closer {
-            format!("node/ant-core-test {GET_OR_CLOSER_AGENT_TOKEN}")
-        } else {
-            "node/ant-core-test".to_string()
-        });
-        core_config.diversity_config = Some(IPDiversityConfig::permissive());
+            core_config.bootstrap_peers = bootstrap_peers
+                .iter()
+                .map(|addr| MultiAddr::quic(*addr))
+                .collect();
+            core_config.connection_timeout = Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS);
+            core_config.node_identity = Some(Arc::clone(&identity));
+            // Every test node answers get-or-closer (ant-node ADR-0020); a client
+            // only sends one to a node whose user agent announces it, as
+            // ant-node's does. The `node/` prefix keeps it in routing tables.
+            core_config.custom_user_agent = Some(if options.announces_get_or_closer {
+                format!("node/ant-core-test {GET_OR_CLOSER_AGENT_TOKEN}")
+            } else {
+                "node/ant-core-test".to_string()
+            });
+            core_config.diversity_config = Some(IPDiversityConfig::permissive());
+            core_config
+        };
 
-        let node = Arc::new(P2PNode::new(core_config).await.expect("create P2P node"));
+        // Create the P2P node, retrying a transient transport/port-bind failure,
+        // as ant-node's e2e harness does. On GitHub runners, node creation now and
+        // then fails with "Failed to create transport" when the chosen loopback
+        // port is momentarily held by another socket (macOS on 2026-10-29, ubuntu
+        // on 2026-11-04). A real transport misconfiguration fails every attempt.
+        let mut created = None;
+        let mut last_err = String::new();
+        for attempt in 1..=NODE_CREATE_ATTEMPTS {
+            match P2PNode::new(build_core_config()).await {
+                Ok(node) => {
+                    created = Some(node);
+                    break;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    sleep(Duration::from_millis(250 * u64::from(attempt))).await;
+                }
+            }
+        }
+        let node = Arc::new(created.unwrap_or_else(|| {
+            panic!("create P2P node after {NODE_CREATE_ATTEMPTS} attempts: {last_err}")
+        }));
         node.start().await.expect("start P2P node");
 
         // Create the chunk store. ant-node #216 replaced the LMDB chunk store
