@@ -25,6 +25,10 @@ use crate::node::types::{
 /// so this crate need not depend on that symbol.
 const RESTART_EXIT_CODE: i32 = 100;
 
+/// ant-node's flag for the UDP port of its browser (WebRTC Direct) listener. ant-node has accepted
+/// it since 0.20; without it the node lets the OS choose the port.
+const WEBRTC_PORT_ARG: &str = "--webrtc-direct-port";
+
 /// How often the low-disk monitor checks free space at node data directories and evicts a node if a
 /// partition has fallen to its eviction threshold.
 pub const EVICTION_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -928,6 +932,11 @@ pub fn build_node_args(config: &NodeConfig) -> Vec<String> {
         args.push(port.to_string());
     }
 
+    if let Some(port) = config.webrtc_port {
+        args.push(WEBRTC_PORT_ARG.to_string());
+        args.push(port.to_string());
+    }
+
     for peer in &config.bootstrap_peers {
         args.push("--bootstrap".to_string());
         args.push(peer.clone());
@@ -1553,6 +1562,7 @@ mod tests {
             data_dir: tmp.path().join("node-7"),
             log_dir: None,
             node_port: None,
+            webrtc_port: None,
             binary_path: "/bin/node".into(),
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
@@ -1646,6 +1656,7 @@ mod tests {
             data_dir: "/data/node-1".into(),
             log_dir: Some("/logs/node-1".into()),
             node_port: Some(12000),
+            webrtc_port: None,
             binary_path: "/bin/node".into(),
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
@@ -1657,6 +1668,8 @@ mod tests {
 
         let args = build_node_args(&config);
 
+        // No WebRTC port configured -> the node picks its own.
+        assert!(!args.contains(&WEBRTC_PORT_ARG.to_string()));
         assert!(args.contains(&"--rewards-address".to_string()));
         assert!(args.contains(&"0xabc123".to_string()));
         assert!(args.contains(&"--root-dir".to_string()));
@@ -1676,6 +1689,34 @@ mod tests {
         assert_eq!(evm_network_arg(&args), Some("arbitrum-one"));
     }
 
+    #[test]
+    fn build_node_args_passes_the_webrtc_port() {
+        let config = NodeConfig {
+            id: 1,
+            service_name: "node1".to_string(),
+            rewards_address: "0xabc123".to_string(),
+            data_dir: "/data/node-1".into(),
+            log_dir: None,
+            node_port: Some(12000),
+            webrtc_port: Some(13000),
+            binary_path: "/bin/node".into(),
+            version: "0.1.0".to_string(),
+            env_variables: HashMap::new(),
+            bootstrap_peers: vec![],
+            upgrade_channel: None,
+            evm_network: EvmNetwork::default(),
+            eviction: None,
+        };
+
+        let args = build_node_args(&config);
+
+        let flag = args
+            .iter()
+            .position(|arg| arg == WEBRTC_PORT_ARG)
+            .expect("WebRTC port flag");
+        assert_eq!(args.get(flag + 1).map(String::as_str), Some("13000"));
+    }
+
     /// Return the value following `--evm-network` in a built arg list, if present.
     fn evm_network_arg(args: &[String]) -> Option<&str> {
         let idx = args.iter().position(|a| a == "--evm-network")?;
@@ -1691,6 +1732,7 @@ mod tests {
             data_dir: "/data/node-1".into(),
             log_dir: None,
             node_port: None,
+            webrtc_port: None,
             binary_path: "/bin/node".into(),
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
@@ -1717,6 +1759,7 @@ mod tests {
             data_dir: "/data/node-1".into(),
             log_dir: None,
             node_port: None,
+            webrtc_port: None,
             binary_path: "/bin/node".into(),
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),
@@ -1748,6 +1791,7 @@ mod tests {
             data_dir: "/data/node-1".into(),
             log_dir: None,
             node_port: None,
+            webrtc_port: None,
             binary_path: "/bin/node".into(),
             version: "0.1.0".to_string(),
             env_variables: HashMap::new(),

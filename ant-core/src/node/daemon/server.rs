@@ -1255,6 +1255,7 @@ mod tests {
             data_dir,
             log_dir: None,
             node_port: None,
+            webrtc_port: None,
             binary_path,
             version: version.into(),
             env_variables: HashMap::new(),

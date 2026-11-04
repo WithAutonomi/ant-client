@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ant node add --webrtc-port <PORT|RANGE>` gives each node a fixed UDP port for its browser
+  (WebRTC Direct) listener, assigned like `--node-port`, so an operator can forward it. Browsers
+  reach a node only on that port, and each node used to pick it at random, so a node behind a
+  router could serve native clients but not browsers (ant-browser-sdk#10). A port given both as a
+  node port and as a WebRTC port is rejected. In `ant-core`: `AddNodeOpts::webrtc_port` and
+  `NodeConfig::webrtc_port`, both `None` in older REST request bodies and registry files.
+
 ## [0.3.12] - 2026-10-22
 
 ### Changed (breaking — `ant-core` browser API)

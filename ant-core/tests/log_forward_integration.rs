@@ -215,6 +215,7 @@ impl Fixture {
             data_dir: root.join("data"),
             log_dir: Some(log_dir),
             node_port: None,
+            webrtc_port: None,
             binary_path: root.join("antnode"),
             version: "0.17.2-beta.1".to_string(),
             env_variables: HashMap::new(),

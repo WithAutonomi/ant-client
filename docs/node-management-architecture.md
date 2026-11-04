@@ -223,6 +223,7 @@ their configuration.
       "data_dir": "/home/user/.local/share/ant/nodes/node-1",
       "log_dir": "/home/user/.local/share/ant/nodes/node-1/logs",
       "node_port": null,
+      "webrtc_port": null,
       "binary_path": "/home/user/.local/share/ant/bin/antnode",
       "version": "0.110.0",
       "env_variables": {},

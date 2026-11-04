@@ -117,6 +117,10 @@ pub struct NodeConfig {
     #[schema(value_type = Option<String>)]
     pub log_dir: Option<PathBuf>,
     pub node_port: Option<u16>,
+    /// UDP port of the node's browser (WebRTC Direct) listener. `None` lets the node pick one.
+    /// Backwards compatible: defaults to `None` when absent from an older registry file.
+    #[serde(default)]
+    pub webrtc_port: Option<u16>,
     #[schema(value_type = String)]
     pub binary_path: PathBuf,
     pub version: String,
@@ -326,6 +330,12 @@ pub struct AddNodeOpts {
     pub rewards_address: String,
     /// Port or port range for node(s).
     pub node_port: Option<PortRange>,
+    /// UDP port or port range for the nodes' browser (WebRTC Direct) listeners, assigned like
+    /// `node_port`. A fixed port lets an operator forward it so browsers can reach the node.
+    ///
+    /// `#[serde(default)]` keeps older REST request bodies deserializing.
+    #[serde(default)]
+    pub webrtc_port: Option<PortRange>,
     /// Custom data directory prefix.
     #[schema(value_type = Option<String>)]
     pub data_dir_path: Option<PathBuf>,
@@ -368,6 +378,7 @@ impl Default for AddNodeOpts {
             count: 1,
             rewards_address: String::new(),
             node_port: None,
+            webrtc_port: None,
             data_dir_path: None,
             log_dir_path: None,
             binary_source: BinarySource::default(),
@@ -585,6 +596,7 @@ mod tests {
         let config: NodeConfig = serde_json::from_str(legacy).unwrap();
         assert!(config.eviction.is_none());
         assert!(config.upgrade_channel.is_none());
+        assert!(config.webrtc_port.is_none());
     }
 
     #[test]
@@ -862,5 +874,7 @@ mod tests {
         }"#;
         let opts: AddNodeOpts = serde_json::from_str(legacy).unwrap();
         assert_eq!(opts.evm_network, EvmNetwork::ArbitrumOne);
+        // Nor does a request body from before `webrtc_port` existed need one.
+        assert!(opts.webrtc_port.is_none());
     }
 }

@@ -24,6 +24,12 @@ pub struct AddArgs {
     #[arg(long)]
     pub node_port: Option<String>,
 
+    /// UDP port or port range for the nodes' browser (WebRTC Direct) listeners
+    /// (e.g., 13000 or 13000-13004). Forward it like --node-port so browsers can
+    /// reach the node; without it each node picks a port at random.
+    #[arg(long)]
+    pub webrtc_port: Option<String>,
+
     /// Custom data directory prefix
     #[arg(long)]
     pub data_dir_path: Option<PathBuf>,
@@ -137,6 +143,9 @@ impl AddArgs {
                 if let Some(port) = node.node_port {
                     println!("    {} {}", "Port".dimmed(), port.to_string().cyan());
                 }
+                if let Some(port) = node.webrtc_port {
+                    println!("    {} {}", "WebRTC port".dimmed(), port.to_string().cyan());
+                }
                 println!(
                     "    {} {}",
                     "Binary".dimmed(),
@@ -152,6 +161,11 @@ impl AddArgs {
     fn to_add_node_opts(&self) -> anyhow::Result<AddNodeOpts> {
         let node_port = self
             .node_port
+            .as_deref()
+            .map(str::parse::<PortRange>)
+            .transpose()?;
+        let webrtc_port = self
+            .webrtc_port
             .as_deref()
             .map(str::parse::<PortRange>)
             .transpose()?;
@@ -172,6 +186,7 @@ impl AddArgs {
             count: self.count,
             rewards_address: self.rewards_address.clone(),
             node_port,
+            webrtc_port,
             data_dir_path: self.data_dir_path.clone(),
             log_dir_path: self.log_dir_path.clone(),
             binary_source,
