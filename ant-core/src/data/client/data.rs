@@ -481,16 +481,42 @@ impl Client {
         &self,
         index: &self_encryption::DataMapIndex,
         concurrency: usize,
-        deliver: impl Fn(usize, Bytes) -> std::result::Result<(), String>,
+        deliver: impl Fn(
+            usize,
+            Bytes,
+            crate::data::client::chunk::ChunkSource,
+        ) -> std::result::Result<(), String>,
     ) -> Result<()> {
+        // Where each record came from, stashed by the fetch and taken by
+        // `deliver`. `read_chunks` runs `deliver` synchronously once a fetch
+        // resolves, with no await in between, so the entry is always the one
+        // this chunk's fetch just wrote; this path is wasm32 only, so the
+        // single-threaded `RefCell` is sound.
+        let sources: std::cell::RefCell<
+            std::collections::HashMap<[u8; 32], crate::data::client::chunk::ChunkSource>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+        let infos = index.infos();
         crate::client_engine::files::read_chunks(
             index,
-            0..index.infos().len(),
-            &|address| self.fetch_data_record(address),
+            0..infos.len(),
+            &|address| {
+                let sources = &sources;
+                async move {
+                    let (bytes, source) = self.fetch_data_record_with_source(address).await?;
+                    sources.borrow_mut().insert(address, source);
+                    Ok(bytes)
+                }
+            },
             &|| self.controller().fetch.current().min(concurrency),
             &crate::runtime::sleep,
             retry_data_fetch,
-            deliver,
+            |chunk, plaintext| {
+                let source = sources
+                    .borrow_mut()
+                    .remove(&infos[chunk].dst_hash.0)
+                    .expect("a delivered chunk's fetch recorded its source");
+                deliver(chunk, plaintext, source)
+            },
         )
         .await
         .map_err(map_read_error)
@@ -527,13 +553,28 @@ impl Client {
         self.chunk_get_observed(&address)
             .await?
             .map(|chunk| chunk.content)
-            .ok_or_else(|| {
-                Error::NotFound(format!(
-                    "Missing chunk {} required for data reconstruction",
-                    hex::encode(address)
-                ))
-            })
+            .ok_or_else(|| missing_data_record(address))
     }
+
+    /// Fetch one record as [`Client::fetch_data_record`] does, and report
+    /// where it came from.
+    #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
+    async fn fetch_data_record_with_source(
+        &self,
+        address: [u8; 32],
+    ) -> Result<(Bytes, crate::data::client::chunk::ChunkSource)> {
+        self.chunk_get_observed_with_source(&address)
+            .await?
+            .map(|(chunk, source)| (chunk.content, source))
+            .ok_or_else(|| missing_data_record(address))
+    }
+}
+
+fn missing_data_record(address: [u8; 32]) -> Error {
+    Error::NotFound(format!(
+        "Missing chunk {} required for data reconstruction",
+        hex::encode(address)
+    ))
 }
 
 fn retry_data_fetch(error: &Error) -> bool {

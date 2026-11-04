@@ -6,7 +6,7 @@ import { Writable } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BrowserNetworkClient } from "./client-fixture.mjs";
-import { encryptPublicFile } from "./pkg/ant_core.js";
+import { encryptPublicFile, parseWebRtcDirectMultiaddr } from "./pkg/ant_core.js";
 import { mockWebRtc } from "./mock-webrtc.mjs";
 
 const large = JSON.parse(await readFile(new URL("./fixtures/large-file.json", import.meta.url)));
@@ -313,7 +313,7 @@ test("a writer rejection stops a stream and releases its lock", async () => {
 test("in-memory downloads use one JS output buffer and return recoverable allocation failures", async () => {
   const original = new TextEncoder().encode("In-memory download round trip.".repeat(100));
   const encrypted = encryptPublicFile(original);
-  const { client } = fixture(encrypted.records);
+  const { rtc, client } = fixture(encrypted.records);
   const NativeUint8Array = globalThis.Uint8Array;
   let reader;
   try {
@@ -322,9 +322,20 @@ test("in-memory downloads use one JS output buffer and return recoverable alloca
       { maxMemoryBytes: original.length });
     assert.deepEqual(result.content, original);
     assert.equal(result.file.chunks.length, 3);
-    // Probes time the first chunks by these messages.
+    // Probes time the first chunks by these messages, and a read investigation
+    // needs the node that served each chunk and the GETs it cost (V2-1872).
+    const peers = rtc.endpoints.map(endpoint => parseWebRtcDirectMultiaddr(endpoint).peerId);
     const chunkProgress = messages.filter(message => message.startsWith("Downloaded chunk "));
-    assert.deepEqual(chunkProgress, ["Downloaded chunk 0/3", "Downloaded chunk 1/3", "Downloaded chunk 2/3", "Downloaded chunk 3/3"]);
+    assert.equal(chunkProgress[0], "Downloaded chunk 0/3");
+    assert.equal(chunkProgress.length, 4);
+    chunkProgress.slice(1).forEach((message, delivered) => {
+      const parts = /^Downloaded chunk (\d+)\/3 from ([0-9a-f]{64}) after (\d+) attempts$/.exec(message);
+      assert(parts, `unexpected chunk progress ${message}`);
+      assert.equal(parts[1], String(delivered + 1));
+      assert(peers.includes(parts[2]), `${parts[2]} served a chunk but is not a mock node`);
+      // One uncontended mock holder: one GET per chunk.
+      assert.equal(parts[3], "1");
+    });
     const unset = await client.downloadPublicFile(encrypted.address, null, () => {});
     assert.equal(unset.hash, result.hash);
     globalThis.Uint8Array = class extends NativeUint8Array {
@@ -350,4 +361,32 @@ test("in-memory downloads use one JS output buffer and return recoverable alloca
     assert.equal(streamed.hash, result.hash);
     assert.deepEqual(Buffer.concat(chunks), Buffer.from(original));
   } finally { globalThis.Uint8Array = NativeUint8Array; reader?.close(); client.close(); }
+});
+
+test("a repeated in-memory download reports every chunk from the chunk cache", async () => {
+  const original = new TextEncoder().encode("Cached download round trip.".repeat(100));
+  const encrypted = encryptPublicFile(original);
+  const { rtc, client } = fixture(encrypted.records);
+  try {
+    await client.downloadPublicFile(encrypted.address, 2, () => {});
+    const before = rtc.requests.length;
+    const messages = [];
+    const again = await client.downloadPublicFile(encrypted.address, 2, message => messages.push(message));
+    assert.deepEqual(again.content, original);
+    // The client's chunk cache answers the second download, so it reports no
+    // serving peer and no GET.
+    assert.deepEqual(messages.filter(message => message.startsWith("Downloaded chunk ")), [
+      "Downloaded chunk 0/3",
+      "Downloaded chunk 1/3 from cache after 0 attempts",
+      "Downloaded chunk 2/3 from cache after 0 attempts",
+      "Downloaded chunk 3/3 from cache after 0 attempts",
+    ]);
+    // And it really sent none: the data records are the file's records other
+    // than its DataMap, which the download resolves on its own path.
+    const data = new Set(encrypted.records.map(record => record.address)
+      .filter(address => address !== encrypted.address));
+    const refetched = rtc.requests.slice(before)
+      .filter(request => request.method === "get_chunk" && data.has(request.address));
+    assert.deepEqual(refetched, []);
+  } finally { client.close(); }
 });
