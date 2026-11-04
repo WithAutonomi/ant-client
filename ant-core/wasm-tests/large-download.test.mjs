@@ -390,3 +390,48 @@ test("a repeated in-memory download reports every chunk from the chunk cache", a
     assert.deepEqual(refetched, []);
   } finally { client.close(); }
 });
+
+test("a chunk retried in a later round reports every GET it cost", { timeout: 120_000 }, async () => {
+  const original = new TextEncoder().encode("Retried download round trip.".repeat(100));
+  const encrypted = encryptPublicFile(original);
+  const withheld = encrypted.records.find(record => record.address !== encrypted.address);
+  // Answer the first two GETs for one data record from a store that does not
+  // hold it. One `chunk_get` call cannot spend more than that before giving up
+  // here, so the record is only found in a later deferred round of
+  // `read_chunks` — which is a fresh `chunk_get` with its own attempt count.
+  const WITHHELD_GETS = 2;
+  let asked = 0;
+  let rtc;
+  rtc = mockWebRtc([{
+    respond(_channel, method) {
+      if (method !== "get_chunk") return;
+      if (rtc.requests.at(-1).address !== withheld.address) return;
+      // The NotFound is already built, so supplying the record now makes it
+      // available to the next GET, not this one.
+      if (++asked === WITHHELD_GETS) rtc.stores[0].set(withheld.address, withheld.content);
+    },
+  }]);
+  for (const record of encrypted.records) {
+    if (record.address !== withheld.address) rtc.stores[0].set(record.address, record.content);
+  }
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  try {
+    const messages = [];
+    const result = await client.downloadPublicFile(encrypted.address, 2, message => messages.push(message));
+    assert.deepEqual(result.content, original);
+    const served = rtc.requests
+      .filter(request => request.method === "get_chunk" && request.address === withheld.address).length;
+    // More GETs than one round can spend: the record was fetched again after a
+    // round returned NotFound, so the reported total has to span both.
+    assert(served > WITHHELD_GETS, `the withheld record was only asked for ${served} time(s)`);
+    const attempts = messages
+      .filter(message => message.startsWith("Downloaded chunk ") && message.includes(" after "))
+      .map(message => Number(/ after (\d+) attempts$/.exec(message)[1]));
+    assert.equal(attempts.length, 3);
+    // The retried chunk must report every GET the mock served for it, across
+    // the rounds that failed and the round that succeeded — not just the
+    // succeeding round's count.
+    assert.deepEqual(attempts.filter(count => count > 1), [served]);
+    assert.equal(attempts.filter(count => count === 1).length, 2);
+  } finally { client.close(); }
+});

@@ -495,14 +495,38 @@ impl Client {
         let sources: std::cell::RefCell<
             std::collections::HashMap<[u8; 32], crate::data::client::chunk::ChunkSource>,
         > = std::cell::RefCell::new(std::collections::HashMap::new());
+        // Peer GETs each record has cost so far. `read_chunks` retries a record
+        // that was not found in later deferred rounds, and every round is a
+        // fresh `chunk_get` with its own count, so the rounds are added up here
+        // and the chunk reports what it cost altogether.
+        let spent: std::cell::RefCell<std::collections::HashMap<[u8; 32], usize>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
         let infos = index.infos();
         crate::client_engine::files::read_chunks(
             index,
             0..infos.len(),
             &|address| {
-                let sources = &sources;
+                let (sources, spent) = (&sources, &spent);
                 async move {
-                    let (bytes, source) = self.fetch_data_record_with_source(address).await?;
+                    let dispatched = std::sync::atomic::AtomicUsize::new(0);
+                    let fetched = self
+                        .fetch_data_record_with_source(address, &dispatched)
+                        .await;
+                    // A round that found the record reports its GETs through
+                    // the source, which a single-flight joiner also receives;
+                    // a round that failed reports only through `dispatched`.
+                    let round = match &fetched {
+                        Ok((_, source)) => source.attempts,
+                        Err(_) => dispatched.load(std::sync::atomic::Ordering::Relaxed),
+                    };
+                    let total = {
+                        let mut spent = spent.borrow_mut();
+                        let total = spent.entry(address).or_default();
+                        *total += round;
+                        *total
+                    };
+                    let (bytes, mut source) = fetched?;
+                    source.attempts = total;
                     sources.borrow_mut().insert(address, source);
                     Ok(bytes)
                 }
@@ -562,8 +586,9 @@ impl Client {
     async fn fetch_data_record_with_source(
         &self,
         address: [u8; 32],
+        dispatched: &std::sync::atomic::AtomicUsize,
     ) -> Result<(Bytes, crate::data::client::chunk::ChunkSource)> {
-        self.chunk_get_observed_with_source(&address)
+        self.chunk_get_observed_with_source(&address, dispatched)
             .await?
             .map(|(chunk, source)| (chunk.content, source))
             .ok_or_else(|| missing_data_record(address))
