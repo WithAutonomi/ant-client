@@ -937,7 +937,7 @@ dependencies = [
 [[package]]
 name = "ant-node"
 version = "0.23.1"
-source = "git+https://github.com/grumbach/ant-node?branch=feat%2Fpeer-swarm#e5e86480d978edb6219f660685b89259e57f24f2"
+source = "git+https://github.com/grumbach/ant-node?branch=feat%2Fpeer-swarm#d39c393f658469fe13bc10371e4277c61f4f89b7"
 dependencies = [
  "ant-protocol",
  "bao",
