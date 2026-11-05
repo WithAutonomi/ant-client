@@ -36,19 +36,27 @@ use ant_protocol::transport::{
     CoreNodeConfig, IPDiversityConfig, MlDsa65, MultiAddr, NodeIdentity, P2PEvent, P2PNode,
 };
 use ant_protocol::{CLOSE_GROUP_SIZE, GET_OR_CLOSER_AGENT_TOKEN, MAX_WIRE_MESSAGE_SIZE};
-use rand::Rng;
+use futures::future::join_all;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
 
-const TEST_PORT_RANGE_MIN: u16 = 20_000;
-const TEST_PORT_RANGE_MAX: u16 = 60_000;
 const BOOTSTRAP_COUNT: usize = 2;
 const SPAWN_DELAY_MS: u64 = 200;
 const STABILIZATION_TIMEOUT_SECS: u64 = 180;
+/// The test nodes' saorsa-core `connection_timeout`.
+///
+/// saorsa-core also uses it as the request timeout for every DHT operation
+/// (`DhtNetworkConfig::request_timeout` is set from it), so it bounds how long
+/// a witnessed close-group lookup waits for each peer, as well as the DHT leave
+/// waits in `teardown` (which runs them concurrently, so they don't add up).
+/// At 5 s, slow but live peers were dropped on loaded CI runners, and uploads
+/// failed with "found 6 peers, need 7" (V2-1852); 10 s held on dev2 with the
+/// test capped to one CPU core. Production uses 25 s. ant-node's e2e harness
+/// uses the same value; keep the two in step.
+const TEST_CORE_CONNECTION_TIMEOUT_SECS: u64 = 10;
 /// A chunk read request is a few dozen bytes, so anything larger, such as a
 /// PUT carrying a chunk, is not decoded.
 const MAX_READ_REQUEST_BYTES: usize = 1024;
@@ -329,8 +337,6 @@ impl MiniTestnet {
             .expect("create funded wallet");
 
         let bootstrap_count = BOOTSTRAP_COUNT.min(node_count);
-        let base_port = rand::thread_rng()
-            .gen_range(TEST_PORT_RANGE_MIN..TEST_PORT_RANGE_MAX - node_count as u16);
         let mut nodes = Vec::with_capacity(node_count);
         let mut temp_dirs = Vec::with_capacity(node_count);
         let reads = Arc::new(ReadRequestCounts::default());
@@ -338,12 +344,8 @@ impl MiniTestnet {
 
         // Phase 1: Spawn bootstrap nodes
         for i in 0..bootstrap_count {
-            let port = base_port + i as u16;
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-
             let temp_dir = tempfile::TempDir::new().expect("create temp dir");
             let (node, protocol, silence, chunk_gets, handler) = Self::spawn_node(
-                addr,
                 &bootstrap_addrs,
                 temp_dir.path(),
                 &evm_network,
@@ -353,7 +355,14 @@ impl MiniTestnet {
             )
             .await;
 
-            bootstrap_addrs.push(addr);
+            // The OS picked the node's port (see `spawn_node`), so later nodes
+            // bootstrap from the address it actually bound.
+            let listen_addrs = node.listen_addrs().await;
+            assert!(
+                !listen_addrs.is_empty(),
+                "bootstrap node {i} has no listen address"
+            );
+            bootstrap_addrs.extend(listen_addrs);
             nodes.push(TestNode {
                 p2p_node: Some(Arc::clone(&node)),
                 protocol: Some(protocol),
@@ -367,12 +376,8 @@ impl MiniTestnet {
 
         // Phase 2: Spawn regular nodes
         for i in bootstrap_count..node_count {
-            let port = base_port + i as u16;
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-
             let temp_dir = tempfile::TempDir::new().expect("create temp dir");
             let (node, protocol, silence, chunk_gets, handler) = Self::spawn_node(
-                addr,
                 &bootstrap_addrs,
                 temp_dir.path(),
                 &evm_network,
@@ -483,8 +488,7 @@ impl MiniTestnet {
 
     #[allow(clippy::too_many_lines)]
     async fn spawn_node(
-        listen_addr: SocketAddr,
-        bootstrap_peers: &[SocketAddr],
+        bootstrap_peers: &[MultiAddr],
         data_dir: &std::path::Path,
         evm_network: &EvmNetwork,
         node_index: usize,
@@ -503,19 +507,25 @@ impl MiniTestnet {
         // IPv4-only is intentional for these loopback-only tests: everything
         // binds to 127.0.0.1 on the local host, so dual-stack would add no
         // value and pulls in v6 loopback quirks on some CI runners.
+        //
+        // Port 0: the OS picks a free port, and callers read it back from
+        // `listen_addrs()`. The harness used to pick a random port in
+        // 20000-60000, which overlaps the OS ephemeral range, and now and then
+        // node creation failed with "Failed to create transport" (V2-1852).
+        // Every node and client starts a UPnP gateway search that holds a
+        // `0.0.0.0:<ephemeral>` UDP socket for up to 2 s, and a 127.0.0.1 bind
+        // to a port a wildcard socket holds fails with "address in use". The OS
+        // never assigns a port that is in use.
         let mut core_config = CoreNodeConfig::builder()
-            .port(listen_addr.port())
+            .port(0)
             .ipv6(false)
             .local(true)
             .max_message_size(MAX_WIRE_MESSAGE_SIZE)
             .build()
             .expect("create core config");
 
-        core_config.bootstrap_peers = bootstrap_peers
-            .iter()
-            .map(|addr| MultiAddr::quic(*addr))
-            .collect();
-        core_config.connection_timeout = Duration::from_secs(5);
+        core_config.bootstrap_peers = bootstrap_peers.to_vec();
+        core_config.connection_timeout = Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS);
         core_config.node_identity = Some(Arc::clone(&identity));
         // Every test node answers get-or-closer (ant-node ADR-0020); a client
         // only sends one to a node whose user agent announces it, as
@@ -784,11 +794,18 @@ impl MiniTestnet {
         //    OS can reclaim them before the next sequential test starts.
         //    Without this, ports remain in TIME_WAIT and subsequent tests
         //    encounter "Peer not found" / "Stream error" transport failures.
-        for node in &self.nodes {
-            if let Some(ref p2p_node) = node.p2p_node {
-                let _ = p2p_node.shutdown().await;
-            }
-        }
+        //    The nodes shut down concurrently, so their DHT leave waits (each
+        //    bounded by TEST_CORE_CONNECTION_TIMEOUT_SECS) overlap instead of
+        //    adding up.
+        join_all(
+            self.nodes
+                .iter()
+                .filter_map(|node| node.p2p_node.as_ref())
+                .map(|p2p_node| async move {
+                    let _ = p2p_node.shutdown().await;
+                }),
+        )
+        .await;
     }
 }
 
