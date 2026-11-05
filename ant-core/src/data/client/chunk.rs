@@ -597,17 +597,23 @@ async fn after_nodes<T>(
 
 /// `dispatched`, for a GET whose dispatch `read`, if any, learns of: the
 /// notice the GET gets, and the future that passes it on, which the GET's
-/// own future runs beside.
+/// own future runs beside. The GET counts in `attempts` once it is sent, or
+/// once it ends unsent (it failed before it could be); one cancelled while
+/// still waiting for its turn, because a reader or another GET brought the
+/// record first, cost nothing and is not counted.
 fn watch_dispatch<'a>(
     dispatched: RequestDispatched,
     read: Option<&'a SwarmRead>,
+    attempts: &'a AtomicUsize,
 ) -> (
     RequestDispatched,
     impl std::future::Future<Output = ()> + 'a,
 ) {
     let (notice, sent) = RequestDispatched::channel();
     let forward = async move {
-        if sent.await.is_ok() {
+        let was_sent = sent.await.is_ok();
+        attempts.fetch_add(1, AtomicOrdering::Relaxed);
+        if was_sent {
             if let Some(read) = read {
                 read.dispatched.store(true, AtomicOrdering::Release);
             }
@@ -1316,9 +1322,10 @@ impl Client {
         let _fetching = self.swarm().fetching(address, shares);
         #[cfg(feature = "native")]
         let observation = diag.map(|_| std::sync::Mutex::new(ReadObservation::default()));
-        // Peer GETs this call dispatched, across its early, ordinary and retry
-        // rounds. An atomic, not a `Cell`, because the native `data_download`
-        // futures that reach here are asserted `Send`.
+        // Peer GETs this call sent, or that failed before they could be,
+        // across its early, ordinary and retry rounds (see `watch_dispatch`).
+        // An atomic, not a `Cell`, because the native `data_download` futures
+        // that reach here are asserted `Send`.
         let attempts = AtomicUsize::new(0);
         let node_read = || async {
             // ADR-0020: ask the peers the lookup finds likely to hold the chunk
@@ -1467,10 +1474,8 @@ impl Client {
                 |(peer, addrs), early, dispatched| {
                     #[cfg(feature = "native")]
                     let observation = &observation;
-                    let attempts = &attempts;
-                    let (dispatched, forward) = watch_dispatch(dispatched, swarm);
+                    let (dispatched, forward) = watch_dispatch(dispatched, swarm, &attempts);
                     let get = async move {
-                        attempts.fetch_add(1, AtomicOrdering::Relaxed);
                         if early {
                             #[cfg(feature = "native")]
                             if let Some(diag) = diag {
@@ -2547,6 +2552,41 @@ mod tests {
         // Defensive: a zeroed outcome (e.g. the first attempt's
         // close-group lookup errored) is never authoritative.
         assert!(!is_authoritative_not_found(0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_get_counts_once_sent_or_failed_but_not_while_still_queued() {
+        use futures::FutureExt;
+        let attempts = AtomicUsize::new(0);
+        let read = SwarmRead::default();
+
+        // Sent: counted, and the read learns that a node has the record now.
+        let (notice, forward) =
+            watch_dispatch(RequestDispatched::unobserved(), Some(&read), &attempts);
+        notice.notify();
+        forward.await;
+        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 1);
+        assert!(read.dispatched.load(AtomicOrdering::Acquire));
+
+        // Failed before it could be sent: counted, as main counts a GET that
+        // cost a try, and no dispatch is reported.
+        let read = SwarmRead::default();
+        let (notice, forward) =
+            watch_dispatch(RequestDispatched::unobserved(), Some(&read), &attempts);
+        drop(notice);
+        forward.await;
+        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 2);
+        assert!(!read.dispatched.load(AtomicOrdering::Acquire));
+
+        // Cancelled while still waiting for its turn, as when a reader sends
+        // the record a queued browser GET was waiting to ask for: not counted,
+        // whatever its notice does afterwards.
+        let (notice, forward) =
+            watch_dispatch(RequestDispatched::unobserved(), Some(&read), &attempts);
+        assert!(forward.now_or_never().is_none());
+        notice.notify();
+        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 2);
+        assert!(!read.dispatched.load(AtomicOrdering::Acquire));
     }
 
     #[test]
