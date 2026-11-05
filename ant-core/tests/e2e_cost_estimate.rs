@@ -171,7 +171,7 @@ async fn test_estimate_matches_actual_cost() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_estimate_works_without_wallet() {
-    // Use 10 nodes (> CLOSE_GROUP_SIZE=7) for quote reliability
+    // DEFAULT_NODE_COUNT, well above CLOSE_GROUP_SIZE, for quote reliability
     let testnet = MiniTestnet::start(DEFAULT_NODE_COUNT).await;
     let node = testnet.node(3).expect("Node 3 should exist");
 
