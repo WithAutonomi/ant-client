@@ -528,6 +528,21 @@ async fn an_ask_that_finds_no_peer_spends_none_of_the_reads_time() {
 }
 
 #[test]
+fn a_client_asks_for_a_files_records_in_one_order_of_its_own() {
+    let one = Swarm::with_rtc(None, 0);
+    let order = one.read_order(64);
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, (0..64).collect::<Vec<_>>());
+    // Every download in this client asks in the same order, so two at once
+    // share each record's fetch.
+    assert_eq!(one.read_order(64), order);
+    // Another client asks in another (the same one from two random seeds
+    // would be a 1 in 64! chance).
+    assert_ne!(Swarm::with_rtc(None, 0).read_order(64), order);
+}
+
+#[test]
 fn a_room_starts_a_bounded_number_of_answers() {
     let room = Room::new([3; 32], 1, SECRET).unwrap_or_else(|| panic!("a room"));
     for _ in 0..room::ANSWERS_PER_WINDOW {

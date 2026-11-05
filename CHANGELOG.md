@@ -29,8 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as long as the nodes take now, then the nodes are read too, and the first record that checks
   against its address wins. Finding peers runs on its own and never delays a read, and a
   client sends other readers one record at a time while its own fetches run; nodes stay the last
-  seed, and nodes without swarm rooms are read as before. A browser download asks for its
-  records in an order of its own. Always on. In `ant-core`: `Client::join_swarm`,
+  seed, and nodes without swarm rooms are read as before. A browser client asks for a file's
+  records in an order of its own, the same for each of its downloads. Always on. In `ant-core`: `Client::join_swarm`,
   `swarm_stats` and `swarm_room_stats`, with `SwarmStats` (its `discovery` field a
   `DiscoveryStats`) and `RoomStats` (each open link's `OpenLinkPeer` names the peer it reaches,
   for that room only). In the browser: `joinSwarm`, `swarmStats` and `swarmRoomStats`, and a

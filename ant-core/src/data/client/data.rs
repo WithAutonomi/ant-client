@@ -21,8 +21,6 @@ use ant_protocol::compute_address;
 use bytes::Bytes;
 #[cfg(feature = "native")]
 use futures::stream::StreamExt;
-#[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
-use rand::seq::SliceRandom;
 use self_encryption::{encrypt, DataMap};
 use sha2::{Digest, Sha256};
 use std::num::NonZeroUsize;
@@ -494,11 +492,13 @@ impl Client {
     /// together in deferred rounds. Each chunk goes to `deliver` as it arrives,
     /// in any order.
     ///
-    /// The records are asked for in an order of this download's own, as
+    /// The records are asked for in an order of this client's own, as
     /// BitTorrent picks pieces: readers of one file who start together then
     /// hold different records early on, and a record one is still waiting
-    /// for can come from another reader that has it. A download delivers its
-    /// chunks in any order, so its order costs it nothing.
+    /// for can come from another reader that has it. Two downloads of a file
+    /// in one client ask in the same order, so they still share each record's
+    /// fetch. A download delivers its chunks in any order, so its order costs
+    /// it nothing.
     #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
     pub(crate) async fn data_download_indexed_chunks(
         &self,
@@ -525,8 +525,7 @@ impl Client {
         let spent: std::cell::RefCell<std::collections::HashMap<[u8; 32], usize>> =
             std::cell::RefCell::new(std::collections::HashMap::new());
         let infos = index.infos();
-        let mut order: Vec<usize> = (0..infos.len()).collect();
-        order.shuffle(&mut rand::thread_rng());
+        let order = self.swarm().read_order(infos.len());
         crate::client_engine::files::read_chunks(
             index,
             order,

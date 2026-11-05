@@ -53,7 +53,9 @@ use std::time::UNIX_EPOCH;
 use ant_protocol::{MemberId, Membership, OfferId, RoomKey};
 use bytes::Bytes;
 use futures::future::{select, Either};
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, Semaphore};
 
@@ -664,6 +666,9 @@ pub(crate) struct Inner {
     /// Whether any join waits, so a read looks at them only then.
     joins_wait: AtomicBool,
     stop: Arc<Stop>,
+    /// Picks the order this client's browser downloads ask for a file's
+    /// records in (see [`Swarm::read_order`]).
+    read_order_seed: u64,
 }
 
 impl Default for Swarm {
@@ -726,8 +731,24 @@ impl Swarm {
                 waiting_joins: Mutex::default(),
                 joins_wait: AtomicBool::new(false),
                 stop: Arc::default(),
+                read_order_seed: rand::random(),
             }),
         }
+    }
+
+    /// The order a browser download asks for a file's `records` records in:
+    /// picked at random once per client, as BitTorrent picks pieces, so
+    /// readers in different clients ask in different orders, while two
+    /// downloads of one file in this client ask in the same one and keep
+    /// sharing each record's fetch.
+    #[cfg_attr(
+        not(all(feature = "browser-wasm", target_arch = "wasm32")),
+        allow(dead_code)
+    )]
+    pub(crate) fn read_order(&self, records: usize) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..records).collect();
+        order.shuffle(&mut StdRng::seed_from_u64(self.inner.read_order_seed));
+        order
     }
 
     /// Joins the room for a file being read, if not in it already, through
