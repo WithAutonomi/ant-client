@@ -4,15 +4,23 @@ on:
   pull_request:
     branches: [main, "rc-*"]
 
+# A new push to a PR cancels the run still going for the commit it replaces.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   RUST_LOG: "off"
 
+# Every job has a timeout above its slowest successful run in the 50 runs
+# before 2026-11-04 (V2-1867).
 jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,6 +33,7 @@ jobs:
   release-scripts:
     name: Release scripts
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Test the release notes fallback
@@ -35,6 +44,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -50,6 +60,7 @@ jobs:
   notices:
     name: Third-party notices
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -73,6 +84,7 @@ jobs:
   browser-wasm:
     name: Browser WASM
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -183,6 +195,7 @@ jobs:
   test-unit:
     name: Unit Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -203,6 +216,7 @@ jobs:
   test-e2e:
     name: E2E Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 110
     strategy:
       fail-fast: false
       matrix:
@@ -252,8 +266,7 @@ jobs:
     # was breached with the ADR-0003 six-test suite (PR #174: macOS
     # passed at 57m09s, Ubuntu canceled at 60m20s mid-run with no test
     # failure — V2-1046). 90 min gives the observed ~60-min runtime real
-    # headroom while still catching genuine hangs (the neighboring E2E
-    # job has no explicit cap at all, so 90 remains the tighter bound).
+    # headroom while still catching genuine hangs.
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -294,6 +307,7 @@ jobs:
   doc:
     name: Documentation
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -306,6 +320,7 @@ jobs:
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -320,6 +335,7 @@ jobs:
   security:
     name: Security Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
