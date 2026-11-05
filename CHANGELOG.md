@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Downloaded chunk n/total` prefix is unchanged, so startup probes that match on it still work
   (#249).
 
+### Fixed
+- A merkle payment sent about 500 candidate requests at once, and part of the burst of answers
+  could be lost on a loaded host, so pools came up short of 16 candidates and the payment failed
+  or retried (V2-1893). A payment now has at most 32 candidate requests in flight. On mainnet
+  this added about half a second per tree. (#252)
+
 ## [0.3.12] - 2026-10-22
 
 ### Changed (breaking — `ant-core` browser API)

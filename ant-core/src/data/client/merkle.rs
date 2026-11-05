@@ -43,6 +43,28 @@ use xor_name::XorName;
 /// Default threshold: use merkle payments when chunk count >= this value.
 pub const DEFAULT_MERKLE_THRESHOLD: usize = 64;
 
+/// Most merkle candidate requests one payment has in flight at once, across all
+/// of its candidate pools.
+///
+/// Every pool asks up to `2 * CANDIDATES_PER_POOL` peers, and a tree's pools
+/// (up to 16) are queried concurrently, so one tree could send about 500
+/// requests at once and get about 500 responses back in one burst. saorsa-core
+/// queues inbound messages on 8 dispatch shards chosen by the sender's IP, 32
+/// messages each, and drops a message when its shard is full (V2-1893).
+/// Responses from peers that share an IP (several nodes on one host, or every
+/// node of a local testnet) all land on one shard, so part of the burst was
+/// dropped. Under CPU load, part of such a burst is also lost below the
+/// dispatcher (V2-1901). Each lost response cost its request the whole
+/// versioned-probe timeout and then a legacy retry, and pools came up short of
+/// 16 candidates.
+///
+/// 32 is the measured choice (V2-1893). On a local testnet held to 2 cores it
+/// lost no responses, against hundreds uncapped, and on mainnet it added about
+/// half a second per tree. A request holds its permit through the probe and the
+/// legacy retry, so slow peers delay the requests queued behind them. A cap of
+/// 16 measured about 6 s per tree on mainnet for that reason.
+const MAX_IN_FLIGHT_MERKLE_CANDIDATE_REQUESTS: usize = 32;
+
 /// Payment multiplier applied to a quoted price before settlement.
 ///
 /// Deliberately the **same constant** the single-node path uses rather than a
@@ -1219,10 +1241,15 @@ impl Client {
     ) -> Result<Vec<MerklePaymentCandidatePool>> {
         on_pool(0, midpoint_proofs.len());
         let mut pool_futures = FuturesUnordered::new();
+        // Shared by every pool of this payment; see the constant.
+        let in_flight = Arc::new(tokio::sync::Semaphore::new(
+            MAX_IN_FLIGHT_MERKLE_CANDIDATE_REQUESTS,
+        ));
 
         for midpoint_proof in midpoint_proofs {
             let pool_address = midpoint_proof.address();
             let mp = midpoint_proof.clone();
+            let in_flight = Arc::clone(&in_flight);
             pool_futures.push(async move {
                 let candidate_nodes = self
                     .get_merkle_candidate_pool(
@@ -1230,6 +1257,7 @@ impl Client {
                         data_type,
                         data_size,
                         merkle_payment_timestamp,
+                        in_flight,
                     )
                     .await?;
                 Ok::<_, Error>(MerklePaymentCandidatePool {
@@ -1269,6 +1297,9 @@ impl Client {
     }
 
     /// Collect `CANDIDATES_PER_POOL` (16) merkle candidate quotes from the network.
+    ///
+    /// Each request to a candidate, including its legacy-shape retry, holds a
+    /// permit from `in_flight` while it waits for an answer.
     #[allow(clippy::too_many_lines)]
     async fn get_merkle_candidate_pool(
         &self,
@@ -1276,6 +1307,7 @@ impl Client {
         data_type: u32,
         data_size: u64,
         merkle_payment_timestamp: u64,
+        in_flight: Arc<tokio::sync::Semaphore>,
     ) -> Result<[MerklePaymentCandidateNode; CANDIDATES_PER_POOL]> {
         let node = self.network();
         let timeout = Duration::from_secs(self.config().quote_timeout_secs);
@@ -1391,8 +1423,11 @@ impl Client {
             let node_clone = node.clone();
             let peers_handle = Arc::clone(&unversioned_peers);
             let capable_handle = Arc::clone(&versioned_capable);
+            let in_flight = Arc::clone(&in_flight);
 
             let fut = async move {
+                // The semaphore is never closed, so acquiring only waits.
+                let _permit = in_flight.acquire_owned().await.ok();
                 // First contact waits only long enough to learn whether the
                 // peer can parse the shape. A peer already known to be legacy
                 // gets the caller's full patience, because that request is the
