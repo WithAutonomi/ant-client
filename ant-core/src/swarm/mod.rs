@@ -233,6 +233,8 @@ pub(crate) struct Pace {
     total: AtomicU64,
     /// What the read spent on peers, kept across its asks.
     spent: Mutex<Spent>,
+    /// The record came from this swarm's own store, not from a peer now.
+    held: AtomicBool,
 }
 
 /// What a read has spent on peers across every time it asks them: the
@@ -287,6 +289,12 @@ impl Pace {
             return false;
         }
         elapsed.as_millis().saturating_mul(total) <= by.as_millis().saturating_mul(received)
+    }
+
+    /// Whether the record [`Swarm::fetch_paced`] returned was one this swarm
+    /// held already, rather than one a peer sent for this read.
+    pub(crate) fn came_held(&self) -> bool {
+        self.held.load(Ordering::Relaxed)
     }
 }
 
@@ -1017,6 +1025,7 @@ impl Swarm {
             for key in &rooms {
                 self.start_finding(key);
             }
+            pace.held.store(true, Ordering::Relaxed);
             return Some(record);
         }
         // A hidden page's timers are slowed to a second or more, which would

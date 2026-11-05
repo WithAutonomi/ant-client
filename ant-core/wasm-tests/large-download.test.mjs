@@ -363,6 +363,32 @@ test("in-memory downloads use one JS output buffer and return recoverable alloca
   } finally { globalThis.Uint8Array = NativeUint8Array; reader?.close(); client.close(); }
 });
 
+test("a download reports a record the client's swarm already holds as from the cache", async () => {
+  const original = new TextEncoder().encode("Held record round trip.".repeat(100));
+  const encrypted = encryptPublicFile(original);
+  const { client } = fixture(encrypted.records);
+  let reader;
+  try {
+    // A reader's read-ahead keeps the records it fetches for the file's room
+    // and out of the client's chunk cache, so the download below finds some
+    // of them only in the swarm's own store: no reader sends them.
+    reader = await client.openPublicFile(encrypted.address);
+    assert.equal((await reader.readRange(0, original.length)).length, original.length);
+    const messages = [];
+    const again = await client.downloadPublicFile(encrypted.address, 2, message => messages.push(message));
+    assert.deepEqual(again.content, original);
+    const delivered = messages.filter(message => message.includes(" after "));
+    assert.equal(delivered.length, 3);
+    for (const message of delivered) {
+      assert.match(message, / from (cache|[0-9a-f]{64}) after \d+ attempts$/,
+        `a record no reader sent was reported as ${message}`);
+    }
+  } finally {
+    reader?.close();
+    client.close();
+  }
+});
+
 test("a repeated in-memory download reports every chunk from the chunk cache", async () => {
   const original = new TextEncoder().encode("Cached download round trip.".repeat(100));
   const encrypted = encryptPublicFile(original);

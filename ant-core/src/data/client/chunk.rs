@@ -243,8 +243,9 @@ const CHUNK_DATA_TYPE: u32 = 0;
 pub(crate) enum ChunkServer {
     /// The node whose GET returned it.
     Node(PeerId),
-    /// No GET of the ordinary read: the client's chunk cache answered it, or,
-    /// natively, ADR-0020's lookup found it, which does not name the node.
+    /// No GET of the ordinary read and no reader now: the client's chunk
+    /// cache or its swarm store held it already, or, natively, ADR-0020's
+    /// lookup found it, which does not name the node.
     Cache,
     /// Another client reading the same file sent it, checked against its
     /// address (ADR-0026 in `ant-node`).
@@ -484,6 +485,10 @@ const QUEUED_PEER_POLL: Duration = Duration::from_millis(250);
 enum Source<T> {
     /// A linked reader, checked.
     Peer(Bytes),
+    /// This client's swarm store, which held it already, checked when it
+    /// came: read before and kept out of the chunk cache, or, natively,
+    /// fetched by another client of the same node.
+    Held(Bytes),
     /// The nodes, as their read returned it.
     Nodes(T),
 }
@@ -1572,6 +1577,12 @@ impl Client {
                     ChunkServer::Reader,
                 )))
             }
+            Source::Held(content) => {
+                return Ok(Some((
+                    DataChunk::new(*address, content),
+                    ChunkServer::Cache,
+                )))
+            }
             Source::Nodes(result) => result,
         };
         #[cfg(feature = "native")]
@@ -1663,10 +1674,20 @@ impl Client {
             },
         )
         .await?;
-        if matches!(source, Source::Peer(_)) {
-            debug!("Chunk {} came from another client", hex::encode(address));
-            read.from_peer.store(true, AtomicOrdering::Relaxed);
-        }
+        let source = match source {
+            // Neither a reader's transfer nor the nodes', so it says nothing
+            // about the nodes either.
+            Source::Peer(record) if pace.came_held() => {
+                read.from_peer.store(true, AtomicOrdering::Relaxed);
+                Source::Held(record)
+            }
+            Source::Peer(record) => {
+                debug!("Chunk {} came from another client", hex::encode(address));
+                read.from_peer.store(true, AtomicOrdering::Relaxed);
+                Source::Peer(record)
+            }
+            source => source,
+        };
         Ok(source)
     }
 
