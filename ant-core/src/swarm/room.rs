@@ -17,10 +17,11 @@ use ant_protocol::pqc::api::{
 use ant_protocol::transport::{MultiAddr, PeerId};
 use ant_protocol::MAX_SWARM_WAIT_MS;
 use ant_protocol::{
-    canonical_ip, constrain_swarm_sdp, is_global_ip, ChunkMessage, ChunkMessageBody, MemberId,
-    Membership, OfferId, RoomKey, SwarmAnnounceRequest, SwarmAnnounceResponse, SwarmAnswerRequest,
-    SwarmAnswerResponse, SwarmLeaveRequest, SwarmOffer, SwarmRefusal, SwarmSignal,
-    MAX_SWARM_OFFERS, MAX_SWARM_SDP_BYTES, SWARM_RENDEZVOUS_NODES, SWARM_SIGNAL_TTL_MS,
+    canonical_ip, constrain_swarm_sdp, is_global_ip, is_local_ip, ChunkMessage, ChunkMessageBody,
+    MemberId, Membership, OfferId, RoomKey, SwarmAnnounceRequest, SwarmAnnounceResponse,
+    SwarmAnswerRequest, SwarmAnswerResponse, SwarmLeaveRequest, SwarmOffer, SwarmRefusal,
+    SwarmSignal, MAX_SWARM_OFFERS, MAX_SWARM_SDP_BYTES, SWARM_RENDEZVOUS_NODES,
+    SWARM_SIGNAL_TTL_MS,
 };
 use tokio::sync::OwnedSemaphorePermit;
 use web_time::Instant;
@@ -1328,21 +1329,25 @@ fn signal_bytes(signal: &SwarmSignal) -> usize {
 }
 
 /// Another member's SDP, as this client applies it: the candidates a
-/// receiver may try ([`constrain_swarm_sdp`]). Local addresses and mDNS
-/// names only if the node that relayed it was itself `reached` at a local
-/// address (a network of its own, such as a test network), loopback ones only
-/// if over loopback (a network on one host): on a network reached at public
-/// addresses they would let a stranger point this client at its own home
-/// network. The node keeps public addresses to the sender's own; one that
-/// does not is still held to the candidate limit. Only candidates change, so
-/// the link's binding to both ends' fingerprints is the same either way.
+/// receiver may try ([`constrain_swarm_sdp`]). Local addresses
+/// ([`is_local_ip`]: private use, shared, link-local, loopback, unique local)
+/// and mDNS names only if the node that relayed it was itself `reached` at a
+/// local address (a network of its own, such as a test network), loopback
+/// ones only if over loopback (a network on one host): on a network reached
+/// at public addresses they would let a stranger point this client at its own
+/// home network. An address neither public nor local (documentation,
+/// benchmarking, reserved, Teredo) is applied on no network. The node keeps
+/// public addresses to the sender's own; one that does not is still held to
+/// the candidate limit. Only candidates change, so the link's binding to both
+/// ends' fingerprints is the same either way.
 fn applicable_sdp(sdp: &str, reached: &[IpAddr]) -> String {
     let loopback = reached.iter().any(|ip| canonical_ip(*ip).is_loopback());
-    let local = reached.iter().any(|ip| !is_global_ip(*ip));
+    let local = reached.iter().any(|ip| is_local_ip(*ip));
     constrain_swarm_sdp(sdp, |ip| match ip {
         Some(ip) if ip.is_loopback() => loopback,
         Some(ip) if is_global_ip(ip) => true,
-        _ => local,
+        Some(ip) => local && is_local_ip(ip),
+        None => local,
     })
 }
 
@@ -1367,7 +1372,12 @@ mod tests {
                    a=candidate:5 1 udp 1 1f2e3d4c.local 5004 typ host\r\n\
                    a=candidate:6 1 udp 1 224.0.0.251 5353 typ host\r\n\
                    a=candidate:7 1 udp 1 198.18.0.1 5005 typ host\r\n\
-                   a=candidate:8 1 udp 1 fec0::1 5006 typ host\r\n";
+                   a=candidate:8 1 udp 1 fec0::1 5006 typ host\r\n\
+                   a=candidate:9 1 udp 1 fd12::4 5007 typ host\r\n\
+                   a=candidate:10 1 udp 1 64:ff9b::c0a8:104 5008 typ host\r\n\
+                   a=candidate:11 1 udp 1 64:ff9b::808:404 5009 typ host\r\n\
+                   a=candidate:12 1 udp 1 2001:db8::1 5010 typ host\r\n\
+                   a=candidate:13 1 udp 1 2001:4:112::1 5011 typ host\r\n";
         let kept = |reached: &[IpAddr]| -> Vec<String> {
             applicable_sdp(sdp, reached)
                 .lines()
@@ -1378,19 +1388,31 @@ mod tests {
         };
         // Nodes on public addresses: public candidates only, whatever the
         // sender says, as when this client cannot tell how it reached them.
-        assert_eq!(kept(&[IpAddr::from(Ipv4Addr::new(1, 1, 1, 5))]), ["4"]);
-        assert_eq!(kept(&[]), ["4"]);
+        // Nothing through NAT64, which would reach whatever IPv4 address it
+        // carries, a home network's among them.
+        assert_eq!(
+            kept(&[IpAddr::from(Ipv4Addr::new(1, 1, 1, 5))]),
+            ["4", "13"]
+        );
+        assert_eq!(kept(&[]), ["4", "13"]);
         // Nodes on a network of their own: its local addresses and names
-        // too, benchmarking and IPv6 site-local addresses among them.
+        // too, but nothing neither public nor local (benchmarking, IPv6
+        // site-local, documentation).
         assert_eq!(
             kept(&[IpAddr::from(Ipv4Addr::new(10, 77, 0, 2))]),
-            ["3", "4", "5", "7", "8"]
+            ["3", "4", "5", "9", "13"]
         );
+        // Nor when the node itself is at such an address: that is no network
+        // of its own.
+        for reached in ["198.18.0.1", "2001:db8::2", "64:ff9b:1::a4d:2"] {
+            let reached: IpAddr = reached.parse().expect("ip");
+            assert_eq!(kept(&[reached]), ["4", "13"], "{reached}");
+        }
         // A node reached over loopback (as an IPv4-mapped address too): a
         // network on this host, where loopback is how its members meet.
         assert_eq!(
             kept(&[IpAddr::from(Ipv4Addr::LOCALHOST.to_ipv6_mapped())]),
-            ["1", "2", "3", "4", "5", "7", "8"]
+            ["1", "2", "3", "4", "5", "9", "13"]
         );
     }
 
