@@ -21,6 +21,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CLI's message changes from `payment error: Insufficient tokens to pay for quotes. Have: …` to
   `insufficient funds: wallet has … atto, payment needs … atto`. A shortfall of gas (ETH) is not
   detected up front and is unchanged.
+- Readers of the same file share its records, BitTorrent style, in every client (ADR-0026 in
+  `ant-node`). Each download, stream or opened reader joins the file's swarm room as soon as it
+  has the root map, at the closest nodes that host rooms, meets the file's other readers over
+  WebRTC (webrtc-rs natively, the browser's own in WASM), and takes records they hold beside the
+  nodes, never instead of them: a peer keeps a read while it is on pace to finish within about
+  as long as the nodes take now, then the nodes are read too, and the first record that checks
+  against its address wins. Finding peers runs on its own and never delays a read, and a
+  client sends other readers one record at a time while its own fetches run; nodes stay the last
+  seed, and nodes without swarm rooms are read as before. A browser client asks for a file's
+  records in an order of its own, the same for each of its downloads. Always on. In `ant-core`: `Client::join_swarm`,
+  `swarm_stats` and `swarm_room_stats`, with `SwarmStats` (its `discovery` field a
+  `DiscoveryStats`) and `RoomStats` (each open link's `OpenLinkPeer` names the peer it reaches,
+  for that room only). In the browser: `joinSwarm`, `swarmStats` and `swarmRoomStats`, and a
+  `Swarm room <tag>` progress line when a file opens; a downloaded chunk another reader sent
+  reports `from a reader` in its progress (#244).
+- `ant file download` prints swarm totals after a successful read and adds the exact `swarm` and
+  `swarm_rooms` statistics to its `--json` result. `--all-peers` and `--download-diagnostics`
+  still take file data from nodes only, so `records_from_peers` stays 0 for those reads; they can
+  still serve other readers (#244).
 
 ### Changed
 - `install.sh` puts `ant` on `PATH`, as `install.ps1` already did on Windows, so `ant --version`

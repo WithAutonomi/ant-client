@@ -8,7 +8,9 @@ use futures_util::future::{select, Either};
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use self_encryption::{DataMap, DataMapIndex, EncryptedChunk};
-use std::{cell::RefCell, collections::HashMap, future::Future, ops::Range, sync::Mutex};
+#[cfg(any(all(feature = "browser-wasm", target_arch = "wasm32"), test))]
+use std::ops::Range;
+use std::{cell::RefCell, collections::HashMap, future::Future, sync::Mutex, time::Duration};
 
 /// self_encryption splits every encryptable file into at least three chunks.
 pub(crate) const MIN_FILE_CHUNKS: usize = 3;
@@ -131,7 +133,7 @@ where
     F: Fn([u8; 32]) -> Fut,
     Fut: Future<Output = Result<Bytes, E>>,
     C: Fn() -> usize,
-    S: Fn(std::time::Duration) -> SF,
+    S: Fn(Duration) -> SF,
     SF: Future<Output = ()>,
 {
     let root = resolve(map, fetch, cap).await?;
@@ -152,10 +154,12 @@ where
 
 /// Fetch, verify and decrypt `chunks` in one deferred retry pass, handing each
 /// plaintext chunk to `deliver` as it arrives, in any order. Nothing is kept
-/// once delivered, so memory is bounded by the fetches in flight.
+/// once delivered, so memory is bounded by the fetches in flight. The records
+/// are asked for in the order `chunks` lists them; a chunk the map does not
+/// have is skipped.
 pub(crate) async fn read_chunks<E, F, Fut, C, S, SF, D>(
     index: &DataMapIndex,
-    chunks: Range<usize>,
+    chunks: impl IntoIterator<Item = usize>,
     fetch: &F,
     cap: &C,
     sleep: &S,
@@ -166,12 +170,14 @@ where
     F: Fn([u8; 32]) -> Fut,
     Fut: Future<Output = Result<Bytes, E>>,
     C: Fn() -> usize,
-    S: Fn(std::time::Duration) -> SF,
+    S: Fn(Duration) -> SF,
     SF: Future<Output = ()>,
     D: Fn(usize, Bytes) -> Result<(), String>,
 {
-    let requests = index.infos()[chunks]
-        .iter()
+    let infos = index.infos();
+    let requests = chunks
+        .into_iter()
+        .filter_map(|chunk| infos.get(chunk))
         .map(|info| (info.index, info.dst_hash.0))
         .collect();
     fetch_records_deferred(
@@ -205,7 +211,7 @@ where
     F: Fn([u8; 32]) -> Fut,
     Fut: Future<Output = Result<Bytes, E>>,
     C: Fn() -> usize,
-    S: Fn(std::time::Duration) -> SF,
+    S: Fn(Duration) -> SF,
     SF: Future<Output = ()>,
 {
     let index = DataMapIndex::new(root).map_err(|e| ReadError::Invalid(e.to_string()))?;
@@ -227,7 +233,7 @@ where
     F: Fn([u8; 32]) -> Fut,
     Fut: Future<Output = Result<Bytes, E>>,
     C: Fn() -> usize,
-    S: Fn(std::time::Duration) -> SF,
+    S: Fn(Duration) -> SF,
     SF: Future<Output = ()>,
 {
     let end = start.saturating_add(length as u64).min(index.file_size());
@@ -348,13 +354,22 @@ where
 }
 
 /// Native file-download retry rounds: retry missing records together after the
-/// first batch settles, immediately once, then after 15 and 45 seconds. The
-/// caller supplies typed fatal errors and a runtime-specific timer.
+/// first batch settles, immediately once, then after 15 and 45 seconds. With a
+/// nonzero `pace`, those last two rounds wait at least as long as the batch's
+/// longest round so far took on `clock` (the caller's monotonic time), up to
+/// `pace`: while nodes are that slow a retry soon after adds load and seldom
+/// finds them less busy, and a read whose other records came quickly (from
+/// other readers, or in a short batch) would otherwise wait only a minute in
+/// all between its last tries, in the worst of it. The immediate retry, which
+/// catches a record missing only for a moment, is never held back. The caller
+/// supplies typed fatal errors, a runtime-specific timer and its clock.
 pub(crate) async fn deferred_batch<K, E, F, Fut, C, S, SF>(
     requests: Vec<(usize, K)>,
     fetch: F,
     cap: C,
     sleep: S,
+    pace: Duration,
+    clock: impl Fn() -> Duration,
     exhausted: impl Fn(K) -> E,
 ) -> Result<Vec<(usize, Bytes)>, E>
 where
@@ -362,18 +377,20 @@ where
     F: Fn(usize, K, usize) -> Fut,
     Fut: Future<Output = Result<(usize, Result<Bytes, K>), E>>,
     C: Fn() -> usize,
-    S: Fn(std::time::Duration) -> SF,
+    S: Fn(Duration) -> SF,
     SF: Future<Output = ()>,
 {
     let mut remaining = requests;
     let mut results = Vec::new();
+    let mut longest = Duration::ZERO;
     for (round, delay) in [0, 0, 15, 45].into_iter().enumerate() {
         if remaining.is_empty() {
             break;
         }
         if delay > 0 {
-            sleep(std::time::Duration::from_secs(delay)).await;
+            sleep(Duration::from_secs(delay).max(longest.min(pace))).await;
         }
+        let started = clock();
         let input = std::mem::take(&mut remaining);
         let pending =
             super::rolling_unordered(input, |(index, key)| fetch(index, key, round + 1), &cap);
@@ -385,6 +402,7 @@ where
                 Err(key) => remaining.push((index, key)),
             }
         }
+        longest = longest.max(clock().saturating_sub(started));
     }
     if let Some((_, key)) = remaining.first() {
         return Err(exhausted(*key));
@@ -407,7 +425,7 @@ where
     F: Fn([u8; 32]) -> Fut,
     Fut: Future<Output = Result<Bytes, E>>,
     C: Fn() -> usize,
-    S: Fn(std::time::Duration) -> SF,
+    S: Fn(Duration) -> SF,
     SF: Future<Output = ()>,
     A: Fn(usize, Bytes) -> Result<Bytes, String>,
 {
@@ -437,6 +455,10 @@ where
         },
         cap,
         sleep,
+        // A browser read keeps the fixed rounds: a page waiting on a range
+        // (a video's next seconds) is not held back by a slow round.
+        Duration::ZERO,
+        || Duration::ZERO,
         |address| {
             ReadError::Fetch(
                 errors
@@ -453,9 +475,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::Instant;
 
     /// Long enough that only a stalled pipeline reaches it.
-    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn fixture() -> (Bytes, DataMap, HashMap<[u8; 32], Bytes>) {
         let content = Bytes::from((0..18000).map(|i| (i * 37) as u8).collect::<Vec<_>>());
@@ -593,6 +616,8 @@ mod tests {
                 sleeps.lock().unwrap().push(delay.as_secs());
                 async {}
             },
+            Duration::from_secs(300),
+            || Duration::ZERO,
             |_| (),
         )
         .await
@@ -601,6 +626,7 @@ mod tests {
             result.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
+        // Rounds that take no time keep the fixed delays, paced or not.
         assert_eq!(*sleeps.lock().unwrap(), vec![15, 45]);
         assert_eq!(
             attempts
@@ -620,6 +646,64 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    /// The delays (in whole seconds) a batch of records `0..=4` waits between
+    /// its rounds when record 0 is never found, each fetch of record `n`
+    /// taking `took(n)` on a paused clock.
+    async fn paced_waits(took: fn(u8) -> u64, pace: u64) -> Vec<u64> {
+        let sleeps = Mutex::new(Vec::new());
+        let origin = Instant::now();
+        let result = deferred_batch(
+            (0..=4u8).map(|key| (usize::from(key), key)).collect(),
+            |index, key, _| async move {
+                tokio::time::sleep(Duration::from_secs(took(key))).await;
+                Ok::<_, u8>((index, if key == 0 { Err(key) } else { Ok(Bytes::new()) }))
+            },
+            || 2,
+            |delay| {
+                sleeps.lock().unwrap().push(delay.as_secs());
+                tokio::time::sleep(delay)
+            },
+            Duration::from_secs(pace),
+            || origin.elapsed(),
+            |key| key,
+        )
+        .await;
+        assert_eq!(result, Err(0));
+        sleeps.into_inner().unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_rounds_hold_back_the_last_two_retries_up_to_the_pace() {
+        // Unpaced, the fixed delays whatever the rounds take.
+        assert_eq!(paced_waits(|_| 100, 0).await, vec![15, 45]);
+        // The first round fetches five records two at a time, 300 s: the
+        // last two retries wait as long, the immediate one not at all.
+        assert_eq!(paced_waits(|_| 100, 600).await, vec![300, 300]);
+        // Never past the pace.
+        assert_eq!(paced_waits(|_| 100, 120).await, vec![120, 120]);
+        // Quick rounds keep the fixed delays.
+        assert_eq!(paced_waits(|_| 1, 600).await, vec![15, 45]);
+        // The missing record fails in 5 s each time, but the four others
+        // take 200 s each, two at a time behind it, so the first round takes
+        // 405 s: the batch's longest round, not the missing record's own
+        // fetch, sets the wait.
+        assert_eq!(
+            paced_waits(|key| if key == 0 { 5 } else { 200 }, 600).await,
+            vec![405, 405]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_whose_other_records_came_quickly_still_spreads_its_last_tries() {
+        // The other records arrive in 5 s each (as from other readers); the
+        // missing one's fetch takes 200 s and fails. Unpaced, its last two
+        // tries follow 15 and 45 s after the rounds before them; paced, each
+        // waits as long as a round of the busy nodes takes.
+        let took: fn(u8) -> u64 = |key| if key == 0 { 200 } else { 5 };
+        assert_eq!(paced_waits(took, 0).await, vec![15, 45]);
+        assert_eq!(paced_waits(took, 600).await, vec![200, 200]);
     }
 
     #[tokio::test]
@@ -737,7 +821,7 @@ mod tests {
                 }
             }
         };
-        let sleep = |delay: std::time::Duration| {
+        let sleep = |delay: Duration| {
             sleeps.borrow_mut().push(delay.as_secs());
             async {}
         };

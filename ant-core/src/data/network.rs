@@ -15,6 +15,7 @@ use ant_protocol::{
     MAX_WIRE_MESSAGE_SIZE,
 };
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 #[cfg(feature = "native")]
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -209,6 +210,17 @@ pub trait BrowserNetwork {
         target: &'a [u8; 32],
         count: usize,
     ) -> futures::future::LocalBoxFuture<'a, Result<PeerAddresses>>;
+    /// As [`BrowserNetwork::find_closest_peers`], for a swarm room's
+    /// rendezvous nodes: a walk that warms no connections to the nodes it
+    /// learns of, which would take the reads' turns to gather ICE.
+    /// Adapters that never warm connections keep the default.
+    fn find_rendezvous_peers<'a>(
+        &'a self,
+        target: &'a [u8; 32],
+        count: usize,
+    ) -> futures::future::LocalBoxFuture<'a, Result<PeerAddresses>> {
+        self.find_closest_peers(target, count)
+    }
     /// Read-only discovery may report verified candidates before completing.
     /// Existing adapters remain compatible and supply their final result only.
     fn find_read_peers<'a>(
@@ -238,6 +250,38 @@ pub trait BrowserNetwork {
     /// until then. Adapters that never skip a peer for that report none.
     fn refused_peers(&self) -> Vec<(PeerId, std::time::Duration)> {
         Vec::new()
+    }
+    /// The IP addresses this client holds an authenticated session with
+    /// `peer` at: ones it reached `peer` on, not ones `peer` claims.
+    /// Adapters that cannot tell report none.
+    fn reached_ips(&self, _peer: &PeerId) -> Vec<IpAddr> {
+        Vec::new()
+    }
+    /// Whether a browser client on this adapter takes part in the swarm. It
+    /// must then say which nodes host swarm rooms ([`Self::hosts_swarm`]),
+    /// since a node that predates them closes the channel a swarm request
+    /// comes on, and open sessions for swarm requests
+    /// ([`Self::connect_for_swarm`]). A client on an adapter that does not
+    /// joins no room and reads from the nodes alone, as adapters that keep
+    /// the default do.
+    fn supports_swarm(&self) -> bool {
+        false
+    }
+    /// Whether `peer` hosts swarm rooms, as a session this client holds with
+    /// it said when it opened: `None` if no open session has said.
+    /// Adapters that cannot tell answer `None`.
+    fn hosts_swarm(&self, _peer: &PeerId) -> Option<bool> {
+        None
+    }
+    /// Opens a session with `peer` on the lane swarm requests use, if none is
+    /// open, and waits for its hello, so a request sent next finds it open.
+    /// Adapters with nothing to open first keep the default.
+    fn connect_for_swarm<'a>(
+        &'a self,
+        _peer: &'a PeerId,
+        _addrs: &'a [MultiAddr],
+    ) -> futures::future::LocalBoxFuture<'a, ()> {
+        Box::pin(async {})
     }
     /// Whether `peer` would take a paid pointer write from this client, as
     /// far as can be told before one is sent: `Some(true)` if it would,
@@ -560,6 +604,23 @@ impl Network {
         self.backend.find_closest_peers(target, count).await
     }
 
+    /// The closest peers to a swarm room's key, for its rendezvous: a lookup
+    /// that warms no connections for reads to come.
+    pub(crate) async fn find_rendezvous_peers(
+        &self,
+        target: &[u8; 32],
+        count: usize,
+    ) -> Result<Vec<(PeerId, Vec<MultiAddr>)>> {
+        #[cfg(feature = "native")]
+        {
+            self.find_closest_peers(target, count).await
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.backend.find_rendezvous_peers(target, count).await
+        }
+    }
+
     /// Collect authenticated close-group responder views.
     #[cfg(not(feature = "native"))]
     pub async fn find_witnessed_close_group_with_view_count(
@@ -641,6 +702,61 @@ impl Network {
         #[cfg(not(feature = "native"))]
         {
             self.backend.refused_peers()
+        }
+    }
+
+    /// The IP addresses this client holds an authenticated connection with
+    /// `peer` at, as reached, not as `peer` advertises them. Empty when
+    /// there is none.
+    pub(crate) async fn reached_ips(&self, peer: &PeerId) -> Vec<IpAddr> {
+        #[cfg(feature = "native")]
+        {
+            // saorsa-core names each connection by its remote address. A
+            // relayed connection is named by the relay's, a host this client
+            // already sends to.
+            self.node()
+                .transport()
+                .channels_for_peer(peer)
+                .await
+                .iter()
+                .filter_map(|channel| channel.parse::<SocketAddr>().ok())
+                .map(|address| address.ip())
+                .collect()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.backend.reached_ips(peer)
+        }
+    }
+
+    /// Opens a session with `peer` for a swarm request, if none is open:
+    /// in a browser, so the dial can take its turn on its own; native clients
+    /// connect as they send.
+    #[cfg(not(feature = "native"))]
+    pub(crate) async fn connect_for_swarm(&self, peer: &PeerId, addrs: &[MultiAddr]) {
+        self.backend.connect_for_swarm(peer, addrs).await;
+    }
+
+    /// Whether this browser client takes part in the swarm: only on an
+    /// adapter that can say which nodes host rooms.
+    #[cfg(not(feature = "native"))]
+    pub(crate) fn supports_swarm(&self) -> bool {
+        self.backend.supports_swarm()
+    }
+
+    /// Whether `peer` hosts swarm rooms, as far as this client can tell
+    /// without asking: `None` if it cannot. A browser learns it from the
+    /// capabilities a node advertises when a session opens; a native node
+    /// advertises none.
+    pub(crate) fn hosts_swarm(&self, peer: &PeerId) -> Option<bool> {
+        #[cfg(feature = "native")]
+        {
+            let _ = peer;
+            None
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.backend.hosts_swarm(peer)
         }
     }
 

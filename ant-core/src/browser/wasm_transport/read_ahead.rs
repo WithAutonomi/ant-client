@@ -143,7 +143,8 @@ impl ReadAheadPool {
             Network::from_browser(Rc::new(adapter)),
             ClientConfig::default(),
         )
-        .with_chunk_cache(ChunkCache::new(READ_AHEAD_CACHE_RECORDS));
+        .with_chunk_cache(ChunkCache::new(READ_AHEAD_CACHE_RECORDS))
+        .with_swarm_of(reads);
         Rc::new(Self {
             client,
             fetches: SingleFlight::default(),
@@ -159,10 +160,13 @@ impl ReadAheadPool {
         // A record a read fetched itself needs no second fetch.
         if let Some(content) = self.reads.chunk_cache().get(&address) {
             if crate::record::verify(&address, &content).is_ok() {
+                // Still offered to the file's room, as any read's is.
+                self.reads.swarm().seed(address, content.clone());
                 return Ok(Some(content));
             }
         }
         let mut started = None;
+        let node_time = Cell::new(None);
         let flown = self
             .fetches
             .run(
@@ -173,7 +177,11 @@ impl ReadAheadPool {
                         self.reads.controller().fetch.observation_epoch(),
                         Instant::now(),
                     ));
-                    self.client.chunk_get(&address)
+                    async {
+                        let (value, nodes) = self.client.chunk_get_for_read_ahead(&address).await;
+                        node_time.set(nodes);
+                        value
+                    }
                 },
                 |result| match result {
                     Ok(chunk) => Ok(chunk.clone()),
@@ -184,9 +192,28 @@ impl ReadAheadPool {
         let result = match flown {
             Flown::Led { value, .. } => {
                 self.client.chunk_cache().remove(&address);
-                if let (true, Some((epoch, started))) = (self.awaited.contains(&address), started) {
-                    self.reads
-                        .observe_chunk_get(&value, started.elapsed(), epoch);
+                // Only a fetch the nodes served, and only their part of it,
+                // tells the limiter how they cope: a miss of theirs that a
+                // linked reader made good included.
+                let nodes = node_time.get().filter(|_| self.awaited.contains(&address));
+                if let (Some(nodes), Some((epoch, _))) = (nodes, started) {
+                    match nodes.missed {
+                        Some(outcome) => self.reads.controller().fetch.observe_fetch_in_epoch(
+                            outcome,
+                            nodes.latency,
+                            0,
+                            epoch,
+                        ),
+                        None => {
+                            self.reads.observe_chunk_get(&value, nodes.latency, epoch);
+                            // And how long a peer on pace may keep a read, as
+                            // every read someone waits for that the nodes
+                            // served sets it.
+                            if matches!(value, Ok(Some(_))) {
+                                self.client.swarm().note_node_read(nodes.latency);
+                            }
+                        }
+                    }
                 }
                 value
             }
