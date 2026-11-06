@@ -1,7 +1,7 @@
 import { BrowserNetworkClient } from "./client-fixture.mjs";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { contentAddress, encryptPublicFile, parseWebRtcDirectMultiaddr, test_encode_public_data_map } from "./pkg/ant_core.js";
+import { BrowserTestNode, contentAddress, encryptPublicFile, parseWebRtcDirectMultiaddr, test_close_group_size, test_encode_public_data_map } from "./pkg/ant_core.js";
 import { asChromium, mockWebRtc, paymentNetwork } from "./mock-webrtc.mjs";
 
 const content = new TextEncoder().encode("Discoverable storage holder regression.".repeat(100));
@@ -159,6 +159,91 @@ test("cold closer hints cannot occupy the read slots before a connected holder",
     assert.equal(reader.size, content.length);
     assert.ok(rtc.requests.some(r => r.node === holder && r.method === "get_chunk"));
     assert.ok(!rtc.requests.some(r => ordered.slice(0, 2).includes(r.node) && r.method === "get_chunk"));
+  } finally { clearTimeout(deadline); reader?.close(); client.close(); }
+});
+
+// The close group the read's rule counts, and the bootstrap nodes a client
+// connects to at most.
+const closeGroupSize = test_close_group_size();
+const bootstrapNodes = 4;
+// How long a far bootstrap node takes to answer a GET for a record it lacks,
+// and how long the close group takes to connect.
+const farMissMs = 100;
+const groupConnectMs = 600;
+// A lookup node this slow holds discovery past the deadline a read must beat.
+const slowLookupMs = 3000;
+const readDeadlineMs = 1500;
+// An address for identities that no node behind them could answer at.
+const inventedAddress = "/ip4/10.0.0.1/udp/9000/quic";
+
+// The mock node at `index` as a lookup reply lists it, with its owner proof.
+function signedPeer(index) {
+  const node = new BrowserTestNode(index + 1, false);
+  try { return node.signed_peer(); } finally { node.free(); }
+}
+
+test("a read stops asking hints once a lookup lists a close group nearer the record", async () => {
+  // The read's first hints are its bootstrap nodes, the farthest from the
+  // record. Their signed lookup replies list the record's close group, which
+  // takes a while to connect, and whose farthest member holds the record. A
+  // hint with a whole close group listed nearer cannot hold the record, so the
+  // read asks no bootstrap node after those replies and waits for the group.
+  const nodes = Array.from({ length: 16 }, () => ({}));
+  const rtc = mockWebRtc(nodes);
+  const target = BigInt(`0x${datamap.address}`);
+  const ordered = rtc.endpoints.map((endpoint, index) => ({ index,
+    distance: BigInt(`0x${parseWebRtcDirectMultiaddr(endpoint).peerId}`) ^ target,
+  })).sort((a, b) => a.distance < b.distance ? -1 : 1).map(({ index }) => index);
+  const group = ordered.slice(0, closeGroupSize);
+  const far = ordered.slice(-bootstrapNodes);
+  const holder = group.at(-1);
+  nodes[holder].chunk = datamap.content;
+  for (const index of group) nodes[index].connectDelay = groupConnectMs;
+  for (const index of far) {
+    Object.assign(nodes[index], { addressV2: true, peers: group.map(signedPeer) });
+    nodes[index].delay = method => method === "get_chunk" ? farMissMs : 0;
+  }
+  const client = new BrowserNetworkClient(far.map(index => rtc.endpoints[index]));
+  let reader;
+  try {
+    reader = await client.openPublicFile(datamap.address);
+    assert.equal(reader.size, content.length);
+    const gets = rtc.requests.filter(r => r.method === "get_chunk");
+    assert.ok(gets.some(r => r.node === holder));
+    const farGets = gets.filter(r => far.includes(r.node)).length;
+    assert.ok(farGets <= 1, `the read asked ${farGets} far hints`);
+  } finally { reader?.close(); client.close(); }
+});
+
+test("peers a lookup reply lists without an owner proof do not rule out a holder", async () => {
+  // A bootstrap node without signed addresses lists a close group of
+  // identities nearer the record than its holder. Unproven, they cannot rule
+  // the holder out, so the read asks it once the lookup reaches it, instead of
+  // waiting for a slow node to end the lookup.
+  const [bootstrap, holder, slow] = [0, 1, 2];
+  const nodes = [{}, {}, {}];
+  const rtc = mockWebRtc(nodes);
+  const listing = index => ({
+    peer_id: parseWebRtcDirectMultiaddr(rtc.endpoints[index]).peerId,
+    native_addresses: [], reliability: 1, webrtc_direct: { multiaddr: rtc.endpoints[index] },
+  });
+  const target = BigInt(`0x${datamap.address}`);
+  const invented = Array.from({ length: closeGroupSize }, (_, offset) => ({
+    peer_id: (target ^ BigInt(offset + 1)).toString(16).padStart(64, "0"),
+    native_addresses: [inventedAddress], reliability: 1,
+  }));
+  nodes[bootstrap].peers = [...invented, listing(holder), listing(slow)];
+  nodes[holder].chunk = datamap.content;
+  nodes[slow].delay = method => method === "find_node" ? slowLookupMs : 0;
+  const client = new BrowserNetworkClient([rtc.endpoints[bootstrap]]);
+  let reader, deadline;
+  try {
+    reader = await Promise.race([
+      client.openPublicFile(datamap.address),
+      new Promise((_, reject) => deadline = setTimeout(() => reject(new Error("unproven peers ruled out the holder")), readDeadlineMs)),
+    ]);
+    assert.equal(reader.size, content.length);
+    assert.ok(rtc.requests.some(r => r.node === holder && r.method === "get_chunk"));
   } finally { clearTimeout(deadline); reader?.close(); client.close(); }
 });
 
@@ -345,6 +430,29 @@ test("an ordinary reader reads ahead only once a read continues another", async 
     assert.deepEqual(await reader.readRange(10, 10), original.slice(10, 20));
     const window = await settled(rtc, 500) - opened;
     assert(window > 2 && window < starts.length, `fetched ${window} records`);
+  } finally { reader?.close(); client.close(); }
+});
+
+// The first record's GET takes this long, and timers may fire this much early.
+const firstRecordMs = 400;
+const timerSlackMs = 20;
+
+test("a read that continues no other fetches the record after it only once it has finished", async () => {
+  // The record after a header read is fetched in case the read starts a
+  // stream. Fetched alongside, its GET would compete with the one the read,
+  // such as a player's first, waits for.
+  const { original, encrypted } = recordFile(3);
+  const rtc = serve(encrypted, new Set(), new Map([[0, firstRecordMs]]));
+  const client = new BrowserNetworkClient(rtc.endpoints);
+  let reader;
+  try {
+    reader = await client.openPublicFile(encrypted.address);
+    assert.deepEqual(await reader.readRange(0, 10), original.slice(0, 10));
+    await settled(rtc);
+    const sent = index => rtc.requests.find(r => r.method === "get_chunk" && r.address === encrypted.chunks[index].dst_hash);
+    assert.ok(sent(1), "the record after the read was not fetched");
+    assert.ok(sent(1).at - sent(0).at >= firstRecordMs - timerSlackMs,
+      `the next record was fetched ${Math.round(sent(1).at - sent(0).at)} ms after the read's record`);
   } finally { reader?.close(); client.close(); }
 });
 

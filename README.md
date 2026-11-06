@@ -46,7 +46,10 @@ Uploads retain their existing size limits.
 and its private-file counterpart allocate the output as one JavaScript
 `Uint8Array` and copy each decrypted chunk into place as it arrives, so WASM
 holds only the records in flight. Progress is reported as
-`Downloaded chunk n/total`, and an `AbortSignal` cancels the download. `maxMemoryBytes` limits the output buffer,
+`Downloaded chunk n/total from <peer hex> after <n> attempts`, naming the node
+that served the chunk and every GET it cost, retry rounds included
+(`from cache after 0 attempts` when the client's chunk cache answered it), and
+an `AbortSignal` cancels the download. `maxMemoryBytes` limits the output buffer,
 not total process memory; without it, allocation is attempted up to the
 JavaScript engine's buffer limit. Allocation errors reject with guidance to use
 streaming, since browsers do not expose a reliable amount of free memory.
@@ -154,7 +157,15 @@ Both installers take the same environment variables:
 |----------|-------------|
 | `ANT_CHANNEL` | Release channel: `stable` (default) or `beta`. See [Beta Programme](#beta-programme). |
 | `ANT_VERSION` | Install one specific version, e.g. `0.3.3`. Overrides `ANT_CHANNEL`. |
-| `INSTALL_DIR` | Where to put the binary. Defaults to `~/.local/bin` on Linux, `/usr/local/bin` on macOS, `%LOCALAPPDATA%\ant\bin` on Windows. |
+| `INSTALL_DIR` | Where to put the binary. Defaults to `~/.local/bin` on Linux and macOS, `%LOCALAPPDATA%\ant\bin` on Windows. |
+| `ANT_NO_MODIFY_PATH` | Set to `1` to stop the installer adding `INSTALL_DIR` to your `PATH`. |
+
+If `INSTALL_DIR` is not already on your `PATH`, the installer adds it, so `ant` works in every new
+terminal. `install.ps1` adds it to your Windows user `PATH`. `install.sh` adds one guarded line to
+`~/.profile`, to whichever of `~/.bash_profile`, `~/.bash_login` and `~/.bashrc` you already have,
+to `~/.zshenv` when zsh is installed and to `conf.d/ant.fish` when fish is, and lists each file it
+changed. To leave your startup files alone, pass `--no-modify-path` (`curl ... | bash -s --
+--no-modify-path`) or set `ANT_NO_MODIFY_PATH=1`.
 
 ### npm
 

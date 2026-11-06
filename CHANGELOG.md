@@ -22,6 +22,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `insufficient funds: wallet has … atto, payment needs … atto`. A shortfall of gas (ETH) is not
   detected up front and is unchanged.
 
+### Changed
+- `install.sh` puts `ant` on `PATH`, as `install.ps1` already did on Windows, so `ant --version`
+  works in a new terminal straight after installing (#194). When `INSTALL_DIR` is not already on
+  `PATH` it adds a guarded line to `~/.profile`, to the user's existing bash startup files, to
+  `~/.zshenv` when zsh is installed and to fish's `conf.d` when fish is, and lists each file it
+  changed. A directory whose name contains `$`, a backtick, `"` or `\` is not added, because
+  shells can run part of such a PATH entry as code (macOS login shells re-read `PATH` through
+  `path_helper` without escaping it). The installer says so and prints an escaped line for the
+  current shell instead. A name with `:`, which separates `PATH` entries, can't be added at all,
+  and an install directory containing a newline (in `INSTALL_DIR`, or in the current directory
+  for a relative one) is rejected before anything is installed.
+  `--no-modify-path` or `ANT_NO_MODIFY_PATH=1` (also honoured by `install.ps1`) restores
+  the old print-the-line behaviour. The macOS default install directory moves from
+  `/usr/local/bin`, which is root-owned without Homebrew so the install failed without `sudo`, to
+  `~/.local/bin`, matching Linux. If another `ant` is already on `PATH` — an earlier macOS
+  install in `/usr/local/bin`, or an unrelated program such as Apache Ant — the installer says
+  so, since it may shadow the new one.
+- In the browser, a complete download's per-chunk progress names the node that served the chunk
+  and the GETs it cost: `Downloaded chunk 3/147 from <peer hex> after 1 attempts`, or
+  `from cache after 0 attempts` when the client's chunk cache answered it (V2-1872). Read
+  investigations could previously see only `Downloaded chunk n/total`. The count covers every
+  GET the chunk cost — the deferred retry rounds that found nothing included, and the GETs of a
+  fetch shared with a concurrent download of the same chunk — so a costly retry shows up rather
+  than being reported as the succeeding round alone. The
+  `Downloaded chunk n/total` prefix is unchanged, so startup probes that match on it still work
+  (#249).
+
 ## [0.3.12] - 2026-10-22
 
 ### Changed (breaking — `ant-core` browser API)
