@@ -82,10 +82,18 @@ async fn insufficient_funds_then_funding_unblocks_native_payment() {
         PaymentRequest::Quotes(vec![([17; 32].into(), funder.address(), Amount::from(100))]);
     let adapter = Checkpoints::default();
     let mut state = UploadState::default();
-    assert!(client
+    // Also pins evmlib's shortfall wording, which `Error::from_payment_failure`
+    // parses: if evmlib rewords it, this becomes `Error::Payment` and fails here.
+    match client
         .test_execute_native_payment(&adapter, &request, &mut state, true)
         .await
-        .is_err());
+    {
+        Err(Error::InsufficientFunds { have, need }) => {
+            assert_eq!(have, Amount::ZERO);
+            assert_eq!(need, Amount::from(100));
+        }
+        other => panic!("expected InsufficientFunds, got {:?}", other.map(|_| ())),
+    }
     assert!(state.pending_payment.is_none());
     assert!(adapter
         .last

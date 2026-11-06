@@ -129,10 +129,11 @@ impl Client {
         info!("Payment total: {} atto", payment.total_amount());
 
         // 4. Pay on-chain
-        let tx_hashes = payment
-            .pay(wallet)
-            .await
-            .map_err(|e| Error::Payment(format!("On-chain payment failed: {e}")))?;
+        let tx_hashes = payment.pay(wallet).await.map_err(|e| match e {
+            // Already typed by `pay`; wrapping it would demote it to `Payment`.
+            Error::InsufficientFunds { .. } => e,
+            e => Error::Payment(format!("On-chain payment failed: {e}")),
+        })?;
 
         info!(
             "On-chain payment succeeded: {} transactions",
