@@ -4,6 +4,8 @@
 //! is the BLAKE3 hash of the content.
 
 #[cfg(feature = "native")]
+use crate::client_engine::kad_read::KadReadOutcome;
+#[cfg(feature = "native")]
 use crate::data::client::diagnostics::{
     bounded_error, unix_now_ms, DownloadDiagnosticsOutcome, DownloadDiagnosticsRecord,
     DownloadDiagnosticsSender, DownloadRequestCorrelation,
@@ -234,6 +236,30 @@ use web_time::{Duration, Instant};
 /// Data type identifier for chunks (used in quote requests).
 const CHUNK_DATA_TYPE: u32 = 0;
 
+/// What a browser download reports about one delivered chunk: the peer that
+/// served it, and every peer GET it cost.
+///
+/// `peer` is `None` when no GET served the chunk — the client's chunk cache
+/// answered it. `attempts` is the total across the deferred retry rounds
+/// `read_chunks` spent on the record, which the download path accumulates;
+/// a single `chunk_get` reports its own count through the `dispatched`
+/// counter of [`Client::chunk_get_observed_with_source`].
+#[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
+#[derive(Clone, Debug)]
+pub(crate) struct ChunkSource {
+    pub peer: Option<PeerId>,
+    pub attempts: usize,
+}
+
+/// A fetched chunk and the peer that served it, or `None` when no GET did.
+pub(crate) type SourcedChunk = (DataChunk, Option<PeerId>);
+
+/// What one shared `chunk_get` resolves to: its outcome, and the number of
+/// peer GETs the fetch dispatched. Both reach a joiner, so sharing a fetch
+/// costs a caller the same as leading it — including a round that found
+/// nothing, whose outcome is an error and so carries no chunk to report with.
+pub(crate) type SharedChunkGet = (Result<Option<SourcedChunk>>, usize);
+
 use crate::transfer_policy::{PutRejection, PutShortfall};
 
 /// Classify a failed single-peer PUT (ADR-0002 / V2-468 / V2-554). A
@@ -326,6 +352,28 @@ struct ChunkPeerGetTarget {
     peer_id: PeerId,
     peer_addrs: Vec<MultiAddr>,
     xor_distance: [u8; 32],
+}
+
+/// Check a chunk a peer sent for `asked` against that address.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidData`] if the peer sent another address, or
+/// content that does not hash to it.
+pub(crate) fn verified_chunk(
+    asked: &XorName,
+    address: XorName,
+    content: Bytes,
+) -> Result<DataChunk> {
+    if address != *asked {
+        return Err(Error::InvalidData(format!(
+            "Mismatched chunk address: expected {}, got {}",
+            hex::encode(asked),
+            hex::encode(address)
+        )));
+    }
+    crate::record::verify(&address, &content).map_err(Error::InvalidData)?;
+    Ok(DataChunk::new(address, content))
 }
 
 fn chunk_peer_get_targets(
@@ -424,24 +472,62 @@ impl Client {
             let epoch = self.controller().fetch.observation_epoch();
             let started = Instant::now();
             let result = self
-                .chunk_get_from_closest_peers_with_diagnostics(address, peer_count, Some(diag))
+                .chunk_get_from_closest_peers_with_diagnostics(
+                    address,
+                    peer_count,
+                    None,
+                    Some(diag),
+                )
                 .await;
             self.observe_chunk_get(&result, started.elapsed(), epoch);
-            return result;
+            return result.map(strip_chunk_source);
         }
-        self.chunk_get_shared(address, peer_count, true).await
+        self.chunk_get_shared(address, peer_count, true, None)
+            .await
+            .map(strip_chunk_source)
+    }
+
+    /// Fetch a chunk as [`Client::chunk_get_observed`] does, and report where
+    /// it came from. Browser downloads name the serving peer and the GETs the
+    /// chunk cost in their per-chunk progress.
+    ///
+    /// `dispatched` is raised by the peer GETs the fetch sends, on every
+    /// outcome, so a caller retrying the chunk in a later round can add up
+    /// what the whole chunk cost — including the rounds that found nothing,
+    /// which return an error and so carry no chunk to report with. A caller
+    /// that joins another's fetch is charged the same count as the one that
+    /// led it, because the same GETs served them both.
+    #[cfg(all(feature = "browser-wasm", target_arch = "wasm32"))]
+    pub(crate) async fn chunk_get_observed_with_source(
+        &self,
+        address: &XorName,
+        dispatched: &std::sync::atomic::AtomicUsize,
+    ) -> Result<Option<SourcedChunk>> {
+        self.chunk_get_shared(
+            address,
+            self.config().close_group_size,
+            true,
+            Some(dispatched),
+        )
+        .await
     }
 
     /// Fetch a chunk, or wait for this client's fetch of the same address and
     /// peer count if one is already in flight, so concurrent reads of a chunk
     /// send its GETs once. A shared fetch feeds the adaptive fetch limiter
     /// once, if any caller sharing it observes.
+    ///
+    /// The fetch's GET count rides in the shared result, so a joiner is
+    /// charged for the GETs it shared even when they found nothing and the
+    /// outcome is an error. `dispatched` is raised by that count for whichever
+    /// caller this is, leader or joiner.
     async fn chunk_get_shared(
         &self,
         address: &XorName,
         peer_count: usize,
         observe: bool,
-    ) -> Result<Option<DataChunk>> {
+        dispatched: Option<&std::sync::atomic::AtomicUsize>,
+    ) -> Result<Option<SourcedChunk>> {
         let mut started = None;
         let flown = self
             .chunk_gets
@@ -450,36 +536,52 @@ impl Client {
                 observe,
                 || {
                     started = Some((self.controller().fetch.observation_epoch(), Instant::now()));
-                    self.chunk_get_from_closest_peers_with_diagnostics(
-                        address,
-                        peer_count,
-                        #[cfg(feature = "native")]
-                        None,
-                    )
+                    async move {
+                        let sent = std::sync::atomic::AtomicUsize::new(0);
+                        let outcome = self
+                            .chunk_get_from_closest_peers_with_diagnostics(
+                                address,
+                                peer_count,
+                                Some(&sent),
+                                #[cfg(feature = "native")]
+                                None,
+                            )
+                            .await;
+                        (outcome, sent.load(std::sync::atomic::Ordering::Relaxed))
+                    }
                 },
-                |result| match result {
-                    Ok(chunk) => Ok(chunk.clone()),
-                    Err(error) => Err(error.duplicate()),
+                |(outcome, sent)| {
+                    (
+                        match outcome {
+                            Ok(chunk) => Ok(chunk.clone()),
+                            Err(error) => Err(error.duplicate()),
+                        },
+                        *sent,
+                    )
                 },
             )
             .await;
-        match flown {
+        let (outcome, sent) = match flown {
             Flown::Led { value, observe } => {
                 if let (true, Some((epoch, started))) = (observe, started) {
-                    self.observe_chunk_get(&value, started.elapsed(), epoch);
+                    self.observe_chunk_get(&value.0, started.elapsed(), epoch);
                 }
                 value
             }
             Flown::Joined(value) => value,
+        };
+        if let Some(dispatched) = dispatched {
+            dispatched.fetch_add(sent, std::sync::atomic::Ordering::Relaxed);
         }
+        outcome
     }
 
     /// Feed one `chunk_get` outcome to the adaptive fetch limiter, including
     /// one another client fetched on this client's behalf. `epoch` is the
     /// limiter's observation epoch when the fetch started.
-    pub(crate) fn observe_chunk_get(
+    pub(crate) fn observe_chunk_get<T: ChunkBytes>(
         &self,
-        result: &Result<Option<DataChunk>>,
+        result: &Result<Option<T>>,
         latency: Duration,
         epoch: u64,
     ) {
@@ -487,13 +589,37 @@ impl Client {
             .as_ref()
             .ok()
             .and_then(Option::as_ref)
-            .map_or(0, |chunk| chunk.content.len() as u64);
+            .map_or(0, ChunkBytes::chunk_bytes);
         self.controller().fetch.observe_fetch_in_epoch(
             chunk_get_outcome(result),
             latency,
             bytes,
             epoch,
         );
+    }
+}
+
+/// Drop a fetch's serving peer, for the callers that report only the chunk.
+fn strip_chunk_source(found: Option<SourcedChunk>) -> Option<DataChunk> {
+    found.map(|(chunk, _)| chunk)
+}
+
+/// The chunk payload of a successful `chunk_get`, so the adaptive limiter's
+/// byte-aware observation works whether or not the caller kept the chunk's
+/// [`ChunkSource`].
+pub(crate) trait ChunkBytes {
+    fn chunk_bytes(&self) -> u64;
+}
+
+impl ChunkBytes for DataChunk {
+    fn chunk_bytes(&self) -> u64 {
+        self.content.len() as u64
+    }
+}
+
+impl ChunkBytes for SourcedChunk {
+    fn chunk_bytes(&self) -> u64 {
+        self.0.chunk_bytes()
     }
 }
 
@@ -513,7 +639,7 @@ impl Client {
 /// does not need to see internal peer noise; that's noise about the
 /// production network's natural peer-side variability, not about the
 /// client's effective capacity.
-pub(crate) fn chunk_get_outcome(result: &Result<Option<DataChunk>>) -> Outcome {
+pub(crate) fn chunk_get_outcome<T>(result: &Result<Option<T>>) -> Outcome {
     match result {
         Ok(Some(_)) => Outcome::Success,
         Ok(None) => Outcome::Timeout,
@@ -826,15 +952,21 @@ impl Client {
         address: &XorName,
         peer_count: usize,
     ) -> Result<Option<DataChunk>> {
-        self.chunk_get_shared(address, peer_count, false).await
+        self.chunk_get_shared(address, peer_count, false, None)
+            .await
+            .map(strip_chunk_source)
     }
 
+    /// `dispatched` is raised by every peer GET this call sends, whatever the
+    /// call then returns, so a caller that retries the chunk can total up its
+    /// rounds. See [`Client::chunk_get_observed_with_source`].
     async fn chunk_get_from_closest_peers_with_diagnostics(
         &self,
         address: &XorName,
         peer_count: usize,
+        dispatched: Option<&std::sync::atomic::AtomicUsize>,
         #[cfg(feature = "native")] diag: Option<&ChunkFetchDiagnostics<'_>>,
-    ) -> Result<Option<DataChunk>> {
+    ) -> Result<Option<SourcedChunk>> {
         // Check cache first, with integrity verification.
         if let Some(cached) = self.chunk_cache().get(address) {
             if crate::record::verify(address, &cached).is_ok() {
@@ -848,7 +980,7 @@ impl Client {
                         None,
                     );
                 }
-                return Ok(Some(DataChunk::new(*address, cached)));
+                return Ok(Some((DataChunk::new(*address, cached), None)));
             }
             // Cache entry corrupted — evict and fall through to network fetch.
             debug!(
@@ -858,9 +990,54 @@ impl Client {
             self.chunk_cache().remove(address);
         }
 
+        // ADR-0020: ask the peers the lookup finds likely to hold the chunk
+        // for it as well as for closer peers, and stop at the first verified
+        // chunk. A peer whose content fails verification only drops out. A
+        // lookup that finds no holder, or fails, says nothing about absence,
+        // so the ordinary read below runs then, with its own absence rule and
+        // bad-content rule. It starts from the peers the lookup ended on
+        // rather than look them up again.
+        #[cfg(feature = "native")]
+        let kad_closest = match self.chunk_get_kad(address, peer_count).await {
+            Ok(KadReadOutcome::Found(chunk)) => {
+                if let Some(diag) = diag {
+                    diag.emit_chunk_level(
+                        "kad",
+                        chunk.content.len() as u64,
+                        DownloadDiagnosticsOutcome::Found,
+                        None,
+                    );
+                }
+                self.chunk_cache().put(chunk.address, chunk.content.clone());
+                return Ok(Some((chunk, None)));
+            }
+            Ok(KadReadOutcome::NotFound { closest }) => {
+                std::sync::Mutex::new((!closest.is_empty()).then(|| {
+                    closest
+                        .into_iter()
+                        .map(|node| {
+                            let addrs = node.addresses_by_priority();
+                            (node.peer_id, addrs)
+                        })
+                        .collect::<Vec<_>>()
+                }))
+            }
+            Err(e) => {
+                debug!(
+                    "Kad read of {} failed: {e}; reading it the ordinary way",
+                    hex::encode(address)
+                );
+                std::sync::Mutex::new(None)
+            }
+        };
+
         #[cfg(feature = "native")]
         let observation = diag.map(|_| std::sync::Mutex::new(ReadObservation::default()));
-        let result = crate::client_engine::read::retrieve_progressive(
+        // Peer GETs this call dispatched, across its early, ordinary and retry
+        // rounds. An atomic, not a `Cell`, because the native `data_download`
+        // futures that reach here are asserted `Send`.
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = crate::client_engine::read::retrieve_progressive(
             *address,
             // Use the same bounded fallback allowance while discovery is in
             // flight. Stopping after just the close-group count can exhaust
@@ -874,6 +1051,8 @@ impl Client {
             |sender| {
                 #[cfg(feature = "native")]
                 let observation = &observation;
+                #[cfg(feature = "native")]
+                let kad_closest = &kad_closest;
                 async move {
                     let progress = crate::data::network::ReadProgress::new(
                         *address,
@@ -885,8 +1064,14 @@ impl Client {
                     let lookup_started = Instant::now();
                     #[cfg(feature = "native")]
                     let mut contexts = Vec::new();
+                    // Only the first round reuses the kad lookup's peers; a
+                    // retry looks them up afresh.
                     #[cfg(feature = "native")]
-                    let closest_result = if diag.is_some() {
+                    let reused = kad_closest.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    #[cfg(feature = "native")]
+                    let closest_result = if let Some(closest) = reused {
+                        Ok(closest)
+                    } else if diag.is_some() {
                         self.network()
                             .find_closest_peers_with_diagnostics(address, peer_count)
                             .await
@@ -957,7 +1142,9 @@ impl Client {
             |(peer, addrs), early, dispatched| {
                 #[cfg(feature = "native")]
                 let observation = &observation;
+                let attempts = &attempts;
                 async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if early {
                         #[cfg(feature = "native")]
                         if let Some(diag) = diag {
@@ -980,7 +1167,8 @@ impl Client {
                                     diag,
                                     &early_observation,
                                 )
-                                .await;
+                                .await
+                                .map(|chunk| chunk.map(|chunk| (chunk, peer)));
                         }
                     }
                     #[cfg(feature = "native")]
@@ -988,10 +1176,12 @@ impl Client {
                         dispatched.notify();
                         return self
                             .chunk_get_diagnostic_attempt(address, &peer, &addrs, diag, observation)
-                            .await;
+                            .await
+                            .map(|chunk| chunk.map(|chunk| (chunk, peer)));
                     }
                     self.chunk_get_from_peer(address, &peer, &addrs, dispatched)
                         .await
+                        .map(|chunk| chunk.map(|chunk| (chunk, peer)))
                 }
             },
             |error| {
@@ -1015,7 +1205,14 @@ impl Client {
             },
             crate::runtime::sleep,
         )
-        .await?;
+        .await;
+        // Report the GETs before the error path returns: a round that found
+        // nothing still cost them, and a retrying caller needs them counted.
+        if let Some(dispatched) = dispatched {
+            let sent = attempts.load(std::sync::atomic::Ordering::Relaxed);
+            dispatched.fetch_add(sent, std::sync::atomic::Ordering::Relaxed);
+        }
+        let result = outcome?;
         #[cfg(feature = "native")]
         if result.is_none() {
             if let (Some(diag), Some(observation)) = (diag, &observation) {
@@ -1028,10 +1225,10 @@ impl Client {
                 );
             }
         }
-        if let Some(chunk) = &result {
+        Ok(result.map(|(chunk, peer)| {
             self.chunk_cache().put(chunk.address, chunk.content.clone());
-        }
-        Ok(result)
+            (chunk, Some(peer))
+        }))
     }
 
     /// Retrieve a chunk from every peer in the close group.
@@ -1131,7 +1328,7 @@ impl Client {
 
     /// Fetch a chunk from a specific peer, notifying `dispatched` once the GET
     /// waits only on that peer.
-    async fn chunk_get_from_peer(
+    pub(crate) async fn chunk_get_from_peer(
         &self,
         address: &XorName,
         peer: &PeerId,
@@ -1167,25 +1364,15 @@ impl Client {
                 ChunkMessageBody::GetResponse(ChunkGetResponse::Success {
                     address: addr,
                     content,
-                }) => {
-                    if addr != *address {
-                        return Some(Err(Error::InvalidData(format!(
-                            "Mismatched chunk address: expected {addr_hex}, got {}",
-                            hex::encode(addr)
-                        ))));
-                    }
-
-                    if let Err(error) = crate::record::verify(&addr, &content) {
-                        return Some(Err(Error::InvalidData(error)));
-                    }
-
-                    debug!(
-                        "Retrieved chunk {} ({} bytes) from peer {peer}",
-                        hex::encode(addr),
-                        content.len()
-                    );
-                    Some(Ok(Some(DataChunk::new(addr, Bytes::from(content)))))
-                }
+                }) => Some(
+                    verified_chunk(address, addr, Bytes::from(content)).map(|chunk| {
+                        debug!(
+                            "Retrieved chunk {addr_hex} ({} bytes) from peer {peer}",
+                            chunk.content.len()
+                        );
+                        Some(chunk)
+                    }),
+                ),
                 ChunkMessageBody::GetResponse(ChunkGetResponse::NotFound { .. }) => Some(Ok(None)),
                 ChunkMessageBody::GetResponse(ChunkGetResponse::Error(e)) => Some(Err(
                     Error::Protocol(format!("Remote GET error for {addr_hex}: {e}")),
@@ -1499,30 +1686,35 @@ mod tests {
             "found-chunk must be Success",
         );
 
+        // The same classification for a chunk paired with its source, which
+        // is what the browser download path carries (V2-1872).
+        let sourced: SourcedChunk = (DataChunk::new([0u8; 32], Bytes::from_static(b"x")), None);
+        assert_eq!(chunk_get_outcome(&Ok(Some(sourced))), Outcome::Success);
+
         // Ok(None): chunk_get exhausted the close group across first
         // attempt + retry. This is the load-shedding signal — count it
         // as Timeout so a sustained run of them on a saturated link
         // shrinks the cap.
         assert_eq!(
-            chunk_get_outcome(&Ok(None)),
+            chunk_get_outcome::<DataChunk>(&Ok(None)),
             Outcome::Timeout,
             "Ok(None) must be Timeout — that's the controller's load-shedding signal",
         );
 
         // Capacity signals from explicit error variants.
         assert_eq!(
-            chunk_get_outcome(&Err(Error::Timeout("t".into()))),
+            chunk_get_outcome::<DataChunk>(&Err(Error::Timeout("t".into()))),
             Outcome::Timeout,
         );
         assert_eq!(
-            chunk_get_outcome(&Err(Error::Network("n".into()))),
+            chunk_get_outcome::<DataChunk>(&Err(Error::Network("n".into()))),
             Outcome::NetworkError,
         );
 
         // Unexpected error variant (e.g. Protocol) — propagates out of
         // chunk_get to the caller and is not a capacity signal.
         assert_eq!(
-            chunk_get_outcome(&Err(Error::Protocol("p".into()))),
+            chunk_get_outcome::<DataChunk>(&Err(Error::Protocol("p".into()))),
             Outcome::ApplicationError,
         );
     }

@@ -2050,6 +2050,21 @@ impl LookupQuery<BrowserLookupCandidate> for BrowserNetworkLookupQuery {
                     match result {
                         Ok(nodes) => {
                             if let Some(progress) = &read_progress {
+                                // The responder's session authenticated it, and
+                                // `find_node` verified every owner proof it
+                                // returned. A peer listed without one is unproven.
+                                progress.listed(
+                                    std::iter::once(responder)
+                                        .chain(
+                                            nodes
+                                                .iter()
+                                                .filter(|node| node.address_record.is_some())
+                                                .filter_map(|node| {
+                                                    parse_lookup_key(&node.peer_id, "peer ID").ok()
+                                                }),
+                                        )
+                                        .map(PeerId::from_bytes),
+                                );
                                 let hints = std::iter::once(&candidate.wire)
                                     .chain(nodes.iter())
                                     .filter(|node| {
