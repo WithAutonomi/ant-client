@@ -1097,7 +1097,9 @@ impl Client {
                 prepared.merkle_payment_timestamp,
             )
             .await
-            .map_err(|e| Error::Payment(format!("Merkle batch payment failed: {e}")))?;
+            .map_err(|e| {
+                Error::from_payment_failure(format!("Merkle batch payment failed: {e}"))
+            })?;
 
         info!(
             "Merkle payment succeeded: winner pool {}",

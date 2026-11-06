@@ -7,24 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- `ant node daemon info` and `ant node daemon start` no longer mistake a stale PID file for a
-  running daemon (V2-1655). A daemon that dies without cleaning up (a reboot, an OOM kill)
-  leaves its PID and port files behind, and once the PID is reused by an unrelated process,
-  `info` reported the dead daemon as running while `status` said it was not, and `start`
-  refused to start a new one. Both now require the process to be identifiable as the daemon,
-  the check `stop` already applied, and `start` removes the stale files before starting a new
-  daemon. On every platform the process must be `ant` running `ant node daemon run`, so another
-  `ant` command holding the reused PID is not taken for the daemon either. Where a process's
-  arguments or executable can't be read (another user's, an elevated or protected one on
-  Windows) or don't show that, it counts as the daemon only if the daemon's own API on the
-  recorded port reports its PID, on the configured listen address or either loopback (IPv4 or
-  IPv6), each asked with a one-second deadline. Otherwise `start` and `stop` say they can't tell
-  and leave the files alone, rather than risk orphaning a live daemon. Previously macOS trusted any
-  live PID and Windows checked only the executable's name, case-sensitively. `start` now fails
-  instead of carrying on when a stale file can't be removed, and it only spawns the daemon from
-  the `ant` binary. The `info` help text and README no longer claim its output is always JSON:
-  it is human-readable unless `--json` is passed, like every other command.
+### Added
+- `data::Error::InsufficientFunds { have, need }` (amounts in atto): a wallet whose payment-token
+  balance is below the payment total now fails with this instead of a generic
+  `Error::Payment(String)`, so consumers such as the mobile SDK can offer "top up your wallet"
+  without matching on message text (#152). It covers every wallet-backed payment path: the
+  journaled native path that file and data uploads use, the wave-batch and Merkle batch paths, and
+  single-chunk payment. Nothing has been paid when it is returned, because the wallet checks its
+  balance before sending. A shortfall after earlier batches of the same upload were paid still
+  surfaces as `PartialUpload`, so the spend and the stored chunks are still reported, and it is now
+  kept typed in the new `PartialUpload::cause` field (also set when storing the paid batches
+  failed too). Code that builds `PartialUpload` or matches it without `..` must add the field. The
+  CLI's message changes from `payment error: Insufficient tokens to pay for quotes. Have: …` to
+  `insufficient funds: wallet has … atto, payment needs … atto`. A shortfall of gas (ETH) is not
+  detected up front and is unchanged.
 
 ### Changed
 - `install.sh` puts `ant` on `PATH`, as `install.ps1` already did on Windows, so `ant --version`
@@ -52,6 +48,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than being reported as the succeeding round alone. The
   `Downloaded chunk n/total` prefix is unchanged, so startup probes that match on it still work
   (#249).
+
+### Fixed
+- `ant node daemon info` and `ant node daemon start` no longer mistake a stale PID file for a
+  running daemon (V2-1655). A daemon that dies without cleaning up (a reboot, an OOM kill)
+  leaves its PID and port files behind, and once the PID is reused by an unrelated process,
+  `info` reported the dead daemon as running while `status` said it was not, and `start`
+  refused to start a new one. Both now require the process to be identifiable as the daemon,
+  the check `stop` already applied, and `start` removes the stale files before starting a new
+  daemon. On every platform the process must be `ant` running `ant node daemon run`, so another
+  `ant` command holding the reused PID is not taken for the daemon either. Where a process's
+  arguments or executable can't be read (another user's, an elevated or protected one on
+  Windows) or don't show that, it counts as the daemon only if the daemon's own API on the
+  recorded port reports its PID, on the configured listen address or either loopback (IPv4 or
+  IPv6), each asked with a one-second deadline. Otherwise `start` and `stop` say they can't tell
+  and leave the files alone, rather than risk orphaning a live daemon. Previously macOS trusted any
+  live PID and Windows checked only the executable's name, case-sensitively. `start` now fails
+  instead of carrying on when a stale file can't be removed, and it only spawns the daemon from
+  the `ant` binary. The `info` help text and README no longer claim its output is always JSON:
+  it is human-readable unless `--json` is passed, like every other command.
 
 ## [0.3.12] - 2026-10-22
 

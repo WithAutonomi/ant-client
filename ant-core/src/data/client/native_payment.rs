@@ -165,7 +165,7 @@ async fn execute_once<A: UploadAdapter, F: Fn(&UploadState) -> bool + Send + Syn
                 wallet
                     .prepare_payment(request)
                     .await
-                    .map_err(Error::Payment)
+                    .map_err(Error::from_payment_failure)
             };
             let signed = match prepared {
                 Ok(signed) => signed,
