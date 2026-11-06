@@ -67,6 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of carrying on when a stale file can't be removed, and it only spawns the daemon from
   the `ant` binary. The `info` help text and README no longer claim its output is always JSON:
   it is human-readable unless `--json` is passed, like every other command.
+- A merkle payment sent about 500 candidate requests at once, and part of the burst of answers
+  could be lost on a loaded host, so pools came up short of 16 candidates and the payment failed
+  or retried (V2-1893). A payment now has at most 32 candidate requests in flight. On mainnet
+  this added about half a second per tree. (#252)
 
 ## [0.3.12] - 2026-10-22
 
