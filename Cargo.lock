@@ -936,8 +936,8 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.23.1"
-source = "git+https://github.com/grumbach/ant-node?branch=feat%2Fpeer-swarm#d39c393f658469fe13bc10371e4277c61f4f89b7"
+version = "0.24.0"
+source = "git+https://github.com/grumbach/ant-node?branch=feat%2Fpeer-swarm#546028bab6f2f116ea10498c7151ca8b0b2b734b"
 dependencies = [
  "ant-protocol",
  "bao",
@@ -990,8 +990,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "5.0.1"
-source = "git+https://github.com/grumbach/ant-protocol?branch=feat%2Fpeer-swarm#ffbed67b484506f9de27a52308ab1ddc6a95d84a"
+version = "6.0.0"
+source = "git+https://github.com/grumbach/ant-protocol?branch=feat%2Fpeer-swarm#61e3dbf50c3b851e9cd056e01ecc0611a2c31e4e"
 dependencies = [
  "blake3",
  "bytes",
@@ -5580,8 +5580,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.29.2"
-source = "git+https://github.com/grumbach/saorsa-core?branch=feat%2Fpeer-swarm#e04065db8dc2ae83523febcb64b2e3042988e8e5"
+version = "0.30.0"
+source = "git+https://github.com/grumbach/saorsa-core?branch=feat%2Fpeer-swarm#b7966e2b2f448f665c485adb57b253056d476cf4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5648,8 +5648,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.38.2"
-source = "git+https://github.com/grumbach/saorsa-transport?branch=feat%2Fpeer-swarm#5e6ea135b5e7cdcf349f613d55e7c645859633c9"
+version = "0.39.0"
+source = "git+https://github.com/grumbach/saorsa-transport?branch=feat%2Fpeer-swarm#8e361de20f10a346762a8177dfda8eea7ebec369"
 dependencies = [
  "anyhow",
  "async-trait",
