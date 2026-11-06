@@ -1036,7 +1036,7 @@ impl Rendezvous<'_> {
     /// Acts on one signal, which came through the node this client `reached`
     /// at those addresses; returns whether it led to anything.
     fn signal(&self, signal: SwarmSignal, pending: &mut Vec<Offered>, reached: &[IpAddr]) -> bool {
-        match signal {
+        match applicable_signal(signal, reached) {
             SwarmSignal::Offer {
                 from,
                 offer_id,
@@ -1078,7 +1078,7 @@ impl Rendezvous<'_> {
                     self.node.clone(),
                     from,
                     offer_id,
-                    applicable_sdp(&sdp, reached),
+                    sdp,
                 ))
             }
             SwarmSignal::Answer {
@@ -1100,7 +1100,6 @@ impl Rendezvous<'_> {
                 count(self.swarm, 1, |discovery| &discovery.answers_received);
                 // Bound to the answer as it is applied: its fingerprints are
                 // the ones the connection then checks.
-                let sdp = applicable_sdp(&sdp, reached);
                 let binding = link::Binding::of(&offer_sdp, &sdp, true);
                 let swarm = self.swarm.clone();
                 let stop = Arc::clone(self.stop);
@@ -1328,18 +1327,46 @@ fn signal_bytes(signal: &SwarmSignal) -> usize {
     }
 }
 
+/// A signal from another member, as this client acts on it: an offer or an
+/// answer alike, with its SDP as [`applicable_sdp`] applies it for the node
+/// this client `reached` at those addresses.
+fn applicable_signal(signal: SwarmSignal, reached: &[IpAddr]) -> SwarmSignal {
+    match signal {
+        SwarmSignal::Offer {
+            from,
+            offer_id,
+            sdp,
+        } => SwarmSignal::Offer {
+            from,
+            offer_id,
+            sdp: applicable_sdp(&sdp, reached),
+        },
+        SwarmSignal::Answer {
+            from,
+            offer_id,
+            sdp,
+        } => SwarmSignal::Answer {
+            from,
+            offer_id,
+            sdp: applicable_sdp(&sdp, reached),
+        },
+    }
+}
+
 /// Another member's SDP, as this client applies it: the candidates a
 /// receiver may try ([`constrain_swarm_sdp`]). Local addresses
-/// ([`is_local_ip`]: private use, shared, link-local, loopback, unique local)
-/// and mDNS names only if the node that relayed it was itself `reached` at a
+/// ([`is_local_ip`]: private use, link-local, loopback, unique local) and
+/// mDNS names only if the node that relayed it was itself `reached` at a
 /// local address (a network of its own, such as a test network), loopback
 /// ones only if over loopback (a network on one host): on a network reached
 /// at public addresses they would let a stranger point this client at its own
-/// home network. An address neither public nor local (documentation,
-/// benchmarking, reserved, Teredo) is applied on no network. The node keeps
-/// public addresses to the sender's own; one that does not is still held to
-/// the candidate limit. Only candidates change, so the link's binding to both
-/// ends' fingerprints is the same either way.
+/// home network. An address neither public nor local (shared carrier-grade NAT
+/// space, whose subscribers share no network, documentation, benchmarking,
+/// reserved, Teredo) is applied on no network, and a node reached only at one
+/// gives no local candidates. The node keeps public addresses to the sender's
+/// own; one that does not is still held to the candidate limit. Only
+/// candidates change, so the link's binding to both ends' fingerprints is the
+/// same either way.
 fn applicable_sdp(sdp: &str, reached: &[IpAddr]) -> String {
     let loopback = reached.iter().any(|ip| canonical_ip(*ip).is_loopback());
     let local = reached.iter().any(|ip| is_local_ip(*ip));
@@ -1356,6 +1383,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "native")]
     use std::io::Cursor;
+    use std::mem::discriminant;
     use std::net::Ipv4Addr;
     #[cfg(feature = "native")]
     use webrtc::ice::candidate::{candidate_base::unmarshal_candidate, Candidate};
@@ -1403,8 +1431,22 @@ mod tests {
             ["3", "4", "5", "9", "13"]
         );
         // Nor when the node itself is at such an address: that is no network
-        // of its own.
-        for reached in ["198.18.0.1", "2001:db8::2", "64:ff9b:1::a4d:2"] {
+        // of its own. Shared (carrier-grade NAT) space among them, at either
+        // end and IPv4-mapped: its subscribers share no network.
+        for reached in [
+            "198.18.0.1",
+            "2001:db8::2",
+            "64:ff9b:1::a4d:2",
+            "100.64.0.0",
+            "100.64.0.1",
+            "100.127.255.255",
+            "::ffff:100.64.0.1",
+        ] {
+            let reached: IpAddr = reached.parse().expect("ip");
+            assert_eq!(kept(&[reached]), ["4", "13"], "{reached}");
+        }
+        // Just outside it, a node is public, as on any public network.
+        for reached in ["100.63.255.255", "100.128.0.0"] {
             let reached: IpAddr = reached.parse().expect("ip");
             assert_eq!(kept(&[reached]), ["4", "13"], "{reached}");
         }
@@ -1414,6 +1456,59 @@ mod tests {
             kept(&[IpAddr::from(Ipv4Addr::LOCALHOST.to_ipv6_mapped())]),
             ["1", "2", "3", "4", "5", "9", "13"]
         );
+    }
+
+    #[test]
+    fn offers_and_answers_alike_apply_only_what_the_node_allows() {
+        let sdp = "v=0\r\n\
+                   a=candidate:1 1 udp 1 192.168.1.4 5000 typ host\r\n\
+                   a=candidate:2 1 udp 1 fd12::4 5001 typ host\r\n\
+                   a=candidate:3 1 udp 1 fe80::1 5002 typ host\r\n\
+                   a=candidate:4 1 udp 1 1f2e3d4c.local 5003 typ host\r\n\
+                   a=candidate:5 1 udp 1 100.64.0.9 5004 typ host\r\n\
+                   a=candidate:6 1 udp 1 8.8.4.4 5005 typ srflx raddr 0.0.0.0 rport 0\r\n";
+        let applied = |signal: SwarmSignal, reached: &[IpAddr]| -> Vec<String> {
+            let (SwarmSignal::Offer { sdp, .. } | SwarmSignal::Answer { sdp, .. }) =
+                applicable_signal(signal, reached);
+            sdp.lines()
+                .filter_map(|line| line.strip_prefix("a=candidate:"))
+                .filter_map(|candidate| candidate.split(' ').next())
+                .map(str::to_string)
+                .collect()
+        };
+        let offer = SwarmSignal::Offer {
+            from: [7; 16],
+            offer_id: [8; 16],
+            sdp: sdp.to_string(),
+        };
+        let answer = SwarmSignal::Answer {
+            from: [7; 16],
+            offer_id: [8; 16],
+            sdp: sdp.to_string(),
+        };
+        let shared: IpAddr = "100.64.0.1".parse().expect("ip");
+        let mapped: IpAddr = "::ffff:100.64.0.1".parse().expect("ip");
+        let lan = IpAddr::from(Ipv4Addr::new(10, 77, 0, 2));
+        for signal in [offer, answer] {
+            // A node reached through shared (carrier-grade NAT) space: no
+            // private, unique local, link-local or mDNS candidate, nor a
+            // shared one, only the public one.
+            for reached in [shared, mapped] {
+                assert_eq!(applied(signal.clone(), &[reached]), ["6"], "{reached}");
+            }
+            // A node on a network of its own: its local candidates too, but
+            // still no shared one.
+            assert_eq!(applied(signal.clone(), &[lan]), ["1", "2", "3", "4", "6"]);
+            // Who sent it and which offer it names are left as they were.
+            let (SwarmSignal::Offer { from, offer_id, .. }
+            | SwarmSignal::Answer { from, offer_id, .. }) =
+                applicable_signal(signal.clone(), &[lan]);
+            assert_eq!((from, offer_id), ([7; 16], [8; 16]));
+            assert_eq!(
+                discriminant(&applicable_signal(signal.clone(), &[lan])),
+                discriminant(&signal)
+            );
+        }
     }
 
     /// What the native WebRTC stack reads from an SDP after this client
