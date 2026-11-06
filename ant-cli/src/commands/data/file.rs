@@ -13,7 +13,7 @@ use ant_core::data::{
     embeddable_data_map, parse_link, spawn_download_diagnostics_writer, Client, CollisionPolicy,
     ContentRef, CostEstimateConfidence, DownloadEvent, Error as DataError, FileChunkPeerReport,
     FileChunkPeerReportPeer, FileChunkPeerStatus, FileChunkPeerSweepReport, Link, Manifest,
-    ManifestEntry, PaymentMode, UploadEvent,
+    ManifestEntry, PaymentMode, RoomStats, SwarmStats, UploadEvent,
 };
 use ant_core::datamap_file::{original_name_from_datamap, read_datamap, write_datamap};
 
@@ -79,10 +79,14 @@ pub enum FileAction {
         #[arg(long, alias = "peer-count", value_name = "COUNT")]
         peers: Option<NonZeroUsize>,
         /// Fetch each file chunk from every selected closest peer and print
-        /// ranked per-peer results after a successful download.
+        /// ranked per-peer results after a successful download. The file data
+        /// still comes from nodes only, so `records_from_peers` stays 0; this
+        /// client can still serve other readers.
         #[arg(long, alias = "try-all-peers")]
         all_peers: bool,
-        /// Write one JSONL record per normal-path chunk fetch attempt.
+        /// Write one JSONL record per normal-path chunk fetch attempt. The file
+        /// data still comes from nodes only, so `records_from_peers` stays 0;
+        /// this client can still serve other readers.
         #[arg(long, value_name = "PATH", conflicts_with = "all_peers")]
         download_diagnostics: Option<PathBuf>,
     },
@@ -681,6 +685,11 @@ async fn handle_file_download(
     }
     .await;
 
+    // The CLI force-exits after this task. Snapshot the client while still on
+    // the download task, immediately after the download future completes.
+    let swarm = client.swarm_stats();
+    let swarm_rooms = client.swarm_room_stats();
+
     drop(diagnostics);
     if let Some(writer) = diagnostics_writer {
         writer
@@ -697,6 +706,8 @@ async fn handle_file_download(
             file: output_path.display().to_string(),
             size: file_size,
             elapsed_secs: elapsed.as_secs_f64(),
+            swarm,
+            swarm_rooms,
             chunk_peer_check,
         };
         println!("{}", serde_json::to_string(&out)?);
@@ -705,6 +716,26 @@ async fn handle_file_download(
         println!("  File: {}", output_path.display());
         println!("  Size: {}", format_size(file_size));
         println!("  Time: {:.1}s", elapsed.as_secs_f64());
+        println!("  Swarm:");
+        println!("    Records from peers: {}", swarm.records_from_peers);
+        println!("    Bytes from peers: {}", swarm.bytes_from_peers);
+        println!("    Records served: {}", swarm.records_served);
+        println!("    Bytes served: {}", swarm.bytes_served);
+        println!("    Links: {}", swarm.links);
+        println!("    Rooms: {}", swarm.rooms);
+        println!("    Discovery announces: {}", swarm.discovery.announces);
+        println!(
+            "    Discovery announces refused: {}",
+            swarm.discovery.announces_refused
+        );
+        println!(
+            "    Discovery links proven: {}",
+            swarm.discovery.links_proven
+        );
+        println!(
+            "    Discovery links failed: {}",
+            swarm.discovery.links_failed
+        );
 
         if let Some(ref chunk_peer_check) = chunk_peer_check {
             print_file_peer_check(chunk_peer_check);
@@ -824,6 +855,8 @@ struct DownloadJsonResult {
     file: String,
     size: u64,
     elapsed_secs: f64,
+    swarm: SwarmStats,
+    swarm_rooms: Vec<RoomStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chunk_peer_check: Option<FilePeerCheckJson>,
 }
@@ -1171,6 +1204,135 @@ mod tests {
 
     fn test_address() -> String {
         "00".repeat(TEST_ADDRESS_BYTE_LEN)
+    }
+
+    fn assert_json_keys(value: &serde_json::Value, expected: &[&str]) {
+        let actual = value
+            .as_object()
+            .expect("JSON value must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = expected.iter().copied().collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn download_json_result_includes_swarm_stats_and_rooms() {
+        use ant_core::data::{DiscoveryStats, OpenLinkPeer};
+
+        let result = DownloadJsonResult {
+            file: "file.bin".to_string(),
+            size: 1,
+            elapsed_secs: 0.5,
+            swarm: SwarmStats {
+                records_from_peers: 1,
+                bytes_from_peers: 2,
+                records_rejected: 3,
+                asks_busy: 4,
+                asks_missing: 5,
+                asks_failed: 6,
+                records_served: 7,
+                bytes_served: 8,
+                links: 9,
+                rooms: 10,
+                discovery: DiscoveryStats {
+                    lookups: 11,
+                    announces: 12,
+                    announces_failed: 13,
+                    announces_timed_out: 14,
+                    announces_refused: 15,
+                    bytes_sent: 16,
+                    bytes_received: 17,
+                    offers_made: 18,
+                    offers_delivered: 19,
+                    offers_received: 20,
+                    answers_sent: 21,
+                    answers_received: 22,
+                    channels_opened: 23,
+                    links_proven: 24,
+                    links_failed: 25,
+                },
+            },
+            swarm_rooms: vec![RoomStats {
+                tag: "room-1".to_string(),
+                records_from_peers: 26,
+                bytes_from_peers: 27,
+                records_rejected: 28,
+                records_served: 29,
+                bytes_served: 30,
+                links: 31,
+                open_links: vec!["fingerprint-1".to_string()],
+                open_link_peers: vec![OpenLinkPeer {
+                    fingerprint: "fingerprint-1".to_string(),
+                    peer: "peer-1".to_string(),
+                }],
+            }],
+            chunk_peer_check: None,
+        };
+        let json = serde_json::to_value(result).unwrap();
+
+        assert_json_keys(
+            &json,
+            &["file", "size", "elapsed_secs", "swarm", "swarm_rooms"],
+        );
+        assert_json_keys(
+            &json["swarm"],
+            &[
+                "records_from_peers",
+                "bytes_from_peers",
+                "records_rejected",
+                "asks_busy",
+                "asks_missing",
+                "asks_failed",
+                "records_served",
+                "bytes_served",
+                "links",
+                "rooms",
+                "discovery",
+            ],
+        );
+        assert_json_keys(
+            &json["swarm"]["discovery"],
+            &[
+                "lookups",
+                "announces",
+                "announces_failed",
+                "announces_timed_out",
+                "announces_refused",
+                "bytes_sent",
+                "bytes_received",
+                "offers_made",
+                "offers_delivered",
+                "offers_received",
+                "answers_sent",
+                "answers_received",
+                "channels_opened",
+                "links_proven",
+                "links_failed",
+            ],
+        );
+        assert_json_keys(
+            &json["swarm_rooms"][0],
+            &[
+                "tag",
+                "records_from_peers",
+                "bytes_from_peers",
+                "records_rejected",
+                "records_served",
+                "bytes_served",
+                "links",
+                "open_links",
+                "open_link_peers",
+            ],
+        );
+        assert_json_keys(
+            &json["swarm_rooms"][0]["open_link_peers"][0],
+            &["fingerprint", "peer"],
+        );
+        assert_eq!(json["swarm"]["records_from_peers"], 1);
+        assert_eq!(json["swarm"]["discovery"]["links_failed"], 25);
+        assert_eq!(json["swarm_rooms"][0]["records_from_peers"], 26);
     }
 
     #[test]

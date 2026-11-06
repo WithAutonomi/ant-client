@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for that room only). In the browser: `joinSwarm`, `swarmStats` and `swarmRoomStats`, and a
   `Swarm room <tag>` progress line when a file opens; a downloaded chunk another reader sent
   reports `from a reader` in its progress (#244).
+- `ant file download` prints swarm totals after a successful read and adds the exact `swarm` and
+  `swarm_rooms` statistics to its `--json` result. `--all-peers` and `--download-diagnostics`
+  still take file data from nodes only, so `records_from_peers` stays 0 for those reads; they can
+  still serve other readers (#244).
 
 ### Changed
 - `install.sh` puts `ant` on `PATH`, as `install.ps1` already did on Windows, so `ant --version`
