@@ -690,6 +690,7 @@ fn partial_upload_after_fatal(
         total_chunks,
         spend: Box::new(spend),
         reason,
+        cause: None,
     }
 }
 
@@ -1039,6 +1040,7 @@ fn settlement_refusal_after_paid_waves(
              the {total_stored} chunk(s) in earlier wave(s) were already paid for and stored, \
              and the remaining {remaining_count} chunk(s) were neither quoted nor paid. {refusal}"
         ),
+        cause: None,
     }
 }
 
@@ -2262,6 +2264,7 @@ impl Client {
                             gas_cost_wei: 0,
                         }),
                         reason: "finalize_upload: chunk storage failed after retries".into(),
+                        cause: None,
                     });
                 }
                 let chunks_stored = already_stored_count + wave_result.stored.len();
@@ -3696,6 +3699,7 @@ mod tests {
                 gas_cost_wei: 0,
             }),
             reason: "merkle chunk store aborted".into(),
+            cause: None,
         });
         let outcome = assemble_merkle_finalize_outcome(
             store_result,
@@ -3780,6 +3784,7 @@ mod tests {
                 gas_cost_wei: 0,
             }),
             reason: "quorum shortfall".into(),
+            cause: None,
         });
         let outcome = assemble_merkle_finalize_outcome(
             first_pass,
@@ -4295,6 +4300,7 @@ mod tests {
                 gas_cost_wei: 11,
             }),
             reason: "wave store failed after retries".to_string(),
+            cause: None,
         };
 
         let outcome = fold_single_wave(Err(err)).unwrap();
@@ -4350,10 +4356,12 @@ mod tests {
             total_chunks,
             spend,
             reason,
+            cause,
         } = err
         else {
             panic!("expected PartialUpload, got: {err:?}");
         };
+        assert!(cause.is_none());
         assert_eq!(got_stored, stored);
         assert_eq!(stored_count, 2);
         assert_eq!(failed_count, 3);
@@ -4771,6 +4779,7 @@ impl Client {
                     gas_cost_wei: batch_result.gas_cost_wei,
                 }),
                 reason,
+                cause: None,
             });
         }
 
